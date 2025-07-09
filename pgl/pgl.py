@@ -80,9 +80,27 @@ class pgl:
     ################################################################
     def checkOS(self):
         """
-        Check if the current operating system is macOS.
-        """
+        Check if the current operating system is macOS and retrieves system information.
 
+        This method verifies if the code is running on macOS (Darwin). If so, it obtains the macOS
+        version and hardware information by calling the system profiler. The hardware info is parsed
+        into a dictionary for easy access.
+
+        Returns:
+            bool: True if running on macOS and information was retrieved (or attempted),
+                  False if running on a non-macOS system.
+
+        Verbose Mode:
+            Module-level 'verbose' (pgl.verbose) can be set to display:
+                - 1 MacOS version
+                - 2 Hardware information
+
+        Author:
+            JLG
+
+        Date:
+            July 9, 2025
+        """
         if platform.system() == "Darwin":
             # get version
             self.macOSversion = platform.mac_ver()
