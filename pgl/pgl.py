@@ -217,6 +217,29 @@ class pgl:
     # Set the display resolution
     ################################################################
     def setResolution(self, whichScreen, screenWidth, screenHeight, screenRefreshRate, screenColorDepth):
+        """
+        Set the resolution and display settings for a given screen.
+
+        This function sets the width, height, refresh rate, and bit depth of the specified
+        display using the underlying `_displayInfo` compiled extension. 
+
+        Args:
+            whichScreen (int): Index of the display to query (0 = primary). Must be >= 0 and less
+                than the number of active displays.
+            screenWidth (int): Desired screen width in pixels.
+            screenHeight (int): Desired screen height in pixels.
+            screenRefreshRate (int): Desired refresh rate in Hz.
+            screenColorDepth (int): Desired color depth in bits per pixel (e.g., 32 for 32-bit color).
+
+        Returns:
+            None: The function does not return a value, but it will print the new resolution if successful.
+
+        Author:
+            JLG
+
+        Date:
+            July 9, 2025
+        """
         # Print what we are doing
         if self.verbose > 1: print(f"(pgl:setResolution) Setting resolution for screen {whichScreen} to {screenWidth}x{screenHeight}, refresh rate {screenRefreshRate}Hz, color depth {screenColorDepth}-bit")
 
@@ -228,12 +251,32 @@ class pgl:
     # Get the number of displays and the default display
     ################################################################
     def getNumDisplaysAndDefault(self):
+        """
+        Get the number of displays and the default display index.
+
+        This function retrieves the total number of active displays and identifies the
+        default display (usually the primary display) using the underlying `_displayInfo`
+        compiled extension.
+
+        Args:
+            None
+
+        Returns:
+            tuple[int, int]: A 2-tuple containing:
+                - numDisplays (int): The total number of active displays.
+                - defaultDisplay (int): The index of the default display (0 = primary).
+
+        Author:
+            JLG
+
+        Date:
+            July 9, 2025
+        """
         # Print what we are doing
         if self.verbose > 1: print("(pgl:getNumDisplaysAndDefault) Getting number of displays and default display")
-        
-        # Call the C function to get the number of displays and the default display
-        return _displayInfo.getNumDisplaysAndDefault()     
 
+        # Call the C function to get the number of displays and the default display
+        return _displayInfo.getNumDisplaysAndDefault()
 
 def parseGPUInfo(text):
     """
