@@ -17,6 +17,10 @@ static PyObject* setVerbose(PyObject* self, PyObject* args);
 static PyObject* setResolution(PyObject* self, PyObject* args);
 static PyObject* getResolution(PyObject* self, PyObject* args);
 static PyObject* getNumDisplaysAndDefault(PyObject* self, PyObject* args);
+
+//////////////////////////
+//   helper functions   //
+//////////////////////////
 int getBitDepth(CGDisplayModeRef displayMode);
 boolean_t setBestMode(CGDirectDisplayID whichDisplay,int screenWidth,int screenHeight,int frameRate,int bitDepth);
 void printDisplayModes(CGDirectDisplayID whichDisplay);
