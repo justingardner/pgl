@@ -5,7 +5,8 @@
 #############
 # Import modules
 #############
-import platform, subprocess, pprint
+import platform, subprocess, pprint, random, string, os
+import numpy as np
 
 from ._socket import _socket
 from . import _displayInfo
@@ -30,9 +31,6 @@ class pgl:
         if not self.checkOS():
             raise Exception("(pgl) Unsupported OS")
                 
-        # start socket library
-        self.s = _socket()
-
         # Init verbose level to normal
         self.verbose = 1
 
@@ -66,7 +64,68 @@ class pgl:
     def open(self, whichScreen, screenWidth, screenHeight, screenRefreshRate, screenColorDepth):
         # Print what we are doing
         if self.verbose > 0: print(f"(pgl:open) Opening screen {whichScreen} with dimensions {screenWidth}x{screenHeight}, refresh rate {screenRefreshRate}Hz, color depth {screenColorDepth}-bit")
-        # Here you would add the code to actually open the screen using a graphics library
+        # for now hard-code these
+        self.metalAppName = "/Users/justin/proj/mgl/metal/binary/stable/mglMetal.app"
+        self.metalSocketPath = "/Users/justin/Library/Containers/gru.mglMetal/Data"
+        
+        # get a randomized socket name
+        self.metalSocketName = "pglMetal.socket."+''.join(random.choices(string.ascii_letters + string.digits, k=10))
+        
+        # create the socket path
+        socketName = os.path.join(self.metalSocketPath, self.metalSocketName)
+
+        # start up mglMetal application
+        if not os.path.exists(self.metalAppName):
+            print(f"(pgl:open) Error: mglMetal application not found at {self.metalAppName}")
+            return False
+        else:
+            if self.verbose > 0: 
+                print(f"(pgl:open) Starting mglMetal application: {self.metalAppName}")
+                print(f"(pgl:open) Using socket with address: {socketName}")
+            # start the mglMetal application
+            try:
+                result = subprocess.run([
+                    "open", "-g", "-n", self.metalAppName,
+                    "--args", "-mglConnectionAddress", socketName
+                    ], check=True)
+            except Exception as e:
+                print(f"(pgl:open) Error starting mglMetal application: {e}")
+                return False
+        
+        # now try to connect to the socket
+        self.s = _socket(socketName)
+
+        self.clearScreen([0.4, 0.2, 0.5])
+        self.flush()
+    def clearScreen(self, color):
+        """
+        Clear the screen with a specified color.
+
+        Args:
+            color (list or tuple): RGB color values as a list or tuple of three floats in the range [0, 1].
+
+        Returns:
+            bool: True if the screen was cleared successfully, False otherwise.
+        """
+        # Print what we are doing
+        if self.verbose > 0: print(f"(pgl:clearScreen) Clearing screen with color {color}")
+
+        # Check if the socket is connected
+        if not self.s:
+            print("(pgl:clearScreen) ❌ Not connected to socket")
+            return False
+        
+        # Send the clear command
+        # send it clear screen color
+        self.s.write(np.uint16(1012))
+        #ackTime = self.s.read('double')
+        self.s.write(np.array(color, dtype=np.float32))
+        
+    def flush(self):
+        self.s.write(np.uint16(1001))
+        
+        
+        # success
         return True
     
     ################################################################
@@ -278,6 +337,9 @@ class pgl:
         # Call the C function to get the number of displays and the default display
         return _displayInfo.getNumDisplaysAndDefault()
 
+################
+# parseGPUInfo #
+################
 def parseGPUInfo(text):
     """
     Parse the output of `system_profiler SPDisplaysDataType` into a structured dictionary.
