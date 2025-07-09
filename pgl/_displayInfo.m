@@ -85,8 +85,6 @@ static PyObject* setResolution(PyObject* self, PyObject* args)
   int screenWidth, screenHeight, frameRate, bitDepth;
   if (!PyArg_ParseTuple(args, "iiiii", &displayNumber, &screenWidth, &screenHeight, &frameRate, &bitDepth)) return NULL;
 
-  Py_INCREF(Py_False); return Py_False;
-
   // start auto release pool
   NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
 
@@ -97,41 +95,38 @@ static PyObject* setResolution(PyObject* self, PyObject* args)
   CGDisplayCount numDisplays;
   CFDictionaryRef modeInfo;
 
-  // FIX, FIX, FIX: get status of global for verbose
-  int verbose = 1;
-
   // check number of displays
   displayErrorNum = CGGetActiveDisplayList(kMaxDisplays,displays,&numDisplays);
   if (displayErrorNum) {
-    printf("(pgl:displayInfo:setResolution) Cannot get displays (%d)\n", displayErrorNum);
+    printf("(pgl:_displayInfo:_setResolution) Cannot get displays (%d)\n", displayErrorNum);
     [pool release];
     Py_INCREF(Py_False); return Py_False;
   }
-
-  if (verbose) printf("(pgl:displayInfo:setResolution) Found %i displays\n",numDisplays);
+ 
+  // checkfor valid displayNumber
+  NSArray *screens = [NSScreen screens];
+  if (displayNumber < 0 || displayNumber >= [screens count]) {
+    if (verbose) printf("(pgl:displayInfo:_setResolution) Invalid display number %d\n", displayNumber);
+    [pool release];
+     Py_INCREF(Py_False); return Py_False;
+  }
 
   // get the display
   whichDisplay = displays[displayNumber];
 
-  // capture the appropriate display
-  //  CGDisplayCapture(whichDisplay);
-
   // Switch the display mode
   boolean_t success=false;
   success = setBestMode(whichDisplay,screenWidth,screenHeight,frameRate,bitDepth);
-  //CGDisplaySwitchToMode(whichDisplay,CGDisplayBestModeForParametersAndRefreshRate(whichDisplay,*bitDepth,*screenWidth,*screenHeight,*frameRate,&success));
 
   // check to see if it found the right setting
   if (!success) {
-    printf("(pgl:displayInfo:setResolution) Warning: failed to set requested display parameters.\n");
+    printf("(pgl:displayInfo:_setResolution) Warning: failed to set requested display parameters.\n");
     [pool release];
     Py_INCREF(Py_False); return Py_False;
   }
 
-
   [pool release];
-
-  // retrun success
+  // return success
   Py_INCREF(Py_True); return Py_True;
 }
 
@@ -306,8 +301,8 @@ boolean_t setBestMode(CGDirectDisplayID whichDisplay,int screenWidth,int screenH
     if ((bestWidth == (int)CGDisplayModeGetWidth(mode)) && (bestHeight == (int)CGDisplayModeGetHeight(mode))) {
       thisBitDepth = getBitDepth(mode);
       if (fabs((double)bitDepth-(double)thisBitDepth) < minDifference) {
-	minDifference = fabs((double)bitDepth-(double)thisBitDepth);
-	bestBitDepth = thisBitDepth;
+	      minDifference = fabs((double)bitDepth-(double)thisBitDepth);
+	      bestBitDepth = thisBitDepth;
       }
     }
   }
@@ -337,12 +332,20 @@ boolean_t setBestMode(CGDirectDisplayID whichDisplay,int screenWidth,int screenH
     if (thisFrameRate == 0) thisFrameRate = bestFrameRate;
     // check that the width/height and bitDepth are matched to the best
     if ((bestWidth == (int)CGDisplayModeGetWidth(mode)) && (bestHeight == (int)CGDisplayModeGetHeight(mode)) && (bestBitDepth == getBitDepth(mode)) && (bestFrameRate == thisFrameRate))  {
+      // print the mode that is being set
+      if (verbose > 0)
+        printf("(pgl:displayInfo:setBestMode) Setting display %i to %ix%i %iHz %i bits\n",
+               whichDisplay, bestWidth, bestHeight, bestFrameRate, bestBitDepth);
+      // capture the appropriate display
+      CGDisplayCapture(whichDisplay);
       // set the video mode
       CGDisplaySetDisplayMode(whichDisplay,mode,NULL);
+      // release the appropriate display
+      CGDisplayRelease(whichDisplay);
       retval = true;
     }
   }
-  // releast the mode list
+  // release the mode list
   CFRelease(modeList);
 
   if ((bestWidth != screenWidth) || (bestHeight != screenHeight) || (bestBitDepth != bitDepth) || (bestFrameRate != frameRate)) {

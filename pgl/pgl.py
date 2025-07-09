@@ -221,7 +221,9 @@ class pgl:
         if self.verbose > 1: print(f"(pgl:setResolution) Setting resolution for screen {whichScreen} to {screenWidth}x{screenHeight}, refresh rate {screenRefreshRate}Hz, color depth {screenColorDepth}-bit")
 
         # Call the C function to set the display info
-        return _displayInfo.setResolution(whichScreen, screenWidth, screenHeight, screenRefreshRate, screenColorDepth)  
+        if _displayInfo.setResolution(whichScreen, screenWidth, screenHeight, screenRefreshRate, screenColorDepth):
+            # print what resolution the display was set to
+            self.getResolution(whichScreen)
     ################################################################
     # Get the number of displays and the default display
     ################################################################
