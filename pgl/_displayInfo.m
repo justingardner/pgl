@@ -84,7 +84,7 @@ static PyObject* setResolution(PyObject* self, PyObject* args)
   int displayNumber = 0;
   int screenWidth, screenHeight, frameRate, bitDepth;
   if (!PyArg_ParseTuple(args, "iiiii", &displayNumber, &screenWidth, &screenHeight, &frameRate, &bitDepth)) return NULL;
-  printDisplayModes(displayNumber);
+
   Py_INCREF(Py_False); return Py_False;
 
   // start auto release pool
@@ -144,10 +144,7 @@ static PyObject* getResolution(PyObject* self, PyObject* args)
   int displayNumber = 0;
   if (!PyArg_ParseTuple(args, "i", &displayNumber)) return NULL;
 
-  // FIX, FIX, FIX: get status of global for verbose
-  int verbose = 1;
-
- // start auto release pool
+  // start auto release pool
   NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
 
   // get all screen array
@@ -195,8 +192,6 @@ static PyObject* getResolution(PyObject* self, PyObject* args)
     return Py_BuildValue("(iiii)", -1,-1,-1,-1);
   }
 
-  if (verbose) printf("(pgl:displayInfo:getResolution) Found %i displays\n",numDisplays);
-
   // get the display
   whichDisplay = displays[displayNumber];
 
@@ -215,6 +210,10 @@ static PyObject* getResolution(PyObject* self, PyObject* args)
 
   // release the autorelease pool
   [pool release];
+
+  // display information depending on verbose level
+  if (verbose>0) printf("(pgl:displayInfo:getResolution) Display %i/%i: %ix%i %iHz %ibits\n",displayNumber,numDisplays,screenWidth,screenHeight,frameRate,bitDepth);
+  if (verbose>1) printDisplayModes(displayNumber);
 
   // return the screen resolution, frame rate, and bit depth
   return Py_BuildValue("(iiii)", screenWidth, screenHeight, frameRate, bitDepth);
