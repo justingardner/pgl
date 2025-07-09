@@ -1,5 +1,5 @@
 # Makefile
-build:
+build: pgl/_displayInfo.m
 	python setup.py build_ext --inplace
 
 clean:
