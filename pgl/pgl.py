@@ -5,6 +5,8 @@
 #############
 # Import modules
 #############
+import platform, subprocess, pprint
+
 from ._socket import _socket
 from . import _displayInfo
 
@@ -16,6 +18,8 @@ class pgl:
     # Variables
     ################################################################
     _verbose = 1 # verbosity level, 0 = silent, 1 = normal, 2 = verbose
+    macOSversion = None
+    hardwareInfo = None
 
     ################################################################
     # Init Function
@@ -53,7 +57,7 @@ class pgl:
             _displayInfo.setVerbose(level)
 
         # Print the new verbosity level
-        print(f"(pgl) Verbosity level set to {self._verbose}")
+        if self._verbose > 0: print(f"(pgl) Verbosity level set to {self._verbose}")
 
     #################################################################
     # Test function  
@@ -72,23 +76,90 @@ class pgl:
         return True
     
     ################################################################
-    # TODO: Check OS compatibility
+    # Check OS compatibility
     ################################################################
     def checkOS(self):
-        # Check here that the OS is supported
-        # For now, we assume all OSes are supported
-        print("(pgl:checkOS) TODO: Check OS compatibility")
-        return True
+        """
+        Check if the current operating system is macOS.
+        """
+
+        if platform.system() == "Darwin":
+            # get version
+            self.macOSversion = platform.mac_ver()
+            # get hardware info
+            try:
+                hardwareInfo = subprocess.run(
+                    ["system_profiler", "SPHardwareDataType"],
+                    capture_output=True,
+                    text=True,
+                    check=True
+                )
+                # parse into a dict for easier access
+                lines = hardwareInfo.stdout.splitlines()
+                self.hardwareInfo = {}
+                for line in lines:
+                    if ":" in line:
+                        key, value = line.split(":", 1)
+                        key = key.strip()
+                        value = value.strip()
+                        # add to dict
+                        self.hardwareInfo[key] = value
+
+            except subprocess.CalledProcessError as e:
+                self.hardwareInfo = f"Error retrieving hardware info: {e}"
+
+            # Print the macOS version and hardware info
+            if self.verbose > 0: print("(pgl:checkOS) Running on macOS version:", self.macOSversion[0])
+            if self.verbose > 1: 
+                print("(pgl:checkOS) Hardware info")
+                pprint.pprint(self.hardwareInfo)
+            return True
+        else:
+            # not macOS
+            print("(pgl:checkOS) PGL is only supported on macOS")
+            return False
     
     ################################################################
     # Get the display resolution
     ################################################################
     def getResolution(self, whichScreen):
+        """
+        Get the resolution and display settings for a given screen.
+
+        This function retrieves the width, height, refresh rate, and bit depth of the specified
+        display using the underlying `_displayInfo` compiled extension. 
+
+        Args:
+            whichScreen (int): Index of the display to query (0 = primary). Must be >= 0 and less
+                than the number of active displays.
+
+        Returns:
+            tuple[int, int, int, int]: A 4-tuple containing:
+                - width (int): Screen width in pixels.
+                - height (int): Screen height in pixels.
+                - refresh_rate (int): Refresh rate in Hz.
+                - bit_depth (int): Color depth in bits per pixel.
+
+        Raises:
+            None. Errors are signaled by a return value of (-1, -1, -1, -1)
+
+        Verbose Mode:
+            Module-level 'verbose' (pgl.verbose) can be set to display:
+                - 1 Screen resolution, refresh rate and bit depth
+                - 2 all available modes for the display
+
+        Author:
+            JLG
+
+        Date:
+            July 9, 2025
+        """
         # Print what we are doing
         if self.verbose > 1: print(f"(pgl:getResolution) Getting resolution for screen {whichScreen}")
 
         # Call the C function to get the display info
         return _displayInfo.getResolution(whichScreen)
+    
     ################################################################
     # Set the display resolution
     ################################################################
