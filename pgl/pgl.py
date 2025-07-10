@@ -5,7 +5,7 @@
 #############
 # Import modules
 #############
-import platform, subprocess, pprint, random, string, os
+import platform, subprocess, pprint, random, string, os, re
 import numpy as np
 
 from ._socket import _socket
@@ -22,6 +22,7 @@ class pgl:
     macOSversion = None
     hardwareInfo = None
     gpuInfo = None
+    commandTypes = None
 
     ################################################################
     # Init Function
@@ -34,6 +35,9 @@ class pgl:
         # Init verbose level to normal
         self.verbose = 1
 
+        # get the command types
+        self.commandTypes = parseCommandTypes()
+        
         # print what we are doing
         if self.verbose > 0: print("(pgl) Main library instance created")
     
@@ -54,6 +58,9 @@ class pgl:
             self._verbose = level
             # tell the displayInfo c-code library to set the verbosity level
             _displayInfo.setVerbose(level)
+            # if we have a socket, set the verbosity level there too
+            if hasattr(self, 's') and self.s:
+                self.s.verbose = level
 
         # Print the new verbosity level
         if self._verbose > 0: print(f"(pgl) Verbosity level set to {self._verbose}")
@@ -97,6 +104,42 @@ class pgl:
 
         self.clearScreen([0.4, 0.2, 0.5])
         self.flush()
+    def close(self):
+        """
+        Close the connection to the mglMetal application and clean up.
+
+        This function sends a close command to the mglMetal application, waits for a response,
+        and then closes the socket connection.
+
+        Returns:
+            bool: True if the connection was closed successfully, False otherwise.
+        """
+        # Print what we are doing
+        if self.verbose > 0: print("(pgl:close) Closing connection to mglMetal application")
+
+        # Check if the socket is connected
+        if not self.s:
+            print("(pgl:close) ❌ Not connected to socket")
+            return False
+        
+        # get the PID of the mglMetal application
+        pid = self.s.getPID()
+        if pid is None:
+            print("(pgl:close) ❌ Could not find PID of mglMetal application")
+            return False
+        
+        # close the application
+        if self.verbose > 0: print(f"(pgl:close) Closing mglMetal application with PID {pid}")
+        try:
+            subprocess.run(["kill", "-9", str(pid)], check=True)
+            if self.verbose > 0: print(f"(pgl:close) mglMetal application with PID: {pid} was killed successfully.")
+        except subprocess.CalledProcessError as e:
+            print(f"(pgl:close) Error killing mglMetal application with PID: {pid} : {e}")
+
+        # Close the socket
+        self.s.close()
+        
+        return True
     def clearScreen(self, color):
         """
         Clear the screen with a specified color.
@@ -108,7 +151,7 @@ class pgl:
             bool: True if the screen was cleared successfully, False otherwise.
         """
         # Print what we are doing
-        if self.verbose > 0: print(f"(pgl:clearScreen) Clearing screen with color {color}")
+        if self.verbose > 1: print(f"(pgl:clearScreen) Clearing screen with color {color}")
 
         # Check if the socket is connected
         if not self.s:
@@ -116,14 +159,25 @@ class pgl:
             return False
         
         # Send the clear command
-        # send it clear screen color
-        self.s.write(np.uint16(1012))
+        self.s.write(np.uint16(self.commandTypes.get("mglSetClearColor")))
         #ackTime = self.s.read('double')
+        # send the color data
         self.s.write(np.array(color, dtype=np.float32))
         
     def flush(self):
-        self.s.write(np.uint16(1001))
-        
+        """        
+        Flush the drawing commands to the screen.
+
+        This function sends a flush command to the mglMetal application to ensure that all
+        drawing commands are executed.
+
+        Args:
+            None
+
+        Returns:
+            bool: True if the flush command was sent successfully, False otherwise.
+        """
+        self.s.write(np.uint16(self.commandTypes.get("mglFlush")))
         
         # success
         return True
@@ -399,3 +453,46 @@ def parseGPUInfo(text):
     except Exception as e:
         print(f"(parseGpuDisplayInfo) Warning: Parsing failed with error: {e}")
         return {}
+
+
+def parseCommandTypes(filename="mglCommandTypes.h"):
+    """
+    Parse the command types from the mglCommandTypes.h file.
+
+    This function reads the mglCommandTypes.h file, extracts command names and their values,
+    and returns a dictionary mapping command names to their corresponding values.
+
+    Returns:
+        dict: A dictionary where keys are command names and values are their corresponding values.
+    """
+    commandTypes = {}
+
+    with open(filename, "r") as f:
+        lines = f.readlines()
+
+    inEnum = False
+
+    for line in lines:
+        line = line.strip()
+
+        # Start of the enum
+        if line.startswith("typedef enum mglCommandCode"):
+            inEnum = True
+            continue
+
+        if inEnum:
+            # End of the enum
+            if line.startswith("}"): 
+                inEnum = False
+                break
+
+            # Match lines like: mglPing = 0,
+            match = re.match(r"(mgl\w+)\s*=\s*([0-9]+|UINT16_MAX)", line)
+            if match:
+                name, valueStr = match.groups()
+                if valueStr == "UINT16_MAX":
+                    value = 0xFFFF
+                else:
+                    value = int(valueStr)
+                commandTypes[name] = value
+    return commandTypes

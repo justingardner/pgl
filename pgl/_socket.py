@@ -3,12 +3,17 @@
 #            communicate with the standalone mgl engine for
 #            pgl psychophysics and experiment library
 ################################################################
-import socket, sys, time, struct
+import socket, sys, time, struct, subprocess, os
 import numpy as np
 
 class _socket:
+    # init variables
+    s = None
+    socketName = None
+    verbose = 1
+
     # Init Function
-    def __init__(self,socketPath,timeout=10):
+    def __init__(self,socketName,timeout=10):
         # initialize start time
         startTime = time.time()
         attempt = 0
@@ -19,8 +24,9 @@ class _socket:
         while True:
             try:
                 self.s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                self.s.connect(socketPath)
-                print("✅ Connected!")
+                self.s.connect(socketName)
+                self.socketName = socketName
+                print("Connected to:", socketName)
                 return
             except (FileNotFoundError, ConnectionRefusedError):
                 # Keep trying until timeout
@@ -52,9 +58,30 @@ class _socket:
         else:
             raise TypeError("Unsupported data type")
 
-
         try:
             self.s.sendall(packed)
-            print("(pgl:_socket) ✅ Message sent:", message)
+            if self.verbose > 1: print("(pgl:_socket) Message sent:", message)
         except Exception as e:
             print("(pgl:_socket) ❌ Error sending message:", e)
+    
+    def getPID(self):
+        # Find the PID of the process who made the socket
+        try:
+            output = subprocess.check_output(['lsof', '-U', self.socketName])
+            for line in output.decode().splitlines():
+                if 'pgl' in line:
+                    return int(line.split()[1])
+        except Exception as e:
+            print("(pgl:_socket) ❌ Error finding PID:", e)
+        return None
+    
+    def close(self):
+        # Close the socket if it is open
+        if os.path.exists(self.socketName):
+            try:
+                os.remove(self.socketName)
+                print("(pgl:_socket) Closed socket:", self.socketName)
+            except Exception as e:
+                print("(pgl:_socket) ❌ Error closing socket:", e)
+            finally:
+                self.s = None
