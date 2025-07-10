@@ -140,6 +140,37 @@ class pgl:
         self.s.close()
         
         return True
+    def printCommandResults(self, commandResults, relativeToTime=None):
+        """
+        Print the results of a command.
+
+        Args:
+            commandResults (dict): The command results to print.
+        """
+        print(f"(pgl:printCommandResults) Command results:")
+        if relativeToTime is None:
+            relativeToTime = commandResults['ack']
+            print(f"(pgl:printCommandResults) Ack: {commandResults['ack']:.3f} (absolute time in seconds)")
+        else:
+            print(f"(pgl:printCommandResults) Ack: {(commandResults['ack'] - relativeToTime)*1000.0:.3f} ms (relative to {relativeToTime})")
+        print(f"(pgl:printCommandResults) Command Code: {commandResults['commandCode']}")
+        print(f"(pgl:printCommandResults) Success: {commandResults['success']}")
+        if commandResults['vertexStart'] != 0:
+            print(f"(pgl:printCommandResults) Vertex Start: {(commandResults['vertexStart'] - relativeToTime)*1000.0:.3f} ms")
+        if commandResults['vertexEnd'] != 0:
+            print(f"(pgl:printCommandResults) Vertex End: {(commandResults['vertexEnd'] - relativeToTime)*1000.0:.3f} ms")
+        if commandResults['fragmentStart'] != 0:
+            print(f"(pgl:printCommandResults) Fragment Start: {(commandResults['fragmentStart'] - relativeToTime)*1000.0:.3f} ms")
+        if commandResults['fragmentEnd'] != 0:
+            print(f"(pgl:printCommandResults) Fragment End: {(commandResults['fragmentEnd'] - relativeToTime)*1000.0:.3f} ms")
+        if commandResults['drawableAcquired'] != 0:
+            print(f"(pgl:printCommandResults) Drawable Acquired: {(commandResults['drawableAcquired'] - relativeToTime)*1000.0:.3f} ms")
+        if commandResults['drawablePresented'] != 0:
+            print(f"(pgl:printCommandResults) Drawable Presented: {(commandResults['drawablePresented'] - relativeToTime)*1000.0:.3f} ms")
+        if commandResults['processedTime'] != 0:
+            print(f"(pgl:printCommandResults) Processed Time: {(commandResults['processedTime'] - relativeToTime)*1000.0:.3f} ms")
+
+
     def clearScreen(self, color):
         """
         Clear the screen with a specified color.
@@ -160,9 +191,11 @@ class pgl:
         
         # Send the clear command
         self.s.writeCommand("mglSetClearColor")
-        #ackTime = self.s.read('double')
         # send the color data
         self.s.write(np.array(color, dtype=np.float32))
+        # Read the command results
+        commandResults = self.s.readCommandResults()
+        if self.verbose > 0: self.printCommandResults(commandResults)
         
     def flush(self):
         """        
@@ -178,6 +211,8 @@ class pgl:
             bool: True if the flush command was sent successfully, False otherwise.
         """
         self.s.writeCommand("mglFlush")
+        commandResults = self.s.readCommandResults()
+        if self.verbose > 0: self.printCommandResults(commandResults)
         
         # success
         return True
