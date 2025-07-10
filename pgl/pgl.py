@@ -35,9 +35,6 @@ class pgl:
         # Init verbose level to normal
         self.verbose = 1
 
-        # get the command types
-        self.commandTypes = parseCommandTypes()
-        
         # print what we are doing
         if self.verbose > 0: print("(pgl) Main library instance created")
     
@@ -102,6 +99,9 @@ class pgl:
         # now try to connect to the socket
         self.s = _socket(socketName)
 
+        # and parse command types
+        self.s.parseCommandTypes()
+
         self.clearScreen([0.4, 0.2, 0.5])
         self.flush()
     def close(self):
@@ -159,7 +159,7 @@ class pgl:
             return False
         
         # Send the clear command
-        self.s.write(np.uint16(self.commandTypes.get("mglSetClearColor")))
+        self.s.writeCommand("mglSetClearColor")
         #ackTime = self.s.read('double')
         # send the color data
         self.s.write(np.array(color, dtype=np.float32))
@@ -177,7 +177,7 @@ class pgl:
         Returns:
             bool: True if the flush command was sent successfully, False otherwise.
         """
-        self.s.write(np.uint16(self.commandTypes.get("mglFlush")))
+        self.s.writeCommand("mglFlush")
         
         # success
         return True
@@ -453,46 +453,3 @@ def parseGPUInfo(text):
     except Exception as e:
         print(f"(parseGpuDisplayInfo) Warning: Parsing failed with error: {e}")
         return {}
-
-
-def parseCommandTypes(filename="mglCommandTypes.h"):
-    """
-    Parse the command types from the mglCommandTypes.h file.
-
-    This function reads the mglCommandTypes.h file, extracts command names and their values,
-    and returns a dictionary mapping command names to their corresponding values.
-
-    Returns:
-        dict: A dictionary where keys are command names and values are their corresponding values.
-    """
-    commandTypes = {}
-
-    with open(filename, "r") as f:
-        lines = f.readlines()
-
-    inEnum = False
-
-    for line in lines:
-        line = line.strip()
-
-        # Start of the enum
-        if line.startswith("typedef enum mglCommandCode"):
-            inEnum = True
-            continue
-
-        if inEnum:
-            # End of the enum
-            if line.startswith("}"): 
-                inEnum = False
-                break
-
-            # Match lines like: mglPing = 0,
-            match = re.match(r"(mgl\w+)\s*=\s*([0-9]+|UINT16_MAX)", line)
-            if match:
-                name, valueStr = match.groups()
-                if valueStr == "UINT16_MAX":
-                    value = 0xFFFF
-                else:
-                    value = int(valueStr)
-                commandTypes[name] = value
-    return commandTypes
