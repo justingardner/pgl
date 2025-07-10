@@ -3,7 +3,7 @@
 #            communicate with the standalone mgl engine for
 #            pgl psychophysics and experiment library
 ################################################################
-import socket, sys, time, struct, subprocess, os
+import socket, sys, time, struct, subprocess, os, re
 import numpy as np
 
 class _socket:
@@ -85,3 +85,64 @@ class _socket:
                 print("(pgl:_socket) ❌ Error closing socket:", e)
             finally:
                 self.s = None
+    def writeCommand(self, commandName):
+        """
+        Write a command to the socket by its name.
+
+        Args:
+            commandName (str): The name of the command to send.
+        
+        Returns:
+            bool: True if the command was sent successfully, False otherwise.
+        """
+        if not self.s:
+            print("(pgl:_socket) ❌ Not connected to socket")
+            return False
+        
+        commandValue = self.commandTypes.get(commandName)
+        if commandValue is None:
+            print(f"(pgl:_socket) ❌ Command '{commandName}' not found")
+            return False
+        
+        self.write(np.uint16(commandValue))
+        return True
+
+    def parseCommandTypes(self, filename="mglCommandTypes.h"):
+        """
+        Parse the command types from the mglCommandTypes.h file.
+
+        This function reads the mglCommandTypes.h file, extracts command names and their values,
+        and returns a dictionary mapping command names to their corresponding values.
+
+        """
+        self.commandTypes = {}
+
+        with open(filename, "r") as f:
+            lines = f.readlines()
+
+        inEnum = False
+
+        for line in lines:
+            line = line.strip()
+
+            # Start of the enum
+            if line.startswith("typedef enum mglCommandCode"):
+                inEnum = True
+                continue
+
+            if inEnum:
+                # End of the enum
+                if line.startswith("}"): 
+                    inEnum = False
+                    break
+
+                # Match lines like: mglPing = 0,
+                match = re.match(r"(mgl\w+)\s*=\s*([0-9]+|UINT16_MAX)", line)
+                if match:
+                    name, valueStr = match.groups()
+                    if valueStr == "UINT16_MAX":
+                        value = 0xFFFF
+                    else:
+                        value = int(valueStr)
+                    self.commandTypes[name] = value
+    
