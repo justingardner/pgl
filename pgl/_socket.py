@@ -39,7 +39,23 @@ class _socket:
                 sys.stdout.flush()
                 time.sleep(0.5)  # Wait before retrying
 
+    def close(self):
+        """
+          Close the socket connection. 
+        """
+        if os.path.exists(self.socketName):
+            try:
+                os.remove(self.socketName)
+                print("(pgl:_socket) Closed socket:", self.socketName)
+            except Exception as e:
+                print("(pgl:_socket) ❌ Error closing socket:", e)
+            finally:
+                self.s = None
+
     def write(self, message):
+        """
+        Write a message to the socket.
+        """
         # check socket
         if not self.s:
             print("(pgl:_socket) ❌ Not connected to socket")
@@ -64,27 +80,6 @@ class _socket:
         except Exception as e:
             print("(pgl:_socket) ❌ Error sending message:", e)
     
-    def getPID(self):
-        # Find the PID of the process who made the socket
-        try:
-            output = subprocess.check_output(['lsof', '-U', self.socketName])
-            for line in output.decode().splitlines():
-                if 'pgl' in line:
-                    return int(line.split()[1])
-        except Exception as e:
-            print("(pgl:_socket) ❌ Error finding PID:", e)
-        return None
-    
-    def close(self):
-        # Close the socket if it is open
-        if os.path.exists(self.socketName):
-            try:
-                os.remove(self.socketName)
-                print("(pgl:_socket) Closed socket:", self.socketName)
-            except Exception as e:
-                print("(pgl:_socket) ❌ Error closing socket:", e)
-            finally:
-                self.s = None
     def writeCommand(self, commandName):
         """
         Write a command to the socket by its name.
@@ -106,6 +101,60 @@ class _socket:
         
         self.write(np.uint16(commandValue))
         return True
+    def read(self, dataType, numRows=1, numCols=1, numSlices=1):
+        """
+        Read a message from the socket.
+        """
+        if not self.s:
+            print("(pgl:_socket) ❌ Not connected to socket")
+            return None
+
+        try:
+            # Read the appropriate number of bytes based on the data type
+            numBytes = np.dtype(dataType).itemsize*numRows*numCols*numSlices
+            packed = self.s.recv(numBytes)
+            # check length of packed data
+            if len(packed) != numBytes:
+                print("(pgl:_socket) ❌ Expected ", numBytes, "bytes, but received", len(packed), "bytes")
+                return None
+            else:
+                # unpack the data and reshape it
+                return np.squeeze(np.frombuffer(packed, dtype=dataType).reshape((numRows, numCols, numSlices)))
+        except Exception as e:
+            print("(pgl:_socket) ❌ Error reading message:", e)
+            return None
+        
+    def readCommandResults(self):
+        """
+        Read the results from the socket after sending a command.
+        
+        Returns:
+            np.ndarray: The results read from the socket, or None if an error occurs.
+        """
+        if not self.s:
+            print("(pgl:_socket:readCommandResults) ❌ Not connected to socket")
+            return None
+        
+        try:
+            commandResults = {
+                'ack': self.read(np.double),
+                'commandCode': self.read(np.uint16),
+                'success': self.read(np.uint32),
+                'processedTime': self.read(np.double),
+                'vertexStart': self.read(np.double),
+                'vertexEnd': self.read(np.double),
+                'fragmentStart': self.read(np.double),
+                'fragmentEnd': self.read(np.double),
+                'drawableAcquired': self.read(np.double),
+                'drawablePresented': self.read(np.double),
+            }
+            return(commandResults)
+        
+        except Exception as e:
+            print("(pgl:_socket:readCommandResults) ❌ Error reading results:", e)
+            return None
+
+
 
     def parseCommandTypes(self, filename="mglCommandTypes.h"):
         """
@@ -145,4 +194,17 @@ class _socket:
                     else:
                         value = int(valueStr)
                     self.commandTypes[name] = value
+    def getPID(self):
+        """
+        Find the PID of the process who made the socket
+        """
+        try:
+            output = subprocess.check_output(['lsof', '-U', self.socketName])
+            for line in output.decode().splitlines():
+                if 'pgl' in line:
+                    return int(line.split()[1])
+        except Exception as e:
+            print("(pgl:_socket) ❌ Error finding PID:", e)
+        return None
     
+   
