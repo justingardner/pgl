@@ -61,12 +61,19 @@ class _socket:
             print("(pgl:_socket) ❌ Not connected to socket")
             return
         # Pack data for sending
-        if isinstance(message, np.uint16):
+        if type(message) == np.uint16:
             packed = struct.pack('@H', message)
+        # single int value
+        elif type(message) == np.uint32:
+            # Pack as 4-byte unsigned int
+            packed = struct.pack('@I', message)        
         # single float value
-        elif isinstance(message, float):
+        elif type(message) == float or type(message) == np.float32:
             # Pack as 4-byte double float
             packed = struct.pack('@f', message)
+        elif type(message) == np.double:
+            # Pack as 8-byte double float
+            packed = struct.pack('@d', message)
         # array of floats
         elif isinstance(message, np.ndarray) and np.issubdtype(message.dtype, np.floating):
             # pack as 4 byte floats
@@ -124,7 +131,27 @@ class _socket:
             print("(pgl:_socket) ❌ Error reading message:", e)
             return None
         
-    def readCommandResults(self):
+    def readAck(self):
+        """
+        Read an acknowledgment from the socket.
+        
+        Returns:
+            float: The acknowledgment time from the socket, or None if an error occurs.
+        """
+        if not self.s:
+            print("(pgl:_socket:readAck) ❌ Not connected to socket")
+            return None
+        
+        try:
+            ack = self.read(np.double)
+            if ack is None:
+                print("(pgl:_socket:readAck) ❌ Error reading acknowledgment")
+                return None
+            return ack
+        except Exception as e:
+            print("(pgl:_socket:readAck) ❌ Error reading acknowledgment:", e)
+            return None
+    def readCommandResults(self, ack=None):
         """
         Read the results from the socket after sending a command.
         
@@ -136,18 +163,22 @@ class _socket:
             return None
         
         try:
-            commandResults = {
-                'ack': self.read(np.double),
-                'commandCode': self.read(np.uint16),
-                'success': self.read(np.uint32),
-                'processedTime': self.read(np.double),
-                'vertexStart': self.read(np.double),
-                'vertexEnd': self.read(np.double),
-                'fragmentStart': self.read(np.double),
-                'fragmentEnd': self.read(np.double),
-                'drawableAcquired': self.read(np.double),
-                'drawablePresented': self.read(np.double),
-            }
+            commandResults = {}
+            # Read ack if not passed in
+            if ack is None:
+                commandResults['ack'] = self.read(np.double)
+            else:
+                commandResults['ack'] = ack
+            # Read the rest of the command results
+            commandResults['commandCode'] = self.read(np.uint16)
+            commandResults['success'] = self.read(np.uint32)
+            commandResults['processedTime'] = self.read(np.double)
+            commandResults['vertexStart'] = self.read(np.double)
+            commandResults['vertexEnd'] = self.read(np.double)
+            commandResults['fragmentStart'] = self.read(np.double)
+            commandResults['fragmentEnd'] = self.read(np.double)
+            commandResults['drawableAcquired'] = self.read(np.double)
+            commandResults['drawablePresented'] = self.read(np.double)
             return(commandResults)
         
         except Exception as e:
