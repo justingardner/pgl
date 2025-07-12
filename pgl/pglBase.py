@@ -1,5 +1,6 @@
 ################################################################
-# pglBase.py: Base module for the pgl psychophysics and experiment library
+#   filename: pglBase.py
+#    purpose: Base module for the pgl psychophysics and experiment library
 #         by: JLG
 #       date: July 9, 2025
 ################################################################
@@ -7,11 +8,11 @@
 #############
 # Import modules
 #############
-import platform, subprocess, pprint, random, string, os, re
+import platform, subprocess, pprint, random, string, os, pprint
 import numpy as np
-
 from ._socket import _socket
 from . import _displayInfo
+from types import SimpleNamespace
 
 #############
 # Main class
@@ -24,6 +25,11 @@ class pglBase:
     macOSversion = None
     hardwareInfo = None
     gpuInfo = None
+    screenX = SimpleNamespace(pix = 0)
+    screenY = SimpleNamespace(pix = 0)
+    screenWidth = SimpleNamespace(pix = 0, cm = 0.0, deg = 0.0)
+    screenHeight = SimpleNamespace(pix = 0, cm = 0.0, deg = 0.0)
+    distanceToScreen = SimpleNamespace(cm = 0.0)
 
     ################################################################
     # Init Function
@@ -38,6 +44,15 @@ class pglBase:
 
         # print what we are doing
         if self.verbose > 0: print("(pglBase) Main library instance created")
+    
+    ################################################################
+    # Delete Function
+    ################################################################
+    def __del__(self):
+
+        self.close()  # close the socket if it exists
+        # print what we are doing
+        if self.verbose > 0: print("(pglBase) Main library closed")
     
     ################################################################
     # Verbose property
@@ -103,8 +118,68 @@ class pglBase:
         # and parse command types
         self.s.parseCommandTypes()
 
+        # get the window location
+        self.getWindowFrameInDisplay()
+
         self.clearScreen([0.4, 0.2, 0.5])
         self.flush()
+    def setWindowFrameInDisplay(self, whichScreen, screenX, screenY, screenWidth, screenHeight):
+        """
+        Set the window frame location and size
+ 
+        Args:
+            whichScreen (int): The screen number to set the window frame for.
+            screenX (int): The x-coordinate of the window frame.
+            screenY (int): The y-coordinate of the window frame.
+            screenWidth (int): The width of the window frame.
+            screenHeight (int): The height of the window frame.
+        """
+        self.s.writeCommand("mglSetWindowFrameInDisplay")
+        self.s.write(np.uint32(whichScreen))
+        self.s.write(np.uint32(screenX))
+        self.s.write(np.uint32(screenY))
+        self.s.write(np.uint32(screenWidth))
+        self.s.write(np.uint32(screenHeight))
+        commandResults = self.s.readCommandResults()
+        # save pixel dimensions
+        self.screenWidth.pix = screenWidth
+        self.screenHeight.pix = screenHeight
+    
+    def getWindowFrameInDisplay(self):
+        """
+        Get the current window frame location and size.
+
+        Returns:
+            dict: A dictionary containing the window frame information.
+            - 'whichScreen' (int): The screen number where the window frame is located.
+            - 'screenX' (int): The x-coordinate of the window frame in pixels.
+            - 'screenY' (int): The y-coordinate of the window frame in pixels.
+            - 'screenWidth' (int): The width of the window frame in pixels.
+            - 'screenHeight' (int): The height of the window frame in pixels.
+        """
+        self.s.writeCommand("mglGetWindowFrameInDisplay")
+        ack = self.s.readAck()
+        responseIncoming = self.s.read(np.double)
+        if responseIncoming < 0:
+            print(f"(pglBase:getWindowFrameInDisplay) ❌ Error getting window frame size")
+            windowLocation = {}
+        else:
+            windowLocation = {'whichScreen': self.s.read(np.uint32),
+                              'screenX': self.s.read(np.uint32),
+                              'screenY': self.s.read(np.uint32),
+                              'screenWidth': self.s.read(np.uint32),
+                              'screenHeight': self.s.read(np.uint32)} 
+        commandResults = self.s.readCommandResults(ack)
+
+        # update the stored values
+        self.whichScreen = windowLocation.get('whichScreen', 0)
+        self.screenX.pix = windowLocation.get('screenX', 0)
+        self.screenY.pix = windowLocation.get('screenY', 0)
+        self.screenWidth.pix = windowLocation.get('screenWidth', 0)
+        self.screenHeight.pix = windowLocation.get('screenHeight', 0)
+
+        return windowLocation
+
     def close(self):
         """
         Close the connection to the mglMetal application and clean up.
