@@ -180,6 +180,23 @@ class pglBase:
 
         return windowLocation
 
+    def fullscreen(self, goFullScreen=True):
+        """
+        Set the window to fullscreen mode.
+
+        Args:
+            goFullScreen (bool): If True, set the window to fullscreen. If False, exit fullscreen.
+        """
+        if goFullScreen:
+            self.s.writeCommand("mglFullscreen")
+        else:
+            self.s.writeCommand("mglWindowed")
+        commandResults = self.s.readCommandResults()
+        if commandResults.get('success',False) is False:
+            print("(pglBase:fullscreen) ❌ Error setting fullscreen mode")
+            return False
+        return True
+
     def close(self):
         """
         Close the connection to the mglMetal application and clean up.
