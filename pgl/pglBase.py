@@ -25,6 +25,7 @@ class pglBase:
     macOSversion = None
     hardwareInfo = None
     gpuInfo = None
+    commandResults = None
     s = None  # socket connection to mglMetal application
     screenX = SimpleNamespace(pix = 0)
     screenY = SimpleNamespace(pix = 0)
@@ -168,84 +169,10 @@ class pglBase:
         
         # success
         return True
-    def setWindowFrameInDisplay(self, whichScreen, screenX, screenY, screenWidth, screenHeight):
-        """
-        Set the window frame location and size
  
-        Args:
-            whichScreen (int): The screen number to set the window frame for.
-            screenX (int): The x-coordinate of the window frame.
-            screenY (int): The y-coordinate of the window frame.
-            screenWidth (int): The width of the window frame.
-            screenHeight (int): The height of the window frame.
-        """
-        self.s.writeCommand("mglSetWindowFrameInDisplay")
-        self.s.write(np.uint32(whichScreen+1))  # whichScreen is 0-indexed in Python, but 1-indexed in mglMetal
-        self.s.write(np.uint32(screenX))
-        self.s.write(np.uint32(screenY))
-        self.s.write(np.uint32(screenWidth))
-        self.s.write(np.uint32(screenHeight))
-        commandResults = self.s.readCommandResults()
-        # save pixel dimensions
-        self.screenWidth.pix = screenWidth
-        self.screenHeight.pix = screenHeight
-    
-    def getWindowFrameInDisplay(self):
-        """
-        Get the current window frame location and size.
-
-        Returns:
-            dict: A dictionary containing the window frame information.
-            - 'whichScreen' (int): The screen number where the window frame is located.
-            - 'screenX' (int): The x-coordinate of the window frame in pixels.
-            - 'screenY' (int): The y-coordinate of the window frame in pixels.
-            - 'screenWidth' (int): The width of the window frame in pixels.
-            - 'screenHeight' (int): The height of the window frame in pixels.
-        """
-        if self.s is None: 
-            print(f"(pglBase:getWindowFrameInDisplay) ❌ No screen is open")
-            return {}
-
-        self.s.writeCommand("mglGetWindowFrameInDisplay")
-        ack = self.s.readAck()
-        responseIncoming = self.s.read(np.double)
-        if responseIncoming < 0:
-            print(f"(pglBase:getWindowFrameInDisplay) ❌ Error getting window frame size")
-            windowLocation = {}
-        else:
-            windowLocation = {'whichScreen': self.s.read(np.uint32),
-                              'screenX': self.s.read(np.uint32),
-                              'screenY': self.s.read(np.uint32),
-                              'screenWidth': self.s.read(np.uint32),
-                              'screenHeight': self.s.read(np.uint32)} 
-        commandResults = self.s.readCommandResults(ack)
-
-        # update the stored values
-        self.whichScreen = windowLocation.get('whichScreen', 0)
-        self.screenX.pix = windowLocation.get('screenX', 0)
-        self.screenY.pix = windowLocation.get('screenY', 0)
-        self.screenWidth.pix = windowLocation.get('screenWidth', 0)
-        self.screenHeight.pix = windowLocation.get('screenHeight', 0)
-
-        return windowLocation
-
-    def fullScreen(self, goFullScreen=True):
-        """
-        Set the window to fullScreen mode.
-
-        Args:
-            goFullScreen (bool): If True, set the window to fullscreen. If False, exit fullscreen.
-        """
-        if goFullScreen:
-            self.s.writeCommand("mglFullscreen")
-        else:
-            self.s.writeCommand("mglWindowed")
-        commandResults = self.s.readCommandResults()
-        if commandResults.get('success',False) is False:
-            print("(pglBase:fullscreen) ❌ Error setting fullscreen mode")
-            return False
-        return True
-
+    ################################################################
+    # close
+    ################################################################
     def close(self):
         """
         Close the connection to the mglMetal application and clean up.
@@ -256,6 +183,9 @@ class pglBase:
         Returns:
             bool: True if the connection was closed successfully, False otherwise.
         """
+         # make sure that a screen is open
+        if self.s is None: return True
+
         # Print what we are doing
         if self.verbose > 0: print("(pglBase:close) Closing connection to mglMetal application")
 
@@ -283,6 +213,136 @@ class pglBase:
         self.s = None
         
         return True
+    
+    ################################################################
+    # flush
+    ################################################################
+    def flush(self):
+        """        
+        Flush the drawing commands to the screen.
+
+        This function sends a flush command to the mglMetal application to ensure that all
+        drawing commands are executed.
+
+        Args:
+            None
+
+        Returns:
+            bool: True if the flush command was sent successfully, False otherwise.
+        """
+        # make sure that a screen is open
+        if self.s is None: 
+            print(f"(pglBase:flush) ❌ No screen is open")
+            return False
+        self.s.writeCommand("mglFlush")
+        self.commandResults = self.s.readCommandResults()
+        
+        # success
+        return True
+    
+    ################################################################
+    # setWindowFrameInDisplay
+    ################################################################
+    def setWindowFrameInDisplay(self, whichScreen, screenX, screenY, screenWidth, screenHeight):
+        """
+        Set the window frame location and size
+ 
+        Args:
+            whichScreen (int): The screen number to set the window frame for.
+            screenX (int): The x-coordinate of the window frame.
+            screenY (int): The y-coordinate of the window frame.
+            screenWidth (int): The width of the window frame.
+            screenHeight (int): The height of the window frame.
+        """
+        # make sure that a screen is open
+        if self.s is None: 
+            print(f"(pglBase:setWindowFrameInDisplay) ❌ No screen is open")
+            return
+        self.s.writeCommand("mglSetWindowFrameInDisplay")
+        self.s.write(np.uint32(whichScreen+1))  # whichScreen is 0-indexed in Python, but 1-indexed in mglMetal
+        self.s.write(np.uint32(screenX))
+        self.s.write(np.uint32(screenY))
+        self.s.write(np.uint32(screenWidth))
+        self.s.write(np.uint32(screenHeight))
+        self.commandResults = self.s.readCommandResults()
+        # save pixel dimensions
+        self.screenWidth.pix = screenWidth
+        self.screenHeight.pix = screenHeight
+    
+    ################################################################
+    # getWindowFrameInDisplay
+    ################################################################
+    def getWindowFrameInDisplay(self):
+        """
+        Get the current window frame location and size.
+
+        Returns:
+            dict: A dictionary containing the window frame information.
+            - 'whichScreen' (int): The screen number where the window frame is located.
+            - 'screenX' (int): The x-coordinate of the window frame in pixels.
+            - 'screenY' (int): The y-coordinate of the window frame in pixels.
+            - 'screenWidth' (int): The width of the window frame in pixels.
+            - 'screenHeight' (int): The height of the window frame in pixels.
+        """
+        # make sure that a screen is open
+        if self.s is None: 
+            print(f"(pglBase:getWindowFrameInDisplay) ❌ No screen is open")
+            return {}
+
+        self.s.writeCommand("mglGetWindowFrameInDisplay")
+        ack = self.s.readAck()
+        responseIncoming = self.s.read(np.double)
+        if responseIncoming < 0:
+            print(f"(pglBase:getWindowFrameInDisplay) ❌ Error getting window frame size")
+            windowLocation = {}
+        else:
+            windowLocation = {'whichScreen': self.s.read(np.uint32),
+                              'screenX': self.s.read(np.uint32),
+                              'screenY': self.s.read(np.uint32),
+                              'screenWidth': self.s.read(np.uint32),
+                              'screenHeight': self.s.read(np.uint32)} 
+        self.commandResults = self.s.readCommandResults(ack)
+
+        # update the stored values
+        self.whichScreen = windowLocation.get('whichScreen', 0)
+        self.screenX.pix = int(windowLocation.get('screenX', 0))
+        self.screenY.pix = int(windowLocation.get('screenY', 0))
+        self.screenWidth.pix = int(windowLocation.get('screenWidth', 0))
+        self.screenHeight.pix = int(windowLocation.get('screenHeight', 0))
+
+        return windowLocation
+
+    ################################################################
+    # fullScreen
+    ################################################################
+    def fullScreen(self, goFullScreen=True):
+        """
+        Set the window to fullScreen mode.
+
+        Args:
+            goFullScreen (bool): If True, set the window to fullscreen. If False, exit fullscreen.
+
+        Returns:
+            bool: True if the fullscreen mode was set successfully, False otherwise.
+        """
+        # make sure that a screen is open
+        if self.s is None: 
+            print(f"(pglBase:fullScreen) ❌ No screen is open")
+            return False
+
+        if goFullScreen:
+            self.s.writeCommand("mglFullscreen")
+        else:
+            self.s.writeCommand("mglWindowed")
+        self.commandResults = self.s.readCommandResults()
+        if commandResults.get('success',False) is False:
+            print("(pglBase:fullscreen) ❌ Error setting fullscreen mode")
+            return False
+        return True
+
+    ################################################################
+    # printCommandResults
+    ################################################################
     def printCommandResults(self, commandResults, relativeToTime=None):
         """
         Print the results of a command.
@@ -314,52 +374,6 @@ class pglBase:
             print(f"(pglBase:printCommandResults) Processed Time: {(commandResults['processedTime'] - relativeToTime)*1000.0:.3f} ms")
 
 
-    def clearScreen(self, color):
-        """
-        Clear the screen with a specified color.
-
-        Args:
-            color (list or tuple): RGB color values as a list or tuple of three floats in the range [0, 1].
-
-        Returns:
-            bool: True if the screen was cleared successfully, False otherwise.
-        """
-        # Print what we are doing
-        if self.verbose > 1: print(f"(pgl:clearScreen) Clearing screen with color {color}")
-
-        # Check if the socket is connected
-        if not self.s:
-            print("(pgl:clearScreen) ❌ Not connected to socket")
-            return False
-        
-        # Send the clear command
-        self.s.writeCommand("mglSetClearColor")
-        # send the color data
-        self.s.write(np.array(color, dtype=np.float32))
-        # Read the command results
-        commandResults = self.s.readCommandResults()
-        if self.verbose > 0: self.printCommandResults(commandResults)
-        
-    def flush(self):
-        """        
-        Flush the drawing commands to the screen.
-
-        This function sends a flush command to the mglMetal application to ensure that all
-        drawing commands are executed.
-
-        Args:
-            None
-
-        Returns:
-            bool: True if the flush command was sent successfully, False otherwise.
-        """
-        self.s.writeCommand("mglFlush")
-        commandResults = self.s.readCommandResults()
-        if self.verbose > 0: self.printCommandResults(commandResults)
-        
-        # success
-        return True
-    
     ################################################################
     # Check OS compatibility
     ################################################################
@@ -463,106 +477,6 @@ class pglBase:
             print("(pgl:checkOS) PGL is only supported on macOS")
             return False
     
-    ################################################################
-    # Get the display resolution
-    ################################################################
-    def getResolution(self, whichScreen):
-        """
-        Get the resolution and display settings for a given screen.
-
-        This function retrieves the width, height, refresh rate, and bit depth of the specified
-        display using the underlying `_displayInfo` compiled extension. 
-
-        Args:
-            whichScreen (int): Index of the display to query (0 = primary). Must be >= 0 and less
-                than the number of active displays.
-
-        Returns:
-            tuple[int, int, int, int]: A 4-tuple containing:
-                - width (int): Screen width in pixels.
-                - height (int): Screen height in pixels.
-                - refresh_rate (int): Refresh rate in Hz.
-                - bit_depth (int): Color depth in bits per pixel.
-
-        Raises:
-            None. Errors are signaled by a return value of (-1, -1, -1, -1)
-
-        Verbose Mode:
-            Module-level 'verbose' (pgl.verbose) can be set to display:
-                - 1 Screen resolution, refresh rate and bit depth
-                - 2 all available modes for the display
-        """
-        # Print what we are doing
-        if self.verbose > 1: print(f"(pgl:getResolution) Getting resolution for screen {whichScreen}")
-
-        # Call the C function to get the display info
-        return _displayInfo.getResolution(whichScreen)
-    
-    ################################################################
-    # Set the display resolution
-    ################################################################
-    def setResolution(self, whichScreen, screenWidth, screenHeight, screenRefreshRate, screenColorDepth):
-        """
-        Set the resolution and display settings for a given screen.
-
-        This function sets the width, height, refresh rate, and bit depth of the specified
-        display using the underlying `_displayInfo` compiled extension. 
-
-        Args:
-            whichScreen (int): Index of the display to query (0 = primary). Must be >= 0 and less
-                than the number of active displays.
-            screenWidth (int): Desired screen width in pixels.
-            screenHeight (int): Desired screen height in pixels.
-            screenRefreshRate (int): Desired refresh rate in Hz.
-            screenColorDepth (int): Desired color depth in bits per pixel (e.g., 32 for 32-bit color).
-
-        Returns:
-            None: The function does not return a value, but it will print the new resolution if successful.
-
-        Author:
-            JLG
-
-        Date:
-            July 9, 2025
-        """
-        # Print what we are doing
-        if self.verbose > 1: print(f"(pgl:setResolution) Setting resolution for screen {whichScreen} to {screenWidth}x{screenHeight}, refresh rate {screenRefreshRate}Hz, color depth {screenColorDepth}-bit")
-
-        # Call the C function to set the display info
-        if _displayInfo.setResolution(whichScreen, screenWidth, screenHeight, screenRefreshRate, screenColorDepth):
-            # print what resolution the display was set to
-            self.getResolution(whichScreen)
-    ################################################################
-    # Get the number of displays and the default display
-    ################################################################
-    def getNumDisplaysAndDefault(self):
-        """
-        Get the number of displays and the default display index.
-
-        This function retrieves the total number of active displays and identifies the
-        default display (usually the primary display) using the underlying `_displayInfo`
-        compiled extension.
-
-        Args:
-            None
-
-        Returns:
-            tuple[int, int]: A 2-tuple containing:
-                - numDisplays (int): The total number of active displays.
-                - defaultDisplay (int): The index of the default display (0 = primary).
-
-        Author:
-            JLG
-
-        Date:
-            July 9, 2025
-        """
-        # Print what we are doing
-        if self.verbose > 1: print("(pgl:getNumDisplaysAndDefault) Getting number of displays and default display")
-
-        # Call the C function to get the number of displays and the default display
-        return _displayInfo.getNumDisplaysAndDefault()
-
 ################
 # parseGPUInfo #
 ################
