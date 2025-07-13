@@ -223,16 +223,12 @@ static PyObject* getResolution(PyObject* self, PyObject* args)
 //////////////////////////////////////////
 static PyObject* getNumDisplaysAndDefault(PyObject* self, PyObject* args)
 {
-  // Replace this with real logic
-  int numDisplays;
-  int defaultDisplayNum = 1;
-
   // start auto release pool
   NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
 
   // return num displays and default display number
-  numDisplays = [[NSScreen screens] count];
-  defaultDisplayNum = numDisplays;
+  int numDisplays = [[NSScreen screens] count];
+  int defaultDisplayNum = numDisplays-1;
 
   [pool release]; 
 

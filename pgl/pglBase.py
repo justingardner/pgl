@@ -25,6 +25,7 @@ class pglBase:
     macOSversion = None
     hardwareInfo = None
     gpuInfo = None
+    s = None  # socket connection to mglMetal application
     screenX = SimpleNamespace(pix = 0)
     screenY = SimpleNamespace(pix = 0)
     screenWidth = SimpleNamespace(pix = 0, cm = 0.0, deg = 0.0)
@@ -81,9 +82,44 @@ class pglBase:
     ################################################################
     # Open a screen
     ################################################################
-    def open(self, whichScreen, screenWidth, screenHeight, screenRefreshRate, screenColorDepth):
-        # Print what we are doing
-        if self.verbose > 0: print(f"(pglBase:open) Opening screen {whichScreen} with dimensions {screenWidth}x{screenHeight}, refresh rate {screenRefreshRate}Hz, color depth {screenColorDepth}-bit")
+    def open(self, whichScreen=None, screenWidth=None, screenHeight=None, screenX=None, screenY=None):
+        """
+        Open a screen on the specified display.
+
+        Args:
+            whichScreen (int): The screen number to open, 0 is the primary display
+                               the default is to open the non-primary display
+            screenWidth (int, optional): The width of the screen in pixels.
+            screenHeight (int, optional): The height of the screen in pixels.
+            If screenWidth and screenHeight are not provided, the screen will open full screen
+            screenX (int, optional): The x-coordinate of the screen in pixels.
+            screenY (int, optional): The y-coordinate of the screen in pixels
+        
+        Returns:
+            bool: True if the screen was opened successfully, False otherwise.
+        """
+        # get how many displays we have
+        (numDisplays, defaultDisplay) = self.getNumDisplaysAndDefault()
+        if whichScreen is None: whichScreen = defaultDisplay
+
+        # Check if the screen number is valid
+        if whichScreen < 0 or whichScreen >= numDisplays:
+            print(f"(pglBase:open) Error: Invalid screen number {whichScreen}. Must be between 0 and {numDisplays-1}.")
+            return False
+
+        # Check whether any screen positioning was provided, in which
+        # case we will not open full screen
+        if (screenWidth, screenHeight, screenX, screenY) == (None, None, None, None):
+            fullScreen = True
+        else:
+            fullScreen = False
+
+        # Set ddefault values
+        screenWidth = screenWidth if screenWidth is not None else 800
+        screenHeight = screenHeight if screenHeight is not None else 600
+        screenX = screenX if screenX is not None else 100
+        screenY = screenY if screenY is not None else 100            
+
         # for now hard-code these
         self.metalAppName = "/Users/justin/proj/mgl/metal/binary/stable/mglMetal.app"
         self.metalSocketPath = "/Users/justin/Library/Containers/gru.mglMetal/Data"
@@ -102,8 +138,8 @@ class pglBase:
             if self.verbose > 0: 
                 print(f"(pglBase:open) Starting mglMetal application: {self.metalAppName}")
                 print(f"(pglBase:open) Using socket with address: {socketName}")
-            # start the mglMetal application
             try:
+                # start the mglMetal application
                 result = subprocess.run([
                     "open", "-g", "-n", self.metalAppName,
                     "--args", "-mglConnectionAddress", socketName
@@ -117,12 +153,21 @@ class pglBase:
 
         # and parse command types
         self.s.parseCommandTypes()
+        
+        # set the window location and size
+        self.setWindowFrameInDisplay(whichScreen, screenX, screenY, screenWidth, screenHeight)
+
+        # set full screen if requested
+        if fullScreen: self.fullScreen(True)
 
         # get the window location
         self.getWindowFrameInDisplay()
 
         self.clearScreen([0.4, 0.2, 0.5])
         self.flush()
+        
+        # success
+        return True
     def setWindowFrameInDisplay(self, whichScreen, screenX, screenY, screenWidth, screenHeight):
         """
         Set the window frame location and size
@@ -135,7 +180,7 @@ class pglBase:
             screenHeight (int): The height of the window frame.
         """
         self.s.writeCommand("mglSetWindowFrameInDisplay")
-        self.s.write(np.uint32(whichScreen))
+        self.s.write(np.uint32(whichScreen+1))  # whichScreen is 0-indexed in Python, but 1-indexed in mglMetal
         self.s.write(np.uint32(screenX))
         self.s.write(np.uint32(screenY))
         self.s.write(np.uint32(screenWidth))
@@ -157,6 +202,10 @@ class pglBase:
             - 'screenWidth' (int): The width of the window frame in pixels.
             - 'screenHeight' (int): The height of the window frame in pixels.
         """
+        if self.s is None: 
+            print(f"(pglBase:getWindowFrameInDisplay) ❌ No screen is open")
+            return {}
+
         self.s.writeCommand("mglGetWindowFrameInDisplay")
         ack = self.s.readAck()
         responseIncoming = self.s.read(np.double)
@@ -180,9 +229,9 @@ class pglBase:
 
         return windowLocation
 
-    def fullscreen(self, goFullScreen=True):
+    def fullScreen(self, goFullScreen=True):
         """
-        Set the window to fullscreen mode.
+        Set the window to fullScreen mode.
 
         Args:
             goFullScreen (bool): If True, set the window to fullscreen. If False, exit fullscreen.
@@ -231,6 +280,7 @@ class pglBase:
 
         # Close the socket
         self.s.close()
+        self.s = None
         
         return True
     def printCommandResults(self, commandResults, relativeToTime=None):
