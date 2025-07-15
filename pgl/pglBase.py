@@ -428,7 +428,6 @@ class pglBase:
                                         "Memory:",
                                         self.cpuInfo.get("Memory", "Unknown "))
             # Print GPU info
-            print(self.gpuInfo)
             if self.verbose > 0:
                 for gpuName, gpuInfo in self.gpuInfo.items():
                     gpuChipset = gpuInfo.get("Chipset Model", "Unknown")
@@ -489,6 +488,11 @@ def getCPUInfo():
 
         # extract processor name, which can be named different things on different systems
         processor = next((cpuInfo.get(k) for k in ("Chip", "Processor Name", "CPU Type", "CPU") if cpuInfo.get(k)), "Unknown")
+
+        # add on procesor speed if it exists
+        processor += (f" {cpuInfo.get('Processor Speed', '')}" if "Processor Speed" in cpuInfo else "")
+        
+        # add to processor entry
         cpuInfo["Processor"] = processor
         return cpuInfo
     except Exception as e:
