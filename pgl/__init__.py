@@ -5,4 +5,10 @@ from .screen import screen
 from .task import task
 
 class pgl(pglBase, pglResolution, pglDraw):
+    """
+    purpose: psychophysics and experiment library for Python.
+    License: MIT License — see LICENSE file for details.
+         by: JLG
+       date: July 9, 2025
+    """
     pass

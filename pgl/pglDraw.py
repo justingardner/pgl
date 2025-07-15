@@ -15,22 +15,9 @@ import numpy as np
 # Drawing class
 #############
 class pglDraw:
-    ################################################################
-    # Init Function
-    ################################################################
-    def __init__(self):
-        """
-        Initialize the pglDraw class.
-
-        This class provides methods for drawing operations on the screen.
-
-        Args:
-            None
-
-        Returns:
-            None
-        """
-        pass
+    """
+    pglDraw class for drawing operations.
+    """
 
     ################################################################
     # clearScreen
