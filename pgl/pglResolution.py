@@ -9,7 +9,7 @@
 #############
 # Import modules
 #############
-from . import _displayInfo
+from . import _resolution
 
 #############
 # Main class
@@ -20,7 +20,7 @@ class pglResolution:
 
     This class provides methods to get and set display resolutions
     and other display-related information using the underlying
-    `_displayInfo` compiled extension.
+    `_resolution` compiled extension.
 
     Args:
         None
@@ -37,7 +37,7 @@ class pglResolution:
         Get the resolution and display settings for a given screen.
 
         This function retrieves the width, height, refresh rate, and bit depth of the specified
-        display using the underlying `_displayInfo` compiled extension. 
+        display using the underlying `_resolution` compiled extension. 
 
         Args:
             whichScreen (int): Index of the display to query (0 = primary). Must be >= 0 and less
@@ -62,7 +62,7 @@ class pglResolution:
         if self.verbose > 1: print(f"(pgl:getResolution) Getting resolution for screen {whichScreen}")
 
         # Call the C function to get the display info
-        return _displayInfo.getResolution(whichScreen)
+        return _resolution.getResolution(whichScreen)
     
     ################################################################
     # Set the display resolution
@@ -72,7 +72,7 @@ class pglResolution:
         Set the resolution and display settings for a given screen.
 
         This function sets the width, height, refresh rate, and bit depth of the specified
-        display using the underlying `_displayInfo` compiled extension. 
+        display using the underlying `_resolution` compiled extension. 
 
         Args:
             whichScreen (int): Index of the display to query (0 = primary). Must be >= 0 and less
@@ -95,7 +95,7 @@ class pglResolution:
         if self.verbose > 1: print(f"(pgl:setResolution) Setting resolution for screen {whichScreen} to {screenWidth}x{screenHeight}, refresh rate {screenRefreshRate}Hz, color depth {screenColorDepth}-bit")
 
         # Call the C function to set the display info
-        if _displayInfo.setResolution(whichScreen, screenWidth, screenHeight, screenRefreshRate, screenColorDepth):
+        if _resolution.setResolution(whichScreen, screenWidth, screenHeight, screenRefreshRate, screenColorDepth):
             # print what resolution the display was set to
             self.getResolution(whichScreen)
     
@@ -107,7 +107,7 @@ class pglResolution:
         Get the number of displays and the default display index.
 
         This function retrieves the total number of active displays and identifies the
-        default display (usually the primary display) using the underlying `_displayInfo`
+        default display (usually the primary display) using the underlying `_resolution`
         compiled extension.
 
         Args:
@@ -128,5 +128,5 @@ class pglResolution:
         if self.verbose > 1: print("(pgl:getNumDisplaysAndDefault) Getting number of displays and default display")
 
         # Call the C function to get the number of displays and the default display
-        return _displayInfo.getNumDisplaysAndDefault()
+        return _resolution.getNumDisplaysAndDefault()
 

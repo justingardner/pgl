@@ -11,7 +11,7 @@
 import platform, subprocess, pprint, random, string, os, pprint
 import numpy as np
 from ._socket import _socket
-from . import _displayInfo
+from . import _resolution
 from types import SimpleNamespace
 
 #############
@@ -72,7 +72,7 @@ class pglBase:
             # set the verbosity level
             self._verbose = level
             # tell the displayInfo c-code library to set the verbosity level
-            _displayInfo.setVerbose(level)
+            _resolution.setVerbose(level)
             # if we have a socket, set the verbosity level there too
             if hasattr(self, 's') and self.s:
                 self.s.verbose = level
@@ -537,5 +537,5 @@ def parseGPUInfo(text):
         return result
 
     except Exception as e:
-        print(f"(parseGpuDisplayInfo) Warning: Parsing failed with error: {e}")
+        print(f"(parseGpuInfo) Warning: Parsing failed with error: {e}")
         return {}

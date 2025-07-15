@@ -34,7 +34,7 @@ int verbose = 1;
 //   Python Object Defs      //
 ///////////////////////////////
 // Method table
-static PyMethodDef DisplayInfoMethods[] = {
+static PyMethodDef ResolutionMethods[] = {
     {"setResolution", setResolution, METH_VARARGS, "Get resolution info for a display"},
     {"getResolution", getResolution, METH_VARARGS, "Set resolution for a display"},
     {"getNumDisplaysAndDefault", getNumDisplaysAndDefault, METH_NOARGS, "Get number of displays and default"},
@@ -43,16 +43,16 @@ static PyMethodDef DisplayInfoMethods[] = {
 };
 
 // Module definition
-static struct PyModuleDef displayInfoModule = {
+static struct PyModuleDef resolutionModule = {
     PyModuleDef_HEAD_INIT,
-    "_displayInfo",
+    "_resolution",
     "Display Info Extension Module",
     -1,
-    DisplayInfoMethods
+    ResolutionMethods
 };
 
-PyMODINIT_FUNC PyInit__displayInfo(void) {
-    return PyModule_Create(&displayInfoModule);
+PyMODINIT_FUNC PyInit__resolution(void) {
+    return PyModule_Create(&resolutionModule);
 }
 
 ////////////////////////////
@@ -69,7 +69,7 @@ static PyObject* setVerbose(PyObject* self, PyObject* args)
 
   // print a message if verbose is set to a high level
   if (verbose > 1)
-    printf("(pgl:displayInfo:setVerbose) Verbose level set to %d\n", verbose);
+    printf("(pgl:resolution:setVerbose) Verbose level set to %d\n", verbose);
 
   // return success
   Py_INCREF(Py_True); return Py_True;
@@ -102,7 +102,7 @@ static PyObject* setResolution(PyObject* self, PyObject* args)
   // check number of displays
   displayErrorNum = CGGetActiveDisplayList(kMaxDisplays,displays,&numDisplays);
   if (displayErrorNum) {
-    printf("(pgl:_displayInfo:_setResolution) Cannot get displays (%d)\n", displayErrorNum);
+    printf("(pgl:_resolution:_setResolution) Cannot get displays (%d)\n", displayErrorNum);
     [pool release];
     Py_INCREF(Py_False); return Py_False;
   }
@@ -110,7 +110,7 @@ static PyObject* setResolution(PyObject* self, PyObject* args)
   // checkfor valid displayNumber
   NSArray *screens = [NSScreen screens];
   if (displayNumber < 0 || displayNumber >= [screens count]) {
-    if (verbose) printf("(pgl:displayInfo:_setResolution) Invalid display number %d\n", displayNumber);
+    if (verbose) printf("(pgl:_resolution:_setResolution) Invalid display number %d\n", displayNumber);
     [pool release];
      Py_INCREF(Py_False); return Py_False;
   }
@@ -124,7 +124,7 @@ static PyObject* setResolution(PyObject* self, PyObject* args)
 
   // check to see if it found the right setting
   if (!success) {
-    printf("(pgl:displayInfo:_setResolution) Warning: failed to set requested display parameters.\n");
+    printf("(pgl:_resolution:_setResolution) Warning: failed to set requested display parameters.\n");
     [pool release];
     Py_INCREF(Py_False); return Py_False;
   }
@@ -151,7 +151,7 @@ static PyObject* getResolution(PyObject* self, PyObject* args)
 
   // checkfor valid displayNumber
   if (displayNumber < 0 || displayNumber >= [screens count]) {
-    if (verbose) printf("(pgl:displayInfo:getResolution) Invalid display number %d\n", displayNumber);
+    if (verbose) printf("(pgl:_resolution:getResolution) Invalid display number %d\n", displayNumber);
     [pool release];
     return Py_BuildValue("(iiii)", -1,-1,-1,-1);
   }
@@ -186,7 +186,7 @@ static PyObject* getResolution(PyObject* self, PyObject* args)
   // check number of displays
   displayErrorNum = CGGetActiveDisplayList(kMaxDisplays,displays,&numDisplays);
   if (displayErrorNum) {
-    printf("(pgl:displayInfo:getResolution) Cannot get displays (%d)\n", displayErrorNum);
+    printf("(pgl:_resolution:getResolution) Cannot get displays (%d)\n", displayErrorNum);
     [pool release];
     return Py_BuildValue("(iiii)", -1,-1,-1,-1);
   }
@@ -211,7 +211,7 @@ static PyObject* getResolution(PyObject* self, PyObject* args)
   [pool release];
 
   // display information depending on verbose level
-  if (verbose>0) printf("(pgl:displayInfo:getResolution) Display %i/%i: %ix%i %iHz %ibits\n",displayNumber,numDisplays,screenWidth,screenHeight,frameRate,bitDepth);
+  if (verbose>0) printf("(pgl:_resolution:getResolution) Display %i/%i: %ix%i %iHz %ibits\n",displayNumber,numDisplays,screenWidth,screenHeight,frameRate,bitDepth);
   if (verbose>1) printDisplayModes(displayNumber);
 
   // return the screen resolution, frame rate, and bit depth
@@ -334,7 +334,7 @@ boolean_t setBestMode(CGDirectDisplayID whichDisplay,int screenWidth,int screenH
     if ((bestWidth == (int)CGDisplayModeGetWidth(mode)) && (bestHeight == (int)CGDisplayModeGetHeight(mode)) && (bestBitDepth == getBitDepth(mode)) && (bestFrameRate == thisFrameRate))  {
       // print the mode that is being set
       if (verbose > 0)
-        printf("(pgl:displayInfo:setBestMode) Setting display %i to %ix%i %iHz %i bits\n",
+        printf("(pgl:_resolution:setBestMode) Setting display %i to %ix%i %iHz %i bits\n",
                whichDisplay, bestWidth, bestHeight, bestFrameRate, bestBitDepth);
       // capture the appropriate display
       CGDisplayCapture(whichDisplay);
@@ -364,7 +364,7 @@ void printDisplayModes(CGDirectDisplayID whichDisplay)
   CFArrayRef modeList;
   CFIndex index, count;
 
-  printf("(pgl:displayInfo:printDisplayModes) Available video modes for display %i\n", whichDisplay);
+  printf("(pgl:_resolution:printDisplayModes) Available video modes for display %i\n", whichDisplay);
 
   // get all available display modes
   modeList = CGDisplayCopyAllDisplayModes(whichDisplay, NULL);
