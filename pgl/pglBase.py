@@ -8,7 +8,8 @@
 #############
 # Import modules
 #############
-import platform, subprocess, pprint, random, string, os, pprint
+import platform, subprocess, random, string, os
+from pprint import pprint
 import numpy as np
 from ._socket import _socket
 from . import _resolution
@@ -23,7 +24,7 @@ class pglBase:
     ################################################################
     _verbose = 1 # verbosity level, 0 = silent, 1 = normal, 2 = verbose
     macOSversion = None
-    hardwareInfo = None
+    cpuInfo = None
     gpuInfo = None
     commandResults = None
     s = None  # socket connection to mglMetal application
@@ -403,51 +404,31 @@ class pglBase:
         if platform.system() == "Darwin":
             # get version
             self.macOSversion = platform.mac_ver()
+
             # get hardware and gpu info
             try:
-                # hardware info
-                hardwareInfo = subprocess.run(
-                    ["system_profiler", "SPHardwareDataType"],
-                    capture_output=True,
-                    text=True,
-                    check=True
-                )
-                # parse into a dict for easier access
-                lines = hardwareInfo.stdout.splitlines()
-                self.hardwareInfo = {}
-                for line in lines:
-                    if ":" in line:
-                        key, value = line.split(":", 1)
-                        key = key.strip()
-                        value = value.strip()
-                        # add to dict
-                        self.hardwareInfo[key] = value
-                # gpu info
-                gpuInfo = subprocess.run(
-                    ["system_profiler", "SPDisplaysDataType"],
-                    capture_output=True,
-                    text=True,
-                    check=True
-                )
-                # parse into a dict for easier access
-                self.gpuInfo = parseGPUInfo(gpuInfo.stdout) 
+                # get cpu info and parse into a dict for easier access
+                self.cpuInfo = getCPUInfo()
+                # get gpu info and parse into a dict for easier access
+                self.gpuInfo = getGPUInfo() 
 
             except subprocess.CalledProcessError as e:
-                self.hardwareInfo["error"] = f"Error retrieving hardware info: {e}"
+                self.cpuInfo["error"] = f"Error retrieving hardware info: {e}"
                 self.gpuInfo["error"] = f"Error retrieving gpu info: {e}"
             # Print the macOS version and hardware info
             if self.verbose > 0:
-                modelName = self.hardwareInfo.get("Model Name", "Unknown Model").strip()
-                modelID = self.hardwareInfo.get("Model Identifier", "Unknown Identifier").strip()
+                modelName = self.cpuInfo.get("Model Name", "Unknown Model").strip()
+                modelID = self.cpuInfo.get("Model Identifier", "Unknown Identifier").strip()
                 osVersion = self.macOSversion[0].strip()
                 print(f"(pgl:checkOS) Running on {modelName} ({modelID}) with macOS version: {osVersion}")
             if self.verbose > 0: print("(pgl:checkOS)",
-                                        self.hardwareInfo.get("Chip", "Unknown "),
+                                        self.cpuInfo.get("Processor", "Unknown "),
                                         "Cores:",
-                                        self.hardwareInfo.get("Total Number of Cores", "Unknown "),
+                                        self.cpuInfo.get("Total Number of Cores", "Unknown "),
                                         "Memory:",
-                                        self.hardwareInfo.get("Memory", "Unknown "))
+                                        self.cpuInfo.get("Memory", "Unknown "))
             # Print GPU info
+            print(self.gpuInfo)
             if self.verbose > 0:
                 for gpuName, gpuInfo in self.gpuInfo.items():
                     gpuChipset = gpuInfo.get("Chipset Model", "Unknown")
@@ -477,12 +458,49 @@ class pglBase:
             print("(pgl:checkOS) PGL is only supported on macOS")
             return False
     
+
 ################
-# parseGPUInfo #
+# getCPUInfo   #
 ################
-def parseGPUInfo(text):
+def getCPUInfo():
     """
-    Parse the output of `system_profiler SPDisplaysDataType` into a structured dictionary.
+    Get and Parse the output of `system_profiler SPHardwareDataType` into a structured dictionary.
+
+    Returns:
+        dict: A dictionary containing CPU information.
+    """
+    try:
+        systemProfilerOutput = subprocess.run(
+            ["system_profiler", "SPHardwareDataType"],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        # parse into a dict for easier access
+        lines = systemProfilerOutput.stdout.splitlines()
+        cpuInfo = {"system_profiler_output": systemProfilerOutput.stdout}
+        for line in lines:
+            if ":" in line:
+                key, value = line.split(":", 1)
+                key = key.strip()
+                value = value.strip()
+                # add to dict
+                cpuInfo[key] = value
+
+        # extract processor name, which can be named different things on different systems
+        processor = next((cpuInfo.get(k) for k in ("Chip", "Processor Name", "CPU Type", "CPU") if cpuInfo.get(k)), "Unknown")
+        cpuInfo["Processor"] = processor
+        return cpuInfo
+    except Exception as e:
+        print(f"(pglBase:getCPUInfo) Warning: {e}")
+        return {}
+
+################
+# getGPUInfo   #
+################
+def getGPUInfo():
+    """
+    Get and Parse the output of `system_profiler SPDisplaysDataType` into a structured dictionary.
 
     Supports multiple GPUs, nested display info
 
@@ -493,8 +511,16 @@ def parseGPUInfo(text):
         dict: A dictionary mapping GPU names to their attributes and associated displays.
     """
     try:
-        lines = text.splitlines()
-        result = {}
+        # gpu info
+        systemProfilerOutput = subprocess.run(
+            ["system_profiler", "SPDisplaysDataType"],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        # split into lines
+        lines = systemProfilerOutput.stdout.splitlines()
+        gpuInfo = {}
         currentGpu = None
         currentDisplay = None
         displayList = []
@@ -510,19 +536,19 @@ def parseGPUInfo(text):
             # Detect top-level GPU name
             if indent == 4 and line.endswith(":") and not stripped.startswith("Displays:"):
                 currentGpu = stripped.rstrip(":")
-                result[currentGpu] = {}
+                gpuInfo[currentGpu] = {"system_profiler_output": systemProfilerOutput.stdout}
                 displayList = []
                 inDisplaysSection = False
 
             # Start of Displays section
             elif indent == 6 and stripped == "Displays:":
                 inDisplaysSection = True
-                result[currentGpu]["Displays"] = displayList
+                gpuInfo[currentGpu]["Displays"] = displayList
 
             # GPU metadata
             elif indent == 6 and ":" in stripped and not inDisplaysSection:
                 key, value = map(str.strip, stripped.split(":", 1))
-                result[currentGpu][key] = value
+                gpuInfo[currentGpu][key] = value
 
             # New display name
             elif indent == 8 and stripped.endswith(":") and inDisplaysSection:
@@ -534,8 +560,8 @@ def parseGPUInfo(text):
                 key, value = map(str.strip, stripped.split(":", 1))
                 currentDisplay[key] = value
 
-        return result
+        return gpuInfo
 
     except Exception as e:
-        print(f"(parseGpuInfo) Warning: Parsing failed with error: {e}")
+        print(f"(pglBase:getGPUInfo) Warning: Parsing failed with error: {e}")
         return {}
