@@ -335,7 +335,7 @@ class pglBase:
         else:
             self.s.writeCommand("mglWindowed")
         self.commandResults = self.s.readCommandResults()
-        if commandResults.get('success',False) is False:
+        if self.commandResults.get('success',False) is False:
             print("(pglBase:fullscreen) ❌ Error setting fullscreen mode")
             return False
         return True

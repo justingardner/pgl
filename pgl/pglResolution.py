@@ -15,24 +15,19 @@ from . import _displayInfo
 # Main class
 #############
 class pglResolution:
-    ################################################################
-    # Init Function
-    ################################################################
-    def __init__(self):
-        """
-        Initialize the pglResolution class.
+    """
+    Initialize the pglResolution class.
 
-        This class provides methods to get and set display resolutions
-        and other display-related information using the underlying
-        `_displayInfo` compiled extension.
+    This class provides methods to get and set display resolutions
+    and other display-related information using the underlying
+    `_displayInfo` compiled extension.
 
-        Args:
-            None
+    Args:
+        None
 
-        Returns:
-            None
-        """
-        pass
+    Returns:
+        None
+    """
 
     ################################################################
     # Get the display resolution

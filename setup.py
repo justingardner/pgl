@@ -1,8 +1,8 @@
 from setuptools import setup, find_packages, Extension
 
 displayInfoExtension = Extension(
-    'pgl._displayInfo', 
-    sources=['pgl/_displayInfo.m'],
+    'pgl._resolution', 
+    sources=['pgl/_resolution.m'],
     extra_compile_args=['-ObjC'],
     extra_link_args=[
         '-framework', 'CoreGraphics',
