@@ -90,7 +90,7 @@ class pglTransform:
     ################################################################
     # Set scale of transform
     ################################################################
-    def setTransformScale(self, xScale = 1.0, yScale = 1.0, zScale = 1.0):
+    def setTransformScale(self, xScale = 1.0, yScale = 1.0, zScale = 1.0, keepCurrent=False):
         '''
         '''
         # Create a xform that scales
@@ -99,7 +99,10 @@ class pglTransform:
         xformScale[1,1] = yScale
         xformScale[2,2] = zScale
         # multiply with current transform
-        self.xform = np.matmul(xformScale,self.xform)
+        if keepCurrent:
+            self.xform = np.matmul(xformScale,self.xform)
+        else:
+            self.xform = xformScale
         # now update the xform on the application
         self.setTransform(self.xform)
 

@@ -70,7 +70,7 @@ class pglDraw:
         if dotAntialiasingBorder is None: dotAntialiasingBorder = 0
 
         # make into an array
-        dotData = np.array([1000,y,z,*dotColor,*dotSize,dotShape,dotAntialiasingBorder], dtype=np.float32)
+        dotData = np.array([x,y,z,*dotColor,*dotSize,dotShape,dotAntialiasingBorder], dtype=np.float32)
 
         # send dots commanbd
         self.s.writeCommand("mglDots")
