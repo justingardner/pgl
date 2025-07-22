@@ -238,6 +238,17 @@ class pglBase:
         self.s.writeCommand("mglFlush")
         self.commandResults = self.s.readCommandResults()
         
+        # keep profile information if profileMode is set
+        if self.profileMode > 0:
+            # check if we need to reallocate the buffer
+            if self.profileModeBufferIndex >= self.profileModeBufferSize:
+                # reallocate the buffer
+                self.profileModeBufferSize *= 2
+                self.profileModeFlushBuffer = np.resize(self.profileModeFlushBuffer, self.profileModeBufferSize)
+            # store the results in the buffer
+            self.profileModeFlushBuffer[self.profileModeBufferIndex] = self.commandResults['processedTime']
+            self.profileModeBufferIndex += 1
+        
         # success
         return True
     
@@ -341,6 +352,17 @@ class pglBase:
             return False
         return True
 
+    ################################################################
+    # isOpen
+    ################################################################
+    def isOpen(self):
+        """
+        Check if a screen is currently open.
+
+        Returns:
+            bool: True if a screen is open, False otherwise.
+        """
+        return self.s is not None
     ################################################################
     # printCommandResults
     ################################################################

@@ -32,7 +32,7 @@ class pglResolution:
     ################################################################
     # Get the display resolution
     ################################################################
-    def getResolution(self, whichScreen):
+    def getResolution(self, whichScreen = None):
         """
         Get the resolution and display settings for a given screen.
 
@@ -41,14 +41,15 @@ class pglResolution:
 
         Args:
             whichScreen (int): Index of the display to query (0 = primary). Must be >= 0 and less
-                than the number of active displays.
+                than the number of active displays. If ommitted, defaults to the screen on which
+                pgl is open and running or, if not running, the primary display.
 
         Returns:
             tuple[int, int, int, int]: A 4-tuple containing:
                 - width (int): Screen width in pixels.
                 - height (int): Screen height in pixels.
-                - refresh_rate (int): Refresh rate in Hz.
-                - bit_depth (int): Color depth in bits per pixel.
+                - refreshRate (int): Refresh rate in Hz.
+                - bitDepth (int): Color depth in bits per pixel.
 
         Raises:
             None. Errors are signaled by a return value of (-1, -1, -1, -1)
@@ -58,6 +59,22 @@ class pglResolution:
                 - 1 Screen resolution, refresh rate and bit depth
                 - 2 all available modes for the display
         """
+        # Get default for whichScreen if not provided
+        if whichScreen is None:
+            if self.isOpen():
+                # If pgl is open, use the screen on which it is running
+                windowLocation = self.getWindowFrameInDisplay()
+                whichScreen = windowLocation.get('whichScreen', 0)
+            else:
+                # If pgl is not open, use the primary display
+                whichScreen = 0
+
+        # Validate whichScreen
+        numDisplays, _ = self.getNumDisplaysAndDefault()
+        if whichScreen < 0 or whichScreen >= numDisplays:
+            print(f"(pgl:getResolution) Error: Invalid screen number {whichScreen}. Must be between 0 and {numDisplays-1}.")
+            return (-1, -1, -1, -1)
+
         # Print what we are doing
         if self.verbose > 1: print(f"(pgl:getResolution) Getting resolution for screen {whichScreen}")
 
