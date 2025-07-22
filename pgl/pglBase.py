@@ -245,8 +245,14 @@ class pglBase:
                 # reallocate the buffer
                 self.profileModeBufferSize *= 2
                 self.profileModeFlushBuffer = np.resize(self.profileModeFlushBuffer, self.profileModeBufferSize)
+                # reallocate the commandResults buffer
+                if self._profileMode >= 2:
+                    self.profileModeCommandResults.extend([{} for _ in range(self.profileModeBufferSize - len(self.profileModeCommandResults))])
             # store the results in the buffer
             self.profileModeFlushBuffer[self.profileModeBufferIndex] = self.commandResults['processedTime']
+            # save the whole command structure if needed
+            if self._profileMode >= 2:
+                self.profileModeCommandResults[self.profileModeBufferIndex] = self.commandResults 
             self.profileModeBufferIndex += 1
         
         # success
@@ -366,36 +372,35 @@ class pglBase:
     ################################################################
     # printCommandResults
     ################################################################
-    def printCommandResults(self, commandResults=None, relativeToTime=None):
+    def printCommandResults(self, commandResults=None, relativeToTime=None, prefix="(pglBase:printCommandResults)"):
         """
         Print the results of a command.
 
         Args:
             commandResults (dict): The command results to print.
         """
-        print(f"(pglBase:printCommandResults) Command results:")
         if commandResults is None: commandResults = self.commandResults
         if relativeToTime is None:
             relativeToTime = commandResults['ack']
-            print(f"(pglBase:printCommandResults) Ack: {commandResults['ack']:.3f} (absolute time in seconds)")
+            print(f"{prefix} Ack: {commandResults['ack']:.3f} (absolute time in seconds)")
         else:
-            print(f"(pglBase:printCommandResults) Ack: {(commandResults['ack'] - relativeToTime)*1000.0:.3f} ms (relative to {relativeToTime})")
-        print(f"(pglBase:printCommandResults) Command Code: {commandResults['commandCode']}")
-        print(f"(pglBase:printCommandResults) Success: {commandResults['success']}")
+            print(f"{prefix} Ack: {(commandResults['ack'] - relativeToTime)*1000.0:.3f} ms (relative to {relativeToTime})")
+        print(f"{prefix} Command Code: {commandResults['commandCode']}")
+        print(f"{prefix} Success: {commandResults['success']}")
         if commandResults['vertexStart'] != 0:
-            print(f"(pglBase:printCommandResults) Vertex Start: {(commandResults['vertexStart'] - relativeToTime)*1000.0:.3f} ms")
+            print(f"{prefix} Vertex Start: {(commandResults['vertexStart'] - relativeToTime)*1000.0:.3f} ms")
         if commandResults['vertexEnd'] != 0:
-            print(f"(pglBase:printCommandResults) Vertex End: {(commandResults['vertexEnd'] - relativeToTime)*1000.0:.3f} ms")
+            print(f"{prefix} Vertex End: {(commandResults['vertexEnd'] - relativeToTime)*1000.0:.3f} ms")
         if commandResults['fragmentStart'] != 0:
-            print(f"(pglBase:printCommandResults) Fragment Start: {(commandResults['fragmentStart'] - relativeToTime)*1000.0:.3f} ms")
+            print(f"{prefix} Fragment Start: {(commandResults['fragmentStart'] - relativeToTime)*1000.0:.3f} ms")
         if commandResults['fragmentEnd'] != 0:
-            print(f"(pglBase:printCommandResults) Fragment End: {(commandResults['fragmentEnd'] - relativeToTime)*1000.0:.3f} ms")
+            print(f"{prefix} Fragment End: {(commandResults['fragmentEnd'] - relativeToTime)*1000.0:.3f} ms")
         if commandResults['drawableAcquired'] != 0:
-            print(f"(pglBase:printCommandResults) Drawable Acquired: {(commandResults['drawableAcquired'] - relativeToTime)*1000.0:.3f} ms")
+            print(f"{prefix} Drawable Acquired: {(commandResults['drawableAcquired'] - relativeToTime)*1000.0:.3f} ms")
         if commandResults['drawablePresented'] != 0:
-            print(f"(pglBase:printCommandResults) Drawable Presented: {(commandResults['drawablePresented'] - relativeToTime)*1000.0:.3f} ms")
+            print(f"{prefix} Drawable Presented: {(commandResults['drawablePresented'] - relativeToTime)*1000.0:.3f} ms")
         if commandResults['processedTime'] != 0:
-            print(f"(pglBase:printCommandResults) Processed Time: {(commandResults['processedTime'] - relativeToTime)*1000.0:.3f} ms")
+            print(f"{prefix} Processed Time: {(commandResults['processedTime'] - relativeToTime)*1000.0:.3f} ms")
 
 
     ################################################################
