@@ -27,6 +27,7 @@ class pglProfile:
     _profileMode = 0  # Default profile mode (0 = off, 1 = dropped frames, 2 = detailed)
     profileModeBufferSize = None
     profileModeFlushBuffer = None
+    profileModeCommandResults = None
     profileModeBufferIndex = 0
     profileList = []
     profileInfo = {}
@@ -60,9 +61,14 @@ class pglProfile:
                 if self.verbose > 0:
                     print(f"(pglProfile) profileModeBufferSize set to {self.profileModeBufferSize} frames ({self.profileModeBufferSize / frameRate:.2f} seconds)")
                     print(f"(pglProfile) Will reallocate if this is exceeded, but you can change this with pgl.profileModeBufferSize = <new size>")
-                # init buffer FIX, FIX, FIX deal with profile mode = 2 here
+                # init buffer 
                 self.profileModeFlushBuffer = np.zeros(self.profileModeBufferSize)
                 self.profileModeBufferIndex = 0
+                if self._profileMode >= 2:
+                    # If profileMode is set to detailed, initialize the profileInfo dict
+                    self.profileModeCommandResults =[{} for _ in range(self.profileModeBufferSize)]
+                else:
+                    self.profileModeCommandResults = None
             # initialize information about the profile
             self.profileInfo['startTime'] = time.time()
             localTime = time.localtime(self.profileInfo['startTime'])
@@ -89,6 +95,8 @@ class pglProfile:
 
                 # package into the dict
                 self.profileInfo['flushTimes'] = self.profileModeFlushBuffer[:self.profileModeBufferIndex-1]
+                # Save command results (can be none if profileMode is 1)
+                self.profileInfo['commandResults'] = self.profileModeCommandResults[:self.profileModeBufferIndex-1]
                 # Save the profile information to the profileList
                 self.profileList.append(self.profileInfo)
                 # Reset the buffer index
@@ -136,6 +144,17 @@ class pglProfile:
                 print(frameText)
                 print(frameTimeText)
                 print(droppedFramesText)
+                # print them for each of the dropped frames
+                commandResults = profileInfo.get('commandResults', None)
+                for iDroppedFrame, frameTime in enumerate(frameTimes):
+                    if frameTime > dropCriteria:
+                        print(f"  Dropped Frame {iDroppedFrame+1}: {frameTime*1000:.2f} ms")
+                        if commandResults is not None:
+                            if iDroppedFrame > 0:
+                                self.printCommandResults(commandResults[iDroppedFrame],commandResults[iDroppedFrame-1]['processedTime'],prefix=f"    ")
+                            else:
+                                self.printCommandResults(commandResults[iDroppedFrame],prefix=f"    ")
+
                 # plot a historgram
                 counts, _, _ = plt.hist(frameTimes*1000, bins=50, alpha=0.75, edgecolor='black')
                 plt.title(f'Frame Time Histogram\n{profileText}\n{timeText}\n{frameText}\n{frameTimeText}\n{droppedFramesText}')
