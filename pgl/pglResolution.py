@@ -64,7 +64,7 @@ class pglResolution:
             if self.isOpen():
                 # If pgl is open, use the screen on which it is running
                 windowLocation = self.getWindowFrameInDisplay()
-                whichScreen = windowLocation.get('whichScreen', 0)
+                whichScreen = windowLocation.get('whichScreen', 1)-1
             else:
                 # If pgl is not open, use the primary display
                 whichScreen = 0
