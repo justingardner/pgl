@@ -344,7 +344,7 @@ class pglBase:
     ################################################################
     # printCommandResults
     ################################################################
-    def printCommandResults(self, commandResults, relativeToTime=None):
+    def printCommandResults(self, commandResults=None, relativeToTime=None):
         """
         Print the results of a command.
 
@@ -352,6 +352,7 @@ class pglBase:
             commandResults (dict): The command results to print.
         """
         print(f"(pglBase:printCommandResults) Command results:")
+        if commandResults is None: commandResults = self.commandResults
         if relativeToTime is None:
             relativeToTime = commandResults['ack']
             print(f"(pglBase:printCommandResults) Ack: {commandResults['ack']:.3f} (absolute time in seconds)")
