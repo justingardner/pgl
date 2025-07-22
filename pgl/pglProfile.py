@@ -10,6 +10,7 @@
 # Import modules
 #############
 import numpy as np
+import matplotlib.pyplot as plt
 
 #############
 # Profile class
@@ -65,6 +66,9 @@ class pglProfile:
                 print("(pglProfile) profileMode is off, saving profile data.")
                 # Save the profile information to the profileList
                 self.profileList.append(self.profileModeFlushBuffer[:self.profileModeBufferIndex-1])
+                # update default buffer size if we went over
+                if  self.profileModeBufferIndex > self.profileModeBufferSize
+                    self.profileModeBufferSize = self.profileModeBufferIndex
                 # Reset the buffer index
                 self.profileModeBufferIndex = 0
 
@@ -89,7 +93,9 @@ class pglProfile:
                 # compute stats
                 meanFrameTime = np.mean(frameTimes)
                 stdFrameTime = np.std(frameTimes)
-                droppedFrames = np.sum(frameTimes > meanFrameTime + 5 * stdFrameTime)
+                droppedFrames = np.sum(frameTimes > meanFrameTime + meanFrameTime/2)
                 # display the mean and std of the frame times
                 print(f"(pglProfile) Mean frame time: {meanFrameTime*1000:.2f} ms, std: {stdFrameTime*1000:.2f} ms")
                 print(f"(pglProfile) Dropped frames: {droppedFrames}")  
+                # plot a historgram
+                plt.hist(frameTimes, bins=50, alpha=0.75, edgecolor='black')
