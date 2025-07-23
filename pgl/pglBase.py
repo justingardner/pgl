@@ -394,7 +394,7 @@ class pglBase:
     ################################################################
     # printCommandResults
     ################################################################
-    def printCommandResults(self, commandResults=None, relativeToTime=None, prefix="(pglBase:printCommandResults)"):
+    def printCommandResults(self, commandResults=None, relativeToTime=None, prefix="(pglBase:printCommandResults)", index=0):
         """
         Print the results of a command.
 
@@ -402,27 +402,31 @@ class pglBase:
             commandResults (dict): The command results to print.
         """
         if commandResults is None: commandResults = self.commandResults
+        # get the ack time if it exists
+        ack = commandResults.get('ack',0)
+        if isinstance(ack, np.ndarray):
+            ack = ack[index]
         if relativeToTime is None:
-            relativeToTime = commandResults['ack']
-            print(f"{prefix} Ack: {commandResults['ack']:.3f} (absolute time in seconds)")
+            relativeToTime = ack
+            print(f"{prefix} Ack: {ack:.3f} (absolute time in seconds)")
         else:
-            print(f"{prefix} Ack: {(commandResults['ack'] - relativeToTime)*1000.0:.3f} ms (relative to {relativeToTime})")
-        print(f"{prefix} Command Code: {commandResults['commandCode']}")
-        print(f"{prefix} Success: {commandResults['success']}")
-        if commandResults['vertexStart'] != 0:
-            print(f"{prefix} Vertex Start: {(commandResults['vertexStart'] - relativeToTime)*1000.0:.3f} ms")
-        if commandResults['vertexEnd'] != 0:
-            print(f"{prefix} Vertex End: {(commandResults['vertexEnd'] - relativeToTime)*1000.0:.3f} ms")
-        if commandResults['fragmentStart'] != 0:
-            print(f"{prefix} Fragment Start: {(commandResults['fragmentStart'] - relativeToTime)*1000.0:.3f} ms")
-        if commandResults['fragmentEnd'] != 0:
-            print(f"{prefix} Fragment End: {(commandResults['fragmentEnd'] - relativeToTime)*1000.0:.3f} ms")
-        if commandResults['drawableAcquired'] != 0:
-            print(f"{prefix} Drawable Acquired: {(commandResults['drawableAcquired'] - relativeToTime)*1000.0:.3f} ms")
-        if commandResults['drawablePresented'] != 0:
-            print(f"{prefix} Drawable Presented: {(commandResults['drawablePresented'] - relativeToTime)*1000.0:.3f} ms")
-        if commandResults['processedTime'] != 0:
-            print(f"{prefix} Processed Time: {(commandResults['processedTime'] - relativeToTime)*1000.0:.3f} ms")
+            print(f"{prefix} Ack: {ack - relativeToTime*1000.0:.3f} ms (relative to {relativeToTime})")
+        print(f"{prefix} Command Code: {commandResults['commandCode'][index]}")
+        print(f"{prefix} Success: {commandResults['success'][index]}")
+        if commandResults['vertexStart'][index] != 0:
+            print(f"{prefix} Vertex Start: {(commandResults['vertexStart'][index] - relativeToTime)*1000.0:.3f} ms")
+        if commandResults['vertexEnd'][index] != 0:
+            print(f"{prefix} Vertex End: {(commandResults['vertexEnd'][index] - relativeToTime)*1000.0:.3f} ms")
+        if commandResults['fragmentStart'][index] != 0:
+            print(f"{prefix} Fragment Start: {(commandResults['fragmentStart'][index] - relativeToTime)*1000.0:.3f} ms")
+        if commandResults['fragmentEnd'][index] != 0:
+            print(f"{prefix} Fragment End: {(commandResults['fragmentEnd'][index] - relativeToTime)*1000.0:.3f} ms")
+        if commandResults['drawableAcquired'][index] != 0:
+            print(f"{prefix} Drawable Acquired: {(commandResults['drawableAcquired'][index] - relativeToTime)*1000.0:.3f} ms")
+        if commandResults['drawablePresented'][index] != 0:
+            print(f"{prefix} Drawable Presented: {(commandResults['drawablePresented'][index] - relativeToTime)*1000.0:.3f} ms")
+        if commandResults['processedTime'][index] != 0:
+            print(f"{prefix} Processed Time: {(commandResults['processedTime'][index] - relativeToTime)*1000.0:.3f} ms")
 
 
     ################################################################
