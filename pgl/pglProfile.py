@@ -73,7 +73,10 @@ class pglProfile:
             self.profileInfo['startTime'] = time.time()
             localTime = time.localtime(self.profileInfo['startTime'])
             self.profileInfo['startTimeStr'] = time.strftime("%Y-%m-%d %H:%M:%S", localTime)
-
+            # get the cpu and gpu times
+            (cpuTime, gpuTime) = self.getTimestamps()
+            self.profileInfo['cpuTime'] = cpuTime
+            self.profileInfo['gpuTime'] = gpuTime
             self.profileInfo['profileMode'] = self._profileMode
             self.profileInfo['profileModeBufferStartSize'] = self.profileModeBufferSize
             self.profileInfo['frameRate'] = frameRate
