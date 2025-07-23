@@ -185,7 +185,7 @@ class pglBase:
             bool: True if the connection was closed successfully, False otherwise.
         """
          # make sure that a screen is open
-        if self.s is None: return True
+        if self.isOpen() is False: return True
 
         # Print what we are doing
         if self.verbose > 0: print("(pglBase:close) Closing connection to mglMetal application")
