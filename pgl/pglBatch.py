@@ -113,6 +113,7 @@ class pglBatch:
         
         # read command results
         commandResults = self.s.readCommandResults(0, nCommands)
+        
         self._batchState = 0
         if self.verbose > 0:
             print(f"(pglBatch:batchEnd) Ended batch with {nCommands} commands.")
@@ -120,10 +121,10 @@ class pglBatch:
         # now end profiling info
         self.profileInfo['commandResults'] = commandResults
 
-        # get the processedTime for all flush events
+        # get the flushTime for all flush events
         commandCode = commandResults.get('commandCode',np.array([]))
-        processedTime= commandResults.get('processedTime',np.array([]))
-        self.profileInfo['flushTimes'] = processedTime[commandCode==self.s.getCommandValue("mglFlush")]
-        
+        flushTime= commandResults.get(self.profileCommandResultsField,np.array([]))
+        self.profileInfo['flushTimes'] = flushTime[commandCode==self.s.getCommandValue("mglFlush")]
+        print(self.profileInfo['flushTimes'])
          # Save the profile information to the profileList
         self.profileList.append(self.profileInfo)

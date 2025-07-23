@@ -249,7 +249,7 @@ class pglBase:
                 if self._profileMode >= 2:
                     self.profileModeCommandResults.extend([{} for _ in range(self.profileModeBufferSize - len(self.profileModeCommandResults))])
             # store the results in the buffer
-            self.profileModeFlushBuffer[self.profileModeBufferIndex] = self.commandResults['processedTime']
+            self.profileModeFlushBuffer[self.profileModeBufferIndex] = self.commandResults[self.profileCommandResultsField]
             # save the whole command structure if needed
             if self._profileMode >= 2:
                 self.profileModeCommandResults[self.profileModeBufferIndex] = self.commandResults 

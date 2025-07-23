@@ -31,6 +31,8 @@ class pglProfile:
     profileModeBufferIndex = 0
     profileList = []
     profileInfo = {}
+    #profileCommandResultsField = 'drawablePresented'  # Default field for command results to track
+    profileCommandResultsField = 'processedTime'  # Default field for command results to track
 
     ################################################################
     # profileMode property
@@ -143,12 +145,13 @@ class pglProfile:
                 # display the number of frames in the profile
                 print(f"-------- pglProfile {iProfile+1} -------------")
                 flushTimes = profileInfo['flushTimes']
+                if self.verbose>1: print(flushTimes)
                 nFrames = len(flushTimes)
-                print(nFrames)
                 totalTime = flushTimes[-1] - flushTimes[0]
                 expectedFrameTime = 1 / profileInfo['frameRate']*1000  # in ms
                 # get the difference in times
                 frameTimes = np.diff(flushTimes)
+                if self.verbose>1: print(frameTimes*1000)
                 # compute stats
                 meanFrameTime = np.mean(frameTimes)
                 medianFrameTime = np.median(frameTimes)
