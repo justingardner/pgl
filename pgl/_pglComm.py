@@ -3,10 +3,11 @@
 #            communicate with the standalone mgl engine for
 #            pgl psychophysics and experiment library
 ################################################################
-import socket, sys, time, struct, subprocess, os, re
+import sys, time, struct, subprocess, os, re
+from socket import socket, AF_UNIX, SOCK_STREAM
 import numpy as np
 
-class _socket:
+class _pglComm:
     # init variables
     s = None
     socketName = None
@@ -19,11 +20,11 @@ class _socket:
         attempt = 0
 
         # display what we are doing
-        sys.stdout.write("(pgl:_socket) ")
+        sys.stdout.write("(pgl:_pglComm) ")
         sys.stdout.flush()
         while True:
             try:
-                self.s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                self.s = socket(AF_UNIX, SOCK_STREAM)
                 self.s.connect(socketName)
                 self.socketName = socketName
                 print("Connected to:", socketName)
@@ -32,7 +33,7 @@ class _socket:
                 # Keep trying until timeout
                 elapsed = time.time() - startTime
                 if elapsed > timeout:
-                    print("\n(pgl:_socket) ❌ Timeout: Could not connect to socket:", socketPath)
+                    print("\n(pgl:_pglComm) ❌ Timeout: Could not connect to socket:", socketPath)
                     return None
                 # Print a dot for feedback
                 sys.stdout.write(".")
@@ -46,9 +47,9 @@ class _socket:
         if os.path.exists(self.socketName):
             try:
                 os.remove(self.socketName)
-                print("(pgl:_socket) Closed socket:", self.socketName)
+                print("(pgl:_pglComm) Closed socket:", self.socketName)
             except Exception as e:
-                print("(pgl:_socket) ❌ Error closing socket:", e)
+                print("(pgl:_pglComm) ❌ Error closing socket:", e)
             finally:
                 self.s = None
 
@@ -58,7 +59,7 @@ class _socket:
         """
         # check socket
         if not self.s:
-            print("(pgl:_socket) ❌ Not connected to socket")
+            print("(pgl:_pglComm) ❌ Not connected to socket")
             return
         # Pack data for sending
         if type(message) == np.uint16:
@@ -83,9 +84,9 @@ class _socket:
 
         try:
             self.s.sendall(packed)
-            if self.verbose > 1: print("(pgl:_socket) Message sent:", message)
+            if self.verbose > 1: print("(pgl:_pglComm) Message sent:", message)
         except Exception as e:
-            print("(pgl:_socket) ❌ Error sending message:", e)
+            print("(pgl:_pglComm) ❌ Error sending message:", e)
     
     def writeCommand(self, commandName):
         """
@@ -98,12 +99,12 @@ class _socket:
             bool: True if the command was sent successfully, False otherwise.
         """
         if not self.s:
-            print("(pgl:_socket) ❌ Not connected to socket")
+            print("(pgl:_pglComm) ❌ Not connected to socket")
             return False
         
         commandValue = self.getCommandValue(commandName)
         if commandValue is None:
-            print(f"(pgl:_socket) ❌ Command '{commandName}' not found")
+            print(f"(pgl:_pglComm) ❌ Command '{commandName}' not found")
             return False
         
         self.write(np.uint16(commandValue))
@@ -116,7 +117,7 @@ class _socket:
         Read a message from the socket.
         """
         if not self.s:
-            print("(pgl:_socket) ❌ Not connected to socket")
+            print("(pgl:_pglComm) ❌ Not connected to socket")
             return None
 
         try:
@@ -125,13 +126,13 @@ class _socket:
             packed = self.recvBlocking(numBytes)
             # check length of packed data
             if len(packed) != numBytes:
-                print(f"(pgl:_socket:read) ❌ Expected {numBytes} bytes ({numRows}x{numCols}x{numSlices} of {np.dtype(dataType).itemsize}), but received {len(packed)} bytes")
+                print(f"(pgl:_pglComm:read) ❌ Expected {numBytes} bytes ({numRows}x{numCols}x{numSlices} of {np.dtype(dataType).itemsize}), but received {len(packed)} bytes")
                 return None
             else:
                 # unpack the data and reshape it
                 return np.squeeze(np.frombuffer(packed, dtype=dataType).reshape((numRows, numCols, numSlices)))
         except Exception as e:
-            print("(pgl:_socket:read) ❌ Error reading message:", e)
+            print("(pgl:_pglComm:read) ❌ Error reading message:", e)
             return None
 
     def recvBlocking(self, numBytes):
@@ -144,7 +145,7 @@ class _socket:
         while bytesReceived < numBytes:
             chunk = self.s.recv(numBytes - bytesReceived)  # Receive remaining bytes
             if not chunk:  # If chunk is empty, the connection has been closed
-                raise ConnectionError("(pgl:_socket:recvBlocking) Connection closed unexpectedly")
+                raise ConnectionError("(pgl:_pglComm:recvBlocking) Connection closed unexpectedly")
             packed.extend(chunk)  # Append the received chunk to the packed bytearray
             bytesReceived += len(chunk)  # Update the count of received bytes
 
@@ -158,17 +159,17 @@ class _socket:
             float: The acknowledgment time from the socket, or None if an error occurs.
         """
         if not self.s:
-            print("(pgl:_socket:readAck) ❌ Not connected to socket")
+            print("(pgl:_pglComm:readAck) ❌ Not connected to socket")
             return None
         
         try:
             ack = self.read(np.double)
             if ack is None:
-                print("(pgl:_socket:readAck) ❌ Error reading acknowledgment")
+                print("(pgl:_pglComm:readAck) ❌ Error reading acknowledgment")
                 return None
             return ack
         except Exception as e:
-            print("(pgl:_socket:readAck) ❌ Error reading acknowledgment:", e)
+            print("(pgl:_pglComm:readAck) ❌ Error reading acknowledgment:", e)
             return None
     def readCommandResults(self, ack=None, nCommands=1):
         """
@@ -178,7 +179,7 @@ class _socket:
             np.ndarray: The results read from the socket, or None if an error occurs.
         """
         if not self.s:
-            print("(pgl:_socket:readCommandResults) ❌ Not connected to socket")
+            print("(pgl:_pglComm:readCommandResults) ❌ Not connected to socket")
             return None
         
         try:
@@ -201,7 +202,7 @@ class _socket:
             return(commandResults)
         
         except Exception as e:
-            print("(pgl:_socket:readCommandResults) ❌ Error reading results:", e)
+            print("(pgl:_pglComm:readCommandResults) ❌ Error reading results:", e)
             return None
 
 
@@ -254,7 +255,7 @@ class _socket:
                 if 'pgl' in line:
                     return int(line.split()[1])
         except Exception as e:
-            print("(pgl:_socket) ❌ Error finding PID:", e)
+            print("(pgl:_pglComm) ❌ Error finding PID:", e)
         return None
     
    

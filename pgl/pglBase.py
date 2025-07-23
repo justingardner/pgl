@@ -11,7 +11,7 @@
 import platform, subprocess, random, string, os
 from pprint import pprint
 import numpy as np
-from ._socket import _socket
+from . import _pglComm as pglComm
 from . import _resolution
 from types import SimpleNamespace
 
@@ -151,7 +151,7 @@ class pglBase:
                 return False
         
         # now try to connect to the socket
-        self.s = _socket(socketName)
+        self.s = pglComm._pglComm(socketName)
 
         # and parse command types
         self.s.parseCommandTypes()
