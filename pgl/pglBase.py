@@ -232,7 +232,7 @@ class pglBase:
             bool: True if the flush command was sent successfully, False otherwise.
         """
         # make sure that a screen is open
-        if self.s is None: 
+        if self.isOpen() is False: 
             print(f"(pglBase:flush) ❌ No screen is open")
             return False
         self.s.writeCommand("mglFlush")
@@ -357,6 +357,28 @@ class pglBase:
             print("(pglBase:fullscreen) ❌ Error setting fullscreen mode")
             return False
         return True
+
+    ################################################################
+    # getTimestamps
+    ################################################################
+    def getTimestamps(self):
+        """
+        Get the timestamps for the cpu and gpu
+
+        Returns:
+            tuple: (cpuTime, gpuTime)
+        """
+        if self.isOpen() is False:
+            print(f"(pglBase:getTimestamps) ❌ No screen is open")
+            return {}
+
+        self.s.writeCommand("mglSampleTimestamps")
+        ack = self.s.readAck()
+        cpuTime = self.s.read(np.double)
+        gpuTime = self.s.read(np.double)
+        self.commandResults = self.s.readCommandResults(ack)
+
+        return (cpuTime, gpuTime)
 
     ################################################################
     # isOpen

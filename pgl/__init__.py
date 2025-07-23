@@ -3,10 +3,11 @@ from .pglResolution import pglResolution
 from .pglDraw import pglDraw
 from .pglTransform import pglTransform
 from .pglProfile import pglProfile
+from .pglBatch import pglBatch
 from .screen import screen
 from .task import task
 
-class pgl(pglBase, pglResolution, pglDraw, pglTransform, pglProfile):
+class pgl(pglBase, pglResolution, pglDraw, pglTransform, pglProfile, pglBatch):
     """
     purpose: psychophysics and experiment library for Python.
     License: MIT License — see LICENSE file for details.

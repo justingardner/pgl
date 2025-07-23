@@ -119,18 +119,34 @@ class _socket:
         try:
             # Read the appropriate number of bytes based on the data type
             numBytes = np.dtype(dataType).itemsize*numRows*numCols*numSlices
-            packed = self.s.recv(numBytes)
+            packed = self.recvBlocking(numBytes)
             # check length of packed data
             if len(packed) != numBytes:
-                print("(pgl:_socket) ❌ Expected ", numBytes, "bytes, but received", len(packed), "bytes")
+                print(f"(pgl:_socket:read) ❌ Expected {numBytes} bytes ({numRows}x{numCols}x{numSlices} of {np.dtype(dataType).itemsize}), but received {len(packed)} bytes")
                 return None
             else:
                 # unpack the data and reshape it
                 return np.squeeze(np.frombuffer(packed, dtype=dataType).reshape((numRows, numCols, numSlices)))
         except Exception as e:
-            print("(pgl:_socket) ❌ Error reading message:", e)
+            print("(pgl:_socket:read) ❌ Error reading message:", e)
             return None
-        
+
+    def recvBlocking(self, numBytes):
+        '''
+        Receive exactly numBytes from the socket. Will block until all bytes are received.
+        '''
+        bytesReceived = 0
+        packed = bytearray()  # Use a bytearray to collect the bytes
+
+        while bytesReceived < numBytes:
+            chunk = self.s.recv(numBytes - bytesReceived)  # Receive remaining bytes
+            if not chunk:  # If chunk is empty, the connection has been closed
+                raise ConnectionError("(pgl:_socket:recvBlocking) Connection closed unexpectedly")
+            packed.extend(chunk)  # Append the received chunk to the packed bytearray
+            bytesReceived += len(chunk)  # Update the count of received bytes
+
+        return packed
+
     def readAck(self):
         """
         Read an acknowledgment from the socket.
@@ -151,7 +167,7 @@ class _socket:
         except Exception as e:
             print("(pgl:_socket:readAck) ❌ Error reading acknowledgment:", e)
             return None
-    def readCommandResults(self, ack=None):
+    def readCommandResults(self, ack=None, nCommands=1):
         """
         Read the results from the socket after sending a command.
         
@@ -170,15 +186,15 @@ class _socket:
             else:
                 commandResults['ack'] = ack
             # Read the rest of the command results
-            commandResults['commandCode'] = self.read(np.uint16)
-            commandResults['success'] = self.read(np.uint32)
-            commandResults['processedTime'] = self.read(np.double)
-            commandResults['vertexStart'] = self.read(np.double)
-            commandResults['vertexEnd'] = self.read(np.double)
-            commandResults['fragmentStart'] = self.read(np.double)
-            commandResults['fragmentEnd'] = self.read(np.double)
-            commandResults['drawableAcquired'] = self.read(np.double)
-            commandResults['drawablePresented'] = self.read(np.double)
+            commandResults['commandCode'] = self.read(np.uint16, nCommands)
+            commandResults['success'] = self.read(np.uint32, nCommands)
+            commandResults['processedTime'] = self.read(np.double, nCommands)
+            commandResults['vertexStart'] = self.read(np.double, nCommands)
+            commandResults['vertexEnd'] = self.read(np.double, nCommands)
+            commandResults['fragmentStart'] = self.read(np.double, nCommands)
+            commandResults['fragmentEnd'] = self.read(np.double, nCommands)
+            commandResults['drawableAcquired'] = self.read(np.double, nCommands)
+            commandResults['drawablePresented'] = self.read(np.double, nCommands)
             return(commandResults)
         
         except Exception as e:
