@@ -402,32 +402,53 @@ class pglBase:
             commandResults (dict): The command results to print.
         """
         if commandResults is None: commandResults = self.commandResults
-        # get the ack time if it exists
-        ack = commandResults.get('ack',0)
-        if isinstance(ack, np.ndarray):
-            ack = ack[index]
-        if relativeToTime is None:
-            relativeToTime = ack
-            print(f"{prefix} Ack: {ack:.3f} (absolute time in seconds)")
-        else:
-            print(f"{prefix} Ack: {ack - relativeToTime*1000.0:.3f} ms (relative to {relativeToTime})")
-        print(f"{prefix} Command Code: {commandResults['commandCode'][index]}")
-        print(f"{prefix} Success: {commandResults['success'][index]}")
-        if commandResults['vertexStart'][index] != 0:
-            print(f"{prefix} Vertex Start: {(commandResults['vertexStart'][index] - relativeToTime)*1000.0:.3f} ms")
-        if commandResults['vertexEnd'][index] != 0:
-            print(f"{prefix} Vertex End: {(commandResults['vertexEnd'][index] - relativeToTime)*1000.0:.3f} ms")
-        if commandResults['fragmentStart'][index] != 0:
-            print(f"{prefix} Fragment Start: {(commandResults['fragmentStart'][index] - relativeToTime)*1000.0:.3f} ms")
-        if commandResults['fragmentEnd'][index] != 0:
-            print(f"{prefix} Fragment End: {(commandResults['fragmentEnd'][index] - relativeToTime)*1000.0:.3f} ms")
-        if commandResults['drawableAcquired'][index] != 0:
-            print(f"{prefix} Drawable Acquired: {(commandResults['drawableAcquired'][index] - relativeToTime)*1000.0:.3f} ms")
-        if commandResults['drawablePresented'][index] != 0:
-            print(f"{prefix} Drawable Presented: {(commandResults['drawablePresented'][index] - relativeToTime)*1000.0:.3f} ms")
-        if commandResults['processedTime'][index] != 0:
-            print(f"{prefix} Processed Time: {(commandResults['processedTime'][index] - relativeToTime)*1000.0:.3f} ms")
 
+        # fieldnames that have special printing
+        commandsInt = {'commandCode','success'}
+        commandsGPUTime = {'vertexStart','vertexEnd','fragmentStart','fragmentEnd','drawableAcquired','drawablePresented'}
+        commandsCPUTime = {'ack','processedTime'}
+        
+        # extract all valid values from the commandReults
+        # that is, ones where the field has the indexed
+        # value and put it into a new dict for easy access
+        extractedValues = {}
+        for field in commandResults.keys():
+            # get the field value
+            value = commandResults.get(field)
+            # convert to a float array
+            value = np.array([value], dtype=np.float32)
+            # if it is None, we will just ignore
+            if value is not None:
+                if isinstance(value, np.ndarray):
+                    if index < value.size:
+                        value = value[index]
+                    else:
+                        print(f"Index {index} out of bounds for {field} array")
+                        continue
+                # get the value and save it to extractedValues
+                if value != 0:
+                    extractedValues[field] = value
+        # get relativeTime if not set
+        postfix = ''
+        if relativeToTime is None:
+            ack = extractedValues.get('ack',None)
+            if ack is None:
+                postfix = '(absolute time)'
+            else:
+                postfix = f"(relative to {ack})"
+                relativeToTime = ack
+            
+        # print everything that made it to extractedValues
+        for field in extractedValues.keys():
+            value = extractedValues[field]
+            if field in commandsInt:
+                print(f"{prefix} {field}: {int(value)}")
+            elif field in commandsCPUTime:
+                print(f"{prefix} {field}: {(value ) * 1000.0:0.3f} ms {postfix}")
+            elif field in commandsGPUTime:
+                print(f"{prefix} {field}: GPU: {(value) * 1000.0:.3f} ms")
+            else:
+                print(f"{prefix} {field}: {value}")
 
     ################################################################
     # Check OS compatibility
