@@ -52,6 +52,15 @@ class pglBatch:
             print("(pglBatch:batchStart) ❌ Batch already started. Please end the current batch before starting a new one.")
             return
         self._batchState = 1
+
+        # turn on profiling for batch mode
+        if self._profileMode > 0:
+            print("(pglBatch:pglBatchStart) Profile mode is already started")
+            # Fix, Fix, Fix should handle this contingency by combining info
+            return
+        self._profileMode = -1
+        self._profileModeStart()
+
         # send command for starting the batch
         self.s.writeCommand("mglStartBatch")
         ack = self.s.readAck()
@@ -93,14 +102,28 @@ class pglBatch:
         
         # read command count
         nCommands = self.s.read(np.uint32)
+
         # send command to finish batch
         self.s.writeCommand("mglFinishBatch")
         ack = self.s.readAck()
         
-        if self.verbose > 0:
-            print(f"(pglBatch:batchEnd) Ending batch with {nCommands} commands.")
+        # end the profiling
+        self._profileModeEnd()
+
         
         # read command results
-        self.s.readCommandResults(0, nCommands)
+        commandResults = self.s.readCommandResults(0, nCommands)
         self._batchState = 0
-        if self.verbose > 0: print("(pglBatch:batchEnd) Batch ended.")
+        if self.verbose > 0:
+            print(f"(pglBatch:batchEnd) Ended batch with {nCommands} commands.")
+
+        # now end profiling info
+        self.profileInfo['commandResults'] = commandResults
+
+        # get the processedTime for all flush events
+        commandCode = commandResults.get('commandCode',np.array([]))
+        processedTime= commandResults.get('processedTime',np.array([]))
+        self.profileInfo['flushTimes'] = processedTime[commandCode==self.s.getCommandValue("mglFlush")]
+        
+         # Save the profile information to the profileList
+        self.profileList.append(self.profileInfo)

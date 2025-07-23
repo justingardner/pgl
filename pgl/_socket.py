@@ -101,13 +101,16 @@ class _socket:
             print("(pgl:_socket) ❌ Not connected to socket")
             return False
         
-        commandValue = self.commandTypes.get(commandName)
+        commandValue = self.getCommandValue(commandName)
         if commandValue is None:
             print(f"(pgl:_socket) ❌ Command '{commandName}' not found")
             return False
         
         self.write(np.uint16(commandValue))
         return True
+    def getCommandValue(self,commandName):
+        return(self.commandTypes.get(commandName))
+    
     def read(self, dataType, numRows=1, numCols=1, numSlices=1):
         """
         Read a message from the socket.
