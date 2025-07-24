@@ -125,6 +125,6 @@ class pglBatch:
         commandCode = commandResults.get('commandCode',np.array([]))
         flushTime= commandResults.get(self.profileCommandResultsField,np.array([]))
         self.profileInfo['flushTimes'] = flushTime[commandCode==self.s.getCommandValue("mglFlush")]
-        print(self.profileInfo['flushTimes'])
+
          # Save the profile information to the profileList
         self.profileList.append(self.profileInfo)
