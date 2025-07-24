@@ -123,7 +123,8 @@ class pglBase:
         screenY = screenY if screenY is not None else 100            
 
         # for now hard-code these
-        self.metalAppName = "/Users/justin/proj/mgl/metal/binary/stable/mglMetal.app"
+        #self.metalAppName = "/Users/justin/proj/mgl/metal/binary/stable/mglMetal.app"\
+        self.metalAppName = getMetalAppName()
         self.metalSocketPath = "/Users/justin/Library/Containers/gru.mglMetal/Data"
         
         # get a randomized socket name
@@ -416,7 +417,7 @@ class pglBase:
             # get the field value
             value = commandResults.get(field)
             # convert to a float array
-            value = np.array([value], dtype=np.float32)
+            value = np.array([value], dtype=np.float32).flatten()
             # if it is None, we will just ignore
             if value is not None:
                 if isinstance(value, np.ndarray):
@@ -424,10 +425,10 @@ class pglBase:
                         value = value[index]
                     else:
                         print(f"Index {index} out of bounds for {field} array")
+                        value = None
                         continue
                 # get the value and save it to extractedValues
-                if value != 0:
-                    extractedValues[field] = value
+                if value != 0: extractedValues[field] = value
         # get relativeTime if not set
         postfix = ''
         if relativeToTime is None:
@@ -644,3 +645,33 @@ def getGPUInfo():
     except Exception as e:
         print(f"(pglBase:getGPUInfo) Warning: Parsing failed with error: {e}")
         return {}
+
+###################################
+# get the name of the mglMetalApp
+###################################
+def getMetalAppName(stable=False):
+    homeDirectory = os.path.expanduser("~")
+    stableAppPath = os.path.join(homeDirectory, "proj/mgl/metal/binary/stable/mglMetal.app")
+    derivedDataDirectory = os.path.join(homeDirectory, "Library/Developer/Xcode/DerivedData")
+
+    # If runStable is True, always return the stable app path
+    if stable: return stableAppPath
+
+    latestBuildPath = None
+    latestBuildTime = 0
+
+    # Search for all mglMetal.app instances in DerivedData
+    for dirPath, dirNames, fileNames in os.walk(derivedDataDirectory):
+        for dirName in dirNames:
+            if dirName.endswith(".app") and "mglMetal" in dirName:
+                appPath = os.path.join(dirPath, dirName)
+                modificationTime = os.path.getmtime(appPath)
+                if modificationTime > latestBuildTime:
+                    latestBuildTime = modificationTime
+                    latestBuildPath = appPath
+
+    # Determine which app to return
+    if latestBuildPath:
+        return latestBuildPath
+    else:
+        return stableAppPath
