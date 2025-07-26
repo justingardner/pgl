@@ -29,11 +29,11 @@ class pglImage:
             return None
     
         # get image width and height
-        imageWidth = imageData.shape[0]
-        imageHeight = imageData.shape[1]
+        imageWidth = imageData.shape[1]
+        imageHeight = imageData.shape[0]
 
-        # permute dimensions so that the image is RGBA, RGBA, RGBA, ...
-        imageData = np.transpose(imageData, (2, 1, 0)).astype(np.float32).flatten()
+        # flatten and convert to float32
+        imageData = imageData.astype(np.float32).flatten()
 
         # send the createTexture command
         self.s.writeCommand("mglCreateTexture")
@@ -64,21 +64,29 @@ class pglImage:
     def imageDisplay(self, imageInstance, loc=(0, 0), size=(1, 1)):
         '''
         '''
+        # vertex coordinates in device coordinates
+        vertexLeft = -20
+        vertexRight = 20
+        vertexTop = 15
+        vertexBottom = -15
+        # no z coordinate
+        z = 0
+        # texture coordinates which map to vertex coordinates
+        texRight = 1
+        texLeft = 0
+        texTop = 0
+        texBottom = 1
         
-        left = -8
-        right = 8
-        top = 8
-        bottom = -8
-        
-        # create the two triangles for which the image will be displayed on
+        # create the two triangles which map the texture (ie image)
+        # to vertices in device coordinates
         vertices = np.array([
-            [right, top, 0, 1, 0],
-            [left, top, 0, 0, 0],
-            [left, bottom, 0, 0, 1],
-    
-            [right, top, 0, 1, 0],
-            [left, bottom, 0, 0, 1],
-            [right, bottom, 0, 1, 1]
+            [vertexRight, vertexTop, z, texRight, texTop],
+            [vertexLeft, vertexTop, z, texLeft, texTop],
+            [vertexLeft, vertexBottom, z, texLeft, texBottom],
+
+            [vertexRight, vertexTop, z, texRight, texTop],
+            [vertexLeft, vertexBottom, z, texLeft, texBottom],
+            [vertexRight, vertexBottom, z, texRight, texBottom]
         ], dtype=np.float32) 
         nVertices = np.float32(vertices.shape[0])
 
