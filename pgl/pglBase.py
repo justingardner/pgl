@@ -445,9 +445,9 @@ class pglBase:
             if field in commandsInt:
                 print(f"{prefix} {field}: {int(value)}")
             elif field in commandsCPUTime:
-                print(f"{prefix} {field}: {(value ) * 1000.0:0.3f} ms {postfix}")
+                print(f"{prefix} {field}: {(value * 1000.0 - relativeToTime):0.3f} ms {postfix}")
             elif field in commandsGPUTime:
-                print(f"{prefix} {field}: GPU: {(value) * 1000.0:.3f} ms")
+                print(f"{prefix} {field}: {((value / 1000000.0)-relativeToTime):.3f} ms")
             else:
                 print(f"{prefix} {field}: {value}")
 
