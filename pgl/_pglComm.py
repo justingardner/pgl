@@ -72,17 +72,18 @@ class _pglComm:
         elif type(message) == float or type(message) == np.float32:
             # Pack as 4-byte double float
             packed = struct.pack('@f', message)
-        elif type(message) == np.double:
+        elif type(message) == np.double or type(message) == np.float64:
             # Pack as 8-byte double float
             packed = struct.pack('@d', message)
         # array of floats
-        elif isinstance(message, np.ndarray) and np.issubdtype(message.dtype, np.floating):
+        elif isinstance(message, np.ndarray) and np.issubdtype(message.dtype, np.float32):
             # pack as 4 byte floats
             packed = message.astype(np.float32).tobytes()
         else:
             raise TypeError("Unsupported data type")
 
         try:
+            if self.verbose>=2:print(f"(pgl:_pglComm) Sending message with length {len(packed)} bytes")
             self.s.sendall(packed)
             if self.verbose > 1: print("(pgl:_pglComm) Message sent:", message)
         except Exception as e:
