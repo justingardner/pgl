@@ -23,6 +23,7 @@ class pglTransform:
     yPix2Deg = None
     xDeg2Pix = None
     yDeg2Pix = None
+    coordinateFrame = "default" 
     ################################################################
     # Transform to visual angle coordinates
     ################################################################
@@ -80,6 +81,8 @@ class pglTransform:
         # set scale 
         self.setTransformScale(2.0 / self.screenWidth.deg, 2.0 / self.screenHeight.deg)
 
+        # done
+        self.coordinateFrame = "visualAngle"
     ################################################################
     # Transform to screen coordinates
     ################################################################
