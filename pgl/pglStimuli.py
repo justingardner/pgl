@@ -134,7 +134,7 @@ class pglStimuli:
 
         return gaussian
     
-    def gabor(self, width=None, height=None, spatialFrequency=1.0, orientation=0.0, contrast=1.0, phase=0.0, stdX=None, stdY=None):
+    def gabor(self, width=None, height=None, spatialFrequency=1.0, orientation=0.0, contrast=1.0, phase=0.0, stdX=None, stdY=None, returnAsMatrix = False):
         '''
         Generate a Gabor patch.
 
@@ -147,9 +147,16 @@ class pglStimuli:
         - height: Height of the Gabor patch in degrees (default is screenHeight).
         - stdX: Standard deviation in the X direction (default is 1/8 width).
         - stdY: Standard deviation in the Y direction (default is 1/8 height).
+        - returnAsMatrix (False): If True, return as a numpy matrix. If False, 
+            return as a pglImageStimulus
 
         Returns:
-        - A numpy array representing the Gabor stimulus.
+        - A pglImageStimulus representing the Gabor stimulus. Use the display() method to show it.
+
+        e.g.:
+        gabor = pgl.gabor(width=5, height=5, spatialFrequency=1.0, orientation=0.0, contrast=1.0, phase=0.0, stdX=0.5, stdY=0.5)
+        gabor.display()
+        pgl.flush()
         '''
         if self.coordinateFrame != "visualAngle":
             print("(pgl:pglStimuli:gabor) Error: gabor can only be generated in visualAngle coordinates. run visualAngle() ")
@@ -173,8 +180,9 @@ class pglStimuli:
         grating = self.grating(width, height, spatialFrequency, orientation, contrast, phase)
         gaussian = self.gaussian(width, height, stdX, stdY)
         gabor = ((grating * gaussian)+1)/2
-
-        # create a stimulus
+        if returnAsMatrix: return gabor
+        
+        # create a pglImageStimulus
         gaborStimulus = pglImageStimulus(self)
         rgba = np.zeros((gabor.shape[0], gabor.shape[1], 4), dtype=np.float32)
         rgba[..., 0] = gabor
@@ -183,6 +191,8 @@ class pglStimuli:
         rgba[..., 3] = gaussian
         gaborStimulus.addImage(rgba)
         return gaborStimulus
+
+
 class _pglStimulus:
     '''
     Base class for all stimuli.
@@ -228,9 +238,8 @@ class pglImageStimulus(_pglStimulus):
         Args:
         - imageData: The image data to be added.
         '''
-        if not isinstance(imageData, np.ndarray) or imageData.ndim != 3 or imageData.shape[2] != 4:
-            print("(pgl:pglStimulus:addImage) Error: imageData must be a nxmx4 numpy matrix.")
-            return None
+        (tf,imageData) = self.pgl.imageValidate(imageData)
+        if not tf: return None
         
         # make into a pgl image
         imageInstance = self.pgl.imageCreate(imageData)
@@ -256,5 +265,4 @@ class pglImageStimulus(_pglStimulus):
         '''
         Print information about the stimulus.
         '''
-        print(self.pgl.screenWidth.deg)
         print(f"(pgl:pglStimulus:print) Image {self.currentImage} of {self.nImages}.")
