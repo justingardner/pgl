@@ -651,7 +651,8 @@ def getGPUInfo():
 ###################################
 def getMetalAppName(stable=False):
     homeDirectory = os.path.expanduser("~")
-    stableAppPath = os.path.join(homeDirectory, "proj/mgl/metal/binary/stable/mglMetal.app")
+    #stableAppPath = os.path.join(homeDirectory, "proj/mgl/metal/binary/stable/mglMetal.app")
+    stableAppPath = os.path.join(homeDirectory, "proj/pgl/metal/mglMetal.app")
     derivedDataDirectory = os.path.join(homeDirectory, "Library/Developer/Xcode/DerivedData")
 
     # If runStable is True, always return the stable app path
