@@ -9,7 +9,7 @@ from .pglStimuli import pglStimuli
 from .pglTimestamp import pglTimestamp
 from .pglDevice import pglDevice
 from .pglEvent import pglEvent
-from .pglVPixx import pglProPixx
+from .pglVPixx import pglProPixx, pglDataPixx
 #from .screen import screen
 #from .task import task
 
