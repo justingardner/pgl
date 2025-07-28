@@ -180,16 +180,18 @@ class pglStimuli:
         grating = self.grating(width, height, spatialFrequency, orientation, contrast, phase)
         gaussian = self.gaussian(width, height, stdX, stdY)
         gabor = ((grating * gaussian)+1)/2
+        grating = self.grating(width, height, spatialFrequency, orientation+45, contrast, phase)
+        gaussian = self.gaussian(width, height, stdX, stdY)
+        gabor2 = ((grating * gaussian)+1)/2
         if returnAsMatrix: return gabor
         
         # create a pglImageStimulus
         gaborStimulus = pglImageStimulus(self)
-        rgba = np.zeros((gabor.shape[0], gabor.shape[1], 4), dtype=np.float32)
-        rgba[..., 0] = gabor
-        rgba[..., 1] = gabor
-        rgba[..., 2] = gabor
-        rgba[..., 3] = gaussian
-        gaborStimulus.addImage(rgba)
+        gaborStimulus.addImage(gabor)
+        gaborStimulus.addImage(gabor2)
+        gaborStimulus.addImage(gabor)
+        gaborStimulus.addImage(gabor2)
+        gaborStimulus.print()
         return gaborStimulus
 
 
@@ -220,9 +222,6 @@ class pglImageStimulus(_pglStimulus):
     Base class for image stimuli.
     This class is not meant to be instantiated directly.
     '''
-    nImages = 0
-    currentImage = 0
-    imageList = []
     def __init__(self, pgl):
         '''
         Initialize the image stimulus with an image instance.
@@ -230,6 +229,9 @@ class pglImageStimulus(_pglStimulus):
         Args:
         '''
         super().__init__(pgl)
+        self.nImages = 0
+        self.currentImage = 0
+        self.imageList = []
     
     def addImage(self, imageData):
         '''
@@ -243,7 +245,9 @@ class pglImageStimulus(_pglStimulus):
         
         # make into a pgl image
         imageInstance = self.pgl.imageCreate(imageData)
+        print(f"(pgl:pglStimulus:addImage) Adding image {imageInstance.imageNum} ({imageInstance.imageWidth}x{imageInstance.imageHeight})")
         self.imageList.append(imageInstance)
+        self.imageList[-1].print()
         # update count
         self.nImages += 1
 
@@ -255,14 +259,20 @@ class pglImageStimulus(_pglStimulus):
             print("(pgl:pglStimulus:display) No images to display.")
             return None
         
+        # Print information about the stimulus
+        if self.pgl.verbose>1: print(f"(pgl:pglStimulus:display) Displaying image {self.currentImage} of {self.nImages}.")
+
         # display current image        
         self.imageList[self.currentImage].display()
 
         # Increment the current image index
         self.currentImage = (self.currentImage + 1) % self.nImages
-        if self.pgl.verbose>1: print(f"(pgl:pglStimulus:display) Displaying image {self.currentImage} of {self.nImages}.")
+        
     def print(self):
         '''
         Print information about the stimulus.
         '''
-        print(f"(pgl:pglStimulus:print) Image {self.currentImage} of {self.nImages}.")
+        print(f"(pgl:pglStimulus:print) Image {self.currentImage}/{self.nImages}. ")
+        # print info on each image
+        for iImage in range(self.nImages):
+            self.imageList[iImage].print()

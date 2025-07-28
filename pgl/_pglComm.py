@@ -83,7 +83,7 @@ class _pglComm:
             raise TypeError("Unsupported data type")
 
         try:
-            if self.verbose>=2:print(f"(pgl:_pglComm) Sending message with length {len(packed)} bytes")
+            if self.verbose>=3:print(f"(pgl:_pglComm) Sending message with length {len(packed)} bytes")
             self.s.sendall(packed)
             if self.verbose > 1: print("(pgl:_pglComm) Message sent:", message)
         except Exception as e:
@@ -108,6 +108,8 @@ class _pglComm:
             print(f"(pgl:_pglComm) ❌ Command '{commandName}' not found")
             return False
         
+        if self.verbose>=1:
+            print(f"(pgl:_pglComm) Sending command: {commandName} (value: {commandValue})")
         self.write(np.uint16(commandValue))
         return True
     def getCommandValue(self,commandName):
