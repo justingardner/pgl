@@ -60,18 +60,26 @@ class pglImage:
         imageInstance = _pglImageInstance(imageNum, imageWidth, imageHeight, self)
         return imageInstance
     
-    def imageDisplay(self, imageInstance, loc=(0, 0), size=(1, 1)):
+    def imageDisplay(self, imageInstance, displayLocation=None, displaySize=None):
         '''
         '''
         if self.isOpen() == False:
             print("(pgl:pglStimulus:display) pgl is not open. Cannot display image.")
             return None
 
+        if displaySize is None:
+            # default size is image size
+            displaySize = (imageInstance.imageWidth * self.xPix2Deg, imageInstance.imageHeight * self.yPix2Deg)
+        if displayLocation is None:
+            # default location is center of screen
+            displayLocation = (0, 0)
+
         # vertex coordinates in device coordinates
-        vertexLeft = -20
-        vertexRight = 20
-        vertexTop = 15
-        vertexBottom = -15
+        vertexLeft = -displaySize[0]/2 + displayLocation[0]
+        vertexRight = displaySize[0]/2 + displayLocation[0]
+        vertexTop = displaySize[1]/2 + displayLocation[1]
+        vertexBottom = -displaySize[1]/2 + displayLocation[1]
+        print(vertexLeft, vertexRight, vertexTop, vertexBottom)
         # no z coordinate
         z = 0
         # texture coordinates which map to vertex coordinates
@@ -198,11 +206,11 @@ class _pglImageInstance:
     def __del__(self):
         # call the pgl function 
         self.pgl.imageDelete(self)
-    def display(self, loc=(0, 0), size=(1, 1)):
+    def display(self, displayLocation=None, displaySize=None):
         '''
           Display the image at the specified location and size.
         '''
         # call the pgl function to display
-        self.pgl.imageDisplay(self,loc,size)
+        self.pgl.imageDisplay(self, displayLocation, displaySize)
     def print(self):
        print(f"imageNum: {self.imageNum} ({self.imageWidth}x{self.imageHeight})")

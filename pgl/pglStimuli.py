@@ -67,7 +67,6 @@ class pglStimuli:
 
         # Calculate the grating
         grating = contrast * np.sin(2 * np.pi * spatialFrequency * (X * np.cos(theta) + Y * np.sin(theta)) + phase)
-
         return grating
 
     def gaussian(self, width=None, height=None, stdX=None, stdY=None, centerX=0, centerY=0, orientation=0.0, contrast=1.0):
