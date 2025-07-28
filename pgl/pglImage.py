@@ -24,9 +24,8 @@ class pglImage:
         '''
      
         # check dimensions of imageData
-        if not isinstance(imageData, np.ndarray) or imageData.ndim != 3 or imageData.shape[2] != 4:
-            print("(pglImage:imageCreate) Image must be nxmx4")
-            return None
+        (tf, imageData) = self.imageValidate(imageData)
+        if not tf: return None
     
         # get image width and height
         imageWidth = imageData.shape[1]
@@ -187,7 +186,6 @@ class _pglImageInstance:
     # phase -- optional value to choose sampler phase:
     #   0: phase (default)
     phase = 0
-    pgl = None
     def __init__(self, imageNum, imageWidth, imageHeight, pgl):
         # keep reference to pgl 
         self.pgl = pgl
@@ -195,6 +193,8 @@ class _pglImageInstance:
         self.imageWidth = imageWidth
         self.imageHeight = imageHeight
         self.imageNum = imageNum
+        if pgl.verbose>1: 
+            print(f"(pglImage:_pglImageInstance) Created image instance with: {self.imageNum} ({self.imageWidth}x{self.imageHeight})")
     def __del__(self):
         # call the pgl function 
         self.pgl.imageDelete(self)
