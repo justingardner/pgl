@@ -197,7 +197,13 @@ class _pglStimulus:
         Display the stimulus.
         This method should be implemented by subclasses.
         '''
-        raise NotImplementedError("Subclasses must implement this method.")
+        raise NotImplementedError("(_pglStimulus) Subclasses must implement this method.")
+    def print(self):
+        '''
+        Print information about the stimulus.
+        This method should be implemented by subclasses.
+        '''
+        raise NotImplementedError("(_pglStimulus) Subclasses must implement this method.")
 
 class pglImageStimulus(_pglStimulus):
     '''
@@ -237,12 +243,18 @@ class pglImageStimulus(_pglStimulus):
         Display the current image.
         '''
         if self.nImages == 0:
-            print("(pgl:pglStimulus:display) Error: No images to display.")
+            print("(pgl:pglStimulus:display) No images to display.")
             return None
+        
+        # display current image        
+        self.imageList[self.currentImage].display()
 
-        currentImage = self.imageList[self.currentImage]
-        currentImage.display()
-        currentImage.print()
         # Increment the current image index
         self.currentImage = (self.currentImage + 1) % self.nImages
-        print(f"(pgl:pglStimulus:display) Displaying image {self.currentImage} of {self.nImages}.")
+        if self.pgl.verbose>1: print(f"(pgl:pglStimulus:display) Displaying image {self.currentImage} of {self.nImages}.")
+    def print(self):
+        '''
+        Print information about the stimulus.
+        '''
+        print(self.pgl.screenWidth.deg)
+        print(f"(pgl:pglStimulus:print) Image {self.currentImage} of {self.nImages}.")

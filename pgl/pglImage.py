@@ -64,6 +64,10 @@ class pglImage:
     def imageDisplay(self, imageInstance, loc=(0, 0), size=(1, 1)):
         '''
         '''
+        if self.isOpen() == False:
+            print("(pgl:pglStimulus:display) pgl is not open. Cannot display image.")
+            return None
+
         # vertex coordinates in device coordinates
         vertexLeft = -20
         vertexRight = 20
@@ -127,10 +131,11 @@ class _pglImageInstance:
     # phase -- optional value to choose sampler phase:
     #   0: phase (default)
     phase = 0
-
+    pgl = None
     def __init__(self, imageNum, imageWidth, imageHeight, pgl):
         # keep reference to pgl 
         self.pgl = pgl
+        # and image info
         self.imageWidth = imageWidth
         self.imageHeight = imageHeight
         self.imageNum = imageNum
@@ -141,7 +146,7 @@ class _pglImageInstance:
         '''
           Display the image at the specified location and size.
         '''
-        # call the pgl function 
+        # call the pgl function to display
         self.pgl.imageDisplay(self,loc,size)
     def print(self):
        print(f"imageNum: {self.imageNum} ({self.imageWidth}x{self.imageHeight})")
