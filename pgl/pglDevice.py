@@ -50,6 +50,7 @@ class pglDevice:
         Clean up the _pglDevice instance.
         """
         # Perform any necessary cleanup here
+        print(f"(pglDevice) Cleaning up device of type {self.deviceType}")
         pass
 
     def poll(self):
