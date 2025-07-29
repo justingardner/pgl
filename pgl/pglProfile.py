@@ -86,7 +86,7 @@ class pglProfile:
     ################################################################
     def _profileModeStart(self):
         # get frameRate of screen
-        _,_,frameRate,_ = self.getResolution()
+        frameRate = self.getFrameRate()
         # set default profileModeBufferSize if not set
         if self.profileModeBufferSize is None:
             # set buffer size to 60 seconds worth of frames
@@ -147,6 +147,9 @@ class pglProfile:
                 flushTimes = profileInfo['flushTimes']
                 if self.verbose>1: print(flushTimes)
                 nFrames = len(flushTimes)
+                if (nFrames==0):
+                    print("(pglProfile) No frames in profile.")
+                    continue
                 totalTime = flushTimes[-1] - flushTimes[0]
                 expectedFrameTime = 1 / profileInfo['frameRate']*1000  # in ms
                 # get the difference in times
