@@ -154,6 +154,92 @@ class pglDataPixx(pglDevice):
                    time = round(x[0] - self.deviceStartTime, 2)
                    print(f'(pglDataPixx:poll) Button code: {str(x[1])}  Button ID: {buttonID}, Time: {time}')
 
+
+    ################################################################
+    # setup digital output
+    ################################################################
+    def setupDigitalOutput(self):
+        """
+        Setup the digital output for the DataPixx device.
+        """
+        # Check that we have a device
+        if self.device is None or self.currentStatus==-1:
+            print("(pglDataPixx:enableButtonSchedules) DataPixx device is not initialized.")
+            return
+        
+        # load the dp library
+        try:
+            from pypixxlib import _libdpx as dp
+        except ImportError:
+            print("(pglDataPixx:enableButtonSchedules) pypixxlib is not installed. Please install it to use DataPixx button schedules.")
+            return
+    
+        # Initialize the DataPixx device
+        dp.DPxOpen()
+        # enable button scheduless
+        self.enableButtonSchedules()
+        print("(pglDataPixx:enableButtonSchedules) DataPixx digital output setup complete.")
+
+    ################################################################
+    # enableButtonSchedules: Modified from VPIxx example code
+    ################################################################
+    def enableButtonSchedules(self):
+
+        # load the dp library
+        try:
+            from pypixxlib import _libdpx as dp
+        except ImportError:
+            print("(pglDataPixx:enableButtonSchedules) pypixxlib is not installed. Please install it to use DataPixx button schedules.")
+            return
+        
+        #Create our digital output waveforms. Each button press (rising edge) triggers a
+        #1 msec trig on the corresponding dout pin, followed by 2 msec on low.
+        #We'll use the dual /MRI as our example. DinChannels will depend on your button box type, you can use the PyPixx Digital I/O demo to verify your channel mappings.
+        #Note that if PixelModeGB is enabled it will control dout 8-23, dout waveforms which try to alter these will have no effect
+
+        #Din0 - Red
+        redWaveform = [1, 0, 0]
+
+        #Din1 - Yellow
+        yellowWaveform = [2, 0, 0]
+
+        #Din2 - Green
+        greenWaveform = [4, 0, 0]
+
+        #Din3 - Blue
+        blueWaveform = [8, 0, 0]
+
+        #Let's write the waveforms into the DPx memory. The address is set by 0 + 4096*channel_of_desired_digital_in_trigger
+        redAddress = 0+4096*0
+        yellowAddress = 0+4096*1
+        greenAddress = 0+4096*2
+        blueAddress = 0+4096*3
+
+        #write schedules into ram
+        dp.DPxWriteRam(redAddress, redWaveform)
+        dp.DPxWriteRam(yellowAddress, yellowWaveform)
+        dp.DPxWriteRam(greenAddress, greenWaveform)
+        dp.DPxWriteRam(blueAddress, blueWaveform)
+
+        #configure buffer-- only need to configure the first one, rest will follow the same format
+        dp.DPxSetDoutBuff(redAddress, len(redWaveform)*2)
+        dp.DPxSetDoutSched(0, 10, 'hz', len(redWaveform)+1)
+        dp.DPxUpdateRegCache()
+
+        #turn on debounce so button jitter is suppressed
+        dp.DPxEnableDinDebounce()
+
+        #Enable button schedules, set mode to 1 for RPx /MRI setup
+        dp.DPxEnableDoutButtonSchedules()
+        dp.DPxSetDoutButtonSchedulesMode(1)
+        dp.DPxWriteRegCache()
+
+        
+        
+
+    ################################################################
+    # test function, can be removed once working
+    ################################################################
     def test(self):
         exitButton = 'blue'
         #self.deviceLog = self.device.din.setDinLog(12e6, 1000)
