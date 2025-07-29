@@ -19,7 +19,7 @@ class pglDataPixx(pglDevice):
     """
     Represents a DataPixx device.
     """    
-    def __init__(self, pgl, deviceType=None):
+    def __init__(self):
         '''
         Initialize the pglDataPixx instance.
         
@@ -33,7 +33,7 @@ class pglDataPixx(pglDevice):
         self.currentStatus = -1
 
         # call parent constructor
-        super().__init__(pgl, deviceType or "DataPixx")
+        super().__init__("DataPixx")
         
         # get library
         try:
@@ -44,9 +44,10 @@ class pglDataPixx(pglDevice):
         
         # Initialize the DATAPixx3 instance
         try:
-            self.datapixx = DATAPixx3()
+            self.device = DATAPixx3()
         except Exception as e:
             print(f"(pglDataPixx) Failed to initialize DataPixx: {e}")
+            self.device = None
             return  
         
         # run status to get status
@@ -64,21 +65,27 @@ class pglDataPixx(pglDevice):
             return self.currentStatus
 
         try:
-            # Get current status
-            self.assemblyRevision = self.datapixx.getAssemblyRevision()
-            self.firmwareRevision = self.datapixx.getFirmwareRevision()
-            self.name = self.datapixx.getName()
-            self.serialNumber = self.datapixx.getSerialNumber()
+            # Names of methods that are supported by the DataPixx device
+            methodNames = {
+                'getAssemblyRevision': 'assemblyRevision',
+                'getFirmwareRevision': 'firmwareRevision',
+                'getName': 'name',
+                'getSerialNumber': 'serialNumber',
+                'getTime': 'deviceTime'
+            }
+            # Get current status using the method names
+            for method, attributeName in methodNames.items():
+                # Use getattr to call the method dynamically on the device object
+                self.deviceAttributes[attributeName] = getattr(self.device, method)()
 
-            # get device and cpu time
-            self.deviceTime = self.datapixx.getTime()
-            self.cpuTime = self.pgl.getSecs()
+            # get cpu time
+            self.deviceAttributes['cpuTime'] = self.pglTimestamp.getSecs()
 
             # print current status
-            if self.pgl.verbose > 0:
-                print(f"(pglDataPixx) {self.name}")
-                print(f"              serial #: {self.serialNumber}, assembly revision: {self.assemblyRevision}, firmware revision: {self.firmwareRevision}")
-                print(f"              device time: {self.deviceTime}, cpu time: {self.cpuTime}")
+            if self.verbose > 0:
+                print(f"(pglDataPixx) {self.deviceAttributes.get('name','Unknown DataPixx name')}")
+                print(f"              serial #: {self.deviceAttributes.get('serialNumber','Unknown')}, assembly revision: {self.deviceAttributes.get('assemblyRevision','Unknown')}, firmware revision: {self.deviceAttributes.get('firmwareRevision','Unknown')}")
+                print(f"              device time: {self.deviceAttributes.get('deviceTime','Unknown')}, cpu time: {self.deviceAttributes.get('cpuTime','Unknown')}")
 
             self.currentStatus = 1
         except Exception as e:
@@ -93,7 +100,7 @@ class pglProPixx(pglDevice):
     """
     Represents a ProPixx device.
     """    
-    def __init__(self, pgl, deviceType=None):
+    def __init__(self):
         '''
         Initialize the pglProPixx instance.
         
@@ -107,7 +114,7 @@ class pglProPixx(pglDevice):
         self.currentStatus = -1
 
         # call parent constructor
-        super().__init__(pgl, deviceType or "ProPixx")
+        super().__init__("ProPixx")
         
         # get library
         try:
@@ -118,7 +125,7 @@ class pglProPixx(pglDevice):
         
         # Initialize the DATAPixx3 instance
         try:
-            self.propixx = PROPixx()
+            self.device = PROPixx()
         except Exception as e:
             print(f"(pglProPixx) Failed to initialize ProPixx: {e}")
             return
@@ -136,50 +143,59 @@ class pglProPixx(pglDevice):
         if self.currentStatus == -1:
             print("(pglProPixx) ProPixx not initialized properly.")
             return self.currentStatus
-
         try:
-            # Get current status
-            self.assemblyRevision = self.propixx.getAssemblyRevision()
-            self.coreTemperature = self.propixx.getCoreTemperature()
-            self.displayResolution = self.propixx.getDisplayResolution()
-            self.dlpSequencerProgram = self.propixx.getDlpSequencerProgram()
-            self.fanPwm = self.propixx.getFanPwm()
-            self.firmwareRevision = self.propixx.getFirmwareRevision()
-            self.ledIntensity = self.propixx.getLedIntensity()
-            self.name = self.propixx.getName()
-            self.ramSize = self.propixx.getRamSize()
-            self.rasterLinePixelSync = self.propixx.getRasterLinePixelSync()
-            self.serialNumber = self.propixx.getSerialNumber()
-            self.videoSource = self.propixx.getVideoSource()
-            self.videoVerticalFrameFrequency = self.propixx.getVideoVerticalFrameFrequency()
-            self.videoVerticalFramePeriod = self.propixx.getVideoVerticalFramePeriod()
-            self.videoVerticalTotal = self.propixx.getVideoVerticalTotal()
-            self.visibleLinePerVerticalFrame = self.propixx.getVisibleLinePerVerticalFrame()
-            self.visiblePixelsPerHorizontalLine = self.propixx.getVisiblePixelsPerHorizontalLine()
-            self.isActive = self.propixx.isActive()
-            self.isQuietMode = self.propixx.isQuietMode()
-            self.isReady = self.propixx.isReady()
-            self.isRearProjection = self.propixx.isRearProjection()
+            # Names of methods that are supported by the ProPixx device
+            # These methods will be used to get the current status of the device
+            methodNames = {
+                'getAssemblyRevision': 'assemblyRevision',
+                'getCoreTemperature': 'coreTemperature',
+                'getDisplayResolution': 'displayResolution',
+                'getDlpSequencerProgram': 'dlpSequencerProgram',
+                'getFanPwm': 'fanPwm',
+                'getFirmwareRevision': 'firmwareRevision',
+                'getLedIntensity': 'ledIntensity',
+                'getName': 'name',
+                'getRamSize': 'ramSize',
+                'getRasterLinePixelSync': 'rasterLinePixelSync',
+                'getSerialNumber': 'serialNumber',
+                'getVideoSource': 'videoSource',
+                'getVideoVerticalFrameFrequency': 'videoVerticalFrameFrequency',
+                'getVideoVerticalFramePeriod': 'videoVerticalFramePeriod',
+                'getVideoVerticalTotal': 'videoVerticalTotal',
+                'getVisibleLinePerVerticalFrame': 'visibleLinePerVerticalFrame',
+                'getVisiblePixelsPerHorizontalLine': 'visiblePixelsPerHorizontalLine',
+                'isActive': 'isActive',
+                'isQuietMode': 'isQuietMode',
+                'isReady': 'isReady',
+                'isRearProjection': 'isRearProjection',
+                'getTime': 'deviceTime'
+            }
 
-            # get device and cpu time
-            self.deviceTime = self.propixx.getTime()
-            self.cpuTime = self.pgl.getSecs()
+            # Get current status using the method names
+            for method, attributeName in methodNames.items():
+                # Use getattr to call the method dynamically on the device object
+                self.deviceAttributes[attributeName] = getattr(self.device, method)()
 
-            # print current status
-            if self.pgl.verbose > 0:
-                print(f"(pglProPixx) {self.name}: {self.displayResolution} {self.dlpSequencerProgram}")
-                print(f"             isActive: {self.isActive}, isQuietMode: {self.isQuietMode}, isReady: {self.isReady}, isRearProjection: {self.isRearProjection}")
-                print(f"             core temperature: {self.coreTemperature}C, fan PWM: {self.fanPwm}, LED intensity: {self.ledIntensity}, video source: {self.videoSource}")
-                print(f"             serial #: {self.serialNumber} assembly revision: {self.assemblyRevision}, firmware revision: {self.firmwareRevision}, ram: {self.ramSize}")
-                print(f"             device time: {self.deviceTime}, cpu time: {self.cpuTime}")
-            if self.pgl.verbose > 1:
-                print(f"             video vertical frame frequency: {self.videoVerticalFrameFrequency}Hz, video vertical frame period: {self.videoVerticalFramePeriod}ms, video vertical total: {self.videoVerticalTotal}")
-                print(f"             visible pixels per horizontal line: {self.visiblePixelsPerHorizontalLine}, visible lines per vertical frame: {self.visibleLinePerVerticalFrame}, raster line pixel sync: {self.rasterLinePixelSync}")
-            self.currentStatus = 1
+            # Get CPU time
+            self.deviceAttributes['cpuTime'] = self.pglTimestamp.getSecs()
+
+            # Print current status
+            if self.verbose > 0:
+                print(f"(pglProPixx) {self.deviceAttributes.get('name', 'Unknown ProPixx name')}: {self.deviceAttributes.get('displayResolution', 'Unknown')} {self.deviceAttributes.get('dlpSequencerProgram', 'Unknown')}")
+                print(f"             isActive: {self.deviceAttributes.get('isActive', 'Unknown')}, isQuietMode: {self.deviceAttributes.get('isQuietMode', 'Unknown')}, isReady: {self.deviceAttributes.get('isReady', 'Unknown')}, isRearProjection: {self.deviceAttributes.get('isRearProjection', 'Unknown')}")
+                print(f"             core temperature: {self.deviceAttributes.get('coreTemperature', 'Unknown')}C, fan PWM: {self.deviceAttributes.get('fanPwm', 'Unknown')}, LED intensity: {self.deviceAttributes.get('ledIntensity', 'Unknown')}, video source: {self.deviceAttributes.get('videoSource', 'Unknown')}")
+                print(f"             serial #: {self.deviceAttributes.get('serialNumber', 'Unknown')} assembly revision: {self.deviceAttributes.get('assemblyRevision', 'Unknown')}, firmware revision: {self.deviceAttributes.get('firmwareRevision', 'Unknown')}, ram: {self.deviceAttributes.get('ramSize', 'Unknown')}")
+                print(f"             device time: {self.deviceAttributes.get('deviceTime', 'Unknown')}, cpu time: {self.deviceAttributes.get('cpuTime', 'Unknown')}")
+
+            if self.verbose > 1:
+                print(f"             video vertical frame frequency: {self.deviceAttributes.get('videoVerticalFrameFrequency', 'Unknown')}Hz, video vertical frame period: {self.deviceAttributes.get('videoVerticalFramePeriod', 'Unknown')}ms, video vertical total: {self.deviceAttributes.get('videoVerticalTotal', 'Unknown')}")
+                print(f"             visible pixels per horizontal line: {self.deviceAttributes.get('visiblePixelsPerHorizontalLine', 'Unknown')}, visible lines per vertical frame: {self.deviceAttributes.get('visibleLinePerVerticalFrame', 'Unknown')}, raster line pixel sync: {self.deviceAttributes.get('rasterLinePixelSync', 'Unknown')}")
+                self.currentStatus = 1
         except Exception as e:
             print(f"(pglProPixx) Could not get current status: {e}")
             self.currentStatus = 0
             return self.currentStatus
+        
     def setRearProjection(self, rearProjection=True):
         '''
         Set the rear projection mode for the ProPixx device.
@@ -192,9 +208,8 @@ class pglProPixx(pglDevice):
             return
 
         try:
-            self.propixx.setRearProjectionMode(rearProjection)
-            self.isRearProjection = self.propixx.isRearProjection()
-            self.currentStatus = self.isRearProjection
+            self.device.setRearProjectionMode(rearProjection)
+            self.isRearProjection = self.device.isRearProjection()
         except Exception as e:
             print(f"(pglProPixx) Could not set rear projection: {e}")
             self.currentStatus = 0
