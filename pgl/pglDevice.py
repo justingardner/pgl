@@ -5,6 +5,11 @@
 #       date: July 28, 2025
 ################################################################
 
+###########
+# # Import
+##########
+from pgl import pglTimestamp
+
 #################################################################
 # Parent class for devices
 #################################################################
@@ -12,7 +17,7 @@ class pglDevice:
     """
     Parent class for all pglDevice types
     """
-    def __init__(self, pgl, deviceType):  
+    def __init__(self, deviceType):  
         '''
         Initialize the _pglDevice instance.
         
@@ -23,14 +28,18 @@ class pglDevice:
         Returns:
             None
         '''
-        # keep pointer to pgl
-        self.pgl = pgl
         # set the device type
         self.deviceType = deviceType
         # set the initialization time
-        self.startTime = pgl.getDateAndTime()
+        self.pglTimestamp = pglTimestamp()
+        self.startTime = self.pglTimestamp.getDateAndTime()
         # set the device status
         self.currentStatus = 0
+        # some fields about the device that will be set by subclasses
+        self.device = None
+        self.deviceAttributes = {}
+        # set verbosity
+        self.verbose = 1
 
 
     def __repr__(self):
