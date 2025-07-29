@@ -19,17 +19,18 @@ class pglStimuli:
     Class for generating common psychophysical stimuli.
 
     '''
-    def grating(self, width=None, height=None, spatialFrequency=1.0, orientation=0.0, contrast=1.0, phase=0.0):
+    def grating(self, width=None, height=None, spatialFrequency=1.0, orientation=0.0, contrast=1.0, phase=0.0, temporalFrequency=0.0, direction = 1, returnAsMatrix = False):
         '''
         Generate a sinusoidal grating
 
         Parameters:
-        - spatialFrequency: Frequency of the grating in cycles per degree.
-        - phase: Phase of the grating in degrees.
-        - orientation: Orientation of the grating in degrees.
-        - contrast: Contrast of the grating (0 to 1).
-        - width: Width of the grating in degrees (default is screenWidth).
-        - height: Height of the grating in degrees (default is screenHeight ).
+        - spatialFrequency (float): Frequency of the grating in cycles per degree.
+        - temporalFrequency (float): Temporal frequency of the grating in Hz. (default is 0)
+        - phase (float): Phase of the grating in degrees.
+        - orientation (float): Orientation of the grating in degrees.
+        - contrast (float): Contrast of the grating (0 to 1).
+        - width (float): Width of the grating in degrees (default is screenWidth).
+        - height (float): Height of the grating in degrees (default is screenHeight).
 
         Returns:
         - A numpy array representing the grating stimulus.
@@ -55,6 +56,32 @@ class pglStimuli:
         if width is None: width = self.screenWidth.deg
         if height is None: height = self.screenHeight.deg
 
+        # create a squence of frames for this temporal frequency
+        if temporalFrequency != 0:
+            # get deltaT of monitor
+            deltaT = 1 / self.getRefreshRate()
+            # calculate on period
+            period = direction / temporalFrequency
+            # get time points to compute images from
+            phasePoints = np.arange(0, period, deltaT)
+            nPhase = len(phasePoints)
+            # Now, prealocate array
+            grating = np.zeros((int(height * self.yDeg2Pix), int(width * self.xDeg2Pix), nPhase), dtype=np.float32)
+            # for each phasePoint, compute the grating
+            for iPhase, phaseValue in enumerate(phasePoints):
+                # get the phase for this frame
+                print(iPhase,phase, nPhase, phaseValue)
+                thisPhase = phase + 360 * (iPhase / nPhase)
+                # compute frame
+                grating[..., iPhase] = self.grating(width, height, spatialFrequency, orientation, contrast, thisPhase)
+            if returnAsMatrix: return grating
+            # create a pglImageStimulus
+            gratingStimulus = pglImageStimulus(self)
+            for iPhase in range(nPhase):
+                gratingStimulus.addImage(grating[..., iPhase])
+            gratingStimulus.print()
+            return gratingStimulus
+            
         # Create a grid of coordinates with resolution
         # set by the current screen resolution
         x = np.linspace(-width/2, width/2, int(width * self.xDeg2Pix))

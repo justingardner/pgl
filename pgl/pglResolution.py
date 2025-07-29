@@ -146,4 +146,20 @@ class pglResolution:
 
         # Call the C function to get the number of displays and the default display
         return _resolution.getNumDisplaysAndDefault()
+    ################################################################
+    # Get refreshRate
+    ################################################################
+    def getRefreshRate(self, whichScreen = None):
+        """
+        Get the refresh rate of a specified display.
 
+        Convenience function which retrieves just the refreshRate from getResolution
+
+        Args:
+            whichScreen (int): Same as getResolution
+
+        Returns:
+            int: The refresh rate in Hz, or -1 if an error occurs.
+        """
+        (_,_,refreshRate,_) = self.getResolution(whichScreen)
+        return refreshRate
