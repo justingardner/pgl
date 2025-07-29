@@ -108,7 +108,7 @@ class _pglComm:
             print(f"(pgl:_pglComm) ❌ Command '{commandName}' not found")
             return False
         
-        if self.verbose>=1:
+        if self.verbose>1:
             print(f"(pgl:_pglComm) Sending command: {commandName} (value: {commandValue})")
         self.write(np.uint16(commandValue))
         return True

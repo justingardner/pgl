@@ -79,7 +79,7 @@ class pglImage:
         vertexRight = displaySize[0]/2 + displayLocation[0]
         vertexTop = displaySize[1]/2 + displayLocation[1]
         vertexBottom = -displaySize[1]/2 + displayLocation[1]
-        print(vertexLeft, vertexRight, vertexTop, vertexBottom)
+        
         # no z coordinate
         z = 0
         # texture coordinates which map to vertex coordinates
