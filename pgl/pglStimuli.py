@@ -59,7 +59,7 @@ class pglStimuli:
         # create a squence of frames for this temporal frequency
         if temporalFrequency != 0:
             # get deltaT of monitor
-            deltaT = 1 / self.getRefreshRate()
+            deltaT = 1 / self.getFrameRate()
             # calculate on period
             period = direction / temporalFrequency
             # get time points to compute images from
@@ -78,7 +78,6 @@ class pglStimuli:
             gratingStimulus = pglImageStimulus(self)
             for iPhase in range(nPhase):
                 gratingStimulus.addImage(grating[..., iPhase])
-            gratingStimulus.print()
             return gratingStimulus
             
         # Create a grid of coordinates with resolution

@@ -149,11 +149,11 @@ class pglResolution:
     ################################################################
     # Get refreshRate
     ################################################################
-    def getRefreshRate(self, whichScreen = None):
+    def getFrameRate(self, whichScreen = None):
         """
-        Get the refresh rate of a specified display.
+        Get the frame rate of a specified display.
 
-        Convenience function which retrieves just the refreshRate from getResolution
+        Convenience function which retrieves just the frameRate from getResolution
 
         Args:
             whichScreen (int): Same as getResolution
@@ -161,5 +161,5 @@ class pglResolution:
         Returns:
             int: The refresh rate in Hz, or -1 if an error occurs.
         """
-        (_,_,refreshRate,_) = self.getResolution(whichScreen)
-        return refreshRate
+        (_,_,frameRate,_) = self.getResolution(whichScreen)
+        return frameRate

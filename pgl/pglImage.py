@@ -145,14 +145,14 @@ class pglImage:
             # if all values are between -1 and 1, we can scale them
             if np.all(imageData >= -1) and np.all(imageData <= 1):
                 imageData = (imageData + 1) / 2
-                if self.verbose>0: print(f"(pglImage:imageValidate) imageData values were scaled from [{-1}, {1}] to [0, 1].")
+                if self.verbose>1: print(f"(pglImage:imageValidate) imageData values were scaled from [{-1}, {1}] to [0, 1].")
                 return (True, imageData)
             else:
                 # scale between min and max
                 minVal = np.min(imageData)
                 maxVal = np.max(imageData)
                 imageData = (imageData - minVal) / (maxVal - minVal)
-                if self.verbose>0: print(f"(pglImage:imageValidate) imageData values were scaled from [{minVal}, {maxVal}] to [0, 1].")
+                if self.verbose>1: print(f"(pglImage:imageValidate) imageData values were scaled from [{minVal}, {maxVal}] to [0, 1].")
                 return (True, imageData)
         # check if any values are greater than 1
         elif np.any(imageData > 1):
