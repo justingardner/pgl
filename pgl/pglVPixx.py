@@ -50,9 +50,44 @@ class pglDataPixx(pglDevice):
             self.device = None
             return  
         
+        # buttonCodes
+        self.buttonCodes = {65528:'blue', 65522:'yellow', 65521:'red', 65524:'green', 65521:'white', 65520:'button release'}
+
+        
         # run status to get status
         self.currentStatus = self.status()
+
+        # set the device start time
+        self.deviceStartTime = self.deviceAttributes.get('deviceTime', 0)
+
+        # start device log
+        self.deviceLog = self.device.din.setDinLog(12e6, 1000)
+        # start logging
+        self.device.din.startDinLog()
+        self.device.updateRegisterCache()
+
     
+    def __del__(self):
+        """
+        Destructor for the pglDataPixx class.
+        """
+        if self.device is not None and self.currentStatus != -1:
+            try:
+                self.device.din.stopDinLog()
+                self.device.updateRegisterCache()
+            except Exception as e:
+                print(f"(pglDataPixx) Error during cleanup: {e}")
+
+        # set variables to initial state
+        self.device = None
+        self.currentStatus = -1
+
+        # Call the superclass's destructor (FIX, why can't we call this?)
+        #super().__del__()
+
+    ################################################################
+    # Get the status of the DataPixx device
+    ################################################################
     def status(self):
         """
         Get the status of the DataPixx device.
@@ -92,6 +127,72 @@ class pglDataPixx(pglDevice):
             print(f"(pglDataPixx) Could not get current status: {e}")
             self.currentStatus = 0
             return self.currentStatus
+    ################################################################
+    # Poll for events
+    ################################################################
+    def poll(self):
+        """
+        Poll the DataPixx device for events.
+
+        This method polls the DataPixx device for any keypad or other device events
+        """
+        # read device status
+        self.device.din.startDinLog()
+        self.device.updateRegisterCache()
+        self.device.din.getDinLogStatus(self.deviceLog)
+        newEvents = self.deviceLog["newLogFrames"]
+        
+        if newEvents > 0:
+            eventList = self.device.din.readDinLog(self.deviceLog, newEvents)
+
+            for x in eventList:
+               if x[1] in self.buttonCodes:
+                   #look up the name of the button
+                   buttonID = self.buttonCodes[x[1]]
+
+                   #get the time of the press, since we started logging
+                   time = round(x[0] - self.deviceStartTime, 2)
+                   print(f'(pglDataPixx:poll) Button code: {str(x[1])}  Button ID: {buttonID}, Time: {time}')
+
+    def test(self):
+        exitButton = 'blue'
+        #self.deviceLog = self.device.din.setDinLog(12e6, 1000)
+        self.device.din.startDinLog()
+        self.device.updateRegisterCache()
+        finished = False
+
+
+        #let's create a loop which checks the schedule at 0.25 s intervals for button presses.
+        #Any time a button press is found, we print the timestamp and button pressed.
+        #If a designated exit button is pressed, we disconnect.
+        while finished == False:
+            #read device status
+            self.device.updateRegisterCache()
+            self.device.din.getDinLogStatus(self.deviceLog)
+            newEvents = self.deviceLog["newLogFrames"]
+
+            if newEvents > 0:
+                eventList = self.device.din.readDinLog(self.deviceLog, newEvents)
+
+                for x in eventList:
+                    if x[1] in self.buttonCodes:
+                        #look up the name of the button
+                        buttonID = self.buttonCodes[x[1]]
+
+                        #get the time of the press, since we started logging
+                        time = round(x[0] - self.deviceStartTime, 2)
+                        printStr = 'Button pressed! Button code: ' + str(x[1]) + ', Button ID: ' + buttonID + ', Time:' + str(time)
+                        print(printStr)
+                        if buttonID == exitButton:
+                            finished = True
+            #wait for 0.25 seconds
+            self.pglTimestamp.waitSecs(0.25)
+            #Finished=True
+
+        #Stop logging
+        #self.device.din.stopDinLog()
+        #self.device.updateRegisterCache()
+
 
 ###################################
 # ProPixx device
