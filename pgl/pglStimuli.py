@@ -70,7 +70,6 @@ class pglStimuli:
             # for each phasePoint, compute the grating
             for iPhase, phaseValue in enumerate(phasePoints):
                 # get the phase for this frame
-                print(iPhase,phase, nPhase, phaseValue)
                 thisPhase = phase + 360 * (iPhase / nPhase)
                 # compute frame
                 grating[..., iPhase] = self.grating(width, height, spatialFrequency, orientation, contrast, thisPhase)
@@ -271,9 +270,8 @@ class pglImageStimulus(_pglStimulus):
         
         # make into a pgl image
         imageInstance = self.pgl.imageCreate(imageData)
-        print(f"(pgl:pglStimulus:addImage) Adding image {imageInstance.imageNum} ({imageInstance.imageWidth}x{imageInstance.imageHeight})")
+        if self.pgl.verbose>1: print(f"(pgl:pglStimulus:addImage) Adding image {imageInstance.imageNum} ({imageInstance.imageWidth}x{imageInstance.imageHeight})")
         self.imageList.append(imageInstance)
-        self.imageList[-1].print()
         # update count
         self.nImages += 1
 
