@@ -49,9 +49,12 @@ class pglStimuli:
         if not isinstance(orientation, (int, float)):
             print("(pgl:pglStimuli:gaussian) orientation must be a number.")
             return None
-        if not isinstance(contrast, (int, float)) or not (0 <= contrast <= 1):
-            print("(pgl:pglStimuli:gaussian) contrast must be a number between 0 and 1.")
-            return None 
+        if not isinstance(contrast, (int, float)) or not (-1 <= contrast <= 1):
+            print("(pgl:pglStimuli:gaussian) contrast must be a number between -1 and 1.")
+            return None
+        if not isinstance(direction, int) or direction not in [-1, 0, 1]:
+            print("(pgl:pglStimuli:gaussian) direction must be -1, 0, or 1.")
+            return None
 
         if width is None: width = self.screenWidth.deg
         if height is None: height = self.screenHeight.deg
@@ -61,18 +64,25 @@ class pglStimuli:
             # get deltaT of monitor
             deltaT = 1 / self.getFrameRate()
             # calculate on period
-            period = direction / temporalFrequency
+            period = 1 / temporalFrequency
             # get time points to compute images from
             phasePoints = np.arange(0, period, deltaT)
+            # set direction
+            if direction == -1: phasePoints = phasePoints[::-1]
             nPhase = len(phasePoints)
-            # Now, prealocate array
+            # Now, preallocate array
             grating = np.zeros((int(height * self.yDeg2Pix), int(width * self.xDeg2Pix), nPhase), dtype=np.float32)
             # for each phasePoint, compute the grating
             for iPhase, phaseValue in enumerate(phasePoints):
                 # get the phase for this frame
-                thisPhase = phase + 360 * (iPhase / nPhase)
+                thisPhase = phase + direction * 360 * iPhase / nPhase
+                # if direction = 0, this is a contrast reversing grating
+                if direction == 0:
+                    thisContrast = contrast * np.cos(2 * np.pi * iPhase / nPhase)
+                else:
+                    thisContrast = contrast
                 # compute frame
-                grating[..., iPhase] = self.grating(width, height, spatialFrequency, orientation, contrast, thisPhase)
+                grating[..., iPhase] = self.grating(width, height, spatialFrequency, orientation, thisContrast, thisPhase)
             if returnAsMatrix: return grating
             # create a pglImageStimulus
             gratingStimulus = pglImageStimulus(self)
