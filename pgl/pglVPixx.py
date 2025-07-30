@@ -176,10 +176,81 @@ class pglDataPixx(pglDevice):
     
         # Initialize the DataPixx device
         dp.DPxOpen()
+        
         # enable button scheduless
         self.enableButtonSchedules()
+
+        # enable pixel mode
+        self.enablePixelMode()
+
+
         print("(pglDataPixx:enableButtonSchedules) DataPixx digital output setup complete.")
 
+    ################################################################
+    # enablePixelMode: Modified from VPIxx example code
+    ################################################################
+    def enablePixelMode(self):
+        """
+        Enable pixel mode for the DataPixx device.
+        
+        This method enables the pixel mode for the DataPixx device, allowing it to control pixel-level output.
+        """
+        # Check that we have a device
+        if self.device is None or self.currentStatus==-1:
+            print("(pglDataPixx:enablePixelMode) DataPixx device is not initialized.")
+            return
+        
+        # load the dp library
+        try:
+            from pypixxlib import _libdpx as dp
+        except ImportError:
+            print("(pglDataPixx:enablePixelMode) pypixxlib is not installed. Please install it to use DataPixx pixel mode.")
+            return
+
+        # Enable pixel mode
+        #dp.DPxOpen()
+        dp.DPxEnableDoutPixelModeB()
+        #dp.DPxEnableDoutPixelModeGB()
+        #dp.DPxEnableDoutPixelMode()
+        dp.DPxWriteRegCache()
+
+        print("(pglDataPixx:enablePixelMode) Pixel mode enabled.")
+
+    ################################################################
+    # getError: Modified from VPIxx example code
+    ################################################################
+    def getError(self):
+        """
+        Gets any error from the DataPixx device and prints out the message
+        
+        Will return 0 if no error or the error number if there is an error
+
+        """
+        if self.device is None or self.currentStatus == -1:
+            print("(pglDataPixx:getError) DataPixx device is not initialized.")
+            return
+        try:
+            from pypixxlib import _libdpx as dp
+        except ImportError:
+            print("(pglDataPixx:getError) pypixxlib is not installed. Please install it to use DataPixx error handling.")
+            return
+
+        try:
+            # get error
+            errorNum = dp.DPxGetError()
+            if errorNum != 0:
+                errorStr = dp.DPxGetErrorString()
+                print(f"(pglDataPixx:getError) DataPixx error {errorNum}: {errorStr}")
+
+            # clear error
+            dp.DPxClearError()
+            print("(pglDataPixx:getError) Error state cleared.")
+            
+            if dp.DPxIs5VFault(): print("(pglDataPixx:getError) 5V fault detected.")
+            
+            
+        except Exception as e:
+            print(f"(pglDataPixx:getError) Could not get error state: {e}")
     ################################################################
     # enableButtonSchedules: Modified from VPIxx example code
     ################################################################
@@ -194,6 +265,10 @@ class pglDataPixx(pglDevice):
         
         #Create our digital output waveforms. Each button press (rising edge) triggers a
         #1 msec trig on the corresponding dout pin, followed by 2 msec on low.
+        
+        # JG: This is not what actually happens. Looks like what it actually does is related to what
+        #.    Hz you set below in the DPxSetDoutSched. If it is 10 Hz, then each entry is 100ms for example.
+
         #We'll use the dual /MRI as our example. DinChannels will depend on your button box type, you can use the PyPixx Digital I/O demo to verify your channel mappings.
         #Note that if PixelModeGB is enabled it will control dout 8-23, dout waveforms which try to alter these will have no effect
 
@@ -201,7 +276,7 @@ class pglDataPixx(pglDevice):
         redWaveform = [1, 0, 0]
 
         #Din1 - Yellow
-        yellowWaveform = [2, 0, 0]
+        yellowWaveform = [1, 0, 0]
 
         #Din2 - Green
         greenWaveform = [4, 0, 0]
@@ -223,7 +298,7 @@ class pglDataPixx(pglDevice):
 
         #configure buffer-- only need to configure the first one, rest will follow the same format
         dp.DPxSetDoutBuff(redAddress, len(redWaveform)*2)
-        dp.DPxSetDoutSched(0, 10, 'hz', len(redWaveform)+1)
+        dp.DPxSetDoutSched(0, 20, 'hz', len(redWaveform)+1)
         dp.DPxUpdateRegCache()
 
         #turn on debounce so button jitter is suppressed
