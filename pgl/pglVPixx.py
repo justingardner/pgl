@@ -11,6 +11,7 @@
 #from pgl import pglEvent
 from pgl import pglDevice
 from pgl import pglEvent
+import numpy as np
 
 ###################################
 # DataPixx device
@@ -254,7 +255,18 @@ class pglDataPixx(pglDevice):
     ################################################################
     # enableButtonSchedules: Modified from VPIxx example code
     ################################################################
-    def enableButtonSchedules(self,buttonMap = {'redLeft':1, 'yellowLeft':2, 'greenLeft':3, 'blueLeft':4, 'whiteLeft':5, 'redRight':6, 'yellowRight':7, 'greenRight':8, 'blueRight':9, 'whiteRight':10}):
+    def enableButtonSchedules(self,buttonMap = {'redLeft':1, 'yellowLeft':2, 'greenLeft':3, 'blueLeft':4, 'whiteLeft':5, 'redRight':6, 'yellowRight':7, 'greenRight':8, 'blueRight':9, 'whiteRight':10}, pulseWidth=50):
+        """
+            Enable button schedules for the DataPixx device. Button schedules convert button press events into digital output waveforms.
+
+            Args:
+                buttonMap (dict): A dictionary mapping button names to their corresponding digital output values. The digital output
+                                  values will be converted into lines, so for example 1 = 0001, 4 = 0100, 7 = 0111 etc
+                                  The button names are: redLeft, yellowLeft, greenLeft, blueLeft, whiteLeft, redRight, yellowRight, greenRight, blueRight, whiteRight
+                pulseWidth (int): The width of the pulse in milliseconds. Default is 50 ms. When tested on oscilliscope, pulses still look good even down to a microsecond in width
+            Returns:
+                None
+        """
 
         # load the dp library
         try:
@@ -295,17 +307,17 @@ class pglDataPixx(pglDevice):
         #Note that if PixelModeGB is enabled it will control dout 8-23, dout waveforms which try to alter these will have no effect
 
 
-        redLeftWaveform = [buttonMap.get('redLeft', 0), 0, 0]
-        yellowLeftWaveform = [buttonMap.get('yellowLeft', 0), 0, 0]
-        greenLeftWaveform = [buttonMap.get('greenLeft', 0), 0, 0]
-        blueLeftWaveform = [buttonMap.get('blueLeft', 0), 0, 0]
-        whiteLeftWaveform = [buttonMap.get('whiteLeft', 0), 0, 0]
+        redLeftWaveform = [buttonMap.get('redLeft', 0)]
+        yellowLeftWaveform = [buttonMap.get('yellowLeft', 0)]
+        greenLeftWaveform = [buttonMap.get('greenLeft', 0)]
+        blueLeftWaveform = [buttonMap.get('blueLeft', 0)]
+        whiteLeftWaveform = [buttonMap.get('whiteLeft', 0)]
 
-        redRightWaveform = [buttonMap.get('redRight', 0), 0, 0]
-        yellowRightWaveform = [buttonMap.get('yellowRight', 0), 0, 0]
-        greenRightWaveform = [buttonMap.get('greenRight', 0), 0, 0]
-        blueRightWaveform = [buttonMap.get('blueRight', 0), 0, 0]
-        whiteRightWaveform = [buttonMap.get('whiteRight', 0), 0, 0]
+        redRightWaveform = [buttonMap.get('redRight', 0)]
+        yellowRightWaveform = [buttonMap.get('yellowRight', 0)]
+        greenRightWaveform = [buttonMap.get('greenRight', 0)]
+        blueRightWaveform = [buttonMap.get('blueRight', 0)]
+        whiteRightWaveform = [buttonMap.get('whiteRight', 0)]
 
         # 1 shows up on PIN 1 of DB25
         # 4, 6 shows up on PIN 2 of DB25 (so, pin 2 is 3rd bit)
@@ -340,7 +352,7 @@ class pglDataPixx(pglDevice):
 
         #configure buffer-- only need to configure the first one, rest will follow the same format
         dp.DPxSetDoutBuff(redLeftAddress, len(redLeftWaveform)*2)
-        dp.DPxSetDoutSched(0, 20, 'hz', len(redLeftWaveform)+1)
+        dp.DPxSetDoutSched(0, np.round(1000/pulseWidth).astype(int), 'hz', len(redLeftWaveform)+1)
         dp.DPxUpdateRegCache()
 
         #turn on debounce so button jitter is suppressed
