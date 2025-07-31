@@ -254,7 +254,7 @@ class pglDataPixx(pglDevice):
     ################################################################
     # enableButtonSchedules: Modified from VPIxx example code
     ################################################################
-    def enableButtonSchedules(self):
+    def enableButtonSchedules(self,buttonMap = {'redLeft':1, 'yellowLeft':2, 'greenLeft':3, 'blueLeft':4, 'whiteLeft':5, 'redRight':6, 'yellowRight':7, 'greenRight':8, 'blueRight':9, 'whiteRight':10}):
 
         # load the dp library
         try:
@@ -265,40 +265,82 @@ class pglDataPixx(pglDevice):
         
         #Create our digital output waveforms. Each button press (rising edge) triggers a
         #1 msec trig on the corresponding dout pin, followed by 2 msec on low.
+
+        # JG: THis statement is also incorrect. the number encodes the digital word that you want to send, not the pin number.
+        #     Noting the cable, then the bits to cable pin are: 17 4 16 3 15 2 14 1
+        #     So, to get the pins to go high independetnly: 128=17, 64=4, 32=16, 16=3, 8=15, 4=2, 2=14, 1=1
+        #
+        #     Next set of bits to cable pin are: 21 8 20 7 19 6 18 5
         
         # JG: This is not what actually happens. Looks like what it actually does is related to what
         #.    Hz you set below in the DPxSetDoutSched. If it is 10 Hz, then each entry is 100ms for example.
 
+        #JG Response Pix maps buttons to DB25 PIns as follows
+        
+        # LEFT
+        # Red = DB25 Pin 1 (input) -> DevicePixx Digital in 0
+        # Yellow = DB25 Pin 14 (input) -> DevicePixx Digital in 1
+        # Green = DB25 Pin 2 (input) -> DevicePixx Digital in 2
+        # Blue = DB25 Pin 15 (input) -> DevicePixx Digital in 3
+        # White = DB25 Pin 3 (input) -> DevicePixx Digital in 4 (not implemented ion all contol pads, according to the manual
+        
+        # RIGHT
+        # Red = DB25 Pin 16 (input) -> DevicePixx Digital in 5
+        # Yellow = DB25 Pin 4 (input) -> DevicePixx Digital in 6
+        # Green = DB25 Pin 17 (input) -> DevicePixx Digital in 7
+        # Blue = DB25 Pin 5 (input) -> DevicePixx Digital in 8
+        # White = DB25 Pin 18 (input) -> DevicePixx Digital in 9 (not implemented ion all contol pads, according to the manual
+
         #We'll use the dual /MRI as our example. DinChannels will depend on your button box type, you can use the PyPixx Digital I/O demo to verify your channel mappings.
         #Note that if PixelModeGB is enabled it will control dout 8-23, dout waveforms which try to alter these will have no effect
 
-        #Din0 - Red
-        redWaveform = [1, 0, 0]
 
-        #Din1 - Yellow
-        yellowWaveform = [1, 0, 0]
+        redLeftWaveform = [buttonMap.get('redLeft', 0), 0, 0]
+        yellowLeftWaveform = [buttonMap.get('yellowLeft', 0), 0, 0]
+        greenLeftWaveform = [buttonMap.get('greenLeft', 0), 0, 0]
+        blueLeftWaveform = [buttonMap.get('blueLeft', 0), 0, 0]
+        whiteLeftWaveform = [buttonMap.get('whiteLeft', 0), 0, 0]
 
-        #Din2 - Green
-        greenWaveform = [4, 0, 0]
+        redRightWaveform = [buttonMap.get('redRight', 0), 0, 0]
+        yellowRightWaveform = [buttonMap.get('yellowRight', 0), 0, 0]
+        greenRightWaveform = [buttonMap.get('greenRight', 0), 0, 0]
+        blueRightWaveform = [buttonMap.get('blueRight', 0), 0, 0]
+        whiteRightWaveform = [buttonMap.get('whiteRight', 0), 0, 0]
 
-        #Din3 - Blue
-        blueWaveform = [8, 0, 0]
+        # 1 shows up on PIN 1 of DB25
+        # 4, 6 shows up on PIN 2 of DB25 (so, pin 2 is 3rd bit)
+        # 16 shows up on PIN 3 of DB25 (10000)
+        #
 
         #Let's write the waveforms into the DPx memory. The address is set by 0 + 4096*channel_of_desired_digital_in_trigger
-        redAddress = 0+4096*0
-        yellowAddress = 0+4096*1
-        greenAddress = 0+4096*2
-        blueAddress = 0+4096*3
+        redLeftAddress = 0+4096*0
+        yellowLeftAddress = 0+4096*1
+        greenLeftAddress = 0+4096*2
+        blueLeftAddress = 0+4096*3
+        whiteLeftAddress = 0+4096*4
+        
+        redRightAddress = 0+4096*5
+        yellowRightAddress = 0+4096*6
+        greenRightAddress = 0+4096*7
+        blueRightAddress = 0+4096*8
+        whiteRightAddress = 0+4096*9
 
         #write schedules into ram
-        dp.DPxWriteRam(redAddress, redWaveform)
-        dp.DPxWriteRam(yellowAddress, yellowWaveform)
-        dp.DPxWriteRam(greenAddress, greenWaveform)
-        dp.DPxWriteRam(blueAddress, blueWaveform)
+        dp.DPxWriteRam(redLeftAddress, redLeftWaveform)
+        dp.DPxWriteRam(yellowLeftAddress, yellowLeftWaveform)
+        dp.DPxWriteRam(greenLeftAddress, greenLeftWaveform)
+        dp.DPxWriteRam(blueLeftAddress, blueLeftWaveform)
+        dp.DPxWriteRam(whiteLeftAddress, whiteLeftWaveform)
+        
+        dp.DPxWriteRam(redRightAddress, redRightWaveform)
+        dp.DPxWriteRam(yellowRightAddress, yellowRightWaveform)
+        dp.DPxWriteRam(greenRightAddress, greenRightWaveform)
+        dp.DPxWriteRam(blueRightAddress, blueRightWaveform)
+        dp.DPxWriteRam(whiteRightAddress, whiteRightWaveform)
 
         #configure buffer-- only need to configure the first one, rest will follow the same format
-        dp.DPxSetDoutBuff(redAddress, len(redWaveform)*2)
-        dp.DPxSetDoutSched(0, 20, 'hz', len(redWaveform)+1)
+        dp.DPxSetDoutBuff(redLeftAddress, len(redLeftWaveform)*2)
+        dp.DPxSetDoutSched(0, 20, 'hz', len(redLeftWaveform)+1)
         dp.DPxUpdateRegCache()
 
         #turn on debounce so button jitter is suppressed
