@@ -10,6 +10,10 @@ from .pglTimestamp import pglTimestamp
 from .pglDevice import pglDevice
 from .pglEvent import pglEvent
 from .pglVPixx import pglProPixx, pglDataPixx
+from .pglEyeTracker import pglEyeTracker
+from .pglTrackPixx import pglTrackPixx3
+
+
 #from .screen import screen
 #from .task import task
 
