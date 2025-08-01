@@ -255,7 +255,7 @@ class pglDataPixx(pglDevice):
     ################################################################
     # enableButtonSchedules: Modified from VPIxx example code
     ################################################################
-    def enableButtonSchedules(self,buttonMap = {'redLeft':1, 'yellowLeft':2, 'greenLeft':3, 'blueLeft':4, 'whiteLeft':5, 'redRight':6, 'yellowRight':7, 'greenRight':8, 'blueRight':9, 'whiteRight':10}, pulseWidth=50):
+    def enableButtonSchedules(self, buttonMap = None, pulseWidth=50):
         """
             Enable button schedules for the DataPixx device. Button schedules convert button press events into digital output waveforms.
 
@@ -274,6 +274,16 @@ class pglDataPixx(pglDevice):
         except ImportError:
             print("(pglDataPixx:enableButtonSchedules) pypixxlib is not installed. Please install it to use DataPixx button schedules.")
             return
+        
+        
+        if buttonMap is None:
+            # default button map
+            buttonMap = {
+                'redLeft': 1, 'yellowLeft': 2, 'greenLeft': 3, 'blueLeft': 4, 'whiteLeft': 5,
+                'redLeftRelease': 1, 'yellowLeftRelease': 2, 'greenLeftRelease': 3, 'blueLeftRelease': 4, 'whiteLeftRelease': 5,
+                'redRight': 6, 'yellowRight': 7, 'greenRight': 8, 'blueRight': 9, 'whiteRight': 10,
+                'redRightRelease': 6, 'yellowRightRelease': 7, 'greenRightRelease': 8, 'blueRightRelease': 9, 'whiteRightRelease': 10
+            }
         
         #Create our digital output waveforms. Each button press (rising edge) triggers a
         #1 msec trig on the corresponding dout pin, followed by 2 msec on low.
@@ -308,16 +318,26 @@ class pglDataPixx(pglDevice):
 
 
         redLeftWaveform = [buttonMap.get('redLeft', 0)]
+        redLeftReleaseWaveform = [buttonMap.get('redLeftRelease', 0)]
         yellowLeftWaveform = [buttonMap.get('yellowLeft', 0)]
+        yellowLeftReleaseWaveform = [buttonMap.get('yellowLeftRelease', 0)]        
         greenLeftWaveform = [buttonMap.get('greenLeft', 0)]
+        greenLeftReleaseWaveform = [buttonMap.get('greenLeftRelease', 0)]
         blueLeftWaveform = [buttonMap.get('blueLeft', 0)]
+        blueLeftReleaseWaveform = [buttonMap.get('blueLeftRelease', 0)]
         whiteLeftWaveform = [buttonMap.get('whiteLeft', 0)]
+        whiteLeftReleaseWaveform = [buttonMap.get('whiteLeftRelease', 0)]
 
         redRightWaveform = [buttonMap.get('redRight', 0)]
+        redRightReleaseWaveform = [buttonMap.get('redRightRelease', 0)]
         yellowRightWaveform = [buttonMap.get('yellowRight', 0)]
+        yellowRightReleaseWaveform = [buttonMap.get('yellowRightRelease', 0)]
         greenRightWaveform = [buttonMap.get('greenRight', 0)]
+        greenRightReleaseWaveform = [buttonMap.get('greenRightRelease', 0)]
         blueRightWaveform = [buttonMap.get('blueRight', 0)]
+        blueRightReleaseWaveform = [buttonMap.get('blueRightRelease', 0)]
         whiteRightWaveform = [buttonMap.get('whiteRight', 0)]
+        whiteRightReleaseWaveform = [buttonMap.get('whiteRightRelease', 0)]
 
         # 1 shows up on PIN 1 of DB25
         # 4, 6 shows up on PIN 2 of DB25 (so, pin 2 is 3rd bit)
@@ -325,30 +345,52 @@ class pglDataPixx(pglDevice):
         #
 
         #Let's write the waveforms into the DPx memory. The address is set by 0 + 4096*channel_of_desired_digital_in_trigger
-        redLeftAddress = 0+4096*0
-        yellowLeftAddress = 0+4096*1
-        greenLeftAddress = 0+4096*2
-        blueLeftAddress = 0+4096*3
-        whiteLeftAddress = 0+4096*4
-        
-        redRightAddress = 0+4096*5
-        yellowRightAddress = 0+4096*6
-        greenRightAddress = 0+4096*7
-        blueRightAddress = 0+4096*8
-        whiteRightAddress = 0+4096*9
+        buttonAddressOffset = 4096
+        releaseOffset = 2048
+        redLeftAddress = buttonAddressOffset*0
+        redLeftReleaseAddress = buttonAddressOffset*0 + releaseOffset
+        yellowLeftAddress = buttonAddressOffset*1
+        yellowLeftReleaseAddress = buttonAddressOffset*1 + releaseOffset
+        greenLeftAddress = buttonAddressOffset*2
+        greenLeftReleaseAddress = buttonAddressOffset*2 + releaseOffset
+        blueLeftAddress = buttonAddressOffset*3
+        blueLeftReleaseAddress = buttonAddressOffset*3 + releaseOffset
+        whiteLeftAddress = buttonAddressOffset*4
+        whiteLeftReleaseAddress = buttonAddressOffset*4 + releaseOffset
+
+        redRightAddress = buttonAddressOffset*5
+        redRightReleaseAddress = buttonAddressOffset*5 + releaseOffset
+        yellowRightAddress = buttonAddressOffset*6
+        yellowRightReleaseAddress = buttonAddressOffset*6 + releaseOffset
+        greenRightAddress = buttonAddressOffset*7
+        greenRightReleaseAddress = buttonAddressOffset*7 + releaseOffset
+        blueRightAddress = buttonAddressOffset*8
+        blueRightReleaseAddress = buttonAddressOffset*8 + releaseOffset
+        whiteRightAddress = buttonAddressOffset*9
+        whiteRightReleaseAddress = buttonAddressOffset*9 + releaseOffset
 
         #write schedules into ram
         dp.DPxWriteRam(redLeftAddress, redLeftWaveform)
+        dp.DPxWriteRam(redLeftReleaseAddress, redLeftReleaseWaveform)
         dp.DPxWriteRam(yellowLeftAddress, yellowLeftWaveform)
+        dp.DPxWriteRam(yellowLeftReleaseAddress, yellowLeftReleaseWaveform)
         dp.DPxWriteRam(greenLeftAddress, greenLeftWaveform)
+        dp.DPxWriteRam(greenLeftReleaseAddress, greenLeftReleaseWaveform)
         dp.DPxWriteRam(blueLeftAddress, blueLeftWaveform)
+        dp.DPxWriteRam(blueLeftReleaseAddress, blueLeftReleaseWaveform)
         dp.DPxWriteRam(whiteLeftAddress, whiteLeftWaveform)
+        dp.DPxWriteRam(whiteLeftReleaseAddress, whiteLeftReleaseWaveform)
         
         dp.DPxWriteRam(redRightAddress, redRightWaveform)
+        dp.DPxWriteRam(redRightReleaseAddress, redRightReleaseWaveform)
         dp.DPxWriteRam(yellowRightAddress, yellowRightWaveform)
+        dp.DPxWriteRam(yellowRightReleaseAddress, yellowRightReleaseWaveform)
         dp.DPxWriteRam(greenRightAddress, greenRightWaveform)
+        dp.DPxWriteRam(greenRightReleaseAddress, greenRightReleaseWaveform)
         dp.DPxWriteRam(blueRightAddress, blueRightWaveform)
+        dp.DPxWriteRam(blueRightReleaseAddress, blueRightReleaseWaveform)
         dp.DPxWriteRam(whiteRightAddress, whiteRightWaveform)
+        dp.DPxWriteRam(whiteRightReleaseAddress, whiteRightReleaseWaveform)
 
         #configure buffer-- only need to configure the first one, rest will follow the same format
         dp.DPxSetDoutBuff(redLeftAddress, len(redLeftWaveform)*2)
@@ -358,9 +400,10 @@ class pglDataPixx(pglDevice):
         #turn on debounce so button jitter is suppressed
         dp.DPxEnableDinDebounce()
 
-        #Enable button schedules, set mode to 1 for RPx /MRI setup
+        # Enable button schedules
         dp.DPxEnableDoutButtonSchedules()
-        dp.DPxSetDoutButtonSchedulesMode(1)
+        # Set the button schedules mode to 2 for button push and release events (1 for push only)
+        dp.DPxSetDoutButtonSchedulesMode(2)
         dp.DPxWriteRegCache()
 
         
