@@ -18,7 +18,7 @@ class pglEyeTracker(pglDevice):
     This class is intended to be subclassed by specific eye tracker implementations.
     """
     
-    def __init__(self, deviceType=None):
+    def __init__(self, pgl=None, deviceType=None):
         """
         Initialize the eye tracker device.
         """
@@ -30,6 +30,7 @@ class pglEyeTracker(pglDevice):
         self.isCalibrated = False
         self.calibrationTime = None
         self.isTracking = False 
+        self.pgl = pgl
 
     def __del__(self):
         """Destructor to clean up resources."""
@@ -48,6 +49,23 @@ class pglEyeTracker(pglDevice):
         self.isCalibrated = True
         self.calibrationTime = self.pglTimestamp.getDateAndTime()
 
+    def calibrate(self):
+        """Calibrate the eye tracker."""
+        # perform calibration logic here
+        self.isCalibrated = True
+        self.calibrationTime = self.pglTimestamp.getDateAndTime()
+
+    def calibrateEyeImage(self):
+        """
+        Calibrate the eye image.
+
+        This method should be implemented by subclasses to display the eye image and
+        Allow experimenter/subject to adjust the illuminator intensity, focus, position
+        and other paramteres to optimize view of the eye
+        """
+        print("(pglEyeTracker:calibrateEyeImage) This method should be implemented by the specific eye tracker subclass.")
+        return None
+  
     def getCameraImage(self):
         """
         Get the current camera image from the eye tracker.
@@ -56,10 +74,8 @@ class pglEyeTracker(pglDevice):
         Returns:
             pglImage: The current camera image from the eye tracker.
         """
-        if self.currentStatus < 0:
-            print("(pglEyeTracker:getCameraImage) Eye tracker did not initialize properly.")
-            return False
-        return True
+        print("(pglEyeTracker:getCameraImage) This method should be implemented by the specific eye tracker subclass.")
+        return None
 
     def start(self):
         """Start eye tracking."""
