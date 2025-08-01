@@ -110,7 +110,8 @@ class pglTrackPixx3(pglEyeTracker):
         thisTime = self.dp.DPxGetTime()
 
         # stay in a loop, drawing camera images and allowing experimenter/subject to adjust parameters
-        while True:
+        loopCalibration = True
+        while loopCalibration:
 
             # wait for a duration of 1/60 second.
             if (thisTime - lastTime) > 1/60: # Just refresh at 60 Hz.
@@ -123,6 +124,13 @@ class pglTrackPixx3(pglEyeTracker):
 
                 # flush screen
                 self.pgl.flush()
+
+                # poll for button press events
+                self.pgl.devicesPoll()
+                event = self.pgl.eventsGet()                
+                if event is not None:
+                    event.print()
+                    loopCalibration = False
 
                 # restart frame time counter
                 lastTime = thisTime
