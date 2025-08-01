@@ -77,3 +77,40 @@ class pglDevice:
         # Implement status retrieval logic here
         return "(pglDevice) Device status not implemented"
     
+#################################################################
+# pglDevices is mixed into pgl and handles multiple pglDevice instances
+#################################################################
+class pglDevices:
+    """
+    Class to manage multiple pglDevice instances.
+    """
+    
+    def __init__(self):
+        """
+        Initialize the pglDevices instance.
+        """
+        self.devices = []
+
+    def devicesAdd(self, device):
+        """
+        Add a pglDevice instance to the list of devices.
+
+        Args:
+            device (pglDevice): The device to add.
+        """
+        if isinstance(device, pglDevice):
+            self.devices.append(device)
+            print(f"(pglDevices) Added device: {device.deviceType}")
+        else:
+            print("(pglDevices) Error: Device must be an instance of pglDevice.")
+
+    def devicesPoll(self):
+        """
+        Poll all devices for updates.
+
+        This method iterates through all devices and calls their poll method.
+        """
+        for device in self.devices:
+            print(f"(pglDevices) Polling device: {device.deviceType}")
+            result = device.poll()
+            print(f"(pglDevices) Result: {result}")
