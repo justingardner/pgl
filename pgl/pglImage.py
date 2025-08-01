@@ -80,8 +80,11 @@ class pglImage:
         vertexTop = displaySize[1]/2 + displayLocation[1]
         vertexBottom = -displaySize[1]/2 + displayLocation[1]
         
+        if self.verbose>1:
+            print(f"(pglImage:imageDisplay) Displaying image {imageInstance.imageNum} at {displayLocation} with size {displaySize}.")
         # no z coordinate
         z = 0
+
         # texture coordinates which map to vertex coordinates
         texRight = 1
         texLeft = 0
@@ -124,7 +127,36 @@ class pglImage:
         if not isinstance(imageData, np.ndarray) or imageData.ndim < 2 or imageData.ndim > 3:
             print("(pglImage:imageValidate) imageData should be a numpy matrix either WxH, WxHx3 or WxHx4.")
             return (False, None)
-        
+                
+        # make float32
+        imageData = imageData.astype(np.float32)
+
+        # check if any alues are less than 0
+        if np.any(imageData < 0):
+            # if all values are between -1 and 1, we can scale them
+            if np.all(imageData >= -1) and np.all(imageData <= 1):
+                imageData = (imageData + 1) / 2
+                if self.verbose>1: print(f"(pglImage:imageValidate) imageData values were scaled from [{-1}, {1}] to [0, 1].")
+            else:
+                # scale between min and max
+                minVal = np.min(imageData)
+                maxVal = np.max(imageData)
+                imageData = (imageData - minVal) / (maxVal - minVal)
+                if self.verbose>1: print(f"(pglImage:imageValidate) imageData values were scaled from [{minVal}, {maxVal}] to [0, 1].")
+        # check if any values are greater than 1
+        elif np.any(imageData > 1):
+            # if all values are whole numbers between 0 and 255, this is an 8 bit image
+            if np.all(np.floor(imageData) == imageData) and np.all((imageData>=0) & (imageData<=255)):
+                if self.verbose>0: print(f"(pglImage:imageValidate) imageData values were scaled from [0, 255] to [0, 1].")
+                imageData = imageData / 255.0
+            else:
+                # scale between min and max
+                minVal = np.min(imageData)
+                maxVal = np.max(imageData)
+                imageData = (imageData - minVal) / (maxVal - minVal)
+                if self.verbose>0: print(f"(pglImage:imageValidate) imageData values were scaled from [{minVal}, {maxVal}] to [0, 1].")
+
+        # check dimensions
         if imageData.ndim == 2:
             # assume grayscale image, convert to RGBA
             imageData = np.stack((imageData,)*4, axis=-1)
@@ -137,39 +169,8 @@ class pglImage:
             print("(pglImage:imageValidate) imageData should be a WxHx3 or WxHx4 numpy matrix.")
             return (False, None)
         
-        # make float32
-        imageData = imageData.astype(np.float32)
-
-        # check if any alues are less than 0
-        if np.any(imageData < 0):
-            # if all values are between -1 and 1, we can scale them
-            if np.all(imageData >= -1) and np.all(imageData <= 1):
-                imageData = (imageData + 1) / 2
-                if self.verbose>1: print(f"(pglImage:imageValidate) imageData values were scaled from [{-1}, {1}] to [0, 1].")
-                return (True, imageData)
-            else:
-                # scale between min and max
-                minVal = np.min(imageData)
-                maxVal = np.max(imageData)
-                imageData = (imageData - minVal) / (maxVal - minVal)
-                if self.verbose>1: print(f"(pglImage:imageValidate) imageData values were scaled from [{minVal}, {maxVal}] to [0, 1].")
-                return (True, imageData)
-        # check if any values are greater than 1
-        elif np.any(imageData > 1):
-            # if all values are whole numbers between 0 and 255, this is an 8 bit image
-            if np.all(np.floor(imageData) == imageData) and np.all((imageData>=0) & (imageData<=255)):
-                imageData = imageData / 255.0
-                return (True, imageData)
-            else:
-                # scale between min and max
-                minVal = np.min(imageData)
-                maxVal = np.max(imageData)
-                imageData = (imageData - minVal) / (maxVal - minVal)
-                if self.verbose>0: print(f"(pglImage:imageValidate) imageData values were scaled from [{minVal}, {maxVal}] to [0, 1].")
-                return (True, imageData)
-        else:
-            # all values are between 0 and 1, so we can use them as is
-            return (True, imageData)            
+        return (True, imageData)
+       
 
  
 #container class that holds image reference
