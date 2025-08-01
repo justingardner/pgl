@@ -147,16 +147,20 @@ class pglDataPixx(pglDevice):
         newEvents = self.deviceLog["newLogFrames"]
         
         if newEvents > 0:
+            # get the eventList
             eventList = self.device.din.readDinLog(self.deviceLog, newEvents)
+            # set up a list for holding events
+            events = []
 
             for x in eventList:
                 #get the time of the press, since we started logging
                 time = round(x[0] - self.deviceStartTime, 2)
                 code = x[1]
                 id = self.buttonCodes.get(code, 'Unknown')
-                event = pglEventResponsePixx(code, id, time)
-                return(event)
-                #event.print()
+                events.append(pglEventResponsePixx(code, id, time))
+            
+            # return all the events
+            return(events)
 
     ################################################################
     # setup digital output
