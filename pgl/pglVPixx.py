@@ -51,8 +51,11 @@ class pglDataPixx(pglDevice):
             self.device = None
             return  
         
-        # buttonCodes
-        self.buttonCodes = {65528:'blue', 65522:'yellow', 65521:'red', 65524:'green', 65521:'white', 65520:'button release'}
+        # buttonCodes, FIX, FIX, FIX: The right button pad seems to be wonky and not returning any codes at this time, so
+        # needs to be added when the hardware is fixed.
+        self.buttonCodes = {65281:'red left', 65282:'yellow left', 65284:'green left', 65288:'blue left', 65296:'white left',
+                            65312:'red right', 65344:'yellow right', 65408:'green right',
+                            65280:'button release'}
 
         
         # run status to get status
@@ -147,14 +150,13 @@ class pglDataPixx(pglDevice):
             eventList = self.device.din.readDinLog(self.deviceLog, newEvents)
 
             for x in eventList:
-               if x[1] in self.buttonCodes:
-                   #look up the name of the button
-                   buttonID = self.buttonCodes[x[1]]
-
-                   #get the time of the press, since we started logging
-                   time = round(x[0] - self.deviceStartTime, 2)
-                   print(f'(pglDataPixx:poll) Button code: {str(x[1])}  Button ID: {buttonID}, Time: {time}')
-
+                #get the time of the press, since we started logging
+                time = round(x[0] - self.deviceStartTime, 2)
+                code = x[1]
+                id = self.buttonCodes.get(code, 'Unknown')
+                event = pglEventResponsePixx(code, id, time)
+                return(event)
+                #event.print()
 
     ################################################################
     # setup digital output
@@ -619,42 +621,29 @@ class pglProPixx(pglDevice):
 ###################################
 class pglEventResponsePixx(pglEvent):
     """
-    Represents a response event for the Pixx device.
+    Represents a response event for ResponsePixx
 
-    Args:
-        pgl (object): The pgl instance.
-        type (str): The type of the event.
-
-    Returns:
-        None
     """
     
-    def __init__(self, pgl, type):
+    def __init__(self, code, id, deviceTime):
         '''
         Initialize the pglEventResponsePixx instance.
         Args:
-            pgl (object): The pgl instance.
-            type (str): The type of the event.
+            code (int): The event code.
+            id (str): The event ID.
+            deviceTime (float): The device time.
         Returns:
             None
         '''
-        super().__init__(pgl, type)
+        super().__init__("ResponsePixx")
+        self.code = code
+        self.id = id
+        self.deviceTime = deviceTime
 
-        try:
-            from pypixxlib.datapix import DATAPixx3
-        except ImportError:
-            raise ImportError("(pglEventResponsePixx) pypixxlib is not installed. Please install it to use Pixx events.")
-        # Initialize the DATAPixx3 instance
-        try:
-            self.datapixx = DATAPixx3()
-        except Exception as e:
-            raise RuntimeError(f"(pglEventResponsePixx) Failed to initialize DATAPixx3: {e}")   
-
-    def poll(self):
-        """
-        Poll the Pixx event.
-
-        This method polls the Pixx device for any updates or changes.
-        """
-        # Implement Pixx polling logic here
-        pass
+    def print(self):
+        '''
+        Print the details of the pglEventResponsePixx instance.
+        Returns:
+            None
+        '''
+        print(f"(pglEventResponsePixx) Code: {self.code}, ID: {self.id}, Device Time: {self.deviceTime}")

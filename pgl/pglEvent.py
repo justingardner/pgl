@@ -25,36 +25,52 @@ class pglEvents:
     Returns:
         None
     """
-
-    ################################################################
-    # create an event type
-    ################################################################
-    def eventCreate(self,type):
-        '''
-        Create a new event of the specified type.
-
+    def __init__(self):
+        """
+        Initialize the pglEvents instance.
+        
         Args:
-            type (str): The type of the event to create.
-
+            None
+        
         Returns:
-            pglEvent: An instance of the pglEvent class representing the created event.
-        ''' 
-        pass
+            None
+        """
+        self.events = []
 
     ################################################################
-    # create an event type
+    # Add events to the event list
     ################################################################
-    def eventDelete(self,event):
-        '''
-        Delete an existing event.
+    def eventsAdd(self,events):
+        """
+        Add events to the event list.
 
         Args:
-            event (pglEvent): The event to delete.
+            events (list): A list of events to add.
 
         Returns:
             None
+        """
+        if isinstance(events, list):
+            self.events.extend(events)
+        else:
+            self.events.append(events)
+
+    ################################################################
+    # create an event type
+    ################################################################
+    def eventsGet(self):
+        '''
+        Get events from the event list (which will be populated by polling devices)
+
+        Args:
+            None
+
+        Returns:
+            pglEvent: An instance of pglEvent containing the event data.
         ''' 
-        pass
+        if self.events:
+            return self.events.pop(0)
+        return None
 
 #################################################################
 # Parent classes for events
@@ -64,20 +80,24 @@ class pglEvent:
     Parent class for all pglEvent types
     """
     
-    def __init__(self,pgl,type):
+    def __init__(self, deviceType="pglEvent"):
         """
         Initialize the pglEvent instance.
         """
-        self.type = type
-        self.pgl = pgl
+        self.deviceType = deviceType
 
     def __repr__(self):
-        return f"<pglEvent type={self.type}>"
-    
+        return f"<pglEvent type={self.deviceType}>"
+
     def __del__(self):
         """
         Clean up the pglEvent instance.
         """
         # Perform any necessary cleanup here
         pass
-
+    
+    def print(self):
+        """
+        Print the details of the pglEvent instance.
+        """
+        print(f"(pglEvent) Device Type: {self.deviceType}")

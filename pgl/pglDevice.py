@@ -110,7 +110,8 @@ class pglDevices:
 
         This method iterates through all devices and calls their poll method.
         """
-        for device in self.devices:
-            print(f"(pglDevices) Polling device: {device.deviceType}")
-            result = device.poll()
-            print(f"(pglDevices) Result: {result}")
+        for device in self.devices: 
+            # poll each device for events
+            eventList = device.poll()
+            # add them to the events list
+            self.eventsAdd(eventList)
