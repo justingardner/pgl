@@ -96,7 +96,7 @@ class pglTrackPixx3(pglEyeTracker):
             return False
 
         # Adapted from TPxCalibrationTesting.py example code Step 2
-        
+        #self.dp.DPxOpen()
         # Get initial search limits for TPx. Search limits for either eye are
         # specified as 1 x 4 vector with the (x,y) coordinates of top left corner of
         # the search window and (x,y) coordinates of the bottom right corner. If
@@ -147,20 +147,26 @@ class pglTrackPixx3(pglEyeTracker):
                         # decrease LED intensity
                         self.ledIntensity = max(0, self.ledIntensity - 1)
                         self.dp.TPxSetLEDIntensity(self.ledIntensity)
-                        print(f"(pglTrackPixx3:calibrateEyeImage) Decreased LED intensity to {self.ledIntensity}.")
+                        self.dp.DPxUpdateRegCache()
+
+                        print(f"(pglTrackPixx3:calibrateEyeImage) Decreased LED intensity to {self.ledIntensity} {self.dp.TPxGetLEDIntensity()}.")
+
                     elif event.id == "red left":
                         # increase LED intensity
                         self.ledIntensity = min(8, self.ledIntensity + 1)
                         self.dp.TPxSetLEDIntensity(self.ledIntensity)
+                        self.dp.DPxUpdateRegCache()
                         print(f"(pglTrackPixx3:calibrateEyeImage) Increased LED intensity to {self.ledIntensity}.")
                     elif event.id == "green left":
                         # increase lens
                         self.lens = min(2, self.lens + 1)
                         self.dp.TPxSetLens(self.lens)
+                        self.dp.DPxUpdateRegCache()
                         print(f"(pglTrackPixx3:calibrateEyeImage) Increased lens focal length to {self.lens*25+25} mm.")
                     elif event.id == "blue left":
                         # decrease lens
                         self.lens = max(0, self.lens - 1)
+                        self.dp.DPxUpdateRegCache()
                         self.dp.TPxSetLens(self.lens)
                         print(f"(pglTrackPixx3:calibrateEyeImage) Decreased lens focal length to {self.lens*25+25} mm.")
                     else:
