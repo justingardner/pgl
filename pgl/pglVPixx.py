@@ -260,9 +260,13 @@ class pglDataPixx(pglDevice):
             Enable button schedules for the DataPixx device. Button schedules convert button press events into digital output waveforms.
 
             Args:
-                buttonMap (dict): A dictionary mapping button names to their corresponding digital output values. The digital output
+                buttonMap (string or dict): For a string, sets a default mapping of buttons to digital outputs can be: 'all', 'left', or 'right' which map
+                            button presses to digital output values 0001, 0010, 0011, etc (for left, right or all buttons in order of red, yellow, green, blue, white)
+                            or can be 'allPressRelease', 'leftPressRelease', 'rightPressRelease' which map button press and release events (see code for mapping)
+                            For a dict, it should be a dictionary mapping button names to their corresponding digital output values. The digital output
                                   values will be converted into lines, so for example 1 = 0001, 4 = 0100, 7 = 0111 etc
                                   The button names are: redLeft, yellowLeft, greenLeft, blueLeft, whiteLeft, redRight, yellowRight, greenRight, blueRight, whiteRight
+                                  For release events: redLeftRelease, yellowLeftRelease, greenLeftRelease, blueLeftRelease, whiteLeftRelease, etc.
                 pulseWidth (int): The width of the pulse in milliseconds. Default is 50 ms. When tested on oscilliscope, pulses still look good even down to a microsecond in width
             Returns:
                 None
@@ -275,16 +279,50 @@ class pglDataPixx(pglDevice):
             print("(pglDataPixx:enableButtonSchedules) pypixxlib is not installed. Please install it to use DataPixx button schedules.")
             return
         
-        
-        if buttonMap is None:
-            # default button map
-            buttonMap = {
+        allPressRelease =  {
                 'redLeft': 1, 'yellowLeft': 2, 'greenLeft': 3, 'blueLeft': 4, 'whiteLeft': 5,
-                'redLeftRelease': 1, 'yellowLeftRelease': 2, 'greenLeftRelease': 3, 'blueLeftRelease': 4, 'whiteLeftRelease': 5,
-                'redRight': 6, 'yellowRight': 7, 'greenRight': 8, 'blueRight': 9, 'whiteRight': 10,
+                'redLeftRelease': 6, 'yellowLeftRelease': 7, 'greenLeftRelease': 8, 'blueLeftRelease': 9, 'whiteLeftRelease': 10,
+                'redRight': 11, 'yellowRight': 12, 'greenRight': 13, 'blueRight': 14, 'whiteRight': 15,
+                'redRightRelease': 16, 'yellowRightRelease': 17, 'greenRightRelease': 18, 'blueRightRelease': 19, 'whiteRightRelease': 20
+            }
+        allPress = {
+                'redLeft': 1, 'yellowLeft': 2, 'greenLeft': 3, 'blueLeft': 4, 'whiteLeft': 5,
+                'redRight': 6, 'yellowRight': 7, 'greenRight': 8, 'blueRight': 9, 'whiteRight': 10
+            }
+        leftPress = {
+                'redLeft': 1, 'yellowLeft': 2, 'greenLeft': 3, 'blueLeft': 4, 'whiteLeft': 5,
+            }
+        leftPressRelease = {
+                'redLeft': 1, 'yellowLeft': 2, 'greenLeft': 3, 'blueLeft': 4, 'whiteLeft': 5,
+                'redLeftRelease': 6, 'yellowLeftRelease': 7, 'greenLeftRelease': 8, 'blueLeftRelease': 9, 'whiteLeftRelease': 10
+            }
+        rightPressRelease = {
+                'redRight': 1, 'yellowRight': 2, 'greenRight': 3, 'blueRight': 4, 'whiteRight': 5,
                 'redRightRelease': 6, 'yellowRightRelease': 7, 'greenRightRelease': 8, 'blueRightRelease': 9, 'whiteRightRelease': 10
             }
-        
+        if buttonMap is None:
+            # default button map
+            buttonMap = allPress
+        elif isinstance(buttonMap, str):
+            if buttonMap.lower() in ['allpressrelease']:
+                buttonMap = allPressRelease
+            elif buttonMap.lower() in ['all', 'allpress']:
+                buttonMap = allPress
+            elif buttonMap.lower() in ['left', 'leftpress']:
+                buttonMap = leftPress
+            elif buttonMap.lower() in ['leftpressrelease']:
+                buttonMap = leftPressRelease
+            elif buttonMap.lower() in ['right', 'rightpress']:
+                buttonMap = rightPress
+            elif buttonMap.lower() in ['rightpressrelease']:
+                buttonMap = rightPressRelease
+            else:
+                print(f"(pglDataPixx:enableButtonSchedules) Unknown buttonMap type: {buttonMap} (defaulting to all).")
+                buttonMap = allPress
+        elif not isinstance(buttonMap, dict):
+            print(f"(pglDataPixx:enableButtonSchedules) buttonMap should be a string or a dictionary, got {type(buttonMap)}. Defaulting to all.")
+            buttonMap = allPress
+
         #Create our digital output waveforms. Each button press (rising edge) triggers a
         #1 msec trig on the corresponding dout pin, followed by 2 msec on low.
 
