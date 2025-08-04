@@ -170,7 +170,7 @@ class pglTrackPixx3(pglEyeTracker):
                         self.dp.TPxSetLens(self.lens)
                         print(f"(pglTrackPixx3:calibrateEyeImage) Decreased lens focal length to {self.lens*25+25} mm.")
                     else:
-                        print(f"(pglTrackPixx3:calibrateEyeImage) Unknown event: {event.id}")
+                        print(f"(pglTrackPixx3:calibrateEyeImage) Unknown event: {event}")
 
                 # update timer (TPx)
                 self.dp.DPxUpdateRegCache()
