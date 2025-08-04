@@ -115,3 +115,5 @@ class pglDevices:
             eventList = device.poll()
             # add them to the events list
             self.eventsAdd(eventList)
+            # return the eventList
+            return eventList

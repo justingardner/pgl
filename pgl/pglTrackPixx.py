@@ -127,19 +127,25 @@ class pglTrackPixx3(pglEyeTracker):
                 # flush screen
                 self.pgl.flush()
 
-
                 # restart frame time counter
                 lastTime = thisTime
             # If not time for a full refresh, just update time
             else:
+                # update timer (TPx)
+                self.dp.DPxUpdateRegCache()
+                thisTime = self.dp.DPxGetTime()
+
                 # poll for button press events
-                self.pgl.devicesPoll()
-                event = self.pgl.eventsGet()                
-                if event is not None:
+                events = self.pgl.devicesPoll()
+                if events is None: continue
+                #print(events)
+                for event in events:
                     # handle the events
                     if event.id == "white left":
                         # exit the calibration loop
                         print("(pglTrackPixx3:calibrateEyeImage) Exiting calibrate eye image loop")
+                        self.pgl.clearScreen((0,0,0))
+                        self.pgl.flush()
                         self.pgl.clearScreen((0,0,0))
                         self.pgl.flush()
                         loopCalibration = False
@@ -172,9 +178,6 @@ class pglTrackPixx3(pglEyeTracker):
                     else:
                         print(f"(pglTrackPixx3:calibrateEyeImage) Unknown event: {event}")
 
-                # update timer (TPx)
-                self.dp.DPxUpdateRegCache()
-                thisTime = self.dp.DPxGetTime()
 
 
 
