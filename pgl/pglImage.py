@@ -147,14 +147,14 @@ class pglImage:
         elif np.any(imageData > 1):
             # if all values are whole numbers between 0 and 255, this is an 8 bit image
             if np.all(np.floor(imageData) == imageData) and np.all((imageData>=0) & (imageData<=255)):
-                if self.verbose>0: print(f"(pglImage:imageValidate) imageData values were scaled from [0, 255] to [0, 1].")
+                if self.verbose>1: print(f"(pglImage:imageValidate) imageData values were scaled from [0, 255] to [0, 1].")
                 imageData = imageData / 255.0
             else:
                 # scale between min and max
                 minVal = np.min(imageData)
                 maxVal = np.max(imageData)
                 imageData = (imageData - minVal) / (maxVal - minVal)
-                if self.verbose>0: print(f"(pglImage:imageValidate) imageData values were scaled from [{minVal}, {maxVal}] to [0, 1].")
+                if self.verbose>1: print(f"(pglImage:imageValidate) imageData values were scaled from [{minVal}, {maxVal}] to [0, 1].")
 
         # check dimensions
         if imageData.ndim == 2:

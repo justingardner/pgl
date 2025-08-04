@@ -100,4 +100,4 @@ class pglEvent:
         """
         Print the details of the pglEvent instance.
         """
-        print(f"(pglEvent) Device Type: {self.deviceType}")
+        print(f"(pglEvent) Device Type: {self.deviceType}: {self.__repr__()}")

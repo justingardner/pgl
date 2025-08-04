@@ -643,11 +643,11 @@ class pglEventResponsePixx(pglEvent):
         self.code = code
         self.id = id
         self.deviceTime = deviceTime
-
-    def print(self):
+    
+    def __repr__(self):
         '''
-        Print the details of the pglEventResponsePixx instance.
+        Return a string representation of the pglEventResponsePixx instance.
         Returns:
-            None
+            str: String representation of the instance.
         '''
-        print(f"(pglEventResponsePixx) Code: {self.code}, ID: {self.id}, Device Time: {self.deviceTime}")
+        return f"(pglEventResponsePixx) Code: {self.code}, ID: {self.id}, Device Time: {self.deviceTime}"
