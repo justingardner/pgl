@@ -193,6 +193,62 @@ class pglDraw:
         # draw the vertical line
         self.line(x, y - size, x, y + size, color)
 
+    ################################################################
+    # fixationCross
+    ################################################################
+    def fixationCross(self, size=1, x=0, y=0, color=None):
+        """
+        Draw a fixation cross.
+
+        Args:
+            size (float): The size of the cross.
+            x (float): The x coordinate of the center of the cross.
+            y (float): The y coordinate of the center of the cross.
+            color (list or tuple, optional): RGB color values as a list or tuple of three floats in the range [0, 1].
+
+        Returns:
+            None
+        """
+        # validate color
+        color = self.validateColor(color, withAlpha=False)
+
+        # draw the horizontal line
+        self.line(x - size, y, x + size, y, color)
+
+        # draw the vertical line
+        self.line(x, y - size, x, y + size, color)
+
+    ################################################################
+    # circle
+    ################################################################
+    def circle(self, radius=1, x=0, y=0, color=None, numSegments=36):
+        """
+        Draw a circle.
+
+        Args:
+            radius (float): The radius of the circle.
+            x (float): The x coordinate of the center of the circle.
+            y (float): The y coordinate of the center of the circle.
+            color (list or tuple, optional): RGB color values as a list or tuple of three floats in the range [0, 1].
+
+        Returns:
+            None
+        """
+        # validate color
+        color = self.validateColor(color, withAlpha=False)
+
+        # draw the circle using a series of line segments
+        for i in range(numSegments):
+            # calculate start and stop angle for segment
+            angle1 = 2 * np.pi * i / numSegments
+            angle2 = 2 * np.pi * (i + 1) / numSegments
+            # draw that segment
+            x1 = x + radius * np.cos(angle1)
+            y1 = y + radius * np.sin(angle1)
+            x2 = x + radius * np.cos(angle2)
+            y2 = y + radius * np.sin(angle2)
+            self.line(x1, y1, x2, y2, color)
+
     ####################################################
     # validate color
     ####################################################
@@ -215,7 +271,7 @@ class pglDraw:
         if isinstance(color, (int, float)):
             color = [color, color, color]
 
-        if not isinstance(color, (list, tuple)):
+        if not isinstance(color, (list, tuple, np.ndarray)):
             print("(pgldraw:validateColor) Color must be a list or tuple of three floats. Defaulting to white.")
             color = [1.0, 1.0, 1.0]
 
