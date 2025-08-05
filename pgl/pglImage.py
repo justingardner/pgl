@@ -9,6 +9,7 @@
 # Import modules
 #############
 import numpy as np
+from types import SimpleNamespace
 
 #############
 # Image class
@@ -69,7 +70,7 @@ class pglImage:
 
         if displaySize is None:
             # default size is image size
-            displaySize = (imageInstance.imageWidth * self.xPix2Deg, imageInstance.imageHeight * self.yPix2Deg)
+            displaySize = (imageInstance.width.pix * self.xPix2Deg, imageInstance.height.pix * self.yPix2Deg)
         if displayLocation is None:
             # default location is center of screen
             displayLocation = (0, 0)
@@ -79,6 +80,14 @@ class pglImage:
         vertexRight = displaySize[0]/2 + displayLocation[0]
         vertexTop = displaySize[1]/2 + displayLocation[1]
         vertexBottom = -displaySize[1]/2 + displayLocation[1]
+
+        # keep this coordinates for reference
+        imageInstance.displayed = True
+        imageInstance.displayTime = self.getDateAndTime()
+        imageInstance.displayLeft= vertexLeft
+        imageInstance.displayRight = vertexRight
+        imageInstance.displayTop = vertexTop
+        imageInstance.displayBottom = vertexBottom
         
         if self.verbose>1:
             print(f"(pglImage:imageDisplay) Displaying image {imageInstance.imageNum} at {displayLocation} with size {displaySize}.")
@@ -199,11 +208,12 @@ class _pglImageInstance:
         # keep reference to pgl 
         self.pgl = pgl
         # and image info
-        self.imageWidth = imageWidth
-        self.imageHeight = imageHeight
+        self.width = SimpleNamespace(pix=imageWidth)
+        self.height = SimpleNamespace(pix=imageHeight)
         self.imageNum = imageNum
+        self.displayed = None
         if pgl.verbose>1: 
-            print(f"(pglImage:_pglImageInstance) Created image instance with: {self.imageNum} ({self.imageWidth}x{self.imageHeight})")
+            print(f"(pglImage:_pglImageInstance) Created image instance with: {self.imageNum} ({self.width.pix}x{self.height.pix})")
     def __del__(self):
         # call the pgl function 
         self.pgl.imageDelete(self)
@@ -214,4 +224,7 @@ class _pglImageInstance:
         # call the pgl function to display
         self.pgl.imageDisplay(self, displayLocation, displaySize)
     def print(self):
-       print(f"imageNum: {self.imageNum} ({self.imageWidth}x{self.imageHeight})")
+       if self.displayed is not None:
+            print(f"Image {self.imageNum} ({self.width.pix}x{self.height.pix}) displayed: left: {self.displayLeft} right: {self.displayRight} bottom: {self.displayBottom} top: {self.displayTop} time: {self.displayTime}")
+       else:
+           print(f"Image: {self.imageNum} ({self.width.pix}x{self.height.pix})")

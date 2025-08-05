@@ -120,7 +120,7 @@ class pglDraw:
     ################################################################
     # line
     ################################################################
-    def line(self, x1, y1, x2, y2, lineColor=None):
+    def line(self, x1, y1, x2, y2, color=None, units=None):
         """
         Draw a line
 
@@ -129,16 +129,25 @@ class pglDraw:
             y1 (float): y coordinate of the start point
             x2 (float): x coordinate of the end point
             y2 (float): y coordinate of the end point
-            lineColor (list or tuple, optional): RGB color values as a list or tuple of three floats in the range [0, 1]
+            color (list or tuple, optional): RGB color values as a list or tuple of three floats in the range [0, 1]
 
         Returns:
             None
         """
         # set defaults
-        if lineColor is None: lineColor = np.ones(3)
+        if color is None: color = np.ones(3)
 
         # validate color
-        lineColor = self.validateColor(lineColor, withAlpha=False)
+        color = self.validateColor(color, withAlpha=False)
+
+        # Convert units if necessary
+        if units is None:
+            pass
+        elif units.lower() in ("pixels","pix","pixel","px"):
+            x1, y1 = self.pix2deg(x1, y1)
+            x2, y2 = self.pix2deg(x2, y2)
+        elif units != "device":
+            print(f"(pglDraw:line) Invalid units '{units}'. Using deg units.")
 
         # make into vertex data
         if isinstance(x1, (list, tuple, np.ndarray)):
@@ -151,11 +160,11 @@ class pglDraw:
             vertexData = np.array([], dtype=np.float32)
             for iLine in range(nLines):
                 # if x1 is a list or array, use the corresponding y1, x2, y2
-                vertexData = np.append(vertexData,np.array([x1[iLine], y1[iLine], 0, *lineColor, x2[iLine], y2[iLine], 0, *lineColor], dtype=np.float32))
+                vertexData = np.append(vertexData,np.array([x1[iLine], y1[iLine], 0, *color, x2[iLine], y2[iLine], 0, *color], dtype=np.float32))
 
         else:
             # if x1 is a single value, then draw a single line
-            vertexData = np.array([x1, y1, 0, *lineColor, x2, y2, 0, *lineColor], dtype=np.float32)
+            vertexData = np.array([x1, y1, 0, *color, x2, y2, 0, *color], dtype=np.float32)
             nLines = 1
 
         # send line command
