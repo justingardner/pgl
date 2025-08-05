@@ -79,6 +79,10 @@ class _pglComm:
         elif isinstance(message, np.ndarray) and np.issubdtype(message.dtype, np.float32):
             # pack as 4 byte floats
             packed = message.astype(np.float32).tobytes()
+        # array of doubles
+        elif isinstance(message, np.ndarray) and np.issubdtype(message.dtype, np.float64):
+            # pack as 8 byte doubles
+            packed = message.astype(np.float64).tobytes()
         else:
             raise TypeError("Unsupported data type")
 
