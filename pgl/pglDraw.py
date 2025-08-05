@@ -86,38 +86,6 @@ class pglDraw:
         self.s.readCommandResults()
 
     ################################################################
-    # dots
-    ################################################################
-    def dots(self, x, y, z=None, dotColor=None, dotSize=None, dotShape=None, dotAntialiasingBorder=None):
-        """
-        Draw dots
-
-        Args:
-            
-
-        Returns:
-            bool: True if the dots drew correctly
-        """
-        # set defaults
-        if z is None: z = 0.0
-        if dotColor is None: dotColor = np.ones(4)
-        if dotSize is None: dotSize = np.ones(2)*10
-        if dotShape is None: dotShape = 1
-        if dotAntialiasingBorder is None: dotAntialiasingBorder = 0
-
-        # make into an array
-        dotData = np.array([x,y,z,*dotColor,*dotSize,dotShape,dotAntialiasingBorder], dtype=np.float32)
-
-        # send dots commanbd
-        self.s.writeCommand("mglDots")
-        # send the number of dots
-        self.s.write(np.uint32(1))
-        # send the data
-        self.s.write(dotData)
-        # read the command results
-        self.s.readCommandResults()
-
-    ################################################################
     # line
     ################################################################
     def line(self, x1, y1, x2, y2, color=None, units=None):
@@ -300,3 +268,40 @@ class pglDraw:
 
         # Convert to numpy array and ensure it's float32
         return np.array(color, dtype=np.float32)
+    ####################################################
+    # arcs
+    ####################################################
+    def arc(self, x, y, innerRadius=0, outerRadius=1, startAngle=0, stopAngle=np.pi, borderSize=0.1, color=None):
+        """
+        Draw arcs.
+
+        Args:
+            x (float or list): x coordinate(s) of the center of the arc(s).
+            y (float or list): y coordinate(s) of the center of the arc(s).
+            innerRadius (float): The inner radius of the arc.
+            outerRadius (float): The outer radius of the arc.
+            startAngle (float): The starting angle of the arc in radians.           
+            stopAngle (float): The stopping angle of the arc in radians.
+            color (list or tuple, optional): RGB color values as a list or tuple of three floats in the range [0, 1].
+
+        Returns:
+            None
+        """
+        # validate color
+        color = self.validateColor(color)
+
+        # get vertex data
+        vertexData = [x, y, 0, *color, innerRadius, outerRadius, innerRadius, outerRadius, startAngle, stopAngle, borderSize]
+        print(np.array(vertexData, dtype=np.double))
+        # send arc command
+        self.s.writeCommand("mglArcs")
+        ack = self.s.readAck()
+
+        # send the number of arcs
+        self.s.write(np.uint32(1))
+        # send the vertex data
+        self.s.write(np.array(vertexData, dtype=np.float32))
+
+        # read the command results
+        results = self.s.readCommandResults(ack)
+

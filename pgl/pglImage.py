@@ -76,19 +76,15 @@ class pglImage:
             displayLocation = (0, 0)
 
         # vertex coordinates in device coordinates
-        vertexLeft = -displaySize[0]/2 + displayLocation[0]
-        vertexRight = displaySize[0]/2 + displayLocation[0]
-        vertexTop = displaySize[1]/2 + displayLocation[1]
-        vertexBottom = -displaySize[1]/2 + displayLocation[1]
+        imageInstance.displayLeft = -displaySize[0]/2 + displayLocation[0]
+        imageInstance.displayRight = displaySize[0]/2 + displayLocation[0]
+        imageInstance.displayTop = displaySize[1]/2 + displayLocation[1]
+        imageInstance.displayBottom = -displaySize[1]/2 + displayLocation[1]
 
         # keep this coordinates for reference
         imageInstance.displayed = True
         imageInstance.displayTime = self.getDateAndTime()
-        imageInstance.displayLeft= vertexLeft
-        imageInstance.displayRight = vertexRight
-        imageInstance.displayTop = vertexTop
-        imageInstance.displayBottom = vertexBottom
-        
+
         if self.verbose>1:
             print(f"(pglImage:imageDisplay) Displaying image {imageInstance.imageNum} at {displayLocation} with size {displaySize}.")
         # no z coordinate
@@ -103,13 +99,13 @@ class pglImage:
         # create the two triangles which map the texture (ie image)
         # to vertices in device coordinates
         vertices = np.array([
-            [vertexRight, vertexTop, z, texRight, texTop],
-            [vertexLeft, vertexTop, z, texLeft, texTop],
-            [vertexLeft, vertexBottom, z, texLeft, texBottom],
+            [imageInstance.displayRight, imageInstance.displayTop, z, texRight, texTop],
+            [imageInstance.displayLeft, imageInstance.displayTop, z, texLeft, texTop],
+            [imageInstance.displayLeft, imageInstance.displayBottom, z, texLeft, texBottom],
 
-            [vertexRight, vertexTop, z, texRight, texTop],
-            [vertexLeft, vertexBottom, z, texLeft, texBottom],
-            [vertexRight, vertexBottom, z, texRight, texBottom]
+            [imageInstance.displayRight, imageInstance.displayTop, z, texRight, texTop],
+            [imageInstance.displayLeft, imageInstance.displayBottom, z, texLeft, texBottom],
+            [imageInstance.displayRight, imageInstance.displayBottom, z, texRight, texBottom]
         ], dtype=np.float32) 
         nVertices = np.float32(vertices.shape[0])
 
@@ -126,7 +122,17 @@ class pglImage:
     def imageDelete(self, imageInstance):
         '''
         '''
-        pass
+        if self.isOpen() == False:
+            return
+        if not isinstance(imageInstance, _pglImageInstance):
+            print("(pglImage:imageDelete) imageInstance should be an instance of _pglImageInstance.")
+            return
+        
+        if self.verbose>=1: print(f"(pglImage:imageDelete) Deleting image {imageInstance.imageNum} ({imageInstance.width.pix}x{imageInstance.height.pix})")
+        # send the deleteTexture command
+        self.s.writeCommand("mglDeleteTexture")
+        self.s.write(np.double(imageInstance.imageNum))
+        self.commandResults = self.s.readCommandResults()
 
     def imageValidate(self, imageData):
         '''
@@ -205,8 +211,10 @@ class _pglImageInstance:
     #   0: phase (default)
     phase = 0
     def __init__(self, imageNum, imageWidth, imageHeight, pgl):
+        
         # keep reference to pgl 
         self.pgl = pgl
+        
         # and image info
         self.width = SimpleNamespace(pix=imageWidth)
         self.height = SimpleNamespace(pix=imageHeight)
