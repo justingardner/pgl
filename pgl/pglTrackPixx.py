@@ -124,6 +124,33 @@ class pglTrackPixx3(pglEyeTracker):
                 cameraImage = self.getCameraImage()
                 cameraImage.display()
 
+                # Get eye data in camera space
+                expectedIrisSize = self.dp.TPxGetIrisExpectedSize()
+                (ppLeftMajor, _, ppRightMajor, _) = self.dp.TPxGetPupilSize() 
+                (ppLeftX, ppLeftY, ppRightX, ppRightY) = self.dp.TPxGetPupilCoordinatesInPixels() 
+
+                # covert to degrees for display
+                ppLeftXDeg = ppLeftX * self.pgl.xPix2Deg + cameraImage.displayLeft
+                ppLeftYDeg = -ppLeftY * self.pgl.yPix2Deg + cameraImage.displayTop
+                ppRightXDeg = ppRightX * self.pgl.xPix2Deg + cameraImage.displayLeft
+                ppRightYDeg = -ppRightY * self.pgl.yPix2Deg + cameraImage.displayTop
+
+                # get center of left and right pupils in degrees
+                eyeLeft = (ppLeftXDeg, ppLeftYDeg)
+                eyeRight = (ppRightXDeg, ppRightYDeg)
+
+                # draw cross at the pupil center
+                if ppLeftMajor > 0:
+                    self.pgl.line(eyeLeft[0], eyeLeft[1]+self.pgl.yPix2Deg * ppLeftMajor/2, eyeLeft[0], eyeLeft[1]-self.pgl.yPix2Deg * ppLeftMajor/2, color=(0,1,0))
+                    self.pgl.line(eyeLeft[0]-self.pgl.xPix2Deg * ppLeftMajor/2, eyeLeft[1], eyeLeft[0]+self.pgl.xPix2Deg * ppLeftMajor/2, eyeLeft[1], color=(0,1,0))
+                else:
+                    self.pgl.fixationCross(1,cameraImage.displayLeft, cameraImage.displayTop, color=(1,0,0))
+                if ppRightMajor > 0:
+                    self.pgl.line(eyeRight[0], eyeRight[1]+self.pgl.yPix2Deg * ppRightMajor/2, eyeRight[0], eyeRight[1]-self.pgl.yPix2Deg * ppRightMajor/2, color=(0,1,1))
+                    self.pgl.line(eyeRight[0]-self.pgl.xPix2Deg * ppRightMajor/2, eyeRight[1], eyeRight[0]+self.pgl.xPix2Deg * ppRightMajor/2, eyeRight[1], color=(0,1,1))
+                else:
+                    self.pgl.fixationCross(1,cameraImage.displayRight, cameraImage.displayTop, color=(1,0,0))
+                
                 # flush screen
                 self.pgl.flush()
 
