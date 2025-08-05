@@ -56,7 +56,7 @@ class pglDraw:
     ################################################################
     # dots
     ################################################################
-    def dots(self, x, y, z=None, dotColor=None, dotSize=None, dotShape=None, dotAntialiasingBorder=None):
+    def dots(self, x, y, z=None, color=None, dotSize=None, dotShape=None, dotAntialiasingBorder=None):
         """
         Draw dots
 
@@ -68,13 +68,13 @@ class pglDraw:
         """
         # set defaults
         if z is None: z = 0.0
-        if dotColor is None: dotColor = np.ones(4)
+        if color is None: color = np.ones(4)
         if dotSize is None: dotSize = np.ones(2)*10
         if dotShape is None: dotShape = 1
         if dotAntialiasingBorder is None: dotAntialiasingBorder = 0
 
         # make into an array
-        dotData = np.array([x,y,z,*dotColor,*dotSize,dotShape,dotAntialiasingBorder], dtype=np.float32)
+        dotData = np.array([x,y,z,*color,*dotSize,dotShape,dotAntialiasingBorder], dtype=np.float32)
 
         # send dots commanbd
         self.s.writeCommand("mglDots")

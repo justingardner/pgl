@@ -56,7 +56,7 @@ class pglEvents:
             self.events.append(events)
 
     ################################################################
-    # create an event type
+    # Gets an event
     ################################################################
     def eventsGet(self):
         '''
@@ -71,6 +71,27 @@ class pglEvents:
         if self.events:
             return self.events.pop(0)
         return None
+    ################################################################
+    # eventsWaitFor
+    ################################################################
+    def eventsWaitFor(self, waitForList):
+        """
+        Wait for specific events to occur.
+
+        Args:
+            waitForList (list): A list of event types to wait for.
+
+        Returns:
+            pglEvent: An instance of pglEvent containing the event data.
+        """
+        while True:
+            # Poll for events
+            events = self.devicesPoll()
+            if events:
+                for event in events:
+                    if event.id in waitForList:
+                        return event
+            self.waitSecs(0.01)
 
 #################################################################
 # Parent classes for events

@@ -128,11 +128,11 @@ class pglImage:
             print("(pglImage:imageDelete) imageInstance should be an instance of _pglImageInstance.")
             return
         
-        if self.verbose>=1: print(f"(pglImage:imageDelete) Deleting image {imageInstance.imageNum} ({imageInstance.width.pix}x{imageInstance.height.pix})")
+        ##if self.verbose>=1: print(f"(pglImage:imageDelete) Deleting image {imageInstance.imageNum} ({imageInstance.width.pix}x{imageInstance.height.pix})")
         # send the deleteTexture command
-        self.s.writeCommand("mglDeleteTexture")
-        self.s.write(np.double(imageInstance.imageNum))
-        self.commandResults = self.s.readCommandResults()
+        #self.s.writeCommand("mglDeleteTexture")
+        #self.s.write(np.double(imageInstance.imageNum))
+        #self.commandResults = self.s.readCommandResults()
 
     def imageValidate(self, imageData):
         '''
