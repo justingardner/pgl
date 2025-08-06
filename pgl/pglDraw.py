@@ -384,28 +384,26 @@ class pglDraw:
         textHeight = textHeight * self.yPix2Deg
         padding = padding * self.yPix2Deg
         lineHeight = textHeight + padding * 2
-
+        linesPerScreen = int(self.screenHeight.deg / lineHeight)
+        
         if line is None and y is None:
             # get current line number
             line = self.currentLine
-            # check to see if we will go over the bottom
-            if ((line+1) * lineHeight) > self.screenHeight.deg:
-                # reset next line number to 1
-                self.currentLine = 1
-            else:
-                self.currentLine += 1
+            # and update
+            self.currentLine += 1
 
+        # negative line numbers
+        if line < 0: line = linesPerScreen + line + 1
 
         # calculate line if necessary
         if line is not None:
-            if line>0:
-                # if line is specified, calculate y based on line number
-                y =  self.screenHeight.deg / 2 - textHeight/2 - (line - 1) * (textHeight + padding * 2) - padding
-                self.currentLine = line+1
-            else:
-                # if line is negative, calculate y based on line number from the bottom
-                y = -self.screenHeight.deg / 2 + textHeight/2 + (-line - 1) * (textHeight + padding * 2) + padding
-            
+            # if line is specified, calculate y based on line number
+            y =  self.screenHeight.deg / 2 - textHeight/2 - (line - 1) * (textHeight + padding * 2) - padding
+            self.currentLine = line+1
+
+        # check to see if we will go over the bottom
+        if self.currentLine > linesPerScreen: self.currentLine = 1
+   
         # create the image and display
         img = self.imageCreate(np.array(img))
         img.display(displayLocation=(x,y))
