@@ -336,6 +336,7 @@ class pglDraw:
         fontPath = "/System/Library/Fonts"
         p = Path(fontName)
         # add ttf suffix if not specified
+        if not p.suffix: fontName += ".ttc"
         if p.is_absolute():
             # If the fontName is an absolute path, use it directly
             fontFullName = fontName
