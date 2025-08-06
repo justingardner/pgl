@@ -401,6 +401,7 @@ class pglDraw:
             if line>0:
                 # if line is specified, calculate y based on line number
                 y =  self.screenHeight.deg / 2 - textHeight/2 - (line - 1) * (textHeight + padding * 2) - padding
+                self.currentLine = line+1
             else:
                 # if line is negative, calculate y based on line number from the bottom
                 y = -self.screenHeight.deg / 2 + textHeight/2 + (-line - 1) * (textHeight + padding * 2) + padding
