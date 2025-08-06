@@ -308,7 +308,7 @@ class pglDraw:
     ######################################################
     # text
     ######################################################
-    def text(self, str, x=0, y=0, color=None, fontSize=40, fontName="Helvetica"):
+    def text(self, str, x=0, y=0, color=None, fontSize=40, fontName="Helvetica", line=None):
         """
         Draw text on the screen.
 
@@ -316,10 +316,13 @@ class pglDraw:
             str (str): The text to draw.
             x (float): The x coordinate of the text.
             y (float): The y coordinate of the text.
+            line (int): The line number to draw the text on. IF this
+                        is set, y will be ignored and instead the text
+                        will be drawn on the specified line.
             color (list or tuple, optional): RGB color values as a list or tuple of three floats in the range [0, 1].
             fontSize (int): The size of the font.
             fontName (str): The name of the font.
-            units (str): The units for the coordinates. Default is "deg".
+
 
         Returns:
             None
@@ -333,25 +336,36 @@ class pglDraw:
         font = ImageFont.truetype(fontPath, fontSize)
 
         # padding around text
-        padding = 10 
+        padding = 11
 
         # Create a dummy image to measure text size
         dummyImg = Image.new("RGBA", (1, 1))
         draw = ImageDraw.Draw(dummyImg)
 
-        # Get bounding box of the text
+        # Get bounding box for text sample of characters that are usually the tallest
+        # to get font height, get text width from actual string
+        bbox = draw.textbbox((0, 0), "HITLFEfhkl", font=font)
+        textHeight = bbox[3] - bbox[1]
         bbox = draw.textbbox((0, 0), str, font=font)
-        text_width = bbox[2] - bbox[0]
-        text_height = bbox[3] - bbox[1]
+        textWidth = bbox[2] - bbox[0]
 
         # Create an image with transparent background
-        img = Image.new("RGBA", (text_width + 2 * padding, text_height + 2 * padding), (0, 0, 0, 0))
+        img = Image.new("RGBA", (textWidth + 2 * padding, textHeight + 2 * padding), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
 
         # Draw anti-aliased text
         draw.text((padding, padding), str, font=font, fill=tuple(int(255*c) for c in color))
 
-        # Convert to NumPy array
+        # calculate line if necessary
+        if line is not None:
+            print(textHeight)
+            # get text height in degrees
+            textHeight = textHeight * self.yPix2Deg
+            padding = padding * self.yPix2Deg
+            # if line is specified, calculate y based on line number
+            y =  self.screenHeight.deg / 2 - textHeight/2 - (line - 1) * (textHeight + padding * 2) - padding
+
+        # create the image and display
         img = self.imageCreate(np.array(img))
         img.display(displayLocation=(x,y))
 
