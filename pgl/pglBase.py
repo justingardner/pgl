@@ -257,6 +257,9 @@ class pglBase:
                 self.profileModeCommandResults[self.profileModeBufferIndex] = self.commandResults 
             self.profileModeBufferIndex += 1
         
+        # reset line counter for pglDraw:text
+        self.currentLine = 1
+        
         # success
         return True
     

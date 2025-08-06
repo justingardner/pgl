@@ -21,6 +21,10 @@ class pglDraw:
     """
     pglDraw class for drawing operations.
     """
+    def __init__(self):   
+        # set current line starting at top of screen
+        self.currentLine = 1
+    
 
     ################################################################
     # clearScreen
@@ -309,14 +313,18 @@ class pglDraw:
     ######################################################
     # text
     ######################################################
-    def text(self, str, x=0, y=0, color=None, fontSize=40, fontName="Helvetica", line=None):
+    def text(self, str, x=0, y=None, color=None, fontSize=40, fontName="Helvetica", line=None):
         """
         Draw text on the screen.
 
         Args:
             str (str): The text to draw.
-            x (float): The x coordinate of the text.
-            y (float): The y coordinate of the text.
+            x (float): The x coordinate of the text. 
+            y (float): The y coordinate of the text. If omitted and line is not set
+                        then the text will be drawn at the top of the screen and
+                        each subsequent call will draw text one line below until
+                        the bottom of the screen is reached, upon which it will
+                        revert to the top of the screen.
             line (int): The line number to draw the text on. IF this
                         is set, y will be ignored and instead the text
                         will be drawn on the specified line from top of screen.
@@ -372,18 +380,31 @@ class pglDraw:
         # Draw anti-aliased text
         draw.text((padding, padding), str, font=font, fill=tuple(int(255*c) for c in color))
 
+        # get text height in degrees
+        textHeight = textHeight * self.yPix2Deg
+        padding = padding * self.yPix2Deg
+        lineHeight = textHeight + padding * 2
+
+        if line is None and y is None:
+            # get current line number
+            line = self.currentLine
+            # check to see if we will go over the bottom
+            if ((line+1) * lineHeight) > self.screenHeight.deg:
+                # reset next line number to 1
+                self.currentLine = 1
+            else:
+                self.currentLine += 1
+
+
         # calculate line if necessary
         if line is not None:
-            # get text height in degrees
-            textHeight = textHeight * self.yPix2Deg
-            padding = padding * self.yPix2Deg
             if line>0:
                 # if line is specified, calculate y based on line number
                 y =  self.screenHeight.deg / 2 - textHeight/2 - (line - 1) * (textHeight + padding * 2) - padding
             else:
                 # if line is negative, calculate y based on line number from the bottom
                 y = -self.screenHeight.deg / 2 + textHeight/2 + (-line - 1) * (textHeight + padding * 2) + padding
-
+            
         # create the image and display
         img = self.imageCreate(np.array(img))
         img.display(displayLocation=(x,y))
@@ -391,6 +412,7 @@ class pglDraw:
     def test(self):
         try:
             import signal
+            # pause the signal handler for Ctrl-C
             originalHandler = signal.getsignal(signal.SIGINT)
             signal.signal(signal.SIGINT, signal.SIG_IGN)
             self.waitSecs(5)
