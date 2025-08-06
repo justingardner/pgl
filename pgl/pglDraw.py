@@ -318,7 +318,8 @@ class pglDraw:
             y (float): The y coordinate of the text.
             line (int): The line number to draw the text on. IF this
                         is set, y will be ignored and instead the text
-                        will be drawn on the specified line.
+                        will be drawn on the specified line from top of screen.
+                        If line is negative, then from the bottom of the screen.
             color (list or tuple, optional): RGB color values as a list or tuple of three floats in the range [0, 1].
             fontSize (int): The size of the font.
             fontName (str): The name of the font.
@@ -362,8 +363,12 @@ class pglDraw:
             # get text height in degrees
             textHeight = textHeight * self.yPix2Deg
             padding = padding * self.yPix2Deg
-            # if line is specified, calculate y based on line number
-            y =  self.screenHeight.deg / 2 - textHeight/2 - (line - 1) * (textHeight + padding * 2) - padding
+            if line>0:
+                # if line is specified, calculate y based on line number
+                y =  self.screenHeight.deg / 2 - textHeight/2 - (line - 1) * (textHeight + padding * 2) - padding
+            else:
+                # if line is negative, calculate y based on line number from the bottom
+                y = -self.screenHeight.deg / 2 + textHeight/2 + (-line - 1) * (textHeight + padding * 2) + padding
 
         # create the image and display
         img = self.imageCreate(np.array(img))
