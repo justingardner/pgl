@@ -14,6 +14,7 @@ import numpy as np
 from . import _pglComm as pglComm
 from . import _resolution
 from types import SimpleNamespace
+import signal
 
 #############
 # Main class
@@ -277,13 +278,21 @@ class pglBase:
         if self.s is None: 
             print(f"(pglBase:setWindowFrameInDisplay) ❌ No screen is open")
             return
-        self.s.writeCommand("mglSetWindowFrameInDisplay")
-        self.s.write(np.uint32(whichScreen+1))  # whichScreen is 0-indexed in Python, but 1-indexed in mglMetal
-        self.s.write(np.uint32(screenX))
-        self.s.write(np.uint32(screenY))
-        self.s.write(np.uint32(screenWidth))
-        self.s.write(np.uint32(screenHeight))
-        self.commandResults = self.s.readCommandResults()
+        try:
+            # pause interrupts so we don't get interrupted by Ctrl-C
+            self.pauseInterrupts()
+            # send the commands
+            self.s.writeCommand("mglSetWindowFrameInDisplay")
+            self.s.write(np.uint32(whichScreen+1))  # whichScreen is 0-indexed in Python, but 1-indexed in mglMetal
+            self.s.write(np.uint32(screenX))
+            self.s.write(np.uint32(screenY))
+            self.s.write(np.uint32(screenWidth))
+            self.s.write(np.uint32(screenHeight))
+            self.commandResults = self.s.readCommandResults()
+        finally:
+            # restore interrupts
+            self.restoreInterrupts()
+
         # save pixel dimensions
         self.screenWidth.pix = screenWidth
         self.screenHeight.pix = screenHeight
@@ -532,7 +541,29 @@ class pglBase:
             # not macOS
             print("(pgl:checkOS) PGL is only supported on macOS")
             return False
+
+    #################################################################
+    # Pause interrupts
+    #################################################################
+    def pauseInterrupts(self):
+        """
+        Pause interrupts by ignoring the SIGINT signal (Ctrl-C).
+        
+        Used for when running communication to mglMetal
+        """
+        # keep original handler so we can restore it later
+        self.originalHandler = signal.getsignal(signal.SIGINT)
+        # ignore SIGINT (Ctrl-C)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
     
+    #################################################################
+    # Pause interrupts
+    #################################################################
+    def restoreInterrupts(self):
+        """
+        Restore interrupts by re-enabling the SIGINT signal (Ctrl-C).
+        """
+        signal.signal(signal.SIGINT, self.originalHandler)
 
 ################
 # getCPUInfo   #

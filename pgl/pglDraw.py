@@ -388,5 +388,14 @@ class pglDraw:
         img = self.imageCreate(np.array(img))
         img.display(displayLocation=(x,y))
 
-
+    def test(self):
+        try:
+            import signal
+            originalHandler = signal.getsignal(signal.SIGINT)
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            self.waitSecs(5)
+            print("Test complete")
+        finally:
+            # Restore original handler so Ctrl-C works again
+            signal.signal(signal.SIGINT, originalHandler)
 
