@@ -10,6 +10,7 @@
 # Import modules
 #############
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 
 #############
 # Drawing class
@@ -304,4 +305,55 @@ class pglDraw:
 
         # read the command results
         results = self.s.readCommandResults(ack)
+    ######################################################
+    # text
+    ######################################################
+    def text(self, str, x=0, y=0, color=None, fontSize=40, fontName="Helvetica"):
+        """
+        Draw text on the screen.
+
+        Args:
+            str (str): The text to draw.
+            x (float): The x coordinate of the text.
+            y (float): The y coordinate of the text.
+            color (list or tuple, optional): RGB color values as a list or tuple of three floats in the range [0, 1].
+            fontSize (int): The size of the font.
+            fontName (str): The name of the font.
+            units (str): The units for the coordinates. Default is "deg".
+
+        Returns:
+            None
+        """
+        # validate color
+        color = self.validateColor(color)
+
+        # Load Helvetica (on macOS)
+        fontPath = "/System/Library/Fonts/Helvetica.ttc"
+        fontSize = 40
+        font = ImageFont.truetype(fontPath, fontSize)
+
+        # padding around text
+        padding = 10 
+
+        # Create a dummy image to measure text size
+        dummyImg = Image.new("RGBA", (1, 1))
+        draw = ImageDraw.Draw(dummyImg)
+
+        # Get bounding box of the text
+        bbox = draw.textbbox((0, 0), str, font=font)
+        text_width = bbox[2] - bbox[0]
+        text_height = bbox[3] - bbox[1]
+
+        # Create an image with transparent background
+        img = Image.new("RGBA", (text_width + 2 * padding, text_height + 2 * padding), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+
+        # Draw anti-aliased text
+        draw.text((padding, padding), str, font=font, fill=tuple(int(255*c) for c in color))
+
+        # Convert to NumPy array
+        img = self.imageCreate(np.array(img))
+        img.display(displayLocation=(x,y))
+
+
 
