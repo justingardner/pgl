@@ -11,6 +11,8 @@
 #############
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+import os
+from pathlib import Path
 
 #############
 # Drawing class
@@ -242,7 +244,6 @@ class pglDraw:
             np.ndarray: A numpy array of the validated color.
         """
         if color is None:
-            print("(pglDraw:validateColor) Color is None. Defaulting to white.")
             color = [1.0, 1.0, 1.0]
 
         # If a scalar is provided, convert it to grayscale
@@ -331,11 +332,24 @@ class pglDraw:
         # validate color
         color = self.validateColor(color)
 
-        # Load Helvetica (on macOS)
-        fontPath = "/System/Library/Fonts/Helvetica.ttc"
-        fontSize = 40
-        font = ImageFont.truetype(fontPath, fontSize)
-
+        # Load Font
+        fontPath = "/System/Library/Fonts"
+        p = Path(fontName)
+        # add ttf suffix if not specified
+        if p.is_absolute():
+            # If the fontName is an absolute path, use it directly
+            fontFullName = fontName
+        else:
+            # join with default font path
+            fontFullName = os.path.join(fontPath, fontName)
+        try:
+            # Try to load the specified font
+            font = ImageFont.truetype(fontFullName, fontSize)
+        except:
+            print(f"(pglDraw:text) Failed to load font '{fontName}' from '{fontPath}'. Using default font.")
+            fontFullName = os.path.join(fontPath,"Helvetica.ttc")
+            font = ImageFont.truetype(fontFullName, fontSize)
+        
         # padding around text
         padding = 11
 
@@ -359,7 +373,6 @@ class pglDraw:
 
         # calculate line if necessary
         if line is not None:
-            print(textHeight)
             # get text height in degrees
             textHeight = textHeight * self.yPix2Deg
             padding = padding * self.yPix2Deg
