@@ -63,32 +63,68 @@ class pglDraw:
     ################################################################
     # dots
     ################################################################
-    def dots(self, x, y, z=None, color=None, dotSize=None, dotShape=None, dotAntialiasingBorder=None):
+    def dots(self, x, y, z=0, color=None, dotSize=np.ones(2)*10, dotShape=1, dotAntialiasingBorder=0):
         """
         Draw dots
 
         Args:
-            
+            x (float or array-like): The x coordinates of the dots.
+            y (float or array-like): The y coordinates of the dots.
+            z (float or array-like, optional): The z coordinates of the dots (default is 0.0).
+            color (list or tuple, optional): RGB color values as a list or tuple of three floats in the range [0, 1].
+            dotSize (float or array-like, optional): The size of the dots (default is 10).
+            dotShape (int, optional): The shape of the dots (default is 1).
+            dotAntialiasingBorder (float, optional): The antialiasing border size (default is 0).
 
         Returns:
-            bool: True if the dots drew correctly
+            bool: True if the dots were drawn successfully, False otherwise.
         """
-        # set defaults
-        if z is None: z = 0.0
-        if color is None: color = np.ones(4)
-        if dotSize is None: dotSize = np.ones(2)*10
-        if dotShape is None: dotShape = 1
-        if dotAntialiasingBorder is None: dotAntialiasingBorder = 0
+        # Convert inputs to 1D arrays (even if scalar)
+        x = np.atleast_1d(np.ravel(x))
+        y = np.atleast_1d(np.ravel(y))
 
-        # make into an array
-        dotData = np.array([x,y,z,*color,*dotSize,dotShape,dotAntialiasingBorder], dtype=np.float32)
+        # Check that lengths match
+        if not (x.shape == y.shape):
+            print("(pglDraw:dots) x, y must all be the same length.")
+            return False
 
-        # send dots commanbd
+        # Init dotVertexData with appropriate size matrix
+        n = x.shape[0]
+        dotVertexData = np.zeros((n, 11), dtype=np.float32)
+        dotVertexData[:, 0] = x
+        dotVertexData[:, 1] = y
+
+        # If z is provided, ensure it matches the length of x and y
+        z = np.atleast_1d(np.ravel(z)).astype(np.float32)
+        # check if z is a scalar
+        if z.shape[0] not in (1,n):
+            # If z is an array, it must match the length of x and y
+            print("(pglDraw:dots) z must be the same length as x and y or a scalar.")
+            return False            
+
+        # Validate color and put into matrix
+        color = self.validateColor(color, withAlpha=True, n=n)
+        dotVertexData[:, 3:7] = color 
+
+        # Validate dotSize and put into matrix. 
+        dotSize = np.atleast_1d(dotSize).astype(np.float32)
+        if dotSize.shape[0] == 1: dotSize = [dotSize[0], dotSize[0]]
+        dotVertexData[:, 7:9] = dotSize
+
+        # Validate dotShape and put into matrix
+        dotShape = np.atleast_1d(np.ravel(dotShape)).astype(np.float32)
+        dotVertexData[:, 9] = dotShape
+
+        # Validate dotAntialiasingBorder and put into matrix
+        dotAntialiasingBorder = np.atleast_1d(np.ravel(dotAntialiasingBorder)).astype(np.float32)
+        dotVertexData[:, 10] = dotAntialiasingBorder
+
+        # send dots command
         self.s.writeCommand("mglDots")
         # send the number of dots
-        self.s.write(np.uint32(1))
+        self.s.write(np.uint32(n))
         # send the data
-        self.s.write(dotData)
+        self.s.write(dotVertexData)
         # read the command results
         self.s.readCommandResults()
 
@@ -178,31 +214,6 @@ class pglDraw:
         self.line(x, y - size, x, y + size, color)
 
     ################################################################
-    # fixationCross
-    ################################################################
-    def fixationCross(self, size=1, x=0, y=0, color=None):
-        """
-        Draw a fixation cross.
-
-        Args:
-            size (float): The size of the cross.
-            x (float): The x coordinate of the center of the cross.
-            y (float): The y coordinate of the center of the cross.
-            color (list or tuple, optional): RGB color values as a list or tuple of three floats in the range [0, 1].
-
-        Returns:
-            None
-        """
-        # validate color
-        color = self.validateColor(color, withAlpha=False)
-
-        # draw the horizontal line
-        self.line(x - size, y, x + size, y, color)
-
-        # draw the vertical line
-        self.line(x, y - size, x, y + size, color)
-
-    ################################################################
     # circle
     ################################################################
     def circle(self, radius=1, x=0, y=0, color=None, numSegments=36):
@@ -236,7 +247,7 @@ class pglDraw:
     ####################################################
     # validate color
     ####################################################
-    def validateColor(self, color, withAlpha=True):
+    def validateColor(self, color, withAlpha=True,n=None):
         """
         Validate the color input.
 
@@ -248,32 +259,43 @@ class pglDraw:
             np.ndarray: A numpy array of the validated color.
         """
         if color is None:
-            color = [1.0, 1.0, 1.0]
+            color = np.array([[1.0, 1.0, 1.0]]).astype(np.float32)  # Default to white if no color is provided
 
-        # If a scalar is provided, convert it to grayscale
-        if isinstance(color, (int, float)):
-            color = [color, color, color]
+        # convert to numpy array
+        color = np.atleast_2d(np.array(color, dtype=np.float32))
 
-        if not isinstance(color, (list, tuple, np.ndarray)):
-            print("(pgldraw:validateColor) Color must be a list or tuple of three floats. Defaulting to white.")
-            color = [1.0, 1.0, 1.0]
-
-        if len(color) < 3:
-            print("(pgldraw:validateColor) Color must be a list or tuple of three floats. Defaulting to white.")
-            color = [1.0, 1.0, 1.0]
-
-        if withAlpha and len(color) < 4:
-            # If withAlpha is True, ensure the color has an alpha channel
-            color = list(color) + [1.0]
+        if color.ndim > 1:
+            if n is None:
+                # If n is not specified, just use the first color
+                color = np.atleast_2d(color[0,:])
+                print(f"(pgldraw:validateColor) {color.shape[0]} colors provided, using only first color.")
+            elif color.shape[0] not in (1,n):
+                # If n is specified, ensure the color matches the length of n
+                print(f"(pgldraw:validateColor) {color.shape[0]} colors provided, but expected {n}. Using only the first color.")
+                color = np.atleast_2d(color[0,:])
         
-        if not withAlpha and len(color) > 3:
+        # If a scalar is provided, convert it to grayscale
+        if color.shape[1] == 1:
+            color[:,2] = color[:,1]
+            color[:,3] = color[:,1]
+
+        if color.shape[1] < 3:
+            print("(pgldraw:validateColor) Color must be a list or tuple of three floats. Defaulting to white.")
+            color = np.array([[1.0, 1.0, 1.0]]).astype(np.float32)    
+
+        if withAlpha and color.shape[1] < 4:
+            # If withAlpha is True, ensure the color has an alpha channel
+            color =  np.column_stack((color, np.full((color.shape[0],), 1.0)))
+        
+        if not withAlpha and color.shape[1] > 3:
             # say what we are doing
             if self.verbose>0: print("(pglDraw:validateColor) Ignoring alpha channel in color.")
             # If withAlpha is False, ignore the alpha channel
-            color = color[:3]   
+            color = color[:,0:3]   
 
-        # Convert to numpy array and ensure it's float32
-        return np.array(color, dtype=np.float32)
+        return(color)
+    
+    
     ####################################################
     # arcs
     ####################################################
