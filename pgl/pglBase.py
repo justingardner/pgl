@@ -167,6 +167,9 @@ class pglBase:
         # get the window location
         self.getWindowFrameInDisplay()
 
+        # get frame rate
+        self.frameRate = self.getFrameRate(whichScreen)
+
         self.clearScreen([0.4, 0.2, 0.5])
         self.flush()
         

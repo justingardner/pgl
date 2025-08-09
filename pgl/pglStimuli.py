@@ -227,6 +227,25 @@ class pglStimuli:
         gaborStimulus.addImage(gabor2)
         gaborStimulus.print()
         return gaborStimulus
+    
+    def randomDots(self, width=10, height=10, color=[1,1,1], aperture='elliptical', density=10, dotSize=0.1, dotShape=1, dotAntialiasingBorder=0):
+        '''
+        Generate a random dot stimulus.
+
+        Parameters:
+        - width: Width of the stimulus in degrees (default is 10).
+        - height: Height of the stimulus in degrees (default is 10).
+        - aperture: Shape of the aperture ('elliptical' or 'rectangular', default is 'elliptical').
+        - density: Density of dots per square degree (default is 10).
+        - dotSize: Size of the dots in degrees (default is 1).
+        - dotShape: Shape of the dots (0 for rectangular, 1 for circular, default is 1).
+        - dotAntialiasingBorder: Antialiasing border size in pixels (default is 0).
+
+        Returns:
+        - A pglRandomDotsStimulus instance.
+        '''
+        rdk = pglRandomDotsStimulus(self, width, height, color, aperture, density, dotSize, dotShape, dotAntialiasingBorder)
+        return rdk
 
 
 class _pglStimulus:
@@ -251,10 +270,69 @@ class _pglStimulus:
         '''
         raise NotImplementedError("(_pglStimulus) Subclasses must implement this method.")
 
+class pglRandomDotsStimulus(_pglStimulus):
+    '''
+    Base class for random dot stimuli.
+    '''
+    def __init__(self, pgl, width=10, height=10, color=[1,1,1], aperture='elliptical', density=10, dotSize=1, dotShape=1, dotAntialiasingBorder=0):
+        # call init function of parent class
+        super().__init__(pgl)
+        self.width = width
+        self.height = height
+        self.color = pgl.validateColor(color)
+        self.aperture = aperture
+        self.density = density
+        self.dotSize = dotSize
+        self.dotShape = dotShape
+        self.dotAntialiasingBorder = dotAntialiasingBorder
+
+        # calculate number of dots
+        self.n = int(self.width * self.height * self.density)
+        if self.pgl.verbose>1: print(f"(pgl:pglStimulus:init) Creating random dot stimulus with {self.n} dots, size {self.dotSize}, shape {self.dotShape}, aperture {self.aperture}.")
+        
+        # create arrays of random positions
+        rx = self.width / 2
+        ry = self.height / 2
+        self.x = np.random.uniform(-rx, rx, self.n)
+        self.y = np.random.uniform(-ry, ry, self.n)
+        self.z = np.zeros(self.n)
+
+        # compute the radii squared for checking against oval apertures
+        self.rx2 = rx * rx
+        self.ry2 = ry * ry
+
+        # default aperture check type
+        if aperture not in ['elliptical', 'rectangular']:
+            print(f"(pgl:pglStimulus:init) Error: Unknown aperture type '{aperture}'. Use 'elliptical' or 'rectangular'. Defaulting to elliptical")
+            aperture = 'elliptical'
+
+        if aperture == 'elliptical':
+            self.apertureCheck = lambda x, y: (x**2 / self.rx2) + (y**2 / self.ry2) > 1
+        elif aperture == 'rectangular':
+            self.apertureCheck = lambda x, y: (np.abs(x) > rx) | (np.abs(y) > ry)
+    
+    def __repr__(self):
+        return f"<pglRandomDotStimulus: {self.n} dots, size={self.dotSize}, shape={self.dotShape}, aperture={self.aperture}>"
+
+    def display(self, direction=0, coherence=1.0, speed=1.0):
+        '''
+        Display the stimulus.
+        '''
+        self.pgl.dots(self.x, self.y, self.z, color=self.color, dotSize=self.dotSize, dotShape=self.dotShape, dotAntialiasingBorder=self.dotAntialiasingBorder)
+        # update positions based on direction and speed
+        if speed != 0:
+            self.x += (speed * np.cos(direction))/self.pgl.frameRate
+            self.y += (speed * np.sin(direction))/self.pgl.frameRate
+            # check if the dots are within the aperture
+            invalidDots = self.apertureCheck(self.x, self.y)
+            if np.any(invalidDots):
+                # regenerate positions for invalid dots
+                self.x[invalidDots] = -self.x[invalidDots]
+                self.y[invalidDots] = -self.y[invalidDots]
+                self.z[invalidDots] = 0
 class pglImageStimulus(_pglStimulus):
     '''
     Base class for image stimuli.
-    This class is not meant to be instantiated directly.
     '''
     def __init__(self, pgl):
         '''
@@ -267,6 +345,9 @@ class pglImageStimulus(_pglStimulus):
         self.currentImage = 0
         self.imageList = []
     
+    def __repr__(self):
+        return f"<pglImageStimulus: {self.currentImage+1}/{self.nImages}>"
+
     def addImage(self, imageData):
         '''
         Add an image to the stimulus.
@@ -305,7 +386,7 @@ class pglImageStimulus(_pglStimulus):
         '''
         Print information about the stimulus.
         '''
-        print(f"(pgl:pglStimulus:print) Image {self.currentImage}/{self.nImages}. ")
+        print(self.__repr__())
         # print info on each image
         for iImage in range(self.nImages):
             self.imageList[iImage].print()

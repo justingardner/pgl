@@ -63,7 +63,7 @@ class pglDraw:
     ################################################################
     # dots
     ################################################################
-    def dots(self, x, y, z=0, color=None, dotSize=np.ones(2)*10, dotShape=1, dotAntialiasingBorder=0):
+    def dots(self, x, y, z=0, color=None, dotSize=np.ones(2)*0.2, dotShape=1, dotAntialiasingBorder=0):
         """
         Draw dots
 
@@ -72,9 +72,12 @@ class pglDraw:
             y (float or array-like): The y coordinates of the dots.
             z (float or array-like, optional): The z coordinates of the dots (default is 0.0).
             color (list or tuple, optional): RGB color values as a list or tuple of three floats in the range [0, 1].
-            dotSize (float or array-like, optional): The size of the dots (default is 10).
-            dotShape (int, optional): The shape of the dots (default is 1).
-            dotAntialiasingBorder (float, optional): The antialiasing border size (default is 0).
+            dotSize: The size of the dots, if scalar, then both x and y dimension will be the same. 
+                    If a list or array of length 2, then the first value is the x dimension and the second value is the y dimension.
+                    Units are in degrees. Note that dots are meant to render less than 1 degree or so
+                    each, so size is not guaranteed if they are larger than that. 
+            dotShape (int, optional): The shape of the dots 0=rectangular, 1=circular (default is 1).
+            dotAntialiasingBorder (float, optional): The antialiasing border size in pixels(default is 0).
 
         Returns:
             bool: True if the dots were drawn successfully, False otherwise.
@@ -109,6 +112,8 @@ class pglDraw:
         # Validate dotSize and put into matrix. 
         dotSize = np.atleast_1d(dotSize).astype(np.float32)
         if dotSize.shape[0] == 1: dotSize = [dotSize[0], dotSize[0]]
+        dotSize[0] *= self.xDeg2Pix
+        dotSize[1] *= self.yDeg2Pix
         dotVertexData[:, 7:9] = dotSize
 
         # Validate dotShape and put into matrix
