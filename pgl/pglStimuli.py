@@ -319,7 +319,12 @@ class pglRandomDotsStimulus(_pglStimulus):
 
     def display(self, direction=0, coherence=1.0, speed=1.0):
         '''
-        Display the stimulus.
+        Display the random dot stimulus
+
+        Parameters:
+        - direction: Direction of motion in degrees (default is 0).
+        - coherence: Coherence of the motion (0 to 1, default is 1.0).
+        - speed: Speed of the motion in degrees per second (default is 1.0
         '''
         # check if the dots are within the aperture
         invalidDots = self.apertureCheck(self.x, self.y)
@@ -334,6 +339,18 @@ class pglRandomDotsStimulus(_pglStimulus):
 
         # draw the dots
         self.pgl.dots(self.x, self.y, self.z, color=self.color, dotSize=self.dotSize, dotShape=self.dotShape, dotAntialiasingBorder=self.dotAntialiasingBorder)
+
+        # convert direction into an array of directions
+        direction = np.deg2rad(direction)
+        direction = np.tile(direction, self.n)
+
+        # for incoherent motion, set the proportion of incoherent dots
+        # to have a random direction
+        incoherentDots = np.random.rand(self.n) > coherence
+        if np.any(incoherentDots):
+            # set the direction of incoherent dots to a random direction
+            randomDirections = np.random.uniform(0, 2 * np.pi, np.sum(incoherentDots))
+            direction[incoherentDots] = randomDirections
 
         # update positions based on direction and speed
         if speed != 0:
