@@ -279,7 +279,6 @@ class pglRandomDotsStimulus(_pglStimulus):
         super().__init__(pgl)
         self.width = width
         self.height = height
-        self.color = pgl.validateColor(color)
         self.aperture = aperture
         self.density = density
         self.dotSize = dotSize
@@ -290,6 +289,10 @@ class pglRandomDotsStimulus(_pglStimulus):
         self.n = int(self.width * self.height * self.density)
         if self.pgl.verbose>1: print(f"(pgl:pglStimulus:init) Creating random dot stimulus with {self.n} dots, size {self.dotSize}, shape {self.dotShape}, aperture {self.aperture}.")
         
+        # validate color
+        self.color = pgl.validateColor(color, n=self.n, forceN=True)
+        self.color[:,3] = 1
+
         # create arrays of random positions
         rx = self.width / 2
         ry = self.height / 2
@@ -318,18 +321,24 @@ class pglRandomDotsStimulus(_pglStimulus):
         '''
         Display the stimulus.
         '''
+        # check if the dots are within the aperture
+        invalidDots = self.apertureCheck(self.x, self.y)
+        # make all dots visible
+        self.color[:,3] = 1
+        if np.any(invalidDots):
+            # make dots outside of the aperture invisible
+            self.color[invalidDots, 3] = 0
+            self.x[invalidDots] = -self.x[invalidDots]
+            self.y[invalidDots] = -self.y[invalidDots]
+            self.z[invalidDots] = 0
+
+        # draw the dots
         self.pgl.dots(self.x, self.y, self.z, color=self.color, dotSize=self.dotSize, dotShape=self.dotShape, dotAntialiasingBorder=self.dotAntialiasingBorder)
+
         # update positions based on direction and speed
         if speed != 0:
             self.x += (speed * np.cos(direction))/self.pgl.frameRate
             self.y += (speed * np.sin(direction))/self.pgl.frameRate
-            # check if the dots are within the aperture
-            invalidDots = self.apertureCheck(self.x, self.y)
-            if np.any(invalidDots):
-                # regenerate positions for invalid dots
-                self.x[invalidDots] = -self.x[invalidDots]
-                self.y[invalidDots] = -self.y[invalidDots]
-                self.z[invalidDots] = 0
 class pglImageStimulus(_pglStimulus):
     '''
     Base class for image stimuli.
