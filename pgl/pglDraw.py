@@ -75,7 +75,7 @@ class pglDraw:
             dotSize: The size of the dots, if scalar, then both x and y dimension will be the same. 
                     If a list or array of length 2, then the first value is the x dimension and the second value is the y dimension.
                     Units are in degrees. Note that dots are meant to render less than 1 degree or so
-                    each, so size is not guaranteed if they are larger than that. 
+                    each, so size is not guaranteed if they are larger than that. Default is 0.2 degrees
             dotShape (int, optional): The shape of the dots 0=rectangular, 1=circular (default is 1).
             dotAntialiasingBorder (float, optional): The antialiasing border size in pixels(default is 0).
 
@@ -252,7 +252,7 @@ class pglDraw:
     ####################################################
     # validate color
     ####################################################
-    def validateColor(self, color, withAlpha=True,n=None):
+    def validateColor(self, color, withAlpha=True, n=None, forceN=False):
         """
         Validate the color input.
 
@@ -269,16 +269,19 @@ class pglDraw:
         # convert to numpy array
         color = np.atleast_2d(np.array(color, dtype=np.float32))
 
-        if color.ndim > 1:
-            if n is None:
+        if n is None:
+            if color.shape[0]>1:
                 # If n is not specified, just use the first color
                 color = np.atleast_2d(color[0,:])
                 print(f"(pgldraw:validateColor) {color.shape[0]} colors provided, using only first color.")
-            elif color.shape[0] not in (1,n):
+        else:
+            if color.shape[0] not in (1,n):
                 # If n is specified, ensure the color matches the length of n
                 print(f"(pgldraw:validateColor) {color.shape[0]} colors provided, but expected {n}. Using only the first color.")
                 color = np.atleast_2d(color[0,:])
-        
+            if forceN and color.shape[0] != n:
+                color = np.repeat(color, n, axis=0)
+
         # If a scalar is provided, convert it to grayscale
         if color.shape[1] == 1:
             color[:,2] = color[:,1]
