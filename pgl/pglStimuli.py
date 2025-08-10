@@ -228,7 +228,7 @@ class pglStimuli:
         gaborStimulus.print()
         return gaborStimulus
     
-    def randomDots(self, width=10, height=10, color=[1,1,1], aperture='elliptical', density=10, dotSize=0.1, dotShape=1, dotAntialiasingBorder=0):
+    def randomDots(self, width=10, height=10, color=[1,1,1], aperture='elliptical', density=10, dotSize=0.1, dotShape=1, dotAntialiasingBorder=0, noiseType='randomwalk'):
         '''
         Generate a random dot stimulus.
 
@@ -244,7 +244,7 @@ class pglStimuli:
         Returns:
         - A pglRandomDotsStimulus instance.
         '''
-        rdk = pglRandomDotsStimulus(self, width, height, color, aperture, density, dotSize, dotShape, dotAntialiasingBorder)
+        rdk = pglRandomDotsStimulus(self, width, height, color, aperture, density, dotSize, dotShape, dotAntialiasingBorder, noiseType)
         return rdk
 
 
@@ -274,7 +274,7 @@ class pglRandomDotsStimulus(_pglStimulus):
     '''
     Base class for random dot stimuli.
     '''
-    def __init__(self, pgl, width=10, height=10, color=[1,1,1], aperture='elliptical', density=10, dotSize=1, dotShape=1, dotAntialiasingBorder=0):
+    def __init__(self, pgl, width=10, height=10, color=[1,1,1], aperture='elliptical', density=10, dotSize=1, dotShape=1, dotAntialiasingBorder=0, noiseType='randomwalk'):
         # call init function of parent class
         super().__init__(pgl)
         self.width = width
@@ -284,6 +284,14 @@ class pglRandomDotsStimulus(_pglStimulus):
         self.dotSize = dotSize
         self.dotShape = dotShape
         self.dotAntialiasingBorder = dotAntialiasingBorder
+
+        if noiseType.lower() in ['randomwalk', 'random', 'random walk']:
+            self.noiseType = 0
+        elif noiseType.lower() in ['movshon', 'replot']:
+            self.noiseType = 1
+        else:
+            print(f"(pgl:pglStimulus:init) Unknown noise type '{noiseType}'. Defaulting to 'randomwalk'.")
+            self.noiseType = 0
 
         # calculate number of dots
         self.n = int(self.width * self.height * self.density)
@@ -348,9 +356,16 @@ class pglRandomDotsStimulus(_pglStimulus):
         # to have a random direction
         incoherentDots = np.random.rand(self.n) > coherence
         if np.any(incoherentDots):
-            # set the direction of incoherent dots to a random direction
-            randomDirections = np.random.uniform(0, 2 * np.pi, np.sum(incoherentDots))
-            direction[incoherentDots] = randomDirections
+            if self.noiseType == 0:
+                # set the direction of incoherent dots to a random direction
+                randomDirections = np.random.uniform(0, 2 * np.pi, np.sum(incoherentDots))
+                direction[incoherentDots] = randomDirections
+            else:
+                numIncoherentDots = np.sum(incoherentDots)
+                # replot randomly
+                self.x[incoherentDots] = np.random.uniform(-self.width/2, self.width/2, numIncoherentDots)
+                self.y[incoherentDots] = np.random.uniform(-self.height/2, self.height/2, numIncoherentDots)
+                
 
         # update positions based on direction and speed
         if speed != 0:
