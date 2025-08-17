@@ -271,11 +271,11 @@ class pglDraw:
             print("(pglDraw:quad) Vertices must be an n x 4 x 2 matrix, but got shape", vertices.shape)
             return
 
-        # get the number of vertices
-        nVertices = vertices.shape[0]
+        # get the number of quads
+        nQuads = vertices.shape[0]
 
         # get the color
-        color = self.validateColor(color, n=nVertices, withAlpha=False, forceN=True)
+        color = self.validateColor(color, n=nQuads, withAlpha=False, forceN=True)
 
         # Each quad is actually two triangles put together
         # these are the indices for each of the triangles
@@ -288,7 +288,7 @@ class pglDraw:
             # where the 6 indexes are the two triangles vertices
             vertices[:,quadTriangleIndices,:].reshape(-1,2),
             # add a column of zeros for z
-            np.zeros((nVertices*6,1)),
+            np.zeros((nQuads*6,1)),
             # add the color for each vertex
             np.repeat(color[:, np.newaxis, :], 6, axis=1).reshape(-1, 3)
         ]).astype(np.float32)
@@ -296,7 +296,7 @@ class pglDraw:
         # send quad command
         self.s.writeCommand("mglQuad")
         # send the number of vertices
-        self.s.write(np.uint32(6 * nVertices))
+        self.s.write(np.uint32(6 * nQuads))
         # send the data
         self.s.write(vertexData)
         # read the command results
