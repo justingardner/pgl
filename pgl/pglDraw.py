@@ -249,6 +249,61 @@ class pglDraw:
             y2 = y + radius * np.sin(angle2)
             self.line(x1, y1, x2, y2, color)
 
+    ################################################################
+    # quad
+    ################################################################
+    def quad(self, vertices, color=None):
+        '''
+        Draw a quad
+
+        Args:
+            vertices(np.array): n x 4 x 2 matrix of vertices. You can omit
+            the nth dimension and just pass a 4x2 matrix for one quad
+            color:
+        '''
+        
+        # get the vertices as an n x 4 x 2 matrix
+        vertices = np.atleast_3d(np.array(vertices, dtype=np.float32))
+        if vertices.shape[-1] == 1: vertices = np.moveaxis(vertices, -1, 0)
+
+        # check dimensions
+        if vertices.shape[1] != 4 or vertices.shape[2] != 2:
+            print("(pglDraw:quad) Vertices must be an n x 4 x 2 matrix, but got shape", vertices.shape)
+            return
+
+        # get the number of vertices
+        nVertices = vertices.shape[0]
+
+        # get the color
+        color = self.validateColor(color, n=nVertices, withAlpha=False, forceN=True)
+
+        # create vertex data
+        allVertexData = []
+        for iVertex in range(nVertices):
+            # create vertex data for each quad. This makes two triangles
+            # to make the quad
+            vertexData = np.array([vertices[iVertex, 0, 0], vertices[iVertex, 0, 1], 0, *color[iVertex],
+                                   vertices[iVertex, 1, 0], vertices[iVertex, 1, 1], 0, *color[iVertex],
+                                   vertices[iVertex, 2, 0], vertices[iVertex, 2, 1], 0, *color[iVertex],
+                                   vertices[iVertex, 2, 0], vertices[iVertex, 2, 1], 0, *color[iVertex],
+                                   vertices[iVertex, 3, 0], vertices[iVertex, 3, 1], 0, *color[iVertex],
+                                   vertices[iVertex, 0, 0], vertices[iVertex, 0, 1], 0, *color[iVertex]], dtype=np.float32)
+            
+            # append to the list
+            allVertexData.append(vertexData)
+        
+
+        # convert to numpy array
+        vertexData = np.concatenate(allVertexData)
+        # send quad command
+        self.s.writeCommand("mglQuad")
+        # send the number of vertices
+        self.s.write(np.uint32(6 * nVertices))
+        # send the data
+        self.s.write(vertexData)
+        # read the command results
+        self.s.readCommandResults()
+
     ####################################################
     # validate color
     ####################################################
