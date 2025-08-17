@@ -277,24 +277,22 @@ class pglDraw:
         # get the color
         color = self.validateColor(color, n=nVertices, withAlpha=False, forceN=True)
 
-        # create vertex data
-        allVertexData = []
-        for iVertex in range(nVertices):
-            # create vertex data for each quad. This makes two triangles
-            # to make the quad
-            vertexData = np.array([vertices[iVertex, 0, 0], vertices[iVertex, 0, 1], 0, *color[iVertex],
-                                   vertices[iVertex, 1, 0], vertices[iVertex, 1, 1], 0, *color[iVertex],
-                                   vertices[iVertex, 2, 0], vertices[iVertex, 2, 1], 0, *color[iVertex],
-                                   vertices[iVertex, 2, 0], vertices[iVertex, 2, 1], 0, *color[iVertex],
-                                   vertices[iVertex, 3, 0], vertices[iVertex, 3, 1], 0, *color[iVertex],
-                                   vertices[iVertex, 0, 0], vertices[iVertex, 0, 1], 0, *color[iVertex]], dtype=np.float32)
-            
-            # append to the list
-            allVertexData.append(vertexData)
-        
+        # Each quad is actually two triangles put together
+        # these are the indices for each of the triangles
+        # ie 0,1,2 and 2,3,0
+        quadTriangleIndices = np.array([0, 1, 2, 2, 3, 0])
 
-        # convert to numpy array
-        vertexData = np.concatenate(allVertexData)
+        # Create an array of vertex data which is x y z r g b for each vertex
+        vertexData = np.hstack([
+            # reshape the vertices to be 6n x 2
+            # where the 6 indexes are the two triangles
+            vertices[:,quadTriangleIndices,:].reshape(-1,2),
+            # add a column of zeros for z
+            np.zeros((nVertices*6,1)),
+            # add the color for each vertex
+            np.repeat(color[:, np.newaxis, :], 6, axis=1).reshape(-1, 3)
+        ]).astype(np.float32)
+
         # send quad command
         self.s.writeCommand("mglQuad")
         # send the number of vertices
