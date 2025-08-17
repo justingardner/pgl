@@ -121,7 +121,7 @@ class pglTransform:
         xformOffset[1,3] = yOffset
         xformOffset[2,3] = zOffset
         # multiply with current transform
-        self.xform = np.matmul(xformScale,self.xform)
+        self.xform = np.matmul(xformOffset,self.xform)
         # now update the xform on the application
         self.setTransform(self.xform)
         
