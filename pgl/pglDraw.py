@@ -285,7 +285,7 @@ class pglDraw:
         # Create an array of vertex data which is x y z r g b for each vertex
         vertexData = np.hstack([
             # reshape the vertices to be 6n x 2
-            # where the 6 indexes are the two triangles
+            # where the 6 indexes are the two triangles vertices
             vertices[:,quadTriangleIndices,:].reshape(-1,2),
             # add a column of zeros for z
             np.zeros((nVertices*6,1)),
