@@ -247,6 +247,47 @@ class pglStimuli:
         rdk = pglRandomDotsStimulus(self, width, height, color, aperture, density, dotSize, dotShape, dotAntialiasingBorder, noiseType)
         return rdk
 
+    ####################################################
+    # checkerboard
+    ####################################################
+    def checkerboard(self, x=0, y=0, width=None, height=None, checkWidth=1.0, checkHeight = 1.0, color=None):
+        """
+        Checkerboard stimulus 
+        Args:
+            x (float): x coordinate of the center of the checkerboard.
+            y (float): y coordinate of the center of the checkerboard.
+            width (float, optional): Width of the checkerboard in degrees. If None, will use screenWidth.
+            height (float, optional): Height of the checkerboard in degrees. If None, will use screenHeight.
+            checkWidth (float): Width of each checker square in degrees. Default=1.0
+            checkHeight (float): Height of each checker square in degrees. Default=1.0
+            color (list or tuple, optional): RGB color values as a list or tuple of three floats in the range [0, 1].
+        """
+        if self.coordinateFrame != "visualAngle":
+            print("(pgl:pglStimuli:checkerboard) Error: checkerboard can only be generated in visualAngle coordinates. run visualAngle() ")
+            return None
+
+        # Validate inputs
+        if not isinstance(x, (int, float)):
+            print("(pgl:pglStimuli:checkerboard) x must be a number.")
+            return None
+        if not isinstance(y, (int, float)):
+            print("(pgl:pglStimuli:checkerboard) y must be a number.")
+            return None
+        if not isinstance(checkWidth, (int, float)) or checkWidth <= 0:
+            print("(pgl:pglStimuli:checkerboard) checkWidth must be a positive number.")
+            return None
+        if not isinstance(checkHeight, (int, float)) or checkHeight <= 0:
+            print("(pgl:pglStimuli:checkerboard) checkHeight must be a positive number.")
+            return None
+        
+        # Create the checkerboard stimulus
+        checkerboardStimulus = pglCheckerboardStimulus(self, x=x, y=y, width=width, height=height,
+                                                       checkWidth=checkWidth, checkHeight=checkHeight,
+                                                       color=color)
+        return checkerboardStimulus
+
+
+
 
 class _pglStimulus:
     '''
@@ -270,6 +311,9 @@ class _pglStimulus:
         '''
         raise NotImplementedError("(_pglStimulus) Subclasses must implement this method.")
 
+################################################################
+# Random dot stimulus class
+################################################################
 class pglRandomDotsStimulus(_pglStimulus):
     '''
     Base class for random dot stimuli.
@@ -371,6 +415,10 @@ class pglRandomDotsStimulus(_pglStimulus):
         if speed != 0:
             self.x += (speed * np.cos(direction))/self.pgl.frameRate
             self.y += (speed * np.sin(direction))/self.pgl.frameRate
+
+################################################################
+# Image stimulus class
+################################################################
 class pglImageStimulus(_pglStimulus):
     '''
     Base class for image stimuli.
@@ -431,3 +479,61 @@ class pglImageStimulus(_pglStimulus):
         # print info on each image
         for iImage in range(self.nImages):
             self.imageList[iImage].print()
+
+################################################################
+# Checkerboard stimulus class
+################################################################
+class pglCheckerboardStimulus(_pglStimulus):
+    '''
+    Base class for checkerboard stimuli.
+    '''
+    def __init__(self, pgl,x=0,y=0,width=None,height=None,checkWidth=1.0,checkHeight=1.0,color=None):
+        '''
+        Initialize the checkerboard stimulus.
+        '''
+        super().__init__(pgl)
+        self.x = x
+        self.y = y
+        self.width = pgl.screenWidth.deg if width is None else width
+        self.height = pgl.screenHeight.deg if height is None else height
+        self.checkWidth = checkWidth
+        self.checkHeight = checkHeight
+        self.color = pgl.validateColor(color, n=2, forceN=True, withAlpha=False) if color is not None else np.array([[1, 1, 1], [0, 0, 0]], dtype=np.float32)
+    
+    def __repr__(self):
+        return f"<pglCheckerboardStimulus: center: ({self.x}, {self.y}) size: {self.width}x{self.height} checkSize: {self.checkWidth}x{self.checkHeight} color: {self.color}>"
+
+    def display(self, stimulusPhase=0):
+        '''
+        Display the checkerboard stimulus
+        '''
+        # x coordinates
+        xMin = self.x - self.width / 2
+        xMax = self.x + self.width / 2
+        xCoords = np.arange(xMin, xMax, self.checkWidth)
+        if (xCoords[-1] < xMax): xCoords = np.append(xCoords, xMax)
+        Nx = len(xCoords) - 1
+
+        # y coordinates
+        yMin = self.y - self.height / 2
+        yMax = self.y + self.height / 2
+        yCoords = np.arange(yMin, yMax, self.checkHeight)
+        if (yCoords[-1] < yMax): yCoords = np.append(yCoords, yMax)
+        Ny = len(yCoords) - 1
+
+        # create a checkerboard pattern
+        iQuad = 0
+        quad = np.zeros((Nx * Ny, 4, 2), dtype=np.float32)
+        colors = np.zeros((Nx * Ny, 3), dtype=np.float32)
+        for jCoord in range(len(yCoords)-1):
+            colorIndex = jCoord % 2
+            for iCoord in range(len(xCoords)-1):
+                quad[iQuad,:,:] = np.array([[xCoords[iCoord], yCoords[jCoord]],
+                                         [xCoords[iCoord+1], yCoords[jCoord]],
+                                         [xCoords[iCoord+1], yCoords[jCoord+1]],
+                                         [xCoords[iCoord], yCoords[jCoord+1]]])
+                colors[iQuad,:] = self.color[colorIndex % 2]
+                colorIndex += 1
+                iQuad += 1
+        # draw the checkerboard
+        self.pgl.quad(quad, color=colors)

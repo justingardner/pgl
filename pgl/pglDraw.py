@@ -393,6 +393,7 @@ class pglDraw:
 
         # read the command results
         results = self.s.readCommandResults(ack)
+    
     ######################################################
     # text
     ######################################################
