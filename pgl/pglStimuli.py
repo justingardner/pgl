@@ -499,7 +499,10 @@ class pglCheckerboardStimulus(_pglStimulus):
         self.checkWidth = checkWidth
         self.checkHeight = checkHeight
         self.color = pgl.validateColor(color, n=2, forceN=True, withAlpha=False) if color is not None else np.array([[1, 1, 1], [0, 0, 0]], dtype=np.float32)
-    
+        self.startTime = pgl.getSecs()
+        self.temporalFrequency = 1.0
+        self.temporalSquareWave = False
+
     def __repr__(self):
         return f"<pglCheckerboardStimulus: center: ({self.x}, {self.y}) size: {self.width}x{self.height} checkSize: {self.checkWidth}x{self.checkHeight} color: {self.color}>"
 
@@ -510,8 +513,21 @@ class pglCheckerboardStimulus(_pglStimulus):
         # x coordinates
         xMin = self.x - self.width / 2
         xMax = self.x + self.width / 2
-        xCoords = np.arange(xMin, xMax, self.checkWidth)
+        
+        # calculate the phase of the checkerboard
+        phase = stimulusPhase + self.temporalFrequency * 2 * np.pi * (self.pgl.getSecs() - self.startTime)
+        
+        # temporal square wave
+        if self.temporalSquareWave:
+            cosPhase = np.where(np.cos(phase) >= 0, 1, 0)
+        else:
+          cosPhase = np.cos(phase)
+        
+        # calculate x coordinates
+        xCoords = np.arange(xMin + cosPhase*self.checkWidth, xMax, self.checkWidth)
         if (xCoords[-1] < xMax): xCoords = np.append(xCoords, xMax)
+        if (xCoords[0] < xMin): xCoords[0] = xMin
+        xCoords = np.insert(xCoords, 0, xMin)
         Nx = len(xCoords) - 1
 
         # y coordinates
@@ -519,6 +535,7 @@ class pglCheckerboardStimulus(_pglStimulus):
         yMax = self.y + self.height / 2
         yCoords = np.arange(yMin, yMax, self.checkHeight)
         if (yCoords[-1] < yMax): yCoords = np.append(yCoords, yMax)
+        if (yCoords[0] > yMin): yCoords = np.insert(yCoords, 0, yMin)
         Ny = len(yCoords) - 1
 
         # create a checkerboard pattern
