@@ -14,7 +14,10 @@ class _pglComm:
     verbose = 1
 
     # Init Function
-    def __init__(self,socketName,timeout=10):
+    def __init__(self, socketName, pgl=None, timeout=10):
+        # keep pgl reference
+        self.pgl = pgl
+
         # initialize start time
         startTime = time.time()
         attempt = 0
@@ -88,6 +91,9 @@ class _pglComm:
 
         try:
             if self.verbose>=3:print(f"(pgl:_pglComm) Sending message with length {len(packed)} bytes")
+             # if we are logging commands for replay, log the command values
+            if self.pgl.commandRecording: self.pgl.logCommandData(packed)
+            # send the packed data
             self.s.sendall(packed)
             if self.verbose > 1: print("(pgl:_pglComm) Message sent:", message)
         except Exception as e:
@@ -107,17 +113,54 @@ class _pglComm:
             print("(pgl:_pglComm) ❌ Not connected to socket")
             return False
         
+        # get the command value from the string
         commandValue = self.getCommandValue(commandName)
         if commandValue is None:
             print(f"(pgl:_pglComm) ❌ Command '{commandName}' not found")
             return False
         
+        # display command if high verbosity is set
         if self.verbose>1:
             print(f"(pgl:_pglComm) Sending command: {commandName} (value: {commandValue})")
-        self.write(np.uint16(commandValue))
+
+        # if we are logging commands for replay, log the command
+        if self.pgl.commandRecording: self.pgl.logCommandValue(commandValue)
+
+        # write the command value to the socket
+        self.write(commandValue)
         return True
+    def replayCommand(self, commandData):
+        """
+        Replay a command to the socket.
+        
+        Args:
+            commandValue (int): The value of the command to send.
+            commandData (bytes, optional): Additional data associated with the command.
+        
+        Returns:
+            bool: True if the command was sent successfully, False otherwise.
+        """
+        if not self.s:
+            print("(pgl:_pglComm) ❌ Not connected to socket")
+            return False
+        
+        for chunk in commandData: self.s.sendall(chunk)
+ 
+        # read the command results
+        commandResults = self.readCommandResults()
+        
+        return True
+    
     def getCommandValue(self,commandName):
-        return(self.commandTypes.get(commandName))
+        """
+        Get the value of a command by its name.
+        """
+        return(self.commandValues.get(commandName))
+    def getCommandName(self,commandValue):
+        """
+        Get the name of a command by its value.
+        """
+        return(self.commandNames.get(commandValue))
     
     def read(self, dataType, numRows=1, numCols=1, numSlices=1):
         """
@@ -214,15 +257,15 @@ class _pglComm:
 
 
 
-    def parseCommandTypes(self, filename="mglCommandTypes.h"):
+    def parseCommandValues(self, filename="mglCommandTypes.h"):
         """
-        Parse the command types from the mglCommandTypes.h file.
+        Parse the command values from the mglCommandTypes.h file.
 
         This function reads the mglCommandTypes.h file, extracts command names and their values,
         and returns a dictionary mapping command names to their corresponding values.
 
         """
-        self.commandTypes = {}
+        self.commandValues = {}
 
         with open(filename, "r") as f:
             lines = f.readlines()
@@ -248,10 +291,12 @@ class _pglComm:
                 if match:
                     name, valueStr = match.groups()
                     if valueStr == "UINT16_MAX":
-                        value = 0xFFFF
+                        value = np.uint16(0xFFFF)
                     else:
-                        value = int(valueStr)
-                    self.commandTypes[name] = value
+                        value = np.uint16(int(valueStr))
+                    self.commandValues[name] = value
+        # now let's make a reverse lookup dictionary
+        self.commandNames = {v: k for k, v in self.commandValues.items()}
     def getPID(self):
         """
         Find the PID of the process who made the socket
