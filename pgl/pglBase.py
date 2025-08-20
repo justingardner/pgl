@@ -153,10 +153,10 @@ class pglBase:
                 return False
         
         # now try to connect to the socket
-        self.s = pglComm._pglComm(socketName)
+        self.s = pglComm._pglComm(socketName,self)
 
         # and parse command types
-        self.s.parseCommandTypes()
+        self.s.parseCommandValues()
         
         # set the window location and size
         self.setWindowFrameInDisplay(whichScreen, screenX, screenY, screenWidth, screenHeight)
