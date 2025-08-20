@@ -576,15 +576,24 @@ class pglStimulusCheckerboardSliding(_pglStimulusCheckerboard):
         # calculate the phase of the checkerboard
         phase = -1 + 2 * ((stimulusPhase + self.temporalFrequency * (self.pgl.getSecs() - self.startTime)) % 1)
 
-        # calculate x coordinates
+        # calculate x coordinates that slide in one direction 
         xCoordsOdd = np.arange(xMin + phase*self.checkWidth, xMax, self.checkWidth)        
         if (xCoordsOdd[-1] < xMax): xCoordsOdd = np.append(xCoordsOdd, xMax)
         if (phase <= 0): xCoordsOdd[0] = xMin        
         xCoordsOdd = np.insert(xCoordsOdd, 0, xMin)
 
         # calculate the number of x coordinates
-        Nx = len(xCoordsOdd) - 1
-        #print(xCoordsOdd)
+        NxOdd = len(xCoordsOdd) - 1
+
+        # calculate x coordinates that slide in the other direction 
+        xCoordsEven = np.arange(xMin - phase*self.checkWidth, xMax, self.checkWidth)        
+        if (xCoordsEven[-1] < xMax): xCoordsEven = np.append(xCoordsEven, xMax)
+        if (phase > 0): xCoordsEven[0] = xMin        
+        xCoordsEven = np.insert(xCoordsEven, 0, xMin)
+
+        # calculate the number of x coordinates
+        NxEven = len(xCoordsEven) - 1
+
         # y coordinates
         yMin = self.y - self.height / 2
         yMax = self.y + self.height / 2
@@ -593,17 +602,24 @@ class pglStimulusCheckerboardSliding(_pglStimulusCheckerboard):
         if (yCoords[0] > yMin): yCoords = np.insert(yCoords, 0, yMin)
         Ny = len(yCoords) - 1
 
+        Nx = max(NxOdd, NxEven)
         # create a checkerboard pattern
         iQuad = 0
         quad = np.zeros((Nx * Ny, 4, 2), dtype=np.float32)
         colors = np.zeros((Nx * Ny, 3), dtype=np.float32)
         for jCoord in range(len(yCoords)-1):
+            if jCoord % 2 == 0:
+                # even rows use xCoordsEven
+                xCoords = xCoordsEven
+            else:
+                # odd rows use xCoordsOdd
+                xCoords = xCoordsOdd
             colorIndex = jCoord % 2
-            for iCoord in range(len(xCoordsOdd)-1):
-                quad[iQuad,:,:] = np.array([[xCoordsOdd[iCoord], yCoords[jCoord]],
-                                            [xCoordsOdd[iCoord+1], yCoords[jCoord]],
-                                            [xCoordsOdd[iCoord+1], yCoords[jCoord+1]],
-                                            [xCoordsOdd[iCoord], yCoords[jCoord+1]]])
+            for iCoord in range(len(xCoords)-1):
+                quad[iQuad,:,:] = np.array([[xCoords[iCoord], yCoords[jCoord]],
+                                            [xCoords[iCoord+1], yCoords[jCoord]],
+                                            [xCoords[iCoord+1], yCoords[jCoord+1]],
+                                            [xCoords[iCoord], yCoords[jCoord+1]]])
                 colors[iQuad,:] = self.color[colorIndex % 2]
                 colorIndex += 1
                 iQuad += 1
