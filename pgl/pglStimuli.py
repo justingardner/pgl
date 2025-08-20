@@ -250,7 +250,7 @@ class pglStimuli:
     ####################################################
     # checkerboard
     ####################################################
-    def checkerboard(self, x=0, y=0, width=None, height=None, checkWidth=1.0, checkHeight = 1.0, color=None):
+    def checkerboard(self, x=0, y=0, width=None, height=None, checkWidth=1.0, checkHeight = 1.0, temporalFrequency = 1.0, color=None):
         """
         Checkerboard stimulus 
         Args:
@@ -260,6 +260,7 @@ class pglStimuli:
             height (float, optional): Height of the checkerboard in degrees. If None, will use screenHeight.
             checkWidth (float): Width of each checker square in degrees. Default=1.0
             checkHeight (float): Height of each checker square in degrees. Default=1.0
+            temporalFrequency (float): Temporal frequency of the checkerboard in Hz. Default=1.0
             color (list or tuple, optional): RGB color values as a list or tuple of three floats in the range [0, 1].
         """
         if self.coordinateFrame != "visualAngle":
@@ -283,7 +284,7 @@ class pglStimuli:
         # Create the checkerboard stimulus
         checkerboardStimulus = pglStimulusCheckerboardSliding(self, x=x, y=y, width=width, height=height,
                                                                  checkWidth=checkWidth, checkHeight=checkHeight,
-                                                                 color=color)
+                                                                 temporalFrequency=temporalFrequency, color=color)
         return checkerboardStimulus
 
 
@@ -487,7 +488,7 @@ class _pglStimulusCheckerboard(_pglStimulus):
     '''
     Base class for checkerboard stimuli.
     '''
-    def __init__(self, pgl,x=0,y=0,width=None,height=None,checkWidth=1.0,checkHeight=1.0,color=None):
+    def __init__(self, pgl,x=0,y=0,width=None,height=None,checkWidth=1.0,checkHeight=1.0,temporalFrequency=1.0,color=None):
         '''
         Initialize the checkerboard stimulus.
         '''
@@ -500,7 +501,7 @@ class _pglStimulusCheckerboard(_pglStimulus):
         self.checkHeight = checkHeight
         self.color = pgl.validateColor(color, n=2, forceN=True, withAlpha=False) if color is not None else np.array([[1, 1, 1], [0, 0, 0]], dtype=np.float32)
         self.startTime = pgl.getSecs()
-        self.temporalFrequency = 1.0
+        self.temporalFrequency = temporalFrequency
         self.temporalSquareWave = False
 
     def __repr__(self):
