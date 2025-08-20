@@ -84,8 +84,8 @@ class pglStimuli:
                 # compute frame
                 grating[..., iPhase] = self.grating(width, height, spatialFrequency, orientation, thisContrast, thisPhase)
             if returnAsMatrix: return grating
-            # create a pglImageStimulus
-            gratingStimulus = pglImageStimulus(self)
+            # create a pglStimulusImage
+            gratingStimulus = pglStimulusImage(self)
             for iPhase in range(nPhase):
                 gratingStimulus.addImage(grating[..., iPhase])
             return gratingStimulus
@@ -182,10 +182,10 @@ class pglStimuli:
         - stdX: Standard deviation in the X direction (default is 1/8 width).
         - stdY: Standard deviation in the Y direction (default is 1/8 height).
         - returnAsMatrix (False): If True, return as a numpy matrix. If False, 
-            return as a pglImageStimulus
+            return as a pglStimulusImage.
 
         Returns:
-        - A pglImageStimulus representing the Gabor stimulus. Use the display() method to show it.
+        - A pglStimulusImage representing the Gabor stimulus. Use the display() method to show it.
 
         e.g.:
         gabor = pgl.gabor(width=5, height=5, spatialFrequency=1.0, orientation=0.0, contrast=1.0, phase=0.0, stdX=0.5, stdY=0.5)
@@ -219,8 +219,8 @@ class pglStimuli:
         gabor2 = ((grating * gaussian)+1)/2
         if returnAsMatrix: return gabor
         
-        # create a pglImageStimulus
-        gaborStimulus = pglImageStimulus(self)
+        # create a  pglStimulusImage
+        gaborStimulus = pglStimulusImage(self)
         gaborStimulus.addImage(gabor)
         gaborStimulus.addImage(gabor2)
         gaborStimulus.addImage(gabor)
@@ -242,9 +242,9 @@ class pglStimuli:
         - dotAntialiasingBorder: Antialiasing border size in pixels (default is 0).
 
         Returns:
-        - A pglRandomDotsStimulus instance.
+        - A pglStimulusRandomDots instance.
         '''
-        rdk = pglRandomDotsStimulus(self, width, height, color, aperture, density, dotSize, dotShape, dotAntialiasingBorder, noiseType)
+        rdk = pglStimulusRandomDots(self, width, height, color, aperture, density, dotSize, dotShape, dotAntialiasingBorder, noiseType)
         return rdk
 
     ####################################################
@@ -281,7 +281,7 @@ class pglStimuli:
             return None
         
         # Create the checkerboard stimulus
-        checkerboardStimulus = pglCheckerboardStimulus(self, x=x, y=y, width=width, height=height,
+        checkerboardStimulus = pglStimulusCheckerboard(self, x=x, y=y, width=width, height=height,
                                                        checkWidth=checkWidth, checkHeight=checkHeight,
                                                        color=color)
         return checkerboardStimulus
@@ -314,7 +314,7 @@ class _pglStimulus:
 ################################################################
 # Random dot stimulus class
 ################################################################
-class pglRandomDotsStimulus(_pglStimulus):
+class pglStimulusRandomDots(_pglStimulus):
     '''
     Base class for random dot stimuli.
     '''
@@ -367,7 +367,7 @@ class pglRandomDotsStimulus(_pglStimulus):
             self.apertureCheck = lambda x, y: (np.abs(x) > rx) | (np.abs(y) > ry)
     
     def __repr__(self):
-        return f"<pglRandomDotStimulus: {self.n} dots, size={self.dotSize}, shape={self.dotShape}, aperture={self.aperture}>"
+        return f"<pglStimulusRandomDot: {self.n} dots, size={self.dotSize}, shape={self.dotShape}, aperture={self.aperture}>"
 
     def display(self, direction=0, coherence=1.0, speed=1.0):
         '''
@@ -419,7 +419,7 @@ class pglRandomDotsStimulus(_pglStimulus):
 ################################################################
 # Image stimulus class
 ################################################################
-class pglImageStimulus(_pglStimulus):
+class pglStimulusImage(_pglStimulus):
     '''
     Base class for image stimuli.
     '''
@@ -435,7 +435,7 @@ class pglImageStimulus(_pglStimulus):
         self.imageList = []
     
     def __repr__(self):
-        return f"<pglImageStimulus: {self.currentImage+1}/{self.nImages}>"
+        return f"<pglStimulusImage: {self.currentImage+1}/{self.nImages}>"
 
     def addImage(self, imageData):
         '''
@@ -483,7 +483,7 @@ class pglImageStimulus(_pglStimulus):
 ################################################################
 # Checkerboard stimulus class
 ################################################################
-class pglCheckerboardStimulus(_pglStimulus):
+class pglStimulusCheckerboard(_pglStimulus):
     '''
     Base class for checkerboard stimuli.
     '''
@@ -504,7 +504,7 @@ class pglCheckerboardStimulus(_pglStimulus):
         self.temporalSquareWave = False
 
     def __repr__(self):
-        return f"<pglCheckerboardStimulus: center: ({self.x}, {self.y}) size: {self.width}x{self.height} checkSize: {self.checkWidth}x{self.checkHeight} color: {self.color}>"
+        return f"<pglStimulusCheckerboard: center: ({self.x}, {self.y}) size: {self.width}x{self.height} checkSize: {self.checkWidth}x{self.checkHeight} color: {self.color}>"
 
     def display(self, stimulusPhase=0):
         '''
@@ -517,7 +517,8 @@ class pglCheckerboardStimulus(_pglStimulus):
         # calculate the phase of the checkerboard
         phase = stimulusPhase + self.temporalFrequency * 2 * np.pi * (self.pgl.getSecs() - self.startTime)
         
-        # temporal square wave
+        # Make the temporal pattern a square wave if set
+        # otherwise sinusoidal motion
         if self.temporalSquareWave:
             cosPhase = np.where(np.cos(phase) >= 0, 1, 0)
         else:
@@ -528,6 +529,7 @@ class pglCheckerboardStimulus(_pglStimulus):
         if (xCoords[-1] < xMax): xCoords = np.append(xCoords, xMax)
         if (xCoords[0] < xMin): xCoords[0] = xMin
         xCoords = np.insert(xCoords, 0, xMin)
+        # calculate the number of x coordinates
         Nx = len(xCoords) - 1
 
         # y coordinates
