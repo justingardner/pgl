@@ -281,9 +281,9 @@ class pglStimuli:
             return None
         
         # Create the checkerboard stimulus
-        checkerboardStimulus = pglStimulusCheckerboard(self, x=x, y=y, width=width, height=height,
-                                                       checkWidth=checkWidth, checkHeight=checkHeight,
-                                                       color=color)
+        checkerboardStimulus = pglStimulusCheckerboardSliding(self, x=x, y=y, width=width, height=height,
+                                                                 checkWidth=checkWidth, checkHeight=checkHeight,
+                                                                 color=color)
         return checkerboardStimulus
 
 
@@ -483,7 +483,7 @@ class pglStimulusImage(_pglStimulus):
 ################################################################
 # Checkerboard stimulus class
 ################################################################
-class pglStimulusCheckerboard(_pglStimulus):
+class _pglStimulusCheckerboard(_pglStimulus):
     '''
     Base class for checkerboard stimuli.
     '''
@@ -506,6 +506,10 @@ class pglStimulusCheckerboard(_pglStimulus):
     def __repr__(self):
         return f"<pglStimulusCheckerboard: center: ({self.x}, {self.y}) size: {self.width}x{self.height} checkSize: {self.checkWidth}x{self.checkHeight} color: {self.color}>"
 
+################################################################
+# Flickering Checkerboard stimulus class
+################################################################
+class pglStimulusCheckerboardFlickering(_pglStimulusCheckerboard):
     def display(self, stimulusPhase=0):
         '''
         Display the checkerboard stimulus
@@ -551,6 +555,55 @@ class pglStimulusCheckerboard(_pglStimulus):
                                          [xCoords[iCoord+1], yCoords[jCoord]],
                                          [xCoords[iCoord+1], yCoords[jCoord+1]],
                                          [xCoords[iCoord], yCoords[jCoord+1]]])
+                colors[iQuad,:] = self.color[colorIndex % 2]
+                colorIndex += 1
+                iQuad += 1
+        # draw the checkerboard
+        self.pgl.quad(quad, color=colors)
+
+################################################################
+# Sliding Checkerboard stimulus class
+################################################################
+class pglStimulusCheckerboardSliding(_pglStimulusCheckerboard):
+    def display(self, stimulusPhase=0):
+        '''
+        Display the checkerboard stimulus
+        '''
+        # x coordinates
+        xMin = self.x - self.width / 2
+        xMax = self.x + self.width / 2
+        
+        # calculate the phase of the checkerboard
+        phase = -1 + 2 * ((stimulusPhase + self.temporalFrequency * (self.pgl.getSecs() - self.startTime)) % 1)
+
+        # calculate x coordinates
+        xCoordsOdd = np.arange(xMin + phase*self.checkWidth, xMax, self.checkWidth)        
+        if (xCoordsOdd[-1] < xMax): xCoordsOdd = np.append(xCoordsOdd, xMax)
+        if (phase <= 0): xCoordsOdd[0] = xMin        
+        xCoordsOdd = np.insert(xCoordsOdd, 0, xMin)
+
+        # calculate the number of x coordinates
+        Nx = len(xCoordsOdd) - 1
+        #print(xCoordsOdd)
+        # y coordinates
+        yMin = self.y - self.height / 2
+        yMax = self.y + self.height / 2
+        yCoords = np.arange(yMin, yMax, self.checkHeight)
+        if (yCoords[-1] < yMax): yCoords = np.append(yCoords, yMax)
+        if (yCoords[0] > yMin): yCoords = np.insert(yCoords, 0, yMin)
+        Ny = len(yCoords) - 1
+
+        # create a checkerboard pattern
+        iQuad = 0
+        quad = np.zeros((Nx * Ny, 4, 2), dtype=np.float32)
+        colors = np.zeros((Nx * Ny, 3), dtype=np.float32)
+        for jCoord in range(len(yCoords)-1):
+            colorIndex = jCoord % 2
+            for iCoord in range(len(xCoordsOdd)-1):
+                quad[iQuad,:,:] = np.array([[xCoordsOdd[iCoord], yCoords[jCoord]],
+                                            [xCoordsOdd[iCoord+1], yCoords[jCoord]],
+                                            [xCoordsOdd[iCoord+1], yCoords[jCoord+1]],
+                                            [xCoordsOdd[iCoord], yCoords[jCoord+1]]])
                 colors[iQuad,:] = self.color[colorIndex % 2]
                 colorIndex += 1
                 iQuad += 1
