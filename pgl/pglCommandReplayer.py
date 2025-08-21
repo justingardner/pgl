@@ -91,13 +91,36 @@ class pglCommandReplayer:
             commandName = self.s.getCommandName(commandValue)
             print(f"Command {iCommand}: {commandName} (Value: {commandValue}, Data length: {len(self.commandLogData[iCommand]) if self.commandLogData[iCommand] is not None else 0})")
 
-    def commandReplay(self):
+    def commandReplay(self, frameGrab=False):
         '''
         Replay all recorded pgl commands.
         '''
+        # if we are going to frame grab
+        mglFlushCommandValue = self.s.getCommandValue("mglFlush")
+        if frameGrab:
+            # init frame grab mode (which makes an offscreen context)
+            self.frameGrabInit()
+            # count the number of mglFlush commands
+            mglFlushCount = np.sum(self.commandLog == mglFlushCommandValue)
+            frames = np.zeros((mglFlushCount, self.screenHeight.pix, self.screenWidth.pix, 4), dtype=np.float32)
+        iFrame = 0
+
         for iCommand in range(self.logEntryIndex):
             # display commands in verbose mode
             if self.verbose>1: print(f"(pglCommandReplayer) Replaying command {iCommand}: {self.s.getCommandName(self.commandLog[iCommand])} ")
             # replay the command (just need to pass command data, which includes
             # the command value and any associated data)
             self.s.replayCommand(self.commandLogData[iCommand])
+            # if the command was flush, and we are frame grabbing, grab the frame
+            if frameGrab and self.commandLog[iCommand] == mglFlushCommandValue:
+                # grab the frame
+                frames[iFrame,:,:,:] = self.frameGrab()
+                iFrame += 1      
+
+        # if we are frame grabbing, return the frames
+        if frameGrab:
+            # end the frame grab mode
+            self.frameGrabEnd()
+            return frames
+        else:
+            return None
