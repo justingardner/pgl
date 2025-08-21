@@ -119,6 +119,7 @@ class pglImage:
         self.s.write(np.float32(imageInstance.phase))
         self.s.write(np.uint32(imageInstance.imageNum))
         self.commandResults = self.s.readCommandResults(ackTime)
+ 
     def imageDelete(self, imageInstance):
         '''
         '''
@@ -128,6 +129,7 @@ class pglImage:
             print("(pglImage:imageDelete) imageInstance should be an instance of _pglImageInstance.")
             return
         
+        # FiX, FIX, FIX
         ##if self.verbose>=1: print(f"(pglImage:imageDelete) Deleting image {imageInstance.imageNum} ({imageInstance.width.pix}x{imageInstance.height.pix})")
         # send the deleteTexture command
         #self.s.writeCommand("mglDeleteTexture")
