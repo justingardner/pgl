@@ -13,12 +13,13 @@ from .pglVPixx import pglProPixx, pglDataPixx
 from .pglEyeTracker import pglEyeTracker
 from .pglTrackPixx import pglTrackPixx3
 from .pglCommandReplayer import pglCommandReplayer
+from .pglFrameGrab import pglFrameGrab
 
 
 #from .screen import screen
 #from .task import task
 
-class pgl(pglBase, pglResolution, pglDraw, pglTransform, pglProfile, pglBatch, pglImage, pglStimuli, pglTimestamp, pglDevices, pglEvents, pglCommandReplayer):
+class pgl(pglBase, pglResolution, pglDraw, pglTransform, pglProfile, pglBatch, pglImage, pglStimuli, pglTimestamp, pglDevices, pglEvents, pglCommandReplayer, pglFrameGrab):
     """
     purpose: psychophysics and experiment library for Python.
     License: MIT License — see LICENSE file for details.
@@ -39,6 +40,7 @@ class pgl(pglBase, pglResolution, pglDraw, pglTransform, pglProfile, pglBatch, p
       pglDevices.__init__(self, *args, **kwargs)
       pglEvents.__init__(self, *args, **kwargs)
       pglCommandReplayer.__init__(self, *args, **kwargs)
-      
+      pglFrameGrab.__init__(self, *args, **kwargs)
+
 __version__ = "1.0.0"
 __author__ = "JLG"
