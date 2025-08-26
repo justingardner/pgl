@@ -107,9 +107,6 @@ class pglFrameGrab:
         imageWidth = self.s.read(np.uint32)
         imageHeight = self.s.read(np.uint32)
 
-        # display
-        print(f"(mglFrameGrab) width x height: {imageWidth} x {imageHeight}")
-
         # read the length in bytes
         dataLength = self.s.read(np.uint32)
 
