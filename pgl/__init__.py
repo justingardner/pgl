@@ -9,12 +9,14 @@ from .pglStimuli import pglStimuli
 from .pglTimestamp import pglTimestamp
 from .pglDevice import pglDevice, pglDevices
 from .pglEvent import pglEvent, pglEvents
-from .pglVPixx import pglProPixx, pglDataPixx
-from .pglEyeTracker import pglEyeTracker
-from .pglTrackPixx import pglTrackPixx3
 from .pglCommandReplayer import pglCommandReplayer
 from .pglFrameGrab import pglFrameGrab
 
+# Device specific imports (eye trackers, etc.)
+from .pglVPixx import pglProPixx, pglDataPixx
+from .pglEyeTracker import pglEyeTracker
+from .pglTrackPixx import pglTrackPixx3
+from .pglEyelink import pglEyelinkCustomDisplay, pglEyelink
 
 #from .screen import screen
 #from .task import task
