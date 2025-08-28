@@ -520,7 +520,7 @@ class pglDraw:
             self.currentLine += 1
 
         # negative line numbers
-        if line < 0: line = linesPerScreen + line + 1
+        if line is not None and line < 0: line = linesPerScreen + line + 1
 
         # calculate line if necessary
         if line is not None:

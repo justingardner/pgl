@@ -218,7 +218,7 @@ if _HAVE_PYLINK:
                 # draw the title below the image
                 if self.cameraImageTitle:
                     # Draw title
-                    self.pgl.text(self.cameraImageTitle,fontSize=10,color=(0,0,0))
+                    self.pgl.text(self.cameraImageTitle,fontSize=10,color=(0,0,0),x=im.displayLeft+(im.displayRight-im.displayLeft)/2,y=im.displayTop+0.5)
                 # flush to screen
                 self.pgl.flush()
                 
