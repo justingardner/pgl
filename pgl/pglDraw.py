@@ -154,8 +154,9 @@ class pglDraw:
         if color is None: color = np.ones(3)
 
         # validate color
-        color = self.validateColor(color, withAlpha=False)
-
+        color = self.validateColor(color, withAlpha=False, n = 1)
+        color = color.flatten()
+        
         # Convert units if necessary
         if units is None:
             pass
@@ -196,7 +197,7 @@ class pglDraw:
     ################################################################
     # fixationCross
     ################################################################
-    def fixationCross(self, size=1, x=0, y=0, color=None):
+    def fixationCross(self, size=1, x=0, y=0, color=None, units=None):
         """
         Draw a fixation cross.
 
@@ -213,46 +214,78 @@ class pglDraw:
         color = self.validateColor(color, withAlpha=False)
 
         # draw the horizontal line
-        self.line(x - size, y, x + size, y, color)
+        self.line(x - size/2, y, x + size/2, y, color, units=units)
 
         # draw the vertical line
-        self.line(x, y - size, x, y + size, color)
+        self.line(x, y - size/2, x, y + size/2, color, units=units)
 
     ################################################################
     # circle
     ################################################################
-    def circle(self, radius=1, x=0, y=0, color=None, numSegments=36):
+    def circle(self, radius=1, x=0, y=0, color=None, numSegments=36, fill=False, units=None):
         """
-        Draw a circle.
+        Draw a circle. Note that arc is more general, and possibly faster (but does not work in pixel coordinates)
 
         Args:
             radius (float): The radius of the circle.
             x (float): The x coordinate of the center of the circle.
             y (float): The y coordinate of the center of the circle.
             color (list or tuple, optional): RGB color values as a list or tuple of three floats in the range [0, 1].
+            numSegments (int, optional): The number of segments to use to approximate the circle (default is 36).
+            fill (bool, optional): Whether to fill the circle (default is False).
+            units (str, optional): The units for the coordinates and radius. If 'pix' then pixels, otherwise degrees.
 
         Returns:
             None
         """
         # validate color
         color = self.validateColor(color, withAlpha=False)
+        
+        # if radius is a scalar, make it into a list
+        if np.isscalar(radius): radius = [radius, radius]
+        
+        # Convert units if necessary
+        if units is None:
+            pass
+        elif units.lower() in ("pixels","pix","pixel","px"):
+            x, y = self.pix2deg(x, y)
+            radius[0] = radius[0] * self.xPix2Deg
+            radius[1] = radius[1] * self.yPix2Deg
+        elif units != "device":
+            print(f"(pglDraw:circle) Invalid units '{units}'. Using deg units.")
 
-        # draw the circle using a series of line segments
-        for i in range(numSegments):
-            # calculate start and stop angle for segment
-            angle1 = 2 * np.pi * i / numSegments
-            angle2 = 2 * np.pi * (i + 1) / numSegments
-            # draw that segment
-            x1 = x + radius * np.cos(angle1)
-            y1 = y + radius * np.sin(angle1)
-            x2 = x + radius * np.cos(angle2)
-            y2 = y + radius * np.sin(angle2)
-            self.line(x1, y1, x2, y2, color)
+        if fill:
+            quad = np.zeros((numSegments,4,2), dtype=np.float32)
+            # draw the circle using a series of line segments
+            for i in range(numSegments):
+                # calculate start and stop angle for segment
+                angle1 = 2 * np.pi * i / numSegments
+                angle2 = 2 * np.pi * (i + 1) / numSegments
+                # draw that segment
+                x1 = x + radius[0] * np.cos(angle1)
+                y1 = y + radius[1] * np.sin(angle1)
+                x2 = x + radius[0] * np.cos(angle2)
+                y2 = y + radius[1] * np.sin(angle2)
+                # make it into a quad
+                quad[i,:,:] = np.array([[x, y], [x1, y1], [x2, y2], [x, y]])
+            self.quad(quad, color=color)
+        else:
+            # draw the circle using a series of line segments
+            for i in range(numSegments):
+                # calculate start and stop angle for segment
+                angle1 = 2 * np.pi * i / numSegments
+                angle2 = 2 * np.pi * (i + 1) / numSegments
+                # draw that segment
+                x1 = x + radius[0] * np.cos(angle1)
+                y1 = y + radius[1] * np.sin(angle1)
+                x2 = x + radius[0] * np.cos(angle2)
+                y2 = y + radius[1] * np.sin(angle2)
+                self.line(x1, y1, x2, y2, color)
 
     ################################################################
     # quad
     ################################################################
-    def quad(self, vertices, color=None):
+    def quad(self, vertices, color=None, units=None):
         '''
         Draw a quad
 
@@ -265,6 +298,14 @@ class pglDraw:
         # get the vertices as an n x 4 x 2 matrix
         vertices = np.atleast_3d(np.array(vertices, dtype=np.float32))
         if vertices.shape[-1] == 1: vertices = np.moveaxis(vertices, -1, 0)
+
+        # Convert units if necessary
+        if units is None:
+            pass
+        elif units.lower() in ("pixels","pix","pixel","px"):
+            vertices[:,:,0], vertices[:,:,1] = self.pix2deg(vertices[:,:,0], vertices[:,:,1])
+        elif units != "device":
+            print(f"(pglDraw:quad) Invalid units '{units}'. Using deg units.")
 
         # check dimensions
         if vertices.shape[1] != 4 or vertices.shape[2] != 2:
@@ -378,6 +419,7 @@ class pglDraw:
         """
         # validate color
         color = self.validateColor(color)
+        color = color.flatten()
 
         # get vertex data
         vertexData = [x, y, 0, *color, innerRadius, outerRadius, innerRadius, outerRadius, startAngle, stopAngle, borderSize]

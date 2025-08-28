@@ -57,7 +57,7 @@ if _HAVE_PYLINK:
             
             # background and foreground colors
             self.backgroundColor = (128, 128, 128)
-            self.foregroundColorColor = (0, 0, 0)
+            self.foregroundColor = (0, 0, 0)
             
             # Fix, Fix, Fix (compute this from dges of visual angle)
             self.targetSizePixels = 32
@@ -110,7 +110,7 @@ if _HAVE_PYLINK:
             # allocate buffer for camera image
             self.cameraImageSize = (width, height)
             # Fix, fix, fix: allocate4 cameaImageBuffer
-            self.cameraImageBuffer = array.array('I', [0]*(width*height))
+            self.cameraImageBuffer = np.zeros((height, width, 3), dtype=np.float32)
             # clear display
             self.clear_cal_display()
             return 1
@@ -130,7 +130,7 @@ if _HAVE_PYLINK:
                 
             # add line to camera image buffer
             for iPixel in range(width):
-                self.cameraImageBuffer[line,iPixel] = self.imagePalette[buff[iPixel]]
+                self.cameraImageBuffer[line,iPixel,:] = self.imagePalette[buff[iPixel]]
         
             # if last line, draw the full image
             # fix, fix, fix: check if this is correct
@@ -138,18 +138,17 @@ if _HAVE_PYLINK:
                 # clear display
                 self.clear_cal_display()
                 # draw the camera image
-                self.pgl.drawImage(self.cameraImageBuffer, (0,0), self.cameraImageSize, self.cameraImageSize)
+                im = self.pgl.imageCreate(self.cameraImageBuffer)
+                im.display()
                 # draw the title below the image
                 if self.cameraImageTitle:
-                    self.pgl.drawText(self.cameraImageTitle, (10, self.cameraImageSize[1]+10), color=self.foregroundColor)
+                    self.pgl.text(self.cameraImageTitle)
                 # flush to screen
                 self.pgl.flush()
                 
         def set_image_palette(self, r, g, b):
             """ get the color palette for the camera image"""
-            self.imagePalette = []
-            for iColor in range(r.shape[0]):
-                self.imagePalette.append((int(r[iColor])<<16 | int(g[iColor])<<8 | int(b[iColor])))
+            self.imagePalette = np.stack([r, g, b], axis=1)
         
         def erase_cal_target(self):
             """ erase the calibration target"""
@@ -157,10 +156,11 @@ if _HAVE_PYLINK:
 
         def draw_cal_target(self, x, y):
             """ draw the calibration target, i.e., a bull's eye"""
-            # Fix, fix, fix, implement "pix" in circle
-            # also, implement an oval of fillcircle or other
-            self.pgl.circle(x=x, y=y, radius=self.targetSizePixels/2, color=self.foregroundColor, units='pix')
-            self.pgl.fixationCross(x, y, size=self.targetSizePixels, color=self.backgroundColor, units='pix')
+            
+            # draw target as a filled circle with a cross
+            self.pgl.circle(x=x, y=y, radius=self.targetSizePixels/2, color=self.foregroundColor, fill=True, units='pix')
+            self.pgl.fixationCross(x=x, y=y, size=self.targetSizePixels, color=self.backgroundColor, units='pix')
+
         def play_beep(self, beepid):
             """ play warning beeps if being requested"""
             pass
@@ -181,7 +181,7 @@ if _HAVE_PYLINK:
             # coordinates for a diamond around fixation cross.
             coords = [ (x, y-height/2), (x+width/2, y),
                        (x, y+height/2), (x-width/2, y)]
-            # Fix, fix, fix, implement "pix" in quad
+            # Draw as a quad
             self.pgl.quad(coords, self.getColorFromIndex(colorindex), units='pix')
             
         def get_mouse_state(self):
@@ -202,17 +202,17 @@ if _HAVE_PYLINK:
         def getColorFromIndex(self, colorindex):
             """ color scheme for different elements """
             if colorindex == pylink.CR_HAIR_COLOR:
-                return (255, 255, 255, 255)
+                return (1, 1, 1)
             elif colorindex == pylink.PUPIL_HAIR_COLOR:
-                return (255, 255, 255, 255)
+                return (1, 1, 1)
             elif colorindex == pylink.PUPIL_BOX_COLOR:
-                return (0, 255, 0, 255)
+                return (0, 1, 0)
             elif colorindex == pylink.SEARCH_LIMIT_BOX_COLOR:
-                return (255, 0, 0, 255)
+                return (1, 0, 0)
             elif colorindex == pylink.MOUSE_CURSOR_COLOR:
-                return (255, 0, 0, 255)
+                return (1, 0, 0)
             else:
-                return (0, 0, 0, 0)
+                return (0, 0, 0)
 
         def exit_image_display(self):
             """ exit the camera image display"""
