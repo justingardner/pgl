@@ -465,6 +465,7 @@ class pglDraw:
         """
         # validate color
         color = self.validateColor(color)
+        color = color.flatten()
 
         # Load Font
         fontPath = "/System/Library/Fonts"

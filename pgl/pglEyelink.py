@@ -9,8 +9,10 @@
 # Import modules
 #############
 import sys, array
+import numpy as np
 from pynput import keyboard
 from pgl import pglEyeTracker
+from pgl import pglEventKeyboard
 
 try:
     import pylink
@@ -59,8 +61,10 @@ class pglEyelink(pglEyeTracker):
             # setup our custom display so that the eyelink calls pgl functions
             # to display targets for calibration and validation
             pylink.closeGraphics()
-            customDisplay = pglEyelinkCustomDisplay(self.pgl, self.eyelink)
-            pylink.openGraphicsEx(customDisplay)
+            self.customDisplay = pglEyelinkCustomDisplay(self.pgl, self.eyelink)
+            pylink.openGraphicsEx(self.customDisplay)
+            
+            print(f"(pglEyelink) Using pgl display for Eyelink calibration and validation.")
 
     def __del__(self):
         """Destructor to clean up resources."""
@@ -90,7 +94,7 @@ class pglEyelink(pglEyeTracker):
 # define the custom display class for eyelink
 if _HAVE_PYLINK:
     class pglEyelinkCustomDisplay(pylink.EyeLinkCustomDisplay):
-        def __init__(self, pgl, eyelink):
+        def __init__(self, pgl, eyelink=None):
             # init super class
             super().__init__()
             # store pgl and eyelink instance
@@ -124,7 +128,7 @@ if _HAVE_PYLINK:
             self.cameraImageTitle = ""
             
             # setup keymap
-            keyMap = {
+            self.keyMap = {
                 # Function keys
                 keyboard.Key.f1: pylink.F1_KEY,
                 keyboard.Key.f2: pylink.F2_KEY,
@@ -184,6 +188,7 @@ if _HAVE_PYLINK:
             self.cameraImageBuffer = np.zeros((height, width, 3), dtype=np.float32)
             # clear display
             self.clear_cal_display()
+            print("(pglEyelink) setup_image_display")
             return 1
 
         def image_title(self, text):
@@ -204,16 +209,16 @@ if _HAVE_PYLINK:
                 self.cameraImageBuffer[line,iPixel,:] = self.imagePalette[buff[iPixel]]
         
             # if last line, draw the full image
-            # fix, fix, fix: check if this is correct
             if line == totlines-1:
                 # clear display
-                self.clear_cal_display()
+                self.pgl.clearScreen(self.backgroundColor)
                 # draw the camera image
                 im = self.pgl.imageCreate(self.cameraImageBuffer)
                 im.display()
                 # draw the title below the image
                 if self.cameraImageTitle:
-                    self.pgl.text(self.cameraImageTitle)
+                    # Draw title
+                    self.pgl.text(self.cameraImageTitle,fontSize=10,color=(0,0,0))
                 # flush to screen
                 self.pgl.flush()
                 
@@ -228,10 +233,12 @@ if _HAVE_PYLINK:
         def draw_cal_target(self, x, y):
             """ draw the calibration target, i.e., a bull's eye"""
             
+            print(f"(pglEyelink) Calibration target at ({x},{y})")
             # draw target as a filled circle with a cross
             self.pgl.circle(x=x, y=y, radius=self.targetSizePixels/2, color=self.foregroundColor, fill=True, units='pix')
             self.pgl.fixationCross(x=x, y=y, size=self.targetSizePixels, color=self.backgroundColor, units='pix')
-
+            self.pgl.flush()
+            
         def play_beep(self, beepid):
             """ play warning beeps if being requested"""
             pass
@@ -240,21 +247,24 @@ if _HAVE_PYLINK:
             """ handle key input and send it over to the tracker"""
             keyboardEvents = []
             # poll for keyboard events
-            events = self.pgl.poll()
+            events = self.pgl.devicesPoll()
             for event in events:
-                if isinstance(event, pglEventKeyboard):
+                if isinstance(event, pglEventKeyboard):                    
                     # convert modifier
                     modifier = 0
-                    if event.shift: modifier |= pylink.KEY_SHIFT
-                    if event.ctrl: modifier |= pylink.KEY_CTRL
-                    if event.alt: modifier |= pylink.KEY_ALT
-                    if event.cmd: modifier |= pylink.KEY_CMD
+                    #if event.shift: modifier |= pylink.KEY_SHIFT
+                    #if event.ctrl: modifier |= pylink.KEY_CTRL
+                    #if event.alt: modifier |= pylink.KEY_ALT
+                    #if event.cmd: modifier |= pylink.KEY_CMD
                         
                     # see if it is in the keyMap
                     if event.key in self.keyMap:
+                        print(f"KeyMap: {event.keyStr}={self.keyMap[event.key]}")
                         keyboardEvents.append(pylink.KeyInput(self.keyMap[event.key], modifier))
                     else:
+                        print(f"Key: {event.keyStr}={event.keyCode}")
                         keyboardEvents.append(pylink.KeyInput(event.keyCode, modifier))
+            
             # return keyboard events
             return keyboardEvents
         def draw_line(self, x1, y1, x2, y2, colorindex):
