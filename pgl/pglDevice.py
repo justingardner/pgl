@@ -111,13 +111,14 @@ class pglDevices:
 
         This method iterates through all devices and calls their poll method.
         """
+
         for device in self.devices: 
             # poll each device for events
             eventList = device.poll()
             # add them to the events list
             self.eventsAdd(eventList)
-            # return the eventList
-            return eventList
+        # return the eventList
+        return eventList
 
 #############################
 # keyboard device
@@ -196,6 +197,7 @@ class pglKeyboard(pglDevice):
 
     def poll(self): 
         eventList = []
+
         while not self.keyQueue.empty():
             key, timestamp, shift, ctrl, alt, cmd = self.keyQueue.get()
             # get string representation
