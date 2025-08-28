@@ -9,6 +9,7 @@
 # Import modules
 #############
 import sys, array
+from pynput import keyboard
 from pgl import pglEyeTracker
 
 try:
@@ -27,7 +28,7 @@ class pglEyelink(pglEyeTracker):
     Based on example code: pygame_eyelink_display.py form pylink manual
     """
 
-    def __init__(self, pgl=None, deviceType="Eyelink", eyelinkAddress="100.1.1.1"):
+    def __init__(self, pgl=None, deviceType="Eyelink", eyelinkAddress="100.1.1.1", edfFilename="test.edf"):
         """
         Initialize the Eyelink device.
         """
@@ -47,17 +48,44 @@ class pglEyelink(pglEyeTracker):
             self.eyelink = None
             return
         
-        def __del__(self):
-            """Destructor to clean up resources."""
-            if self.eyelink is not None:
-                if self.eyelink.isConnected():
-                    print("(pglEyelink) Closing connection to Eyelink.")
-                    try:
-                        self.eyelink.close()
-                    except Exception as e:
-                        print(f"(pglEyelink) Error closing Eyelink: {e}")
-            super().__del__()
+        # open a data file
+        self.eyelink.openDataFile(edfFilename)
+        
+        # send over a command to let the tracker know the correct screen resolution
+        if not self.pgl is None:
+            screenCoordsCommand = f"screen_pixel_coords = 0 0 {self.pgl.screenWidth.pix-1} {self.pgl.screenHeight.pix-1}"
+            self.eyelink.sendCommand(screenCoordsCommand)
+        
+            # setup our custom display so that the eyelink calls pgl functions
+            # to display targets for calibration and validation
+            pylink.closeGraphics()
+            customDisplay = pglEyelinkCustomDisplay(self.pgl, self.eyelink)
+            pylink.openGraphicsEx(customDisplay)
 
+    def __del__(self):
+        """Destructor to clean up resources."""
+        if self.eyelink is not None:
+            if self.eyelink.isConnected():
+                print("(pglEyelink) Closing connection to Eyelink.")
+                try:
+                    self.eyelink.close()
+                except Exception as e:
+                    print(f"(pglEyelink) Error closing Eyelink: {e}")
+
+
+    def calibrate(self):
+        """Calibrate the eye tracker."""
+        if self.eyelink is not None:
+            print("(pglEyelink) Starting calibration routine")
+            print("             Enter: Show camera image")
+            print("             C: (C)alibrate V: (V)alidate")
+            print("             0 or Q: (Q)uit calibration")
+            try:
+                self.eyelink.doTrackerSetup()
+            except Exception as e:
+                print(f"(pglEyelink) Error during calibration: {e}")
+        else:
+            print("(pglEyelink) Eyelink is not initialized.")
 
 # define the custom display class for eyelink
 if _HAVE_PYLINK:
@@ -94,6 +122,38 @@ if _HAVE_PYLINK:
             
             # title to be displayed below the camera image
             self.cameraImageTitle = ""
+            
+            # setup keymap
+            keyMap = {
+                # Function keys
+                keyboard.Key.f1: pylink.F1_KEY,
+                keyboard.Key.f2: pylink.F2_KEY,
+                keyboard.Key.f3: pylink.F3_KEY,
+                keyboard.Key.f4: pylink.F4_KEY,
+                keyboard.Key.f5: pylink.F5_KEY,
+                keyboard.Key.f6: pylink.F6_KEY,
+                keyboard.Key.f7: pylink.F7_KEY,
+                keyboard.Key.f8: pylink.F8_KEY,
+                keyboard.Key.f9: pylink.F9_KEY,
+                keyboard.Key.f10: pylink.F10_KEY,
+
+                # Arrow keys    
+                keyboard.Key.up: pylink.CURS_UP,
+                keyboard.Key.down: pylink.CURS_DOWN,
+                keyboard.Key.left: pylink.CURS_LEFT,
+                keyboard.Key.right: pylink.CURS_RIGHT,
+
+                # Page up/down
+                keyboard.Key.page_up: pylink.PAGE_UP,
+                keyboard.Key.page_down: pylink.PAGE_DOWN,
+
+                # Control keys
+                keyboard.Key.backspace: ord('\b'),
+                keyboard.Key.enter: pylink.ENTER_KEY,
+                keyboard.Key.space: ord(' '),
+                keyboard.Key.esc: pylink.ESC_KEY,
+                keyboard.Key.tab: ord('\t'),
+            }
             
         def __str__(self):
             """ overwrite __str__ """
@@ -178,9 +238,25 @@ if _HAVE_PYLINK:
 
         def get_input_key(self):
             """ handle key input and send it over to the tracker"""
-            # Fix, fix, fix: get key from pgl
-            return None
-        
+            keyboardEvents = []
+            # poll for keyboard events
+            events = self.pgl.poll()
+            for event in events:
+                if isinstance(event, pglEventKeyboard):
+                    # convert modifier
+                    modifier = 0
+                    if event.shift: modifier |= pylink.KEY_SHIFT
+                    if event.ctrl: modifier |= pylink.KEY_CTRL
+                    if event.alt: modifier |= pylink.KEY_ALT
+                    if event.cmd: modifier |= pylink.KEY_CMD
+                        
+                    # see if it is in the keyMap
+                    if event.key in self.keyMap:
+                        keyboardEvents.append(pylink.KeyInput(self.keyMap[event.key], modifier))
+                    else:
+                        keyboardEvents.append(pylink.KeyInput(event.keyCode, modifier))
+            # return keyboard events
+            return keyboardEvents
         def draw_line(self, x1, y1, x2, y2, colorindex):
             """ draw lines"""
             self.pgl.line(x1, y1, x2, y2, self.getColorFromIndex(colorindex),units='pix')        

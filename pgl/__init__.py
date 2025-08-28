@@ -7,7 +7,7 @@ from .pglBatch import pglBatch
 from .pglImage import pglImage
 from .pglStimuli import pglStimuli
 from .pglTimestamp import pglTimestamp
-from .pglDevice import pglDevice, pglDevices
+from .pglDevice import pglDevice, pglDevices, pglKeyboard
 from .pglEvent import pglEvent, pglEvents
 from .pglCommandReplayer import pglCommandReplayer
 from .pglFrameGrab import pglFrameGrab
