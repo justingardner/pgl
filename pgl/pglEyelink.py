@@ -26,8 +26,8 @@ class pglEyelink(pglEyeTracker):
     pglEyelink class for interfacing with SR-Research Eyelink.
     Based on example code: pygame_eyelink_display.py form pylink manual
     """
-    
-    def __init__(self, pgl=None, deviceType="Eyelink"):
+
+    def __init__(self, pgl=None, deviceType="Eyelink", eyelinkAddress="100.1.1.1"):
         """
         Initialize the Eyelink device.
         """
@@ -39,6 +39,24 @@ class pglEyelink(pglEyeTracker):
             print("(pglEyelink) pylink is not installed. Please install it from SR-Research website to use Eyelink.")
             return
 
+        # create an eyelink instance
+        try:
+            self.eyelink = pylink.EyeLink(eyelinkAddress)
+        except RuntimeError as e:
+            print(f"(pglEyelink) Error initializing Eyelink: {e}")
+            self.eyelink = None
+            return
+        
+        def __del__(self):
+            """Destructor to clean up resources."""
+            if self.eyelink is not None:
+                if self.eyelink.isConnected():
+                    print("(pglEyelink) Closing connection to Eyelink.")
+                    try:
+                        self.eyelink.close()
+                    except Exception as e:
+                        print(f"(pglEyelink) Error closing Eyelink: {e}")
+            super().__del__()
 
 
 # define the custom display class for eyelink
@@ -51,19 +69,12 @@ if _HAVE_PYLINK:
             self.pgl = pgl
             self._tracker = eyelink
             
-            # FIX, FIX, FIX (need this?)
-            self._version = '2025.08.26'
-            self._last_updated = '8/26/2025'
-            
             # background and foreground colors
             self.backgroundColor = (128, 128, 128)
             self.foregroundColor = (0, 0, 0)
             
-            # Fix, Fix, Fix (compute this from dges of visual angle)
-            self.targetSizePixels = 32
-            
-            # Fix, Fix, fix, (need this?)
-            self.targetType = 'circle'
+            # Make this target size about 1 degree
+            self.targetSizePixels = round((self.pgl.xDeg2Pix + self.pgl.yDeg2Pix)/2)
             
             # sounds, Fix, Fix, fix to play sounds
             self.beeTarget = None
