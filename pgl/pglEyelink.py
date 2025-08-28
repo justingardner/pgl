@@ -213,7 +213,7 @@ if _HAVE_PYLINK:
                 # clear display
                 self.pgl.clearScreen(self.backgroundColor)
                 # draw the camera image
-                im = self.pgl.imageCreate(self.cameraImageBuffer)
+                im = self.pgl.imageCreate(self.cameraImageBuffer[0:totlines,0:width])
                 im.display()
                 # draw the title below the image
                 if self.cameraImageTitle:

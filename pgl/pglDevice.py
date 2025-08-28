@@ -183,9 +183,9 @@ class pglKeyboard(pglDevice):
             self.alt = False
         elif key in [keyboard.Key.cmd, keyboard.Key.cmd_r]:
             self.cmd = False
-        elif key == keyboard.Key.esc:
-            print("(pglKeyboard) Esc key released, ending keyboard listener")
-            return False  # stops listener
+        #elif key == keyboard.Key.esc:
+        #    print("(pglKeyboard) Esc key released, ending keyboard listener")
+        #    return False  # stops listener
 
     # Proper stop method
     def stopListener(self): 
