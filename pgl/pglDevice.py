@@ -9,6 +9,9 @@
 # # Import
 ##########
 from asyncio import subprocess
+import io
+import sys
+from time import sleep
 from pgl import pglTimestamp
 from .pglEvent import pglEvent
 
@@ -135,6 +138,8 @@ class pglKeyboard(pglDevice):
         if not self.checkAccessibilityPermission():
             print("(pglKeyboard) ❌ This app is not authorized for Accessibility input monitoring. No keyboard events will be detected!!")
             print("              Go to System Settings → Privacy & Security → Accessibility and add this app.")
+            print("              If you are running VS Code and it already has permissions granted, try running from a terminal with:")
+            print("              /Applications/Visual\\ Studio\\ Code.app/Contents/MacOS/Electron")
             return
 
         # Create a thread-safe queue
@@ -160,24 +165,53 @@ class pglKeyboard(pglDevice):
         self.cmd = False
 
         print("(pglKeyboard) Keyboard listener initialized.")
+    
     def checkAccessibilityPermission(self):
         """
         Returns True if the process is trusted for accessibility events.
         Works on macOS using tccutil database query.
         """
+        accessibilityPermission = False
+
+        # capture stdout and stderr
+        error = None
+        stdout_capture = io.StringIO()
+        stderr_capture = io.StringIO()
+
         try:
-            # This command checks if the current app is listed in the accessibility DB
-            result = subprocess.run(
-                ["sqlite3", "~/Library/Application Support/com.apple.TCC/TCC.db", 
-                "SELECT allowed FROM access WHERE client='Python' AND service='kTCCServiceAccessibility';"],
-                capture_output=True,
-                text=True,
-                shell=True
-            )
-            output = result.stdout.strip()
-            return output == "1"
-        except Exception:
-            return False
+            # Redirect stdout and stderr
+            old_stdout, old_stderr = sys.stdout, sys.stderr
+            sys.stdout, sys.stderr = stdout_capture, stderr_capture
+
+            # Start a temporary listener
+            listener = keyboard.Listener()
+            listener.start()  # non-blocking
+            sleep(0.1)   # give it a moment to initialize
+
+            if not listener.running: error = "Listener did not start properly"
+
+        except Exception as e:
+            error = str(e)
+
+        finally:
+            listener.stop()
+            # Restore stdout and stderr
+            sys.stdout, sys.stderr = old_stdout, old_stderr
+
+        # Get captured output
+        stdout_output = stdout_capture.getvalue()
+        stderr_output = stderr_capture.getvalue()
+
+        if error:
+            print(f"(pglKeyboard) ❌ {error.rstrip('\n')}")
+        elif stdout_output:
+            print(f"(pglKeyboard) ❌ {stdout_output.rstrip('\n')}")
+        elif stderr_output:
+            print(f"(pglKeyboard) ❌ {stderr_output.rstrip('\n')}")
+        else:
+            accessibilityPermission = True
+        
+        return(accessibilityPermission)
 
 
     def __del__(self):
