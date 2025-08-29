@@ -8,6 +8,8 @@
 #############
 # Import modules
 #############
+from datetime import datetime
+import glob
 import inspect
 import platform, subprocess, random, string, os
 from pprint import pprint
@@ -16,6 +18,8 @@ from . import _pglComm as pglComm
 from . import _resolution
 from types import SimpleNamespace
 import signal
+import glob
+import psutil
 
 #############
 # Main class
@@ -51,6 +55,9 @@ class pglBase:
         self.homeDir = os.path.expanduser("~")
         pglDir = inspect.getfile(self.__class__)
         self.pglDir = os.path.dirname(os.path.dirname(pglDir))
+        
+        # get socket path
+        self.metalSocketPath = os.path.join(self.homeDir, "Library/Containers/gru.mglMetal/Data")
 
         # print what we are doing
         if self.verbose > 0: print("(pglBase) Main library instance created")
@@ -137,12 +144,11 @@ class pglBase:
         # get metal app name
         self.metalAppName = self.getMetalAppName(stable=stable, mglMetalPath=mglMetalPath)
 
-        # get socket path
-        self.metalSocketPath = os.path.join(self.homeDir, "Library/Containers/gru.mglMetal/Data")
+        # get a socket name that incorporated date, time and a random string
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        randomString = ''.join(random.choices(string.ascii_letters + string.digits, k=10))
+        self.metalSocketName = f"pglMetal.socket.{timestamp}.{randomString}"
 
-        # get a randomized socket name
-        self.metalSocketName = "pglMetal.socket."+''.join(random.choices(string.ascii_letters + string.digits, k=10))
-        
         # create the socket path
         socketName = os.path.join(self.metalSocketPath, self.metalSocketName)
 
@@ -574,7 +580,80 @@ class pglBase:
             # not macOS
             print("(pgl:checkOS) PGL is only supported on macOS")
             return False
+    ################################################################
+    # Clean up open windows (which may be orphaned) and there socket connections
+    ################################################################
+    def cleanUp(self):
+        '''
+        Clean up open windows (which may be orphaned) and their socket connections
+        '''
+        if self.isOpen(): self.close()
+        self.shutdownAll()
+        self.removeOrphanedSockets()
 
+    ################################################################
+    # Shutdown all mglMetal processes
+    ################################################################
+    def shutdownAll(self):
+        '''
+        Shutdown all mglMetal processes
+        '''
+        for proc in psutil.process_iter(['name']):
+            if proc.info['name'] == 'mglMetal':
+                print(f"(pglBase:shutdownAll) Shutting down mglMetal process: {proc.pid}")
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except TimeoutExpired:
+                    print(f"(pglBase:shutdownAll) Forcefully killing mglMetal process: {proc.pid}")
+                    proc.kill()
+
+    ################################################################
+    # Remove orphaned sockets
+    ################################################################
+    def removeOrphanedSockets(self):
+        '''
+        Remove orphaned sockets
+        '''
+        if not hasattr(self, 'metalSocketPath'):
+            print("(pglBase:removeOrphanedSockets) No metalSocketPath defined, cannot remove orphaned sockets")
+            return
+        
+        socketPattern = os.path.join(self.metalSocketPath, "pglMetal.socket.*")
+
+        # check for all mglMetal processes that are running, what their socket address are
+        openMetalSockets = []
+        for proc in psutil.process_iter(['name']):
+            try:
+                if proc.info['name'] == 'mglMetal':
+                    # check UNIX socket connections for this process
+                    for conn in proc.connections(kind='unix'):
+                        if conn.laddr:  # laddr is the socket path
+                            openMetalSockets.append(conn.laddr)
+
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue  # skip processes we can't inspect
+        
+        # print out open sockets
+        for socket in list(set(openMetalSockets)):
+            print(f"(pglBase:removeOrphanedSockets) Found open socket: {socket}")
+
+        nRemovedSockets = 0
+        for socketPath in glob.glob(socketPattern):
+            # check if it is one that mglMetal is using
+            if not socketPath in openMetalSockets:
+                print(f"(pglBase:removeOrphanedSockets) Removing orphaned socket: {socketPath}")
+                try:
+                    os.remove(socketPath)
+                    nRemovedSockets += 1
+                except OSError as e:
+                    print(f"(pglBase:removeOrphanedSockets) Failed to remove {socketPath}: {e}")
+        
+        # Display how many sockets were removed
+        if nRemovedSockets > 0:
+            print(f"(pglBase:removeOrphanedSockets) Removed {nRemovedSockets} orphaned sockets")
+        else:
+            print(f"(pglBase:removeOrphanedSockets) No orphaned sockets found in {self.metalSocketPath}")
     #################################################################
     # Pause interrupts
     #################################################################
