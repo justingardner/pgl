@@ -8,6 +8,7 @@
 ###########
 # # Import
 ##########
+from asyncio import subprocess
 from pgl import pglTimestamp
 from .pglEvent import pglEvent
 
@@ -130,7 +131,11 @@ import threading
 class pglKeyboard(pglDevice):
     def __init__(self): 
         super().__init__(deviceType="pglKeyboard")
-        print("(pglKeyboard) Keyboard listener initialized.")
+
+        if not self.checkAccessibilityPermission():
+            print("(pglKeyboard) ❌ This app is not authorized for Accessibility input monitoring. No keyboard events will be detected!!")
+            print("              Go to System Settings → Privacy & Security → Accessibility and add this app.")
+            return
 
         # Create a thread-safe queue
         self.keyQueue = Queue()
@@ -153,6 +158,27 @@ class pglKeyboard(pglDevice):
         self.ctrl = False
         self.alt = False
         self.cmd = False
+
+        print("(pglKeyboard) Keyboard listener initialized.")
+    def checkAccessibilityPermission(self):
+        """
+        Returns True if the process is trusted for accessibility events.
+        Works on macOS using tccutil database query.
+        """
+        try:
+            # This command checks if the current app is listed in the accessibility DB
+            result = subprocess.run(
+                ["sqlite3", "~/Library/Application Support/com.apple.TCC/TCC.db", 
+                "SELECT allowed FROM access WHERE client='Python' AND service='kTCCServiceAccessibility';"],
+                capture_output=True,
+                text=True,
+                shell=True
+            )
+            output = result.stdout.strip()
+            return output == "1"
+        except Exception:
+            return False
+
 
     def __del__(self):
         self.stopListener()
@@ -189,14 +215,28 @@ class pglKeyboard(pglDevice):
 
     # Proper stop method
     def stopListener(self): 
-        if hasattr(self, 'listener') and self.listener.running:
-            self.listener.stop()  # stop the keyboard listener
+        '''
+        Stop the keyboard listener.
+        '''
+         # stop the keyboard listener
+        if self.isRunning(): self.listener.stop() 
+        # stop the thread
         if hasattr(self, 'listenerThread') and self.listenerThread.is_alive():
             self.listenerThread.join(timeout=1)
         print("(pglKeyboard) Listener thread stopped")
 
+    def isRunning(self):
+        '''
+        Check if the keyboard listener is running.
+        '''
+        return hasattr(self, 'listener') and self.listener.running
+
     def poll(self): 
+        '''
+        Poll the key queue for events.
+        '''
         eventList = []
+        if not self.isRunning: return eventList
 
         while not self.keyQueue.empty():
             key, timestamp, shift, ctrl, alt, cmd = self.keyQueue.get()
