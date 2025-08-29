@@ -274,6 +274,13 @@ class _pglComm:
         """
         self.commandValues = {}
 
+        # check for file
+        if not os.path.isfile(filename):
+            print(f"(pgl:_pglComm:parseCommandValues) ❌ Error: File not found: {filename}")
+            # close connection, since we are now screwed
+            self.close()
+            return
+        
         with open(filename, "r") as f:
             lines = f.readlines()
 

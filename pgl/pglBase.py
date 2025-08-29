@@ -136,8 +136,10 @@ class pglBase:
 
         # get metal app name
         self.metalAppName = self.getMetalAppName(stable=stable, mglMetalPath=mglMetalPath)
-        self.metalSocketPath = "/Users/justin/Library/Containers/gru.mglMetal/Data"
-        
+
+        # get socket path
+        self.metalSocketPath = os.path.join(self.homeDir, "Library/Containers/gru.mglMetal/Data")
+
         # get a randomized socket name
         self.metalSocketName = "pglMetal.socket."+''.join(random.choices(string.ascii_letters + string.digits, k=10))
         
@@ -173,6 +175,10 @@ class pglBase:
         # and parse command types
         commandTypesFilename = os.path.join(self.pglDir, "metal/mglCommandTypes.h")
         self.s.parseCommandValues(commandTypesFilename)
+        if not self.s.isOpen():
+            print("(pglBase:open) ❌ Error: Could not parse command types.")
+            self.s = None
+            return False
 
         # set the window location and size
         self.setWindowFrameInDisplay(whichScreen, screenX, screenY, screenWidth, screenHeight)
