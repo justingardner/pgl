@@ -25,11 +25,22 @@ class pglImage:
             Creates a new image from the provided image data.
 
             Args:
-                imageData: The image data to create the image from.
+                imageData: The image data to create the image from. Can be HxW grayscale,
+                 HxWx3 RGB, or HxWx4 RGBA data.
 
             Returns:
-                An instance of _pglImageInstance or None if the image could not be created.
-                Can be displayed by calling imageDisplay()
+                An instance of pglImageInstance or None if the image could not be created.
+                The pglImageInstance can be displayed by calling imageDisplay(). This is used
+                if you want to display an image multiple times and want to save the overhead
+                of creating the image each type. If you want to just display once, you can
+                just call imageDisplay().
+
+            Example:
+                pgl.open()
+                imageData = np.random.rand(480, 640, 3)
+                imageInstance = pgl.imageCreate(imageData)
+                if imageInstance is not None:
+                    pgl.imageDisplay(imageInstance)
 
         '''
      
@@ -66,43 +77,75 @@ class pglImage:
         if self.verbose>1: print(f"(pglImage:imageCreate) Created image {imageNum} ({nImages} total images)")
         self.s.readCommandResults(ackTime)
 
-        # create an instance of _pglImageInstance
-        imageInstance = _pglImageInstance(imageNum, imageWidth, imageHeight, self)
+        # create an instance of pglImageInstance
+        imageInstance = pglImageInstance(imageNum, imageWidth, imageHeight, self)
         return imageInstance
     
-    def imageDisplay(self, imageInstance, displayLocation=None, displaySize=None):
+    def imageDisplay(self, imageInstance, x=None, y=None, width=None, height=None, xAlign=0, yAlign=0):
         '''
-        Displays an image
-        
+        Displays an image. If you want to display an image multiple times and want
+        to avoid the overhead of creating the image each time, you can use the
+        pglImageInstance returned by imageCreate.
+
         Args:
             imageInstance: Either what is returned by imageCreate or a numpy matrix
-            displayLocation: The location to display the image.
-            displaySize: The size to display the image.
+            x,y: The location to display the image. Defaults to 0,0
+            width,height: The size to display the image. If only one is set, then the
+                other one will be set to maintain the aspect ratio. If neither are set, then
+                will display at full resolution given the pixel dimensions or if the image
+                is bigger then the window to fit within the window         
+            xAlign: Horizontal alignment of the image relative to x. -1=left, 0=center, 1=right
+            yAlign: Vertical alignment of the image relative to y. -1=top, 0=center, 1=bottom
 
         Returns:
             None
+
+        Example:
+            pgl.open()
+            imageData = np.random.rand(480, 640, 3)
+            imageInstance = pgl.imageCreate(imageData)
+            if imageInstance is not None:
+                pgl.imageDisplay(imageInstance, x=100, y=100, width=200, height=200)
+
         '''
         if self.isOpen() == False:
             print("(pgl:pglStimulus:display) pgl is not open. Cannot display image.")
             return None
         
         # check for image passed in
-        if not isinstance(imageInstance, _pglImageInstance):
+        if not isinstance(imageInstance, pglImageInstance):
             imageInstance = self.imageCreate(imageInstance)
             if imageInstance is None: return None
 
-        if displaySize is None:
-            # default size is image size
-            displaySize = (imageInstance.width.pix * self.xPix2Deg, imageInstance.height.pix * self.yPix2Deg)
-        if displayLocation is None:
+        if width is None:
+            if height is None:
+                widthRatio = imageInstance.width.pix / self.screenWidth.pix
+                heightRatio = imageInstance.height.pix / self.screenHeight.pix
+                maxRatio = max(widthRatio, heightRatio)
+                if maxRatio > 1:
+                    # scale down to fit within window
+                    width = imageInstance.width.pix * self.xPix2Deg / maxRatio
+                    height = imageInstance.height.pix * self.yPix2Deg / maxRatio
+                else:
+                    # default size is image size
+                    width = imageInstance.width.pix * self.xPix2Deg
+                    height = imageInstance.height.pix * self.yPix2Deg
+            else:
+                # make width proportional to height
+                width = height * (imageInstance.width.pix / imageInstance.height.pix)
+        if height is None:
             # default location is center of screen
-            displayLocation = (0, 0)
+            height = width * (imageInstance.height.pix / imageInstance.width.pix)
+        if x is None: x = 0
+        if y is None: y = 0
 
         # vertex coordinates in device coordinates
-        imageInstance.displayLeft = -displaySize[0]/2 + displayLocation[0]
-        imageInstance.displayRight = displaySize[0]/2 + displayLocation[0]
-        imageInstance.displayTop = displaySize[1]/2 + displayLocation[1]
-        imageInstance.displayBottom = -displaySize[1]/2 + displayLocation[1]
+        imageInstance.displayLeft = x - (xAlign + 1) / 2 * width
+        imageInstance.displayRight = imageInstance.displayLeft + width
+        imageInstance.displayTop = y + (yAlign + 1) / 2 * height
+        imageInstance.displayBottom = imageInstance.displayTop - height
+        imageInstance.displayWidth = width
+        imageInstance.displayHeight = height
 
         # keep this coordinates for reference
         imageInstance.displayed = True
@@ -145,11 +188,13 @@ class pglImage:
  
     def imageDelete(self, imageInstance):
         '''
+            Delete the specified image instance. This returns memory from the mglMetal app
+            which is allocated to hold the image.
         '''
         if self.isOpen() == False:
             return
-        if not isinstance(imageInstance, _pglImageInstance):
-            print("(pglImage:imageDelete) imageInstance should be an instance of _pglImageInstance.")
+        if not isinstance(imageInstance, pglImageInstance):
+            print("(pglImage:imageDelete) imageInstance should be an instance of pglImageInstance.")
             return
         
         # Delete texture
@@ -215,7 +260,7 @@ class pglImage:
 
  
 #container class that holds image reference
-class _pglImageInstance:
+class pglImageInstance:
     # minMagFilter -- optional value to choose sampler filtering:
     #   0: nearest
     #   1: linear (default)
@@ -247,7 +292,7 @@ class _pglImageInstance:
         self.imageNum = imageNum
         self.displayed = None
         if pgl.verbose>1: 
-            print(f"(pglImage:_pglImageInstance) Created image instance with: {self.imageNum} ({self.width.pix}x{self.height.pix})")
+            print(f"(pglImage:pglImageInstance) Created image instance with: {self.imageNum} ({self.width.pix}x{self.height.pix})")
     def __del__(self):
         # call the pgl function 
         self.pgl.imageDelete(self)
