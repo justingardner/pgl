@@ -102,9 +102,8 @@ if _HAVE_PYLINK:
             self._tracker = eyelink
             
             # background and foreground colors
-            self.backgroundColor = (128, 128, 128)
+            self.backgroundColor = (0.5, 0.5, 0.5)
             self.foregroundColor = (0, 0, 0)
-            
             # Make this target size about 1 degree
             self.targetSizePixels = round((self.pgl.xDeg2Pix + self.pgl.yDeg2Pix)/2)
             
