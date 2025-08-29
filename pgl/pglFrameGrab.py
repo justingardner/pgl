@@ -10,7 +10,7 @@
 # Import modules
 #############
 import numpy as np
-from pgl.pglImage import _pglImageInstance
+from pgl.pglImage import pglImageInstance
 
 #############
 # FrameGrab class
@@ -37,14 +37,14 @@ class pglFrameGrab:
         This will allow drawing to the image instance and not to the screen
         
         Args:
-            imageInstance (_pglImageInstance): The image instance to set as render target. If
+            imageInstance (pglImageInstance): The image instance to set as render target. If
                 ommitted or None, will reset render target to the screen
         '''
         if self.isOpen() == False:
             print("(pglImage:setRenderTarget) pgl is not open. Cannot set render target.")
             return None
-        if not isinstance(imageInstance, _pglImageInstance) and imageInstance is not None:
-            print("(pglImage:setRenderTarget) imageInstance should be an instance of _pglImageInstance.")
+        if not isinstance(imageInstance, pglImageInstance) and imageInstance is not None:
+            print("(pglImage:setRenderTarget) imageInstance should be an instance of pglImageInstance.")
             return None
 
         # send the setRenderTarget command

@@ -437,36 +437,27 @@ class pglDraw:
         results = self.s.readCommandResults(ack)
     
     ######################################################
-    # text
+    # textCreate
     ######################################################
-    def text(self, str, x=0, y=None, color=None, fontSize=40, fontName="Helvetica", line=None):
-        """
-        Draw text on the screen.
+    def textCreate(self, str, color=None, fontSize=40, fontName="Helvetica"):
+        '''
+        Creates a text image from a text string, called by text but
+        you can call this directly and call text with the created image
+        if you intend to draw the string many times and want to avoid
+        the overhead of creating the image of the text each time.
 
         Args:
-            str (str): The text to draw.
-            x (float): The x coordinate of the text. 
-            y (float): The y coordinate of the text. If omitted and line is not set
-                        then the text will be drawn at the top of the screen and
-                        each subsequent call will draw text one line below until
-                        the bottom of the screen is reached, upon which it will
-                        revert to the top of the screen.
-            line (int): The line number to draw the text on. IF this
-                        is set, y will be ignored and instead the text
-                        will be drawn on the specified line from top of screen.
-                        If line is negative, then from the bottom of the screen.
-            color (list or tuple, optional): RGB color values as a list or tuple of three floats in the range [0, 1].
+            str (str): The text to create.
             fontSize (int): The size of the font.
             fontName (str): The name of the font.
 
-
         Returns:
             None
-        """
+        '''
         # validate color
         color = self.validateColor(color)
         color = color.flatten()
-
+        
         # Load Font
         fontPath = "/System/Library/Fonts"
         p = Path(fontName)
@@ -506,11 +497,47 @@ class pglDraw:
 
         # Draw anti-aliased text
         draw.text((padding, padding), str, font=font, fill=tuple(int(255*c) for c in color))
+        
+        # create the text image
+        img = self.imageCreate(np.array(img))
+        return img
+        
+    ######################################################
+    # text
+    ######################################################
+    def text(self, str, x=0, y=None, color=None, fontSize=40, fontName="Helvetica", line=None, xAlign=0, yAlign=0):
+        """
+        Draw text on the screen.
 
+        Args:
+            str (str): The text to draw.
+            x (float): The x coordinate of the text. 
+            y (float): The y coordinate of the text. If omitted and line is not set
+                        then the text will be drawn at the top of the screen and
+                        each subsequent call will draw text one line below until
+                        the bottom of the screen is reached, upon which it will
+                        revert to the top of the screen.
+            xAlign (int): The horizontal alignment of the text. -1 = left, 0 = center, 1 = right.
+            yAlign (int): The vertical alignment of the text. -1 = top, 0 = middle, 1 = bottom.
+            line (int): The line number to draw the text on. IF this
+                        is set, y will be ignored and instead the text
+                        will be drawn on the specified line from top of screen.
+                        If line is negative, then from the bottom of the screen.
+            color (list or tuple, optional): RGB color values as a list or tuple of three floats in the range [0, 1].
+            fontSize (int): The size of the font.
+            fontName (str): The name of the font.
+
+
+        Returns:
+            None
+        """
+        # create the text image
+        textImage = self.textCreate(str, color, fontSize, fontName)
+        
         # get text height in degrees
-        textHeight = textHeight * self.yPix2Deg
-        padding = padding * self.yPix2Deg
-        lineHeight = textHeight + padding * 2
+        textHeight = textImage.height.pix * self.yPix2Deg
+        padding = 0
+        lineHeight = textHeight 
         linesPerScreen = int(self.screenHeight.deg / lineHeight)
         
         if line is None and y is None:
@@ -531,9 +558,8 @@ class pglDraw:
         # check to see if we will go over the bottom
         if self.currentLine > linesPerScreen: self.currentLine = 1
    
-        # create the image and display
-        img = self.imageCreate(np.array(img))
-        img.display(displayLocation=(x,y))
+        # display the text image
+        textImage.display(x,y,xAlign=xAlign,yAlign=yAlign)
 
     def test(self):
         try:
