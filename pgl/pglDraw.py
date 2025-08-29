@@ -13,6 +13,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 import os
 from pathlib import Path
+from pgl.pglImage import pglImageInstance
 
 #############
 # Drawing class
@@ -439,7 +440,7 @@ class pglDraw:
     ######################################################
     # textCreate
     ######################################################
-    def textCreate(self, str, color=None, fontSize=40, fontName="Helvetica"):
+    def textCreate(self, textString, color=None, fontSize=40, fontName="Helvetica"):
         '''
         Creates a text image from a text string, called by text but
         you can call this directly and call text with the created image
@@ -447,7 +448,7 @@ class pglDraw:
         the overhead of creating the image of the text each time.
 
         Args:
-            str (str): The text to create.
+            textString (str): The text to create.
             fontSize (int): The size of the font.
             fontName (str): The name of the font.
 
@@ -488,7 +489,7 @@ class pglDraw:
         # to get font height, get text width from actual string
         bbox = draw.textbbox((0, 0), "HITLFEfhkl", font=font)
         textHeight = bbox[3] - bbox[1]
-        bbox = draw.textbbox((0, 0), str, font=font)
+        bbox = draw.textbbox((0, 0), textString, font=font)
         textWidth = bbox[2] - bbox[0]
 
         # Create an image with transparent background
@@ -496,7 +497,7 @@ class pglDraw:
         draw = ImageDraw.Draw(img)
 
         # Draw anti-aliased text
-        draw.text((padding, padding), str, font=font, fill=tuple(int(255*c) for c in color))
+        draw.text((padding, padding), textString, font=font, fill=tuple(int(255*c) for c in color))
         
         # create the text image
         img = self.imageCreate(np.array(img))
@@ -505,12 +506,13 @@ class pglDraw:
     ######################################################
     # text
     ######################################################
-    def text(self, str, x=0, y=None, color=None, fontSize=40, fontName="Helvetica", line=None, xAlign=0, yAlign=0):
+    def text(self, textString, x=0, y=None, color=None, fontSize=40, fontName="Helvetica", line=None, xAlign=0, yAlign=0):
         """
         Draw text on the screen.
 
         Args:
-            str (str): The text to draw.
+            textString (str): The text to draw. For strings you want to draw multiple times, you
+                       can pass in the return value of textCreate
             x (float): The x coordinate of the text. 
             y (float): The y coordinate of the text. If omitted and line is not set
                         then the text will be drawn at the top of the screen and
@@ -531,9 +533,15 @@ class pglDraw:
         Returns:
             None
         """
-        # create the text image
-        textImage = self.textCreate(str, color, fontSize, fontName)
-        
+        if isinstance(textString, pglImageInstance):
+            textImage = textString
+        elif isinstance(textString, str):
+            # create the text image
+            textImage = self.textCreate(textString, color, fontSize, fontName)
+        else:
+            print("(pglDraw:text) textString must be a string or pglImageInstance returned from textCreate.")
+            return None
+
         # get text height in degrees
         textHeight = textImage.height.pix * self.yPix2Deg
         padding = 0
