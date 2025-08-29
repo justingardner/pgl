@@ -296,12 +296,12 @@ class pglImageInstance:
     def __del__(self):
         # call the pgl function 
         self.pgl.imageDelete(self)
-    def display(self, displayLocation=None, displaySize=None):
+    def display(self, x=None, y=None, width=None, height=None, xAlign=0, yAlign=0):
         '''
           Display the image at the specified location and size.
         '''
         # call the pgl function to display
-        self.pgl.imageDisplay(self, displayLocation, displaySize)
+        self.pgl.imageDisplay(self, x, y, width, height, xAlign, yAlign)
     def print(self):
        if self.displayed is not None:
             print(f"Image {self.imageNum} ({self.width.pix}x{self.height.pix}) displayed: left: {self.displayLeft} right: {self.displayRight} bottom: {self.displayBottom} top: {self.displayTop} time: {self.displayTime}")
