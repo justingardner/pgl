@@ -379,8 +379,9 @@ class pglDraw:
 
         # If a scalar is provided, convert it to grayscale
         if color.shape[1] == 1:
-            color[:,2] = color[:,1]
-            color[:,3] = color[:,1]
+            color = np.repeat(color, 3, axis=1)
+            color[:,1] = color[:,0]
+            color[:,2] = color[:,0]
 
         if color.shape[1] < 3:
             print("(pgldraw:validateColor) Color must be a list or tuple of three floats. Defaulting to white.")

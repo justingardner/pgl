@@ -138,7 +138,7 @@ class pglKeyboard(pglDevice):
         if not self.checkAccessibilityPermission():
             print("(pglKeyboard) ❌ This app is not authorized for Accessibility input monitoring. No keyboard events will be detected!!")
             print("              Go to System Settings → Privacy & Security → Accessibility and add this app.")
-            print("              If you are running VS Code and it already has permissions granted, try running from a terminal with:")
+            print("              If you are running VS Code and it already has permissions granted, try running directly from a terminal with:")
             print("              /Applications/Visual\\ Studio\\ Code.app/Contents/MacOS/Electron")
             return
 
