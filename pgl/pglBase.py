@@ -192,9 +192,14 @@ class pglBase:
         # get frame rate
         self.frameRate = self.getFrameRate(whichScreen)
 
+        # clear screen
         self.clearScreen([0.4, 0.2, 0.5])
         self.flush()
         
+        # print how you can get error log
+        print("(pgl:open) mglMetal error log can be viewed in MacOS Console app by searching for PROCESS mglMetal or in a terminal with:")
+        print("           log stream --level info --process mglMetal")
+
         # success
         return True
  
