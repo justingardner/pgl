@@ -450,7 +450,7 @@ class pglStimulusImage(_pglStimulus):
         
         # make into a pgl image
         imageInstance = self.pgl.imageCreate(imageData)
-        if self.pgl.verbose>1: print(f"(pgl:pglStimulus:addImage) Adding image {imageInstance.imageNum} ({imageInstance.imageWidth}x{imageInstance.imageHeight})")
+        if self.pgl.verbose>1: print(f"(pgl:pglStimulus:addImage) Adding image {imageInstance.imageNum} ({imageInstance.width}x{imageInstance.height})")
         self.imageList.append(imageInstance)
         # update count
         self.nImages += 1
