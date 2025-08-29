@@ -46,6 +46,10 @@ class pglTransform:
             None: This function sets the transform so that all drawing
             functions will use visual angle coordinates.
         """
+        if not self.isOpen():
+            print("(pgl:pglTransform:visualAngleCoordinates) ❌ No display is open.")
+            return
+        
         # Validate inputs
         if not isinstance(distanceToScreenCentimeters, (int, float)) or distanceToScreenCentimeters <= 0:
             print("(pgl:pglTransform:visualAngleCoordinates) distanceToScreen must be a positive number.")  
@@ -87,6 +91,15 @@ class pglTransform:
     # Transform to screen coordinates
     ################################################################
     def screenCoordinates(self):
+        '''
+        Use screenCoodrinates, not implemented
+        '''
+        if not self.isOpen:
+            print("(pgl:pglTransform:screenCoordinates) No display is open.")
+            return
+        
+        print("(pglTransform:screenCoordinates) Not implemented")
+
         pass
 
 

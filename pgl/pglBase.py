@@ -8,6 +8,7 @@
 #############
 # Import modules
 #############
+import inspect
 import platform, subprocess, random, string, os
 from pprint import pprint
 import numpy as np
@@ -45,6 +46,11 @@ class pglBase:
                 
         # Init verbose level to normal
         self.verbose = 1
+
+        # get some directories
+        self.homeDir = os.path.expanduser("~")
+        pglDir = inspect.getfile(self.__class__)
+        self.pglDir = os.path.dirname(os.path.dirname(pglDir))
 
         # print what we are doing
         if self.verbose > 0: print("(pglBase) Main library instance created")
@@ -85,7 +91,7 @@ class pglBase:
     ################################################################
     # Open a screen
     ################################################################
-    def open(self, whichScreen=None, screenWidth=None, screenHeight=None, screenX=None, screenY=None):
+    def open(self, whichScreen=None, screenWidth=None, screenHeight=None, screenX=None, screenY=None, stable=False, mglMetalPath=None):
         """
         Open a screen on the specified display.
 
@@ -97,7 +103,12 @@ class pglBase:
             If screenWidth and screenHeight are not provided, the screen will open full screen
             screenX (int, optional): The x-coordinate of the screen in pixels.
             screenY (int, optional): The y-coordinate of the screen in pixels
-        
+
+            Advanced arguments for debugging:
+            stable (bool, optional): If True, forces the use of a stable version of the mglMetal application,
+                                     rather than looking for a later compiled version.
+            mglMetalPath (str, optional): The file path to the mglMetal application, if omitted will search in the pgl directory
+
         Returns:
             bool: True if the screen was opened successfully, False otherwise.
         """
@@ -107,7 +118,7 @@ class pglBase:
 
         # Check if the screen number is valid
         if whichScreen < 0 or whichScreen >= numDisplays:
-            print(f"(pglBase:open) Error: Invalid screen number {whichScreen}. Must be between 0 and {numDisplays-1}.")
+            print(f"(pglBase:open) ❌ Error: Invalid screen number {whichScreen}. Must be between 0 and {numDisplays-1}.")
             return False
 
         # Check whether any screen positioning was provided, in which
@@ -123,9 +134,8 @@ class pglBase:
         screenX = screenX if screenX is not None else 100
         screenY = screenY if screenY is not None else 100            
 
-        # for now hard-code these
-        #self.metalAppName = "/Users/justin/proj/mgl/metal/binary/stable/mglMetal.app"\
-        self.metalAppName = getMetalAppName()
+        # get metal app name
+        self.metalAppName = self.getMetalAppName(stable=stable, mglMetalPath=mglMetalPath)
         self.metalSocketPath = "/Users/justin/Library/Containers/gru.mglMetal/Data"
         
         # get a randomized socket name
@@ -136,7 +146,7 @@ class pglBase:
 
         # start up mglMetal application
         if not os.path.exists(self.metalAppName):
-            print(f"(pglBase:open) Error: mglMetal application not found at {self.metalAppName}")
+            print(f"(pglBase:open) ❌ Error: mglMetal application not found at {self.metalAppName}")
             return False
         else:
             if self.verbose > 0: 
@@ -149,15 +159,21 @@ class pglBase:
                     "--args", "-mglConnectionAddress", socketName
                     ], check=True)
             except Exception as e:
-                print(f"(pglBase:open) Error starting mglMetal application: {e}")
+                print(f"(pglBase:open) ❌ Error starting mglMetal application: {e}")
                 return False
         
         # now try to connect to the socket
         self.s = pglComm._pglComm(socketName,self)
 
+        if not self.s.isOpen():
+            print("(pglBase:open) ❌ Error: Could not connect to mglMetal application.")
+            self.s = None
+            return False
+
         # and parse command types
-        self.s.parseCommandValues()
-        
+        commandTypesFilename = os.path.join(self.pglDir, "metal/mglCommandTypes.h")
+        self.s.parseCommandValues(commandTypesFilename)
+
         # set the window location and size
         self.setWindowFrameInDisplay(whichScreen, screenX, screenY, screenWidth, screenHeight)
 
@@ -212,7 +228,7 @@ class pglBase:
             subprocess.run(["kill", "-9", str(pid)], check=True)
             if self.verbose > 0: print(f"(pglBase:close) mglMetal application with PID: {pid} was killed successfully.")
         except subprocess.CalledProcessError as e:
-            print(f"(pglBase:close) Error killing mglMetal application with PID: {pid} : {e}")
+            print(f"(pglBase:close) ❌ Error killing mglMetal application with PID: {pid} : {e}")
 
         # Close the socket
         self.s.close()
@@ -571,6 +587,51 @@ class pglBase:
         """
         signal.signal(signal.SIGINT, self.originalHandler)
 
+    ###################################
+    # get the name of the mglMetalApp
+    ###################################
+    def getMetalAppName(self, stable=False, mglMetalPath=None):
+        '''
+        Get the name of the mglMetal application. This will search in the directory where pgl is installed
+        as well as the Xcode DerivedData directory where new versions get compiled. If there is a newer
+        version available, it will be used instead of the stable version (this is helpful for debugging). You
+        can avoid this behavior and always use the stable version by setting stable here, or in open set
+        forceStableMGLMetal=True.
+
+        Args:
+            stable (bool): Whether to use the stable version of the app.
+            mglMetalPath (str, optional): The file path to the mglMetal application, if you want to force a specific path   
+        '''
+        # if forcing a path, just return that
+        if mglMetalPath is not None: return mglMetalPath
+    
+        # paths to stable version and derivedData for recently compiled versions
+        stableAppPath = os.path.join(self.pglDir, "metal/mglMetal.app")
+        derivedDataDirectory = os.path.join(self.homeDir, "Library/Developer/Xcode/DerivedData")
+
+        # If runStable is True, always return the stable app path
+        if stable: return stableAppPath
+
+        latestBuildPath = None
+        latestBuildTime = 0
+
+        # Search for all mglMetal.app instances in DerivedData
+        for dirPath, dirNames, fileNames in os.walk(derivedDataDirectory):
+            for dirName in dirNames:
+                if dirName.endswith(".app") and "mglMetal" in dirName:
+                    appPath = os.path.join(dirPath, dirName)
+                    modificationTime = os.path.getmtime(appPath)
+                    if modificationTime > latestBuildTime:
+                        latestBuildTime = modificationTime
+                        latestBuildPath = appPath
+
+        # Determine which app to return
+        if latestBuildPath:
+            return latestBuildPath
+        else:
+            return stableAppPath
+
+
 ################
 # getCPUInfo   #
 ################
@@ -683,33 +744,3 @@ def getGPUInfo():
         print(f"(pglBase:getGPUInfo) Warning: Parsing failed with error: {e}")
         return {}
 
-###################################
-# get the name of the mglMetalApp
-###################################
-def getMetalAppName(stable=False):
-    homeDirectory = os.path.expanduser("~")
-    #stableAppPath = os.path.join(homeDirectory, "proj/mgl/metal/binary/stable/mglMetal.app")
-    stableAppPath = os.path.join(homeDirectory, "proj/pgl/metal/mglMetal.app")
-    derivedDataDirectory = os.path.join(homeDirectory, "Library/Developer/Xcode/DerivedData")
-
-    # If runStable is True, always return the stable app path
-    if stable: return stableAppPath
-
-    latestBuildPath = None
-    latestBuildTime = 0
-
-    # Search for all mglMetal.app instances in DerivedData
-    for dirPath, dirNames, fileNames in os.walk(derivedDataDirectory):
-        for dirName in dirNames:
-            if dirName.endswith(".app") and "mglMetal" in dirName:
-                appPath = os.path.join(dirPath, dirName)
-                modificationTime = os.path.getmtime(appPath)
-                if modificationTime > latestBuildTime:
-                    latestBuildTime = modificationTime
-                    latestBuildPath = appPath
-
-    # Determine which app to return
-    if latestBuildPath:
-        return latestBuildPath
-    else:
-        return stableAppPath

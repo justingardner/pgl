@@ -36,12 +36,19 @@ class _pglComm:
                 # Keep trying until timeout
                 elapsed = time.time() - startTime
                 if elapsed > timeout:
-                    print("\n(pgl:_pglComm) ❌ Timeout: Could not connect to socket:", socketPath)
+                    print("\n(pgl:_pglComm) ❌ Timeout: Could not connect to socket:", socketName)
+                    self.s = None
                     return None
                 # Print a dot for feedback
                 sys.stdout.write(".")
                 sys.stdout.flush()
                 time.sleep(0.5)  # Wait before retrying
+
+    def isOpen(self):
+        """
+        Check if the socket is open.
+        """
+        return self.s is not None
 
     def close(self):
         """
