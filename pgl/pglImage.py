@@ -22,6 +22,15 @@ class pglImage:
 
     def imageCreate(self, imageData):
         '''
+            Creates a new image from the provided image data.
+
+            Args:
+                imageData: The image data to create the image from.
+
+            Returns:
+                An instance of _pglImageInstance or None if the image could not be created.
+                Can be displayed by calling imageDisplay()
+
         '''
      
         # check dimensions of imageData
@@ -63,10 +72,24 @@ class pglImage:
     
     def imageDisplay(self, imageInstance, displayLocation=None, displaySize=None):
         '''
+        Displays an image
+        
+        Args:
+            imageInstance: Either what is returned by imageCreate or a numpy matrix
+            displayLocation: The location to display the image.
+            displaySize: The size to display the image.
+
+        Returns:
+            None
         '''
         if self.isOpen() == False:
             print("(pgl:pglStimulus:display) pgl is not open. Cannot display image.")
             return None
+        
+        # check for image passed in
+        if not isinstance(imageInstance, _pglImageInstance):
+            imageInstance = self.imageCreate(imageInstance)
+            if imageInstance is None: return None
 
         if displaySize is None:
             # default size is image size
@@ -129,18 +152,19 @@ class pglImage:
             print("(pglImage:imageDelete) imageInstance should be an instance of _pglImageInstance.")
             return
         
-        # FiX, FIX, FIX
-        ##if self.verbose>=1: print(f"(pglImage:imageDelete) Deleting image {imageInstance.imageNum} ({imageInstance.width.pix}x{imageInstance.height.pix})")
+        # Delete texture
+        if self.verbose>=1: print(f"(pglImage:imageDelete) Deleting image {imageInstance.imageNum} ({imageInstance.width.pix}x{imageInstance.height.pix})")
         # send the deleteTexture command
-        #self.s.writeCommand("mglDeleteTexture")
-        #self.s.write(np.double(imageInstance.imageNum))
-        #self.commandResults = self.s.readCommandResults()
+        self.s.writeCommand("mglDeleteTexture")
+        self.s.write(np.uint32(imageInstance.imageNum))
+        self.commandResults = self.s.readCommandResults()
 
     def imageValidate(self, imageData):
         '''
         Validate the image data and return a tuple of (True, imageData) if valid,
         or (False, None) if invalid. This will insure that images are WxHx4 numpy matrices.
         '''
+        imageData = np.array(imageData)
         if not isinstance(imageData, np.ndarray) or imageData.ndim < 2 or imageData.ndim > 3:
             print("(pglImage:imageValidate) imageData should be a numpy matrix either WxH, WxHx3 or WxHx4.")
             return (False, None)
