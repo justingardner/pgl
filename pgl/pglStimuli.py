@@ -316,7 +316,7 @@ class pglStimuli:
     ####################################################
     # bar
     ####################################################
-    def bar(self, width=1.0, speed=1.0):
+    def bar(self, width=1.0, speed=1.0, dir=0):
         '''
         Create a bar stimulus. Used for pRF mapping
         
@@ -334,7 +334,7 @@ class pglStimuli:
             return None
 
         # Create the bar stimulus
-        barStimulus = pglStimulusBar(self, width=width, speed=speed)
+        barStimulus = pglStimulusBar(self, width=width, speed=speed, dir=dir)
         return barStimulus
 
 
@@ -687,27 +687,35 @@ class pglStimulusCheckerboardSliding(_pglStimulusCheckerboard):
 # Bar stimulus class
 ################################################################
 class pglStimulusBar(_pglStimulus):
-    def __init__(self, pgl, width=1.0, speed=1.0):
+    def __init__(self, pgl, width=1.0, speed=1.0, dir=0, stepPosition=True):
         super().__init__(pgl)
         
-        # start at edge of screen
+        # save parameters
         self.width = width
-        self.height = pgl.screenHeight.deg
-        self.passStartTime = pgl.getSecs()
-        self.passStartX = -pgl.screenWidth.deg/2 - width/2        
-        self.passEndX = pgl.screenWidth.deg/2 + width/2        
-        self.passStartY = 0
-        self.passEndY = 0
-
-        self.y = 0
+        self.height = max(pgl.screenHeight.deg,pgl.screenWidth.deg)
         self.speed = speed
-        
-        # create a sliding checkerboard bar
-        self.barStimulus = pglStimulusCheckerboardSliding(pgl, x=self.passStartX, y=self.passStartY, width=self.width)
+        self.dir = dir
+        self.stepPosition = stepPosition
+                
+        # create the bar stimulus
+        self.barStimulus = pglStimulusCheckerboardSliding(pgl, width=self.width, height=self.height)
 
-    def display(self):
+        # start the pass
+        self.initPass()
+        
+    def display(self, dir=0):
+        '''
+        Display the bar stimulus.
+        '''
         # Update the bar stimulus position
-        self.barStimulus.x = self.passStartX + self.speed * (self.pgl.getSecs() - self.passStartTime)
+        if self.stepPosition:
+            # only update, every time the stimulus moves a full width
+            self.thisX = self.passStartX + self.speed * (self.pgl.getSecs() - self.passStartTime)
+            if self.thisX - self.barStimulus.x > self.width:
+                self.barStimulus.x = self.thisX
+        else:
+            # smoothly move
+            self.barStimulus.x = self.passStartX + self.speed * (self.pgl.getSecs() - self.passStartTime)
 
         # display the bar
         self.barStimulus.display()
@@ -715,8 +723,29 @@ class pglStimulusBar(_pglStimulus):
         # check for end of pass
         if self.barStimulus.x > self.passEndX:
             # reset for next pass
-            self.passStartTime = self.pgl.getSecs()
-            self.passStartX = -self.pgl.screenWidth.deg/2 - self.width/2
-            self.passEndX = self.pgl.screenWidth.deg/2 + self.width/2
-            self.passStartY = 0
-            self.passEndY = 0
+            self.initPass()
+                  
+    def initPass(self):
+        '''
+        Initialize the pass parameters for the bar stimulus.
+        '''
+        # save direction
+        self.passDir = self.dir
+
+        # set time
+        self.passStartTime = self.pgl.getSecs()
+        
+        # set the x, y start and end positions
+        self.passStartX = -self.pgl.screenWidth.deg/2 - self.width/2
+        self.passEndX = self.pgl.screenWidth.deg/2 + self.width/2
+        self.passStartY = 0
+        self.passEndY = 0
+        
+        # set the bar stimulus start position            
+        self.barStimulus.x = self.passStartX
+        self.barStimulus.y = self.passStartY
+        
+        # rotate coordinate frame accordingly
+        self.pgl.setTransformRotation(self.passDir)
+
+

@@ -85,6 +85,9 @@ class pglTransform:
         # set scale 
         self.setTransformScale(2.0 / self.screenWidth.deg, 2.0 / self.screenHeight.deg)
 
+        # keep the current transformation as the pre-rotation transform
+        self.xformPreRotation = self.xform
+        
         # done
         self.coordinateFrame = "visualAngle"
     ################################################################
@@ -108,6 +111,12 @@ class pglTransform:
     ################################################################
     def setTransformScale(self, xScale = 1.0, yScale = 1.0, zScale = 1.0, keepCurrent=False):
         '''
+        Set the scale of the transformation.
+
+        Args:
+            xScale (float): The scale factor in the x direction.
+            yScale (float): The scale factor in the y direction.
+            zScale (float): The scale factor in the z direction.
         '''
         # Create a xform that scales
         xformScale = np.eye(4)
@@ -127,6 +136,12 @@ class pglTransform:
     ################################################################
     def setTransformOffset(self, xOffset = 0.0, yOffset = 0.0, zOffset = 0.0):
         '''
+        Set the offset of the transformation
+        
+        Args:
+            xOffset (float): The offset in the x direction.
+            yOffset (float): The offset in the y direction.
+            zOffset (float): The offset in the z direction.
         '''
         # Create a xform that shifts the offset
         xformOffset= np.eye(4)
@@ -135,9 +150,39 @@ class pglTransform:
         xformOffset[2,3] = zOffset
         # multiply with current transform
         self.xform = np.matmul(xformOffset,self.xform)
+        
         # now update the xform on the application
         self.setTransform(self.xform)
         
+    ################################################################
+    # Set rotation of transform
+    ################################################################
+    def setTransformRotation(self, theta=0.0, relativeRotation=False):
+        '''
+        Rotate the coordinate frame by theta degrees.
+        
+        Args:
+            theta (float): Angle in degrees to rotate the coordinate frame.
+            relativeRotation (bool): If True, rotate relative to the current orientation.
+                                     Defaults to False, which will give an absolute rotation
+        '''
+        # convert theta to radian
+        theta = np.deg2rad(theta)
+        # Create a xform that rotates in the x,y dimensions
+        c = np.cos(theta)
+        s = np.sin(theta)
+        xformRotation = np.eye(4)
+        xformRotation[0,0] = c
+        xformRotation[0,1] = -s
+        xformRotation[1,0] = s
+        xformRotation[1,1] = c
+        # multiply with current transform
+        if relativeRotation:
+            self.xform = np.matmul(xformRotation,self.xform)
+        else:
+            self.xform = np.matmul(xformRotation,self.xformPreRotation)
+        # now update the xform on the application
+        self.setTransform(self.xform)
 
     ################################################################
     # Set transform
