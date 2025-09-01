@@ -692,10 +692,12 @@ class pglStimulusBar(_pglStimulus):
         
         # save parameters
         self.width = width
-        self.height = max(pgl.screenHeight.deg,pgl.screenWidth.deg)
         self.speed = speed
         self.dir = dir
         self.stepPosition = stepPosition
+        # set the height to the diagonal length (so that the bars
+        # display full screen even if they are moving in an oblique direction)
+        self.height = np.sqrt(pgl.screenHeight.deg**2 + pgl.screenWidth.deg**2)
                 
         # create the bar stimulus
         self.barStimulus = pglStimulusCheckerboardSliding(pgl, width=self.width, height=self.height)
