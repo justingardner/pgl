@@ -250,7 +250,7 @@ class pglStimuli:
     ####################################################
     # checkerboard
     ####################################################
-    def checkerboard(self, x=0, y=0, width=None, height=None, checkWidth=1.0, checkHeight = 1.0, temporalFrequency = 1.0, color=None):
+    def checkerboard(self, x=0, y=0, width=None, height=None, checkWidth=1.0, checkHeight = 1.0, temporalFrequency = 1.0, color=None, type='sliding', temporalSquareWave=True):
         """
         Checkerboard stimulus 
         Args:
@@ -262,6 +262,11 @@ class pglStimuli:
             checkHeight (float): Height of each checker square in degrees. Default=1.0
             temporalFrequency (float): Temporal frequency of the checkerboard in Hz. Default=1.0
             color (list or tuple, optional): RGB color values as a list or tuple of three floats in the range [0, 1].
+            type (str, optional): Type of checkerboard ('sliding' or 'flickering'). Default='sliding'. When temporalFrequency
+                                  is not zero will either flicker or slide. For bars used in pRF mapping, we use sliding
+                                  type.
+            temporalSquareWave (bool, optional): If True, the checkerboard will use a square wave temporal profile.
+                                                  Default is True. This only changes how flickering stimuli are presented
         """
         if self.coordinateFrame != "visualAngle":
             print("(pgl:pglStimuli:checkerboard) Error: checkerboard can only be generated in visualAngle coordinates. run visualAngle() ")
@@ -269,25 +274,68 @@ class pglStimuli:
 
         # Validate inputs
         if not isinstance(x, (int, float)):
-            print("(pgl:pglStimuli:checkerboard) x must be a number.")
+            print("(pgl:pglStimuli:checkerboard) ❌ x must be a number.")
             return None
         if not isinstance(y, (int, float)):
-            print("(pgl:pglStimuli:checkerboard) y must be a number.")
+            print("(pgl:pglStimuli:checkerboard) ❌ y must be a number.")
             return None
         if not isinstance(checkWidth, (int, float)) or checkWidth <= 0:
-            print("(pgl:pglStimuli:checkerboard) checkWidth must be a positive number.")
+            print("(pgl:pglStimuli:checkerboard) ❌ checkWidth must be a positive number.")
             return None
         if not isinstance(checkHeight, (int, float)) or checkHeight <= 0:
-            print("(pgl:pglStimuli:checkerboard) checkHeight must be a positive number.")
+            print("(pgl:pglStimuli:checkerboard) ❌ checkHeight must be a positive number.")
             return None
-        
+        if not isinstance(temporalFrequency, (int, float)) or temporalFrequency < 0:
+            print("(pgl:pglStimuli:checkerboard) ❌ temporalFrequency must be a non-negative number.")
+            return None
+        if not isinstance(width, (int, float)) and width is not None:
+            print("(pgl:pglStimuli:checkerboard) ❌ width must be a positive number.")
+            return None
+        if not isinstance(height, (int, float)) and height is not None:
+            print("(pgl:pglStimuli:checkerboard) ❌ height must be a positive number.")
+            return None
+        if type not in ['sliding', 'flickering','flicker','slide']:
+            print("(pgl:pglStimuli:checkerboard) ❌ type must be 'sliding' or 'flickering'.")
+            return None
+        if temporalSquareWave not in [True, False]:
+            print("(pgl:pglStimuli:checkerboard) ❌ temporalSquareWave must be a boolean.")
+            return None
+
         # Create the checkerboard stimulus
-        checkerboardStimulus = pglStimulusCheckerboardSliding(self, x=x, y=y, width=width, height=height,
+        if type in ['sliding', 'slide']:
+            checkerboardStimulus = pglStimulusCheckerboardSliding(self, x=x, y=y, width=width, height=height,
                                                                  checkWidth=checkWidth, checkHeight=checkHeight,
                                                                  temporalFrequency=temporalFrequency, color=color)
+        else:
+            checkerboardStimulus = pglStimulusCheckerboardFlickering(self, x=x, y=y, width=width, height=height,
+                                                                   checkWidth=checkWidth, checkHeight=checkHeight,
+                                                                   temporalFrequency=temporalFrequency, color=color,
+                                                                   temporalSquareWave=temporalSquareWave)
         return checkerboardStimulus
+    
+    ####################################################
+    # bar
+    ####################################################
+    def bar(self, width=1.0, speed=1.0):
+        '''
+        Create a bar stimulus. Used for pRF mapping
+        
+        Args:
+            width (float): The width of the bar stimulus in degrees
+            speed (float): The speed in deg/s the bar stimulus moves across screen
+        '''
+        # Validate inputs
+        if not isinstance(width, (int, float)) or width <= 0:
+            print("(pgl:pglStimuli:bar) ❌ width must be a positive number.")
+            return None
 
+        if not isinstance(speed, (int, float)) or speed <= 0:
+            print("(pgl:pglStimuli:bar) ❌ speed must be a positive number.")
+            return None
 
+        # Create the bar stimulus
+        barStimulus = pglStimulusBar(self, width=width, speed=speed)
+        return barStimulus
 
 
 class _pglStimulus:
@@ -488,7 +536,7 @@ class _pglStimulusCheckerboard(_pglStimulus):
     '''
     Base class for checkerboard stimuli.
     '''
-    def __init__(self, pgl,x=0,y=0,width=None,height=None,checkWidth=1.0,checkHeight=1.0,temporalFrequency=1.0,color=None):
+    def __init__(self, pgl,x=0,y=0,width=None,height=None,checkWidth=1.0,checkHeight=1.0,temporalFrequency=1.0,color=None,temporalSquareWave=True):
         '''
         Initialize the checkerboard stimulus.
         '''
@@ -502,7 +550,15 @@ class _pglStimulusCheckerboard(_pglStimulus):
         self.color = pgl.validateColor(color, n=2, forceN=True, withAlpha=False) if color is not None else np.array([[1, 1, 1], [0, 0, 0]], dtype=np.float32)
         self.startTime = pgl.getSecs()
         self.temporalFrequency = temporalFrequency
-        self.temporalSquareWave = False
+        self.temporalSquareWave = temporalSquareWave
+
+        if self.width <= 0:
+            print("(pgl:pglStimuli:checkerboard) ❌ width must be greater than 0, resetting to screen width.")
+            self.width = pgl.screenWidth.deg
+
+        if self.height <= 0:
+            print("(pgl:pglStimuli:checkerboard) ❌ height must be greater than 0, resetting to screen height.")
+            self.height = pgl.screenHeight.deg
 
     def __repr__(self):
         return f"<pglStimulusCheckerboard: center: ({self.x}, {self.y}) size: {self.width}x{self.height} checkSize: {self.checkWidth}x{self.checkHeight} color: {self.color}>"
@@ -626,3 +682,41 @@ class pglStimulusCheckerboardSliding(_pglStimulusCheckerboard):
                 iQuad += 1
         # draw the checkerboard
         self.pgl.quad(quad, color=colors)
+        
+################################################################
+# Bar stimulus class
+################################################################
+class pglStimulusBar(_pglStimulus):
+    def __init__(self, pgl, width=1.0, speed=1.0):
+        super().__init__(pgl)
+        
+        # start at edge of screen
+        self.width = width
+        self.height = pgl.screenHeight.deg
+        self.passStartTime = pgl.getSecs()
+        self.passStartX = -pgl.screenWidth.deg/2 - width/2        
+        self.passEndX = pgl.screenWidth.deg/2 + width/2        
+        self.passStartY = 0
+        self.passEndY = 0
+
+        self.y = 0
+        self.speed = speed
+        
+        # create a sliding checkerboard bar
+        self.barStimulus = pglStimulusCheckerboardSliding(pgl, x=self.passStartX, y=self.passStartY, width=self.width)
+
+    def display(self):
+        # Update the bar stimulus position
+        self.barStimulus.x = self.passStartX + self.speed * (self.pgl.getSecs() - self.passStartTime)
+
+        # display the bar
+        self.barStimulus.display()
+        
+        # check for end of pass
+        if self.barStimulus.x > self.passEndX:
+            # reset for next pass
+            self.passStartTime = self.pgl.getSecs()
+            self.passStartX = -self.pgl.screenWidth.deg/2 - self.width/2
+            self.passEndX = self.pgl.screenWidth.deg/2 + self.width/2
+            self.passStartY = 0
+            self.passEndY = 0
