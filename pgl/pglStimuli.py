@@ -337,6 +337,79 @@ class pglStimuli:
         barStimulus = pglStimulusBar(self, width=width, speed=speed, dir=dir)
         return barStimulus
 
+    ####################################################
+    # radialCheckerboard
+    ####################################################
+    def radialCheckerboard(self, pgl, x=0, y=0, radialWidth=360, theta=0, outerRadius=None, innerRadius=None, checkRadialWidth=15.0, checkRadialLength=1.0, temporalFrequency=1.0, temporalSquareWave=True, color=None, type='flickering'):
+        """
+        Radial checkerboard stimulus
+        Args:
+            x (float): x coordinate of the center of the checkerboard.
+            y (float): y coordinate of the center of the checkerboard.
+            radialWidth (float, optional): Width of the checkerboard in degrees. If None, will use screenWidth.
+            theta (float, optional): Rotation angle of the checkerboard in degrees. Default=0.
+            innerRadius (float, optional): inner radius of checkerboard pattern
+            outerRadius (float, optional): outer radius of checkerboard pattern
+            checkRadialWidth (float): radial width of checkerboard pattern (degrees around circle)
+            checkRadialLength (float): radial length of checks in degrees of visual angle
+            temporalFrequency (float): Temporal frequency of the checkerboard in Hz. Default=1.0
+            color (list or tuple, optional): RGB color values as a list or tuple of three floats in the range [0, 1].
+            type (str, optional): Type of checkerboard ('sliding' or 'flickering'). Default='sliding'. When temporalFrequency
+                                  is not zero will either flicker or slide. For bars used in pRF mapping, we use sliding
+                                  type.
+            temporalSquareWave (bool, optional): If True, the checkerboard will use a square wave temporal profile.
+                                                  Default is True. This only changes how flickering stimuli are presented
+        """
+        if self.coordinateFrame != "visualAngle":
+            print("(pgl:pglStimuli:checkerboard) Error: checkerboard can only be generated in visualAngle coordinates. run visualAngle() ")
+            return None
+
+        # Validate inputs
+        if not isinstance(x, (int, float)):
+            print("(pgl:pglStimuli:checkerboard) ❌ x must be a number.")
+            return None
+        if not isinstance(y, (int, float)):
+            print("(pgl:pglStimuli:checkerboard) ❌ y must be a number.")
+            return None
+        if not isinstance(checkRadialWidth, (int, float)) or checkRadialWidth <= 0:
+            print("(pgl:pglStimuli:checkerboard) ❌ checkRadialWidth must be a positive number.")
+            return None
+        if not isinstance(checkRadialLength, (int, float)) or checkRadialLength <= 0:
+            print("(pgl:pglStimuli:checkerboard) ❌ checkRadialLength must be a positive number.")
+            return None
+        if not isinstance(temporalFrequency, (int, float)) or temporalFrequency < 0:
+            print("(pgl:pglStimuli:checkerboard) ❌ temporalFrequency must be a non-negative number.")
+            return None
+        if not isinstance(radialWidth, (int, float)) and radialWidth is not None:
+            print("(pgl:pglStimuli:checkerboard) ❌ radialWidth must be a positive number.")
+            return None
+        if not isinstance(innerRadius, (int, float)) and innerRadius is not None:
+            print("(pgl:pglStimuli:checkerboard) ❌ innerRadius must be a positive number.")
+            return None
+        if not isinstance(outerRadius, (int, float)) and outerRadius is not None:
+            print("(pgl:pglStimuli:checkerboard) ❌ outerRadius must be a positive number.")
+            return None
+        if type not in ['sliding', 'flickering','flicker','slide']:
+            print("(pgl:pglStimuli:checkerboard) ❌ type must be 'sliding' or 'flickering'.")
+            return None
+        if temporalSquareWave not in [True, False]:
+            print("(pgl:pglStimuli:checkerboard) ❌ temporalSquareWave must be a boolean.")
+            return None
+
+        # Create the checkerboard stimulus
+        if type in ['sliding', 'slide']:
+            checkerboardStimulus = pglStimulusRadialCheckerboardSliding(self, x=x, y=y, radialWidth=radialWidth, theta=theta,
+                                                                       outerRadius=outerRadius, innerRadius=innerRadius,
+                                                                       checkRadialWidth=checkRadialWidth, checkRadialLength=checkRadialLength,
+                                                                       temporalFrequency=temporalFrequency, color=color)
+        else:
+            checkerboardStimulus = pglStimulusRadialCheckerboardFlickering(self, x=x, y=y, radialWidth=radialWidth, theta=theta,
+                                                                         outerRadius=outerRadius, innerRadius=innerRadius,
+                                                                         checkRadialWidth=checkRadialWidth, checkRadialLength=checkRadialLength,
+                                                                        temporalFrequency=temporalFrequency, color=color,
+                                                                        temporalSquareWave=temporalSquareWave)
+        return checkerboardStimulus
+
 
 class _pglStimulus:
     '''
@@ -682,7 +755,169 @@ class pglStimulusCheckerboardSliding(_pglStimulusCheckerboard):
                 iQuad += 1
         # draw the checkerboard
         self.pgl.quad(quad, color=colors)
+ 
+################################################################
+# Radial Checkerboard stimulus class
+################################################################
+class _pglStimulusRadialCheckerboard(_pglStimulus):
+    '''
+    Base class for radial checkerboard stimuli.
+    '''
+    def __init__(self, pgl, x=0, y=0, radialWidth=360, theta=0, outerRadius=None, innerRadius=None, checkRadialWidth = 15.0, checkRadialLength=1.0, temporalFrequency = 1.0, temporalSquareWave=True, color=None):
+        '''
+        Initialize the checkerboard stimulus.
+        '''
+        super().__init__(pgl)
+        self.x = x
+        self.y = y
+        self.radialWidth = np.deg2rad(radialWidth)
+        self.theta = np.deg2rad(theta)
+
+        minRadius = min(self.pgl.screenWidth.deg,self.pgl.screenHeight.deg)/2 
+        self.innerRadius = 0 if innerRadius is None else innerRadius
+        self.outerRadius = minRadius if outerRadius is None else outerRadius
+
+        self.checkRadialWidth = np.deg2rad(checkRadialWidth)
+        self.checkRadialLength = checkRadialLength
+        self.color = pgl.validateColor(color, n=2, forceN=True, withAlpha=False) if color is not None else np.array([[1, 1, 1], [0, 0, 0]], dtype=np.float32)
         
+        self.startTime = pgl.getSecs()
+        self.temporalFrequency = temporalFrequency
+        self.temporalSquareWave = temporalSquareWave
+
+        if self.radialWidth <= 0:
+            print("(pgl:pglStimuli:checkerboard) ❌ radialWidth must be greater than 0, resetting to 360 degrees.")
+            self.radialWidth = np.deg2rad(360)
+
+        if self.innerRadius < 0:
+            print("(pgl:pglStimuli:checkerboard) ❌ innerRadius must be greater than or equal to 0, resetting to 0.")
+            self.innerRadius = 0
+
+        if self.outerRadius <= 0:
+            print("(pgl:pglStimuli:checkerboard) ❌ outerRadius must be greater than 0, resetting to minRadius.")
+            self.outerRadius = minRadius
+
+    def __repr__(self):
+        return f"<pglStimulusCheckerboard: center: ({self.x}, {self.y}) theta: {np.rad2deg(self.theta)} radius: {self.innerRadius}->{self.outerRadius} radialWidth: {np.rad2deg(self.radialWidth)} checkSize: {np.rad2deg(self.checkRadialWidth)}x{self.checkRadialLength} color: {self.color}>"
+
+################################################################
+# Flickering Radial Checkerboard stimulus class
+################################################################
+class pglStimulusRadialCheckerboardFlickering(_pglStimulusRadialCheckerboard):
+    def display(self, stimulusPhase=0):
+        '''
+        Display the checkerboard stimulus
+        '''
+
+        # calculate the phase of the checkerboard
+        phase = stimulusPhase + self.temporalFrequency * 2 * np.pi * (self.pgl.getSecs() - self.startTime)
+        
+        # Make the temporal pattern a square wave if set
+        # otherwise sinusoidal motion
+        if self.temporalSquareWave:
+            cosPhase = np.where(np.cos(phase) >= 0, 1, 0)
+        else:
+          cosPhase = np.cos(phase)
+
+        # calculate r coordinates
+        rCoords = np.arange(self.innerRadius + cosPhase*self.checkRadialLength, self.outerRadius, self.checkRadialLength)
+        if (rCoords[-1] < self.outerRadius): rCoords = np.append(rCoords, self.outerRadius)
+        if (rCoords[0] < self.innerRadius): rCoords[0] = self.innerRadius
+        rCoords = np.insert(rCoords, 0, self.innerRadius)
+        # calculate the number of r coordinates
+        Nr = len(rCoords) - 1
+
+        # theta coordinates
+        thetaMin = self.theta - self.radialWidth / 2
+        thetaMax = self.theta + self.radialWidth / 2
+        thetaCoords = np.arange(thetaMin, thetaMax + self.checkRadialWidth, self.checkRadialWidth)
+        print(np.rad2deg(thetaCoords))
+        Ntheta = len(thetaCoords) - 1
+
+        # create a checkerboard pattern
+        iQuad = 0
+        quad = np.zeros((Nr * Ntheta, 4, 2), dtype=np.float32)
+        colors = np.zeros((Nr * Ntheta, 3), dtype=np.float32)
+        for jCoord in range(len(thetaCoords)-1):
+            colorIndex = jCoord % 2
+            for iCoord in range(len(rCoords)-1):
+                quad[iQuad,:,:] = np.array([[rCoords[iCoord] * np.cos(thetaCoords[jCoord]), rCoords[iCoord] * np.sin(thetaCoords[jCoord])],
+                                         [rCoords[iCoord+1] * np.cos(thetaCoords[jCoord]), rCoords[iCoord+1] * np.sin(thetaCoords[jCoord])],
+                                         [rCoords[iCoord+1] * np.cos(thetaCoords[jCoord+1]), rCoords[iCoord+1] * np.sin(thetaCoords[jCoord+1])],
+                                         [rCoords[iCoord] * np.cos(thetaCoords[jCoord+1]), rCoords[iCoord] * np.sin(thetaCoords[jCoord+1])]])
+                colors[iQuad,:] = self.color[colorIndex % 2]
+                colorIndex += 1
+                iQuad += 1
+        # draw the checkerboard
+        self.pgl.quad(quad, color=colors)
+        print(quad.shape)
+        print(colors.shape)
+
+################################################################
+# Radial checkerboard stimulus class
+################################################################
+class pglStimulusRadialCheckerboardSliding(_pglStimulusCheckerboard):
+    def display(self, stimulusPhase=0):
+        '''
+        Display the checkerboard stimulus
+        '''
+        # x coordinates
+        xMin = self.x - self.width / 2
+        xMax = self.x + self.width / 2
+        
+        # calculate the phase of the checkerboard
+        phase = -1 + 2 * ((stimulusPhase + self.temporalFrequency * (self.pgl.getSecs() - self.startTime)) % 1)
+
+        # calculate x coordinates that slide in one direction 
+        xCoordsOdd = np.arange(xMin + phase*self.checkWidth, xMax, self.checkWidth)        
+        if (xCoordsOdd[-1] < xMax): xCoordsOdd = np.append(xCoordsOdd, xMax)
+        if (phase <= 0): xCoordsOdd[0] = xMin        
+        xCoordsOdd = np.insert(xCoordsOdd, 0, xMin)
+
+        # calculate the number of x coordinates
+        NxOdd = len(xCoordsOdd) - 1
+
+        # calculate x coordinates that slide in the other direction 
+        xCoordsEven = np.arange(xMin - phase*self.checkWidth, xMax, self.checkWidth)        
+        if (xCoordsEven[-1] < xMax): xCoordsEven = np.append(xCoordsEven, xMax)
+        if (phase > 0): xCoordsEven[0] = xMin        
+        xCoordsEven = np.insert(xCoordsEven, 0, xMin)
+
+        # calculate the number of x coordinates
+        NxEven = len(xCoordsEven) - 1
+
+        # y coordinates
+        yMin = self.y - self.height / 2
+        yMax = self.y + self.height / 2
+        yCoords = np.arange(yMin, yMax, self.checkHeight)
+        if (yCoords[-1] < yMax): yCoords = np.append(yCoords, yMax)
+        if (yCoords[0] > yMin): yCoords = np.insert(yCoords, 0, yMin)
+        Ny = len(yCoords) - 1
+
+        Nx = max(NxOdd, NxEven)
+        # create a checkerboard pattern
+        iQuad = 0
+        quad = np.zeros((Nx * Ny, 4, 2), dtype=np.float32)
+        colors = np.zeros((Nx * Ny, 3), dtype=np.float32)
+        for jCoord in range(len(yCoords)-1):
+            if jCoord % 2 == 0:
+                # even rows use xCoordsEven
+                xCoords = xCoordsEven
+            else:
+                # odd rows use xCoordsOdd
+                xCoords = xCoordsOdd
+            colorIndex = jCoord % 2
+            for iCoord in range(len(xCoords)-1):
+                quad[iQuad,:,:] = np.array([[xCoords[iCoord], yCoords[jCoord]],
+                                            [xCoords[iCoord+1], yCoords[jCoord]],
+                                            [xCoords[iCoord+1], yCoords[jCoord+1]],
+                                            [xCoords[iCoord], yCoords[jCoord+1]]])
+                colors[iQuad,:] = self.color[colorIndex % 2]
+                colorIndex += 1
+                iQuad += 1
+        # draw the checkerboard
+        self.pgl.quad(quad, color=colors)
+       
 ################################################################
 # Bar stimulus class
 ################################################################
