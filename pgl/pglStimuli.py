@@ -399,15 +399,15 @@ class pglStimuli:
         # Create the checkerboard stimulus
         if type in ['sliding', 'slide']:
             checkerboardStimulus = pglStimulusRadialCheckerboardSliding(self, x=x, y=y, radialWidth=radialWidth, theta=theta,
-                                                                       outerRadius=outerRadius, innerRadius=innerRadius,
-                                                                       checkRadialWidth=checkRadialWidth, checkRadialLength=checkRadialLength,
-                                                                       temporalFrequency=temporalFrequency, color=color)
+                                                                        outerRadius=outerRadius, innerRadius=innerRadius,
+                                                                        checkRadialWidth=checkRadialWidth, checkRadialLength=checkRadialLength,
+                                                                        temporalFrequency=temporalFrequency, color=color)
         else:
             checkerboardStimulus = pglStimulusRadialCheckerboardFlickering(self, x=x, y=y, radialWidth=radialWidth, theta=theta,
-                                                                         outerRadius=outerRadius, innerRadius=innerRadius,
-                                                                         checkRadialWidth=checkRadialWidth, checkRadialLength=checkRadialLength,
-                                                                        temporalFrequency=temporalFrequency, color=color,
-                                                                        temporalSquareWave=temporalSquareWave)
+                                                                          outerRadius=outerRadius, innerRadius=innerRadius,
+                                                                          checkRadialWidth=checkRadialWidth, checkRadialLength=checkRadialLength,
+                                                                          temporalFrequency=temporalFrequency, color=color,
+                                                                          temporalSquareWave=temporalSquareWave)
         return checkerboardStimulus
 
 
@@ -831,7 +831,6 @@ class pglStimulusRadialCheckerboardFlickering(_pglStimulusRadialCheckerboard):
         thetaMin = self.theta - self.radialWidth / 2
         thetaMax = self.theta + self.radialWidth / 2
         thetaCoords = np.arange(thetaMin, thetaMax + self.checkRadialWidth, self.checkRadialWidth)
-        print(np.rad2deg(thetaCoords))
         Ntheta = len(thetaCoords) - 1
 
         # create a checkerboard pattern
@@ -841,77 +840,69 @@ class pglStimulusRadialCheckerboardFlickering(_pglStimulusRadialCheckerboard):
         for jCoord in range(len(thetaCoords)-1):
             colorIndex = jCoord % 2
             for iCoord in range(len(rCoords)-1):
-                quad[iQuad,:,:] = np.array([[rCoords[iCoord] * np.cos(thetaCoords[jCoord]), rCoords[iCoord] * np.sin(thetaCoords[jCoord])],
-                                         [rCoords[iCoord+1] * np.cos(thetaCoords[jCoord]), rCoords[iCoord+1] * np.sin(thetaCoords[jCoord])],
-                                         [rCoords[iCoord+1] * np.cos(thetaCoords[jCoord+1]), rCoords[iCoord+1] * np.sin(thetaCoords[jCoord+1])],
-                                         [rCoords[iCoord] * np.cos(thetaCoords[jCoord+1]), rCoords[iCoord] * np.sin(thetaCoords[jCoord+1])]])
+                quad[iQuad,:,:] = np.array([[self.x + rCoords[iCoord] * np.cos(thetaCoords[jCoord]), self.y + rCoords[iCoord] * np.sin(thetaCoords[jCoord])],
+                                         [self.x + rCoords[iCoord+1] * np.cos(thetaCoords[jCoord]), self.y + rCoords[iCoord+1] * np.sin(thetaCoords[jCoord])],
+                                         [self.x + rCoords[iCoord+1] * np.cos(thetaCoords[jCoord+1]), self.y + rCoords[iCoord+1] * np.sin(thetaCoords[jCoord+1])],
+                                         [self.x + rCoords[iCoord] * np.cos(thetaCoords[jCoord+1]), self.y + rCoords[iCoord] * np.sin(thetaCoords[jCoord+1])]])
                 colors[iQuad,:] = self.color[colorIndex % 2]
                 colorIndex += 1
                 iQuad += 1
         # draw the checkerboard
         self.pgl.quad(quad, color=colors)
-        print(quad.shape)
-        print(colors.shape)
 
 ################################################################
-# Radial checkerboard stimulus class
+# Sliding Radial checkerboard stimulus class
 ################################################################
-class pglStimulusRadialCheckerboardSliding(_pglStimulusCheckerboard):
+class pglStimulusRadialCheckerboardSliding(_pglStimulusRadialCheckerboard):
     def display(self, stimulusPhase=0):
         '''
         Display the checkerboard stimulus
         '''
-        # x coordinates
-        xMin = self.x - self.width / 2
-        xMax = self.x + self.width / 2
-        
         # calculate the phase of the checkerboard
         phase = -1 + 2 * ((stimulusPhase + self.temporalFrequency * (self.pgl.getSecs() - self.startTime)) % 1)
 
-        # calculate x coordinates that slide in one direction 
-        xCoordsOdd = np.arange(xMin + phase*self.checkWidth, xMax, self.checkWidth)        
-        if (xCoordsOdd[-1] < xMax): xCoordsOdd = np.append(xCoordsOdd, xMax)
-        if (phase <= 0): xCoordsOdd[0] = xMin        
-        xCoordsOdd = np.insert(xCoordsOdd, 0, xMin)
+        # calculate r coordinates that slide in one direction 
+        rCoordsOdd = np.arange(self.innerRadius + phase*self.checkRadialLength, self.outerRadius, self.checkRadialLength)
+        if (rCoordsOdd[-1] < self.outerRadius): rCoordsOdd = np.append(rCoordsOdd, self.outerRadius)
+        if (phase <= 0): rCoordsOdd[0] = self.innerRadius        
+        rCoordsOdd = np.insert(rCoordsOdd, 0, self.innerRadius)
 
-        # calculate the number of x coordinates
-        NxOdd = len(xCoordsOdd) - 1
+        # calculate the number of r coordinates
+        NrOdd = len(rCoordsOdd) - 1
 
-        # calculate x coordinates that slide in the other direction 
-        xCoordsEven = np.arange(xMin - phase*self.checkWidth, xMax, self.checkWidth)        
-        if (xCoordsEven[-1] < xMax): xCoordsEven = np.append(xCoordsEven, xMax)
-        if (phase > 0): xCoordsEven[0] = xMin        
-        xCoordsEven = np.insert(xCoordsEven, 0, xMin)
+        # calculate r coordinates that slide in the other direction 
+        rCoordsEven = np.arange(self.innerRadius - phase*self.checkRadialLength, self.outerRadius, self.checkRadialLength)        
+        if (rCoordsEven[-1] < self.outerRadius): rCoordsEven = np.append(rCoordsEven, self.outerRadius)
+        if (phase > 0): rCoordsEven[0] = self.innerRadius        
+        rCoordsEven = np.insert(rCoordsEven, 0, self.innerRadius)
 
-        # calculate the number of x coordinates
-        NxEven = len(xCoordsEven) - 1
+        # calculate the number of r coordinates
+        NrEven = len(rCoordsEven) - 1
 
-        # y coordinates
-        yMin = self.y - self.height / 2
-        yMax = self.y + self.height / 2
-        yCoords = np.arange(yMin, yMax, self.checkHeight)
-        if (yCoords[-1] < yMax): yCoords = np.append(yCoords, yMax)
-        if (yCoords[0] > yMin): yCoords = np.insert(yCoords, 0, yMin)
-        Ny = len(yCoords) - 1
+        # theta coordinates
+        thetaMin = self.theta - self.radialWidth / 2
+        thetaMax = self.theta + self.radialWidth / 2
+        thetaCoords = np.arange(thetaMin, thetaMax + self.checkRadialWidth, self.checkRadialWidth)
+        Ntheta = len(thetaCoords) - 1
 
-        Nx = max(NxOdd, NxEven)
+        Nr = max(NrOdd, NrEven)
         # create a checkerboard pattern
         iQuad = 0
-        quad = np.zeros((Nx * Ny, 4, 2), dtype=np.float32)
-        colors = np.zeros((Nx * Ny, 3), dtype=np.float32)
-        for jCoord in range(len(yCoords)-1):
+        quad = np.zeros((Nr * Ntheta, 4, 2), dtype=np.float32)
+        colors = np.zeros((Nr * Ntheta, 3), dtype=np.float32)
+        for jCoord in range(len(thetaCoords)-1):
             if jCoord % 2 == 0:
-                # even rows use xCoordsEven
-                xCoords = xCoordsEven
+                # even rows use rCoordsEven
+                rCoords = rCoordsEven
             else:
-                # odd rows use xCoordsOdd
-                xCoords = xCoordsOdd
+                # odd rows use rCoordsOdd
+                rCoords = rCoordsOdd
             colorIndex = jCoord % 2
-            for iCoord in range(len(xCoords)-1):
-                quad[iQuad,:,:] = np.array([[xCoords[iCoord], yCoords[jCoord]],
-                                            [xCoords[iCoord+1], yCoords[jCoord]],
-                                            [xCoords[iCoord+1], yCoords[jCoord+1]],
-                                            [xCoords[iCoord], yCoords[jCoord+1]]])
+            for iCoord in range(len(rCoords)-1):
+                quad[iQuad,:,:] = np.array([[self.x + rCoords[iCoord] * np.cos(thetaCoords[jCoord]), self.y + rCoords[iCoord] * np.sin(thetaCoords[jCoord])],
+                                            [self.x + rCoords[iCoord+1] * np.cos(thetaCoords[jCoord]), self.y + rCoords[iCoord+1] * np.sin(thetaCoords[jCoord])],
+                                            [self.x + rCoords[iCoord+1] * np.cos(thetaCoords[jCoord+1]), self.y + rCoords[iCoord+1] * np.sin(thetaCoords[jCoord+1])],
+                                            [self.x + rCoords[iCoord] * np.cos(thetaCoords[jCoord+1]), self.y + rCoords[iCoord] * np.sin(thetaCoords[jCoord+1])]])
                 colors[iQuad,:] = self.color[colorIndex % 2]
                 colorIndex += 1
                 iQuad += 1
