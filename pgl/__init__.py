@@ -11,15 +11,13 @@ from .pglDevice import pglDevice, pglDevices, pglKeyboard, pglEventKeyboard
 from .pglEvent import pglEvent, pglEvents
 from .pglCommandReplayer import pglCommandReplayer
 from .pglFrameGrab import pglFrameGrab
+from .pglExperiment import pglExperiment, pglTask 
 
 # Device specific imports (eye trackers, etc.)
 from .pglVPixx import pglProPixx, pglDataPixx
 from .pglEyeTracker import pglEyeTracker
 from .pglTrackPixx import pglTrackPixx3
 from .pglEyelink import pglEyelinkCustomDisplay, pglEyelink
-
-#from .screen import screen
-#from .task import task
 
 class pgl(pglBase, pglResolution, pglDraw, pglTransform, pglProfile, pglBatch, pglImage, pglStimuli, pglTimestamp, pglDevices, pglEvents, pglCommandReplayer, pglFrameGrab):
     """
