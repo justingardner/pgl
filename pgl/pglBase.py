@@ -13,6 +13,7 @@ import glob
 import inspect
 import platform, subprocess, random, string, os
 from pprint import pprint
+import sys
 import numpy as np
 from . import _pglComm as pglComm
 from . import _resolution
@@ -527,7 +528,11 @@ class pglBase:
         Date:
             July 9, 2025
         """
+        # get python information
+        self.pythonVersion = sys.version
+        print(f"(pgl:checkOS) Python version: {self.pythonVersion}")
         if platform.system() == "Darwin":
+            
             # get version
             self.macOSversion = platform.mac_ver()
 
