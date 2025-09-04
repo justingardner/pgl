@@ -182,6 +182,8 @@ class pglTask:
         
         # reset blockNum, 
         self.blockNum = -1
+        # set blockLen just to trigger startBlock in startTrial
+        self.blockLen = 1
 
         # start trial
         self.currentTrial = -1
@@ -237,7 +239,7 @@ class pglTask:
         paramNames = [p.name for p in self.parameters if p.randomizationBlock == 1]
         # get all valid values from all parameters where randomizationBlock == 1
         allValidValues = [p.validValues for p in self.parameters if p.randomizationBlock == 1]
-        # get caretsian combination
+        # get cartesian combination
         parameterBlock = itertools.product(*allValidValues)
         # and randomly shuffle the order
         parameterBlock = list(parameterBlock)
