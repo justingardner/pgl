@@ -10,6 +10,9 @@
 #############
 # Import modules
 #############
+import numpy as np
+import itertools
+import random
     
 #############
 # Experiment class
@@ -45,8 +48,10 @@ class pglExperiment:
         '''
         
         # open screen
-        self.pgl.open(1,800,600)
+        #self.pgl.open(1,800,600)
+        self.pgl.open()
         self.pgl.visualAngle(57,40,30)
+        self.pgl.waitSecs(0.5)
 
     def endScreen(self):
         '''
@@ -151,6 +156,8 @@ class pglTask:
         self.currentSegment = 0
         self.currentTrial = 0  
         self.nTrials = 10
+        self.parameters=[]
+        self.name="Task"
     ################################################################
     # seglen property
     ################################################################
@@ -170,13 +177,55 @@ class pglTask:
         '''
         Start the task.
         '''
-        self.currentSegment = 0
-        self.currentTrial = 0
         # set clocks
         self.taskStartTime = startTime
         self.trialStartTime = startTime
         self.segmentStartTime = startTime
-        print("Start")
+
+        # get randomization of parameters
+        (self.parameterNames, self.parameterBlock) = self.getParameterBlock()
+
+        # display block information
+        print(f"({self.name}) Starting block of {len(self.parameterBlock)} trials randomized over: {self.parameterNames}")
+
+        # set trial
+        self.currentTrial = -1
+        self.startTrial(startTime)
+
+    def startTrial(self, startTime):
+        '''
+        Start a trial.
+        '''
+        self.currentTrial += 1
+        self.trialStartTime = startTime
+        self.currentSegment = 0
+        self.currentParams = dict(zip(self.parameterNames, self.parameterBlock[self.currentTrial]))
+        print(f"({self.name}) Trial {self.currentTrial+1}: {self.currentParams}")
+
+    def getParameterBlock(self):
+        '''
+        Get a set of parameters to run over, for example if you have
+        direction and coherence parameters, this would calculate all
+        combination of those parameters and return them for the task
+        to run as a block of trials.
+        '''
+        # get variable names
+        paramNames = [p.name for p in self.parameters if p.randomizationBlock == 1]
+        # get all valid values from all parameters where randomizationBlock == 1
+        allValidValues = [p.validValues for p in self.parameters if p.randomizationBlock == 1]
+        # get caretsian combination
+        parameterBlock = itertools.product(*allValidValues)
+        # and randomly shuffle the order
+        parameterBlock = list(parameterBlock)
+        random.shuffle(parameterBlock)
+        # return the block
+        return (paramNames, parameterBlock)
+
+    def addParameter(self, param):
+        '''
+        Add a parameter to the task.
+        '''
+        self.parameters.append(param)
 
     def update(self, updateTime, events, phaseNum, tasks, experiment):
         '''
@@ -192,18 +241,14 @@ class pglTask:
             # update current segment
             self.currentSegment += 1
             # check for end of trial
-            if self.currentSegment >= self.nSegments:
-                # start at first segment
-                self.currentSegment = 0
-                self.currentTrial += 1
-                self.trialStartTime = updateTime
-                print(f"(pglTask:update) Trial {self.currentTrial} started.")
+            if self.currentSegment >= self.nSegments: 
+                # new trial
+                self.startTrial(updateTime)
 
     def updateScreen(self):
         '''
         Update the screen.
         '''
-        print(".")
         pass
     
     def done(self):
@@ -211,3 +256,58 @@ class pglTask:
         Check if the task is done.
         '''
         return self.currentTrial >= self.nTrials
+
+#############
+# Parameter class
+#############
+class pglParameter:
+    '''
+    Class representing a parameter in the experiment.
+    '''
+    def __init__(self, name: str, validValues: list|tuple|np.ndarray, randomizationBlock: int=1, helpStr: str=""):
+        '''
+        Initialize the parameter.
+        
+        Args:
+            name (str): The name of the parameter.
+            validValues (list, optional): A list of valid values for the parameter. If None, any value is valid.
+            randomizationBlock (int, optional): Sets the block of parameters which get randomized together, so
+              if this is 1, then all other parameters with the same randomizationBlock will be randomized
+              together, meaning that all combinations of these parameters will be generated a block randomization
+              will randomize over all combinations. Typically this is 1 for variables that you want to randomize
+              over and 0 for values that you do not want to randomize over
+            helpStr (str, optional): Help string describing the parameter.
+        '''
+        # validate name
+        if not isinstance(name, str):
+            raise TypeError("(pglParameter) ❌ Error: Parameter name must be a string.")
+        self.name = name
+        
+        # check if it is a list of values
+        if not isinstance(validValues, (list, tuple, np.ndarray)):
+            raise TypeError("(pglParameter) ❌ Error: validValues must be a list, tuple, or ndarray.")
+        self.validValues = validValues
+
+        # validate randomizationBlock
+        if not isinstance(randomizationBlock, int):
+            raise TypeError("(pglParameter) ❌ Error: randomizationBlock must be an int.")
+            return
+        self.randomizationBlock = randomizationBlock
+
+        # validate helpStr
+        if not isinstance(helpStr, str):
+            raise TypeError("(pglParameter) ❌ Error: helpStr must be a string.")
+        self.helpStr = helpStr
+
+    def __repr__(self):
+        return f"pglParameter(name={self.name}, validValues={self.validValues}, randomizationBlock={self.randomizationBlock}, helpStr={self.helpStr})"
+
+    def __str__(self):
+        # display help string
+        if self.helpStr == "":
+            helpStr = ""
+        else:
+            helpStr = f"# {self.helpStr} #\n"
+        
+        # display full string
+        return f"{helpStr}{self.name}: {self.validValues} (randomizationBlock={self.randomizationBlock})"
