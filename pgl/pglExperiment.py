@@ -153,8 +153,6 @@ class pglTask:
     '''
     def __init__(self):
         self._seglen = []
-        self.currentSegment = 0
-        self.currentTrial = 0  
         self.nTrials = 10
         self.parameters=[]
         self.name="Task"
@@ -181,26 +179,46 @@ class pglTask:
         self.taskStartTime = startTime
         self.trialStartTime = startTime
         self.segmentStartTime = startTime
+        
+        # reset blockNum, 
+        self.blockNum = -1
 
-        # get randomization of parameters
-        (self.parameterNames, self.parameterBlock) = self.getParameterBlock()
-
-        # display block information
-        print(f"({self.name}) Starting block of {len(self.parameterBlock)} trials randomized over: {self.parameterNames}")
-
-        # set trial
+        # start trial
         self.currentTrial = -1
         self.startTrial(startTime)
+
+    def startBlock(self, startTime):
+        '''
+        Start a block.
+        '''
+        # get randomization of parameters
+        (self.parameterNames, self.parameterBlock) = self.getParameterBlock()
+        
+        # set variables
+        self.blockNum += 1
+        self.blockStartTime = startTime
+        self.blockLen = len(self.parameterBlock)
+        
+        # display block information
+        print(f"({self.name}) Block {self.blockNum+1}: {self.blockLen} trials randomized over: {self.parameterNames}")
+
 
     def startTrial(self, startTime):
         '''
         Start a trial.
         '''
+        # check if we are at the end of a block
+        if (self.currentTrial%self.blockLen) == self.blockLen-1:
+            self.startBlock(startTime)
+
+        # update values
         self.currentTrial += 1
         self.trialStartTime = startTime
         self.currentSegment = 0
+
         # make a dictionary of the current parameters. 
-        self.currentParams = dict(zip(self.parameterNames, self.parameterBlock[self.currentTrial]))
+        self.currentParams = dict(zip(self.parameterNames, self.parameterBlock[self.currentTrial%self.blockLen]))
+
         # print trial
         print(f"({self.name}) Trial {self.currentTrial+1}: ", end='')
         # and variable settings
