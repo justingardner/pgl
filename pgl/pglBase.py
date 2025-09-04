@@ -45,13 +45,13 @@ class pglBase:
     # Init Function
     ################################################################
     def __init__(self):
+        
+        self.printHeader("pglBase: init")
+        
         # check os
         if not self.checkOS():
             raise Exception("(pglBase) Unsupported OS")
                 
-        # Init verbose level to normal
-        self.verbose = 1
-
         # get some directories
         self.homeDir = os.path.expanduser("~")
         pglDir = inspect.getfile(self.__class__)
@@ -61,7 +61,9 @@ class pglBase:
         self.metalSocketPath = os.path.join(self.homeDir, "Library/Containers/gru.mglMetal/Data")
 
         # print what we are doing
-        if self.verbose > 0: print("(pglBase) Main library instance created")
+        if self.verbose > 0: 
+            print("(pglBase) Main library instance created")
+            self.printHeader()
     
     ################################################################
     # Delete Function
