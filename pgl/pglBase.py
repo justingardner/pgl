@@ -120,6 +120,7 @@ class pglBase:
         Returns:
             bool: True if the screen was opened successfully, False otherwise.
         """
+        self.printHeader("pglBase:open")
         # get how many displays we have
         (numDisplays, defaultDisplay) = self.getNumDisplaysAndDefault()
         if whichScreen is None: whichScreen = defaultDisplay
@@ -208,7 +209,7 @@ class pglBase:
         # print how you can get error log
         print("(pgl:open) mglMetal error log can be viewed in MacOS Console app by searching for PROCESS mglMetal or in a terminal with:")
         print("           log stream --level info --process mglMetal")
-
+        self.printHeader()
         # success
         return True
  
@@ -227,9 +228,11 @@ class pglBase:
         """
          # make sure that a screen is open
         if self.isOpen() is False: return True
-
+        
         # Print what we are doing
-        if self.verbose > 0: print("(pglBase:close) Closing connection to mglMetal application")
+        if self.verbose > 0: 
+            self.printHeader("pglBase:close")
+            print("(pglBase:close) Closing connection to mglMetal application")
 
         # Check if the socket is connected
         if not self.s:
@@ -253,7 +256,7 @@ class pglBase:
         # Close the socket
         self.s.close()
         self.s = None
-        
+        if self.verbose>0: self.printHeader("pglBase:close")
         return True
     
     ################################################################
@@ -683,6 +686,18 @@ class pglBase:
         Restore interrupts by re-enabling the SIGINT signal (Ctrl-C).
         """
         signal.signal(signal.SIGINT, self.originalHandler)
+
+    #################################################################
+    # Print a header
+    #################################################################
+    def printHeader(self, str="", len=80, fillChar="="):
+        '''
+        Print a header with a given string centered
+        '''
+        if str == "":
+            print(fillChar * len)
+        else:
+            print(f" {str} ".center(len, fillChar))
 
     ###################################
     # get the name of the mglMetalApp
