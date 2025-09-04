@@ -256,7 +256,7 @@ class pglBase:
         # Close the socket
         self.s.close()
         self.s = None
-        if self.verbose>0: self.printHeader("pglBase:close")
+        if self.verbose>0: self.printHeader()
         return True
     
     ################################################################
