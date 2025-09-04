@@ -190,8 +190,10 @@ class pglBase:
         self.setWindowFrameInDisplay(whichScreen, screenX, screenY, screenWidth, screenHeight)
 
         # set full screen if requested
-        if fullScreen: self.fullScreen(True)
-
+        if fullScreen: 
+            self.fullScreen(True)
+            #self.waitSecs(0.1)
+        
         # get the window location
         self.getWindowFrameInDisplay()
 
