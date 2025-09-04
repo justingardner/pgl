@@ -22,7 +22,7 @@ class pglExperiment:
     Experiment class which handles timing, parameter randomization,
     subject response, synchronizing with measurement hardware etc
     '''
-    def __init__(self, pgl, suppressInitScreen=False):
+    def __init__(self, pgl, suppressInitScreen=False, suppressEndScreen=False):
         # save pgl
         self.pgl = pgl
         
@@ -31,6 +31,7 @@ class pglExperiment:
 
         # load parameters
         self.loadParameters()
+        self.suppressEndScreen = suppressEndScreen
         
         # current phase of experiment
         self.currentPhase = 0
@@ -133,6 +134,7 @@ class pglExperiment:
                     self.startPhase()
         
         print("(pglExperiment:run) Experiment done.")
+        if not self.suppressEndScreen: self.endScreen()
 
     def startPhase(self):
         '''
