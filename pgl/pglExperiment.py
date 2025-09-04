@@ -199,8 +199,14 @@ class pglTask:
         self.currentTrial += 1
         self.trialStartTime = startTime
         self.currentSegment = 0
+        # make a dictionary of the current parameters. 
         self.currentParams = dict(zip(self.parameterNames, self.parameterBlock[self.currentTrial]))
-        print(f"({self.name}) Trial {self.currentTrial+1}: {self.currentParams}")
+        # print trial
+        print(f"({self.name}) Trial {self.currentTrial+1}: ", end='')
+        # and variable settings
+        for name,value in self.currentParams.items():
+            print(f'{name}={value}', end=' ')
+        print()
 
     def getParameterBlock(self):
         '''
