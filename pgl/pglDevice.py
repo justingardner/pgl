@@ -109,7 +109,7 @@ class pglDevices:
         else:
             print("(pglDevices) Error: Device must be an instance of pglDevice.")
 
-    def devicesPoll(self):
+    def poll(self):
         """
         Poll all devices for updates.
 
@@ -132,7 +132,7 @@ from queue import Queue
 import threading
 
 class pglKeyboard(pglDevice):
-    def __init__(self): 
+    def __init__(self, eatKeys=False): 
         super().__init__(deviceType="pglKeyboard")
 
         if not self.checkAccessibilityPermission():
@@ -148,7 +148,8 @@ class pglKeyboard(pglDevice):
         # Store listener reference
         self.listener = keyboard.Listener(
             on_press=self.onPress,
-            on_release=self.onRelease
+            on_release=self.onRelease,
+            suppress=eatKeys
         )
 
         # Start the keyboard listener thread
@@ -311,7 +312,7 @@ class pglEventKeyboard(pglEvent):
         Returns:
             None
         '''
-        super().__init__("Keyboard")
+        super().__init__("keyboard")
         self.keyStr = keyStr
         self.keyCode = keyCode
         self.key = key

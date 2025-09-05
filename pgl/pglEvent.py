@@ -101,11 +101,11 @@ class pglEvent:
     Parent class for all pglEvent types
     """
     
-    def __init__(self, deviceType="pglEvent"):
+    def __init__(self, type="pglEvent"):
         """
         Initialize the pglEvent instance.
         """
-        self.deviceType = deviceType
+        self.type = type
 
     def __repr__(self):
         return f"<pglEvent type={self.deviceType}>"
