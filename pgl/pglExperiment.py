@@ -55,8 +55,13 @@ class pglExperiment:
         self.pgl.visualAngle(57,40,30)
         
         # add keyboard device
-        self.pgl.devicesAdd(pglKeyboard())
-        
+        keyboardDevices = self.pgl.devicesGet(pglKeyboard)
+        if not keyboardDevices:
+            self.pgl.devicesAdd(pglKeyboard(eatKeys=True))
+        else:
+            for keyboardDevice in keyboardDevices:
+                keyboardDevice.start(eatKeys=True)
+
         # wait half a second for metal app to initialize
         self.pgl.waitSecs(0.5)
 
@@ -116,6 +121,10 @@ class pglExperiment:
         '''
         self.startPhase()
 
+        experimentDone = False
+        d = self.pgl.devicesGet(pglKeyboard)
+        print(d)
+
         # wait for key press to start experiment
         if self.startKeypress is not []:
             experimentStarted = False
@@ -127,10 +136,14 @@ class pglExperiment:
                 # see if we have a match to startKeypress
                 if [e for e in events if e.type == "keyboard" and e.keyStr in self.startKeypress]:
                     experimentStarted = True
+                    
+                if [e for e in events if e.type == "keyboard" and e.keyStr in self.endKeypress]:
+                    experimentStarted = True
+                    experimentDone = True
+
 
         print(f"(pglExperiment:run) Experiment started.")
 
-        experimentDone = False
         while not experimentDone:
             
             # poll for events
@@ -142,15 +155,14 @@ class pglExperiment:
                 continue
 
             # grab any events that match the keyList and return their index within that list
-            keyValues = [keyIndex for e in events if e.type == "keyboard" and e.keyStr in self.keyList for keyIndex in [self.keyList.index(e.keyStr)]]
-            if keyValues: print(keyValues)
+            subjectResponse = [keyIndex for e in events if e.type == "keyboard" and e.keyStr in self.keyList for keyIndex in [self.keyList.index(e.keyStr)]]
 
             # update tasks in current phase
             phaseDone = False
             updateTime = self.pgl.getSecs()
             for task in self.task[self.currentPhase]:
                 # update task
-                task.update(updateTime=updateTime, events=events, phaseNum=self.currentPhase, tasks=self.task[self.currentPhase], experiment=self)
+                task.update(updateTime=updateTime, subjectResponse=subjectResponse, phaseNum=self.currentPhase, tasks=self.task[self.currentPhase], experiment=self)
                 # check if task is done
                 if task.done(): phaseDone = True
             
@@ -168,6 +180,14 @@ class pglExperiment:
                     self.startPhase()
         
         print("(pglExperiment:run) Experiment done.")
+        
+        # stop the keyboard listener
+        keyboardDevices = self.pgl.devicesGet(pglKeyboard)
+        if keyboardDevices is not []:
+            for keyboardDevice in keyboardDevices:
+                keyboardDevice.stop()
+
+        # close screen
         if not self.suppressEndScreen: self.endScreen()
 
     def startPhase(self):
@@ -289,7 +309,7 @@ class pglTask:
         '''
         self.parameters.append(param)
 
-    def update(self, updateTime, events, phaseNum, tasks, experiment):
+    def update(self, updateTime, subjectResponse, phaseNum, tasks, experiment):
         '''
         Update the task.
         '''
@@ -306,6 +326,17 @@ class pglTask:
             if self.currentSegment >= self.nSegments: 
                 # new trial
                 self.startTrial(updateTime)
+        
+        # if there are responses, call response callback
+        if subjectResponse is not []:
+            self.handleSubjectResponse(subjectResponse, updateTime)
+
+    def handleSubjectResponse(self, responses, updateTime):
+        '''
+        Handle subject responses.
+        '''
+        for response in responses:
+            print(f"(pglExperiment) Subject response received: {response} at {updateTime}")
 
     def updateScreen(self):
         '''
