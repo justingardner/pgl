@@ -13,6 +13,7 @@
 import numpy as np
 import itertools
 import random
+from . import pglKeyboard
     
 #############
 # Experiment class
@@ -36,7 +37,7 @@ class pglExperiment:
         # current phase of experiment
         self.currentPhase = 0
         
-        # tasks
+        # initialize tasks
         self.task = [[]]
         
     def __repr__(self):
@@ -52,6 +53,11 @@ class pglExperiment:
         #self.pgl.open(1,800,600)
         self.pgl.open()
         self.pgl.visualAngle(57,40,30)
+        
+        # add keyboard device
+        self.pgl.devicesAdd(pglKeyboard())
+        
+        # wait half a second for metal app to initialize
         self.pgl.waitSecs(0.5)
 
     def endScreen(self):
@@ -65,6 +71,11 @@ class pglExperiment:
         '''
         Load experiment parameters from configuration file.
         '''
+        # this should be settable in a parameter dialog
+        self.startKeypress = ["Key.space"]
+        self.endKeypress = ["Key.esc"]
+        self.keyList = ["1", "2", "3"]
+
         pass
 
     def saveParameters(self):
@@ -104,12 +115,35 @@ class pglExperiment:
         Run the experiment.
         '''
         self.startPhase()
-        
+
+        # wait for key press to start experiment
+        if self.startKeypress is not []:
+            experimentStarted = False
+            print(f"(pglExperiment:run) Waiting for key press ({[key for key in self.startKeypress]}) to start experiment...")
+            while not experimentStarted:
+                # poll for events
+                events = self.pgl.poll()
+
+                # see if we have a match to startKeypress
+                if [e for e in events if e.type == "keyboard" and e.keyStr in self.startKeypress]:
+                    experimentStarted = True
+
+        print(f"(pglExperiment:run) Experiment started.")
+
         experimentDone = False
         while not experimentDone:
             
             # poll for events
-            events = []#self.pgl.devicesPoll()
+            events = self.pgl.poll()
+
+            # see if we have a match to endKeypress
+            if [e for e in events if e.type == "keyboard" and e.keyStr in self.endKeypress]:
+                experimentDone = True
+                continue
+
+            # grab any events that match the keyList and return their index within that list
+            keyValues = [keyIndex for e in events if e.type == "keyboard" and e.keyStr in self.keyList for keyIndex in [self.keyList.index(e.keyStr)]]
+            if keyValues: print(keyValues)
 
             # update tasks in current phase
             phaseDone = False
