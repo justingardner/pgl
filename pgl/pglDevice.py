@@ -69,6 +69,10 @@ class pglDevice:
         # Implement polling logic here
         return f"(pglDevice) Device {self.deviceType}: poll not implemented"
     
+    def start(self):
+        pass
+    def stop(self):
+        pass
     def status(self):
         """
         Get the status of the device.
@@ -109,13 +113,25 @@ class pglDevices:
         else:
             print("(pglDevices) Error: Device must be an instance of pglDevice.")
 
+    def devicesGet(self, deviceType):
+        '''
+        Get a pglDevice instance by its type.
+
+        Args:
+            deviceType (str): The type of the device to retrieve.
+
+        Returns:
+            pglDevice: The device instance if found, None otherwise.
+        '''
+        return [d for d in self.devices if isinstance(d, deviceType)]
+
     def poll(self):
         """
         Poll all devices for updates.
 
         This method iterates through all devices and calls their poll method.
         """
-
+        eventList = []
         for device in self.devices: 
             # poll each device for events
             eventList = device.poll()
@@ -142,6 +158,15 @@ class pglKeyboard(pglDevice):
             print("              /Applications/Visual\\ Studio\\ Code.app/Contents/MacOS/Electron")
             return
 
+        self.start(eatKeys)
+
+    def start(self, eatKeys=False):
+        '''
+        Start the keyboard listener.
+        '''
+        if self.isRunning(): return
+        print(f"(pglKeyboard:start) Starting keyboard listener.")
+        
         # Create a thread-safe queue
         self.keyQueue = Queue()
 
@@ -167,6 +192,14 @@ class pglKeyboard(pglDevice):
 
         print("(pglKeyboard) Keyboard listener initialized.")
     
+    def stop(self):
+        '''
+        Stop the keyboard listener.
+        '''
+        if self.isRunning(): self.stopListener()
+        print(f"(pglKeyboard:stop) Stopping keyboard listener.")
+
+        
     def checkAccessibilityPermission(self):
         """
         Returns True if the process is trusted for accessibility events.
