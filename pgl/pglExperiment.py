@@ -122,11 +122,8 @@ class pglExperiment:
         '''
         Run the experiment.
         '''
-        self.startPhase()
-
         experimentDone = False
         d = self.pgl.devicesGet(pglKeyboard)
-        print(d)
 
         # wait for key press to start experiment
         if self.startKeypress is not []:
@@ -144,7 +141,7 @@ class pglExperiment:
                     experimentStarted = True
                     experimentDone = True
 
-
+        self.startPhase()
         print(f"(pglExperiment:run) Experiment started.")
 
         while not experimentDone:
