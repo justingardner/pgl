@@ -253,7 +253,9 @@ class pglTask:
         self.currentSegment = 0
 
         # get current parameters
-        self.currentParams = self.parameters[0].get() if self.parameters else {}
+        self.currentParams = {}
+        for parameter in self.parameters: 
+            self.currentParams.update(parameter.get())
 
         # print trial
         print(f"({self.name}) Trial {self.currentTrial+1}: ", end='')
@@ -261,25 +263,6 @@ class pglTask:
         for name,value in self.currentParams.items():
             print(f'{name}={value}', end=' ')
         print()
-
-    def getParameterBlock(self):
-        '''
-        Get a set of parameters to run over, for example if you have
-        direction and coherence parameters, this would calculate all
-        combination of those parameters and return them for the task
-        to run as a block of trials.
-        '''
-        # get variable names
-        paramNames = [p.name for p in self.parameters if p.randomizationBlock == 1]
-        # get all valid values from all parameters where randomizationBlock == 1
-        allValidValues = [p.validValues for p in self.parameters if p.randomizationBlock == 1]
-        # get cartesian combination
-        parameterBlock = itertools.product(*allValidValues)
-        # and randomly shuffle the order
-        parameterBlock = list(parameterBlock)
-        random.shuffle(parameterBlock)
-        # return the block
-        return (paramNames, parameterBlock)
 
     def addParameter(self, param):
         '''
@@ -396,7 +379,7 @@ class pglParameter:
 
         # update trial number
         self.currentTrial += 1
-        
+
         return dict(zip(self.parameterNames, self.parameterBlock[self.currentTrial%self.blockLen]))
     
     def getParameterBlock(self):
@@ -420,8 +403,10 @@ class pglParameter:
             random.shuffle(parameterBlock)
         else:
             paramNames = [self.name]
-            # just shuffle this parameter
-            parameterBlock = self.validValues.copy()
+            # turn the list into a list of tuples to be 
+            # compatible with tuples of parameters
+            # from above and then shuffle
+            parameterBlock = [(v,) for v in self.validValues]
             random.shuffle(parameterBlock)
         
         # return the block
