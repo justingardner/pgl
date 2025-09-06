@@ -50,8 +50,8 @@ class pglExperiment:
         '''
         
         # open screen
-        #self.pgl.open(1,800,600)
-        self.pgl.open()
+        self.pgl.open(1,800,600)
+        #self.pgl.open()
         self.pgl.visualAngle(57,40,30)
         
         # add keyboard device
@@ -64,6 +64,9 @@ class pglExperiment:
 
         # wait half a second for metal app to initialize
         self.pgl.waitSecs(0.5)
+        
+        self.pgl.flush()
+        self.pgl.flush()
 
     def endScreen(self):
         '''
@@ -236,46 +239,21 @@ class pglTask:
         self.trialStartTime = startTime
         self.segmentStartTime = startTime
         
-        # reset blockNum, 
-        self.blockNum = -1
-        # set blockLen just to trigger startBlock in startTrial
-        self.blockLen = 1
-
         # start trial
         self.currentTrial = -1
         self.startTrial(startTime)
-
-    def startBlock(self, startTime):
-        '''
-        Start a block.
-        '''
-        # get randomization of parameters
-        (self.parameterNames, self.parameterBlock) = self.getParameterBlock()
-        
-        # set variables
-        self.blockNum += 1
-        self.blockStartTime = startTime
-        self.blockLen = len(self.parameterBlock)
-        
-        # display block information
-        print(f"({self.name}) Block {self.blockNum+1}: {self.blockLen} trials randomized over: {self.parameterNames}")
-
 
     def startTrial(self, startTime):
         '''
         Start a trial.
         '''
-        # check if we are at the end of a block
-        if (self.currentTrial%self.blockLen) == self.blockLen-1:
-            self.startBlock(startTime)
-
         # update values
         self.currentTrial += 1
         self.trialStartTime = startTime
         self.currentSegment = 0
 
-        # make a dictionary of the current parameters. 
-        self.currentParams = dict(zip(self.parameterNames, self.parameterBlock[self.currentTrial%self.blockLen]))
+        # get current parameters
+        self.currentParams = self.parameters[0].get() if self.parameters else {}
 
         # print trial
         print(f"({self.name}) Trial {self.currentTrial+1}: ", end='')
@@ -357,18 +335,13 @@ class pglParameter:
     '''
     Class representing a parameter in the experiment.
     '''
-    def __init__(self, name: str, validValues: list|tuple|np.ndarray, randomizationBlock: int=1, helpStr: str=""):
+    def __init__(self, name: str, validValues: list|tuple|np.ndarray, helpStr: str=""):
         '''
         Initialize the parameter.
         
         Args:
             name (str): The name of the parameter.
-            validValues (list, optional): A list of valid values for the parameter. If None, any value is valid.
-            randomizationBlock (int, optional): Sets the block of parameters which get randomized together, so
-              if this is 1, then all other parameters with the same randomizationBlock will be randomized
-              together, meaning that all combinations of these parameters will be generated a block randomization
-              will randomize over all combinations. Typically this is 1 for variables that you want to randomize
-              over and 0 for values that you do not want to randomize over
+            validValues (list, optional): A list of valid values for the parameter. 
             helpStr (str, optional): Help string describing the parameter.
         '''
         # validate name
@@ -379,18 +352,26 @@ class pglParameter:
         # check if it is a list of values
         if not isinstance(validValues, (list, tuple, np.ndarray)):
             raise TypeError("(pglParameter) ❌ Error: validValues must be a list, tuple, or ndarray.")
-        self.validValues = validValues
-
-        # validate randomizationBlock
-        if not isinstance(randomizationBlock, int):
-            raise TypeError("(pglParameter) ❌ Error: randomizationBlock must be an int.")
-            return
-        self.randomizationBlock = randomizationBlock
-
+        self.validValues = list(validValues)
+        
+        # check if validValues is composed of pglParameters. If so,
+        # then make sure that all values in validValues are pglParameters
+        self.listOfParameters = False
+        if any(isinstance(v, pglParameter) for v in validValues):
+            if all(isinstance(v, pglParameter) for v in validValues):
+                self.listOfParameters = True
+            else:
+                raise TypeError("(pglParameter) ❌ Error: validValues must be a list of pglParameters.")
+                   
         # validate helpStr
         if not isinstance(helpStr, str):
             raise TypeError("(pglParameter) ❌ Error: helpStr must be a string.")
         self.helpStr = helpStr
+        
+        # set to trigger a new block for first trial
+        self.currentTrial = -1
+        self.blockNum = -1
+        self.blockLen = 1
 
     def __repr__(self):
         return f"pglParameter(name={self.name}, validValues={self.validValues}, randomizationBlock={self.randomizationBlock}, helpStr={self.helpStr})"
@@ -404,3 +385,59 @@ class pglParameter:
         
         # display full string
         return f"{helpStr}{self.name}: {self.validValues} (randomizationBlock={self.randomizationBlock})"
+
+    def get(self):
+        '''
+        Get the current value of the parameter.
+        '''
+        # check if we are at the end of a block
+        if (self.currentTrial%self.blockLen) == self.blockLen-1:
+            self.startBlock()
+
+        # update trial number
+        self.currentTrial += 1
+        
+        return dict(zip(self.parameterNames, self.parameterBlock[self.currentTrial%self.blockLen]))
+    
+    def getParameterBlock(self):
+        '''
+        Get a set of parameters to run over, if the is one parameter, it will
+        produce a random ordering of that parameter, but if validValues is a list
+        of parameters, then it will create a block over all of the parameters in the
+        list, for example if you have direction and coherence parameters, this would
+        calculate all combination of those parameters and return them for the task
+        to run as a block of trials.
+        '''
+        if self.listOfParameters:
+            # if validValues is a list of pglParameters, then we need to get the
+            # parameter names and valid values from each parameter in the list
+            paramNames = [p.name for p in self.validValues]
+            allValidValues = [p.validValues for p in self.validValues]
+            # get cartesian combination
+            parameterBlock = itertools.product(*allValidValues)
+            # and randomly shuffle the order
+            parameterBlock = list(parameterBlock)
+            random.shuffle(parameterBlock)
+        else:
+            paramNames = [self.name]
+            # just shuffle this parameter
+            parameterBlock = self.validValues.copy()
+            random.shuffle(parameterBlock)
+        
+        # return the block
+        return (paramNames, parameterBlock)
+
+    def startBlock(self):
+        '''
+        Start a block.
+        '''
+        # get randomization of parameters
+        (self.parameterNames, self.parameterBlock) = self.getParameterBlock()
+        
+        # set variables
+        self.blockNum += 1
+        self.blockLen = len(self.parameterBlock)
+        
+        # display block information
+        print(f"({self.name}) Block {self.blockNum+1}: {self.blockLen} randomized over: {self.parameterNames}")
+
