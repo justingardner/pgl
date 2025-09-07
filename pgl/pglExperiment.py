@@ -50,7 +50,7 @@ class pglExperiment:
         '''
         
         # open screen
-        self.pgl.open(1,800,600)
+        self.pgl.open(0,800,600)
         #self.pgl.open()
         self.pgl.visualAngle(57,40,30)
         
@@ -334,15 +334,6 @@ class pglParameter:
             raise TypeError("(pglParameter) ❌ Error: validValues must be a list, tuple, or ndarray.")
         self.validValues = list(validValues)
         
-        # check if validValues is composed of pglParameters. If so,
-        # then make sure that all values in validValues are pglParameters
-        self.listOfParameters = False
-        if any(isinstance(v, pglParameter) for v in validValues):
-            if all(isinstance(v, pglParameter) for v in validValues):
-                self.listOfParameters = True
-            else:
-                raise TypeError("(pglParameter) ❌ Error: validValues must be a list of pglParameters.")
-                   
         # validate helpStr
         if not isinstance(helpStr, str):
             raise TypeError("(pglParameter) ❌ Error: helpStr must be a string.")
@@ -381,30 +372,15 @@ class pglParameter:
     
     def getParameterBlock(self):
         '''
-        Get a set of parameters to run over, if the is one parameter, it will
-        produce a random ordering of that parameter, but if validValues is a list
-        of parameters, then it will create a block over all of the parameters in the
-        list, for example if you have direction and coherence parameters, this would
-        calculate all combination of those parameters and return them for the task
-        to run as a block of trials.
+        Get a set of parameters to run over, will
+        produce a random ordering of that parameter
         '''
-        if self.listOfParameters:
-            # if validValues is a list of pglParameters, then we need to get the
-            # parameter names and valid values from each parameter in the list
-            paramNames = [p.name for p in self.validValues]
-            allValidValues = [p.validValues for p in self.validValues]
-            # get cartesian combination
-            parameterBlock = itertools.product(*allValidValues)
-            # and randomly shuffle the order
-            parameterBlock = list(parameterBlock)
-            random.shuffle(parameterBlock)
-        else:
-            paramNames = [self.name]
-            # turn the list into a list of tuples to be 
-            # compatible with tuples of parameters
-            # from above and then shuffle
-            parameterBlock = [(v,) for v in self.validValues]
-            random.shuffle(parameterBlock)
+        paramNames = [self.name]
+        # turn the list into a list of tuples to be 
+        # compatible with tuples of parameters
+        # from above and then shuffle
+        parameterBlock = [(v,) for v in self.validValues]
+        random.shuffle(parameterBlock)
         
         # return the block
         return (paramNames, parameterBlock)
@@ -420,6 +396,70 @@ class pglParameter:
         self.blockNum += 1
         self.blockLen = len(self.parameterBlock)
         
-        # display block information
-        print(f"({self.name}) Block {self.blockNum+1}: {self.blockLen} randomized over: {self.parameterNames}")
+        # display block information        
+        print(f"Block {self.blockNum+1}: {self.blockLen} randomized over: {self.parameterNames}")
 
+#############
+# Parameter class
+#############
+class pglParameterBlock(pglParameter):
+    '''
+    Class representing a block of parameters in the experiment.
+    This is a subclass of pglParameter which allows you to group
+    multiple parameters together into a single block.
+    '''
+    def __init__(self, parameters: list, helpStr: str=""):
+        '''
+        Initialize the parameter block.
+        
+        Args:
+            name (str): The name of the parameter block.
+            parameters (list): A list of pglParameter instances to include in the block.
+            helpStr (str, optional): Help string describing the parameter block.
+        '''
+        # validate parameters
+        if not isinstance(parameters, list) or not all(isinstance(p, pglParameter) for p in parameters):
+            raise TypeError("(pglParameterBlock) ❌ Error: parameters must be a list of pglParameter instances.")
+        self.parameters = parameters
+        
+        # validate helpStr
+        if not isinstance(helpStr, str):
+            raise TypeError("(pglParameterBlock) ❌ Error: helpStr must be a string.")
+        self.helpStr = helpStr
+        
+        # set to trigger a new block for first trial
+        self.currentTrial = -1
+        self.blockNum = -1
+        self.blockLen = 1
+
+        # parameter names and valid values from each parameter in the list
+        self.paramNames = [p.name for p in self.parameters]
+        allParameterValues = [p.validValues for p in self.parameters]
+        # get cartesian combination
+        self.allParameterValues = list(itertools.product(*allParameterValues))
+        self.name = ""
+
+    def __repr__(self):
+        return f"pglParameterBlock(parameters={self.parameters}, helpStr={self.helpStr})"
+
+    def __str__(self):
+        # display help string
+        if self.helpStr == "":
+            helpStr = ""
+        else:
+            helpStr = f"# {self.helpStr} #\n"
+        
+        # display full string
+        paramStrs = [str(p) for p in self.parameters]
+        paramStr = "\n".join(paramStrs)
+        return f"{helpStr}:\n{paramStr}"
+
+    def getParameterBlock(self):
+        '''
+        This  will create a block over all of the parameters in the
+        list, for example if you have direction and coherence parameters, this would
+        calculate all combination of those parameters and return them for the task
+        to run as a block of trials.
+        '''
+        random.shuffle(self.allParameterValues)
+        return (self.paramNames, self.allParameterValues)
