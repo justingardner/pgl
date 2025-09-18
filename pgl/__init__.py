@@ -11,7 +11,9 @@ from .pglDevice import pglDevice, pglDevices, pglKeyboard, pglEventKeyboard
 from .pglEvent import pglEvent, pglEvents
 from .pglCommandReplayer import pglCommandReplayer
 from .pglFrameGrab import pglFrameGrab
-from .pglExperiment import pglExperiment, pglTask, pglParameter, pglParameterBlock
+from .pglExperiment import pglExperiment, pglTask
+from .pglParameter import pglParameter, pglParameterBlock
+from .pglStaircase import pglStaircase
 
 # Device specific imports (eye trackers, etc.)
 from .pglVPixx import pglProPixx, pglDataPixx
