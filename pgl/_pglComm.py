@@ -6,6 +6,8 @@
 import sys, time, struct, subprocess, os, re
 from socket import socket, AF_UNIX, SOCK_STREAM
 import numpy as np
+import time
+
 
 class _pglComm:
     # init variables
@@ -325,3 +327,170 @@ class _pglComm:
         return None
     
    
+class pglSerial:
+    '''
+    Class representing a serial communication interface.    
+    '''
+    def __init__(self, port=None, baudrate=9600, dataLen=8, parity='n', stopBits=1, timeout=1):
+        '''
+        Initialize the serial communication interface.
+        Args:
+            port (str, optional): The serial port to connect to. If None, will prompt user to select a port.
+            baudrate (int, optional): The baud rate for the serial communication. Default is 9600.
+            dataLen (int, optional): The number of data bits. Default is 8.
+            parity (str, optional): The parity bit ('e','o','n'). Default is 'n' (none).
+            stopBits (int, optional): The number of stop bits. Default is 1.
+            timeout (float, optional): The read timeout in seconds. Default is 1 second.
+        '''
+        try:
+            import serial
+        except ImportError:
+            print("(pglSerialComm) ❌ Error: pyserial library is not installed. Please install it to use serial communication.")
+            self.serial = None
+            return
+
+       # parse arguments
+        parityMap = {
+              'e': serial.PARITY_EVEN,
+              'o': serial.PARITY_ODD,
+              'n': serial.PARITY_NONE}
+        parity = parityMap.get(parity.lower(), serial.PARITY_NONE)
+        
+        # get the dataLen
+        dataLenMap = {
+            5: serial.FIVEBITS,
+            6: serial.SIXBITS,
+            7: serial.SEVENBITS,
+            8: serial.EIGHTBITS}    
+        dataLen = dataLenMap.get(dataLen, serial.EIGHTBITS)
+        
+        # get the stopBits
+        stopBitsMap = {
+            1: serial.STOPBITS_ONE,
+            1.5: serial.STOPBITS_ONE_POINT_FIVE,
+            2: serial.STOPBITS_TWO}
+        stopBits = stopBitsMap.get(stopBits, serial.STOPBITS_ONE)
+        
+        # get port if not provided
+        if port is None:
+            
+            # get a list of ports
+            import serial.tools.list_ports
+            ports = list(serial.tools.list_ports.comports())
+            
+            # if there are no ports, then return displaying error
+            if len(ports) == 0:
+                print("(pglSerialComm) ❌ No serial ports found.")
+                self.serial = None
+                return
+            else:
+                # display info about each port
+                for iPort, port in enumerate(ports):
+                    print(f"(pglSerialComm) {iPort}: {port.device} - {port.description}")
+                
+                # ask user to select port
+                print(f"(pglSerialComm) Select port [0-{len(ports)-1}]: ")
+                
+                # wait for user to select port
+                portIndex = int(input(""))
+                if portIndex < 0 or portIndex >= len(ports):
+                    print("(pglSerialComm) ❌ Invalid port index.")
+                    self.serial = None
+                    return
+                
+                # port has been selected
+                port = ports[portIndex].device
+        try:
+            # open port
+            self.serial = serial.Serial(port, baudrate, timeout=timeout, bytesize=dataLen, parity=parity, stopbits=stopBits)
+            print(f"(pglSerialComm) Connected to serial port: {port} at {baudrate} baud.")
+        
+        except Exception as e:
+            # check for error on opening port
+            print(f"(pglSerialComm) ❌ Error connecting to serial port {port}: {e}")
+            self.serial = None
+    
+    def write(self, data):
+        '''
+        Write data to the serial port.
+        '''
+        if self.serial is None:
+            print("(pglSerialComm) ❌ Serial port not initialized.")
+            return
+        try:
+            # flush anything in the input buffer
+            self.flush()
+            # convert string data to bytes
+            if isinstance(data, str):
+                data = data.encode('utf-8')
+            # write data
+            self.serial.write(data)
+            
+        except Exception as e:
+            print(f"(pglSerialComm) ❌ Error writing to serial port: {e}")
+    
+    def read(self, timeout=10.0):
+        """
+        Read all available data from the serial port, waiting up to `timeout` seconds
+        for a response.
+        """
+        if self.serial is None:
+            print("(pglSerialComm) ❌ Serial port not initialized.")
+            return None
+
+        start_time = time.time()
+        received_data = bytearray()
+
+        try:
+            while True:
+                # Check how many bytes are waiting
+                bytes_waiting = self.serial.in_waiting
+                if bytes_waiting:
+                    # Read all available bytes
+                    received_data += self.serial.read(bytes_waiting)
+                    time.sleep(0.1)  # Short delay to allow more data to arrive
+            
+                # Break if we have received some data and no new bytes arrived
+                if received_data and self.serial.in_waiting == 0:
+                    break
+
+                # Break if timeout expired
+                if (time.time() - start_time) > timeout:
+                    break
+
+                # wait before checking again
+                time.sleep(0.2)
+
+            if received_data:
+                return bytes(received_data)  # return as immutable bytes
+            else:
+                print("(pglSerialComm) ❌ No data received before timeout.")
+                return None
+
+        except Exception as e:
+            print(f"(pglSerialComm) ❌ Error reading from serial port: {e}")
+            return None
+        
+    def flush(self):
+        '''
+        Flush the serial port input and output buffers.
+        '''
+        if self.serial is None:
+            print("(pglSerialComm) ❌ Serial port not initialized.")
+            return
+        try:
+            self.serial.reset_input_buffer()
+            self.serial.reset_output_buffer()
+        except Exception as e:
+            print(f"(pglSerialComm) ❌ Error flushing serial port: {e}")
+            
+    def close(self):
+        '''
+        Close the serial port.
+        '''
+        if self.serial is None:
+            return
+        try:
+            self.serial.close()
+        except Exception as e:
+            print(f"(pglSerialComm) ❌ Error closing serial port: {e}") 

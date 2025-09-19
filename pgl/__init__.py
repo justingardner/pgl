@@ -14,6 +14,8 @@ from .pglFrameGrab import pglFrameGrab
 from .pglExperiment import pglExperiment, pglTask
 from .pglParameter import pglParameter, pglParameterBlock
 from .pglStaircase import pglStaircase
+from ._pglComm import pglSerial
+from .pglCalibration import pglCalibration, pglCalibrationDeviceMinolta 
 
 # Device specific imports (eye trackers, etc.)
 from .pglVPixx import pglProPixx, pglDataPixx
