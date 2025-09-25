@@ -536,6 +536,9 @@ class pglBase:
         # get python information
         self.pythonVersion = sys.version
         print(f"(pgl:checkOS) Python version: {self.pythonVersion}")
+        
+        # check keyboard
+        
         if platform.system() == "Darwin":
             
             # get version
@@ -858,3 +861,11 @@ def getGPUInfo():
         print(f"(pglBase:getGPUInfo) Warning: Parsing failed with error: {e}")
         return {}
 
+def printHeader(str="", len=80, fillChar="="):
+    '''
+    Print a header with a given string centered
+    '''
+    if str == "":
+        print(fillChar * len)
+    else:
+        print(f" {str} ".center(len, fillChar))

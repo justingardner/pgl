@@ -387,14 +387,20 @@ class pglSerial:
                 # display info about each port
                 for iPort, port in enumerate(ports):
                     print(f"(pglSerialComm) {iPort}: {port.device} - {port.description}")
+                print(f"(pglSerialComm) {len(ports)}: Cancel")
                 
                 # ask user to select port
-                print(f"(pglSerialComm) Select port [0-{len(ports)-1}]: ")
+                print(f"(pglSerialComm) Select port [0-{len(ports)}]: ")
                 
                 # wait for user to select port
                 portIndex = int(input(""))
+                # check for out of range
                 if portIndex < 0 or portIndex >= len(ports):
-                    print("(pglSerialComm) ❌ Invalid port index.")
+                    # if len(ports) then user cancelled so no error message
+                    if portIndex == len(ports):
+                        print("(pglSerialComm) Cancelled")
+                    else:
+                        print("(pglSerialComm) ❌ Invalid port index.")
                     self.serial = None
                     return
                 
@@ -494,3 +500,9 @@ class pglSerial:
             self.serial.close()
         except Exception as e:
             print(f"(pglSerialComm) ❌ Error closing serial port: {e}") 
+    
+    def isOpen(self):
+        '''
+        Check if the serial port is open.
+        '''
+        return self.serial is not None and self.serial.is_open
