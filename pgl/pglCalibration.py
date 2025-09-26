@@ -168,7 +168,8 @@ class pglCalibration():
         self.calibrationValue = []
         self.calibrationMeasurement = []        
         self.calibrationIndex = 0
-        self.fullCalibrationIndex = 0
+        self.fullCalibrationIndex = None
+        self.findMinIndex = None
         
         # start with trying to measure min and max
         self.calibrationMode = self.calibrationModes.get("minmax")
@@ -278,8 +279,6 @@ class pglCalibration():
             if nMeasurementFailures == 0:
                 # get the min value
                 self.minCalibrationVal = self.calibrationValue[-1]
-                # display the min and max value
-                printHeader(f"Starting Full Calibration between {self.minCalibrationVal} and {self.maxCalibrationVal}")
                 # and set our mode to full calibration
                 self.calibrationMode = self.calibrationModes.get("full")
                 return self.getFullCalibrationValue()
@@ -294,40 +293,51 @@ class pglCalibration():
 
     def getFindMinCalibrationValue(self):
         '''
-        Get the next calibration value to try to find a measurable min value
+        Returns values that do a bisection search to find the minimum
+        measurable value
         '''
+        
         # if we have no measurements yet, start at 0.5
-        if self.calibrationIndex == 0:
-            self.calibrationValue.append(0.5)
+        if self.findMinIndex is None:
+            # remember where we started the min search
+            self.findMinIndex = self.calibrationIndex
+            # set the interval to search between
+            self.findMinUnmeasurableVal = 0.0
+            self.findMinMeasurableVal = self.maxCalibrationVal
         else:
             # see if the last measurement was valid
             if self.calibrationMeasurement[-1] is not None:
-                # if it was valid, then we can try a lower value
-                newVal = self.calibrationValue[-1] / 2.0
-                if newVal < self.epsilon:
-                    print("(pglCalibration) Minimum measurable value found.")
-                    self.minCalibrationVal = np.median([x for x in self.calibrationMeasurement if x is not None])
-                    self.calibrationMode = self.calibrationModes.get("full")
-                    return self.getFullCalibrationValue()
-                self.calibrationValue.append(newVal)
+                if self.calibrationValue[-1] < self.findMinMeasurableVal:
+                    self.findMinMeasurableVal = self.calibrationValue[-1]
             else:
-                # if it was not valid, then we need to try a higher value
-                newVal = self.calibrationValue[-1] + (self.maxCalibrationVal - self.calibrationValue[-1]) / 2.0
-                if newVal > self.maxCalibrationVal-self.epsilon:
-                    print("(pglCalibration) Could not find a minimum measurable value.")
-                    self.minCalibrationVal = None
-                    self.calibrationMode = self.calibrationModes.get("done")
-                    return -1
-                self.calibrationValue.append(newVal)
+                # Unmeasurable, so replace unmeasurable value
+                if self.calibrationValue[-1] > self.findMinUnmeasurableVal:
+                    self.findMinUnmeasurableVal = self.calibrationValue[-1]
+            # if we are within epsilon of the unmeasurable value, then accept
+            if (self.findMinMeasurableVal-self.findMinUnmeasurableVal) < self.epsilon:
+                print(f"(pglCalibration) Minimum measurable value found: {self.findMinMeasurableVal}")
+                self.minCalibrationVal = self.findMinMeasurableVal
+                self.calibrationMode = self.calibrationModes.get("full")
+                return self.getFullCalibrationValue()
+        # Check the halfway point between the current unmesurable and measurable
+        newVal = self.findMinUnmeasurableVal + (self.findMinMeasurableVal - self.findMinUnmeasurableVal) / 2.0
+        self.calibrationValue.append(newVal)
         
         return self.calibrationValue[-1]
     def getFullCalibrationValue(self):
         '''
         Get the next calibration value for a full calibration
         '''
-        if (self.fullCalibrationIndex % self.nRepeats) == 0:
+
+        # starting fullcalibration
+        if self.fullCalibrationIndex is None:
+            self.fullCalibrationIndex = self.calibrationIndex
+            # display the min and max value
+            printHeader(f"Starting Full Calibration between {self.minCalibrationVal} and {self.maxCalibrationVal}")
+
+        if ((self.calibrationIndex-self.fullCalibrationIndex) % self.nRepeats) == 0:
             # set the next value to measure
-            step = self.fullCalibrationIndex // self.nRepeats
+            step = (self.calibrationIndex-self.fullCalibrationIndex) // self.nRepeats
             if step == self.nSteps:
                 printHeader("Full calibration complete.")
                 self.calibrationMode = self.calibrationModes.get("done")
@@ -339,7 +349,6 @@ class pglCalibration():
             # repeat last value
             self.calibrationValue.append(self.calibrationValue[-1])
 
-        self.fullCalibrationIndex += 1
         return self.calibrationValue[-1]
 
     def setDisplay(self):
@@ -365,6 +374,7 @@ class pglCalibration():
 
         # make measurement
         self.calibrationMeasurement.append(self.device.measure())
+        
         # increment index
         self.calibrationIndex += 1
         return self.calibrationMeasurement[-1]
