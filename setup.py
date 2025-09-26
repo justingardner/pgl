@@ -11,6 +11,17 @@ displayInfoExtension = Extension(
     ]
 )
 
+gammaTableExtension = Extension(
+    'pgl._pglGammaTable',
+    sources=['pgl/_pglGammaTable.m'],
+    extra_compile_args=['-ObjC'],
+    extra_link_args=[
+        '-framework', 'CoreGraphics',
+        '-framework', 'Cocoa',
+        '-framework', 'CoreFoundation'
+    ]
+)
+
 setup(
     name='pgl',  
     version='0.1.0',
@@ -20,5 +31,5 @@ setup(
     author_email='justin@justingardner.net',
     license='MIT',
     python_requires='>=3.9',
-    ext_modules=[displayInfoExtension]
+    ext_modules=[displayInfoExtension,gammaTableExtension]
 )
