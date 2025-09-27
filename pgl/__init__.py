@@ -16,6 +16,7 @@ from .pglParameter import pglParameter, pglParameterBlock
 from .pglStaircase import pglStaircase
 from ._pglComm import pglSerial
 from .pglCalibration import pglCalibration, pglCalibrationDeviceMinolta 
+from .pglGammaTable import pglGammaTable 
 
 # Device specific imports (eye trackers, etc.)
 from .pglVPixx import pglProPixx, pglDataPixx
@@ -23,7 +24,7 @@ from .pglEyeTracker import pglEyeTracker
 from .pglTrackPixx import pglTrackPixx3
 from .pglEyelink import pglEyelinkCustomDisplay, pglEyelink
 
-class pgl(pglBase, pglResolution, pglDraw, pglTransform, pglProfile, pglBatch, pglImage, pglStimuli, pglTimestamp, pglDevices, pglEvents, pglCommandReplayer, pglFrameGrab):
+class pgl(pglBase, pglResolution, pglDraw, pglTransform, pglProfile, pglBatch, pglImage, pglStimuli, pglTimestamp, pglDevices, pglEvents, pglCommandReplayer, pglFrameGrab, pglGammaTable):
     """
     purpose: psychophysics and experiment library for Python.
     License: MIT License — see LICENSE file for details.

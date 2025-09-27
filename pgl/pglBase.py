@@ -747,6 +747,39 @@ class pglBase:
             return latestBuildPath
         else:
             return stableAppPath
+        
+    #################################################################
+    # validate which screen
+    #################################################################
+    def validateWhichScreen(self, whichScreen = None):
+        """
+        Get the index of the screen currently being used by pgl.
+
+        This function returns the index of the display that pgl is currently using for rendering.
+        If pgl is not running, it returns 0 (the primary display).
+
+        Args:
+            None
+        """
+        # Get default for whichScreen if not provided
+        if whichScreen is None:
+            if self.isOpen():
+                # If pgl is open, use the screen on which it is running
+                windowLocation = self.getWindowFrameInDisplay()
+                whichScreen = windowLocation.get('whichScreen', 1)-1
+            else:
+                # If pgl is not open, use the primary display
+                whichScreen = 0
+
+        # Validate whichScreen
+        numDisplays, _ = self.getNumDisplaysAndDefault()
+        if whichScreen < 0 or whichScreen >= numDisplays:
+            print(f"(pgl:validateWhichScreen) Error: Invalid screen number {whichScreen}. Must be between 0 and {numDisplays-1}.")
+            return None
+        
+        return whichScreen
+
+
 
 
 ################

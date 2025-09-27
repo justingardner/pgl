@@ -59,22 +59,10 @@ class pglResolution:
                 - 1 Screen resolution, refresh rate and bit depth
                 - 2 all available modes for the display
         """
-        # Get default for whichScreen if not provided
-        if whichScreen is None:
-            if self.isOpen():
-                # If pgl is open, use the screen on which it is running
-                windowLocation = self.getWindowFrameInDisplay()
-                whichScreen = windowLocation.get('whichScreen', 1)-1
-            else:
-                # If pgl is not open, use the primary display
-                whichScreen = 0
-
         # Validate whichScreen
-        numDisplays, _ = self.getNumDisplaysAndDefault()
-        if whichScreen < 0 or whichScreen >= numDisplays:
-            print(f"(pgl:getResolution) Error: Invalid screen number {whichScreen}. Must be between 0 and {numDisplays-1}.")
-            return (-1, -1, -1, -1)
-
+        whichScreen = self.validateWhichScreen(whichScreen)
+        if (whichScreen is None): return (-1,-1,-1,-1)
+        
         # Print what we are doing
         if self.verbose > 1: print(f"(pgl:getResolution) Getting resolution for screen {whichScreen}")
 
@@ -108,6 +96,11 @@ class pglResolution:
         Date:
             July 9, 2025
         """
+        
+        # Validate whichScreen
+        whichScreen = self.validateWhichScreen(whichScreen)
+        if (whichScreen is None): return
+
         # Print what we are doing
         if self.verbose > 1: print(f"(pgl:setResolution) Setting resolution for screen {whichScreen} to {screenWidth}x{screenHeight}, refresh rate {screenRefreshRate}Hz, color depth {screenColorDepth}-bit")
 
@@ -161,5 +154,11 @@ class pglResolution:
         Returns:
             int: The refresh rate in Hz, or -1 if an error occurs.
         """
+        # Validate whichScreen
+        whichScreen = self.validateWhichScreen(whichScreen)
+        if (whichScreen is None): return None
+        
+        # call getResolution and pluck out frameRate
         (_,_,frameRate,_) = self.getResolution(whichScreen)
         return frameRate
+    
