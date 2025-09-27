@@ -1,3 +1,4 @@
+import numpy
 from setuptools import setup, find_packages, Extension
 
 displayInfoExtension = Extension(
@@ -14,6 +15,7 @@ displayInfoExtension = Extension(
 gammaTableExtension = Extension(
     'pgl._pglGammaTable',
     sources=['pgl/_pglGammaTable.m'],
+    include_dirs=[numpy.get_include()], 
     extra_compile_args=['-ObjC'],
     extra_link_args=[
         '-framework', 'CoreGraphics',
