@@ -33,19 +33,22 @@ class pglGammaTable:
         '''
         return _pglGammaTable.getGammaTable(whichScreen)
 
-    def setGammaTable(self, red, green, blue, whichScreen = None):
+    def setGammaTable(self, whichScreen, red, green, blue):
         '''
         Set the gamma table for a given screen.
 
         Args:
+            whichScreen (int): Index of the display to query (0 = primary). Must be >= 0 and less
+                than the number of active displays. If set to None, defaults to the screen on which
+                pgl is open and running or, if not running, the primary display.
             red (numpy.ndarray): Array containing the red gamma values.
             green (numpy.ndarray): Array containing the green gamma values.
             blue (numpy.ndarray): Array containing the blue gamma values.
-            whichScreen (int): Index of the display to query (0 = primary). Must be >= 0 and less
-                than the number of active displays. If ommitted, defaults to the screen on which
-                pgl is open and running or, if not running, the primary display.
         '''
-        return _pglGammaTable.setGammaTable(red, green, blue, whichScreen)
+        whichScreen = self.validateWhichScreen(whichScreen)
+        if (whichScreen is None): return
+        
+        return _pglGammaTable.setGammaTable(whichScreen, red, green, blue)
 
     def getGammaTableSize(self, whichScreen = None):
         '''
