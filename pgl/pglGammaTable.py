@@ -47,9 +47,9 @@ class pglGammaTable:
         '''
         return _pglGammaTable.setGammaTable(red, green, blue, whichScreen)
 
-    def getGammaTableBitDepth(self, whichScreen = None):
+    def getGammaTableSize(self, whichScreen = None):
         '''
-        Get the bit depth of the gamma table for a given screen.
+        Get the size of the gamma table for a given screen.
 
         Args:
             whichScreen (int): Index of the display to query (0 = primary). Must be >= 0 and less
@@ -57,6 +57,11 @@ class pglGammaTable:
                 pgl is open and running or, if not running, the primary display.
 
         Returns:
-            int: The bit depth of the gamma table.
+            int: The size of the gamma table.
         '''
-        return _pglGammaTable.getGammaTableBitDepth(whichScreen)
+        # validate whichScreen
+        whichScreen = self.validateWhichScreen(whichScreen)
+        if (whichScreen is None): return -1
+        
+        # call objective-c function
+        return _pglGammaTable.getGammaTableSize(whichScreen)
