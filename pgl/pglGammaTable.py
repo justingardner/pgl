@@ -39,7 +39,11 @@ class pglGammaTable:
         Returns:
             tuple: A tuple of three numpy arrays (red, green, blue) each containing the gamma table values.
         '''
-        return _pglGammaTable.getGammaTable(whichScreen)
+        if self._pglGammaTable is False:
+            print("(pglGammaTable) ❌ _pglGammaTable not available, cannot getGammaTable.")
+            return (None, None, None)
+        else:
+            return _pglGammaTable.getGammaTable(whichScreen)
 
     def setGammaTable(self, whichScreen, red, green, blue):
         '''
@@ -56,7 +60,11 @@ class pglGammaTable:
         whichScreen = self.validateWhichScreen(whichScreen)
         if (whichScreen is None): return
         
-        return _pglGammaTable.setGammaTable(whichScreen, red, green, blue)
+        if self._pglGammaTable is False:
+            print("(pglGammaTable) ❌ _pglGammaTable not available, cannot setGammaTable.")
+            return False
+        else:
+            return _pglGammaTable.setGammaTable(whichScreen, red, green, blue)
 
     def getGammaTableSize(self, whichScreen = None):
         '''
@@ -76,6 +84,7 @@ class pglGammaTable:
         
         # call objective-c function
         if self._pglGammaTable is False:
+            print("(pglGammaTable) ❌ _pglGammaTable not available, cannot getGammaTableSize.")
             return -1
         else:
             return _pglGammaTable.getGammaTableSize(whichScreen)
