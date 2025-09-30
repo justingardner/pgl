@@ -575,14 +575,16 @@ class pglBase:
                     gpuNumCores = gpuInfo.get("Total Number of Cores", "Unknown")
                     print(f"(pgl:checkOS) GPU: {gpuChipset} ({gpuBus}) {gpuNumCores} cores, {gpuMetalSupport} support" )
                     displays = gpuInfo.get("Displays", [])
-                    for display in displays:
+                    for iDisplay, display in enumerate(displays):
                         displayName = display.get("DisplayName", "Unnamed")
                         displayResolution = display.get("Resolution", "Unknown resolution")
                         displayType = display.get("Display Type", "Unknown type")
+                        #display gamma table size
+                        displayGammaTableSize = self.getGammaTableSize(iDisplay)
                         if display.get("Main Display", "No") == "Yes":
-                            print(f"(pgl:checkOS)   {displayName} [Main Display]: {displayResolution} ({displayType})")
+                            print(f"(pgl:checkOS)   {displayName} [Main Display]: {displayResolution} ({displayType}) GammaTable size: {displayGammaTableSize}")
                         else:
-                            print(f"(pgl:checkOS)   {displayName}: {displayResolution} ({displayType})")
+                            print(f"(pgl:checkOS)   {displayName}: {displayResolution} ({displayType}) GammaTable size: {displayGammaTableSize}")
 
             if self.verbose > 1:
                 # print detailed information
