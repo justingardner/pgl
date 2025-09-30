@@ -41,6 +41,17 @@ class pglTrackPixx3(pglEyeTracker):
             print("(pglTrackPixx3) TrackPixx3 device not detected.")
             return
         
+        # wake the device up
+        print("(pglTrackPixx3) Wake up TrackPixx3")
+
+        print(f"(pglTrackPixx3) TPxIsAwakePictureRequest: {self.dp.TPxIsAwakePictureRequest()}")
+        self.dp.DPxSetTPxAwake()
+        self.dp.DPxWriteRegCache()
+        self.dp.TPxSetAwakePictureRequest()
+        self.dp.DPxWriteRegCache()
+        print(f"(pglTrackPixx3) TPxIsAwakePictureRequest: {self.dp.TPxIsAwakePictureRequest()}")
+        
+
         # Adapted from TPxCalibrationTesting.py example code
 
         # dp.TPxShowOverlay() will activate the console tracker window to display the camera
@@ -125,7 +136,7 @@ class pglTrackPixx3(pglEyeTracker):
                 cameraImage = self.getCameraImage()
                 if cameraImage is None:
                     print("(pglTrackPixx3:calibrateEyeImage) No camera image available. Cannot display.")
-                    break
+                    loopCalibration = False
                 cameraImage.display()
 
                 # Get eye data in camera space
@@ -145,16 +156,16 @@ class pglTrackPixx3(pglEyeTracker):
 
                 # draw cross at the pupil center
                 if ppLeftMajor > 0:
-                    self.pgl.line(eyeLeft[0], eyeLeft[1]+self.pgl.yPix2Deg * ppLeftMajor/2, eyeLeft[0], eyeLeft[1]-self.pgl.yPix2Deg * ppLeftMajor/2, color=(0,1,0))
-                    self.pgl.line(eyeLeft[0]-self.pgl.xPix2Deg * ppLeftMajor/2, eyeLeft[1], eyeLeft[0]+self.pgl.xPix2Deg * ppLeftMajor/2, eyeLeft[1], color=(0,1,0))
+                    self.pgl.line(eyeLeft[0], eyeLeft[1]+self.pgl.yPix2Deg * ppLeftMajor/2, eyeLeft[0], eyeLeft[1]-self.pgl.yPix2Deg * ppLeftMajor/2, color=[0,1,0])
+                    self.pgl.line(eyeLeft[0]-self.pgl.xPix2Deg * ppLeftMajor/2, eyeLeft[1], eyeLeft[0]+self.pgl.xPix2Deg * ppLeftMajor/2, eyeLeft[1], color=[0,1,0])
                 else:
-                    self.pgl.fixationCross(1,cameraImage.displayLeft, cameraImage.displayTop, color=(1,0,0))
+                    self.pgl.fixationCross(1,cameraImage.displayLeft, cameraImage.displayTop, color=[1,0,0])
                 if ppRightMajor > 0:
-                    self.pgl.line(eyeRight[0], eyeRight[1]+self.pgl.yPix2Deg * ppRightMajor/2, eyeRight[0], eyeRight[1]-self.pgl.yPix2Deg * ppRightMajor/2, color=(0,1,1))
-                    self.pgl.line(eyeRight[0]-self.pgl.xPix2Deg * ppRightMajor/2, eyeRight[1], eyeRight[0]+self.pgl.xPix2Deg * ppRightMajor/2, eyeRight[1], color=(0,1,1))
+                    self.pgl.line(eyeRight[0], eyeRight[1]+self.pgl.yPix2Deg * ppRightMajor/2, eyeRight[0], eyeRight[1]-self.pgl.yPix2Deg * ppRightMajor/2, color=[0,1,1])
+                    self.pgl.line(eyeRight[0]-self.pgl.xPix2Deg * ppRightMajor/2, eyeRight[1], eyeRight[0]+self.pgl.xPix2Deg * ppRightMajor/2, eyeRight[1], color=[0,1,1])
                 else:
-                    self.pgl.fixationCross(1,cameraImage.displayRight, cameraImage.displayTop, color=(1,0,0))
-                
+                    self.pgl.fixationCross(1,cameraImage.displayRight, cameraImage.displayTop, color=[1,0,0])
+
                 # flush screen
                 self.pgl.flush()
 
