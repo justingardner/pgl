@@ -9,12 +9,20 @@
 #############
 # Import modules
 #############
-from . import _pglGammaTable
+
 
 #############
 # Main class
 #############
 class pglGammaTable:
+    def __init__(self):
+        # check for _pglGammaTable
+        try:
+            from . import _pglGammaTable
+            self._pglGammaTable = True
+        except ImportError as e:
+            self._pglGammaTable = False
+            print("(pglGammaTable) ❌ Could not import _pglGammaTable: You may need to compile by going to pgl in terminal and running 'make force'")
     '''
     pglGammaTable class wrapper class for getting and setting
     gamma table on macOS using cocoa calls in _pglGammaTable
@@ -67,4 +75,7 @@ class pglGammaTable:
         if (whichScreen is None): return -1
         
         # call objective-c function
-        return _pglGammaTable.getGammaTableSize(whichScreen)
+        if self._pglGammaTable is False:
+            return -1
+        else:
+            return _pglGammaTable.getGammaTableSize(whichScreen)

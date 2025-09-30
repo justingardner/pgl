@@ -22,7 +22,11 @@ from .pglGammaTable import pglGammaTable
 from .pglVPixx import pglProPixx, pglDataPixx
 from .pglEyeTracker import pglEyeTracker
 from .pglTrackPixx import pglTrackPixx3
-from .pglEyelink import pglEyelinkCustomDisplay, pglEyelink
+try:
+    import pylink
+    from .pglEyelink import pglEyelinkCustomDisplay, pglEyelink
+except ImportError:
+    print("(pgl) Warning: pylink not found, pglEyelink class will not be available.")
 
 class pgl(pglBase, pglResolution, pglDraw, pglTransform, pglProfile, pglBatch, pglImage, pglStimuli, pglTimestamp, pglDevices, pglEvents, pglCommandReplayer, pglFrameGrab, pglGammaTable):
     """
@@ -33,6 +37,7 @@ class pgl(pglBase, pglResolution, pglDraw, pglTransform, pglProfile, pglBatch, p
     """
     def __init__(self, *args, **kwargs):
       # Explicitly initialize each parent class
+      pglGammaTable.__init__(self, *args, **kwargs)
       pglBase.__init__(self, *args, **kwargs)
       pglResolution.__init__(self, *args, **kwargs)
       pglDraw.__init__(self, *args, **kwargs)

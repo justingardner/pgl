@@ -51,11 +51,10 @@ class pglDataPixx(pglDevice):
             self.device = None
             return  
         
-        # buttonCodes, FIX, FIX, FIX: The right button pad seems to be wonky and not returning any codes at this time, so
-        # needs to be added when the hardware is fixed.
-        self.buttonCodes = {65281:'red left', 65282:'yellow left', 65284:'green left', 65288:'blue left', 65296:'white left',
-                            65312:'red right', 65344:'yellow right', 65408:'green right',
-                            65280:'button release'}
+        # button codes (hardcoded, note that these maybe different for different responsePixx devices)
+        self.buttonCodes = {64528:'white left', 64513:'red left', 64514:'yellow left', 64516:'green left', 64520:'blue left', 
+                            65024:'white right', 64544:'red right', 64576:'yellow right', 64640:'green right', 64768:'blue right',
+                            64512:'button release'}
 
         
         # run status to get status
@@ -144,6 +143,7 @@ class pglDataPixx(pglDevice):
         self.device.din.startDinLog()
         self.device.updateRegisterCache()
         self.device.din.getDinLogStatus(self.deviceLog)
+        self.device.updateRegisterCache()
         newEvents = self.deviceLog["newLogFrames"]
         
         if newEvents > 0:
