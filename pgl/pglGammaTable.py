@@ -19,9 +19,9 @@ class pglGammaTable:
         # check for _pglGammaTable
         try:
             from . import _pglGammaTable
-            self._pglGammaTable = True
+            self._pglGammaTable = _pglGammaTable
         except ImportError as e:
-            self._pglGammaTable = False
+            self._pglGammaTable = None
             print("(pglGammaTable) ❌ Could not import _pglGammaTable: You may need to compile by going to pgl in terminal and running 'make force'")
     '''
     pglGammaTable class wrapper class for getting and setting
@@ -39,11 +39,11 @@ class pglGammaTable:
         Returns:
             tuple: A tuple of three numpy arrays (red, green, blue) each containing the gamma table values.
         '''
-        if self._pglGammaTable is False:
+        if self._pglGammaTable is None:
             print("(pglGammaTable) ❌ _pglGammaTable not available, cannot getGammaTable.")
             return (None, None, None)
         else:
-            return _pglGammaTable.getGammaTable(whichScreen)
+            return self._pglGammaTable.getGammaTable(whichScreen)
 
     def setGammaTable(self, whichScreen, red, green, blue):
         '''
@@ -59,12 +59,12 @@ class pglGammaTable:
         '''
         whichScreen = self.validateWhichScreen(whichScreen)
         if (whichScreen is None): return
-        
-        if self._pglGammaTable is False:
+
+        if self._pglGammaTable is None:
             print("(pglGammaTable) ❌ _pglGammaTable not available, cannot setGammaTable.")
             return False
         else:
-            return _pglGammaTable.setGammaTable(whichScreen, red, green, blue)
+            return self._pglGammaTable.setGammaTable(whichScreen, red, green, blue)
 
     def getGammaTableSize(self, whichScreen = None):
         '''
@@ -83,8 +83,8 @@ class pglGammaTable:
         if (whichScreen is None): return -1
         
         # call objective-c function
-        if self._pglGammaTable is False:
+        if self._pglGammaTable is None:
             print("(pglGammaTable) ❌ _pglGammaTable not available, cannot getGammaTableSize.")
             return -1
         else:
-            return _pglGammaTable.getGammaTableSize(whichScreen)
+            return self._pglGammaTable.getGammaTableSize(whichScreen)
