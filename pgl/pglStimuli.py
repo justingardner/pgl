@@ -338,6 +338,26 @@ class pglStimuli:
         return barStimulus
 
     ####################################################
+    # movie
+    ####################################################
+    def movie(self, filename, loop=False):
+        '''
+        Create a movie stimulus. 
+
+        Args:
+            filename (str): The file name of the movie file
+            loop (bool): Whether the movie should loop
+        '''
+        # Validate inputs
+        if not isinstance(filename, str):
+            print("(pgl:pglStimuli:movie) ❌ filename must be a string.")
+            return None
+
+        # Create the movie stimulus
+        movieStimulus = pglStimulusMovie(self, filename=filename, loop=loop)
+        return movieStimulus
+
+    ####################################################
     # radialCheckerboard
     ####################################################
     def radialCheckerboard(self, pgl, x=0, y=0, radialWidth=360, theta=0, outerRadius=None, innerRadius=None, checkRadialWidth=15.0, checkRadialLength=1.0, temporalFrequency=1.0, temporalSquareWave=True, color=None, type='flickering'):
@@ -977,3 +997,43 @@ class pglStimulusBar(_pglStimulus):
         self.pgl.setTransformRotation(self.passDir)
 
 
+################################################################
+# Movie stimulus class
+################################################################
+class pglStimulusMovie(_pglStimulus):
+    '''
+    Base class for movie stimuli.
+    '''
+    def __init__(self, pgl, filename, loop=False):
+        '''
+        Initialize the movie stimulus with a movie instance.
+
+        Args:
+        '''
+        super().__init__(pgl)
+        self.pgl = pgl
+        self.filename = filename
+        self.loop = loop
+
+        # make sure that a screen is open
+        if self.pgl.isOpen() is False: 
+            print(f"(pglStimulusMovie) ❌ No screen is open")
+            return False
+        self.pgl.s.writeCommand("mglMovie")
+        self.pgl.commandResults = self.pgl.s.readCommandResults()
+        print(self.pgl.commandResults)
+
+
+    def __repr__(self):
+        return f"<pglStimulusMovie: {self.filename}>"
+
+    def display(self):
+        '''
+        Display the Movie.
+        '''
+        
+    def print(self):
+        '''
+        Print information about the stimulus.
+        '''
+        print(self.__repr__())
