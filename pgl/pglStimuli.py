@@ -1061,6 +1061,15 @@ class pglStimulusMovie(_pglStimulus):
         print(f"(pglStimulusMovie) Sending {nVertices} vertices to PGL")
         self.pgl.s.write(np.uint32(nVertices))
         self.pgl.s.write(vertices)
+        
+        result = self.pgl.s.read(np.float64)
+        if (result < 0): 
+            print("(pglStimulusMovie:init) Error creating movie")
+            return None
+        movieNum = self.pgl.s.read(np.uint32)
+        nMovies = self.pgl.s.read(np.uint32)
+        
+        print(f"(pglStimulusMovie:init) Created movie {movieNum} ({nMovies} total movies)")
         self.commandResults = self.pgl.s.readCommandResults(ackTime)
         print(self.pgl.commandResults)
 
