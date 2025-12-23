@@ -1019,8 +1019,49 @@ class pglStimulusMovie(_pglStimulus):
         if self.pgl.isOpen() is False: 
             print(f"(pglStimulusMovie) ❌ No screen is open")
             return False
+        
+        # for debugging, fix, fix, fix
+        x = 0
+        y = 0
+        xAlign = 0
+        yAlign = 0
+        width = self.pgl.screenWidth.deg
+        height = self.pgl.screenHeight.deg  
+        
+        # vertex coordinates in device coordinates
+        displayLeft = x - (xAlign + 1) / 2 * width
+        displayRight = displayLeft + width
+        displayTop = y + (yAlign + 1) / 2 * height
+        displayBottom = displayTop - height
+
+        # no z coordinate
+        z = 0
+
+        # texture coordinates which map to vertex coordinates
+        texRight = 1
+        texLeft = 0
+        texTop = 0
+        texBottom = 1
+        
+        # create the two triangles which map the texture (ie image)
+        # to vertices in device coordinates
+        vertices = np.array([
+            [displayRight, displayTop, z, texRight, texTop],
+            [displayLeft, displayTop, z, texLeft, texTop],
+            [displayLeft, displayBottom, z, texLeft, texBottom],
+
+            [displayRight, displayTop, z, texRight, texTop],
+            [displayLeft, displayBottom, z, texLeft, texBottom],
+            [displayRight, displayBottom, z, texRight, texBottom]
+        ], dtype=np.float32) 
+        nVertices = np.float32(vertices.shape[0])
+
         self.pgl.s.writeCommand("mglMovie")
-        self.pgl.commandResults = self.pgl.s.readCommandResults()
+        ackTime = self.pgl.s.readAck()
+        print(f"(pglStimulusMovie) Sending {nVertices} vertices to PGL")
+        self.pgl.s.write(np.uint32(nVertices))
+        self.pgl.s.write(vertices)
+        self.commandResults = self.pgl.s.readCommandResults(ackTime)
         print(self.pgl.commandResults)
 
 
