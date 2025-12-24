@@ -211,8 +211,8 @@ class pglBase:
         # print how you can get error log
         print("(pgl:open) mglMetal error log can be viewed in MacOS Console app by searching for PROCESS mglMetal or in a terminal with:")
         print("log stream --level info --process mglMetal")
-        print("(pgl:open) To search for something specifc, e.g. messages from mglMovieCommand:")        
-        print("log stream --predicate 'eventMessage CONTAINS \"mglMovieCommand\"' --style syslog --level info")
+        print("(pgl:open) To search for something specifc, e.g. messages from mglMovie:")        
+        print("log stream --predicate 'eventMessage CONTAINS \"mglMovie\"' --style syslog --level info")
         self.printHeader()
         # success
         return True

@@ -340,13 +340,12 @@ class pglStimuli:
     ####################################################
     # movie
     ####################################################
-    def movie(self, filename, loop=False):
+    def movie(self, filename):
         '''
         Create a movie stimulus. 
 
         Args:
             filename (str): The file name of the movie file
-            loop (bool): Whether the movie should loop
         '''
         # Validate inputs
         if not isinstance(filename, str):
@@ -354,7 +353,7 @@ class pglStimuli:
             return None
 
         # Create the movie stimulus
-        movieStimulus = pglStimulusMovie(self, filename=filename, loop=loop)
+        movieStimulus = pglStimulusMovie(self, filename=filename)
         return movieStimulus
 
     ####################################################
@@ -1001,10 +1000,11 @@ class pglStimulusBar(_pglStimulus):
 # Movie stimulus class
 ################################################################
 class pglStimulusMovie(_pglStimulus):
+    
     '''
     Base class for movie stimuli.
     '''
-    def __init__(self, pgl, filename, loop=False):
+    def __init__(self, pgl, filename):
         '''
         Initialize the movie stimulus with a movie instance.
 
@@ -1013,7 +1013,6 @@ class pglStimulusMovie(_pglStimulus):
         super().__init__(pgl)
         self.pgl = pgl
         self.filename = filename
-        self.loop = loop
 
         # make sure that a screen is open
         if self.pgl.isOpen() is False: 
@@ -1056,7 +1055,7 @@ class pglStimulusMovie(_pglStimulus):
         ], dtype=np.float32) 
         nVertices = np.float32(vertices.shape[0])
 
-        self.pgl.s.writeCommand("mglMovie")
+        self.pgl.s.writeCommand("mglMovieCreate")
         ackTime = self.pgl.s.readAck()
         print(f"(pglStimulusMovie) Sending {nVertices} vertices to PGL")
         self.pgl.s.write(np.uint32(nVertices))
@@ -1066,21 +1065,30 @@ class pglStimulusMovie(_pglStimulus):
         if (result < 0): 
             print("(pglStimulusMovie:init) Error creating movie")
             return None
-        movieNum = self.pgl.s.read(np.uint32)
+        self.movieNum = self.pgl.s.read(np.uint32)
         nMovies = self.pgl.s.read(np.uint32)
         
-        print(f"(pglStimulusMovie:init) Created movie {movieNum} ({nMovies} total movies)")
+        print(f"(pglStimulusMovie:init) Created movie {self.movieNum} ({nMovies} total movies)")
         self.commandResults = self.pgl.s.readCommandResults(ackTime)
         print(self.pgl.commandResults)
+        
 
 
     def __repr__(self):
         return f"<pglStimulusMovie: {self.filename}>"
 
-    def display(self):
+    def play(self):
         '''
-        Display the Movie.
+        play the Movie.
+        
         '''
+        self.pgl.s.writeCommand("mglMoviePlay")
+        ackTime = self.pgl.s.readAck()
+        movieNum = self.pgl.s.write(np.uint32(self.movieNum))
+        self.commandResults = self.pgl.s.readCommandResults(ackTime)
+        print(self.pgl.commandResults)
+
+
         
     def print(self):
         '''
