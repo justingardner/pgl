@@ -1087,10 +1087,15 @@ class pglStimulusMovie(_pglStimulus):
         ackTime = self.pgl.s.readAck()
         self.pgl.s.write(np.uint32(self.movieNum))
         
-        nFrames = self.pgl.s.read(np.uint32)
+        # read drawable presentedTimes
         presentedTimes = self.pgl.s.readArray(np.float64)
+        
+        # read corresponding video frameTimes
+        frameTimes = self.pgl.s.readArray(np.float64)
+        
         self.commandResults = self.pgl.s.readCommandResults(ackTime)
-        print(f"(pglStimulusMovie:play) Movie played {nFrames} frames.")
+        print(f"(pglStimulusMovie:play) Movie played {len(presentedTimes)} frames.")
+        print(f"(pglStimulusMovie:play) Got {len(frameTimes)} frameTimes.")
         
         # report dropped frames (i.e when presentedTimes = 0)
         droppedFrameIndexes = [i for i, t in enumerate(presentedTimes) if t == 0.0]
@@ -1142,7 +1147,52 @@ class pglStimulusMovie(_pglStimulus):
             percent = count / totalFrames * 100
             unclassifiedString = " ".join(f"{i} ({t*1000:.2f}ms)" for i, t in unclassified)
             print(f"{count} frames ({percent:.1f}%) unclassified: {unclassifiedString}")
-            
+        
+        # now let's turn presentedTimes into an array that starts
+        # at 0. We will replace any 0's with the previous non-zero value
+        presentedTimesFromStart = []
+        firstNonZeroValue = None
+        lastValue = 0.0
+
+        # go thorugh each value in presentedTimes
+        for v in presentedTimes:
+            # until we have the first non-zero values
+            # spit out 0 and then remember the starting value
+            if firstNonZeroValue is None:
+                if v == 0:
+                    presentedTimesFromStart.append(0.0)
+                else:
+                    firstNonZeroValue = v
+                    lastValue = 0.0
+                    presentedTimesFromStart.append(0.0)
+            # now that we have the first non-zero value
+            else:
+                # if we find a zero, repeat the last value
+                # otherwise, subtract the first non-zero value
+                if v == 0:
+                    presentedTimesFromStart.append(lastValue)
+                else:
+                    lastValue = v - firstNonZeroValue
+                    presentedTimesFromStart.append(lastValue)
+                    
+        # compute the discrepancy for all frames in frameTimes
+        # that have a non-zero value with presentedTimes. We
+        # will use this to determine how closely the presented times
+        # match the frame times
+        presentedDiscrepancy = np.array([
+            presentedTimesFromStart[i] - frameTimes[i]
+            for i, v in enumerate(frameTimes)
+            if v != 0
+        ]) 
+        # subtract off the first discrepancy for everything because
+        # we need to assume that the first frame is aligned
+        presentedDiscrepancy -= presentedDiscrepancy[0]  
+        
+        # print out the results
+        print(f"Frame discrepancy: {1000*presentedDiscrepancy.mean():.1f} ± {1000*presentedDiscrepancy.std():.1f} ms")        
+        print(" ".join(f"{v*1000:5.1f}" for v in presentedTimesFromStart))            
+        print(" ".join(f"{v*1000:5.1f}" for v in frameTimes))            
+        print(" ".join(f"{v*1000:5.1f}" for v in presentedDiscrepancy))            
     def status(self):
         '''
         get the status of the Movie.
