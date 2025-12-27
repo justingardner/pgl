@@ -10,6 +10,7 @@
 # Import modules
 #############
 import numpy as np
+import matplotlib.pyplot as plt
 
 #############
 # Stimuli class
@@ -1084,10 +1085,77 @@ class pglStimulusMovie(_pglStimulus):
         '''
         self.pgl.s.writeCommand("mglMoviePlay")
         ackTime = self.pgl.s.readAck()
-        movieNum = self.pgl.s.write(np.uint32(self.movieNum))
+        self.pgl.s.write(np.uint32(self.movieNum))
+        
+        nFrames = self.pgl.s.read(np.uint32)
+        presentedTimes = self.pgl.s.readArray(np.float64)
+        self.commandResults = self.pgl.s.readCommandResults(ackTime)
+        print(f"(pglStimulusMovie:play) Movie played {nFrames} frames.")
+        
+        # report dropped frames (i.e when presentedTimes = 0)
+        droppedFrameIndexes = [i for i, t in enumerate(presentedTimes) if t == 0.0]
+        print(f"{len(droppedFrameIndexes)} dropped frames:", " ".join(str(i) for i in droppedFrameIndexes))
+
+        # Compute differences between consecutive elements
+        presentedTimesNoZeros = [t for t in presentedTimes if t != 0.0]
+        frameLens = np.diff(presentedTimesNoZeros)  # diffs[i] = times[i+1] - times[i]
+
+        # now we will compute how many frames are in what frameRate, 
+        # we will test against the expected frameTime (e.g. 1/120) with
+        # this tolerance in %
+        tolerance = 0.05
+
+        # Expected frame durations, based on multiples of the refresh rate
+        multiples = np.array([1, 1.5, 2, 2.5, 3, 3.5, 4])
+        refreshRate = self.pgl.getFrameRate()
+        expectedFrameDuration = multiples / refreshRate  # seconds per frame
+        labels = [f"{int(refreshRate / m)}Hz" for m in multiples]
+
+        # Prepare classification dict
+        classified = {label: [] for label in labels}
+        unclassified = []
+
+        for idx, t in enumerate(frameLens):
+            matched = False
+            for label, expected in zip(labels, expectedFrameDuration):
+                # check length against expected duration with tolerance
+                if abs(t - expected) / expected <= tolerance:                    
+                    classified[label].append(idx)
+                    matched = True
+                    break
+            if not matched:
+                unclassified.append((idx, t))
+
+        totalFrames = len(frameLens)
+
+        # Print report of how many frames were classified into each category
+        for label in labels:
+            indices = classified[label]
+            count = len(indices)
+            if count > 0:
+                percent = count / totalFrames * 100
+                print(f"{count} frames ({percent:.1f}%) at {label}: {' '.join(str(i) for i in indices)}")
+
+        # Print unclassified
+        if unclassified:
+            count = len(unclassified)
+            percent = count / totalFrames * 100
+            unclassifiedString = " ".join(f"{i} ({t*1000:.2f}ms)" for i, t in unclassified)
+            print(f"{count} frames ({percent:.1f}%) unclassified: {unclassifiedString}")
+            
+    def status(self):
+        '''
+        get the status of the Movie.
+        
+        '''
+        self.pgl.s.writeCommand("mglMovieStatus")
+        ackTime = self.pgl.s.readAck()
+        self.pgl.s.write(np.uint32(self.movieNum))
+
+        status = self.pgl.s.read(np.uint32)
+        print(f"(pglStimulusMovie:status) Movie status: {status}")
         self.commandResults = self.pgl.s.readCommandResults(ackTime)
         print(self.pgl.commandResults)
-
 
         
     def print(self):

@@ -194,6 +194,31 @@ class _pglComm:
             print("(pgl:_pglComm:read) ❌ Error reading message:", e)
             return None
 
+    def readArray(self, dataType):
+        """
+        Read a message from the socket.
+        """
+        if not self.s:
+            print("(pgl:_pglComm) ❌ Not connected to socket")
+            return None
+
+        try:
+            # read number of elements in array
+            numElements = self.read(np.uint32)
+            # Read the appropriate number of bytes based on the data type
+            numBytes = np.dtype(dataType).itemsize*numElements
+            packed = self.recvBlocking(numBytes)
+            # check length of packed data
+            if len(packed) != numBytes:
+                print(f"(pgl:_pglComm:readArray) ❌ Expected {numBytes} bytes ({numElements} of {np.dtype(dataType).itemsize}), but received {len(packed)} bytes")
+                return None
+            else:
+                # unpack the data and reshape it
+                return np.frombuffer(packed, dtype=dataType)
+        except Exception as e:
+            print("(pgl:_pglComm:readArray) ❌ Error reading message:", e)
+            return None
+
     def recvBlocking(self, numBytes):
         '''
         Receive exactly numBytes from the socket. Will block until all bytes are received.
