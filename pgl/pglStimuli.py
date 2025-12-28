@@ -1193,6 +1193,20 @@ class pglStimulusMovie(_pglStimulus):
         print(" ".join(f"{v*1000:5.1f}" for v in presentedTimesFromStart))            
         print(" ".join(f"{v*1000:5.1f}" for v in frameTimes))            
         print(" ".join(f"{v*1000:5.1f}" for v in presentedDiscrepancy))            
+
+    def drawFrame(self):
+        '''
+        draw the current frame of the movie (requires a pgl.flush() to display).
+        '''
+        self.pgl.s.writeCommand("mglMovieDrawFrame")
+        ackTime = self.pgl.s.readAck()
+        self.pgl.s.write(np.uint32(self.movieNum))
+
+        #status = self.pgl.s.read(np.uint32)
+        #print(f"(pglStimulusMovie:status) Movie status: {status}")
+        self.commandResults = self.pgl.s.readCommandResults(ackTime)
+        #print(self.pgl.commandResults)
+
     def status(self):
         '''
         get the status of the Movie.
