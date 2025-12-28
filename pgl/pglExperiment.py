@@ -13,6 +13,7 @@
 import numpy as np
 import itertools
 import random
+import math
 from . import pglKeyboard
     
 #############
@@ -115,8 +116,12 @@ class pglExperiment:
         if phaseNum == len(self.task):
             self.task.append([])
 
+        # give it a reference to pgl
+        task.pgl = self.pgl
+
         # add the task
         self.task[phaseNum].append(task)
+        
 
     def run(self):
         '''
@@ -203,6 +208,14 @@ class pglExperiment:
 # Task class
 #############
 class pglTask:
+    # this are set every trial, which allows us to
+    # randomize the length of each segment (based on segmin/segmax)
+    # or jump segment, by dynamically changing from Inf to current time
+    _thisTrialSeglen = []
+    
+    # reference to pgl, set by pglExperiment when added
+    pgl = None
+    
     '''
     Class representing a task in the experiment. For example, a fixation task. Or
     a stimulus task which controls when and what stimuli are presented
@@ -212,6 +225,7 @@ class pglTask:
         self.nTrials = 10
         self.parameters=[]
         self.name="Task"
+        
     ################################################################
     # seglen property
     ################################################################
@@ -221,7 +235,7 @@ class pglTask:
         return self._seglen
     @seglen.setter
     def seglen(self, seglen_):
-        # seglen setting set sboth segmin/segmax
+        # seglen setting set both segmin/segmax
         self._segmin = seglen_
         self._segmax = seglen_
         self._seglen = seglen_
@@ -248,6 +262,16 @@ class pglTask:
         self.currentTrial += 1
         self.trialStartTime = startTime
         self.currentSegment = 0
+        
+        # get a random length for each segment. If segmin==segmax, then fixed length
+        self._thisTrialSeglen = [
+            # if either segmin or segmax is infinite, set to infinite
+            float('inf') if math.isinf(min_val) or math.isinf(max_val) 
+            # otherwise choose a random length between min and max
+            else random.uniform(min_val, max_val)
+            for min_val, max_val in zip(self._segmin, self._segmax)
+        ]
+        print("seglen: ",[f"{x:.2g}" for x in self._thisTrialSeglen])
 
         # get current parameters
         self.currentParams = {}
@@ -256,6 +280,8 @@ class pglTask:
 
         # print trial
         print(f"({self.name}) Trial {self.currentTrial+1}: ", end='')
+        
+        
         # and variable settings
         for name,value in self.currentParams.items():
             print(f'{name}={value}', end=' ')
@@ -275,7 +301,12 @@ class pglTask:
         self.updateScreen()
 
         # check for end of segment
-        if updateTime - self.segmentStartTime >= self._segmax[self.currentSegment]:
+        if updateTime - self.segmentStartTime >= self._thisTrialSeglen[self.currentSegment]:
+            # if the segment len is set to 0, it is a jump segment command
+            # so reset the segment length to how long actually elapsed
+            # so there is a record of how long we were in that segment
+            if self._thisTrialSeglen[self.currentSegment] == 0:
+                self._thisTrialSeglen[self.currentSegment] = updateTime - self.segmentStartTime
             # reset segment clock
             self.segmentStartTime = updateTime
             # update current segment
@@ -308,158 +339,9 @@ class pglTask:
         '''
         return self.currentTrial >= self.nTrials
 
-#############
-# Parameter class
-#############
-class pglParameter:
-    '''
-    Class representing a parameter in the experiment.
-    '''
-    def __init__(self, name: str, validValues: list|tuple|np.ndarray, helpStr: str=""):
+    def jumpSegment(self):
         '''
-        Initialize the parameter.
-        
-        Args:
-            name (str): The name of the parameter.
-            validValues (list, optional): A list of valid values for the parameter. 
-            helpStr (str, optional): Help string describing the parameter.
+        Jump to the next segment.
         '''
-        # validate name
-        if not isinstance(name, str):
-            raise TypeError("(pglParameter) ❌ Error: Parameter name must be a string.")
-        self.name = name
-        
-        # check if it is a list of values
-        if not isinstance(validValues, (list, tuple, np.ndarray)):
-            raise TypeError("(pglParameter) ❌ Error: validValues must be a list, tuple, or ndarray.")
-        self.validValues = list(validValues)
-        
-        # validate helpStr
-        if not isinstance(helpStr, str):
-            raise TypeError("(pglParameter) ❌ Error: helpStr must be a string.")
-        self.helpStr = helpStr
-        
-        # set to trigger a new block for first trial
-        self.currentTrial = -1
-        self.blockNum = -1
-        self.blockLen = 1
-
-    def __repr__(self):
-        return f"pglParameter(name={self.name}, validValues={self.validValues}, randomizationBlock={self.randomizationBlock}, helpStr={self.helpStr})"
-
-    def __str__(self):
-        # display help string
-        if self.helpStr == "":
-            helpStr = ""
-        else:
-            helpStr = f"# {self.helpStr} #\n"
-        
-        # display full string
-        return f"{helpStr}{self.name}: {self.validValues} (randomizationBlock={self.randomizationBlock})"
-
-    def get(self):
-        '''
-        Get the current value of the parameter.
-        '''
-        # check if we are at the end of a block
-        if (self.currentTrial%self.blockLen) == self.blockLen-1:
-            self.startBlock()
-
-        # update trial number
-        self.currentTrial += 1
-
-        return dict(zip(self.parameterNames, self.parameterBlock[self.currentTrial%self.blockLen]))
-    
-    def getParameterBlock(self):
-        '''
-        Get a set of parameters to run over, will
-        produce a random ordering of that parameter
-        '''
-        paramNames = [self.name]
-        # turn the list into a list of tuples to be 
-        # compatible with tuples of parameters
-        # from above and then shuffle
-        parameterBlock = [(v,) for v in self.validValues]
-        random.shuffle(parameterBlock)
-        
-        # return the block
-        return (paramNames, parameterBlock)
-
-    def startBlock(self):
-        '''
-        Start a block.
-        '''
-        # get randomization of parameters
-        (self.parameterNames, self.parameterBlock) = self.getParameterBlock()
-        
-        # set variables
-        self.blockNum += 1
-        self.blockLen = len(self.parameterBlock)
-        
-        # display block information        
-        print(f"Block {self.blockNum+1}: {self.blockLen} randomized over: {self.parameterNames}")
-
-#############
-# Parameter class
-#############
-class pglParameterBlock(pglParameter):
-    '''
-    Class representing a block of parameters in the experiment.
-    This is a subclass of pglParameter which allows you to group
-    multiple parameters together into a single block.
-    '''
-    def __init__(self, parameters: list, helpStr: str=""):
-        '''
-        Initialize the parameter block.
-        
-        Args:
-            name (str): The name of the parameter block.
-            parameters (list): A list of pglParameter instances to include in the block.
-            helpStr (str, optional): Help string describing the parameter block.
-        '''
-        # validate parameters
-        if not isinstance(parameters, list) or not all(isinstance(p, pglParameter) for p in parameters):
-            raise TypeError("(pglParameterBlock) ❌ Error: parameters must be a list of pglParameter instances.")
-        self.parameters = parameters
-        
-        # validate helpStr
-        if not isinstance(helpStr, str):
-            raise TypeError("(pglParameterBlock) ❌ Error: helpStr must be a string.")
-        self.helpStr = helpStr
-        
-        # set to trigger a new block for first trial
-        self.currentTrial = -1
-        self.blockNum = -1
-        self.blockLen = 1
-
-        # parameter names and valid values from each parameter in the list
-        self.paramNames = [p.name for p in self.parameters]
-        allParameterValues = [p.validValues for p in self.parameters]
-        # get cartesian combination
-        self.allParameterValues = list(itertools.product(*allParameterValues))
-        self.name = ""
-
-    def __repr__(self):
-        return f"pglParameterBlock(parameters={self.parameters}, helpStr={self.helpStr})"
-
-    def __str__(self):
-        # display help string
-        if self.helpStr == "":
-            helpStr = ""
-        else:
-            helpStr = f"# {self.helpStr} #\n"
-        
-        # display full string
-        paramStrs = [str(p) for p in self.parameters]
-        paramStr = "\n".join(paramStrs)
-        return f"{helpStr}:\n{paramStr}"
-
-    def getParameterBlock(self):
-        '''
-        This  will create a block over all of the parameters in the
-        list, for example if you have direction and coherence parameters, this would
-        calculate all combination of those parameters and return them for the task
-        to run as a block of trials.
-        '''
-        random.shuffle(self.allParameterValues)
-        return (self.paramNames, self.allParameterValues)
+        # set current segment length to 0 to force jump
+        self._thisTrialSeglen[self.currentSegment] = 0
