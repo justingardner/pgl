@@ -245,14 +245,19 @@ class pglTask:
         '''
         Start the task.
         '''
-        # set clocks
+        # set task start time
         self.taskStartTime = startTime
-        self.trialStartTime = startTime
-        self.segmentStartTime = startTime
         
         # start trial
         self.currentTrial = -1
         self.startTrial(startTime)
+        
+    def startSegment(self, startTime):
+        '''
+        Start a segment.
+        '''
+        self.currentSegment += 1
+        self.segmentStartTime = startTime
 
     def startTrial(self, startTime):
         '''
@@ -261,7 +266,10 @@ class pglTask:
         # update values
         self.currentTrial += 1
         self.trialStartTime = startTime
-        self.currentSegment = 0
+        
+        # start segment (startSegment will update currentSegment to 0)
+        self.currentSegment = -1
+        self.startSegment(startTime)
         
         # get a random length for each segment. If segmin==segmax, then fixed length
         self._thisTrialSeglen = [
@@ -307,10 +315,8 @@ class pglTask:
             # so there is a record of how long we were in that segment
             if self._thisTrialSeglen[self.currentSegment] == 0:
                 self._thisTrialSeglen[self.currentSegment] = updateTime - self.segmentStartTime
-            # reset segment clock
-            self.segmentStartTime = updateTime
-            # update current segment
-            self.currentSegment += 1
+            # call startSegment to begin next segment
+            self.startSegment(updateTime)
             # check for end of trial
             if self.currentSegment >= self.nSegments: 
                 # new trial
