@@ -1182,17 +1182,22 @@ class pglStimulusMovie(_pglStimulus):
         presentedDiscrepancy = np.array([
             presentedTimesFromStart[i] - frameTimes[i]
             for i, v in enumerate(frameTimes)
-            if v != 0
+            if v != -1.0
         ]) 
-        # subtract off the first discrepancy for everything because
-        # we need to assume that the first frame is aligned
-        presentedDiscrepancy -= presentedDiscrepancy[0]  
-        
+
         # print out the results
         print(f"Frame discrepancy: {1000*presentedDiscrepancy.mean():.1f} ± {1000*presentedDiscrepancy.std():.1f} ms")        
         print(" ".join(f"{v*1000:5.1f}" for v in presentedTimesFromStart))            
-        print(" ".join(f"{v*1000:5.1f}" for v in frameTimes))            
-        print(" ".join(f"{v*1000:5.1f}" for v in presentedDiscrepancy))            
+        print(" ".join(
+            f"{v*1000:5.1f}" if v != -1 else f"{'-':>5}"
+            for v in frameTimes
+        ))    
+        # print presentedDiscrepancy aligned with frameTimes        
+        it = iter(presentedDiscrepancy)
+        print(" ".join(
+            f"{next(it)*1000:5.1f}" if v != -1 else f"{'-':>5}"
+            for v in frameTimes
+        ))          
 
     def drawFrame(self):
         '''
@@ -1202,8 +1207,8 @@ class pglStimulusMovie(_pglStimulus):
         ackTime = self.pgl.s.readAck()
         self.pgl.s.write(np.uint32(self.movieNum))
 
-        #status = self.pgl.s.read(np.uint32)
-        #print(f"(pglStimulusMovie:status) Movie status: {status}")
+        frameTime = self.pgl.s.read(np.float64)
+        print(f"(pglStimulusMovie:status) frameTime: {frameTime}")
         self.commandResults = self.pgl.s.readCommandResults(ackTime)
         #print(self.pgl.commandResults)
 
