@@ -1087,22 +1087,87 @@ class pglStimulusMovie(_pglStimulus):
         ackTime = self.pgl.s.readAck()
         self.pgl.s.write(np.uint32(self.movieNum))
         
+        # read movie play start time
+        startTime = self.pgl.s.read(np.float64)
+        
         # read drawable presentedTimes
         presentedTimes = self.pgl.s.readArray(np.float64)
         
-        # read corresponding video frameTimes
+        # read corresponding video frameTimes - this is the corresponding time in the video
         frameTimes = self.pgl.s.readArray(np.float64)
         
+        # read corresponding targetPresentationTimestamps (the time the os thinks the frame will be displayed)
+        targetPresentationTimestamps = self.pgl.s.readArray(np.float64)
+
+        # read corresponding draw frame times (the time at which the code to draw the frame
+        # ran - which is different from when it was displayed which is presentedTimes)
+        drawFrameTimes = self.pgl.s.readArray(np.float64)
+
         self.commandResults = self.pgl.s.readCommandResults(ackTime)
         print(f"(pglStimulusMovie:play) Movie played {len(presentedTimes)} frames.")
         print(f"(pglStimulusMovie:play) Got {len(frameTimes)} frameTimes.")
+        print(f"(pglStimulusMovie:play) Movie started at {startTime:.3f} secs.")
         
-        # report dropped frames (i.e when presentedTimes = 0)
-        droppedFrameIndexes = [i for i, t in enumerate(presentedTimes) if t == 0.0]
+        offsetValue = targetPresentationTimestamps[0]
+        drawFrameTimes = 1000*(drawFrameTimes - offsetValue)
+        targetPresentationTimestamps = 1000*(targetPresentationTimestamps - offsetValue)
+        presentedTimes = np.where((presentedTimes == -1) | (presentedTimes == 0), -1, 1000 * (presentedTimes - offsetValue))
+        
+        # compute how long each frame was presented for, i.e. the difference
+        # between consecutive presentedTimes, but put -1 if either value is -1
+        frameLen = np.array([
+            presentedTimes[i] - presentedTimes[i-1] if presentedTimes[i] != -1 and presentedTimes[i-1] != -1 else -1
+            for i in range(1, len(presentedTimes))
+        ])
+        
+        # compute the discrepancy for all frames in frameTimes
+        # that have a value with presentedTimes. We
+        # will use this to determine how closely the presented times
+        # match the frame times
+        lastValidFrameTime = None
+        delay = []
+        for i in range(len(frameTimes)):
+            if frameTimes[i] != -1:
+                lastValidFrameTime = frameTimes[i]
+            # Use last valid frame if current is -1
+            frameValue = lastValidFrameTime if lastValidFrameTime is not None else 0
+            # if presentedTiems is -1 it is a dropped frame
+            if presentedTimes[i] == -1 or presentedTimes[i] == 0:
+                delay.append(np.nan)
+            else:
+                delay.append(presentedTimes[i] - 1000 * frameValue)
+
+
+        # Determine the maximum width dynamically to represent the numbers
+        maxWidth = max(len(f"{v:.1f}") for v in drawFrameTimes) + 1  # +1 for spacing
+
+        print("frame num: " + " ".join(f"{v:{maxWidth}.0f}" for v in np.arange(len(presentedTimes))))            
+        print("drawFrame: " + " ".join(f"{v:{maxWidth}.1f}" for v in drawFrameTimes))            
+        print("target:    " + " ".join(f"{v:{maxWidth}.1f}" for v in targetPresentationTimestamps))            
+        print("presented: " + " ".join(
+            f"{v:{maxWidth}.1f}" if v != -1 else f"{'-':>{maxWidth}}"
+            for v in presentedTimes
+        ))    
+        print("frameLen:  " + " ".join(
+            f"{v:{maxWidth}.1f}" if v != -1 else f"{'-':>{maxWidth}}"
+            for v in frameLen
+        ))    
+        print("Video time:" + " ".join(
+            f"{v*1000:{maxWidth}.1f}" if v != -1 else f"{'-':>{maxWidth}}"
+            for v in frameTimes
+        ))    
+        print("Delay:     " + " ".join(
+            f"{v:{maxWidth}.1f}" if v != -1 else f"{'-':>{maxWidth}}"
+            for v in delay
+        ))  
+        print(f"Delay: {np.nanmean(delay):.1f} ± {np.nanstd(delay):.1f} ms")        
+  
+        # report dropped frames (i.e when presentedTimes = -1)
+        droppedFrameIndexes = [i for i, t in enumerate(presentedTimes) if t == -1]
         print(f"{len(droppedFrameIndexes)} dropped frames:", " ".join(str(i) for i in droppedFrameIndexes))
 
         # Compute differences between consecutive elements
-        presentedTimesNoZeros = [t for t in presentedTimes if t != 0.0]
+        presentedTimesNoZeros = [t for t in presentedTimes if t != -1]
         frameLens = np.diff(presentedTimesNoZeros)  # diffs[i] = times[i+1] - times[i]
 
         # now we will compute how many frames are in what frameRate, 
@@ -1113,7 +1178,7 @@ class pglStimulusMovie(_pglStimulus):
         # Expected frame durations, based on multiples of the refresh rate
         multiples = np.array([1, 1.5, 2, 2.5, 3, 3.5, 4])
         refreshRate = self.pgl.getFrameRate()
-        expectedFrameDuration = multiples / refreshRate  # seconds per frame
+        expectedFrameDuration = 1000 * multiples / refreshRate  # milliseconds per frame
         labels = [f"{int(refreshRate / m)}Hz" for m in multiples]
 
         # Prepare classification dict
@@ -1148,57 +1213,6 @@ class pglStimulusMovie(_pglStimulus):
             unclassifiedString = " ".join(f"{i} ({t*1000:.2f}ms)" for i, t in unclassified)
             print(f"{count} frames ({percent:.1f}%) unclassified: {unclassifiedString}")
         
-        # now let's turn presentedTimes into an array that starts
-        # at 0. We will replace any 0's with the previous non-zero value
-        presentedTimesFromStart = []
-        firstNonZeroValue = None
-        lastValue = 0.0
-
-        # go thorugh each value in presentedTimes
-        for v in presentedTimes:
-            # until we have the first non-zero values
-            # spit out 0 and then remember the starting value
-            if firstNonZeroValue is None:
-                if v == 0:
-                    presentedTimesFromStart.append(0.0)
-                else:
-                    firstNonZeroValue = v
-                    lastValue = 0.0
-                    presentedTimesFromStart.append(0.0)
-            # now that we have the first non-zero value
-            else:
-                # if we find a zero, repeat the last value
-                # otherwise, subtract the first non-zero value
-                if v == 0:
-                    presentedTimesFromStart.append(lastValue)
-                else:
-                    lastValue = v - firstNonZeroValue
-                    presentedTimesFromStart.append(lastValue)
-                    
-        # compute the discrepancy for all frames in frameTimes
-        # that have a non-zero value with presentedTimes. We
-        # will use this to determine how closely the presented times
-        # match the frame times
-        presentedDiscrepancy = np.array([
-            presentedTimesFromStart[i] - frameTimes[i]
-            for i, v in enumerate(frameTimes)
-            if v != -1.0
-        ]) 
-
-        # print out the results
-        print(f"Frame discrepancy: {1000*presentedDiscrepancy.mean():.1f} ± {1000*presentedDiscrepancy.std():.1f} ms")        
-        print(" ".join(f"{v*1000:5.1f}" for v in presentedTimesFromStart))            
-        print(" ".join(
-            f"{v*1000:5.1f}" if v != -1 else f"{'-':>5}"
-            for v in frameTimes
-        ))    
-        # print presentedDiscrepancy aligned with frameTimes        
-        it = iter(presentedDiscrepancy)
-        print(" ".join(
-            f"{next(it)*1000:5.1f}" if v != -1 else f"{'-':>5}"
-            for v in frameTimes
-        ))          
-
     def drawFrame(self):
         '''
         draw the current frame of the movie (requires a pgl.flush() to display).
