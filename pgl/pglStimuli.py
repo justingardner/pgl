@@ -1071,9 +1071,6 @@ class pglStimulusMovie(_pglStimulus):
         
         print(f"(pglStimulusMovie:init) Created movie {self.movieNum} ({nMovies} total movies)")
         self.commandResults = self.pgl.s.readCommandResults(ackTime)
-        print(self.pgl.commandResults)
-        
-
 
     def __repr__(self):
         return f"<pglStimulusMovie: {self.filename}>"
@@ -1087,31 +1084,46 @@ class pglStimulusMovie(_pglStimulus):
         ackTime = self.pgl.s.readAck()
         self.pgl.s.write(np.uint32(self.movieNum))
         
-        # read movie play start time
-        startTime = self.pgl.s.read(np.float64)
-        
         # read drawable presentedTimes
-        presentedTimes = self.pgl.s.readArray(np.float64)
+        self.presentedTimes = self.pgl.s.readArray(np.float64)
         
-        # read corresponding video frameTimes - this is the corresponding time in the video
-        frameTimes = self.pgl.s.readArray(np.float64)
+        # read corresponding movie times - this is the corresponding time in the movie
+        self.movieTimes = self.pgl.s.readArray(np.float64)
         
         # read corresponding targetPresentationTimestamps (the time the os thinks the frame will be displayed)
-        targetPresentationTimestamps = self.pgl.s.readArray(np.float64)
+        self.targetPresentationTimestamps = self.pgl.s.readArray(np.float64)
 
         # read corresponding draw frame times (the time at which the code to draw the frame
         # ran - which is different from when it was displayed which is presentedTimes)
-        drawFrameTimes = self.pgl.s.readArray(np.float64)
+        self.drawFrameTimes = self.pgl.s.readArray(np.float64)
 
+        # command Results
         self.commandResults = self.pgl.s.readCommandResults(ackTime)
-        print(f"(pglStimulusMovie:play) Movie played {len(presentedTimes)} frames.")
-        print(f"(pglStimulusMovie:play) Got {len(frameTimes)} frameTimes.")
-        print(f"(pglStimulusMovie:play) Movie started at {startTime:.3f} secs.")
         
-        offsetValue = targetPresentationTimestamps[0]
+        # print summary if verbose
+        if self.pgl.verbose>0:
+            print(f"(pglStimulusMovie:play) Movie played {len(self.presentedTimes)} frames.")
+
+        # display frame statistics if versbose is set
+        if self.pgl.verbose>0:
+            self.displayFrameStatistics(
+                self.drawFrameTimes,
+                self.targetPresentationTimestamps,
+                self.presentedTimes,
+                self.movieTimes
+            )
+
+    # display frame statistics    
+    def displayFrameStatistics(self,  drawFrameTimes, targetPresentationTimestamps, presentedTimes, movieTimes):
+        
+        # offset all time values to the first non-zero presentation timestamp
+        offsetValue = next((v for v in targetPresentationTimestamps if v != 0), 0)
         drawFrameTimes = 1000*(drawFrameTimes - offsetValue)
         targetPresentationTimestamps = 1000*(targetPresentationTimestamps - offsetValue)
         presentedTimes = np.where((presentedTimes == -1) | (presentedTimes == 0), -1, 1000 * (presentedTimes - offsetValue))
+        
+        # convert movie time to ms
+        movieTimes = np.where((movieTimes == -1), -1, 1000 * movieTimes)
         
         # compute how long each frame was presented for, i.e. the difference
         # between consecutive presentedTimes, but put -1 if either value is -1
@@ -1126,16 +1138,16 @@ class pglStimulusMovie(_pglStimulus):
         # match the frame times
         lastValidFrameTime = None
         delay = []
-        for i in range(len(frameTimes)):
-            if frameTimes[i] != -1:
-                lastValidFrameTime = frameTimes[i]
+        for i in range(len(movieTimes)):
+            if movieTimes[i] != -1:
+                lastValidFrameTime = movieTimes[i]
             # Use last valid frame if current is -1
             frameValue = lastValidFrameTime if lastValidFrameTime is not None else 0
             # if presentedTiems is -1 it is a dropped frame
             if presentedTimes[i] == -1 or presentedTimes[i] == 0:
                 delay.append(np.nan)
             else:
-                delay.append(presentedTimes[i] - 1000 * frameValue)
+                delay.append(presentedTimes[i] - frameValue)
 
 
         # Determine the maximum width dynamically to represent the numbers
@@ -1152,9 +1164,9 @@ class pglStimulusMovie(_pglStimulus):
             f"{v:{maxWidth}.1f}" if v != -1 else f"{'-':>{maxWidth}}"
             for v in frameLen
         ))    
-        print("Video time:" + " ".join(
-            f"{v*1000:{maxWidth}.1f}" if v != -1 else f"{'-':>{maxWidth}}"
-            for v in frameTimes
+        print("Movie time:" + " ".join(
+            f"{v:{maxWidth}.1f}" if v != -1 else f"{'-':>{maxWidth}}"
+            for v in movieTimes
         ))    
         print("Delay:     " + " ".join(
             f"{v:{maxWidth}.1f}" if v != -1 else f"{'-':>{maxWidth}}"
@@ -1164,7 +1176,7 @@ class pglStimulusMovie(_pglStimulus):
   
         # report dropped frames (i.e when presentedTimes = -1)
         droppedFrameIndexes = [i for i, t in enumerate(presentedTimes) if t == -1]
-        print(f"{len(droppedFrameIndexes)} dropped frames:", " ".join(str(i) for i in droppedFrameIndexes))
+        print(f"{len(droppedFrameIndexes)} dropped frames:" + " ".join(str(i) for i in droppedFrameIndexes))
 
         # Compute differences between consecutive elements
         presentedTimesNoZeros = [t for t in presentedTimes if t != -1]
