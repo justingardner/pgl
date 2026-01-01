@@ -95,6 +95,12 @@ class _pglComm:
         elif isinstance(message, np.ndarray) and np.issubdtype(message.dtype, np.float64):
             # pack as 8 byte doubles
             packed = message.astype(np.float64).tobytes()
+        elif isinstance(message, str):
+            # String, encode as utf-16
+            encoded = message.encode('utf-16le')
+            # prepend length as uint32 (number of code units)
+            lengthPrefix = struct.pack('@I', len(encoded)//2)
+            packed = lengthPrefix + encoded
         else:
             raise TypeError("Unsupported data type")
 

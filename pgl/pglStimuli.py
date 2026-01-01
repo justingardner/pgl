@@ -1005,7 +1005,14 @@ class pglStimulusMovie(_pglStimulus):
     '''
     Base class for movie stimuli.
     '''
-    def __init__(self, pgl, filename):
+    movieError = {-1.0: "File not found",
+                  -2.0: "No permission for file",
+                  -3.0: "Invalid format",
+                  -4.0: "Error reading vertices",
+                  -5.0: "Error creating movie",
+                  -6.0: "Error adding movie"}
+    
+    def __init__(self, pgl, filename=""):
         '''
         Initialize the movie stimulus with a movie instance.
 
@@ -1058,22 +1065,37 @@ class pglStimulusMovie(_pglStimulus):
 
         self.pgl.s.writeCommand("mglMovieCreate")
         ackTime = self.pgl.s.readAck()
-        print(f"(pglStimulusMovie) Sending {nVertices} vertices to PGL")
+        self.pgl.s.write(filename)
         self.pgl.s.write(np.uint32(nVertices))
         self.pgl.s.write(vertices)
         
         result = self.pgl.s.read(np.float64)
         if (result < 0): 
-            print("(pglStimulusMovie:init) Error creating movie")
+            print(f"(pglStimulusMovie:init) Error creating movie: {self.movieError.get(int(result),"Unrecogonized Error")}")
+            self.commandResults = self.pgl.s.readCommandResults(ackTime)
             return None
-        self.movieNum = self.pgl.s.read(np.uint32)
-        nMovies = self.pgl.s.read(np.uint32)
         
-        print(f"(pglStimulusMovie:init) Created movie {self.movieNum} ({nMovies} total movies)")
+        # means we have details for mvoe
+        if result>1.0:
+            # read details of movie
+            self.frameRate = self.pgl.s.read(np.float64)
+            self.duration = self.pgl.s.read(np.float64)
+            self.totalFrames = self.pgl.s.read(np.uint32)
+            self.width = self.pgl.s.read(np.uint32)
+            self.height = self.pgl.s.read(np.uint32)
+            print(self)
+
+        # Read the movie number
+        self.movieNum = self.pgl.s.read(np.uint32)
+        nMovies = self.pgl.s.read(np.uint32)      
+        if self.pgl.verbose>0:  
+            print(f"(pglStimulusMovie:init) Created movie {self.movieNum} ({nMovies} total movies)")
+        
+        # get command results
         self.commandResults = self.pgl.s.readCommandResults(ackTime)
 
     def __repr__(self):
-        return f"<pglStimulusMovie: {self.filename}>"
+        return f"<pglStimulusMovie: {self.filename} {self.width}x{self.height}pix, duration={self.duration}s, {self.frameRate}fps, totalFrames={self.totalFrames}>"
 
     def play(self):
         '''
@@ -1136,23 +1158,42 @@ class pglStimulusMovie(_pglStimulus):
         # that have a value with presentedTimes. We
         # will use this to determine how closely the presented times
         # match the frame times
-        lastValidFrameTime = None
+        lastValidMovieTime = None
+        lastPresentedTime = None
         delay = []
         for i in range(len(movieTimes)):
             if movieTimes[i] != -1:
-                lastValidFrameTime = movieTimes[i]
+                lastValidMovieTime = movieTimes[i]
             # Use last valid frame if current is -1
-            frameValue = lastValidFrameTime if lastValidFrameTime is not None else 0
+            movieTime = lastValidMovieTime if lastValidMovieTime is not None else 0
             # if presentedTiems is -1 it is a dropped frame
             if presentedTimes[i] == -1 or presentedTimes[i] == 0:
-                delay.append(np.nan)
+                # this means a frame was dropped, so the last presented frame
+                # is still displaying, so compute the delay relative to that frame
+                if lastPresentedTime != None:
+                    delay.append(lastPresentedTime - movieTime)
+                else:
+                    # if there is no lastPresentedTime, then nan
+                    delay.append(np.nan)
             else:
-                delay.append(presentedTimes[i] - frameValue)
+                # compute difference betwen the presentedTime and the frameTime
+                delay.append(presentedTimes[i] - movieTime)
+                # keep this presented time, in case there is a dropped frame
+                lastPresentedTime = presentedTimes[i]
 
 
         # Determine the maximum width dynamically to represent the numbers
         maxWidth = max(len(f"{v:.1f}") for v in drawFrameTimes) + 1  # +1 for spacing
 
+        # ok, print out timeline. 
+        # frame num: Is the frame number from start of movie play (starting at 0)
+        # drawFrame: Is the time at which drawFrame is called
+        # target: Is the targetPresentationTimestamp which is the predicted time of frame display
+        # presented: is the time that the frame was actually presented
+        # frameLen: Is how long the frame was shown for
+        # Movie time: is the time in the movie that is being displayed
+        # Delay: is the difference in time between movie time and presented time (negative
+        # values mean that the frame was displayed before the movie time)
         print("frame num: " + " ".join(f"{v:{maxWidth}.0f}" for v in np.arange(len(presentedTimes))))            
         print("drawFrame: " + " ".join(f"{v:{maxWidth}.1f}" for v in drawFrameTimes))            
         print("target:    " + " ".join(f"{v:{maxWidth}.1f}" for v in targetPresentationTimestamps))            
@@ -1247,8 +1288,17 @@ class pglStimulusMovie(_pglStimulus):
         ackTime = self.pgl.s.readAck()
         self.pgl.s.write(np.uint32(self.movieNum))
 
-        status = self.pgl.s.read(np.uint32)
+        status = self.pgl.s.read(np.float64)
         print(f"(pglStimulusMovie:status) Movie status: {status}")
+        if status>0:
+            # read details of movie
+            self.frameRate = self.pgl.s.read(np.float64)
+            self.duration = self.pgl.s.read(np.float64)
+            self.totalFrames = self.pgl.s.read(np.uint32)
+            self.width = self.pgl.s.read(np.uint32)
+            self.height = self.pgl.s.read(np.uint32)
+
+
         self.commandResults = self.pgl.s.readCommandResults(ackTime)
         print(self.pgl.commandResults)
 

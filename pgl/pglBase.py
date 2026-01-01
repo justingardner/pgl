@@ -310,6 +310,37 @@ class pglBase:
         return True
     
     ################################################################
+    # setDesiredFrameRate
+    ################################################################
+    def setDesiredFrameRate(self, desiredFrameRate):
+        """
+        Set the desired frame rate. In modern versions of MacOS
+        frameRates can dynamically change, so apps have to request
+        a desired frame rate. Note that this will not necessarily
+        be followed by the OS, as it depends on system load and
+        energy saving modes etc.
+ 
+        Args:
+            desiredFrameRate (int): The desired frame rate to report to OS
+        """
+        # make sure that a screen is open
+        if self.s is None: 
+            print(f"(pglBase:setDesiredFrameRate) ❌ No screen is open")
+            return
+        try:
+            # pause interrupts so we don't get interrupted by Ctrl-C
+            self.pauseInterrupts()
+            # send the commands
+            print(f"(mglSetDesiredFrameRate: {desiredFrameRate})")
+            self.s.writeCommand("mglSetDesiredFrameRate")
+            self.s.write(np.uint32(desiredFrameRate))
+            self.commandResults = self.s.readCommandResults()
+        finally:
+            # restore interrupts
+            self.restoreInterrupts()
+
+
+    ################################################################
     # setWindowFrameInDisplay
     ################################################################
     def setWindowFrameInDisplay(self, whichScreen, screenX, screenY, screenWidth, screenHeight):
