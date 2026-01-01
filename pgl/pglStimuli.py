@@ -341,7 +341,7 @@ class pglStimuli:
     ####################################################
     # movie
     ####################################################
-    def movie(self, filename):
+    def movie(self, filename, x=0, y=0, displayWidth=0, displayHeight=0, xAlign=0, yAlign=0):
         '''
         Create a movie stimulus. 
 
@@ -354,7 +354,7 @@ class pglStimuli:
             return None
 
         # Create the movie stimulus
-        movieStimulus = pglStimulusMovie(self, filename=filename)
+        movieStimulus = pglStimulusMovie(self, filename=filename, x=x, y=y, displayWidth=displayWidth, displayHeight=displayHeight, xAlign=xAlign, yAlign=yAlign)
         return movieStimulus
 
     ####################################################
@@ -1005,14 +1005,18 @@ class pglStimulusMovie(_pglStimulus):
     '''
     Base class for movie stimuli.
     '''
+    # error codes
     movieError = {-1.0: "File not found",
                   -2.0: "No permission for file",
                   -3.0: "Invalid format",
                   -4.0: "Error reading vertices",
                   -5.0: "Error creating movie",
                   -6.0: "Error adding movie"}
+    # default dimensions
+    width = 0
+    height = 0
     
-    def __init__(self, pgl, filename=""):
+    def __init__(self, pgl, filename="", x=0, y=0, displayWidth=0, displayHeight=0, xAlign=0, yAlign=0):
         '''
         Initialize the movie stimulus with a movie instance.
 
@@ -1027,47 +1031,10 @@ class pglStimulusMovie(_pglStimulus):
             print(f"(pglStimulusMovie) ❌ No screen is open")
             return False
         
-        # for debugging, fix, fix, fix
-        x = 0
-        y = 0
-        xAlign = 0
-        yAlign = 0
-        width = self.pgl.screenWidth.deg
-        height = self.pgl.screenHeight.deg  
-        
-        # vertex coordinates in device coordinates
-        displayLeft = x - (xAlign + 1) / 2 * width
-        displayRight = displayLeft + width
-        displayTop = y + (yAlign + 1) / 2 * height
-        displayBottom = displayTop - height
-
-        # no z coordinate
-        z = 0
-
-        # texture coordinates which map to vertex coordinates
-        texRight = 1
-        texLeft = 0
-        texTop = 0
-        texBottom = 1
-        
-        # create the two triangles which map the texture (ie image)
-        # to vertices in device coordinates
-        vertices = np.array([
-            [displayRight, displayTop, z, texRight, texTop],
-            [displayLeft, displayTop, z, texLeft, texTop],
-            [displayLeft, displayBottom, z, texLeft, texBottom],
-
-            [displayRight, displayTop, z, texRight, texTop],
-            [displayLeft, displayBottom, z, texLeft, texBottom],
-            [displayRight, displayBottom, z, texRight, texBottom]
-        ], dtype=np.float32) 
-        nVertices = np.float32(vertices.shape[0])
 
         self.pgl.s.writeCommand("mglMovieCreate")
         ackTime = self.pgl.s.readAck()
         self.pgl.s.write(filename)
-        self.pgl.s.write(np.uint32(nVertices))
-        self.pgl.s.write(vertices)
         
         result = self.pgl.s.read(np.float64)
         if (result < 0): 
@@ -1093,9 +1060,89 @@ class pglStimulusMovie(_pglStimulus):
         
         # get command results
         self.commandResults = self.pgl.s.readCommandResults(ackTime)
+        
+        # set the display position
+        self.setDisplayPosition(x, y, displayWidth, displayHeight, xAlign, yAlign)
+
 
     def __repr__(self):
         return f"<pglStimulusMovie: {self.filename} {self.width}x{self.height}pix, duration={self.duration}s, {self.frameRate}fps, totalFrames={self.totalFrames}>"
+
+    def setDisplayPosition(self, x = 0, y = 0, displayWidth = 0, displayHeight = 0, xAlign = 0, yAlign = 0):
+        '''
+        Sets the display position
+        
+        args:
+        -  x: x location for movie (default = 0)
+        -  y: y location for movie (default = 0)
+        -  displayWidth: width for movie (default = 0) If height is set, and width is 0 
+            then width will default to correct value to maintain aspect ratio if the movie
+            information has been loaded. Otherwise will default to screenWidth
+        -  displayHeight: height for movie (default = 0) Behaves the same as displayWidth
+        -  xAlign: xAlginment (-1 left, 0 center, 1 right: default = 0)
+        -  yAlign: xAlginment (-1 top, 0 center, 1 bottom: default = 0)
+        '''
+        # handle width and height defaults
+        if displayWidth == 0 and displayHeight == 0:
+            # no width or height, maximize to fill screen
+            displayWidth = self.pgl.screenWidth.deg
+            displayHeight = self.pgl.screenHeight.deg  
+        elif displayWidth == 0:
+            # get width based on aspect ration of movie
+            if width == 0 and height == 0:
+                displayWidth = self.pgl.screenWidth.deg
+            else:
+                # set according to aspect ratio
+                displayWidth = (width / height) * displayHeight
+        elif displayHeight == 0:
+            # get width based on aspect ration of movie
+            if width == 0 and height == 0:
+                displayHeight = self.pgl.screenHeight.deg
+            else:
+                # set according to aspect ratio
+                displayHeight = (height / width) * displayWidth               
+        
+        # vertex coordinates in device coordinates
+        displayLeft = x - (xAlign + 1) / 2 * displayWidth
+        displayRight = displayLeft + displayWidth
+        displayTop = y + (yAlign + 1) / 2 * displayHeight
+        displayBottom = displayTop - displayHeight
+
+        # no z coordinate
+        z = 0
+
+        # texture coordinates which map to vertex coordinates
+        texRight = 1
+        texLeft = 0
+        texTop = 0
+        texBottom = 1
+        
+        # create the two triangles which map the texture (ie image)
+        # to vertices in device coordinates
+        vertices = np.array([
+            [displayRight, displayTop, z, texRight, texTop],
+            [displayLeft, displayTop, z, texLeft, texTop],
+            [displayLeft, displayBottom, z, texLeft, texBottom],
+
+            [displayRight, displayTop, z, texRight, texTop],
+            [displayLeft, displayBottom, z, texLeft, texBottom],
+            [displayRight, displayBottom, z, texRight, texBottom]
+        ], dtype=np.float32) 
+        nVertices = np.float32(vertices.shape[0])
+
+        # write command for display position
+        self.pgl.s.writeCommand("mglMovieSetDisplayPosition")
+        ackTime = self.pgl.s.readAck()
+        self.pgl.s.write(np.uint32(self.movieNum))
+        
+        # write the vertices
+        self.pgl.s.write(np.uint32(nVertices))
+        self.pgl.s.write(vertices)
+        
+        # get command results
+        self.commandResults = self.pgl.s.readCommandResults(ackTime)
+
+
 
     def play(self):
         '''
