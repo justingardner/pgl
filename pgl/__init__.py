@@ -22,6 +22,8 @@ from .pglGammaTable import pglGammaTable
 from .pglVPixx import pglProPixx, pglDataPixx
 from .pglEyeTracker import pglEyeTracker
 from .pglTrackPixx import pglTrackPixx3
+from .pglLabJack import pglLabJack
+
 try:
     import pylink
     from .pglEyelink import pglEyelinkCustomDisplay, pglEyelink
