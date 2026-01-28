@@ -137,6 +137,7 @@ class pglLabJack(pglDevice):
         Stop the analog reading and plot the data
         '''
         if not self.isReading: return
+        self.isReading = False
         
         # Wait for acquisition to finish
         self.acquisitionThread.join()
