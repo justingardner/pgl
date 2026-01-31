@@ -277,12 +277,12 @@ class pglBase:
             None
 
         Returns:
-            bool: True if the flush command was sent successfully, False otherwise.
+            drawablePresented: Returns the time the frame was presented or None if unsuccessful.
         """
         # make sure that a screen is open
         if self.isOpen() is False: 
             print(f"(pglBase:flush) ❌ No screen is open")
-            return False
+            return None
         self.s.writeCommand("mglFlush")
         self.commandResults = self.s.readCommandResults()
         
@@ -307,7 +307,7 @@ class pglBase:
         self.currentLine = 1
         
         # success
-        return True
+        return self.commandResults.get('drawablePresented', None)
     
     ################################################################
     # setDesiredFrameRate
