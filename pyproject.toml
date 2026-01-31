@@ -1,0 +1,13 @@
+[build-system]
+requires = [
+    "setuptools>=64",
+    "wheel",
+    "numpy"
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pgl"
+version = "0.1.0"
+description = "PGL Psychophysics and experiment library"
+requires-python = ">=3.9"
