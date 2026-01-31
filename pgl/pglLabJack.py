@@ -134,9 +134,12 @@ class pglLabJack(pglDevice):
 
     def stopAnalogRead(self):
         '''
-        Stop the analog reading and plot the data
+        Stop the analog reading and plot the data and get data
+        Returns:
+            tuple: (time array, data array)
+        
         '''
-        if self.h is None or not self.isReading: return
+        if self.h is None or not self.isReading: return None, None
         self.isReading = False
         
         # Wait for acquisition to finish
@@ -146,14 +149,28 @@ class pglLabJack(pglDevice):
         with self.bufferLock:
             data = np.array(self.analogBuffer)
 
-        # Plot result
+        # create time array
+        time = np.linspace(self.analogStartTimestamp, self.analogStartTimestamp + self.analogStreamDuration, len(data))
+        
+        return time, data
+
+    def plotAnalogRead(self, time, data):
+        '''
+        Plot the analog read data
+
+        Args:
+            time (array): Time array
+            data (array): Data array
+        '''
+        if time is None or data is None:
+            print("(pglLabJack:plotAnalogRead) No data to plot.")
+            return
         plt.figure()
-        plt.plot(np.linspace(0, self.analogStreamDuration, len(data)), data)
+        plt.plot(time, data)
         plt.xlabel("Time (s)")
         plt.ylabel("Voltage (V)")
-        plt.title("AIN0 Acquisition")
+        plt.title("LabJack Analog Input")
         plt.show()
-
 
     
     def start(self):
