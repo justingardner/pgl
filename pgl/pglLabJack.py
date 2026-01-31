@@ -67,7 +67,7 @@ class pglLabJack(pglDevice):
             
             # timestamp utility
             self.pglTimestamp = pglTimestamp()
-            
+                        
     def __repr__(self):
         if self.h is None:
             return "<pglLabJack device not connected>"
@@ -136,7 +136,7 @@ class pglLabJack(pglDevice):
         '''
         Stop the analog reading and plot the data
         '''
-        if not self.isReading: return
+        if self.h is None or not self.isReading: return
         self.isReading = False
         
         # Wait for acquisition to finish

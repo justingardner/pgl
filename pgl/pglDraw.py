@@ -344,6 +344,57 @@ class pglDraw:
         # read the command results
         self.s.readCommandResults()
 
+    ################################################################
+    # rect
+    ################################################################
+    def rect(self, x=0, y=0, width=1, height=1, color=[1, 1, 1], hAlign='center', vAlign='center', units=None):
+        '''
+        Draw a quad
+
+        Args:
+            x (float): x coordinate of the center of the rectangle
+            y (float): y coordinate of the center of the rectangle
+            width (float): width of the rectangle
+            height (float): height of the rectangle
+            color (list or tuple, optional): RGB color values as a list or tuple of three floats in the range [0, 1].
+            hAlign (str): horizontal alignment of the rectangle ('center', 'left', 'right'). Defaults to center
+            vAlign (str): vertical alignment of the rectangle ('center', 'top', 'bottom'). Defaults to center
+        '''
+        # calculate the vertices
+        if hAlign.lower() == 'center':
+            x1 = x - width / 2
+            x2 = x + width / 2
+        elif hAlign.lower() == 'left':
+            x1 = x
+            x2 = x + width
+        elif hAlign.lower() == 'right':
+            x1 = x - width
+            x2 = x
+        else:
+            print(f"(pglDraw:rect) Invalid hAlign '{hAlign}'. Using 'center'.")
+            x1 = x - width / 2
+            x2 = x + width / 2
+            
+        if vAlign.lower() == 'center':
+            y1 = y - height / 2
+            y2 = y + height / 2
+        elif vAlign.lower() == 'top':
+            y1 = y
+            y2 = y + height
+        elif vAlign.lower() == 'bottom':
+            y1 = y - height
+            y2 = y
+        else:
+            print(f"(pglDraw:rect) Invalid vAlign '{vAlign}'. Using 'center'.")
+            y1 = y - height / 2
+            y2 = y + height / 2
+            
+        vertices = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32)
+        self.quad(vertices, color=color, units=units)
+            
+            
+            
+
     ####################################################
     # validate color
     ####################################################

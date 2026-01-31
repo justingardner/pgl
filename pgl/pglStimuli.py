@@ -430,7 +430,27 @@ class pglStimuli:
                                                                           temporalSquareWave=temporalSquareWave)
         return checkerboardStimulus
 
+    ####################################################
+    # flicker
+    ####################################################
+    def flicker(self, pgl, temporalFrequency=None, x=None, y=None, width=None, height=None, type='square'):
+        '''
+        Full screen flicker stimulus
+        
+        Args:
+            temporalFrequency (float): Temporal frequency of the flicker in Hz. If None, defaults to half the frame rate.
+            type (str): Type of flicker ('square' or 'sinusoidal'). Default is 'square'.
+            x (float): X position of the center of the flicker in degrees. If None, defaults to 0.
+            y (float): Y position of the center of the flicker in degrees. If None, defaults to 0.
+            width (float): Width of the flicker in degrees. If None, defaults to screen width.
+            height (float): Height of the flicker in degrees. If None, defaults to screen height.
+        '''
+        flickerStimulus = pglStimulusFlicker(pgl, temporalFrequency, type, x, y, width, height)
+        return flickerStimulus
 
+################################################################
+# Basre stimulus class
+################################################################
 class _pglStimulus:
     '''
     Base class for all stimuli.
@@ -453,6 +473,83 @@ class _pglStimulus:
         '''
         raise NotImplementedError("(_pglStimulus) Subclasses must implement this method.")
 
+################################################################
+# Full screen flicker stimulus
+################################################################
+class pglStimulusFlicker(_pglStimulus):
+    '''
+    Base class for random dot stimuli.
+    
+    Args:
+        pgl: pgl instance
+        temporalFrequency (float): Temporal frequency of the flicker in Hz. If None, defaults to half the frame rate.
+        type (str): Type of flicker ('square' or 'sinusoidal'). Default is 'square'.
+        x (float): X position of the center of the flicker in degrees. If None, defaults to 0.
+        y (float): Y position of the center of the flicker in degrees. If None, defaults to 0.
+        width (float): Width of the flicker in degrees. If None, defaults to screen width.
+        height (float): Height of the flicker in degrees. If None, defaults to
+    '''
+    def __init__(self, pgl, temporalFrequency=None, type='square', x=None, y=None, width=None, height=None):
+        # call init function of parent class
+        super().__init__(pgl)
+        self.temporalFrequency = temporalFrequency
+        self.type = type
+        self.x = x
+        self.y = y
+        self.width = width
+        self.height = height
+
+        # get frame rate
+        self.frameRate = pgl.getFrameRate()
+
+        # set temporal frequency
+        if temporalFrequency is None:
+            self.temporalFrequency = self.frameRate / 2
+        if width is None:
+            self.width = pgl.screenWidth.deg
+        if height is None:
+            self.height = pgl.screenHeight.deg
+        if x is None:
+            self.x = 0
+        if y is None:
+            self.y = 0
+            
+        # interpret type
+        if type.lower() in ['sinusoidal', 'sine', 'sin']:
+            self.type = 0
+        elif type.lower() in ['square']:
+            self.type = 1
+        else:
+            print(f"(pgl:pglStimulusFlicker:init) Unknown type '{type}'. Defaulting to square")
+            self.type = 1
+            
+        # initialize start time
+        self.startTime = -1
+
+        
+    def __repr__(self):
+        return f"<pglStimulusFlicker: temporalFrequency={self.temporalFrequency}, type={self.type}, x={self.x}, y={self.y}, width={self.width}, height={self.height}>"
+
+    def display(self):
+        '''
+        Display the flicker stimulus
+        '''
+        if self.startTime == -1:
+            self.startTime = self.pgl.getSecs()
+        # get elapsed time
+        elapsedTime = self.pgl.getSecs() - self.startTime
+        # compute phase
+        phase = (elapsedTime * self.temporalFrequency) % 1.0
+        if self.type == 0:
+            # sinusoidal flicker
+            intensity = (np.sin(2 * np.pi * phase) + 1) / 2
+        else:
+            # square flicker
+            intensity = 1.0 if phase < 0.5 else 0.0
+        
+        # draw the rectangle
+        self.pgl.rect(self.x, self.y, self.width, self.height, color=[intensity, intensity, intensity])
+            
 ################################################################
 # Random dot stimulus class
 ################################################################
@@ -1016,6 +1113,11 @@ class pglStimulusMovie(_pglStimulus):
     width = 0
     height = 0
     
+    # arrays of timestamps to be filled in by drawFrames
+    drawFrameTimes = []
+    targetPresentationTimestamps = []
+    movieTimes = []
+    
     def __init__(self, pgl, filename="", x=0, y=0, displayWidth=0, displayHeight=0, xAlign=0, yAlign=0):
         '''
         Initialize the movie stimulus with a movie instance.
@@ -1142,8 +1244,6 @@ class pglStimulusMovie(_pglStimulus):
         # get command results
         self.commandResults = self.pgl.s.readCommandResults(ackTime)
 
-
-
     def play(self):
         '''
         play the Movie.
@@ -1175,24 +1275,19 @@ class pglStimulusMovie(_pglStimulus):
 
         # display frame statistics if versbose is set
         if self.pgl.verbose>0:
-            self.displayFrameStatistics(
-                self.drawFrameTimes,
-                self.targetPresentationTimestamps,
-                self.presentedTimes,
-                self.movieTimes
-            )
+            self.displayFrameStatistics()
 
     # display frame statistics    
-    def displayFrameStatistics(self,  drawFrameTimes, targetPresentationTimestamps, presentedTimes, movieTimes):
+    def displayFrameStatistics(self):
         
         # offset all time values to the first non-zero presentation timestamp
-        offsetValue = next((v for v in targetPresentationTimestamps if v != 0), 0)
-        drawFrameTimes = 1000*(drawFrameTimes - offsetValue)
-        targetPresentationTimestamps = 1000*(targetPresentationTimestamps - offsetValue)
-        presentedTimes = np.where((presentedTimes == -1) | (presentedTimes == 0), -1, 1000 * (presentedTimes - offsetValue))
+        offsetValue = next((v for v in self.targetPresentationTimestamps if v != 0), 0)
+        drawFrameTimes = 1000*(self.drawFrameTimes - offsetValue)
+        targetPresentationTimestamps = 1000*(self.targetPresentationTimestamps - offsetValue)
+        presentedTimes = np.where((self.presentedTimes == -1) | (self.presentedTimes == 0), -1, 1000 * (self.presentedTimes - offsetValue))
         
         # convert movie time to ms
-        movieTimes = np.where((movieTimes == -1), -1, 1000 * movieTimes)
+        movieTimes = np.where((self.movieTimes == -1), -1, 1000 * self.movieTimes)
         
         # compute how long each frame was presented for, i.e. the difference
         # between consecutive presentedTimes, but put -1 if either value is -1
@@ -1321,10 +1416,11 @@ class pglStimulusMovie(_pglStimulus):
         ackTime = self.pgl.s.readAck()
         self.pgl.s.write(np.uint32(self.movieNum))
 
-        frameTime = self.pgl.s.read(np.float64)
-        print(f"(pglStimulusMovie:status) frameTime: {frameTime}")
+        self.drawFrameTimes.append(self.pgl.s.read(np.float64))
+        self.targetPresentationTimestamps.append(self.pgl.s.read(np.float64))
+        self.movieTimes.append(self.pgl.s.read(np.float64))
+
         self.commandResults = self.pgl.s.readCommandResults(ackTime)
-        #print(self.pgl.commandResults)
 
     def status(self):
         '''
