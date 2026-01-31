@@ -1,0 +1,10 @@
+Metadata-Version: 2.4
+Name: pgl
+Version: 0.1.0
+Summary: PGL Psychophysics and experiment library
+Author: Justin Gardner
+Author-email: justin@justingardner.net
+Requires-Python: >=3.9
+Dynamic: author
+Dynamic: author-email
+Dynamic: requires-python
