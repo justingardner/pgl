@@ -17,12 +17,14 @@ from .pglStaircase import pglStaircase
 from ._pglComm import pglSerial
 from .pglCalibration import pglCalibration, pglCalibrationDeviceMinolta 
 from .pglGammaTable import pglGammaTable 
+from .pglSettings import pglScreenSettings
 
 # Device specific imports (eye trackers, etc.)
 from .pglVPixx import pglProPixx, pglDataPixx
 from .pglEyeTracker import pglEyeTracker
 from .pglTrackPixx import pglTrackPixx3
 from .pglLabJack import pglLabJack
+
 
 try:
     import pylink
