@@ -145,15 +145,18 @@ class pglSettings(HasTraits):
 
             # Float
             if isinstance(trait, Float):
+                traitMin = getattr(trait,'min', 0)
+                traitMax = getattr(trait,'max', 1)
+                stepSize = (traitMax - traitMin) / 100
                 slider = widgets.FloatSlider(
-                    min=0, max=1, step=0.01,
+                    min=traitMin, max=traitMax, step=stepSize,
                     description=traitName,
                     style=style,
                     layout=widgets.Layout(width='calc(100% - 100px)'),
                     tooltip=f"{traitName}: float value"
                 )
                 text = widgets.BoundedFloatText(
-                    min=0, max=1, step=0.01,
+                    min=traitMin, max=traitMax, step=stepSize,
                     layout=widgets.Layout(width='100px'),
                     tooltip=f"{traitName}: float value"
                 )
@@ -231,10 +234,10 @@ class pglSettings(HasTraits):
 
 # Screen settings
 class pglScreenSettings(pglSettings):
-    alpha = Float(0.5)
+    alpha = Float(0.5, min=0.0, max=1.0)
     n_iter = Int(100)
     name = Unicode("test")
     options = Unicode("Option 1")
-    distance = Float(1.0)
-    width = Float(10.0)
-    height = Float(5.0)
+    distance = Float(1.0, min = 0.0, max = 10000.0)
+    width = Float(10.0, min = 0.0, max = 10000.0)
+    height = Float(5.0, min = 0.0, max = 10000.0)
