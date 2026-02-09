@@ -152,13 +152,16 @@ class pglSettings(HasTraits):
         """Automatically create widgets for all traits in self."""
         style = {'description_width': '120px'}
         widgetRows = []
+        allHelpText = ""
 
         for traitName, trait in self.getOrderedTraits().items():
             if traitName.startswith('_'):
                 continue  # skip private traits
             
-            # get helpText
+            # get helpText and add to allHelpText
             helpText = getattr(trait, 'help', f"{traitName}: float value")
+            if helpText:
+                allHelpText += f"<b>{traitName}:</b> {helpText}<br>"
             
             # Float
             if isinstance(trait, Float) and trait.min is not None and trait.max is not None:
@@ -269,8 +272,26 @@ class pglSettings(HasTraits):
                 #link((self, traitName), (wDropdown, 'value'))
                 wDropdown.observe(partial(self.onListSelect, wDropdown, traitName), names='value')
                 widgetRows.append(wDropdown)
+        # make helpWidget
+        helpWidget = widgets.HTML(allHelpText)
+        helpWidget.layout.display = 'none'  # hidden by default
+        helpWidget.add_class("help-text")
 
-        return widgetRows
+        # --- Button to toggle help display ---
+        helpButton = widgets.Button(
+            description="Show Help",
+            button_style='info',
+            layout=widgets.Layout(width='120px')
+        )
+        helpButton.on_click(partial(self.toggleHelp, helpWidget=helpWidget))
+        
+        # pack up widgetRows, buttons and help
+        widgetDisplay = widgetRows + [widgets.HBox([helpButton]), helpWidget]
+        
+        return widgetDisplay
+
+    def toggleHelp(self, helpButton, helpWidget):
+        helpWidget.layout.display = 'block' if helpWidget.layout.display == 'none' else 'none'
 
     def onListSelect(self, dropdownWidget, traitName, change):
         # get the selected and currentList
@@ -302,17 +323,17 @@ class pglSettings(HasTraits):
             textWidget.layout.border = "2px solid red"
             
             
-    # ----- Put up edit dialof ---- #
+    # ----- Put up edit dialog ---- #
     def edit(self):
         # setup css styles
         self.setupDisplayStyle()
         
         # make widgets for each parameter
-        widgetRows = self.makeWidgets()
+        widgetDisplay = self.makeWidgets()
         
         # --- Container for widgets display ---
         widgetsBox = widgets.Box(
-            widgetRows,
+            widgetDisplay,
             layout=widgets.Layout(
                 display='flex',
                 flex_flow='column',
