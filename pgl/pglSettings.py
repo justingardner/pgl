@@ -285,10 +285,36 @@ class pglSettings(HasTraits):
         )
         helpButton.on_click(partial(self.toggleHelp, helpWidget=helpWidget))
         
-        # pack up widgetRows, buttons and help
-        widgetDisplay = widgetRows + [widgets.HBox([helpButton]), helpWidget]
+        # --- Button for save ---
+        saveButton = widgets.Button(
+            description="Save settings",
+            button_style='info',
+            layout=widgets.Layout(width='120px')
+        )
+        saveButton.on_click(partial(self.onSave))
         
+        
+        # --- Button for cancel ---
+        cancelButton = widgets.Button(
+            description="Cancel",
+            button_style='info',
+            layout=widgets.Layout(width='120px')
+        )
+        cancelButton.on_click(partial(self.onCancel))
+
+        # pack up widgetRows, buttons and help
+        widgetDisplay = widgetRows + [widgets.HBox([cancelButton, saveButton, widgets.Box(layout=widgets.Layout(flex='1')), helpButton]), helpWidget]
+
         return widgetDisplay
+    
+    def onCancel(self, cancelButton):
+        self.wrapper.layout.display = 'none'
+        pass
+        
+    # must be defined by subclass
+    def onSave(self, saveButton):
+        self.wrapper.layout.display = 'none'
+        pass
 
     def toggleHelp(self, helpButton, helpWidget):
         helpWidget.layout.display = 'block' if helpWidget.layout.display == 'none' else 'none'
@@ -344,7 +370,7 @@ class pglSettings(HasTraits):
         widgetsBox.add_class("dark-widget-card")
 
         # --- Centering wrapper ---
-        wrapper = widgets.Box(
+        self.wrapper = widgets.Box(
             [widgetsBox],
             layout=widgets.Layout(
                 display='flex',
@@ -355,14 +381,15 @@ class pglSettings(HasTraits):
         )
 
         # display
-        display(wrapper)
+        display(self.wrapper)
 
 
 
 
 # Screen settings
 class pglScreenSettings(pglSettings):
-    displayName = List(Unicode(), default_value=["Default", "Add Display"], help="Display name for these settings")
+    #displayName = List(Unicode(), default_value=["Default", "Add Display"], help="Display name for these settings")
+    displayName = Unicode("Default", help="Display name for these settings")
     screenNumber = Int(0, min=0, max=2, step=1, help="Screen number, 0 for window, 1 for main, 2 for secondary etc")
     displayDistance = Float(57.0, min = 0.0, step=0.1, max=None, help="Distance in cm from subject to screen")
     displayWidth = Float(32.0, min = 0.0, step=0.1, max=None, help="Display width in cm")
@@ -370,4 +397,24 @@ class pglScreenSettings(pglSettings):
     
     dataPath = Unicode("~/data",help="Path to data directory").tag(isPath=True)
     #options = List(Unicode(), default_value=["Option 1","Option 2"], help="List of options")
+    
+    def onSave(self, saveButton):
+        # get the screenSetttingsDir
+        screenSettingsDir = Path.home() / ".pgl" / "screenSettings"
 
+        # check if it exists, create if not
+        if not screenSettingsDir.exists():
+            try:
+                screenSettingsDir.mkdir(parents=True, exist_ok=True)
+                print(f"(pglScreenSettings:onSave) Created directory: {screenSettingsDir}")
+            except Exception as e:
+                display(HTML(f"<b>(pglScreenSettings:onSave)</b> Error creating directory {screenSettingsDir}: {e}"))
+                return
+        
+        # get the name 
+        settingsFilename = screenSettingsDir / self.displayName
+        settingsFilename = settingsFilename.with_suffix(".json")
+        
+        # save it
+        self.save(settingsFilename)
+        display(HTML(f"<b>Saved settings to:</b> {settingsFilename}"))
