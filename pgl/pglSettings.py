@@ -8,12 +8,16 @@
 #############
 # Import
 #############
+from collections import OrderedDict
 from curses import wrapper
+from pathlib import Path
 from IPython.display import display, HTML
 import ipywidgets as widgets
 from fileinput import filename
-from traitlets import HasTraits, Float, Int, TraitError, Unicode, Dict, link
+from ipywidgets.widgets import widget
+from traitlets import HasTraits, Float, Int, List, TraitError, Unicode, Dict, link, Bool, TraitType
 import json
+from functools import partial
 
 
 #############
@@ -133,47 +137,103 @@ class pglSettings(HasTraits):
         }
         </style>
         """))
-    
+        
+    # gets the traits in the order that they are defined
+    @classmethod
+    def getOrderedTraits(cls):
+        """Return traits defined in this class (not inherited), in definition order."""
+        ordered = OrderedDict()
+        for name, obj in cls.__dict__.items():
+            if isinstance(obj, TraitType):
+                ordered[name] = obj
+        return ordered
+
     def makeWidgets(self):
         """Automatically create widgets for all traits in self."""
         style = {'description_width': '120px'}
         widgetRows = []
 
-        for traitName, trait in self.traits().items():
+        for traitName, trait in self.getOrderedTraits().items():
             if traitName.startswith('_'):
                 continue  # skip private traits
-
+            
+            # get helpText
+            helpText = getattr(trait, 'help', f"{traitName}: float value")
+            
             # Float
-            if isinstance(trait, Float):
-                traitMin = getattr(trait,'min', 0)
-                traitMax = getattr(trait,'max', 1)
-                stepSize = (traitMax - traitMin) / 100
+            if isinstance(trait, Float) and trait.min is not None and trait.max is not None:
+                traitStep = getattr(trait, 'step', (trait.max - trait.min) / 100)
                 slider = widgets.FloatSlider(
-                    min=traitMin, max=traitMax, step=stepSize,
+                    min=trait.min, max=trait.max, step=traitStep,
                     description=traitName,
                     style=style,
                     layout=widgets.Layout(width='calc(100% - 100px)'),
-                    tooltip=f"{traitName}: float value"
+                    tooltip=helpText
                 )
                 text = widgets.BoundedFloatText(
-                    min=traitMin, max=traitMax, step=stepSize,
+                    min=trait.min, max=trait.max, step=traitStep,
                     layout=widgets.Layout(width='100px'),
-                    tooltip=f"{traitName}: float value"
+                    tooltip=helpText
                 )
+                # link slider and text to trait
                 link((self, traitName), (slider, 'value'))
                 link((self, traitName), (text, 'value'))
+                # add as a row to the widgets
                 widgetRows.append(widgets.HBox([slider, text]))
 
+            elif isinstance(trait, Float) and trait.min is not None:
+                wFloat = widgets.BoundedFloatText(
+                    description=traitName,
+                    min=trait.min,
+                    style=style,
+                    layout=widgets.Layout(width='100%'),
+                    tooltip=helpText
+                )
+                # traitlets will enforce min when the trait is updated
+                link((self, traitName), (wFloat, 'value'))
+
+                # add it to widgets
+                widgetRows.append(wFloat)
+
+            elif isinstance(trait, Float):
+                wFloat = widgets.FloatText(
+                    description=traitName,
+                    style=style,
+                    layout=widgets.Layout(width='100%'),
+                    tooltip=helpText
+                )
+                # traitlets will enforce min when the trait is updated
+                link((self, traitName), (wFloat, 'value'))
+
+                # add it to widgets
+                widgetRows.append(wFloat)
+            
             # Int
             elif isinstance(trait, Int):
                 wInt = widgets.IntText(
                     description=traitName,
                     style=style,
                     layout=widgets.Layout(width='100%'),
-                    tooltip=f"{traitName}: integer value"
+                    tooltip=helpText
                 )
                 link((self, traitName), (wInt, 'value'))
                 widgetRows.append(wInt)
+
+            elif isinstance(trait, Unicode) and trait.metadata.get("isPath", False):
+                wPath = widgets.Text(
+                    description=traitName,
+                    style=style,
+                    layout=widgets.Layout(width='100%'),
+                    tooltip=helpText
+                )
+                # link the widget with the trait
+                link((self, traitName), (wPath, 'value'))
+                
+                # set on_submit for path changes
+                wPath.on_submit(partial(self.onPathSubmit, traitName=traitName))
+                
+                #append the path widget
+                widgetRows.append(wPath)
 
             # Unicode
             elif isinstance(trait, Unicode):
@@ -181,29 +241,75 @@ class pglSettings(HasTraits):
                     description=traitName,
                     style=style,
                     layout=widgets.Layout(width='100%'),
-                    tooltip=f"{traitName}: text value"
+                    tooltip=helpText
                 )
                 link((self, traitName), (wText, 'value'))
                 widgetRows.append(wText)
-
+            
             # Bool
             elif isinstance(trait, Bool):
                 wBool = widgets.Checkbox(
                     description=traitName,
                     value=getattr(self, traitName),
-                    tooltip=f"{traitName}: boolean value"
+                    tooltip=helpText
                 )
                 link((self, traitName), (wBool, 'value'))
                 widgetRows.append(wBool)
+            # List
+            elif isinstance(trait, List):
+                currentList = getattr(self, traitName)
+                wDropdown = widgets.Dropdown(
+                    options=currentList,
+                    value=currentList[0],
+                    description=traitName,
+                    style=style,
+                    layout=widgets.Layout(width='100%'),
+                    tooltip=helpText
+                )
+                #link((self, traitName), (wDropdown, 'value'))
+                wDropdown.observe(partial(self.onListSelect, wDropdown, traitName), names='value')
+                widgetRows.append(wDropdown)
+
         return widgetRows
 
+    def onListSelect(self, dropdownWidget, traitName, change):
+        # get the selected and currentList
+        selected = change['new']
+        currentList = list(getattr(self, traitName))
 
+        # not in current list
+        if selected not in currentList:
+            return
 
+        # Move selected item to top of list
+        newList = [selected] + [x for x in currentList if x != selected]
+
+        # now set to this newList
+        setattr(self, traitName, newList)
+
+    def onPathSubmit(self, textWidget, traitName):
+        raw = textWidget.value
+        try:
+            path = Path(raw).expanduser()
+
+            if not path.exists():
+                # set the border to indicate no change
+                textWidget.layout.border = '2px solid red'
+            else:
+                #self.dataPath = str(path)            
+                textWidget.layout.border = '2px solid green'
+        except Exception:
+            textWidget.layout.border = "2px solid red"
+            
+            
+    # ----- Put up edit dialof ---- #
     def edit(self):
         # setup css styles
         self.setupDisplayStyle()
+        
         # make widgets for each parameter
         widgetRows = self.makeWidgets()
+        
         # --- Container for widgets display ---
         widgetsBox = widgets.Box(
             widgetRows,
@@ -227,6 +333,7 @@ class pglSettings(HasTraits):
             )   
         )
 
+        # display
         display(wrapper)
 
 
@@ -234,10 +341,12 @@ class pglSettings(HasTraits):
 
 # Screen settings
 class pglScreenSettings(pglSettings):
-    alpha = Float(0.5, min=0.0, max=1.0)
-    n_iter = Int(100)
-    name = Unicode("test")
-    options = Unicode("Option 1")
-    distance = Float(1.0, min = 0.0, max = 10000.0)
-    width = Float(10.0, min = 0.0, max = 10000.0)
-    height = Float(5.0, min = 0.0, max = 10000.0)
+    displayName = List(Unicode(), default_value=["Default", "Add Display"], help="Display name for these settings")
+    screenNumber = Int(0, min=0, max=2, step=1, help="Screen number, 0 for window, 1 for main, 2 for secondary etc")
+    displayDistance = Float(57.0, min = 0.0, step=0.1, max=None, help="Distance in cm from subject to screen")
+    displayWidth = Float(32.0, min = 0.0, step=0.1, max=None, help="Display width in cm")
+    displayHeight = Float(18.0, min = 0.0, step=0.1, max=None, help="Display height in cm")
+    
+    dataPath = Unicode("~/data",help="Path to data directory").tag(isPath=True)
+    #options = List(Unicode(), default_value=["Option 1","Option 2"], help="List of options")
+
