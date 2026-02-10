@@ -437,5 +437,5 @@ class pglScreenSettings(pglSettings):
         pgl.visualAngle(self.displayDistance,self.displayWidth,self.displayHeight)
         pgl.bullseye()
         pgl.flush()
-        pgl.waitSecs(2)
+        pgl.waitSecs(10)
         pgl.close()

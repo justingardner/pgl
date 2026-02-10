@@ -433,7 +433,7 @@ class pglStimuli:
     ####################################################
     # flicker
     ####################################################
-    def flicker(self, pgl, temporalFrequency=None, x=None, y=None, width=None, height=None, type='square'):
+    def flicker(self, pgl, temporalFrequency=None, x=None, y=None, width=None, height=None, type='square', phase=0.0):
         '''
         Full screen flicker stimulus
         
@@ -444,8 +444,9 @@ class pglStimuli:
             y (float): Y position of the center of the flicker in degrees. If None, defaults to 0.
             width (float): Width of the flicker in degrees. If None, defaults to screen width.
             height (float): Height of the flicker in degrees. If None, defaults to screen height.
+            phase (float): Phase of the flicker in degrees. Default is 0.
         '''
-        flickerStimulus = pglStimulusFlicker(pgl, temporalFrequency, type, x, y, width, height)
+        flickerStimulus = pglStimulusFlicker(pgl, temporalFrequency, type, x, y, width, height, phase)
         return flickerStimulus
 
 ################################################################
@@ -487,9 +488,10 @@ class pglStimulusFlicker(_pglStimulus):
         x (float): X position of the center of the flicker in degrees. If None, defaults to 0.
         y (float): Y position of the center of the flicker in degrees. If None, defaults to 0.
         width (float): Width of the flicker in degrees. If None, defaults to screen width.
-        height (float): Height of the flicker in degrees. If None, defaults to
+        height (float): Height of the flicker in degrees. If None, defaults to screen height.
+        phase (float): Phase of the flicker in degrees. Default is 0.
     '''
-    def __init__(self, pgl, temporalFrequency=None, type='square', x=None, y=None, width=None, height=None):
+    def __init__(self, pgl, temporalFrequency=None, type='square', x=None, y=None, width=None, height=None, phase=0.0):
         # call init function of parent class
         super().__init__(pgl)
         self.temporalFrequency = temporalFrequency
@@ -498,7 +500,8 @@ class pglStimulusFlicker(_pglStimulus):
         self.y = y
         self.width = width
         self.height = height
-
+        self.phase = 2*np.pi*phase/360
+        
         # get frame rate
         self.frameRate = pgl.getFrameRate()
 
@@ -533,23 +536,36 @@ class pglStimulusFlicker(_pglStimulus):
     def display(self):
         '''
         Display the flicker stimulus
+    
+        Returns:
+            bool: True if a new cycle just started on this frame, False otherwise
         '''
         if self.startTime == -1:
             self.startTime = self.pgl.getSecs()
+            self.lastCycleCount = 0
+    
         # get elapsed time
         elapsedTime = self.pgl.getSecs() - self.startTime
-        # compute phase
-        phase = (elapsedTime * self.temporalFrequency) % 1.0
+    
+        # compute phase and cycle count
+        phase = self.phase + 2 * np.pi * (elapsedTime * self.temporalFrequency % 1.0)
+        currentCycleCount = int(elapsedTime * self.temporalFrequency)
+    
+        # detect new cycle
+        newCycle = (currentCycleCount > self.lastCycleCount)
+        self.lastCycleCount = currentCycleCount
+    
         if self.type == 0:
             # sinusoidal flicker
-            intensity = (np.sin(2 * np.pi * phase) + 1) / 2
+            intensity = (np.sin(phase) + 1) / 2
         else:
             # square flicker
-            intensity = 1.0 if phase < 0.5 else 0.0
-        
+            intensity = 1.0 if phase < np.pi else 0.0
+    
         # draw the rectangle
         self.pgl.rect(self.x, self.y, self.width, self.height, color=[intensity, intensity, intensity])
-            
+    
+        return newCycle          
 ################################################################
 # Random dot stimulus class
 ################################################################
