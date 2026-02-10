@@ -294,6 +294,20 @@ class pglSettings(HasTraits):
         saveButton.on_click(partial(self.onSave))
         
         
+        # --- Button for test ---
+        testButton = widgets.Button(
+            description="Test settings",
+            button_style='info',
+            layout=widgets.Layout(width='120px')
+        )
+        
+        # if there is no onTest method defined by the subclass, hide the test button, otherwise link it to the onTest method
+        if not hasattr(self, 'onTest'):
+            testButton.layout.display = 'none'
+        else:
+            testButton.on_click(partial(self.onTest))
+            
+
         # --- Button for cancel ---
         cancelButton = widgets.Button(
             description="Cancel",
@@ -303,7 +317,7 @@ class pglSettings(HasTraits):
         cancelButton.on_click(partial(self.onCancel))
 
         # pack up widgetRows, buttons and help
-        widgetDisplay = widgetRows + [widgets.HBox([cancelButton, saveButton, widgets.Box(layout=widgets.Layout(flex='1')), helpButton]), helpWidget]
+        widgetDisplay = widgetRows + [widgets.HBox([cancelButton, saveButton, testButton, widgets.Box(layout=widgets.Layout(flex='1')), helpButton]), helpWidget]
 
         return widgetDisplay
     
@@ -313,7 +327,6 @@ class pglSettings(HasTraits):
         
     # must be defined by subclass
     def onSave(self, saveButton):
-        self.wrapper.layout.display = 'none'
         pass
 
     def toggleHelp(self, helpButton, helpWidget):
@@ -383,9 +396,6 @@ class pglSettings(HasTraits):
         # display
         display(self.wrapper)
 
-
-
-
 # Screen settings
 class pglScreenSettings(pglSettings):
     #displayName = List(Unicode(), default_value=["Default", "Add Display"], help="Display name for these settings")
@@ -406,7 +416,7 @@ class pglScreenSettings(pglSettings):
         if not screenSettingsDir.exists():
             try:
                 screenSettingsDir.mkdir(parents=True, exist_ok=True)
-                print(f"(pglScreenSettings:onSave) Created directory: {screenSettingsDir}")
+                display(HTML(f"<b>(pglScreenSettings:onSave)</b> Created directory: {screenSettingsDir}"))
             except Exception as e:
                 display(HTML(f"<b>(pglScreenSettings:onSave)</b> Error creating directory {screenSettingsDir}: {e}"))
                 return
@@ -418,3 +428,14 @@ class pglScreenSettings(pglSettings):
         # save it
         self.save(settingsFilename)
         display(HTML(f"<b>Saved settings to:</b> {settingsFilename}"))
+
+    def onTest(self, testButton):
+        from pgl import pgl
+        pgl = pgl()
+        pgl.open(self.screenNumber)
+        pgl.waitSecs(0.2)
+        pgl.visualAngle(self.displayDistance,self.displayWidth,self.displayHeight)
+        pgl.bullseye()
+        pgl.flush()
+        pgl.waitSecs(2)
+        pgl.close()
