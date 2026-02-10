@@ -14,6 +14,7 @@ from PIL import Image, ImageDraw, ImageFont
 import os
 from pathlib import Path
 from pgl.pglImage import pglImageInstance
+import math
 
 #############
 # Drawing class
@@ -450,7 +451,60 @@ class pglDraw:
 
         return(color)
     
-    
+    ####################################################
+    # bullseye
+    ####################################################
+    def bullseye(self):
+        '''
+        Draw a bullseye stimulus. Used for visualizing screen dimensions
+        '''
+        # get width and height of screen in degrees
+        maxRadius = math.ceil(math.sqrt(self.screenWidth.deg**2 + self.screenHeight.deg**2)/2) + 1
+        
+        # make concentric circles
+        radiusSteps = 0.5
+        for iRadius, innerRadius in enumerate(np.arange(-0.25, maxRadius, radiusSteps)):
+            # compute outerRadius
+            outerRadius = innerRadius + radiusSteps
+            # alternate colors for each ring of the bullseye
+            color = [0, 0, 0] if iRadius % 2 else [0.2, 0.2, 0.2]
+            # if a multiple of 5, make it red to help visualize the dimensions
+            if iRadius % 5 == 0: color = [0.2, 0, 0]
+            if iRadius % 10 == 0: color = [0.3, 0, 0]
+            # draw the circle
+            self.arc(x=0, y=0, innerRadius=innerRadius, outerRadius=outerRadius, startAngle=0, stopAngle=2*np.pi, color=color, borderSize=0)
+
+        # fontSize
+        fontSize = 40
+        
+        # display vertical text labels
+        for iRadius, radius in enumerate(np.arange(2.5, maxRadius, 2.5)):
+            color = [0.8, 0.8, 0.8]
+            if iRadius % 2:
+                self.text(f"{radius:.1f}", x=0, y=radius, color=color, fontSize=fontSize, yAlign=0, xAlign=-1)
+                self.text(f"-{radius:.1f}", x=0, y=-radius, color=color, fontSize=fontSize, yAlign=0, xAlign=-1)
+                self.text(f"{radius:.1f}", x=radius, y=0, color=color, fontSize=fontSize, yAlign=-1, xAlign=0)
+                self.text(f"-{radius:.1f}", x=-radius, y=0, color=color, fontSize=fontSize, yAlign=-1, xAlign=0)
+            else:
+                self.text(f"{radius:.1f}", x=0, y=radius, color=color, fontSize=fontSize, yAlign=0, xAlign=1)
+                self.text(f"-{radius:.1f}", x=0, y=-radius, color=color, fontSize=fontSize, yAlign=0, xAlign=1)
+                self.text(f"{radius:.1f}", x=radius, y=0, color=color, fontSize=fontSize, yAlign=1, xAlign=0)
+                self.text(f"-{radius:.1f}", x=-radius, y=0, color=color, fontSize=fontSize, yAlign=1, xAlign=0)
+        
+        self.text(f"[{self.screenWidth.deg:.1f} x {self.screenHeight.deg:.1f}] degrees", line=-1, xAlign=-1)
+        self.text(f"[{self.screenWidth.pix} x {self.screenHeight.pix}] pixels", line=-2, xAlign=-1)
+        self.text(f"[{self.screenWidth.cm} x {self.screenHeight.cm}] cm", line=-3, xAlign=-1)
+
+        # draw polar angle lines
+        for angle in np.arange(0, 360, 15):
+            angleRad = np.deg2rad(angle)
+            x = maxRadius * np.cos(angleRad)
+            y = maxRadius * np.sin(angleRad)
+            color = 0.8 if angle % 45 == 0 else 0.5
+            self.line(0, 0, x, y, color=color)
+            
+        return
+
     ####################################################
     # arcs
     ####################################################
