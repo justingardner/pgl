@@ -471,6 +471,28 @@ class pglBase:
         return (cpuTime, gpuTime)
 
     ################################################################
+    # getTargetPresentationTimestamp - the time at which the next
+    # frame is scheduled to be presented by the GPU
+    ################################################################
+    def getTargetPresentationTimestamp(self):
+        """
+        Get the timestamps for when the next frame is scheduled to be presented by the GPU
+
+        Returns:
+            double: targetPresentationTimestamp
+        """
+        if self.isOpen() is False:
+            print(f"(pglBase:getTargetPresentationTimestamp) ❌ No screen is open")
+            return 0
+
+        self.s.writeCommand("mglGetTargetPresentationTimestamp")
+        ack = self.s.readAck()
+        targetPresentationTimestamp = self.s.read(np.double)
+        self.commandResults = self.s.readCommandResults(ack)
+
+        return targetPresentationTimestamp
+
+    ################################################################
     # isOpen
     ################################################################
     def isOpen(self):
