@@ -433,9 +433,9 @@ class pglStimuli:
     ####################################################
     # flicker
     ####################################################
-    def flicker(self, pgl, temporalFrequency=None, x=None, y=None, width=None, height=None, type='square', phase=0.0):
+    def flicker(self, pgl, temporalFrequency=None, x=None, y=None, width=None, height=None, type='square', phase=0.0, framewise=False):
         '''
-        Full screen flicker stimulus
+        Uniform flicker stimulus
         
         Args:
             temporalFrequency (float): Temporal frequency of the flicker in Hz. If None, defaults to half the frame rate.
@@ -445,8 +445,10 @@ class pglStimuli:
             width (float): Width of the flicker in degrees. If None, defaults to screen width.
             height (float): Height of the flicker in degrees. If None, defaults to screen height.
             phase (float): Phase of the flicker in degrees. Default is 0.
+            framewise (bool): If True, rather than use timestamps, the stimulus will assume that it is being
+                called every frame and will update the phase based on the number of frames that have passed.
         '''
-        flickerStimulus = pglStimulusFlicker(pgl, temporalFrequency, type, x, y, width, height, phase)
+        flickerStimulus = pglStimulusFlicker(pgl, temporalFrequency, type, x, y, width, height, phase,framewise)
         return flickerStimulus
 
 ################################################################
@@ -490,8 +492,11 @@ class pglStimulusFlicker(_pglStimulus):
         width (float): Width of the flicker in degrees. If None, defaults to screen width.
         height (float): Height of the flicker in degrees. If None, defaults to screen height.
         phase (float): Phase of the flicker in degrees. Default is 0.
+        framewise (bool): If True, rather than use timestamps, the stimulus will assume that it is being
+            called every frame and will update the phase based on the number of frames that have passed. 
+
     '''
-    def __init__(self, pgl, temporalFrequency=None, type='square', x=None, y=None, width=None, height=None, phase=0.0):
+    def __init__(self, pgl, temporalFrequency=None, type='square', x=None, y=None, width=None, height=None, phase=0.0, framewise=False):
         # call init function of parent class
         super().__init__(pgl)
         self.temporalFrequency = temporalFrequency
@@ -528,32 +533,60 @@ class pglStimulusFlicker(_pglStimulus):
             
         # initialize start time
         self.startTime = -1
-
+        
+        # initialize the frameCount used for framewise updates
+        if framewise:
+            self.framewise = True
+            self.frameCount = 0
+            self.framesPerCycle = self.frameRate / self.temporalFrequency
+            if abs(round(self.framesPerCycle) - self.framesPerCycle) < 1e-9:
+                print(f"(pgl:pglStimulusFlicker:init) Warning: temporalFrequency of {self.temporalFrequency} Hz corresponds to a non-integer number of frames per cycle ({self.framesPerCycle}). This may lead to temporal aliasing. Consider choosing a temporal frequency that is a divisor of the frame rate ({self.frameRate} Hz) to avoid this issue. Using {round(self.framesPerCycle)} frames per cycle instead.")
+                self.framesPerCycle = round(self.framesPerCycle)
+        else:
+            self.framewise = False
         
     def __repr__(self):
         return f"<pglStimulusFlicker: temporalFrequency={self.temporalFrequency}, type={self.type}, x={self.x}, y={self.y}, width={self.width}, height={self.height}>"
 
-    def display(self):
+    def display(self, useTargetPresentationTimestamp=True):
         '''
         Display the flicker stimulus
-    
+
+        Args:    
+            useTargetPresentationTimestamp (bool): If True, target presentation timestamp is used, rather that getSecs to decide
+                which phase of the stimulus to show. targetPresentationTimestamp gives the time
+                that Metal predicts that the frame will be displayed (rather than the current cpu time)
+
         Returns:
             bool: True if a new cycle just started on this frame, False otherwise
         '''
-        if self.startTime == -1:
-            self.startTime = self.pgl.getSecs()
-            self.lastCycleCount = 0
+        if self.framewise:
+            # if framewise, we ignore timestamps and just update the phase based on the number of frames that have passed
+            phase = self.phase + 2 * np.pi * (self.frameCount / self.framesPerCycle)
+            newCycle = (self.frameCount % self.framesPerCycle) < 1
+            self.frameCount += 1
+        else:
+            if useTargetPresentationTimestamp:
+                # get the target presentation timestamp for this frame
+                currentTime = self.pgl.getTargetPresentationTimestamp()
+            else:
+                # get the current time using getSecs
+                currentTime = self.pgl.getSecs()
+        
+            if self.startTime == -1:
+                self.startTime = currentTime
+                self.lastCycleCount = 0
     
-        # get elapsed time
-        elapsedTime = self.pgl.getSecs() - self.startTime
+            # get elapsed time
+            elapsedTime = currentTime - self.startTime
     
-        # compute phase and cycle count
-        phase = self.phase + 2 * np.pi * (elapsedTime * self.temporalFrequency % 1.0)
-        currentCycleCount = int(elapsedTime * self.temporalFrequency)
+            # compute phase and cycle count
+            phase = self.phase + 2 * np.pi * (elapsedTime * self.temporalFrequency % 1.0)
+            currentCycleCount = int(elapsedTime * self.temporalFrequency)
     
-        # detect new cycle
-        newCycle = (currentCycleCount > self.lastCycleCount)
-        self.lastCycleCount = currentCycleCount
+            # detect new cycle
+            newCycle = (currentCycleCount > self.lastCycleCount)
+            self.lastCycleCount = currentCycleCount
     
         if self.type == 0:
             # sinusoidal flicker
