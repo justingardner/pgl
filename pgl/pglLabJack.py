@@ -106,28 +106,49 @@ class pglLabJack(pglDevice):
         # configured
         self.digitalOutputConfigured = True
 
-    def digitalOutput(self, state):
+
+    def digitalOutput(self, state, pulseLen=None):
         '''
         Set the digital output state. Call setupDigitalOutput() first to configure the channel.
-    
+
         Args:
             state (bool): True for HIGH, False for LOW
-            
+            pulseLen (float or None): Pulse length in milliseconds. If set, the output
+                                      will return to its original state after this time.
+
         Returns:
-            timestamp (float): Timestamp of when the digital output was set, or None if there was an error.
+            timestamp (float): Timestamp of when the digital output was set,
+                               or None if there was an error.
         '''
+
         if not self.digitalOutputConfigured:
             print("(pglLabJack:setDigitalOutput) Digital output channel not configured. Call setupDigitalOutput() first.")
             return None
-        
-        try:
-            value = 1 if state else 0
-            self.ljm.eWriteName(self.h, self.channel, value)
-        except Exception as e:
-            print(f"(pglLabJack:setDigitalOutput) Error setting {self.channel}: {e}")
-            return None
-        return self.pglTimestamp.getSecs()
 
+        # set state
+        try:
+            self.ljm.eWriteName(self.h, self.channel, 1 if state else 0)
+        except Exception as e:
+            print(f"(pglLabJack:setDigitalOutput) Error reading {self.channel}: {e}")
+            return None
+
+        if pulseLen is not None:
+
+            def restoreState():
+                try:
+                    # wait for pluseLen (in ms)
+                    time.sleep(pulseLen / 1000.0)
+                    # reset the state
+                    self.ljm.eWriteName(self.h, self.channel, 0 if state else 1)
+                except Exception as e:
+                    print(f"(pglLabJack:setDigitalOutput) Error restoring {self.channel}: {e}")
+
+            # start thread to reset state
+            thread = threading.Thread(target=restoreState, daemon=True)
+            thread.start()
+
+        return self.pglTimestamp.getSecs()
+    
     def startAnalogRead(self, duration=2, channels=[0], scanRate=1000, scansPerRead=1000):
         '''
         Start analog input reading from specified channels.
@@ -471,7 +492,7 @@ class pglLabJack(pglDevice):
         
         # Second subplot: Cycle-averaged data
         if cycleLen is not None or digitalSyncChannel is not None:
-            # Get cycles using the new function
+            # Get cycles using the getCycles function
             cycleData = self.getCycles(time, data, cycleLen, digitalSyncChannel, digitalSyncThreshold, ignoreInitial)
             
             if cycleData is None:
@@ -484,7 +505,13 @@ class pglLabJack(pglDevice):
                 cycleTime = cycleData['cycleTime']
                 numChannels = len(cycleData['cycles'])
                 
-                # Plot each channel
+                # convert time to ms, if cycle time is less than 1 second
+                if max(cycleTime) < 1.0:
+                    cycleTime = cycleTime * 1000
+                    xAxisLabel = "Time in Cycle (ms)"
+                else:
+                    xAxisLabel = "Time in Cycle (s)"
+                    
                 for ch in range(numChannels):
                     cycles = cycleData['cycles'][ch]
                     meanCycle = cycleData['mean'][ch]
@@ -505,7 +532,7 @@ class pglLabJack(pglDevice):
                                linewidth=2, label=self.channels[ch])
                 
                 titleStr = "Trigger-Averaged Data" if digitalSyncChannel is not None else "Cycle-Averaged Data"
-                axes[1].set_xlabel("Time in Cycle (s)")
+                axes[1].set_xlabel(xAxisLabel)
                 axes[1].set_ylabel("Voltage (V)")
                 axes[1].set_title(f"{titleStr} (n={cycleData['numCycles']} cycles)")
                 axes[1].legend()
