@@ -95,7 +95,7 @@ class pglLabJack(pglDevice):
     
         try:    
             # Set as digital output (direction = 1 for output)
-            self.ljm.eWriteName(self.h, f"{self.channel}_DIRECTION", 1)
+            self.ljm.eWriteName(self.h, f"{self.channel}", 1)
             # Set initial state to LOW
             self.ljm.eWriteName(self.h, self.channel, 0)
             print(f"(pglLabJack:setupDigitalOutput) {self.channel} configured as output, set to LOW")
@@ -112,17 +112,22 @@ class pglLabJack(pglDevice):
     
         Args:
             state (bool): True for HIGH, False for LOW
+            
+        Returns:
+            timestamp (float): Timestamp of when the digital output was set, or None if there was an error.
         '''
         if not self.digitalOutputConfigured:
             print("(pglLabJack:setDigitalOutput) Digital output channel not configured. Call setupDigitalOutput() first.")
-            return
+            return None
         
         try:
             value = 1 if state else 0
             self.ljm.eWriteName(self.h, self.channel, value)
         except Exception as e:
             print(f"(pglLabJack:setDigitalOutput) Error setting {self.channel}: {e}")
-            
+            return None
+        return self.pglTimestamp.getSecs()
+
     def startAnalogRead(self, duration=2, channels=[0], scanRate=1000, scansPerRead=1000):
         '''
         Start analog input reading from specified channels.
