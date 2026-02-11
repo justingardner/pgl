@@ -24,6 +24,13 @@ gammaTableExtension = Extension(
     ]
 )
 
+timestampExtension = Extension(
+    'pgl._pglTimestamp',          # module name
+    sources=['pgl/_pglTimestamp.m'],  
+    extra_compile_args=[],    # no ObjC needed
+    extra_link_args=[]        # no extra frameworks needed
+)
+
 setup(
     name='pgl',  
     version='0.1.0',
@@ -33,5 +40,5 @@ setup(
     author_email='justin@justingardner.net',
     license='MIT',
     python_requires='>=3.9',
-    ext_modules=[displayInfoExtension,gammaTableExtension]
+    ext_modules=[displayInfoExtension,gammaTableExtension,timestampExtension]
 )
