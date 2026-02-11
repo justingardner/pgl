@@ -9,8 +9,7 @@
 # import
 ##############
 import time
-
-# FIX, FIX, FIX: add mglGetSecs / mglWaitSecs codes
+from . import _pglTimestamp
 
 #################################################################
 # pglTimestamp
@@ -26,7 +25,7 @@ class pglTimestamp:
         Returns:
             float: Current system time in seconds.
         '''
-        return time.time()
+        return _pglTimestamp.getSecs()
     
     def waitSecs(self, secs):
         '''
