@@ -114,7 +114,7 @@ class pglLabJack(pglDevice):
         Args:
             state (bool): True for HIGH, False for LOW
             pulseLen (float or None): Pulse length in milliseconds. If set, the output
-                                      will return to its original state after this time.
+                                      will return back to the opposite state after this time
 
         Returns:
             timestamp (float): Timestamp of when the digital output was set,
@@ -148,7 +148,58 @@ class pglLabJack(pglDevice):
             thread.start()
 
         return self.pglTimestamp.getSecs()
-    
+
+    def digitalOutputAtTime(self, targetTime, state, pulseLen=None):
+        '''
+        Set the digital output state at a specified future time. Call setupDigitalOutput() first to configure the channel.
+
+        WARNING: If calling mulitple times, ensure pulses don't overlap in time as this code
+            does not currently handle multiple overlapping pulses and may produce unexpected results if pulses overlap.
+
+        Args:
+            targetTime (float): Timestamp (in seconds) when the pulse should be delivered.
+                                Must be in the future relative to pglTimestamp.getSecs().
+            state (bool): True for HIGH, False for LOW
+            pulseLen (float or None): Pulse length in milliseconds. If set, the output
+                                      will return back to the opposite state after this time
+
+        Returns:
+            bool: True if the pulse was successfully scheduled, False otherwise
+        '''
+
+        if not self.digitalOutputConfigured:
+            print("(pglLabJack:digitalOutputAtTime) Digital output channel not configured. Call setupDigitalOutput() first.")
+            return False
+
+        # Validate that targetTime is in the future
+        currentTime = self.pglTimestamp.getSecs()
+        if targetTime <= currentTime:
+            print(f"(pglLabJack:digitalOutputAtTime) Target time {targetTime:.6f} is not in the future (current time: {currentTime:.6f}).")
+            return False
+
+        def waitAndPulse():
+            try:
+                # Busy wait until target time
+                while self.pglTimestamp.getSecs() < targetTime:
+                    pass  # Busy wait for precise timing
+                
+                # Set the digital output state
+                self.ljm.eWriteName(self.h, self.channel, 1 if state else 0)
+                
+                # If pulseLen is specified, restore state after delay
+                if pulseLen is not None:
+                    time.sleep(pulseLen / 1000.0)
+                    self.ljm.eWriteName(self.h, self.channel, 0 if state else 1)
+                    
+            except Exception as e:
+                print(f"(pglLabJack:digitalOutputAtTime) Error in scheduled pulse: {e}")
+
+        # Start thread to wait and deliver pulse
+        thread = threading.Thread(target=waitAndPulse, daemon=True)
+        thread.start()
+
+        return True
+            
     def startAnalogRead(self, duration=2, channels=[0], scanRate=1000, scansPerRead=1000):
         '''
         Start analog input reading from specified channels.
@@ -180,8 +231,11 @@ class pglLabJack(pglDevice):
         # derived parameters
         self.numChannels = len(channels)
         self.totalScans = int(duration * scanRate)
-        self.totalReads = self.totalScans // scansPerRead
+        self.totalReads = int(np.ceil(self.totalScans / scansPerRead))
 
+        if self.totalScans % scansPerRead != 0:
+            print(f"(pglLabJack:startAnalogRead) totalScans ({self.totalScans}) is not an integer multiple of scansPerRead ({scansPerRead}). Will collect {self.totalReads * scansPerRead} samples instead of {self.totalScans} and throw out extra samples.")
+            
         # buffer and synchronization
         self.analogBuffer = []
         self.bufferLock = threading.Lock()
@@ -249,15 +303,23 @@ class pglLabJack(pglDevice):
 
             self.isReading = False
 
-    def stopAnalogRead(self):
+    def stopAnalogRead(self, waitToFinish=False, doNotTruncate=False):
         """
         Stop the analog reading and return time and data arrays.
+        
+        Args:
+            waitToFinish (bool): If True, waits for the acquisition thread to finish before returning data.
+                                 If False, signals the thread to stop and returns immediately with whatever data has been collected so far.
+            doNotTruncate (bool): If True, do not truncate the data to the exact number of samples.
+                                 If False (default), truncates the data to the expected number of samples based on duration and scan rate.  
         """
         if self.h is None or not self.isReading:
             return None, None
 
-        # signal thread to stop
-        self.stopEvent.set()
+        # waitToFinish
+        if not waitToFinish:
+            # stop thread
+            self.stopEvent.set()
 
         # wait for acquisition thread
         if self.acquisitionThread.is_alive():
@@ -270,9 +332,14 @@ class pglLabJack(pglDevice):
         # Reshape data to separate channels
         # data shape will be (numSamples, numChannels)
         numSamples = len(data) // self.numChannels
-        data = data[:numSamples * self.numChannels]  # trim incomplete scans
+        data = data[:numSamples * self.numChannels] 
         data = data.reshape(numSamples, self.numChannels)
 
+        # truncate to exact number of samples
+        if not doNotTruncate and numSamples > self.totalScans:
+            data = data[:self.totalScans, :]
+            numSamples = self.totalScans
+            
         # create time array (one timestamp per sample, not per data point)
         time = np.linspace(
             0,
@@ -450,8 +517,7 @@ class pglLabJack(pglDevice):
             'ignoredSamples': ignoredSamples
         }
     
-    
-    def plotAnalogRead(self, time, data, cycleLen=None, digitalSyncChannel=None, digitalSyncThreshold=3, ignoreInitial=None):
+    def plotAnalogRead(self, time, data, cycleLen=None, digitalSyncChannel=None, digitalSyncThreshold=3, ignoreInitial=None, displayStartEnd=None):
         '''
         Plot the analog read data
 
@@ -463,49 +529,104 @@ class pglLabJack(pglDevice):
             digitalSyncThreshold (float): Voltage threshold for detecting digital pulse rising edge
             ignoreInitial (float): Time in seconds to ignore at the beginning of the recording for
                 displaying cycles (e.g., to exclude initial transients). If None, no data is ignored. Must be non-negative.
+            displayStartEnd (float): If not None, will display the first displayStartEnd seconds as separate graphs   
         '''
         if time is None or data is None:
             print("(pglLabJack:plotAnalogRead) No data to plot.")
             return
         
-        # Determine number of subplots
-        if cycleLen is None and digitalSyncChannel is None:
-            fig, ax = plt.subplots(1, 1, figsize=(10, 6))
-            axes = [ax]
-        else:
-            fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+        # Determine number of rows needed
+        numRows = 1  # Always have full trace row
+        if displayStartEnd is not None:
+            numRows += 1  # Add row for start/end segments
+        if cycleLen is not None or digitalSyncChannel is not None:
+            numRows += 1  # Add row for cycle-averaged data
         
-        # First subplot: Original data
+        # Determine grid layout
+        if displayStartEnd is not None or (cycleLen is not None or digitalSyncChannel is not None):
+            fig = plt.figure(figsize=(16, 6 * numRows / 2))
+            gs = fig.add_gridspec(numRows, 2, hspace=0.3, wspace=0.3)
+        else:
+            fig = plt.figure(figsize=(16, 6))
+            gs = fig.add_gridspec(1, 1)
+        
+        currentRow = 0
+        
+        # First row: Full analog trace (spans both columns)
+        axFullTrace = fig.add_subplot(gs[currentRow, :])
         if data.ndim == 1:
             # Single channel
-            axes[0].plot(time, data, label=self.channels[0])
+            axFullTrace.plot(time, data, label=self.channels[0])
         else:
             # Multiple channels
             for i in range(data.shape[1]):
-                axes[0].plot(time, data[:, i], label=self.channels[i])
+                axFullTrace.plot(time, data[:, i], label=self.channels[i])
         
-        axes[0].set_xlabel("Time (s)")
-        axes[0].set_ylabel("Voltage (V)")
-        axes[0].set_title("LabJack Analog Input")
-        axes[0].legend()
-        axes[0].grid(True)
+        axFullTrace.set_xlabel("Time (s)")
+        axFullTrace.set_ylabel("Voltage (V)")
+        axFullTrace.set_title("LabJack Analog Input")
+        axFullTrace.legend()
+        axFullTrace.grid(True)
+        currentRow += 1
         
-        # Second subplot: Cycle-averaged data
+        # Second row: Start and end segments (if requested)
+        if displayStartEnd is not None:
+            # Determine if we should use ms or s for display
+            useMilliseconds = displayStartEnd < 1.0
+            timeMultiplier = 1000 if useMilliseconds else 1
+            timeUnit = "ms" if useMilliseconds else "s"
+            
+            # Left column: First displayStartEnd seconds
+            axStart = fig.add_subplot(gs[currentRow, 0])
+            startIdx = int(displayStartEnd * self.scanRate)
+            timeStart = time[:startIdx] * timeMultiplier
+            if data.ndim == 1:
+                axStart.plot(timeStart, data[:startIdx], label=self.channels[0])
+            else:
+                for ch in range(data.shape[1]):
+                    axStart.plot(timeStart, data[:startIdx, ch], label=self.channels[ch])
+            
+            axStart.set_xlabel(f"Time ({timeUnit})")
+            axStart.set_ylabel("Voltage (V)")
+            axStart.set_title(f"First {displayStartEnd} seconds")
+            axStart.legend()
+            axStart.grid(True)
+            
+            # Right column: Last displayStartEnd seconds
+            axEnd = fig.add_subplot(gs[currentRow, 1])
+            endIdx = int(displayStartEnd * self.scanRate)
+            timeEnd = time[-endIdx:] * timeMultiplier
+            if data.ndim == 1:
+                axEnd.plot(timeEnd, data[-endIdx:], label=self.channels[0])
+            else:
+                for ch in range(data.shape[1]):
+                    axEnd.plot(timeEnd, data[-endIdx:, ch], label=self.channels[ch])
+            
+            axEnd.set_xlabel(f"Time ({timeUnit})")
+            axEnd.set_ylabel("Voltage (V)")
+            axEnd.set_title(f"Last {displayStartEnd} seconds")
+            axEnd.legend()
+            axEnd.grid(True)
+            currentRow += 1
+        
+        # Next row: Cycle-averaged data (if requested, spans both columns)
         if cycleLen is not None or digitalSyncChannel is not None:
+            axCycle = fig.add_subplot(gs[currentRow, :])
+            
             # Get cycles using the getCycles function
             cycleData = self.getCycles(time, data, cycleLen, digitalSyncChannel, digitalSyncThreshold, ignoreInitial)
             
             if cycleData is None:
-                axes[1].text(0.5, 0.5, 'Unable to extract cycles', 
-                           ha='center', va='center', transform=axes[1].transAxes)
-                axes[1].set_xlabel("Time in Cycle (s)")
-                axes[1].set_ylabel("Voltage (V)")
-                axes[1].set_title("Cycle-Averaged Data")
+                axCycle.text(0.5, 0.5, 'Unable to extract cycles', 
+                           ha='center', va='center', transform=axCycle.transAxes)
+                axCycle.set_xlabel("Time in Cycle (s)")
+                axCycle.set_ylabel("Voltage (V)")
+                axCycle.set_title("Cycle-Averaged Data")
             else:
                 cycleTime = cycleData['cycleTime']
                 numChannels = len(cycleData['cycles'])
                 
-                # convert time to ms, if cycle time is less than 1 second
+                # Convert time to ms, if cycle time is less than 1 second
                 if max(cycleTime) < 1.0:
                     cycleTime = cycleTime * 1000
                     xAxisLabel = "Time in Cycle (ms)"
@@ -519,28 +640,28 @@ class pglLabJack(pglDevice):
                     
                     # Plot individual trials as thin lines in background
                     for i in range(cycles.shape[0]):
-                        axes[1].plot(cycleTime, cycles[i, :], color=f'C{ch}', alpha=0.2, linewidth=0.5)
+                        axCycle.plot(cycleTime, cycles[i, :], color=f'C{ch}', alpha=0.2, linewidth=0.5)
                     
                     # Plot standard deviation as filled polygon
-                    axes[1].fill_between(cycleTime, 
+                    axCycle.fill_between(cycleTime, 
                                          meanCycle - stdCycle, 
                                          meanCycle + stdCycle,
                                          color=f'C{ch}', alpha=0.3)
                     
                     # Plot mean as solid line
-                    axes[1].plot(cycleTime, meanCycle, color=f'C{ch}', 
+                    axCycle.plot(cycleTime, meanCycle, color=f'C{ch}', 
                                linewidth=2, label=self.channels[ch])
                 
                 titleStr = "Trigger-Averaged Data" if digitalSyncChannel is not None else "Cycle-Averaged Data"
-                axes[1].set_xlabel(xAxisLabel)
-                axes[1].set_ylabel("Voltage (V)")
-                axes[1].set_title(f"{titleStr} (n={cycleData['numCycles']} cycles)")
-                axes[1].legend()
-                axes[1].grid(True)
+                axCycle.set_xlabel(xAxisLabel)
+                axCycle.set_ylabel("Voltage (V)")
+                axCycle.set_title(f"{titleStr} (n={cycleData['numCycles']} cycles)")
+                axCycle.legend()
+                axCycle.grid(True)
         
         plt.tight_layout()
-        plt.show()
-                 
+        plt.show()    
+              
     def start(self):
         '''
         Start the LabJack device
