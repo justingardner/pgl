@@ -19,9 +19,65 @@ from traitlets import HasTraits, Float, Int, List, TraitError, Unicode, Dict, li
 import json
 from functools import partial
 
+#############
+# Mixin class for managing pgl settings
+#############
+class pglSettingsManager:
+    """
+    pglSettingsManager class for managing settings of pgl.
+    """
+    def __init__(self):   
+        pass
+    
+    def getScreenSettingsDir(self):
+        """
+        Get the directory where screen settings are stored.
+
+        Returns:
+            str: The directory path where settings are stored.
+        """
+        # get the screenSetttingsDir
+        screenSettingsDir = Path.home() / ".pgl" / "screenSettings"
+        
+        # check if it exists, create if not
+        if not screenSettingsDir.exists():
+            try:
+                screenSettingsDir.mkdir(parents=True, exist_ok=True)
+                display(HTML(f"<b>(pglScreenSettings:onSave)</b> Created directory: {screenSettingsDir}"))
+            except Exception as e:
+                display(HTML(f"<b>(pglScreenSettings:onSave)</b> Error creating directory {screenSettingsDir}: {e}"))
+                return None
+
+        return screenSettingsDir
+    
+    def getScreenSettings(self, settingsName):
+        """
+        Load settings from a JSON file and return an instance of the settings class.
+
+        Args:
+            settingsClass (type): The class of the settings to load, which should be a subclass of pglSettings.
+            filename (str): The name of the JSON file to load the settings from.
+
+        Returns:
+            An instance of the settingsClass with values loaded from the specified JSON file.
+        """
+        # get the settings directory and create the full path to the settings file
+        screenSettingsDir = self.getScreenSettingsDir()
+        screenSettingsPath = Path(screenSettingsDir) / settingsName
+        screenSettingsPath = screenSettingsPath.with_suffix(".json")
+        
+        # see if the file exists
+        if not screenSettingsPath.exists():
+            print(f"(pglSettingsManager:loadSettings) Settings file '{screenSettingsPath}' not found.")
+            return None
+        else:
+            print(f"(pglSettingsManager:loadSettings) Loading settings from '{screenSettingsPath}'.")
+            return pglScreenSettings(filename=screenSettingsPath)
 
 #############
-# Main class
+# Main class which should be subclassed for specific settings,
+# provides methods for loading/saving from JSON and displaying widgets
+# to edit the settings
 #############
 class pglSettings(HasTraits):
     def __init__(self, filename=None):
@@ -411,15 +467,6 @@ class pglScreenSettings(pglSettings):
     def onSave(self, saveButton):
         # get the screenSetttingsDir
         screenSettingsDir = Path.home() / ".pgl" / "screenSettings"
-
-        # check if it exists, create if not
-        if not screenSettingsDir.exists():
-            try:
-                screenSettingsDir.mkdir(parents=True, exist_ok=True)
-                display(HTML(f"<b>(pglScreenSettings:onSave)</b> Created directory: {screenSettingsDir}"))
-            except Exception as e:
-                display(HTML(f"<b>(pglScreenSettings:onSave)</b> Error creating directory {screenSettingsDir}: {e}"))
-                return
         
         # get the name 
         settingsFilename = screenSettingsDir / self.displayName
