@@ -18,7 +18,6 @@ from ._pglComm import pglSerial
 from .pglCalibration import pglCalibration, pglCalibrationDeviceMinolta 
 from .pglGammaTable import pglGammaTable 
 from .pglSettings import pglScreenSettings
-from .pglSettings import pglSettingsManager
 # Device specific imports (eye trackers, etc.)
 from .pglVPixx import pglProPixx, pglDataPixx
 from .pglEyeTracker import pglEyeTracker
@@ -32,7 +31,7 @@ try:
 except ImportError:
     print("(pgl) Warning: pylink not found, pglEyelink class will not be available.")
 
-class pgl(pglBase, pglResolution, pglDraw, pglTransform, pglProfile, pglBatch, pglImage, pglStimuli, pglTimestamp, pglDevices, pglEvents, pglCommandReplayer, pglFrameGrab, pglGammaTable, pglSettingsManager):
+class pgl(pglBase, pglResolution, pglDraw, pglTransform, pglProfile, pglBatch, pglImage, pglStimuli, pglTimestamp, pglDevices, pglEvents, pglCommandReplayer, pglFrameGrab, pglGammaTable):
     """
     purpose: psychophysics and experiment library for Python.
     License: MIT License — see LICENSE file for details.
@@ -55,6 +54,5 @@ class pgl(pglBase, pglResolution, pglDraw, pglTransform, pglProfile, pglBatch, p
       pglEvents.__init__(self, *args, **kwargs)
       pglCommandReplayer.__init__(self, *args, **kwargs)
       pglFrameGrab.__init__(self, *args, **kwargs)
-      pglSettingsManager.__init__(self, *args, **kwargs)
 __version__ = "1.0.0"
 __author__ = "JLG"

@@ -53,6 +53,10 @@ class pglSettingsManager:
     def getScreenSettings(self, settingsName):
         """
         Load settings from a JSON file and return an instance of the settings class.
+        This will look in the directory returned by getScreenSettingsDir().
+        If you pass a settingsName, it will look for a file named {name}.json in that directory. 
+        If you do not pass a name, it will search through all files to see which one has the field default set
+        to true
 
         Args:
             settingsClass (type): The class of the settings to load, which should be a subclass of pglSettings.
@@ -73,6 +77,15 @@ class pglSettingsManager:
         else:
             print(f"(pglSettingsManager:loadSettings) Loading settings from '{screenSettingsPath}'.")
             return pglScreenSettings(filename=screenSettingsPath)
+
+        screenSettingsDir = Path.home() / ".pgl" / "screenSettings"
+        print(screenSettingsDir)
+        if screenName is None:
+            # search for display with default set to true
+            for jsonFile in Path(screenSettingsDir).glob("*.json"):
+                print(jsonFile.name)
+        return 
+
 
 #############
 # Main class which should be subclassed for specific settings,
@@ -454,6 +467,7 @@ class pglSettings(HasTraits):
 
 # Screen settings
 class pglScreenSettings(pglSettings):
+    
     #displayName = List(Unicode(), default_value=["Default", "Add Display"], help="Display name for these settings")
     displayName = Unicode("Default", help="Display name for these settings")
     screenNumber = Int(0, min=0, max=2, step=1, help="Screen number, 0 for window, 1 for main, 2 for secondary etc")
@@ -477,12 +491,11 @@ class pglScreenSettings(pglSettings):
         display(HTML(f"<b>Saved settings to:</b> {settingsFilename}"))
 
     def onTest(self, testButton):
-        from pgl import pgl
+        from pgl import pgl, pglExperiment
         pgl = pgl()
-        pgl.open(self.screenNumber)
-        pgl.waitSecs(0.2)
-        pgl.visualAngle(self.displayDistance,self.displayWidth,self.displayHeight)
-        pgl.bullseye()
-        pgl.flush()
-        pgl.waitSecs(10)
-        pgl.close()
+        e = pglExperiment(pgl, suppressInitScreen=True)
+        e.initScreen(self.displayName)
+        e.pgl.bullseye()
+        e.pgl.flush()
+        e.pgl.waitSecs(10)
+        e.pgl.close()

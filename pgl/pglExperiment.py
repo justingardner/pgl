@@ -15,11 +15,13 @@ import itertools
 import random
 import math
 from . import pglKeyboard
-    
+from pathlib import Path
+from .pglSettings import pglSettingsManager
+
 #############
 # Experiment class
 #############
-class pglExperiment:
+class pglExperiment(pglSettingsManager):
     '''
     Experiment class which handles timing, parameter randomization,
     subject response, synchronizing with measurement hardware etc
@@ -43,17 +45,19 @@ class pglExperiment:
         
     def __repr__(self):
         return f"<pglExperiment: {len(self.task)} phases>"
-
-    def initScreen(self):
+    
+    def initScreen(self, settingsName=None):
         '''
         Initialize the screen for the experiment. This will call pgl.open() and
         set parameters according to what is set in setParameters
         '''
+        # get screen settings
+        screenSettings = self.getScreenSettings(settingsName)
         
         # open screen
-        self.pgl.open(0,800,600)
+        self.pgl.open(screenSettings.screenNumber)
         #self.pgl.open()
-        self.pgl.visualAngle(57,40,30)
+        self.pgl.visualAngle(screenSettings.displayDistance,screenSettings.displayWidth,screenSettings.displayHeight)
         
         # add keyboard device
         keyboardDevices = self.pgl.devicesGet(pglKeyboard)
