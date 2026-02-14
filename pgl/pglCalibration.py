@@ -12,7 +12,10 @@ import numpy as np
 import matplotlib.pyplot as plt
 from ._pglComm import pglSerial
 from .pglBase import printHeader
-
+from .pglSettings import pglSettings, pglScreenSettings
+from traitlets import Unicode, Int, Instance, Dict
+from datetime import datetime
+\
 ##########################
 # Calibration device class
 ##########################
@@ -185,14 +188,20 @@ class pglCalibration():
         '''
         pass
     
-    def calibrate(self, nRepeats=4, nSteps=256):
+    def calibrate(self, settingsName, nRepeats=4, nSteps=256):
         '''
         Measure the display characteristics.
+        
+        Args:
+            settingsName (str): Name of the screen settings to calibrate.
+            nRepeats (int): Number of times to repeat each measurement.
+            nSteps (int): Number of steps in the calibration.
         '''
         if self.device is None:
             print("(pglCalibration) No calibration device specified.")
             return None
         
+        e = pglExperiment(self.pgl, settingsName)
         if self.pgl.isOpen() is False:
             print("(pglCalibration) PGL display is not open, cannot calibrate.")
             return None
@@ -218,7 +227,7 @@ class pglCalibration():
             print(f"(pglCalibration) {self.calibrationValue[-1]}: {self.calibrationMeasurement[-1]}")
 
         self.displayCalibration()
-        
+    
     def displayCalibration(self):
         '''
         Display the calibration results.
@@ -397,3 +406,16 @@ class pglCalibration():
         '''
         pass
     
+
+# Calibration settings, subclass of pglSettings to inherit load/save functionality
+class pglCalibrationData(pglSettings):
+    
+    settingsName = Unicode("Default", help="Settings name used to open display")
+    displayInfo = Dict(help="Display information at time of calibration")
+    creationDateTime = Instance(datetime, default_value=datetime.now(), help="Date and time of calibration creation")
+    nRepeats = Int(4, help="Number of repeats per calibration value")
+    nSteps = Int(256, help="Number of steps in the calibration")
+    values = Instance(np.ndarray, allow_none=True, help="Display values used in calibration")
+    measurements = Instance(np.ndarray, allow_none=True, help="Measured luminance values from calibration")
+    calibrationIndexes = Instance(np.ndarray, allow_none=True, help="Indices of value and measurements which contain the calibration.")
+    screenSettings = Instance(pglScreenSettings, allow_none=True, help="Screen settings used during calibration")

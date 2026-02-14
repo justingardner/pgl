@@ -26,12 +26,12 @@ class pglExperiment(pglSettingsManager):
     Experiment class which handles timing, parameter randomization,
     subject response, synchronizing with measurement hardware etc
     '''
-    def __init__(self, pgl, suppressInitScreen=False, suppressEndScreen=False):
+    def __init__(self, pgl, settingsName=None, suppressInitScreen=False, suppressEndScreen=False):
         # save pgl
         self.pgl = pgl
         
         # initialize screen
-        if not suppressInitScreen: self.initScreen()
+        if not suppressInitScreen: self.initScreen(settingsName)
 
         # load parameters
         self.loadParameters()

@@ -18,6 +18,8 @@ from ipywidgets.widgets import widget
 from traitlets import HasTraits, Float, Int, List, TraitError, Unicode, Dict, link, Bool, TraitType
 import json
 from functools import partial
+from datetime import datetime
+import numpy as np
 
 #############
 # Mixin class for managing pgl settings
@@ -50,7 +52,7 @@ class pglSettingsManager:
 
         return screenSettingsDir
     
-    def getScreenSettings(self, settingsName):
+    def getScreenSettings(self, settingsName=None):
         """
         Load settings from a JSON file and return an instance of the settings class.
         This will look in the directory returned by getScreenSettingsDir().
@@ -65,6 +67,9 @@ class pglSettingsManager:
         Returns:
             An instance of the settingsClass with values loaded from the specified JSON file.
         """
+        if settingsName is None:
+            settingsName = "Default"
+            
         # get the settings directory and create the full path to the settings file
         screenSettingsDir = self.getScreenSettingsDir()
         screenSettingsPath = Path(screenSettingsDir) / settingsName
@@ -86,7 +91,61 @@ class pglSettingsManager:
                 print(jsonFile.name)
         return 
 
+class customJSONEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, HasTraits):
+            # Store class name for reconstruction
+            return {
+                '__class__': obj.__class__.__name__,
+                '__module__': obj.__class__.__module__,
+                **{key: getattr(obj, key) for key in obj.trait_names() if not key.startswith('_')}
+            }
+        return super().default(obj)
 
+class customJSONDecoder(json.JSONDecoder):
+    def __init__(self, *args, **kwargs):
+        super().__init__(object_hook=self.object_hook, *args, **kwargs)
+    
+    def object_hook(self, obj):
+        # Reconstruct HasTraits objects
+        if '__class__' in obj and '__module__' in obj:
+            try:
+                import importlib
+                module = importlib.import_module(obj['__module__'])
+                cls = getattr(module, obj['__class__'])
+                
+                # Remove metadata keys
+                data = {k: v for k, v in obj.items() if not k.startswith('__')}
+                
+                # Create instance and set attributes
+                instance = cls()
+                for key, value in data.items():
+                    try:
+                        setattr(instance, key, value)
+                    except:
+                        pass  # Skip if trait validation fails
+                return instance
+            except Exception as e:
+                print(f"(pglSettings) Could not reconstruct {obj.get('__class__')}: {e}")
+                return obj
+        
+        # Convert datetime strings
+        for key, value in obj.items():
+            if isinstance(value, str):
+                try:
+                    obj[key] = datetime.fromisoformat(value)
+                except (ValueError, TypeError):
+                    pass
+            elif isinstance(value, list) and value:
+                try:
+                    obj[key] = np.array(value)
+                except:
+                    pass
+        return obj
 #############
 # Main class which should be subclassed for specific settings,
 # provides methods for loading/saving from JSON and displaying widgets
@@ -101,9 +160,10 @@ class pglSettings(HasTraits):
     # Serialize to JSON file
     def save(self, filename):
         try:
-            data = {key: getattr(self, key) for key in self.trait_names()}
+            filename = Path(filename).with_suffix(".json")
+            data = {key: getattr(self, key) for key in self.getOrderedTraits().keys()}
             with open(filename, 'w') as f:
-                json.dump(data, f, indent=4)
+                json.dump(data, f, indent=4, cls=customJSONEncoder)
             print(f"(pglSettings) Saved settings to '{filename}'")
         except PermissionError:
             print(f"(pglSettings) No permission to write to '{filename}'")
@@ -118,8 +178,9 @@ class pglSettings(HasTraits):
     def load(self, filename):
         # --- Open JSON file ---
         try:
+            filename = Path(filename).with_suffix(".json")
             with open(filename, 'r') as f:
-                data = json.load(f)
+                data = json.load(f, cls=customJSONDecoder)
         except FileNotFoundError:
             print(f"(pglSettings) File '{filename}' not found.")
         except PermissionError:
