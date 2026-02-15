@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 from ._pglComm import pglSerial
 from .pglBase import printHeader
 from .pglSettings import filename, pglSettings, pglScreenSettings, pglSettingsManager
-from traitlets import Unicode, Int, Instance, Dict
+from traitlets import Unicode, Int, Instance, Dict, Tuple
 from datetime import datetime
 from .pglExperiment import pglExperiment
 
@@ -237,7 +237,7 @@ class pglCalibration():
         if self.pgl.isOpen() is False:
             print(f"(pglCalibration) Display {settingsName} did not open, cannot calibrate.")
             return None
-
+        
         # get calibration date and time
         self.calibrationData.creationDateTime = datetime.now()
 
@@ -245,6 +245,16 @@ class pglCalibration():
         self.calibrationData.settingsName = settingsName
         self.calibrationData.screenSettings = e.getScreenSettings(settingsName)
         
+        # linearlize gamma, save the current gamma table so we can replace it
+        screenNumber = self.calibrationData.screenSettings.screenNumber
+        self.currentGammaTable = self.pgl.getGammaTable(screenNumber)
+        self.pgl.setGammaTableLinear(screenNumber)
+        
+        # get the linearized gamma table and save it (for reference as validation will have an inverse table)
+        self.calibrationData.gammaTableSize = self.pgl.getGammaTableSize(screenNumber)
+        gammaTable = self.pgl.getGammaTable(screenNumber)
+        self.calibrationData.gammaTable = tuple(np.array(table) for table in gammaTable)
+
         # set number of repeats and steps
         self.calibrationData.nRepeats = nRepeats
         self.calibrationData.nSteps = nSteps
@@ -254,7 +264,7 @@ class pglCalibration():
             # get display info if available
             gpu = next(iter(self.pgl.gpuInfo.values()))
             displays = gpu.get('Displays', [])
-            self.calibrationData.displayInfo = displays[self.calibrationData.screenSettings.screenNumber]
+            self.calibrationData.displayInfo = displays[screenNumber]
         except Exception as ex:
             print(f"(pglCalibration) Warning: Could not get display info: {ex}")
         
@@ -274,6 +284,12 @@ class pglCalibration():
             # and display
             print(f"(pglCalibration) {self.calibrationValueGet(-1)}: {self.calibrationMeasurementGet(-1)}")
 
+        # restore the original gamma table
+        self.pgl.setGammaTable(screenNumber, self.currentGammaTable[0], self.currentGammaTable[1], self.currentGammaTable[2])
+        
+        # close the screen
+        self.pgl.close()
+        
         # display results when done
         self.calibrationData.display()
         
@@ -499,6 +515,8 @@ class pglCalibrationData(pglSettings):
     settingsName = Unicode("Default", help="Settings name used to open display")
     displayInfo = Dict(help="Display information at time of calibration")
     screenSettings = Instance(pglScreenSettings, allow_none=True, help="Screen settings used during calibration")    
+    gammaTableSize = Int(-1, help="Size of the gamma table at time of calibration")
+    gammaTable = Tuple(Instance(np.ndarray), Instance(np.ndarray), Instance(np.ndarray), allow_none=True, help="Gamma table at time of calibration")
     creationDateTime = Instance(datetime, default_value=datetime.now(), help="Date and time of calibration creation")
     nRepeats = Int(4, help="Number of repeats per calibration value")
     nSteps = Int(256, help="Number of steps in the calibration")
