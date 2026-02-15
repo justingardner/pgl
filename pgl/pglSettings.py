@@ -30,7 +30,26 @@ class pglSettingsManager:
     """
     def __init__(self):   
         pass
-    
+    def getSettingsDir(self):
+        """
+        Get the directory where settings are stored.
+
+        Returns:
+            str: The directory path where settings are stored.
+        """
+        # get the settingsDir
+        settingsDir = Path.home() / ".pgl" 
+        
+        # check if it exists, create if not
+        if not settingsDir.exists():
+            try:
+                settingsDir.mkdir(parents=True, exist_ok=True)
+                display(HTML(f"<b>(pglSettings:onSave)</b> Created directory: {settingsDir}"))
+            except Exception as e:
+                display(HTML(f"<b>(pglSettings:onSave)</b> Error creating directory {settingsDir}: {e}"))
+                return None
+
+        return settingsDir
     def getScreenSettingsDir(self):
         """
         Get the directory where screen settings are stored.
@@ -39,7 +58,7 @@ class pglSettingsManager:
             str: The directory path where settings are stored.
         """
         # get the screenSetttingsDir
-        screenSettingsDir = Path.home() / ".pgl" / "screenSettings"
+        screenSettingsDir = self.getSettingsDir() / "screenSettings"
         
         # check if it exists, create if not
         if not screenSettingsDir.exists():
@@ -52,6 +71,27 @@ class pglSettingsManager:
 
         return screenSettingsDir
     
+    def getCalibrationsDir(self):
+        """
+        Get the directory where screen calibrations are stored
+
+        Returns:
+            str: The directory path where calibrations are stored
+        """
+        # get the screenSetttingsDir
+        calibrationsDir = self.getSettingsDir() / "calibrations"
+        
+        # check if it exists, create if not
+        if not calibrationsDir.exists():
+            try:
+                calibrationsDir.mkdir(parents=True, exist_ok=True)
+                display(HTML(f"<b>(pglScreenSettings:onSave)</b> Created directory: {screenSettingsDir}"))
+            except Exception as e:
+                display(HTML(f"<b>(pglScreenSettings:onSave)</b> Error creating directory {screenSettingsDir}: {e}"))
+                return None
+
+        return calibrationsDir
+
     def getScreenSettings(self, settingsName=None):
         """
         Load settings from a JSON file and return an instance of the settings class.
