@@ -20,6 +20,7 @@ import json
 from functools import partial
 from datetime import datetime
 import numpy as np
+import pgl as pgl
 
 #######################################
 # Mixin class for pgl to provide settings management
@@ -35,7 +36,29 @@ class pglMainSettings:
         """
         Edit pgl settings. Brings up widgt interface to edit settings
         """
-        print("(pglSettings:settings) Opening pgl settings editor...")
+        # initialize experiment so that we can get settings from it
+        from .pglExperiment import pglExperiment
+        e = pglExperiment(self, suppressInitScreen=True)
+        
+        # get the screen settings directory
+        screenSettingsDir = e.getScreenSettingsDir()
+        
+        # cycle through all files in screenSettingsDir with .json extension
+        # and load as a pglScreenSettings instance
+        screenSettings = []
+        for jsonFile in Path(screenSettingsDir).glob("*.json"):
+            screenSettings.append(pglScreenSettings(jsonFile))
+
+        # setup screenSettingsSelect class
+        # to select a screen settings file
+        screenSettingsSelect = pglScreenSettingsSelect()
+        screenSettingsSelect.displayNames = [s.displayName for s in screenSettings]
+        screenSettingsSelect.settings = screenSettings
+        
+        # display the settings
+        screenSettingsSelect.edit()  
+        
+       
 
 #######################################
 # Mixin class for pglExperiment which manages pgl settings 
@@ -476,7 +499,7 @@ class pglSettings(HasTraits):
                     tooltip=helpText
                 )
                 #link((self, traitName), (wDropdown, 'value'))
-                wDropdown.observe(partial(self.onListSelect, wDropdown, traitName), names='value')
+                wDropdown.observe(partial(self.onListSelect, traitName), names='value')
                 widgetRows.append(wDropdown)
         # make helpWidget
         helpWidget = widgets.HTML(allHelpText)
@@ -497,7 +520,10 @@ class pglSettings(HasTraits):
             button_style='info',
             layout=widgets.Layout(width='120px')
         )
-        saveButton.on_click(partial(self.onSave))
+        if not hasattr(self, 'onSave'):
+            saveButton.layout.display = 'none'
+        else:
+            saveButton.on_click(partial(self.onSave))
         
         
         # --- Button for test ---
@@ -528,17 +554,20 @@ class pglSettings(HasTraits):
         return widgetDisplay
     
     def onCancel(self, cancelButton):
-        self.wrapper.layout.display = 'none'
+        self.hide()
         pass
+    
+    def hide(self):
+        """
+        Hide the settings widget.
+        """
+        if hasattr(self, 'wrapper'):
+            self.wrapper.layout.display = 'none'
         
-    # must be defined by subclass
-    def onSave(self, saveButton):
-        pass
-
     def toggleHelp(self, helpButton, helpWidget):
         helpWidget.layout.display = 'block' if helpWidget.layout.display == 'none' else 'none'
 
-    def onListSelect(self, dropdownWidget, traitName, change):
+    def onListSelect(self, traitName, change):
         # get the selected and currentList
         selected = change['new']
         currentList = list(getattr(self, traitName))
@@ -602,6 +631,29 @@ class pglSettings(HasTraits):
         # display
         display(self.wrapper)
 
+# Screen settings select
+class pglScreenSettingsSelect(pglSettings):
+    
+    # traits that can be edited
+    displayNames = List(Unicode(), help="Display names")
+    
+    # Variable containing all the settings, this is set by calling class
+    settings = []
+
+    # when the displayName is selected, edit those settings
+    def onListSelect(self, traitName, change):
+        # call parent method
+        super().onListSelect(traitName, change)
+        # load the selected settings
+        selectedName = change['new']
+        # go through settings, to see which one it matches to
+        for s in self.settings:
+            if s.displayName == selectedName:
+                # display the settings
+                s.edit()
+            else:
+                s.hide()
+
 # Screen settings
 class pglScreenSettings(pglSettings):
     
@@ -610,9 +662,7 @@ class pglScreenSettings(pglSettings):
     displayDistance = Float(57.0, min = 0.0, step=0.1, max=None, help="Distance in cm from subject to screen")
     displayWidth = Float(32.0, min = 0.0, step=0.1, max=None, help="Display width in cm")
     displayHeight = Float(18.0, min = 0.0, step=0.1, max=None, help="Display height in cm")
-    
     dataPath = Unicode("~/data",help="Path to data directory").tag(isPath=True)
-    #options = List(Unicode(), default_value=["Option 1","Option 2"], help="List of options")
     
     def onSave(self, saveButton):
         # get the screenSetttingsDir
