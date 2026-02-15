@@ -1,4 +1,4 @@
-name: gru
+name: pgl
 channels:
   - defaults
   - conda-forge
