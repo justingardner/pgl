@@ -1,5 +1,20 @@
 #!/bin/bash
 
+# pglMode.sh - Enable or restore PGL mode on macOS
+# Description:
+#   PGL mode temporarily disables background services that may
+#   interfere with precise stimulus timing.
+# Usage:
+#   ./pglMode.sh will provide help
+#
+# FIX, FIX, FIX This script needs some work - like it relies
+# on macOS Shortcuts for Do Not Disturb, which need a way to install
+# on a new machine. Also, need to check that flags are working
+# that it proplery prompts the user for passwords when needed
+# can be called multiple times with enable so that it doesn't
+# overwrite settings, that it can put disable all and put
+# settings into a useful mode etc.
+
 PGL_DIR="$HOME/.pgl"
 STATE_FILE="$PGL_DIR/pglModeState"
 CAFFEINATE_PID_FILE="$PGL_DIR/caffeinatePID"
