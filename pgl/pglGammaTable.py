@@ -9,7 +9,7 @@
 #############
 # Import modules
 #############
-
+import numpy as np
 
 #############
 # Main class
@@ -60,6 +60,34 @@ class pglGammaTable:
         whichScreen = self.validateWhichScreen(whichScreen)
         if (whichScreen is None): return
 
+        if self._pglGammaTable is None:
+            print("(pglGammaTable) ❌ _pglGammaTable not available, cannot setGammaTable.")
+            return False
+        else:
+            return self._pglGammaTable.setGammaTable(whichScreen, red, green, blue)
+
+    def setGammaTableLinear(self, whichScreen):
+        '''
+        Set the gamma table to a linear table for a given screen.
+
+        Args:
+            whichScreen (int): Index of the display to query (0 = primary). Must be >= 0 and less
+                than the number of active displays. If set to None, defaults to the screen on which
+                pgl is open and running or, if not running, the primary display.
+        '''
+        whichScreen = self.validateWhichScreen(whichScreen)
+        if (whichScreen is None): return
+
+        gammaTableSize = self.getGammaTableSize(whichScreen)
+        if gammaTableSize <= 0:
+            print("(pglGammaTable) ❌ Could not get gamma table size, cannot set linear gamma table.")
+            return False
+        
+        # create linear table
+        red = np.linspace(0, 1, gammaTableSize, dtype=np.float32)
+        green = np.linspace(0, 1, gammaTableSize, dtype=np.float32)
+        blue = np.linspace(0, 1, gammaTableSize, dtype=np.float32)  
+        
         if self._pglGammaTable is None:
             print("(pglGammaTable) ❌ _pglGammaTable not available, cannot setGammaTable.")
             return False

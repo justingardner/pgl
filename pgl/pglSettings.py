@@ -137,6 +137,12 @@ class customJSONEncoder(json.JSONEncoder):
             return obj.isoformat()
         if isinstance(obj, np.ndarray):
             return obj.tolist()
+        if isinstance(obj, tuple):
+            # Mark tuples specially so we can reconstruct them
+            return {
+                '__tuple__': True,
+                'items': list(obj)
+            }
         if isinstance(obj, HasTraits):
             # Store class name for reconstruction
             return {
@@ -151,6 +157,21 @@ class customJSONDecoder(json.JSONDecoder):
         super().__init__(object_hook=self.object_hook, *args, **kwargs)
     
     def object_hook(self, obj):
+        # Reconstruct tuples
+        if isinstance(obj, dict) and obj.get('__tuple__'):
+            items = obj['items']
+            # Convert lists back to numpy arrays if needed
+            converted_items = []
+            for item in items:
+                if isinstance(item, list):
+                    try:
+                        converted_items.append(np.array(item))
+                    except:
+                        converted_items.append(item)
+                else:
+                    converted_items.append(item)
+            return tuple(converted_items)
+        
         # Reconstruct HasTraits objects
         if '__class__' in obj and '__module__' in obj:
             try:
@@ -173,19 +194,16 @@ class customJSONDecoder(json.JSONDecoder):
                 print(f"(pglSettings) Could not reconstruct {obj.get('__class__')}: {e}")
                 return obj
         
-        # Convert datetime strings
+        # Convert datetime strings and lists to numpy arrays
         for key, value in obj.items():
             if isinstance(value, str):
                 try:
                     obj[key] = datetime.fromisoformat(value)
                 except (ValueError, TypeError):
                     pass
-            elif isinstance(value, list) and value:
-                try:
-                    obj[key] = np.array(value)
-                except:
-                    pass
+            # Don't auto-convert lists here since tuples handle it
         return obj
+
 #############
 # Main class which should be subclassed for specific settings,
 # provides methods for loading/saving from JSON and displaying widgets
