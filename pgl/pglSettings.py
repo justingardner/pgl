@@ -21,9 +21,25 @@ from functools import partial
 from datetime import datetime
 import numpy as np
 
-#############
-# Mixin class for managing pgl settings
-#############
+#######################################
+# Mixin class for pgl to provide settings management
+#######################################
+class pglMainSettings:
+    """
+    Mixin class for pgl to provide settings management.
+    """
+    def __init__(self):   
+        pass
+    
+    def settings(self):
+        """
+        Edit pgl settings. Brings up widgt interface to edit settings
+        """
+        print("(pglSettings:settings) Opening pgl settings editor...")
+
+#######################################
+# Mixin class for pglExperiment which manages pgl settings 
+#######################################
 class pglSettingsManager:
     """
     pglSettingsManager class for managing settings of pgl.
@@ -131,6 +147,8 @@ class pglSettingsManager:
                 print(jsonFile.name)
         return 
 
+# Custom JSON encoder and decoder to handle special Instance
+# traitlets of settings classs, so they can be serialized to JSON
 class customJSONEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, datetime):
@@ -587,7 +605,6 @@ class pglSettings(HasTraits):
 # Screen settings
 class pglScreenSettings(pglSettings):
     
-    #displayName = List(Unicode(), default_value=["Default", "Add Display"], help="Display name for these settings")
     displayName = Unicode("Default", help="Display name for these settings")
     screenNumber = Int(0, min=0, max=2, step=1, help="Screen number, 0 for window, 1 for main, 2 for secondary etc")
     displayDistance = Float(57.0, min = 0.0, step=0.1, max=None, help="Distance in cm from subject to screen")
