@@ -1,0 +1,17 @@
+name: gru
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.12
+  - ipykernel
+  - numpy
+  - matplotlib
+  - pynput
+  - pysimplegui
+  - ipywidgets
+  - gradio
+  - pyserial
+  - gspread
+  - oauth2client
+
