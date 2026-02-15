@@ -17,6 +17,7 @@ import math
 from . import pglKeyboard
 from pathlib import Path
 from .pglSettings import pglSettingsManager
+from IPython.display import display, HTML
 
 #############
 # Experiment class
@@ -46,18 +47,24 @@ class pglExperiment(pglSettingsManager):
     def __repr__(self):
         return f"<pglExperiment: {len(self.task)} phases>"
     
-    def initScreen(self, settingsName=None):
+    def initScreen(self, settingsName=None, settings=None):
         '''
         Initialize the screen for the experiment. This will call pgl.open() and
         set parameters according to what is set in setParameters
         '''
-        # get screen settings
-        screenSettings = self.getScreenSettings(settingsName)
+        # get  settings
+        if settings is None:
+            settings = self.getSettings(settingsName)
+        
+        if settings is None:
+            # display error in HTML
+            display(HTML("<b>(pglExperiment:initScreen)</b> ❌ Could not find settings to open screen."))
+            return
         
         # open screen
-        self.pgl.open(screenSettings.screenNumber)
+        self.pgl.open(settings.screenNumber)
         #self.pgl.open()
-        self.pgl.visualAngle(screenSettings.displayDistance,screenSettings.displayWidth,screenSettings.displayHeight)
+        self.pgl.visualAngle(settings.displayDistance,settings.displayWidth,settings.displayHeight)
         
         # add keyboard device
         keyboardDevices = self.pgl.devicesGet(pglKeyboard)
