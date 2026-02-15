@@ -12,7 +12,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from ._pglComm import pglSerial
 from .pglBase import printHeader
-from .pglSettings import filename, pglSettings, pglScreenSettings, pglSettingsManager
+from .pglSettings import filename, _pglSettings, pglSettings, pglSettingsManager
 from traitlets import Unicode, Int, Instance, Dict, Tuple
 from datetime import datetime
 from .pglExperiment import pglExperiment
@@ -510,11 +510,11 @@ class pglCalibration():
     
 
 # Calibration settings, subclass of pglSettings to inherit load/save functionality
-class pglCalibrationData(pglSettings):
+class pglCalibrationData(_pglSettings):
     
     settingsName = Unicode("Default", help="Settings name used to open display")
     displayInfo = Dict(help="Display information at time of calibration")
-    screenSettings = Instance(pglScreenSettings, allow_none=True, help="Screen settings used during calibration")    
+    screenSettings = Instance(pglSettings, allow_none=True, help="Settings used during calibration")    
     gammaTableSize = Int(-1, help="Size of the gamma table at time of calibration")
     gammaTable = Tuple(Instance(np.ndarray), Instance(np.ndarray), Instance(np.ndarray), allow_none=True, help="Gamma table at time of calibration")
     creationDateTime = Instance(datetime, default_value=datetime.now(), help="Date and time of calibration creation")
