@@ -8,6 +8,7 @@
 #############
 # Import
 #############
+from asyncio import subprocess
 from collections import OrderedDict
 from curses import wrapper
 from pathlib import Path
@@ -15,17 +16,19 @@ from IPython.display import display, HTML
 import ipywidgets as widgets
 from fileinput import filename
 from ipywidgets.widgets import widget
-from traitlets import HasTraits, Float, Int, List, TraitError, Unicode, Dict, link, Bool, TraitType
+from traitlets import HasTraits, Float, Int, List, TraitError, Unicode, Dict, default, link, Bool, TraitType
 import json
 from functools import partial
 from datetime import datetime
 import numpy as np
 import pgl as pgl
+import subprocess
+import platform
 
 #######################################
 # Mixin class for pgl to provide settings management
 #######################################
-class pglMainSettings:
+class pglMainSettingsManager:
     """
     Mixin class for pgl to provide settings management.
     """
@@ -56,7 +59,10 @@ class pglMainSettings:
         screenSettingsSelect.settings = screenSettings
         
         # display the settings
-        screenSettingsSelect.edit()  
+        screenSettingsSelect.edit() 
+        
+        # dispaly the selected settings
+        screenSettings[0].edit() 
         
        
 
@@ -69,46 +75,46 @@ class pglSettingsManager:
     """
     def __init__(self):   
         pass
-    def getSettingsDir(self):
+    def getPGLDir(self):
         """
         Get the directory where settings are stored.
 
         Returns:
             str: The directory path where settings are stored.
         """
-        # get the settingsDir
-        settingsDir = Path.home() / ".pgl" 
+        # get the pglDir
+        pglDir = Path.home() / ".pgl" 
         
         # check if it exists, create if not
-        if not settingsDir.exists():
+        if not pglDir.exists():
             try:
-                settingsDir.mkdir(parents=True, exist_ok=True)
-                display(HTML(f"<b>(pglSettings:onSave)</b> Created directory: {settingsDir}"))
+                pglDir.mkdir(parents=True, exist_ok=True)
+                display(HTML(f"<b>(pglSettings:onSave)</b> Created directory: {pglDir}"))
             except Exception as e:
-                display(HTML(f"<b>(pglSettings:onSave)</b> Error creating directory {settingsDir}: {e}"))
+                display(HTML(f"<b>(pglSettings:onSave)</b> Error creating directory {pglDir}: {e}"))
                 return None
 
-        return settingsDir
-    def getScreenSettingsDir(self):
+        return pglDir
+    def getSettingsDir(self):
         """
         Get the directory where screen settings are stored.
 
         Returns:
             str: The directory path where settings are stored.
         """
-        # get the screenSetttingsDir
-        screenSettingsDir = self.getSettingsDir() / "screenSettings"
+        # get the settingsDir
+        settingsDir = self.getPGLDir() / "settings"
         
         # check if it exists, create if not
-        if not screenSettingsDir.exists():
+        if not settingsDir.exists():
             try:
-                screenSettingsDir.mkdir(parents=True, exist_ok=True)
-                display(HTML(f"<b>(pglScreenSettings:onSave)</b> Created directory: {screenSettingsDir}"))
+                settingsDir.mkdir(parents=True, exist_ok=True)
+                display(HTML(f"<b>(pglScreenSettings:onSave)</b> Created directory: {settingsDir}"))
             except Exception as e:
-                display(HTML(f"<b>(pglScreenSettings:onSave)</b> Error creating directory {screenSettingsDir}: {e}"))
+                display(HTML(f"<b>(pglScreenSettings:onSave)</b> Error creating directory {settingsDir}: {e}"))
                 return None
 
-        return screenSettingsDir
+        return settingsDir
     
     def getCalibrationsDir(self):
         """
@@ -118,57 +124,48 @@ class pglSettingsManager:
             str: The directory path where calibrations are stored
         """
         # get the screenSetttingsDir
-        calibrationsDir = self.getSettingsDir() / "calibrations"
+        calibrationsDir = self.getPGLDir() / "calibrations"
         
         # check if it exists, create if not
         if not calibrationsDir.exists():
             try:
                 calibrationsDir.mkdir(parents=True, exist_ok=True)
-                display(HTML(f"<b>(pglScreenSettings:onSave)</b> Created directory: {screenSettingsDir}"))
+                display(HTML(f"<b>(pglScreenSettings:onSave)</b> Created directory: {calibrationsDir}"))
             except Exception as e:
-                display(HTML(f"<b>(pglScreenSettings:onSave)</b> Error creating directory {screenSettingsDir}: {e}"))
+                display(HTML(f"<b>(pglScreenSettings:onSave)</b> Error creating directory {calibrationsDir}: {e}"))
                 return None
 
         return calibrationsDir
 
-    def getScreenSettings(self, settingsName=None):
+    def getSettings(self, settingsName=None):
         """
         Load settings from a JSON file and return an instance of the settings class.
-        This will look in the directory returned by getScreenSettingsDir().
+        This will look in the directory returned by getSettingsDir().
         If you pass a settingsName, it will look for a file named {name}.json in that directory. 
         If you do not pass a name, it will search through all files to see which one has the field default set
         to true
 
         Args:
-            settingsClass (type): The class of the settings to load, which should be a subclass of pglSettings.
-            filename (str): The name of the JSON file to load the settings from.
+            settingsName (type): The name of the file to load
 
         Returns:
-            An instance of the settingsClass with values loaded from the specified JSON file.
+            An instance of the pglSettings with values loaded from the specified JSON file.
         """
         if settingsName is None:
             settingsName = "Default"
             
         # get the settings directory and create the full path to the settings file
-        screenSettingsDir = self.getScreenSettingsDir()
-        screenSettingsPath = Path(screenSettingsDir) / settingsName
-        screenSettingsPath = screenSettingsPath.with_suffix(".json")
+        settingsDir = self.getSettingsDir()
+        settingsPath = Path(settingsDir) / settingsName
+        settingsPath = settingsPath.with_suffix(".json")
         
         # see if the file exists
-        if not screenSettingsPath.exists():
-            print(f"(pglSettingsManager:loadSettings) Settings file '{screenSettingsPath}' not found.")
+        if not settingsPath.exists():
+            print(f"(pglSettingsManager:loadSettings) Settings file '{settingsPath}' not found.")
             return None
         else:
-            print(f"(pglSettingsManager:loadSettings) Loading settings from '{screenSettingsPath}'.")
-            return pglScreenSettings(filename=screenSettingsPath)
-
-        screenSettingsDir = Path.home() / ".pgl" / "screenSettings"
-        print(screenSettingsDir)
-        if screenName is None:
-            # search for display with default set to true
-            for jsonFile in Path(screenSettingsDir).glob("*.json"):
-                print(jsonFile.name)
-        return 
+            print(f"(pglSettingsManager:loadSettings) Loading settings from '{settingsPath}'.")
+            return pglSettings(filename=settingsPath)
 
 # Custom JSON encoder and decoder to handle special Instance
 # traitlets of settings classs, so they can be serialized to JSON
@@ -250,7 +247,7 @@ class customJSONDecoder(json.JSONDecoder):
 # provides methods for loading/saving from JSON and displaying widgets
 # to edit the settings
 #############
-class pglSettings(HasTraits):
+class _pglSettings(HasTraits):
     def __init__(self, filename=None):
         # Initialize settings from a file
         if filename:
@@ -632,7 +629,7 @@ class pglSettings(HasTraits):
         display(self.wrapper)
 
 # Screen settings select
-class pglScreenSettingsSelect(pglSettings):
+class pglScreenSettingsSelect(_pglSettings):
     
     # traits that can be edited
     displayNames = List(Unicode(), help="Display names")
@@ -655,9 +652,9 @@ class pglScreenSettingsSelect(pglSettings):
                 s.hide()
 
 # Screen settings
-class pglScreenSettings(pglSettings):
+class pglSettings(_pglSettings):
     
-    displayName = Unicode("Default", help="Display name for these settings")
+    settingsName = Unicode(help="Display name for these settings")
     screenNumber = Int(0, min=0, max=2, step=1, help="Screen number, 0 for window, 1 for main, 2 for secondary etc")
     displayDistance = Float(57.0, min = 0.0, step=0.1, max=None, help="Distance in cm from subject to screen")
     displayWidth = Float(32.0, min = 0.0, step=0.1, max=None, help="Display width in cm")
@@ -680,8 +677,24 @@ class pglScreenSettings(pglSettings):
         from pgl import pgl, pglExperiment
         pgl = pgl()
         e = pglExperiment(pgl, suppressInitScreen=True)
-        e.initScreen(self.displayName)
+        # print HTML
+        display(HTML(f"<b>(pglSettings:onTest)</b> Testing settings: {self.settingsName}"))
+        e.initScreen(settings = self)
         e.pgl.bullseye()
         e.pgl.flush()
         e.pgl.waitSecs(10)
         e.pgl.close()
+
+    @default('settingsName')
+    def _default_settingsName(self):
+        try:
+            result = subprocess.run(
+                ['scutil', '--get', 'ComputerName'],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            return result.stdout.strip()
+        except:
+            # Fallback
+            return platform.node().split('.')[0]
