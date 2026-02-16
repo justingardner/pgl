@@ -12,7 +12,7 @@ from asyncio import subprocess
 from collections import OrderedDict
 from curses import wrapper
 from pathlib import Path
-from IPython.display import display, HTML
+from IPython.display import display, HTML, clear_output
 import ipywidgets as widgets
 from fileinput import filename
 from ipywidgets.widgets import widget
@@ -24,6 +24,9 @@ import numpy as np
 import pgl as pgl
 import subprocess
 import platform
+import time
+import threading
+import copy
 
 #######################################
 # Mixin class for pgl to provide settings management
@@ -39,42 +42,15 @@ class pglMainSettingsManager:
         """
         Edit pgl settings. Brings up widgt interface to edit settings
         """
-        # initialize experiment so that we can get settings from it
-        from .pglExperiment import pglExperiment
-        e = pglExperiment(self, suppressInitScreen=True)
-        
-        # get the screen settings directory
-        settingsDir = e.getSettingsDir()
-        
-        # cycle through all files in settingsDir with .json extension
-        # and load as a pglScreenSettings instance
-        settings = []
-        for jsonFile in Path(settingsDir).glob("*.json"):
-            # load settings from file
-            s = pglSettings(jsonFile)
-            # put in displayNames, putting the matching number on top
-            s.displayName = self.getDisplayNames(s.displayNumber)
-            # append to list
-            settings.append(s)
-            
-        # if settings is empty, then create a default settings
-        if len(settings) == 0:
-            # create default settings
-            settings.append(pglSettings())
-            # and save
-            settings[0].onSave(None)
-            
-        # setup settingsSelect class
-        # to select a screen settings file
-        settingsSelect = pglSettingsSelect()
-        settingsSelect.settingsNames = [s.settingsName for s in settings]
-        settingsSelect.settings = settings
+        # initialize settings select class
+        settingsSelect = pglSettingsSelect(self)
+        settingsSelect.load()
         
         # display the settings
         settingsSelect.edit() 
         
         # display the selected settings
-        settings[0].edit() 
+        settingsSelect.settings[0].edit() 
     
     def getDisplayNames(self, displayIndex=None):
         displayNames = ['Windowed']
@@ -678,14 +654,15 @@ class _pglSettings(HasTraits):
 
         # display
         display(self.wrapper)
+
 class confirmationPanel:
-    def __init__(self, onConfirm=None, onCancel=None):
+    def __init__(self, confirmMessage="Confirm?", onConfirm=None, onCancel=None):
         """
         onConfirm: function called if user clicks Yes
         onCancel: function called if user clicks No
         """
         # Message
-        self.label = widgets.HTML("<b>Are you sure you want to delete?</b>")
+        self.label = widgets.HTML(f"<b>{confirmMessage}</b>")
 
         # Yes button (green)
         self.yesButton = widgets.Button(
@@ -737,6 +714,31 @@ class confirmationPanel:
     def display(self):
         display(self.panel, self.output)
 
+def tempDisplay(message, duration=3):
+    """
+    Display an HTML message that disappears after a specified duration.
+    Only clears this specific message, not the whole cell.
+    
+    Args:
+        message: The HTML message to display
+        duration: Time in seconds before the message disappears (default: 3)
+    """
+    # Generate a unique display_id
+    import uuid
+    displayId = str(uuid.uuid4())
+    
+    # Display with the ID
+    display(HTML(message), display_id=displayId)
+    
+    def clearAfterDelay():
+        time.sleep(duration)
+        # Update using the display_id directly
+        display(HTML(""), display_id=displayId, update=True)
+    
+    thread = threading.Thread(target=clearAfterDelay)
+    thread.daemon = True
+    thread.start()
+       
 # Screen settings select
 class pglSettingsSelect(_pglSettings):
     
@@ -746,6 +748,51 @@ class pglSettingsSelect(_pglSettings):
     # Variable containing all the settings, this is set by calling class
     settings = []
 
+    def __init__(self, pgl=None):
+        self.pgl = pgl
+        super().__init__()
+        
+    def load(self, settingsName=None):
+        # initialize experiment so that we can get settings from it
+        from .pglExperiment import pglExperiment
+        e = pglExperiment(self, suppressInitScreen=True)
+        
+        # get the screen settings directory
+        settingsDir = e.getSettingsDir()
+        
+        # cycle through all files in settingsDir with .json extension
+        # and load as a pglScreenSettings instance
+        settings = []
+        for jsonFile in Path(settingsDir).glob("*.json"):
+            # load settings from file
+            s = pglSettings(jsonFile)
+            # put in displayNames, putting the matching number on top
+            s.displayName = self.pgl.getDisplayNames(s.displayNumber)
+            # add a link to this settingsSelect
+            s.settingsSelect = self
+            # append to list
+            settings.append(s)
+            
+        # if settings is empty, then create a default settings
+        if len(settings) == 0:
+            # create default settings
+            settings.append(pglSettings())
+            # and save
+            settings[0].onSave(None)
+            
+        if settingsName is not None:
+            # find the settings with this name and put it on top
+            for i, s in enumerate(settings):
+                if s.settingsName == settingsName:
+                    # move to top
+                    settings.insert(0, settings.pop(i))
+                    break
+                
+        # Now set our settingsNames trait and settings
+        self.settingsNames = [s.settingsName for s in settings]
+        self.settings = settings
+        
+    # ----- Callbacks for list change ---- #
     # when the displayName is selected, edit those settings
     def onListSelect(self, traitName, change):
         # call parent method
@@ -759,6 +806,39 @@ class pglSettingsSelect(_pglSettings):
                 s.edit()
             else:
                 s.hide()
+    
+    def remove(self, settingsInstance):
+        # remove the settingsInstance from our list
+        self.settings = [s for s in self.settings if s != settingsInstance]
+        # update settingsNames
+        self.settingsNames = [s.settingsName for s in self.settings]
+
+    def update(self, settingsInstance):
+        """
+        Update or add a settings instance to the list.
+        If the settingsName already exists, replace it.
+        If it's new, add it to the list.
+        """
+        # Check if this settings name already exists
+        existingIndex = None
+        for i, s in enumerate(self.settings):
+            if s.settingsName == settingsInstance.settingsName:
+                existingIndex = i
+                break
+    
+        if existingIndex is not None:
+            # Replace existing - hide the old one first
+            self.settings[existingIndex].hide()
+            if hasattr(self.settings[existingIndex], 'wrapper'):
+                self.settings[existingIndex].wrapper.close()
+            self.settings[existingIndex] = settingsInstance
+        else:
+            # Add new to the list
+            self.settings.append(settingsInstance)
+    
+        # Update settingsNames and move this one to top
+        allNames = [s.settingsName for s in self.settings]
+        self.settingsNames = [settingsInstance.settingsName] + [n for n in allNames if n != settingsInstance.settingsName]
 
 # Settings
 class pglSettings(_pglSettings):
@@ -773,27 +853,42 @@ class pglSettings(_pglSettings):
     displayHeight = Float(18.0, min = 0.0, step=0.1, max=None, help="Display height in cm")
     dataPath = Unicode("~/data",help="Path to data directory").tag(isPath=True)
     
+    # link back to settings select class
+    settingsSelect = None 
+    
+    # ----- Put up edit dialog ---- #
     def edit(self):
         # call parent method
         super().edit()
         # disable / enable dependent traits
         self.disableEnable(self.displayNumber)
 
+    # ----- callback for onSave button ---- # 
     def onSave(self, saveButton):
-        
-        # get the settingsDir
-        from .pglExperiment import pglExperiment
-        e = pglExperiment(None, suppressInitScreen=True)
-        settingsDir = e.getSettingsDir()
+    
+        # confirmation panel
+        def confirmSave():
+            # get the settingsDir
+            from .pglExperiment import pglExperiment
+            e = pglExperiment(None, suppressInitScreen=True)
+            settingsDir = e.getSettingsDir()
 
-        # get the screenSetttingsDir
-        settingsFilename = settingsDir / self.settingsName
-        settingsFilename = settingsFilename.with_suffix(".json")
+            # get the screenSetttingsDir
+            settingsFilename = settingsDir / self.settingsName
+            settingsFilename = settingsFilename.with_suffix(".json")
+    
+            # save it
+            self.save(settingsFilename)
+            tempDisplay(f"<b>Saved settings to:</b> {settingsFilename}")
         
-        # save it
-        self.save(settingsFilename)
-        display(HTML(f"<b>Saved settings to:</b> {settingsFilename}"))
+            if self.settingsSelect is not None:
+                # Just update this instance in the select list
+                self.settingsSelect.update(self)
+    
+        panel = confirmationPanel(confirmMessage="Are you sure you want to save?", onConfirm=confirmSave)
+        panel.display()
 
+    # ----- callback for onDelete button ---- # 
     def onDelete(self, deleteButton):
         # confirmation panel
         def confirmDelete():
@@ -809,14 +904,18 @@ class pglSettings(_pglSettings):
             # delete the file
             try:
                 settingsFilename.unlink()
-                display(HTML(f"<b>Deleted settings file:</b> {settingsFilename}"))
                 self.hide()
+                if self.settingsSelect is not None:
+                    # remove from settingsSelect
+                    self.settingsSelect.remove(self)
+                tempDisplay(f"<b>Deleted settings file:</b> {settingsFilename}")
             except Exception as e:
-                display(HTML(f"<b>Error deleting settings file {settingsFilename}:</b> {e}"))
+                tempDisplay(f"<b>Error deleting settings file {settingsFilename}:</b> {e}")
         
-        panel = confirmationPanel(onConfirm=confirmDelete)
+        panel = confirmationPanel(confirmMessage="Are you sure you want to delete?", onConfirm=confirmDelete)
         panel.display()
         
+    # ----- callback for onTest button ---- #   
     def onTest(self, testButton):
         from pgl import pgl, pglExperiment
         pgl = pgl()
@@ -827,6 +926,7 @@ class pglSettings(_pglSettings):
         e.pgl.waitSecs(10)
         e.pgl.close()
 
+    # ----- default for settingsName ---- #
     @default('settingsName')
     def _default_settingsName(self):
         try:
@@ -841,6 +941,7 @@ class pglSettings(_pglSettings):
             # Fallback
             return platform.node().split('.')[0]
         
+    # ----- Callbacks for list change ---- #
     # when the displayNames is selected then find the correct
     # displayNumber and set accordingly
     def onListSelect(self, traitName, change):
@@ -857,6 +958,7 @@ class pglSettings(_pglSettings):
                 # and set displayNumber accordingly
                 self.displayNumber = index
     
+     # ----- Callbacks for int change ---- #
     # when the displayNumber is changed, switch the displayNames accordingly
     def onIntSelect(self, traitName, change):
         if traitName == "displayNumber":
@@ -870,6 +972,7 @@ class pglSettings(_pglSettings):
             # disable / enable dependent traits
             self.disableEnable(displayNumber)
 
+    # ----- Disable / enable dependent traits ---- #
     def disableEnable(self, displayNumber):
         # Disable / enable traits dependent on displayNumber
         if hasattr(self, 'widgetMap'):
