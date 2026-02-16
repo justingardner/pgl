@@ -238,7 +238,7 @@ class pglTask:
     def __init__(self, pgl=None):
         self.pgl = pgl
         self._seglen = []
-        self.nTrials = 10
+        self.nTrials = np.inf
         self.parameters=[]
         self.name="Task"
         self.seglen = [1.0]  # default segment length of 1 second

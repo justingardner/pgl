@@ -926,6 +926,7 @@ class pglSettings(_pglSettings):
         class pglTestTask(pglTask):
             def updateScreen(self):
                 self.pgl.bullseye()
+                self.pgl.text(f"Trial {self.currentTrial+1}")
         
         # initialize task
         t = pglTestTask(pgl)
