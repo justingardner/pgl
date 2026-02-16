@@ -1,5 +1,9 @@
 import numpy
 from setuptools import setup, find_packages, Extension
+import sys
+
+if sys.platform != 'darwin':
+    raise RuntimeError("This package only works on macOS")
 
 displayInfoExtension = Extension(
     'pgl._resolution', 
@@ -25,10 +29,19 @@ gammaTableExtension = Extension(
 )
 
 timestampExtension = Extension(
-    'pgl._pglTimestamp',          # module name
-    sources=['pgl/_pglTimestamp.m'],  
-    extra_compile_args=[],    # no ObjC needed
-    extra_link_args=[]        # no extra frameworks needed
+    'pgl._pglTimestamp',
+    sources=['pgl/_pglTimestamp.c'],  
+    extra_compile_args=[],
+    extra_link_args=[]
+)
+
+eventListenerExtension = Extension(
+    'pgl._pglEventListener',
+    sources=['pgl/_pglEventListener.cpp'],
+    extra_link_args=[
+        '-framework', 'ApplicationServices',
+        '-framework', 'Carbon'
+    ]
 )
 
 setup(
@@ -36,9 +49,6 @@ setup(
     version='0.1.0',
     packages=find_packages(), 
     description='PGL Psychophysics and experiment library',
-    author='Justin Gardner',
-    author_email='justin@justingardner.net',
-    license='MIT',
     python_requires='>=3.9',
-    ext_modules=[displayInfoExtension,gammaTableExtension,timestampExtension]
+    ext_modules=[displayInfoExtension,gammaTableExtension,timestampExtension,eventListenerExtension]
 )
