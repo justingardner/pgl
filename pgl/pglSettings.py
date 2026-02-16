@@ -50,8 +50,13 @@ class pglMainSettingsManager:
         # and load as a pglScreenSettings instance
         settings = []
         for jsonFile in Path(settingsDir).glob("*.json"):
-            settings.append(pglSettings(jsonFile))
-
+            # load settings from file
+            s = pglSettings(jsonFile)
+            # put in displayNames, putting the matching number on top
+            s.displayName = self.getDisplayNames(s.displayNumber)
+            # append to list
+            settings.append(s)
+            
         # if settings is empty, then create a default settings
         if len(settings) == 0:
             # create default settings
@@ -70,7 +75,28 @@ class pglMainSettingsManager:
         
         # display the selected settings
         settings[0].edit() 
+    
+    def getDisplayNames(self, displayIndex=None):
+        displayNames = ['Windowed']
+
+        if not self.gpuInfo:
+            return displayNames
+
+        for gpuData in self.gpuInfo.values():
+            displays = gpuData.get("Displays", [])
+            for display in displays:
+                name = f"{display.get('DisplayName', f'Display {len(displayNames)}')}: {display.get('Display Type', 'Unknown')}"
+                if name:
+                    displayNames.append(name)
+
+        if displayIndex is not None:
+            if displayIndex < len(displayNames) and displayIndex >= 0:
+                # move the selected display to the top
+                displayNames.insert(0, displayNames.pop(displayIndex))
+            else:
+                displayNames.insert(0, "Unknown Display")
         
+        return displayNames
 #######################################
 # Mixin class for pglExperiment which manages pgl settings 
 #######################################
@@ -451,6 +477,8 @@ class _pglSettings(HasTraits):
                 )
                 link((self, traitName), (wInt, 'value'))
                 widgetRows.append(wInt)
+                wInt.observe(partial(self.onIntSelect, traitName), names='value')
+
 
             elif isinstance(trait, Unicode) and trait.metadata.get("isPath", False):
                 wPath = widgets.Text(
@@ -499,7 +527,7 @@ class _pglSettings(HasTraits):
                     layout=widgets.Layout(width='100%'),
                     tooltip=helpText
                 )
-                #link((self, traitName), (wDropdown, 'value'))
+                link((self, traitName), (wDropdown, 'options'))
                 wDropdown.observe(partial(self.onListSelect, traitName), names='value')
                 widgetRows.append(wDropdown)
         # make helpWidget
@@ -539,8 +567,18 @@ class _pglSettings(HasTraits):
             testButton.layout.display = 'none'
         else:
             testButton.on_click(partial(self.onTest))
-            
 
+        # --- Button for delete ---
+        deleteButton = widgets.Button(
+            description="Delete settings",
+            button_style='info',
+            layout=widgets.Layout(width='120px')
+        )
+        if not hasattr(self, 'onDelete'):
+            deleteButton.layout.display = 'none'
+        else:
+            deleteButton.on_click(partial(self.onDelete))
+            
         # --- Button for cancel ---
         cancelButton = widgets.Button(
             description="Cancel",
@@ -568,6 +606,9 @@ class _pglSettings(HasTraits):
     def toggleHelp(self, helpButton, helpWidget):
         helpWidget.layout.display = 'block' if helpWidget.layout.display == 'none' else 'none'
 
+    def onIntSelect(self, traitName, change):
+        pass
+        
     def onListSelect(self, traitName, change):
         # get the selected and currentList
         selected = change['new']
@@ -659,7 +700,8 @@ class pglSettingsSelect(_pglSettings):
 class pglSettings(_pglSettings):
     
     settingsName = Unicode(help="Display name for these settings")
-    screenNumber = Int(0, min=0, max=2, step=1, help="Screen number, 0 for window, 1 for main, 2 for secondary etc")
+    displayName = List(Unicode(), help="Names of available screens")
+    displayNumber = Int(0, min=0, step=1, help="Screen number, 0 for window, 1 for main, 2 for secondary etc")
     displayDistance = Float(57.0, min = 0.0, step=0.1, max=None, help="Distance in cm from subject to screen")
     displayWidth = Float(32.0, min = 0.0, step=0.1, max=None, help="Display width in cm")
     displayHeight = Float(18.0, min = 0.0, step=0.1, max=None, help="Display height in cm")
@@ -705,3 +747,32 @@ class pglSettings(_pglSettings):
         except:
             # Fallback
             return platform.node().split('.')[0]
+        
+    # when the displayNames is selected then find the correct
+    # displayNumber and set accordingly
+    def onListSelect(self, traitName, change):
+        # call parent method
+        super().onListSelect(traitName, change)
+        if traitName == "displayName":
+            from pgl import pgl
+            displayNames = pgl().getDisplayNames()
+            # get the selected display name
+            selectedName = change['new']
+            # find the index in displayNames
+            if selectedName in displayNames:
+                index = displayNames.index(selectedName)
+                # and set displayNumber accordingly
+                self.displayNumber = index
+    
+    # when the displayNumber is changed, switch the displayNames accordingly
+    def onIntSelect(self, traitName, change):
+        if traitName == "displayNumber":
+            # get the changed number
+            displayNumber = change['new']
+            # look it up in displays
+            from pgl import pgl
+            displayNames = pgl().getDisplayNames(displayNumber)
+            # and update displayName
+            self.displayName = displayNames
+
+
