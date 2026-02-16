@@ -73,9 +73,10 @@ class pglExperiment(pglSettingsManager):
         keyboardDevices = self.pgl.devicesGet(pglKeyboard)
         if not keyboardDevices:
             self.pgl.devicesAdd(pglKeyboard(eatKeys=True))
-        else:
-            for keyboardDevice in keyboardDevices:
-                keyboardDevice.start(eatKeys=True)
+            keyboardDevices = self.pgl.devicesGet(pglKeyboard)
+        
+        for keyboardDevice in keyboardDevices:
+            keyboardDevice.start(eatKeys=True)
 
         # wait half a second for metal app to initialize
         self.pgl.waitSecs(0.5)
@@ -234,11 +235,13 @@ class pglTask:
     Class representing a task in the experiment. For example, a fixation task. Or
     a stimulus task which controls when and what stimuli are presented
     '''
-    def __init__(self):
+    def __init__(self, pgl=None):
+        self.pgl = pgl
         self._seglen = []
         self.nTrials = 10
         self.parameters=[]
         self.name="Task"
+        self.seglen = [1.0]  # default segment length of 1 second
         
     ################################################################
     # seglen property

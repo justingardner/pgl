@@ -917,14 +917,29 @@ class pglSettings(_pglSettings):
         
     # ----- callback for onTest button ---- #   
     def onTest(self, testButton):
-        from pgl import pgl, pglExperiment
+        # init experiment
+        from pgl import pgl, pglExperiment, pglTask
         pgl = pgl()
         e = pglExperiment(pgl, suppressInitScreen=True)
+        
+        # test task for testing settings
+        class pglTestTask(pglTask):
+            def updateScreen(self):
+                self.pgl.bullseye()
+        
+        # initialize task
+        t = pglTestTask(pgl)
+        e.addTask(t)
+        
+        # open screen
         e.initScreen(settings = self)
-        e.pgl.bullseye()
-        e.pgl.flush()
-        e.pgl.waitSecs(10)
-        e.pgl.close()
+        
+        # and run
+        e.run()
+        #e.pgl.bullseye()
+        #e.pgl.flush()
+        #e.pgl.waitSecs(10)
+        #e.pgl.close()
 
     # ----- default for settingsName ---- #
     @default('settingsName')
