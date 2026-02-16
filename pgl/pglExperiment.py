@@ -62,8 +62,11 @@ class pglExperiment(pglSettingsManager):
             return
         
         # open screen
-        self.pgl.open(settings.screenNumber)
-        #self.pgl.open()
+        if settings.displayNumber == 0:
+            self.pgl.open(0, settings.windowWidth, settings.windowHeight)        
+        else:
+            self.pgl.open(settings.displayNumber-1)        
+            
         self.pgl.visualAngle(settings.displayDistance,settings.displayWidth,settings.displayHeight)
         
         # add keyboard device
