@@ -410,16 +410,18 @@ class _pglSettings(HasTraits):
         widgetRows = []
         allHelpText = ""
 
+        # Initialize widget map
+        self.widgetMap = {}
+
         for traitName, trait in self.getOrderedTraits().items():
             if traitName.startswith('_'):
                 continue  # skip private traits
             
-            # get helpText and add to allHelpText
             helpText = getattr(trait, 'help', f"{traitName}: float value")
             if helpText:
                 allHelpText += f"<b>{traitName}:</b> {helpText}<br>"
             
-            # Float
+            # Float with min/max
             if isinstance(trait, Float) and trait.min is not None and trait.max is not None:
                 traitStep = getattr(trait, 'step', (trait.max - trait.min) / 100)
                 slider = widgets.FloatSlider(
@@ -434,12 +436,13 @@ class _pglSettings(HasTraits):
                     layout=widgets.Layout(width='100px'),
                     tooltip=helpText
                 )
-                # link slider and text to trait
                 link((self, traitName), (slider, 'value'))
                 link((self, traitName), (text, 'value'))
-                # add as a row to the widgets
-                widgetRows.append(widgets.HBox([slider, text]))
+                row = widgets.HBox([slider, text])
+                widgetRows.append(row)
+                self.widgetMap[traitName] = row
 
+            # Float with min only
             elif isinstance(trait, Float) and trait.min is not None:
                 wFloat = widgets.BoundedFloatText(
                     description=traitName,
@@ -448,12 +451,11 @@ class _pglSettings(HasTraits):
                     layout=widgets.Layout(width='100%'),
                     tooltip=helpText
                 )
-                # traitlets will enforce min when the trait is updated
                 link((self, traitName), (wFloat, 'value'))
-
-                # add it to widgets
                 widgetRows.append(wFloat)
+                self.widgetMap[traitName] = wFloat
 
+            # Float without min/max
             elif isinstance(trait, Float):
                 wFloat = widgets.FloatText(
                     description=traitName,
@@ -461,12 +463,10 @@ class _pglSettings(HasTraits):
                     layout=widgets.Layout(width='100%'),
                     tooltip=helpText
                 )
-                # traitlets will enforce min when the trait is updated
                 link((self, traitName), (wFloat, 'value'))
-
-                # add it to widgets
                 widgetRows.append(wFloat)
-            
+                self.widgetMap[traitName] = wFloat
+
             # Int
             elif isinstance(trait, Int):
                 wInt = widgets.IntText(
@@ -476,10 +476,11 @@ class _pglSettings(HasTraits):
                     tooltip=helpText
                 )
                 link((self, traitName), (wInt, 'value'))
-                widgetRows.append(wInt)
                 wInt.observe(partial(self.onIntSelect, traitName), names='value')
+                widgetRows.append(wInt)
+                self.widgetMap[traitName] = wInt
 
-
+            # Path
             elif isinstance(trait, Unicode) and trait.metadata.get("isPath", False):
                 wPath = widgets.Text(
                     description=traitName,
@@ -487,14 +488,10 @@ class _pglSettings(HasTraits):
                     layout=widgets.Layout(width='100%'),
                     tooltip=helpText
                 )
-                # link the widget with the trait
                 link((self, traitName), (wPath, 'value'))
-                
-                # set on_submit for path changes
                 wPath.on_submit(partial(self.onPathSubmit, traitName=traitName))
-                
-                #append the path widget
                 widgetRows.append(wPath)
+                self.widgetMap[traitName] = wPath
 
             # Unicode
             elif isinstance(trait, Unicode):
@@ -506,7 +503,8 @@ class _pglSettings(HasTraits):
                 )
                 link((self, traitName), (wText, 'value'))
                 widgetRows.append(wText)
-            
+                self.widgetMap[traitName] = wText
+
             # Bool
             elif isinstance(trait, Bool):
                 wBool = widgets.Checkbox(
@@ -516,12 +514,14 @@ class _pglSettings(HasTraits):
                 )
                 link((self, traitName), (wBool, 'value'))
                 widgetRows.append(wBool)
+                self.widgetMap[traitName] = wBool
+
             # List
             elif isinstance(trait, List):
                 currentList = getattr(self, traitName)
                 wDropdown = widgets.Dropdown(
                     options=currentList,
-                    value=currentList[0],
+                    value=currentList[0] if currentList else None,
                     description=traitName,
                     style=style,
                     layout=widgets.Layout(width='100%'),
@@ -530,20 +530,20 @@ class _pglSettings(HasTraits):
                 link((self, traitName), (wDropdown, 'options'))
                 wDropdown.observe(partial(self.onListSelect, traitName), names='value')
                 widgetRows.append(wDropdown)
-        # make helpWidget
+                self.widgetMap[traitName] = wDropdown
+
+        # Help widget
         helpWidget = widgets.HTML(allHelpText)
-        helpWidget.layout.display = 'none'  # hidden by default
+        helpWidget.layout.display = 'none'
         helpWidget.add_class("help-text")
 
-        # --- Button to toggle help display ---
         helpButton = widgets.Button(
             description="Show Help",
             button_style='info',
             layout=widgets.Layout(width='120px')
         )
         helpButton.on_click(partial(self.toggleHelp, helpWidget=helpWidget))
-        
-        # --- Button for save ---
+
         saveButton = widgets.Button(
             description="Save settings",
             button_style='info',
@@ -553,22 +553,17 @@ class _pglSettings(HasTraits):
             saveButton.layout.display = 'none'
         else:
             saveButton.on_click(partial(self.onSave))
-        
-        
-        # --- Button for test ---
+
         testButton = widgets.Button(
             description="Test settings",
             button_style='info',
             layout=widgets.Layout(width='120px')
         )
-        
-        # if there is no onTest method defined by the subclass, hide the test button, otherwise link it to the onTest method
         if not hasattr(self, 'onTest'):
             testButton.layout.display = 'none'
         else:
             testButton.on_click(partial(self.onTest))
 
-        # --- Button for delete ---
         deleteButton = widgets.Button(
             description="Delete settings",
             button_style='info',
@@ -578,8 +573,7 @@ class _pglSettings(HasTraits):
             deleteButton.layout.display = 'none'
         else:
             deleteButton.on_click(partial(self.onDelete))
-            
-        # --- Button for cancel ---
+
         cancelButton = widgets.Button(
             description="Cancel",
             button_style='info',
@@ -587,11 +581,19 @@ class _pglSettings(HasTraits):
         )
         cancelButton.on_click(partial(self.onCancel))
 
-        # pack up widgetRows, buttons and help
-        widgetDisplay = widgetRows + [widgets.HBox([cancelButton, saveButton, testButton, widgets.Box(layout=widgets.Layout(flex='1')), helpButton]), helpWidget]
+        # Pack all widgets
+        widgetDisplay = widgetRows + [
+            widgets.HBox([
+                cancelButton,
+                saveButton,
+                testButton,
+                widgets.Box(layout=widgets.Layout(flex='1')),
+                helpButton
+            ]),
+            helpWidget
+        ]
 
         return widgetDisplay
-    
     def onCancel(self, cancelButton):
         self.hide()
         pass
@@ -702,11 +704,19 @@ class pglSettings(_pglSettings):
     settingsName = Unicode(help="Display name for these settings")
     displayName = List(Unicode(), help="Names of available screens")
     displayNumber = Int(0, min=0, step=1, help="Screen number, 0 for window, 1 for main, 2 for secondary etc")
+    windowWidth = Int(800, min=100, step=10, help="Window width in pixels")
+    windowHeight = Int(600, min=100, step=10, help="Window height in pixels")
     displayDistance = Float(57.0, min = 0.0, step=0.1, max=None, help="Distance in cm from subject to screen")
     displayWidth = Float(32.0, min = 0.0, step=0.1, max=None, help="Display width in cm")
     displayHeight = Float(18.0, min = 0.0, step=0.1, max=None, help="Display height in cm")
     dataPath = Unicode("~/data",help="Path to data directory").tag(isPath=True)
     
+    def edit(self):
+        # call parent method
+        super().edit()
+        # disable / enable dependent traits
+        self.disableEnable(self.displayNumber)
+
     def onSave(self, saveButton):
         
         # get the settingsDir
@@ -774,5 +784,13 @@ class pglSettings(_pglSettings):
             displayNames = pgl().getDisplayNames(displayNumber)
             # and update displayName
             self.displayName = displayNames
+            # disable / enable dependent traits
+            self.disableEnable(displayNumber)
 
-
+    def disableEnable(self, displayNumber):
+        # Disable / enable traits dependent on displayNumber
+        if hasattr(self, 'widgetMap'):
+            for trait in ["windowWidth", "windowHeight"]:
+                widget = self.widgetMap.get(trait)
+                if widget:
+                    widget.disabled = displayNumber!=0
