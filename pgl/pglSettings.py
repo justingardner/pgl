@@ -11,7 +11,10 @@
 from asyncio import subprocess
 from collections import OrderedDict
 from curses import wrapper
+from http.client import responses
+from http.client import responses
 from pathlib import Path
+from urllib import response
 from IPython.display import display, HTML, clear_output
 import ipywidgets as widgets
 from fileinput import filename
@@ -927,6 +930,9 @@ class pglSettings(_pglSettings):
             def updateScreen(self):
                 self.pgl.bullseye()
                 self.pgl.text(f"Trial {self.currentTrial+1}")
+            def handleSubjectResponse(self, responses, updateTime):
+                for response in responses:
+                    self.pgl.text(f"Subject response received: {response} at {updateTime}")
         
         # initialize task
         t = pglTestTask(pgl)

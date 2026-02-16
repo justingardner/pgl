@@ -23,7 +23,7 @@ from .pglVPixx import pglProPixx, pglDataPixx
 from .pglEyeTracker import pglEyeTracker
 from .pglTrackPixx import pglTrackPixx3
 from .pglLabJack import pglLabJack
-
+from .pglEventListener import pglEventListener
 
 try:
     import pylink

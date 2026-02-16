@@ -1,5 +1,5 @@
 # Makefile
-build: pgl/_resolution.m
+build: pgl/_resolution.m pgl/_pglGammaTable.m pgl/_pglTimestamp.c pgl/_pglEventListener.cpp
 	python setup.py build_ext --inplace
 
 force:
