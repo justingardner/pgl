@@ -573,7 +573,9 @@ class _pglSettings(HasTraits):
             deleteButton.layout.display = 'none'
         else:
             deleteButton.on_click(partial(self.onDelete))
-
+        
+        spacer = widgets.Box(layout=widgets.Layout(width="120px"))
+        
         cancelButton = widgets.Button(
             description="Cancel",
             button_style='info',
@@ -585,7 +587,9 @@ class _pglSettings(HasTraits):
         widgetDisplay = widgetRows + [
             widgets.HBox([
                 cancelButton,
+                deleteButton,
                 saveButton,
+                spacer,
                 testButton,
                 widgets.Box(layout=widgets.Layout(flex='1')),
                 helpButton
@@ -674,6 +678,64 @@ class _pglSettings(HasTraits):
 
         # display
         display(self.wrapper)
+class confirmationPanel:
+    def __init__(self, onConfirm=None, onCancel=None):
+        """
+        onConfirm: function called if user clicks Yes
+        onCancel: function called if user clicks No
+        """
+        # Message
+        self.label = widgets.HTML("<b>Are you sure you want to delete?</b>")
+
+        # Yes button (green)
+        self.yesButton = widgets.Button(
+            description="Yes",
+            button_style="success",
+            layout=widgets.Layout(width="80px")
+        )
+        self.yesButton.on_click(self._yes_clicked)
+
+        # No button (red)
+        self.noButton = widgets.Button(
+            description="No",
+            button_style="danger",
+            layout=widgets.Layout(width="80px")
+        )
+        self.noButton.on_click(self._no_clicked)
+
+        # Store callbacks
+        self.onConfirm = onConfirm
+        self.onCancel = onCancel
+
+        # Pack the panel
+        self.panel = widgets.VBox([
+            self.label,
+            widgets.HBox([self.yesButton, self.noButton])
+        ])
+        
+        # Output to display result
+        self.output = widgets.Output()
+
+    def _yes_clicked(self, b):
+        with self.output:
+            self.output.clear_output()
+        if self.onConfirm:
+            self.onConfirm()
+        self._hide_panel()
+
+    def _no_clicked(self, b):
+        with self.output:
+            self.output.clear_output()
+        if self.onCancel:
+            self.onCancel()
+        self._hide_panel()
+
+    def _hide_panel(self):
+        # Hide the panel widgets
+        self.panel.layout.display = 'none'
+
+    def display(self):
+        display(self.panel, self.output)
 
 # Screen settings select
 class pglSettingsSelect(_pglSettings):
@@ -732,12 +794,33 @@ class pglSettings(_pglSettings):
         self.save(settingsFilename)
         display(HTML(f"<b>Saved settings to:</b> {settingsFilename}"))
 
+    def onDelete(self, deleteButton):
+        # confirmation panel
+        def confirmDelete():
+            # get the settingsDir
+            from .pglExperiment import pglExperiment
+            e = pglExperiment(None, suppressInitScreen=True)
+            settingsDir = e.getSettingsDir()
+
+            # get the screenSetttingsDir
+            settingsFilename = settingsDir / self.settingsName
+            settingsFilename = settingsFilename.with_suffix(".json")
+            
+            # delete the file
+            try:
+                settingsFilename.unlink()
+                display(HTML(f"<b>Deleted settings file:</b> {settingsFilename}"))
+                self.hide()
+            except Exception as e:
+                display(HTML(f"<b>Error deleting settings file {settingsFilename}:</b> {e}"))
+        
+        panel = confirmationPanel(onConfirm=confirmDelete)
+        panel.display()
+        
     def onTest(self, testButton):
         from pgl import pgl, pglExperiment
         pgl = pgl()
         e = pglExperiment(pgl, suppressInitScreen=True)
-        # print HTML
-        display(HTML(f"<b>(pglSettings:onTest)</b> Testing settings: {self.settingsName}"))
         e.initScreen(settings = self)
         e.pgl.bullseye()
         e.pgl.flush()
