@@ -334,17 +334,17 @@ class _pglSettings(HasTraits):
                     trait = self.traits()[key]
                     expectedType = trait.__class__
                     gotType = type(data[key])
-                    print(f"(pglSettings) '{key}' has wrong type in JSON (expected {expectedType.__name__}, got {gotType.__name__}), using default {getattr(self, key)}")
+                    print(f"(pglSettings) '{key}' has wrong type in JSON file {filename} (expected {expectedType.__name__}, got {gotType.__name__}), using default {getattr(self, key)}")
                 except Exception as e:
                     # Handle any other errors
-                    print(f"(pglSettings) Error: {e} Using default value for {key}: {getattr(self, key)}. ")
+                    print(f"(pglSettings) Error: {e} Using default value for {key} for JSON file {filename}: {getattr(self, key)}. ")
             # if not in the json file, use default value
             else:
-                print(f"(pglSettings) '{key}' not found in JSON, using default {getattr(self, key)}")
+                print(f"(pglSettings) '{key}' not found in JSON file {filename}, using default {getattr(self, key)}")
         # keys in JSON that are not traits
         extraKeys = set(data.keys()) - set(self.trait_names())
         if extraKeys:
-            print(f"(pglSettings) Did not load unknown keys from JSON: {list(extraKeys)}")
+            print(f"(pglSettings) Did not load unknown keys from JSON file {filename}: {list(extraKeys)}")
     
     # display parameters
     def __repr__(self):
