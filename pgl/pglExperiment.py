@@ -14,10 +14,11 @@ import numpy as np
 import itertools
 import random
 import math
-from . import pglKeyboard
+from . import pglKeyboardMouse
 from pathlib import Path
 from .pglSettings import pglSettingsManager
 from IPython.display import display, HTML
+from .pglBase import pglDisplayMessage
 
 #############
 # Experiment class
@@ -69,14 +70,18 @@ class pglExperiment(pglSettingsManager):
             
         self.pgl.visualAngle(settings.displayDistance,settings.displayWidth,settings.displayHeight)
         
-        # add keyboard device
-        keyboardDevices = self.pgl.devicesGet(pglKeyboard)
+        # add keyboard device if not already loaded
+        keyboardDevices = self.pgl.devicesGet(pglKeyboardMouse)
         if not keyboardDevices:
-            self.pgl.devicesAdd(pglKeyboard(eatKeys=True))
-            keyboardDevices = self.pgl.devicesGet(pglKeyboard)
-        
-        for keyboardDevice in keyboardDevices:
-            keyboardDevice.start(eatKeys=True)
+            keyboardMouse = pglKeyboardMouse(eatKeys=None)
+            self.pgl.devicesAdd(keyboardMouse)
+            # check if listener is running
+            if not keyboardMouse.isRunning():
+                pglDisplayMessage("<b>(pglExperiment:initScreen)</b> ❌ Accessibility permission not granted for keyboard/mouse access.", useHTML=True)
+                pglDisplayMessage("On macOS, go to System Preferences -> Security & Privacy -> Privacy -> Accessibility, and add your terminal application (e.g. Terminal, iTerm, etc) to the list of apps allowed to control your computer.", useHTML=True)
+                pglDisplayMessage("If you are running VS Code and it already has permissions granted, try running directly from a terminal with:", useHTML=True)
+                pglDisplayMessage("              /Applications/Visual\\ Studio\\ Code.app/Contents/MacOS/Electron", useHTML=True)
+
 
         # wait half a second for metal app to initialize
         self.pgl.waitSecs(0.5)
@@ -96,8 +101,8 @@ class pglExperiment(pglSettingsManager):
         Load experiment parameters from configuration file.
         '''
         # this should be settable in a parameter dialog
-        self.startKeypress = ["Key.space"]
-        self.endKeypress = ["Key.esc"]
+        self.startKeypress = ["space"]
+        self.endKeypress = ["escape"]
         self.keyList = ["1", "2", "3"]
 
         pass
@@ -143,7 +148,6 @@ class pglExperiment(pglSettingsManager):
         Run the experiment.
         '''
         experimentDone = False
-        d = self.pgl.devicesGet(pglKeyboard)
 
         # wait for key press to start experiment
         if self.startKeypress is not []:
@@ -154,10 +158,10 @@ class pglExperiment(pglSettingsManager):
                 events = self.pgl.poll()
 
                 # see if we have a match to startKeypress
-                if [e for e in events if e.type == "keyboard" and e.keyStr in self.startKeypress]:
+                if [e for e in events if e.type == "keyboard" and e.keyChar in self.startKeypress]:
                     experimentStarted = True
                     
-                if [e for e in events if e.type == "keyboard" and e.keyStr in self.endKeypress]:
+                if [e for e in events if e.type == "keyboard" and e.keyChar in self.endKeypress]:
                     experimentStarted = True
                     experimentDone = True
 
@@ -170,12 +174,12 @@ class pglExperiment(pglSettingsManager):
             events = self.pgl.poll()
 
             # see if we have a match to endKeypress
-            if [e for e in events if e.type == "keyboard" and e.keyStr in self.endKeypress]:
+            if [e for e in events if e.type == "keyboard" and e.keyChar in self.endKeypress]:
                 experimentDone = True
                 continue
 
             # grab any events that match the keyList and return their index within that list
-            subjectResponse = [keyIndex for e in events if e.type == "keyboard" and e.keyStr in self.keyList for keyIndex in [self.keyList.index(e.keyStr)]]
+            subjectResponse = [keyIndex for e in events if e.type == "keyboard" and e.keyChar in self.keyList for keyIndex in [self.keyList.index(e.keyChar)]]
 
             # update tasks in current phase
             phaseDone = False
@@ -202,7 +206,7 @@ class pglExperiment(pglSettingsManager):
         print("(pglExperiment:run) Experiment done.")
         
         # stop the keyboard listener
-        keyboardDevices = self.pgl.devicesGet(pglKeyboard)
+        keyboardDevices = self.pgl.devicesGet(pglKeyboardMouse)
         if keyboardDevices is not []:
             for keyboardDevice in keyboardDevices:
                 keyboardDevice.stop()
@@ -368,3 +372,16 @@ class pglTask:
         '''
         # set current segment length to 0 to force jump
         self._thisTrialSeglen[self.currentSegment] = 0
+
+# test task for testing settings
+class pglTestTask(pglTask):
+    def updateScreen(self):
+        # put upt the bulls eye
+        self.pgl.bullseye()
+        # and text for what trial we are on 
+        # This will just update every trial
+        self.pgl.text(f"Trial {self.currentTrial+1}")
+    
+    def handleSubjectResponse(self, responses, updateTime):
+        for response in responses:
+            self.pgl.text(f"Subject response received: {response} at {updateTime}")

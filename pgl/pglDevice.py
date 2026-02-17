@@ -12,8 +12,10 @@ from asyncio import subprocess
 import io
 import sys
 from time import sleep
+from typing import Optional
 from pgl import pglTimestamp
 from .pglEvent import pglEvent
+from .pglEventListener import pglEventListener
 
 #################################################################
 # Parent class for devices
@@ -141,13 +143,248 @@ class pglDevices:
         return eventList
 
 #############################
-# keyboard device
+# keyboard and mouse device 
+# Uses pglEventListener which
+# calls the _pglEventListener C extension
+# to listen to events and gets
+# hardware precise timestamps for
+# keyboard and mouse events
+##############################
+class pglKeyboardMouse(pglDevice):
+    def __init__(self, eatKeys=None):
+        super().__init__(deviceType="pglKeyboard")
+
+        if not self.checkAccessibilityPermission():
+            print("(pglKeyboardMouse) ❌ This app is not authorized for Accessibility input monitoring. No keyboard events will be detected!!")
+            print("  Go to System Settings → Privacy & Security → Accessibility and add this app.")
+            print("  If you are running VS Code and it already has permissions granted, try running directly from a terminal with:")
+            print("  /Applications/Visual\\ Studio\\ Code.app/Contents/MacOS/Electron")
+            return
+
+        self.start(eatKeys)
+
+    def start(self, eatKeys=None):
+        '''
+        Start the keyboard listener.
+        '''
+        if self.isRunning(): return
+        print(f"(pglKeyboardMouse:start) Starting keyboard and mouse event listener.")
+        
+        # start the listener
+        self.listener = pglEventListener()
+        self.listener.start()
+        
+        # if eatKeys are passed in, set them
+        if eatKeys is not None:
+            self.listener.setEatKeys(keyString=eatKeys)
+    
+    def stop(self):
+        '''
+        Stop the keyboard listener.
+        '''
+        if self.isRunning(): 
+            self.listener.stop()
+        print(f"(pglKeyboardMouse:stop) Stopping keyboard listener.")
+        
+    def checkAccessibilityPermission(self):
+        """
+        Returns True if the process is trusted for accessibility events.
+        Works on macOS using tccutil database query.
+        """
+        # if already running, return True
+        if self.isRunning():
+            return True
+        
+        accessibilityPermission = False
+        listener = None
+
+        # capture stdout and stderr
+        error = None
+        stdout_capture = io.StringIO()
+        stderr_capture = io.StringIO()
+
+        try:
+            # Start a temporary listener
+            listener = pglEventListener()
+            # check if one is already running (could have
+            # been started by another pglEventListener instance)
+            if not listener.isRunning():
+                listener.start()
+                sleep(0.1)
+                # if it is not running, then problem.
+                if not listener.isRunning(): error = "Listener did not start properly"
+
+        except Exception as e:
+            error = str(e)
+
+        finally:
+            if listener is not None:
+                try:
+                    listener.stop()
+                except Exception:
+                    pass
+
+        if error:
+            print(f"(pglKeyboardMouse) ❌ {error.rstrip('\n')}")
+        else:
+            accessibilityPermission = True
+        
+        return(accessibilityPermission)
+
+    def __del__(self):
+        if self.isRunning():
+            self.listener.stop()
+
+    def isRunning(self):
+        '''
+        Check if the keyboard listener is running.
+        '''
+        return hasattr(self, 'listener') and self.listener.isRunning()
+
+    def poll(self): 
+        '''
+        Poll the key queue for events.
+        '''
+        eventList = []
+        if not self.isRunning(): return eventList
+
+        # get all keyEvents from listener
+        keyEvents = self.listener.getAllKeyboardEvents()
+        
+        # extract fields from keyEvents
+        for keyEvent in keyEvents:
+            # Extract fields from event dictionary
+            timestamp = keyEvent['timestamp']
+            keyCode = keyEvent['keyCode']
+            eventType = keyEvent['eventType']
+            
+            # Extract modifier keys
+            shift = keyEvent.get('shift', False)
+            ctrl = keyEvent.get('control', False)
+            alt = keyEvent.get('alt', False)
+            cmd = keyEvent.get('command', False)
+            
+            # Convert keycode to character (if possible)
+            keyChar = self._keyCodeToChar(keyCode, shift)
+            
+            # Create event object
+            eventList.append(pglEventKeyboard(
+                keyChar=keyChar,
+                keyCode=keyCode,
+                key=keyEvent,
+                eventType=eventType,
+                timestamp=timestamp,
+                shift=shift,
+                ctrl=ctrl,
+                alt=alt,
+                cmd=cmd
+            ))
+
+        return eventList
+    
+    def _keyCodeToChar(self, keyCode: int, shift: bool = False) -> Optional[str]:
+        """
+        Convert macOS keycode to character representation.
+        
+        Args:
+            keyCode: The macOS keycode
+            shift: Whether shift is pressed
+            
+        Returns:
+            Character string or special key name
+        """
+        # Lowercase letter keycodes (without shift)
+        keycodeMapLower = {
+            0: 'a', 11: 'b', 8: 'c', 2: 'd', 14: 'e', 3: 'f', 5: 'g', 4: 'h',
+            34: 'i', 38: 'j', 40: 'k', 37: 'l', 46: 'm', 45: 'n', 31: 'o',
+            35: 'p', 12: 'q', 15: 'r', 1: 's', 17: 't', 32: 'u', 9: 'v',
+            13: 'w', 7: 'x', 16: 'y', 6: 'z',
+        }
+        
+        # Uppercase letters (with shift)
+        keycodeMapUpper = {
+            0: 'A', 11: 'B', 8: 'C', 2: 'D', 14: 'E', 3: 'F', 5: 'G', 4: 'H',
+            34: 'I', 38: 'J', 40: 'K', 37: 'L', 46: 'M', 45: 'N', 31: 'O',
+            35: 'P', 12: 'Q', 15: 'R', 1: 'S', 17: 'T', 32: 'U', 9: 'V',
+            13: 'W', 7: 'X', 16: 'Y', 6: 'Z',
+        }
+        
+        # Numbers (without shift)
+        numberMap = {
+            29: '0', 18: '1', 19: '2', 20: '3', 21: '4',
+            23: '5', 22: '6', 26: '7', 28: '8', 25: '9',
+        }
+        
+        # Numbers with shift (symbols)
+        numberShiftMap = {
+            29: ')', 18: '!', 19: '@', 20: '#', 21: '$',
+            23: '%', 22: '^', 26: '&', 28: '*', 25: '(',
+        }
+        
+        # Punctuation without shift
+        punctuationMap = {
+            27: '-', 24: '=', 33: '[', 30: ']', 42: '\\',
+            41: ';', 39: "'", 43: ',', 47: '.', 44: '/', 50: '`',
+        }
+        
+        # Punctuation with shift
+        punctuationShiftMap = {
+            27: '_', 24: '+', 33: '{', 30: '}', 42: '|',
+            41: ':', 39: '"', 43: '<', 47: '>', 44: '?', 50: '~',
+        }
+        
+        # Special keys
+        specialKeys = {
+            49: 'space',
+            36: 'return',
+            48: 'tab',
+            51: 'delete',
+            53: 'escape',
+            76: 'enter',  # Numpad enter
+            123: 'left',
+            124: 'right',
+            125: 'down',
+            126: 'up',
+            122: 'f1', 120: 'f2', 99: 'f3', 118: 'f4', 96: 'f5', 97: 'f6',
+            98: 'f7', 100: 'f8', 101: 'f9', 109: 'f10', 103: 'f11', 111: 'f12',
+        }
+        
+        # Check special keys first
+        if keyCode in specialKeys:
+            return specialKeys[keyCode]
+        
+        # Check letters
+        if shift:
+            if keyCode in keycodeMapUpper:
+                return keycodeMapUpper[keyCode]
+        else:
+            if keyCode in keycodeMapLower:
+                return keycodeMapLower[keyCode]
+        
+        # Check numbers and symbols
+        if shift:
+            if keyCode in numberShiftMap:
+                return numberShiftMap[keyCode]
+            if keyCode in punctuationShiftMap:
+                return punctuationShiftMap[keyCode]
+        else:
+            if keyCode in numberMap:
+                return numberMap[keyCode]
+            if keyCode in punctuationMap:
+                return punctuationMap[keyCode]
+        
+        # Unknown keycode
+        return f'<keycode:{keyCode}>'
+#############################
+# keyboard device (pynput implementation)
+# Pynput does not provide ability to
+# eat specific keys (as of 2/16/2026)
 #############################
 from pynput import keyboard
 from queue import Queue
 import threading
 
-class pglKeyboard(pglDevice):
+class pglPynputKeyboard(pglDevice):
     def __init__(self, eatKeys=False): 
         super().__init__(deviceType="pglKeyboard")
 
@@ -222,7 +459,7 @@ class pglKeyboard(pglDevice):
             listener.start()  # non-blocking
             sleep(0.1)   # give it a moment to initialize
 
-            if not listener.running: error = "Listener did not start properly"
+            if not listener.isRunning(): error = "Listener did not start properly"
 
         except Exception as e:
             error = str(e)
@@ -318,7 +555,7 @@ class pglKeyboard(pglDevice):
                 keyChar = str(key) 
                 keyCode = None
             # put in event list
-            eventList.append(pglEventKeyboard(keyChar, keyCode, key, timestamp, shift, ctrl, alt, cmd))
+            eventList.append(pglEventKeyboard(keyChar, keyCode, key, timestamp, shift, ctrl, alt, cmd, "keydown"))
         return eventList
 
 ###################################
@@ -330,31 +567,32 @@ class pglEventKeyboard(pglEvent):
 
     """
 
-    def __init__(self, keyStr, keyCode, key, deviceTime, shift, ctrl, alt, cmd):
+    def __init__(self, keyChar, keyCode, key, timestamp, shift, ctrl, alt, cmd, eventType = None):
         '''
         Initialize the pglEventKeyboard instance.
         Args:
-            keyStr(str): The key that was pressed.
+            keyChar(str): The key that was pressed.
             keyCode (int): The key code of the pressed key.
             key (Key): The key object.
-            deviceTime (float): The device time.
+            timestamp (double): The device time.
             shift (bool): Whether the shift key was held down.
             ctrl (bool): Whether the ctrl key was held down.
             alt (bool): Whether the alt key was held down.
             cmd (bool): Whether the cmd key was held down.
+            eventType (str): The type of event ('keydown' or 'keyup').
         Returns:
             None
         '''
         super().__init__("keyboard")
-        self.keyStr = keyStr
+        self.keyChar = keyChar
         self.keyCode = keyCode
         self.key = key
-        self.deviceTime = deviceTime
+        self.timestamp = timestamp
         self.shift = shift
         self.ctrl = ctrl
         self.alt = alt
         self.cmd = cmd
-
+        self.eventType = eventType
     def __repr__(self):
         '''
         Return a string representation of the pglEventKeyboard instance.
@@ -366,4 +604,4 @@ class pglEventKeyboard(pglEvent):
         if self.ctrl: modifierStr += "Ctrl "
         if self.alt: modifierStr += "Alt "
         if self.cmd: modifierStr += "Cmd "
-        return f"(pglEventKeyboard) Key: {self.keyStr}, KeyCode: {self.keyCode}, Device Time: {self.deviceTime}, Modifiers: {modifierStr.strip()}"
+        return f"(pglEventKeyboard) Key: {self.keyChar}, KeyCode: {self.keyCode}, Timestamp: {self.timestamp}, Modifiers: {modifierStr.strip()}, Event Type: {self.eventType}"

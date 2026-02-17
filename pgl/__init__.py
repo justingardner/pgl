@@ -1,4 +1,4 @@
-from .pglBase import pglBase
+from .pglBase import pglBase, pglDisplayMessage
 from .pglResolution import pglResolution
 from .pglDraw import pglDraw
 from .pglTransform import pglTransform
@@ -7,11 +7,11 @@ from .pglBatch import pglBatch
 from .pglImage import pglImage
 from .pglStimuli import pglStimuli
 from .pglTimestamp import pglTimestamp
-from .pglDevice import pglDevice, pglDevices, pglKeyboard, pglEventKeyboard
+from .pglDevice import pglDevice, pglDevices, pglKeyboardMouse, pglEventKeyboard
 from .pglEvent import pglEvent, pglEvents
 from .pglCommandReplayer import pglCommandReplayer
 from .pglFrameGrab import pglFrameGrab
-from .pglExperiment import pglExperiment, pglTask
+from .pglExperiment import pglExperiment, pglTask, pglTestTask
 from .pglParameter import pglParameter, pglParameterBlock
 from .pglStaircase import pglStaircase
 from ._pglComm import pglSerial

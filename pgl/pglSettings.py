@@ -27,10 +27,9 @@ import numpy as np
 import pgl as pgl
 import subprocess
 import platform
-import time
-import threading
 import copy
-
+from .pglBase import pglDisplayMessage
+displayDuration = 5  # seconds
 #######################################
 # Mixin class for pgl to provide settings management
 #######################################
@@ -716,31 +715,6 @@ class confirmationPanel:
 
     def display(self):
         display(self.panel, self.output)
-
-def tempDisplay(message, duration=3):
-    """
-    Display an HTML message that disappears after a specified duration.
-    Only clears this specific message, not the whole cell.
-    
-    Args:
-        message: The HTML message to display
-        duration: Time in seconds before the message disappears (default: 3)
-    """
-    # Generate a unique display_id
-    import uuid
-    displayId = str(uuid.uuid4())
-    
-    # Display with the ID
-    display(HTML(message), display_id=displayId)
-    
-    def clearAfterDelay():
-        time.sleep(duration)
-        # Update using the display_id directly
-        display(HTML(""), display_id=displayId, update=True)
-    
-    thread = threading.Thread(target=clearAfterDelay)
-    thread.daemon = True
-    thread.start()
        
 # Screen settings select
 class pglSettingsSelect(_pglSettings):
@@ -882,7 +856,7 @@ class pglSettings(_pglSettings):
     
             # save it
             self.save(settingsFilename)
-            tempDisplay(f"<b>Saved settings to:</b> {settingsFilename}")
+            pglDisplayMessage(f"<b>Saved settings to:</b> {settingsFilename}", duration=displayDuration)
         
             if self.settingsSelect is not None:
                 # Just update this instance in the select list
@@ -911,9 +885,9 @@ class pglSettings(_pglSettings):
                 if self.settingsSelect is not None:
                     # remove from settingsSelect
                     self.settingsSelect.remove(self)
-                tempDisplay(f"<b>Deleted settings file:</b> {settingsFilename}")
+                pglDisplayMessage(f"<b>Deleted settings file:</b> {settingsFilename}", duration=displayDuration)
             except Exception as e:
-                tempDisplay(f"<b>Error deleting settings file {settingsFilename}:</b> {e}")
+                pglDisplayMessage(f"<b>Error deleting settings file {settingsFilename}:</b> {e}", duration=displayDuration)
         
         panel = confirmationPanel(confirmMessage="Are you sure you want to delete?", onConfirm=confirmDelete)
         panel.display()
