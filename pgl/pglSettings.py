@@ -24,11 +24,11 @@ import json
 from functools import partial
 from datetime import datetime
 import numpy as np
-import pgl as pgl
 import subprocess
 import platform
 import copy
 from .pglBase import pglDisplayMessage
+
 displayDuration = 5  # seconds
 #######################################
 # Mixin class for pgl to provide settings management
@@ -457,7 +457,33 @@ class _pglSettings(HasTraits):
                 wInt.observe(partial(self.onIntSelect, traitName), names='value')
                 widgetRows.append(wInt)
                 self.widgetMap[traitName] = wInt
-
+            # Bool
+            elif isinstance(trait, Bool):
+                wBool = widgets.Checkbox(
+                    value=getattr(self, traitName, False),
+                    tooltip=helpText,
+                    indent=False
+                )
+                wLabel = widgets.Label(value=traitName, style=style)
+                wLabel.layout.width = '125px' 
+                wBox = widgets.HBox([wLabel, wBool], layout=widgets.Layout(width='100%'))
+                
+                link((self, traitName), (wBool, 'value'))
+                wBool.observe(partial(self.onBoolSelect, traitName), names='value')
+                widgetRows.append(wBox)
+                self.widgetMap[traitName] = wBool
+            elif isinstance(trait, Bool):
+                wBool = widgets.Checkbox(
+                    description=traitName,
+                    style=style,
+                    layout=widgets.Layout(width='100%'),
+                    tooltip=helpText,
+                    indent=False
+                )
+                link((self, traitName), (wBool, 'value'))
+                wBool.observe(partial(self.onBoolSelect, traitName), names='value')
+                widgetRows.append(wBool)
+                self.widgetMap[traitName] = wBool
             # Path
             elif isinstance(trait, Unicode) and trait.metadata.get("isPath", False):
                 wPath = widgets.Text(
@@ -591,6 +617,9 @@ class _pglSettings(HasTraits):
         helpWidget.layout.display = 'block' if helpWidget.layout.display == 'none' else 'none'
 
     def onIntSelect(self, traitName, change):
+        pass
+        
+    def onBoolSelect(self, traitName, change):
         pass
         
     def onListSelect(self, traitName, change):
@@ -732,7 +761,7 @@ class pglSettingsSelect(_pglSettings):
     def load(self, settingsName=None):
         # initialize experiment so that we can get settings from it
         from .pglExperiment import pglExperiment
-        e = pglExperiment(self, suppressInitScreen=True)
+        e = pglExperiment(self)
         
         # get the screen settings directory
         settingsDir = e.getSettingsDir()
@@ -829,6 +858,13 @@ class pglSettings(_pglSettings):
     displayWidth = Float(32.0, min = 0.0, step=0.1, max=None, help="Display width in cm")
     displayHeight = Float(18.0, min = 0.0, step=0.1, max=None, help="Display height in cm")
     dataPath = Unicode("~/data",help="Path to data directory").tag(isPath=True)
+    startKey = Unicode("space", allow_none=True, help="Key to start experiment")
+    endKey = Unicode("escape", allow_none=True, help="Key to end experiment")
+    volumeTriggerKey = Unicode("`", allow_none=True, help="Key press that signals scanner volume acquisition trigger")
+    responseKeys = Unicode("1234", help="Keys used for subject responses. Can be a string like \"1234\" or a comma-separated list like 'left,right,up,down' and will map to response 0,1,2,etc")
+    eatKeys = Bool(True, help="Whether to eat keypresses so they don't propagate to the OS. Will only eat the keys specified above.")
+    startOnVolumeTrigger = Bool(False, help="Whether to start the experiment on the volume trigger key")
+    closeScreenOnEnd = Bool(True, help="Whether to close the screen when the experiment ends")
     
     # link back to settings select class
     settingsSelect = None 
@@ -847,7 +883,7 @@ class pglSettings(_pglSettings):
         def confirmSave():
             # get the settingsDir
             from .pglExperiment import pglExperiment
-            e = pglExperiment(None, suppressInitScreen=True)
+            e = pglExperiment(None)
             settingsDir = e.getSettingsDir()
 
             # get the screenSetttingsDir
@@ -895,32 +931,20 @@ class pglSettings(_pglSettings):
     # ----- callback for onTest button ---- #   
     def onTest(self, testButton):
         # init experiment
-        from pgl import pgl, pglExperiment, pglTask
+        from pgl import pgl
         pgl = pgl()
-        e = pglExperiment(pgl, suppressInitScreen=True)
-        
-        # test task for testing settings
-        class pglTestTask(pglTask):
-            def updateScreen(self):
-                self.pgl.bullseye()
-                self.pgl.text(f"Trial {self.currentTrial+1}")
-            def handleSubjectResponse(self, responses, updateTime):
-                for response in responses:
-                    self.pgl.text(f"Subject response received: {response} at {updateTime}")
-        
+        from .pglExperiment import pglExperiment, pglTestTask
+        e = pglExperiment(pgl, settings=self)
+                
         # initialize task
         t = pglTestTask(pgl)
         e.addTask(t)
         
         # open screen
-        e.initScreen(settings = self)
+        e.initScreen()
         
         # and run
         e.run()
-        #e.pgl.bullseye()
-        #e.pgl.flush()
-        #e.pgl.waitSecs(10)
-        #e.pgl.close()
 
     # ----- default for settingsName ---- #
     @default('settingsName')

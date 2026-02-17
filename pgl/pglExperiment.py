@@ -16,7 +16,7 @@ import random
 import math
 from . import pglKeyboardMouse
 from pathlib import Path
-from .pglSettings import pglSettingsManager
+from .pglSettings import pglSettingsManager, pglSettings
 from IPython.display import display, HTML
 from .pglBase import pglDisplayMessage
 
@@ -28,47 +28,58 @@ class pglExperiment(pglSettingsManager):
     Experiment class which handles timing, parameter randomization,
     subject response, synchronizing with measurement hardware etc
     '''
-    def __init__(self, pgl, settingsName=None, suppressInitScreen=False, suppressEndScreen=False):
+    def __init__(self, pgl, settingsName=None, settings=None):
+        '''
+        Initialize the pglExperiment class.
+        
+        Args:
+            pgl (pgl): An instance of the pgl class.
+            settingsName (str): The name of the settings to use. If not set (and settings not set), will use default settings
+            settings (pglSettings): An instance of the pglSettings class. If set, will supersede settingsName.
+        '''
         # save pgl
         self.pgl = pgl
         
-        # initialize screen
-        if not suppressInitScreen: self.initScreen(settingsName)
-
-        # load parameters
-        self.loadParameters()
-        self.suppressEndScreen = suppressEndScreen
-        
         # current phase of experiment
         self.currentPhase = 0
+        self.openScreen = False
         
         # initialize tasks
         self.task = [[]]
+
+        # get  settings
+        self.settings = settings
+        if self.settings is None:
+            self.settings = self.getSettings(settingsName)
+        
+        # if there was some error, then display it
+        if self.settings is None:
+            # display error in HTML
+            pglDisplayMessage("<b>(pglExperiment:initScreen)</b> ❌ Could not find settings, using default settings.")
+            # create default settings
+            self.settings = pglSettings()
+            
         
     def __repr__(self):
         return f"<pglExperiment: {len(self.task)} phases>"
     
-    def initScreen(self, settingsName=None, settings=None):
+    def initScreen(self):
         '''
         Initialize the screen for the experiment. This will call pgl.open() and
         set parameters according to what is set in setParameters
-        '''
-        # get  settings
-        if settings is None:
-            settings = self.getSettings(settingsName)
-        
-        if settings is None:
-            # display error in HTML
-            display(HTML("<b>(pglExperiment:initScreen)</b> ❌ Could not find settings to open screen."))
+        '''        
+        if self.settings is None:
+            print("(pglExperiment:initScreen) No settings found to open screen.")
             return
         
         # open screen
-        if settings.displayNumber == 0:
-            self.pgl.open(0, settings.windowWidth, settings.windowHeight)        
+        if self.settings.displayNumber == 0:
+            self.pgl.open(0, self.settings.windowWidth, self.settings.windowHeight)        
         else:
-            self.pgl.open(settings.displayNumber-1)        
+            self.pgl.open(self.settings.displayNumber-1)        
             
-        self.pgl.visualAngle(settings.displayDistance,settings.displayWidth,settings.displayHeight)
+        # set visual angle coordinates
+        self.pgl.visualAngle(self.settings.displayDistance,self.settings.displayWidth,self.settings.displayHeight)
         
         # add keyboard device if not already loaded
         keyboardDevices = self.pgl.devicesGet(pglKeyboardMouse)
@@ -82,43 +93,54 @@ class pglExperiment(pglSettingsManager):
                 pglDisplayMessage("If you are running VS Code and it already has permissions granted, try running directly from a terminal with:", useHTML=True)
                 pglDisplayMessage("              /Applications/Visual\\ Studio\\ Code.app/Contents/MacOS/Electron", useHTML=True)
 
+        # If response keys is a comma-separated list, split it into a list (this is so you can do "1,space,F1,2"
+        if ',' in self.settings.responseKeys:
+            self.responseKeysList = [k.strip() for k in self.settings.responseKeys.split(',')]
+        else:
+            # if no commas, then just make a list of characters
+            self.responseKeysList = list(self.settings.responseKeys)
 
+        # if eatKeys is set, then compose a list of all keys as keyCodes
+        if self.settings.eatKeys:
+            eatKeyCodes = []
+    
+            # Collect all individual keys
+            allKeys = self.responseKeysList.copy()  # Start with response keys list
+    
+            # Add single keys if they exist
+            if self.settings.startKey:
+                allKeys.append(self.settings.startKey)
+            if self.settings.endKey:
+                allKeys.append(self.settings.endKey)
+            if self.settings.volumeTriggerKey:
+                allKeys.append(self.settings.volumeTriggerKey)
+    
+            # Convert all to keycodes
+            for keyChar in allKeys:
+                keyCode = keyboardMouse.charToKeyCode(keyChar)
+                if keyCode is not None:
+                    eatKeyCodes.append(keyCode)
+    
+            keyboardMouse.setEatKeys(eatKeyCodes)
+            
         # wait half a second for metal app to initialize
         self.pgl.waitSecs(0.5)
         
+        # flush screen to get rid of any transients
         self.pgl.flush()
         self.pgl.flush()
+        
+        # mark that we have opened the screen
+        self.openScreen = True
 
     def endScreen(self):
         '''
         Close the screen
         '''
+        if self.settings.closeScreenOnEnd:
+            # close screen
+            self.pgl.close()
 
-        # close screen
-        self.pgl.close()
-    def loadParameters(self):
-        '''
-        Load experiment parameters from configuration file.
-        '''
-        # this should be settable in a parameter dialog
-        self.startKeypress = ["space"]
-        self.endKeypress = ["escape"]
-        self.keyList = ["1", "2", "3"]
-
-        pass
-
-    def saveParameters(self):
-        '''
-        Save experiment parameters to configuration file.
-        '''
-        pass
-
-    def setParameters(self):
-        '''
-        Brings up a dialog to set experiment parameters.
-        '''
-        pass
-    
     def addTask(self, task, phaseNum = None):
         '''
         Add a task to the experiment.
@@ -141,7 +163,6 @@ class pglExperiment(pglSettingsManager):
 
         # add the task
         self.task[phaseNum].append(task)
-        
 
     def run(self):
         '''
@@ -150,18 +171,29 @@ class pglExperiment(pglSettingsManager):
         experimentDone = False
 
         # wait for key press to start experiment
-        if self.startKeypress is not []:
+        if self.settings.startKey is not [] or self.settings.startOnVolumeTrigger:
             experimentStarted = False
-            print(f"(pglExperiment:run) Waiting for key press ({[key for key in self.startKeypress]}) to start experiment...")
+            if self.settings.startOnVolumeTrigger:
+                self.pgl.text("Waiting for volume trigger to start experiment",y=0)
+            else:
+                self.pgl.text(f"Press {self.settings.startKey} key to start experiment",y=0)
+            # flush to display text
+            self.pgl.flush()
             while not experimentStarted:
                 # poll for events
                 events = self.pgl.poll()
 
-                # see if we have a match to startKeypress
-                if [e for e in events if e.type == "keyboard" and e.keyChar in self.startKeypress]:
+                # see if we have a match to startKey
+                if [e for e in events if e.type == "keyboard" and e.keyChar in self.settings.startKey]:
                     experimentStarted = True
-                    
-                if [e for e in events if e.type == "keyboard" and e.keyChar in self.endKeypress]:
+                
+                # if waiting to startOnVolumeTrigger, check for that key                
+                if self.settings.startOnVolumeTrigger:
+                    if [e for e in events if e.type == "keyboard" and e.keyChar in self.settings.volumeTriggerKey]:
+                        experimentStarted = True
+                
+                # Check for end key to allow aborting before starting    
+                if [e for e in events if e.type == "keyboard" and e.keyChar in self.settings.endKey]:
                     experimentStarted = True
                     experimentDone = True
 
@@ -173,13 +205,13 @@ class pglExperiment(pglSettingsManager):
             # poll for events
             events = self.pgl.poll()
 
-            # see if we have a match to endKeypress
-            if [e for e in events if e.type == "keyboard" and e.keyChar in self.endKeypress]:
+            # see if we have a match to endKey
+            if [e for e in events if e.type == "keyboard" and e.keyChar in self.settings.endKey]:
                 experimentDone = True
                 continue
 
             # grab any events that match the keyList and return their index within that list
-            subjectResponse = [keyIndex for e in events if e.type == "keyboard" and e.keyChar in self.keyList for keyIndex in [self.keyList.index(e.keyChar)]]
+            subjectResponse = [keyIndex for e in events if e.type == "keyboard" and e.keyChar in self.responseKeysList for keyIndex in [self.responseKeysList.index(e.keyChar)]]
 
             # update tasks in current phase
             phaseDone = False
@@ -212,7 +244,7 @@ class pglExperiment(pglSettingsManager):
                 keyboardDevice.stop()
 
         # close screen
-        if not self.suppressEndScreen: self.endScreen()
+        self.endScreen()
 
     def startPhase(self):
         '''

@@ -265,7 +265,7 @@ class pglKeyboardMouse(pglDevice):
             cmd = keyEvent.get('command', False)
             
             # Convert keycode to character (if possible)
-            keyChar = self._keyCodeToChar(keyCode, shift)
+            keyChar = self.keyCodeToChar(keyCode, shift)
             
             # Create event object
             eventList.append(pglEventKeyboard(
@@ -282,7 +282,17 @@ class pglKeyboardMouse(pglDevice):
 
         return eventList
     
-    def _keyCodeToChar(self, keyCode: int, shift: bool = False) -> Optional[str]:
+    def setEatKeys(self, keyCodes):
+        '''
+        Set keys to eat so they don't propagate to the OS.
+
+        Args:
+            keyCodes (list): List of key codes to eat.
+        '''
+        if self.isRunning():
+            self.listener.setEatKeys(keyCodes)
+    
+    def keyCodeToChar(self, keyCode: int, shift: bool = False) -> Optional[str]:
         """
         Convert macOS keycode to character representation.
         
@@ -348,7 +358,7 @@ class pglKeyboardMouse(pglDevice):
             122: 'f1', 120: 'f2', 99: 'f3', 118: 'f4', 96: 'f5', 97: 'f6',
             98: 'f7', 100: 'f8', 101: 'f9', 109: 'f10', 103: 'f11', 111: 'f12',
         }
-        
+       
         # Check special keys first
         if keyCode in specialKeys:
             return specialKeys[keyCode]
@@ -375,6 +385,73 @@ class pglKeyboardMouse(pglDevice):
         
         # Unknown keycode
         return f'<keycode:{keyCode}>'
+    
+    def charToKeyCode(self, char: str) -> Optional[int]:
+        """
+        Convert character representation to macOS keycode.
+        
+        Args:
+            char: Character string or special key name
+            
+        Returns:
+            The macOS keycode, or None if not found
+        """
+        # Letter keycodes (case-insensitive)
+        charMapLetters = {
+            'a': 0, 'b': 11, 'c': 8, 'd': 2, 'e': 14, 'f': 3, 'g': 5, 'h': 4,
+            'i': 34, 'j': 38, 'k': 40, 'l': 37, 'm': 46, 'n': 45, 'o': 31,
+            'p': 35, 'q': 12, 'r': 15, 's': 1, 't': 17, 'u': 32, 'v': 9,
+            'w': 13, 'x': 7, 'y': 16, 'z': 6,
+            'A': 0, 'B': 11, 'C': 8, 'D': 2, 'E': 14, 'F': 3, 'G': 5, 'H': 4,
+            'I': 34, 'J': 38, 'K': 40, 'L': 37, 'M': 46, 'N': 45, 'O': 31,
+            'P': 35, 'Q': 12, 'R': 15, 'S': 1, 'T': 17, 'U': 32, 'V': 9,
+            'W': 13, 'X': 7, 'Y': 16, 'Z': 6,
+        }
+        
+        # Numbers and symbols
+        charMapNumbers = {
+            '0': 29, '1': 18, '2': 19, '3': 20, '4': 21,
+            '5': 23, '6': 22, '7': 26, '8': 28, '9': 25,
+            ')': 29, '!': 18, '@': 19, '#': 20, '$': 21,
+            '%': 23, '^': 22, '&': 26, '*': 28, '(': 25,
+        }
+        
+        # Punctuation
+        charMapPunctuation = {
+            '-': 27, '_': 27, '=': 24, '+': 24,
+            '[': 33, '{': 33, ']': 30, '}': 30,
+            '\\': 42, '|': 42, ';': 41, ':': 41,
+            "'": 39, '"': 39, ',': 43, '<': 43,
+            '.': 47, '>': 47, '/': 44, '?': 44,
+            '`': 50, '~': 50,
+        }
+        
+        # Special keys (case-insensitive)
+        charMapSpecial = {
+            'space': 49, 'return': 36, 'tab': 48, 'delete': 51,
+            'escape': 53, 'esc': 53, 'enter': 76,
+            'left': 123, 'right': 124, 'down': 125, 'up': 126,
+            'f1': 122, 'f2': 120, 'f3': 99, 'f4': 118, 'f5': 96, 'f6': 97,
+            'f7': 98, 'f8': 100, 'f9': 101, 'f10': 109, 'f11': 103, 'f12': 111,
+        }
+        
+        # Try letters first
+        if char in charMapLetters:
+            return charMapLetters[char]
+        
+        # Try numbers/symbols
+        if char in charMapNumbers:
+            return charMapNumbers[char]
+        
+        # Try punctuation
+        if char in charMapPunctuation:
+            return charMapPunctuation[char]
+        
+        # Try special keys (case-insensitive)
+        if char.lower() in charMapSpecial:
+            return charMapSpecial[char.lower()]
+        
+        return None
 #############################
 # keyboard device (pynput implementation)
 # Pynput does not provide ability to
