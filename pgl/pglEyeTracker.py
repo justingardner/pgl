@@ -49,12 +49,6 @@ class pglEyeTracker(pglDevice):
         self.isCalibrated = True
         self.calibrationTime = self.pglTimestamp.getDateAndTime()
 
-    def calibrate(self):
-        """Calibrate the eye tracker."""
-        # perform calibration logic here
-        self.isCalibrated = True
-        self.calibrationTime = self.pglTimestamp.getDateAndTime()
-
     def calibrateEyeImage(self):
         """
         Calibrate the eye image.
