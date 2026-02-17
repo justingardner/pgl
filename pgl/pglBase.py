@@ -21,6 +21,9 @@ from types import SimpleNamespace
 import signal
 import glob
 import psutil
+from IPython.display import display, HTML
+import time
+import threading
 
 #############
 # Main class
@@ -835,6 +838,43 @@ class pglBase:
             return None
         
         return whichScreen
+    
+def pglDisplayMessage(message, useHTML=False, duration=None):
+    """
+    Display an HTML message that disappears after a specified duration.
+    Only clears this specific message, not the whole cell.
+        
+    Args:
+        message: The HTML message to display
+        duration: Time in seconds before the message disappears (default: None))
+    """
+    # if duration is set, then must use html
+    if duration is not None:
+        useHTML=True
+        
+    if not useHTML:
+        # just plain print
+        print(message)
+    else:
+        # Generate a unique display_id
+        import uuid
+        displayId = str(uuid.uuid4())
+        
+        # Display with the ID
+        display(HTML(message), display_id=displayId)
+        
+        # If no duration specified, we're done
+        if duration is None:
+            return
+        
+        def clearAfterDelay():
+            time.sleep(duration)
+            # Update using the display_id directly
+            display(HTML(""), display_id=displayId, update=True)
+        
+        thread = threading.Thread(target=clearAfterDelay)
+        thread.daemon = True
+        thread.start()
 
 
 

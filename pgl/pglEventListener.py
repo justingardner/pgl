@@ -58,9 +58,13 @@ class pglEventListener:
             print("(pglEventListener) Listener already running")
             return
         
+        if _pglEventListener.isRunning():
+            print("(pglEventListener) ❌ Another listener is already running in this process")
+            self._running = False
+            return
+        
         _pglEventListener.start(self._eventCallback)
         self._running = True
-        print("(pglEventListener) Event listener started")
     
     def stop(self) -> None:
         """Stop capturing events and cleanup resources."""
@@ -74,12 +78,10 @@ class pglEventListener:
             self._keyboardQueue.clear()
             self._mouseQueue.clear()
             self._keyStatus.clear()
-        
-        print("(pglEventListener) Event listener stopped")
-    
+            
     def isRunning(self) -> bool:
         """Check if listener is currently running."""
-        return _pglEventListener.is_running()
+        return _pglEventListener.isRunning()
     
     def _eventCallback(self, event: Dict) -> None:
         """

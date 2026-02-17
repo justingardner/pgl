@@ -11,3 +11,8 @@ name = "pgl"
 version = "0.1.0"
 description = "PGL Psychophysics and experiment library"
 requires-python = ">=3.9"
+license = {text = "MIT"}
+
+authors = [
+  { name = "Justin L Gardner" }
+]
