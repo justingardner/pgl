@@ -169,6 +169,7 @@ class pglExperiment(pglSettingsManager):
         Run the experiment.
         '''
         experimentDone = False
+        self.volumeNumber = 0
 
         # wait for key press to start experiment
         if self.settings.startKey is not [] or self.settings.startOnVolumeTrigger:
@@ -191,6 +192,7 @@ class pglExperiment(pglSettingsManager):
                 if self.settings.startOnVolumeTrigger:
                     if [e for e in events if e.type == "keyboard" and e.keyChar in self.settings.volumeTriggerKey]:
                         experimentStarted = True
+                        self.volumeNumber += 1
                 
                 # Check for end key to allow aborting before starting    
                 if [e for e in events if e.type == "keyboard" and e.keyChar in self.settings.endKey]:
@@ -199,6 +201,7 @@ class pglExperiment(pglSettingsManager):
 
         self.startPhase()
         print(f"(pglExperiment:run) Experiment started.")
+        self.startTime = self.pgl.getSecs()
 
         while not experimentDone:
             
@@ -210,8 +213,12 @@ class pglExperiment(pglSettingsManager):
                 experimentDone = True
                 continue
 
+            # Check for volume trigger key
+            if [e for e in events if e.type == "keyboard" and e.keyChar in self.settings.volumeTriggerKey and e.eventType == "keydown"]:    
+                self.volumeNumber += 1
+
             # grab any events that match the keyList and return their index within that list
-            subjectResponse = [keyIndex for e in events if e.type == "keyboard" and e.keyChar in self.responseKeysList for keyIndex in [self.responseKeysList.index(e.keyChar)]]
+            subjectResponse = [keyIndex for e in events if e.type == "keyboard" and e.eventType == "keydown" and e.keyChar in self.responseKeysList for keyIndex in [self.responseKeysList.index(e.keyChar)]]
 
             # update tasks in current phase
             phaseDone = False
@@ -235,6 +242,7 @@ class pglExperiment(pglSettingsManager):
                 else:
                     self.startPhase()
         
+        self.endTime = self.pgl.getSecs()
         print("(pglExperiment:run) Experiment done.")
         
         # stop the keyboard listener
@@ -279,6 +287,9 @@ class pglTask:
         self.name="Task"
         self.seglen = [1.0]  # default segment length of 1 second
         
+        self.phaseNum = None
+        self.tasks = None
+        self.e = None
     ################################################################
     # seglen property
     ################################################################
@@ -358,6 +369,11 @@ class pglTask:
         '''
         Update the task.
         '''
+        # store references
+        self.phaseNum = phaseNum
+        self.tasks = tasks
+        self.e = experiment
+        
         # update the screen
         self.updateScreen()
 
@@ -407,13 +423,22 @@ class pglTask:
 
 # test task for testing settings
 class pglTestTask(pglTask):
+    responseText = ""
     def updateScreen(self):
         # put upt the bulls eye
         self.pgl.bullseye()
         # and text for what trial we are on 
         # This will just update every trial
-        self.pgl.text(f"Trial {self.currentTrial+1}")
+        self.pgl.text(f"Trial {self.currentTrial+1}",xAlign=1)
+        if self.e is not None:
+            self.pgl.text(f"Volume {self.e.volumeNumber}",xAlign=1)
+            elapsed = self.pgl.getSecs() - self.e.startTime
+            minutes = int(elapsed // 60)
+            seconds = int(elapsed % 60)
+            self.pgl.text(f"{minutes:02d}:{seconds:02d}",xAlign=1)
+            if self.responseText is not "":
+                self.pgl.text(self.responseText,xAlign=1)
     
     def handleSubjectResponse(self, responses, updateTime):
         for response in responses:
-            self.pgl.text(f"Subject response received: {response} at {updateTime}")
+            self.responseText = f"Subject response received: {response} at {updateTime - self.e.startTime:.2f} seconds"
