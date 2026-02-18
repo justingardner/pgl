@@ -181,15 +181,6 @@ class pglCalibration():
             "done": "None",
         }
         
-        # initialize calibration data
-        self.calibrationData = pglCalibrationData()
-        self.calibrationIndex = 0
-        self.fullCalibrationIndex = None
-        self.findMinIndex = None
-        
-        # start with trying to measure min and max
-        self.calibrationMode = "minmax"
-        
         # value for how close to min and max a value can be
         # to just be considered min or max when doing the
         # search for min and max values
@@ -232,8 +223,18 @@ class pglCalibration():
             print("(pglCalibration) No calibration device specified.")
             return None
         
+        # initialize calibration data
+        self.calibrationData = pglCalibrationData()
+        self.calibrationIndex = 0
+        self.fullCalibrationIndex = None
+        self.findMinIndex = None
+        
+        # start with trying to measure min and max
+        self.calibrationMode = "minmax"
+        
         # open the display with specified settings
         e = pglExperiment(self.pgl, settingsName)
+        e.initScreen()
         if self.pgl.isOpen() is False:
             print(f"(pglCalibration) Display {settingsName} did not open, cannot calibrate.")
             return None
@@ -243,16 +244,17 @@ class pglCalibration():
 
         # save settings name
         self.calibrationData.settingsName = settingsName
-        self.calibrationData.screenSettings = e.getScreenSettings(settingsName)
+        self.calibrationData.settings = e.getSettings(settingsName)
         
         # linearlize gamma, save the current gamma table so we can replace it
-        screenNumber = self.calibrationData.screenSettings.screenNumber
-        self.currentGammaTable = self.pgl.getGammaTable(screenNumber)
-        self.pgl.setGammaTableLinear(screenNumber)
+        displayNumber = self.calibrationData.settings.displayNumber
+        if displayNumber > 0: displayNumber -= 1
+        self.currentGammaTable = self.pgl.getGammaTable(displayNumber)
+        self.pgl.setGammaTableLinear(displayNumber)
         
         # get the linearized gamma table and save it (for reference as validation will have an inverse table)
-        self.calibrationData.gammaTableSize = self.pgl.getGammaTableSize(screenNumber)
-        gammaTable = self.pgl.getGammaTable(screenNumber)
+        self.calibrationData.gammaTableSize = self.pgl.getGammaTableSize(displayNumber)
+        gammaTable = self.pgl.getGammaTable(displayNumber)
         self.calibrationData.gammaTable = tuple(np.array(table) for table in gammaTable)
 
         # set number of repeats and steps
@@ -264,7 +266,7 @@ class pglCalibration():
             # get display info if available
             gpu = next(iter(self.pgl.gpuInfo.values()))
             displays = gpu.get('Displays', [])
-            self.calibrationData.displayInfo = displays[screenNumber]
+            self.calibrationData.displayInfo = displays[displayNumber]
         except Exception as ex:
             print(f"(pglCalibration) Warning: Could not get display info: {ex}")
         
@@ -285,10 +287,10 @@ class pglCalibration():
             print(f"(pglCalibration) {self.calibrationValueGet(-1)}: {self.calibrationMeasurementGet(-1)}")
 
         # restore the original gamma table
-        self.pgl.setGammaTable(screenNumber, self.currentGammaTable[0], self.currentGammaTable[1], self.currentGammaTable[2])
+        self.pgl.setGammaTable(displayNumber, self.currentGammaTable[0], self.currentGammaTable[1], self.currentGammaTable[2])
         
         # close the screen
-        self.pgl.close()
+        e.endScreen()
         
         # display results when done
         self.calibrationData.display()
@@ -501,7 +503,8 @@ class pglCalibration():
         
         # save the calibration data
         self.calibrationData.save(filePath / fileStem)    
-
+        print(f"(pglCalibration) Calibration data saved to {filePath / fileStem}")
+        
     def apply(self, value):
         '''
         Apply the calibration to a given value.
@@ -514,7 +517,7 @@ class pglCalibrationData(_pglSettings):
     
     settingsName = Unicode("Default", help="Settings name used to open display")
     displayInfo = Dict(help="Display information at time of calibration")
-    screenSettings = Instance(pglSettings, allow_none=True, help="Settings used during calibration")    
+    settings = Instance(pglSettings, allow_none=True, help="Settings used during calibration")    
     gammaTableSize = Int(-1, help="Size of the gamma table at time of calibration")
     gammaTable = Tuple(Instance(np.ndarray), Instance(np.ndarray), Instance(np.ndarray), allow_none=True, help="Gamma table at time of calibration")
     creationDateTime = Instance(datetime, default_value=datetime.now(), help="Date and time of calibration creation")

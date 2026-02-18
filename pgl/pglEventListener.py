@@ -13,6 +13,7 @@ from collections import deque
 from typing import Callable, Dict, List, Optional, Set
 import threading
 import atexit
+import time
 
 #############
 # EventListener
@@ -43,6 +44,9 @@ class pglEventListener:
         self._running = False
         self._eatKeys: Set[int] = set()
         
+        self._lastEscTime = 0.0
+        self.DOUBLE_PRESS_WINDOW = 0.5
+
         # Register cleanup
         atexit.register(self.stop)
     
@@ -89,7 +93,12 @@ class pglEventListener:
         Runs in separate thread - must be thread-safe!
         """
         eventType = event.get('eventType', '')
-
+        
+        # handle ESC key for failsafe shutdown
+        if eventType == 'keydown' and event.get('keyCode') == 53:
+            self._handleEscPress()
+            return
+        
         with self._lock:
             if eventType in ('keydown', 'keyup'):
                 keyCode = event['keyCode']
@@ -107,6 +116,24 @@ class pglEventListener:
             elif 'mouse' in eventType:
                 self._mouseQueue.append(event)
     
+    def _handleEscPress(self) -> None:
+        """
+        Handle ESC key press for failsafe shutdown 
+        
+        Single press: Turn off eat keys
+        Double press (within 500ms): Shutdown listener
+        """
+        timestamp = time.time()
+        
+        if 0 < (timestamp - self._lastEscTime) <= self.DOUBLE_PRESS_WINDOW:
+            # Double ESC press, call stop
+            self.stop()
+            self._lastEscTime = 0
+        else:
+            # Single ESC press, turn off eat keys
+            _pglEventListener.setEatKeys([])
+            self._lastEscTime = timestamp
+ 
     def getKeyboardEvent(self) -> Optional[Dict]:
         """
         Get the oldest keyboard event and remove it from queue.

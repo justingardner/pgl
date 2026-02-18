@@ -92,7 +92,10 @@ class pglExperiment(pglSettingsManager):
                 pglDisplayMessage("On macOS, go to System Preferences -> Security & Privacy -> Privacy -> Accessibility, and add your terminal application (e.g. Terminal, iTerm, etc) to the list of apps allowed to control your computer.", useHTML=True)
                 pglDisplayMessage("If you are running VS Code and it already has permissions granted, try running directly from a terminal with:", useHTML=True)
                 pglDisplayMessage("              /Applications/Visual\\ Studio\\ Code.app/Contents/MacOS/Electron", useHTML=True)
-
+        else:
+            # if already loaded, just grab it
+            keyboardMouse = keyboardDevices[0]
+        
         # If response keys is a comma-separated list, split it into a list (this is so you can do "1,space,F1,2"
         if ',' in self.settings.responseKeys:
             self.responseKeysList = [k.strip() for k in self.settings.responseKeys.split(',')]
@@ -137,6 +140,12 @@ class pglExperiment(pglSettingsManager):
         '''
         Close the screen
         '''
+        # stop the keyboard listener
+        keyboardDevices = self.pgl.devicesGet(pglKeyboardMouse)
+        if keyboardDevices is not []:
+            for keyboardDevice in keyboardDevices:
+                keyboardDevice.stop()
+
         if self.settings.closeScreenOnEnd:
             # close screen
             self.pgl.close()
@@ -245,12 +254,6 @@ class pglExperiment(pglSettingsManager):
         self.endTime = self.pgl.getSecs()
         print("(pglExperiment:run) Experiment done.")
         
-        # stop the keyboard listener
-        keyboardDevices = self.pgl.devicesGet(pglKeyboardMouse)
-        if keyboardDevices is not []:
-            for keyboardDevice in keyboardDevices:
-                keyboardDevice.stop()
-
         # close screen
         self.endScreen()
 
@@ -436,7 +439,7 @@ class pglTestTask(pglTask):
             minutes = int(elapsed // 60)
             seconds = int(elapsed % 60)
             self.pgl.text(f"{minutes:02d}:{seconds:02d}",xAlign=1)
-            if self.responseText is not "":
+            if self.responseText != "":
                 self.pgl.text(self.responseText,xAlign=1)
     
     def handleSubjectResponse(self, responses, updateTime):
