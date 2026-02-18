@@ -77,7 +77,10 @@ class pglExperiment(pglSettingsManager):
             self.pgl.open(0, self.settings.windowWidth, self.settings.windowHeight)        
         else:
             self.pgl.open(self.settings.displayNumber-1)        
-            
+        if not self.pgl.isOpen():   
+            pglDisplayMessage("<b>(pglExperiment:initScreen)</b> ❌ Failed to open screen.", useHTML=True, duration=5)
+            return
+        
         # set visual angle coordinates
         self.pgl.visualAngle(self.settings.displayDistance,self.settings.displayWidth,self.settings.displayHeight)
         
@@ -177,6 +180,10 @@ class pglExperiment(pglSettingsManager):
         '''
         Run the experiment.
         '''
+        if self.openScreen == False:
+            pglDisplayMessage("(pglExperiment:run) ❌ Screen is not open. Call initScreen() before running the experiment.",useHTML=True, duration=5)
+            return
+        
         experimentDone = False
         self.volumeNumber = 0
 
