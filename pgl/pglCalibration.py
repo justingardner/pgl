@@ -16,6 +16,7 @@ from .pglSettings import filename, _pglSettings, pglSettings, pglSettingsManager
 from traitlets import Unicode, Int, Instance, Dict, Tuple
 from datetime import datetime
 from .pglExperiment import pglExperiment
+from tqdm.notebook import tqdm
 
 ##########################
 # Calibration device class
@@ -229,6 +230,9 @@ class pglCalibration():
         self.fullCalibrationIndex = None
         self.findMinIndex = None
         
+        # no progress bar at start
+        self.progressBar = None
+        
         # start with trying to measure min and max
         self.calibrationMode = "minmax"
         
@@ -284,7 +288,7 @@ class pglCalibration():
             # make a measurement
             self.measure()
             # and display
-            print(f"(pglCalibration) {self.calibrationValueGet(-1)}: {self.calibrationMeasurementGet(-1)}")
+            self.displayProgress()
 
         # restore the original gamma table
         self.pgl.setGammaTable(displayNumber, self.currentGammaTable[0], self.currentGammaTable[1], self.currentGammaTable[2])
@@ -297,6 +301,21 @@ class pglCalibration():
         
         # and save
         self.save()
+    
+    def displayProgress(self, startProgress=False):
+        '''
+        Display the progress of the calibration.
+        '''
+        if startProgress:
+            self.progressBar = tqdm(total=self.calibrationData.nSteps*self.calibrationData.nRepeats, desc="Calibrating", unit="measurements")
+        else:
+            if self.calibrationMode == "minmax":
+                print(f"(pglCalibration) {self.calibrationValueGet(-1)}: {self.calibrationMeasurementGet(-1)}")
+            elif self.calibrationMode == "minsearch":
+                print(f"(pglCalibration) {self.calibrationValueGet(-1)}: {self.calibrationMeasurementGet(-1)}")
+            elif self.calibrationMode == "full":
+                if self.progressBar is not None:
+                    self.progressBar.update(1)
         
     def getNextCalibrationValue(self):
         '''
@@ -398,6 +417,7 @@ class pglCalibration():
             self.fullCalibrationIndex = self.calibrationIndex
             # display the min and max value
             printHeader(f"Starting Full Calibration between {self.minCalibrationVal} and {self.maxCalibrationVal}")
+            self.displayProgress(startProgress=True)
 
         if ((self.calibrationIndex-self.fullCalibrationIndex) % self.calibrationData.nRepeats) == 0:
             # set the next value to measure
