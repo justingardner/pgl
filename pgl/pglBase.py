@@ -50,7 +50,12 @@ class pglBase:
     def __init__(self):
         
         self.printHeader("pglBase: init")
-        
+        # print how you can get error log
+        print("(pgl) mglMetal error log can be viewed in MacOS Console app by searching for PROCESS mglMetal or in a terminal with:")
+        print("      log stream --level info --process mglMetal")
+        print("(pgl) To search for something specifc, e.g. messages from mglMovie:")        
+        print("      log stream --predicate 'eventMessage CONTAINS \"mglMovie\"' --style syslog --level info")
+
         # check os
         if not self.checkOS():
             raise Exception("(pglBase) Unsupported OS")
@@ -211,11 +216,6 @@ class pglBase:
         self.clearScreen([0.4, 0.2, 0.5])
         self.flush()
         
-        # print how you can get error log
-        print("(pgl:open) mglMetal error log can be viewed in MacOS Console app by searching for PROCESS mglMetal or in a terminal with:")
-        print("log stream --level info --process mglMetal")
-        print("(pgl:open) To search for something specifc, e.g. messages from mglMovie:")        
-        print("log stream --predicate 'eventMessage CONTAINS \"mglMovie\"' --style syslog --level info")
         self.printHeader()
         # success
         return True

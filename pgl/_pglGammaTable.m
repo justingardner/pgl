@@ -191,7 +191,6 @@ static PyObject* getGammaTable(PyObject* self, PyObject* args)
     PyObject *pyGreen = PyList_New(sampleCount);
     PyObject *pyBlue = PyList_New(sampleCount);
     for (uint32_t i = 0; i < sampleCount; i++) {
-        printf("Index %d: R=%f, G=%f, B=%f\n", i, redTable[i], greenTable[i], blueTable[i]);
         PyList_SET_ITEM(pyRed, i, PyFloat_FromDouble(redTable[i]));
         PyList_SET_ITEM(pyGreen, i, PyFloat_FromDouble(greenTable[i]));
         PyList_SET_ITEM(pyBlue, i, PyFloat_FromDouble(blueTable[i]));
