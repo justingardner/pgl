@@ -211,7 +211,7 @@ class pglCalibration():
         '''
         pass
     
-    def calibrate(self, settingsName, nRepeats=4, nSteps=256):
+    def calibrate(self, settingsName, nRepeats=4, nSteps=256, validate=False, inverseGammaTable=None):
         '''
         Measure the display characteristics.
         
@@ -219,6 +219,8 @@ class pglCalibration():
             settingsName (str): Name of the screen settings to calibrate.
             nRepeats (int): Number of times to repeat each measurement.
             nSteps (int): Number of steps in the calibration.
+            validate (bool): If True, use inverseGammaTable instead of linear gamma.
+            inverseGammaTable: Tuple of (R, G, B) gamma tables to apply for validation.
         '''
         if self.device is None:
             print("(pglCalibration) No calibration device specified.")
@@ -250,13 +252,18 @@ class pglCalibration():
         self.calibrationData.settingsName = settingsName
         self.calibrationData.settings = e.getSettings(settingsName)
         
-        # linearlize gamma, save the current gamma table so we can replace it
+        # save the current gamma table so we can replace it
         displayNumber = self.calibrationData.settings.displayNumber
         if displayNumber > 0: displayNumber -= 1
         self.currentGammaTable = self.pgl.getGammaTable(displayNumber)
-        self.pgl.setGammaTableLinear(displayNumber)
         
-        # get the linearized gamma table and save it (for reference as validation will have an inverse table)
+        # Set gamma table - either linear or inverse for validation
+        if validate and inverseGammaTable is not None:
+            self.pgl.setGammaTable(displayNumber, inverseGammaTable[0], inverseGammaTable[1], inverseGammaTable[2])
+        else:
+            self.pgl.setGammaTableLinear(displayNumber)
+        
+        # get the gamma table and save it
         self.calibrationData.gammaTableSize = self.pgl.getGammaTableSize(displayNumber)
         gammaTable = self.pgl.getGammaTable(displayNumber)
         self.calibrationData.gammaTable = tuple(np.array(table) for table in gammaTable)
@@ -278,10 +285,14 @@ class pglCalibration():
         self.setDisplay()
 
         # now, tell operator to make sure everything is setup before continuing
-        print("(pglCalibration) Please ensure the calibration device is properly positioned and ready.")
-        print("(pglCalibration) Press Enter to continue...")
-        input("")
-        printHeader("Establishing min and max values")
+        if validate:
+            print("(pglCalibration) Starting validation measurement...")
+            printHeader("Validating calibration with inverse gamma")
+        else:
+            print("(pglCalibration) Please ensure the calibration device is properly positioned and ready.")
+            print("(pglCalibration) Press Enter to continue...")
+            #input("")
+            printHeader("Establishing min and max values")
         
         # loop to set display and make measurements
         while (self.setDisplay() != -1):
@@ -296,12 +307,55 @@ class pglCalibration():
         # close the screen
         e.endScreen()
         
-        # display results when done
-        self.calibrationData.display()
+        # display results when done (skip for validation)
+        if not validate:
+            self.calibrationData.display()
+            # and save
+            self.save()
+  
+    def display(self, validation=False):
+        '''
+        Display calibration or validation results.
         
-        # and save
-        self.save()
-    
+        Args:
+            validation (bool): If True, display validation data instead of calibration data.
+        '''
+        # Select which data to display
+        if validation:
+            if not hasattr(self.calibrationData, 'validationData'):
+                print("(pglCalibration) No validation data available.")
+                return
+            data = self.calibrationData.validationData
+            gammaTable = self.calibrationData.validationGammaTable
+            titlePrefix = "Validation"
+        else:
+            data = self.calibrationData
+            gammaTable = self.calibrationData.gammaTable
+            titlePrefix = "Calibration"
+        
+        # Create figure with two subplots
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+        
+        # First graph - Display Calibration/Validation
+        ax1.plot(data.calibrationValues, data.calibrationMeasurements, 'o-')
+        ax1.set_xlabel("Display Value")
+        ax1.set_ylabel("Measured Luminance")
+        ax1.set_title(f"Display {titlePrefix}")
+        ax1.grid(True)
+        
+        # Second graph - Gamma Table
+        ax2.plot(range(data.gammaTableSize), gammaTable[0], 'r-', label='Red')
+        ax2.plot(range(data.gammaTableSize), gammaTable[1], 'g-', label='Green')
+        ax2.plot(range(data.gammaTableSize), gammaTable[2], 'b-', label='Blue')
+        ax2.legend()
+        ax2.set_xlabel("Index")
+        ax2.set_ylabel("Gamma Value")
+        ax2.set_title(f"{titlePrefix} Gamma Table")
+        ax2.grid(True)
+        
+        plt.tight_layout()
+        plt.show() 
+             
     def displayProgress(self, startProgress=False):
         '''
         Display the progress of the calibration.
@@ -428,6 +482,7 @@ class pglCalibration():
                 return -1
             value = self.minCalibrationVal + (self.maxCalibrationVal - self.minCalibrationVal) * (step / (self.calibrationData.nSteps - 1))
             print(f"(pglCalibration) Measuring step {step+1} of {self.calibrationData.nSteps}: {value}")
+            #print(f"(pglCalibration) Measured step {step+1} of {self.calibrationData.nSteps}: {value} = {np.median(self.calibrationMeasurementGet(-1,-self.calibrationData.nRepeats+1))}")
             self.calibrationValueAppend(value)
         else:
             # repeat last value
@@ -494,7 +549,9 @@ class pglCalibration():
         '''
         Load calibration data from a file.
         '''
-        pass
+        self.calibrationData = pglCalibrationData()
+        self.calibrationData.load(filepath)
+        print(f"(pglCalibration) Calibration data loaded from {filepath}")
 
     def save(self, filename=None):
         '''
@@ -531,6 +588,106 @@ class pglCalibration():
         '''
         pass
     
+    def validate(self, nRepeats=4, nSteps=256):
+        '''
+        Validate the display calibration by applying inverse gamma and re-measuring.
+        
+        Args:
+            nRepeats (int): Number of times to repeat each measurement.
+            nSteps (int): Number of steps in the validation.
+        '''
+        if self.calibrationData is None:
+            print("(pglCalibration) No calibration data available. Please run calibrate() first.")
+            return None
+        
+        # Check that calibration data is complete
+        if not hasattr(self.calibrationData, 'calibrationValues') or \
+        not hasattr(self.calibrationData, 'calibrationMeasurements'):
+            print("(pglCalibration) Calibration data is incomplete. Please run calibrate() first.")
+            return None
+        
+        # Verify the calibration data matches expected size
+        expectedSize = self.calibrationData.nRepeats * self.calibrationData.nSteps
+        if len(self.calibrationData.calibrationValues) != expectedSize or \
+        len(self.calibrationData.calibrationMeasurements) != expectedSize:
+            print(f"(pglCalibration) Calibration data size mismatch. Expected {expectedSize}, got {len(self.calibrationData.calibrationValues)}")
+            return None
+        
+        print("(pglCalibration) Starting validation with inverse gamma correction...")
+        
+        # Store the original calibration data
+        originalCalibrationData = self.calibrationData
+        
+        # Calculate inverse gamma table from calibration measurements
+        inverseGammaTable = self.calculateInverseGamma(originalCalibrationData)
+        
+        # Run calibration with the inverse gamma table
+        self.calibrate(originalCalibrationData.settingsName, 
+                    nRepeats=nRepeats, 
+                    nSteps=nSteps,
+                    validate=True,
+                    inverseGammaTable=inverseGammaTable)
+        
+        # Store validation results
+        validationData = self.calibrationData
+        
+        # Restore original calibration data
+        self.calibrationData = originalCalibrationData
+        
+        # Store validation results in the calibration data
+        self.calibrationData.validationData = validationData
+        self.calibrationData.validationGammaTable = inverseGammaTable
+        
+        # Display comparison
+        self.display(validation=True)
+        
+        return validationData
+    def calculateInverseGamma(self, calibrationData):
+        '''
+        Calculate inverse gamma table from calibration measurements.
+        
+        Args:
+            calibrationData: The calibration data containing measurements.
+        
+        Returns:
+            Tuple of three numpy arrays (R, G, B) for the inverse gamma table.
+        '''
+        from scipy.interpolate import interp1d
+        
+        # Average the repeated measurements for each step
+        nSteps = calibrationData.nSteps
+        nRepeats = calibrationData.nRepeats
+        
+        # Reshape and average
+        calValues = np.array(calibrationData.calibrationValues).reshape(nSteps, nRepeats)
+        calMeasurements = np.array(calibrationData.calibrationMeasurements).reshape(nSteps, nRepeats)
+        
+        avgValues = np.mean(calValues, axis=1)
+        avgMeasurements = np.mean(calMeasurements, axis=1)
+        
+        # Normalize measurements to 0-1 range
+        minLum = np.min(avgMeasurements)
+        maxLum = np.max(avgMeasurements)
+        normalizedMeasurements = (avgMeasurements - minLum) / (maxLum - minLum)
+        
+        # Create interpolation function: maps desired linear output to required input
+        # We want: given a desired output level, what input do we need?
+        interpFunc = interp1d(normalizedMeasurements, avgValues, 
+                            kind='cubic', 
+                            bounds_error=False, 
+                            fill_value='extrapolate')
+        
+        # Create inverse gamma table
+        gammaTableSize = calibrationData.gammaTableSize
+        linearOutput = np.linspace(0, 1, gammaTableSize)
+        inverseGamma = interpFunc(linearOutput)
+        
+        # Clip to valid range [0, 1] and convert to float32
+        inverseGamma = np.clip(inverseGamma, 0, 1).astype(np.float32)
+        
+        # For RGB, use the same correction for all channels (can be modified for per-channel)
+        return (inverseGamma, inverseGamma.copy(), inverseGamma.copy())
+    
 
 # Calibration settings, subclass of pglSettings to inherit load/save functionality
 class pglCalibrationData(_pglSettings):
@@ -547,17 +704,7 @@ class pglCalibrationData(_pglSettings):
     initMeasurements = Instance(np.ndarray, allow_none=True, help="Measured luminance values corresponding to initValues calibration")
     calibrationValues = Instance(np.ndarray, allow_none=True, help="Display values used in calibration")
     calibrationMeasurements = Instance(np.ndarray, allow_none=True, help="Measured luminance values from calibration")
-
-    def display(self):
-        # the calibration values should be at the end of the measurement, so just grab those
-        plt.figure(figsize=(8,6))
-        plt.plot(self.calibrationValues, self.calibrationMeasurements, 'o-')
-        plt.xlabel("Display Value")
-        plt.ylabel("Measured Luminance")
-        plt.title("Display Calibration")
-        plt.grid(True)
-        plt.show()
-
+      
     def appendValue(self, value, mode="calibration"):
         '''
         Append a calibration value.

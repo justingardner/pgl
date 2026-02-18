@@ -287,26 +287,43 @@ class _pglSettings(HasTraits):
                 data = json.load(f, cls=customJSONDecoder)
         except FileNotFoundError:
             print(f"(pglSettings) File '{filename}' not found.")
+            return
         except PermissionError:
             print(f"(pglSettings) No permission to read '{filename}'.")
+            return
         except IsADirectoryError:
             print(f"(pglSettings) '{filename}' is a directory, not a file.")
+            return
         except OSError as e:
             print(f"(pglSettings) Error accessing '{filename}': {e}")
+            return
         # --- JSON formatting errors ---
         except json.JSONDecodeError as e:
             print(f"(pglSettings) Error decoding JSON in '{filename}': {e}")
+            return
         # --- Catch any other unknown errors ---
         except Exception as e:
             print(f"(pglSettings) Unknown error ({type(e).__name__}) while reading '{filename}': {e}")
+            return
         
         # --- Update traits from JSON data ---
         for key in self.trait_names():
             # if key is in the json file
             if key in data:
                 try:
+                    value = data[key]
+                    
+                    # Convert lists to numpy arrays for specific keys
+                    if isinstance(value, list) and key in ['calibrationMeasurements', 'calibrationValues', 
+                                                            'initMeasurements', 'initValues']:
+                        value = np.array(value)
+                    
+                    # Convert list of lists to tuple of numpy arrays for gammaTable
+                    if isinstance(value, list) and key in ['gammaTable', 'validationGammaTable']:
+                        value = tuple(np.array(channel, dtype=np.float32) for channel in value)
+                    
                     # set the attribute value
-                    setattr(self, key, data[key])
+                    setattr(self, key, value)
                 except TraitError:
                     # Handle trait type mismatch
                     trait = self.traits()[key]
@@ -323,7 +340,6 @@ class _pglSettings(HasTraits):
         extraKeys = set(data.keys()) - set(self.trait_names())
         if extraKeys:
             print(f"(pglSettings) Did not load unknown keys from JSON file {filename}: {list(extraKeys)}")
-    
     # display parameters
     def __repr__(self):
         traitValues = ", ".join(f"{key}={getattr(self, key)!r}" for key in self.trait_names())
