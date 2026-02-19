@@ -256,7 +256,7 @@ class customJSONDecoder(json.JSONDecoder):
 # provides methods for loading/saving from JSON and displaying widgets
 # to edit the settings
 #############
-class _pglSettings(HasTraits):
+class pglSerializable(HasTraits):
     def __init__(self, filename=None):
         # Initialize settings from a file
         if filename:
@@ -762,7 +762,7 @@ class confirmationPanel:
         display(self.panel, self.output)
        
 # Screen settings select
-class pglSettingsSelect(_pglSettings):
+class pglSettingsSelect(pglSerializable):
     
     # traits that can be edited
     settingsNames = List(Unicode(), help="Settings names")
@@ -863,7 +863,7 @@ class pglSettingsSelect(_pglSettings):
         self.settingsNames = [settingsInstance.settingsName] + [n for n in allNames if n != settingsInstance.settingsName]
 
 # Settings
-class pglSettings(_pglSettings):
+class pglSettings(pglSerializable):
     
     settingsName = Unicode(help="Display name for these settings")
     displayName = List(Unicode(), help="Names of available screens")

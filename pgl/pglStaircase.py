@@ -12,6 +12,12 @@ import numpy as np
 import itertools
 import random
 from . import pglParameter
+from .pglTimestamp import pglTimestamp
+from .pglSettings import pglSerializable
+from dataclasses import dataclass
+from traitlets import Float, Int, List
+from .pglData import pglData
+from .pglSettings import _pglSettings
     
 ##########################
 # Staircase class
@@ -73,7 +79,7 @@ class pglStaircase():
         self.history.append(self.__dict__.copy())
         
         # add the start time
-        self.history[-1]["startTime"] = self.pgl.getSecs()
+        self.history[-1]["startTime"] = self.pglTimestamp.getSecs()
         
         # initialize values and responses
         self.history[-1]["values"] = []
@@ -106,7 +112,7 @@ class pglStaircase():
 ##########################
 # Observer model class
 ##########################
-class pglObsserverModel():
+class pglObserverModel():
     '''
     Class representing an observer model for simulating responses.
     '''
@@ -235,3 +241,34 @@ class pglStaircaseUpDown(pglStaircase):
                 self.history[-1]["reversals"].append(0)
             # remember the last direction
             self.lastDirection = "down"
+            
+@dataclass
+pglStaircaseData(pglData):
+    '''
+    Class representing the data from a staircase.
+    This is used to save/load staircase data.
+    '''
+    startTime: float = 0.0
+    values: np.ndarray = field(default_factory=lambda: np.array([]))
+    responses: np.ndarray = field(default_factory=lambda: np.array([]))
+    nTrials: int = 0
+    reversals: list = field(default_factory=list)
+    
+
+    
+    def __init__(self):
+        '''
+        Initialize the staircase data.
+        '''
+        self.history = []
+
+
+pglStaircaseData(_pglSettings):
+    nDown = Int(2, min=0, step=1, help="Number of trials in a row before increasing difficulty")
+    nUp = Int(1, min=0, step=1, help="Number of trials in a row before increasing difficulty")
+    startVal = Float(default_value=None, allow_none=True, help="Starting value for the staircase")
+    minVal = Float(default_value=None, allow_none=True, help="Starting value for the staircase")
+    maxVal = Float(default_value=None, allow_none=True, help="Starting value for the staircase")
+    stepSize = Float(1.0, min=0.0, help="Step size for the staircase")
+    stepChangeSizes = List(Float(), default_value=[0.5, 0.25, 0.125], help="Step sizes to change to at each reversal count")
+    stepChangeReversals = List(Int(), default_value=[2, 4, 6], help="Reversal counts at which to change step size")
