@@ -294,8 +294,6 @@ class pglTask:
     def __init__(self, pgl=None):
         self.pgl = pgl
         self.settings = taskSettings()
-        self.settings.nTrials = np.inf
-        self.name="Task"
         
         self.phaseNum = None
         self.tasks = None
@@ -347,7 +345,7 @@ class pglTask:
             self.currentParams.update(parameter.get())
 
         # print trial
-        print(f"({self.name}) Trial {self.currentTrial+1}: ", end='')
+        print(f"({self.settings.taskName}) Trial {self.currentTrial+1}: ", end='')
         
         # and variable settings
         for name,value in self.currentParams.items():
@@ -439,17 +437,18 @@ class pglTestTask(pglTask):
             self.responseText = f"Subject response received: {response} at {updateTime - self.e.startTime:.2f} seconds"
 
 from .pglSettings import _pglSettings
-from traitlets import List, Float, observe, Instance, Int
+from traitlets import List, Float, observe, Instance, Int, Unicode, Dict
 from .pglParameter import pglParameter, pglParameterBlock
 
 class taskSettings(_pglSettings):
+    taskName = Unicode("Task name", help="Name of the task")
     seglen = List(Float(), help="List of segment lengths in seconds.")
     segmin = List(Float(), help="Minimum length of a segment.")
     segmax = List(Float(), help="Maximum length of a segment.")
     nSegments = Int(help="Number of segments in the task.")
     nTrials = Float(np.inf, help="Number of trials to run for.")
     parameters = List(Instance(pglParameter), default_value=[], help="List of parameters (type pglParameter) for the task.")
-    
+    fixedParameters = Dict(default_value={}, help="Dictionary of fixed parameters for the task.")
     # observe changes in seglen, segmin, segmax to keep them in sync
     @observe("seglen", "segmin", "segmax")
     def _updateSegments(self, change):

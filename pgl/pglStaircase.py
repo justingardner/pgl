@@ -99,7 +99,7 @@ class pglStaircase():
         ax = self.data.plot()
         return ax
             
-    def test(self, observerModel=None, nTrials=100, minVal=0.0, maxVal=100.0, threshold=7.5, slope=3.0):
+    def test(self, observerModel=None, nTrials=100, minVal=0.0, maxVal=1.0, threshold=0.075, slope=3.0):
         '''
         Test the staircase by running a simple simulation.
         '''
@@ -140,7 +140,7 @@ class pglObserverModel():
     '''
     Class representing an observer model for simulating responses.
     '''
-    def __init__(self, threshold=7.5, slope=3.0):
+    def __init__(self, threshold=0.075, slope=3.0):
         '''
         Initialize the observer model.
         '''
@@ -171,9 +171,9 @@ class pglStaircaseUpDown(pglStaircase):
     This is a subclass of pglStaircase so that you can add it
     to an experiment like other parameters. It does 
     '''
-    def __init__(self, nUp=2, nDown=1, stepSize=1,
-                 startVal=20.0, minVal=0.0, maxVal=100.0,
-                 stepChangeSizes=[0.5, 0.25, 0.125], stepChangeReversals=[2, 4, 6],
+    def __init__(self, nUp=2, nDown=1, stepSize=0.05,
+                 startVal=0.3, minVal=0.0, maxVal=1.0,
+                 stepChangeSizes=[0.05, 0.025, 0.0125], stepChangeReversals=[2, 4, 6],
                  numReversalsToFinish=12,
                  description="upDownStaircase"):
         '''
@@ -260,7 +260,11 @@ class pglStaircaseUpDown(pglStaircase):
                 self.updateStepSize()
             # remember the last direction
             self.lastDirection = "up"
-    
+        # clamp current value
+        if self.currentVal < self.settings.minVal:
+            self.currentVal = self.settings.minVal
+        if self.currentVal > self.settings.maxVal:
+            self.currentVal = self.settings.maxVal
     def updateStepSize(self):
         # get number of reversals
         numReversals = len(self.data.reversals)
