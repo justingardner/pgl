@@ -14,6 +14,8 @@ import numpy as np
 import itertools
 import random
 import math
+
+from numpy.ma import resize
 from . import pglKeyboardMouse
 from pathlib import Path
 from .pglSettings import pglSettingsManager, pglSettings
@@ -291,29 +293,13 @@ class pglTask:
     '''
     def __init__(self, pgl=None):
         self.pgl = pgl
-        self._seglen = []
-        self.nTrials = np.inf
-        self.parameters=[]
+        self.settings = taskSettings()
+        self.settings.nTrials = np.inf
         self.name="Task"
-        self.seglen = [1.0]  # default segment length of 1 second
         
         self.phaseNum = None
         self.tasks = None
         self.e = None
-    ################################################################
-    # seglen property
-    ################################################################
-    @property
-    def seglen(self):
-        # Get the current segment length.
-        return self._seglen
-    @seglen.setter
-    def seglen(self, seglen_):
-        # seglen setting set both segmin/segmax
-        self._segmin = seglen_
-        self._segmax = seglen_
-        self._seglen = seglen_
-        self.nSegments = len(seglen_)
 
     def start(self, startTime):
         '''
@@ -351,18 +337,17 @@ class pglTask:
             float('inf') if math.isinf(min_val) or math.isinf(max_val) 
             # otherwise choose a random length between min and max
             else random.uniform(min_val, max_val)
-            for min_val, max_val in zip(self._segmin, self._segmax)
+            for min_val, max_val in zip(self.settings.segmin, self.settings.segmax)
         ]
         print("seglen: ",[f"{x:.2g}" for x in self._thisTrialSeglen])
 
         # get current parameters
         self.currentParams = {}
-        for parameter in self.parameters: 
+        for parameter in self.settings.parameters: 
             self.currentParams.update(parameter.get())
 
         # print trial
         print(f"({self.name}) Trial {self.currentTrial+1}: ", end='')
-        
         
         # and variable settings
         for name,value in self.currentParams.items():
@@ -373,7 +358,7 @@ class pglTask:
         '''
         Add a parameter to the task.
         '''
-        self.parameters.append(param)
+        self.settings.parameters.append(param)
 
     def update(self, updateTime, subjectResponse, phaseNum, tasks, experiment):
         '''
@@ -397,7 +382,7 @@ class pglTask:
             # call startSegment to begin next segment
             self.startSegment(updateTime)
             # check for end of trial
-            if self.currentSegment >= self.nSegments: 
+            if self.currentSegment >= self.settings.nSegments: 
                 # new trial
                 self.startTrial(updateTime)
         
@@ -422,7 +407,7 @@ class pglTask:
         '''
         Check if the task is done.
         '''
-        return self.currentTrial >= self.nTrials
+        return self.currentTrial >= self.settings.nTrials
 
     def jumpSegment(self):
         '''
@@ -452,3 +437,66 @@ class pglTestTask(pglTask):
     def handleSubjectResponse(self, responses, updateTime):
         for response in responses:
             self.responseText = f"Subject response received: {response} at {updateTime - self.e.startTime:.2f} seconds"
+
+from .pglSettings import _pglSettings
+from traitlets import List, Float, observe, Instance, Int
+from .pglParameter import pglParameter, pglParameterBlock
+
+class taskSettings(_pglSettings):
+    seglen = List(Float(), help="List of segment lengths in seconds.")
+    segmin = List(Float(), help="Minimum length of a segment.")
+    segmax = List(Float(), help="Maximum length of a segment.")
+    nSegments = Int(help="Number of segments in the task.")
+    nTrials = Float(np.inf, help="Number of trials to run for.")
+    parameters = List(Instance(pglParameter), default_value=[], help="List of parameters (type pglParameter) for the task.")
+    
+    # observe changes in seglen, segmin, segmax to keep them in sync
+    @observe("seglen", "segmin", "segmax")
+    def _updateSegments(self, change):
+
+        # hold off on trait notifications while we update
+        with self.hold_trait_notifications():
+
+            # if seglen change, then just make seming and segmax the same as seglen
+            if change["name"] == "seglen":
+                self.segmin = list(self.seglen)
+                self.segmax = list(self.seglen)
+
+            elif change["name"] == "segmin":
+                # if segmax is longer than semin, truncate it
+                if len(self.segmax) > len(self.segmin):
+                    self.segmax = self.segmax[:len(self.segmin)]
+                
+                # if segmax is shorter than segmin, extend it
+                if len(self.segmax) < len(self.segmin):
+                    self.segmax += self.segmin[len(self.segmax):]
+                
+                # ensure segmax is not less than segmin
+                for i, (minVal, maxVal) in enumerate(zip(change['new'], self.segmax)):
+                    self.segmax[i] = max(minVal, maxVal)
+                    
+                # set seglen to average of segmin/segmax
+                self.seglen = [(minVal + maxVal) / 2.0 for minVal, maxVal in zip(self.segmin, self.segmax)]
+
+            elif change["name"] == "segmax":
+                # if segmin is longer than semax, truncate it
+                if len(self.segmin) > len(self.segmax):
+                    self.segmin = self.segmin[:len(self.segmax)]
+                
+                # if segmin is shorter than segmax, extend it
+                if len(self.segmin) < len(self.segmax):
+                    self.segmin += self.segmax[len(self.segmin):]
+                
+                # ensure segmax is not less than segmin
+                for i, (minVal, maxVal) in enumerate(zip(change['new'], self.segmin)):
+                    self.segmin[i] = min(minVal, maxVal)
+
+                # set seglen to average of segmin/segmax
+                self.seglen = [(minVal + maxVal) / 2.0 for minVal, maxVal in zip(self.segmin, self.segmax)]
+        
+        self.nSegments = len(self.seglen)
+    '''
+    Settings for pglTask
+    '''
+    def __init__(self):
+        super().__init__()
