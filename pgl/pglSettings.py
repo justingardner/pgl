@@ -29,6 +29,7 @@ import platform
 import copy
 from .pglBase import pglDisplayMessage
 from .pglParameter import pglParameter, pglParameterBlock
+from .pglSerialize import pglSerialize
 
 displayDuration = 5  # seconds
 #######################################
@@ -177,202 +178,20 @@ class pglSettingsManager:
             print(f"(pglSettingsManager:loadSettings) Loading settings from '{settingsPath}'.")
             return pglSettings(filename=settingsPath)
 
-# Custom JSON encoder and decoder to handle special Instance
-# traitlets of settings classs, so they can be serialized to JSON
-class customJSONEncoder(json.JSONEncoder):
-    def default(self, obj):
-        if isinstance(obj, datetime):
-            return obj.isoformat()
-        if isinstance(obj, np.ndarray):
-            return obj.tolist()
-        if isinstance(obj, tuple):
-            # Mark tuples specially so we can reconstruct them
-            return {
-                '__tuple__': True,
-                'items': list(obj)
-            }
-        if isinstance(obj, HasTraits):
-            # Store class name for reconstruction
-            return {
-                '__class__': obj.__class__.__name__,
-                '__module__': obj.__class__.__module__,
-                **{key: getattr(obj, key) for key in obj.trait_names() if not key.startswith('_')}
-            }
-
-        if isinstance(obj, pglParameterBlock):
-            return {
-                "__class__": "pglParameterBlock",
-                "__module__": obj.__class__.__module__,
-                "parameters": obj.parameters,  # encoder will recurse
-                "description": obj.description,
-            }
-
-        if isinstance(obj, pglParameter):
-            return {
-                "__class__": "pglParameter",
-                "__module__": obj.__class__.__module__,
-                "name": obj.name,
-                "validValues": obj.validValues,
-                "description": obj.description,
-            }
-
-        return super().default(obj)
-
-class customJSONDecoder(json.JSONDecoder):
-    def __init__(self, *args, **kwargs):
-        super().__init__(object_hook=self.object_hook, *args, **kwargs)
-    
-    def object_hook(self, obj):
-        # Reconstruct tuples
-        if isinstance(obj, dict) and obj.get('__tuple__'):
-            items = obj['items']
-            # Convert lists back to numpy arrays if needed
-            converted_items = []
-            for item in items:
-                if isinstance(item, list):
-                    try:
-                        converted_items.append(np.array(item))
-                    except:
-                        converted_items.append(item)
-                else:
-                    converted_items.append(item)
-            return tuple(converted_items)
-        
-        # Reconstruct HasTraits objects
-        if '__class__' in obj and '__module__' in obj:
-            try:
-                import importlib
-
-                cls_name = obj["__class__"]
-                module = importlib.import_module(obj["__module__"])
-                cls = getattr(module, cls_name)
-
-                data = {k: v for k, v in obj.items() if not k.startswith("__")}
-
-                # Special handling
-                if cls_name == "pglParameter":
-                    return cls(
-                        name=data["name"],
-                        validValues=data["validValues"],
-                        description=data.get("description", "")
-                    )
-
-                if cls_name == "pglParameterBlock":
-                    return cls(
-                        parameters=data["parameters"],
-                        description=data.get("description", "")
-                    )
-
-                # fallback for HasTraits
-                instance = cls()
-                for key, value in data.items():
-                    setattr(instance, key, value)
-                return instance
-            except Exception as e:
-                print(f"(pglSettings) Could not reconstruct {obj.get('__class__')}: {e}")
-                return obj
-        
-        # Convert datetime strings and lists to numpy arrays
-        for key, value in obj.items():
-            if isinstance(value, str):
-                try:
-                    obj[key] = datetime.fromisoformat(value)
-                except (ValueError, TypeError):
-                    pass
-            # Don't auto-convert lists here since tuples handle it
-        return obj
-
 #############
 # Main class which should be subclassed for specific settings,
 # provides methods for loading/saving from JSON and displaying widgets
 # to edit the settings
 #############
-class _pglSettings(HasTraits):
+class pglSettingsEditable(HasTraits, pglSerialize):
     def __init__(self, filename=None):
-        # Initialize settings from a file
+        # Initialize HasTraits
+        super().__init__()
+        # Load from file if provided
         if filename:
             self.load(filename)
-        
-    # Serialize to JSON file
-    def save(self, filename):
-        print(f"(pglSettings:onSave) Saving settings to '{filename}'")
-        try:
-            filename = Path(filename).with_suffix(".json")
-            data = {key: getattr(self, key) for key in self.getOrderedTraits().keys()}
-            with open(filename, 'w') as f:
-                json.dump(data, f, indent=4, cls=customJSONEncoder)
-        except PermissionError:
-            print(f"(pglSettings) No permission to write to '{filename}'")
-        except IsADirectoryError:
-            print(f"(pglSettings) '{filename}' is a directory, cannot write file")
-        except OSError as e:
-            print(f"(pglSettings) OS error while saving '{filename}': {e}")
-        except Exception as e:
-            print(f"(pglSettings) Unknown error ({type(e).__name__}) while saving '{filename}': {e}")    
-      
-    # load settings from JSON file      
-    def load(self, filename):
-        # --- Open JSON file ---
-        try:
-            filename = Path(filename).with_suffix(".json")
-            with open(filename, 'r') as f:
-                data = json.load(f, cls=customJSONDecoder)
-        except FileNotFoundError:
-            print(f"(pglSettings) File '{filename}' not found.")
-            return
-        except PermissionError:
-            print(f"(pglSettings) No permission to read '{filename}'.")
-            return
-        except IsADirectoryError:
-            print(f"(pglSettings) '{filename}' is a directory, not a file.")
-            return
-        except OSError as e:
-            print(f"(pglSettings) Error accessing '{filename}': {e}")
-            return
-        # --- JSON formatting errors ---
-        except json.JSONDecodeError as e:
-            print(f"(pglSettings) Error decoding JSON in '{filename}': {e}")
-            return
-        # --- Catch any other unknown errors ---
-        except Exception as e:
-            print(f"(pglSettings) Unknown error ({type(e).__name__}) while reading '{filename}': {e}")
-            return
-        
-        # --- Update traits from JSON data ---
-        for key in self.trait_names():
-            # if key is in the json file
-            if key in data:
-                try:
-                    value = data[key]
-                    
-                    # Convert lists to numpy arrays for specific keys
-                    if isinstance(value, list) and key in ['calibrationMeasurements', 'calibrationValues', 
-                                                            'initMeasurements', 'initValues']:
-                        value = np.array(value)
-                    
-                    # Convert list of lists to tuple of numpy arrays for gammaTable
-                    if isinstance(value, list) and key in ['gammaTable', 'validationGammaTable']:
-                        value = tuple(np.array(channel, dtype=np.float32) for channel in value)
-                    
-                    # set the attribute value
-                    setattr(self, key, value)
-                except TraitError:
-                    # Handle trait type mismatch
-                    trait = self.traits()[key]
-                    expectedType = trait.__class__
-                    gotType = type(data[key])
-                    print(f"(pglSettings) '{key}' has wrong type in JSON file {filename} (expected {expectedType.__name__}, got {gotType.__name__}), using default {getattr(self, key)}")
-                except Exception as e:
-                    # Handle any other errors
-                    print(f"(pglSettings) Error: {e} Using default value for {key} for JSON file {filename}: {getattr(self, key)}. ")
-            # if not in the json file, use default value
-            else:
-                print(f"(pglSettings) '{key}' not found in JSON file {filename}, using default {getattr(self, key)}")
-        # keys in JSON that are not traits
-        extraKeys = set(data.keys()) - set(self.trait_names())
-        if extraKeys:
-            print(f"(pglSettings) Did not load unknown keys from JSON file {filename}: {list(extraKeys)}")
-    # display parameters
+    
+   # display parameters
     def __repr__(self):
         traitValues = ", ".join(f"{key}={getattr(self, key)!r}" for key in self.trait_names())
         return f"{self.__class__.__name__}({traitValues})"
@@ -794,7 +613,7 @@ class confirmationPanel:
         display(self.panel, self.output)
        
 # Screen settings select
-class pglSettingsSelect(_pglSettings):
+class pglSettingsSelect(pglSettingsEditable):
     
     # traits that can be edited
     settingsNames = List(Unicode(), help="Settings names")
@@ -895,7 +714,7 @@ class pglSettingsSelect(_pglSettings):
         self.settingsNames = [settingsInstance.settingsName] + [n for n in allNames if n != settingsInstance.settingsName]
 
 # Settings
-class pglSettings(_pglSettings):
+class pglSettings(pglSettingsEditable):
     
     settingsName = Unicode(help="Display name for these settings")
     displayName = List(Unicode(), help="Names of available screens")

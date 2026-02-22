@@ -12,11 +12,13 @@ import numpy as np
 import matplotlib.pyplot as plt
 from ._pglComm import pglSerial
 from .pglBase import printHeader
-from .pglSettings import filename, _pglSettings, pglSettings, pglSettingsManager
+from .pglSettings import filename, pglSettingsEditable, pglSettings, pglSettingsManager
 from traitlets import Unicode, Int, Instance, Dict, Tuple
 from datetime import datetime
 from .pglExperiment import pglExperiment
 from tqdm.notebook import tqdm
+from traitlets import HasTraits
+from .pglSerialize import pglSerialize
 
 ##########################
 # Calibration device class
@@ -690,7 +692,7 @@ class pglCalibration():
     
 
 # Calibration settings, subclass of pglSettings to inherit load/save functionality
-class pglCalibrationData(_pglSettings):
+class pglCalibrationData(HasTraits, pglSerialize):
     
     settingsName = Unicode("Default", help="Settings name used to open display")
     displayInfo = Dict(help="Display information at time of calibration")
