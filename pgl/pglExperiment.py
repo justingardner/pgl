@@ -30,7 +30,7 @@ class pglExperiment(pglSettingsManager):
     Experiment class which handles timing, parameter randomization,
     subject response, synchronizing with measurement hardware etc
     '''
-    def __init__(self, pgl, settingsName=None, settings=None):
+    def __init__(self, pgl, settingsName=None, settings=None, subjectID="s0000", experimentName=""):
         '''
         Initialize the pglExperiment class.
         
@@ -38,18 +38,25 @@ class pglExperiment(pglSettingsManager):
             pgl (pgl): An instance of the pgl class.
             settingsName (str): The name of the settings to use. If not set (and settings not set), will use default settings
             settings (pglSettings): An instance of the pglSettings class. If set, will supersede settingsName.
+            subjectID (str): The identifier for the subject participating in the experiment.
         '''
         # save pgl
         self.pgl = pgl
         
-        # current phase of experiment
+        # starting values for some variables
         self.currentPhase = 0
         self.openScreen = False
         
         # initialize tasks
         self.task = [[]]
+        
+        # get experiment settings
+        self.experimentSettings = pglExperimentSettings()
+        if experimentName != "":
+            self.experimentSettings.experimentName = experimentName
+        self.experimentSettings.subjectID = subjectID
 
-        # get  settings
+        # get settings
         self.settings = settings
         if self.settings is None:
             self.settings = self.getSettings(settingsName)
@@ -104,8 +111,9 @@ class pglExperiment(pglSettingsManager):
             # and if it is not running, start it
             if not keyboardMouse.isRunning():
                 keyboardMouse.start()
-                # and clear its queue
-                keyboardMouse.clear()
+        
+        # clear the mouse and keyboard queues of any pending events
+        keyboardMouse.clear()
         
         # If response keys is a comma-separated list, split it into a list (this is so you can do "1,space,F1,2"
         if ',' in self.settings.responseKeys:
@@ -282,6 +290,16 @@ class pglExperiment(pglSettingsManager):
         startTime = self.pgl.getSecs()
         for task in self.task[self.currentPhase]:
             task.start(startTime)
+    
+    def save(self):
+        '''
+        Save the experiment data. Will store in directory dataDir/experimentName/subjectID/YYYYMMDD 
+        Where dataDir is set by pgl.settings(), experimentSaveName and subjectID are set by
+        pglExperiment.experimentName and pglExperiment.subjectID
+        
+        
+        '''
+
 
 #############
 # Task class
@@ -301,7 +319,7 @@ class pglTask:
     '''
     def __init__(self, pgl=None):
         self.pgl = pgl
-        self.settings = taskSettings()
+        self.settings = pglTaskSettings()
         
         self.phaseNum = None
         self.tasks = None
@@ -445,11 +463,42 @@ class pglTestTask(pglTask):
             self.responseText = f"Subject response received: {response} at {updateTime - self.e.startTime:.2f} seconds"
 
 from .pglSettings import _pglSettings
-from traitlets import List, Float, observe, Instance, Int, Unicode, Dict, validate
+from traitlets import List, Float, TraitError, TraitError, observe, Instance, Int, Unicode, Dict, validate
 from .pglParameter import pglParameter, pglParameterBlock
 
-class taskSettings(_pglSettings):
-    taskName = Unicode("Task name", help="Name of the task")
+class pglExperimentSettings(_pglSettings):
+    experimentName = Unicode("Default experiment", help="Name of the experiment")
+    experimentSaveName = Unicode("defaultExperiment", help="Name to use when saving experiment data (defaults to camelCase version of experimentName)")
+    subjectID = Unicode("s0000", help="Identifier for the subject participating in the experiment.")
+    
+    # observe changes to experimentName and if experimentSaveName is not set
+    # set experimentSaveName to a camelCase version of experimentName
+    @observe("experimentName")
+    def toCamelCase(self, change) -> None:
+        if self.experimentSaveName == "" or self.experimentSaveName == "defaultExperiment":
+            # split experimentName into words
+            words = change['new'].strip().split()
+            if not words:
+                return
+            # convert to camelCase and save as experimentSaveName
+            self.experimentSaveName = words[0].lower() + "".join(word.capitalize() for word in words[1:])
+    
+    @validate("subjectID")
+    def _validateSubjectID(self, proposal):
+        value = proposal["value"]
+
+        if (
+            not isinstance(value, str)
+            or len(value) < 2
+            or value[0] != "s"
+            or not value[1:].isdigit()
+        ):
+            raise TraitError("(experimentSettings) ❌ Error: subjectID must be in format 'sXXXX' where X is a digit.")
+        return value           
+    
+class pglTaskSettings(_pglSettings):
+    taskName = Unicode("Default task", help="Name of the task")
+    taskSaveName = Unicode("defaultTask", help="Name to use when saving task data (defaults to camelCase version of taskName)")
     seglen = List(Float(), help="List of segment lengths in seconds.")
     segmin = List(Float(), help="Minimum length of a segment.")
     segmax = List(Float(), help="Maximum length of a segment.")
@@ -457,6 +506,19 @@ class taskSettings(_pglSettings):
     nTrials = Float(np.inf, help="Number of trials to run for.")
     parameters = List(Instance(pglParameter), default_value=[], help="List of parameters (type pglParameter) for the task.")
     fixedParameters = Dict(default_value={}, help="Dictionary of fixed parameters for the task.")
+    
+    # observe changes to taskName and if taskSaveName is not set
+    # set taskSaveName to a camelCase version of taskName
+    @observe("taskName")
+    def toCamelCase(self, change) -> None:
+        if self.taskSaveName == "" or self.taskSaveName == "defaultTask":
+            # split taskName into words
+            words = change['new'].strip().split()
+            if not words:
+                return
+            # convert to camelCase and save as taskSaveName
+            self.taskSaveName = words[0].lower() + "".join(word.capitalize() for word in words[1:])
+        
     # observe changes in seglen, segmin, segmax to keep them in sync
     @observe("seglen", "segmin", "segmax")
     def _updateSegments(self, change):
