@@ -50,7 +50,7 @@ class pglParameter:
         self.blockLen = 1
 
     def __repr__(self):
-        return f"pglParameter(name={self.name}, validValues={self.validValues}, randomizationBlock={self.randomizationBlock}, description={self.description})"
+        return f"pglParameter(name={self.name}, validValues={self.validValues}, description={self.description})"
 
     def __str__(self):
         # display description
