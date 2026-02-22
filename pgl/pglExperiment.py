@@ -10,21 +10,26 @@
 #############
 # Import modules
 #############
+from datetime import datetime
 import numpy as np
 import itertools
 import random
 import math
+from datetime import datetime
 
 from numpy.ma import resize
 from . import pglKeyboardMouse
 from pathlib import Path
-from .pglSettings import pglSettingsManager, pglSettings
+from .pglSettings import pglSettingsManager, pglSettings, _pglSettings
 from IPython.display import display, HTML
 from .pglBase import pglDisplayMessage
+from traitlets import List, Float, TraitError, TraitError, observe, Instance, Int, Unicode, Dict, validate
+from .pglParameter import pglParameter, pglParameterBlock
 
-#############
+
+##############################################s
 # Experiment class
-#############
+##############################################
 class pglExperiment(pglSettingsManager):
     '''
     Experiment class which handles timing, parameter randomization,
@@ -293,17 +298,34 @@ class pglExperiment(pglSettingsManager):
     
     def save(self):
         '''
-        Save the experiment data. Will store in directory dataDir/experimentName/subjectID/YYYYMMDD 
-        Where dataDir is set by pgl.settings(), experimentSaveName and subjectID are set by
-        pglExperiment.experimentName and pglExperiment.subjectID
-        
-        
+        Save the experiment settings, state and data.         
         '''
+        # Create the directory to save data into (dataDir/experimentSaveName/subjectID/YYYYMMDD_HHMMSS)
+        try:
+            dataDir = Path(self.settings.dataPath).expanduser() / self.experimentSettings.experimentSaveName / self.experimentSettings.subjectID / datetime.now().strftime("%Y%m%d_%H%M%S")
+            dataDir.mkdir(parents=True, exist_ok=True)    
+        except Exception as e:
+            print(f"(pglExperiment:save) ❌ Could not create data directory {dataDir}: {e}")
+            return
+        
+        # give user feedback where things are being saved
+        print(f"(pglExperiment:save) Saving experiment data to: {dataDir}")
+        
+        # save settings
+        self.settings.save(dataDir / "experimentSettings.json")
 
-
-#############
+        # save each task
+        for phaseTasks in self.task:
+            for task in phaseTasks:
+                task.save(dataDir)        
+    def load(self):
+        '''
+        Load the experiment settings, state and data.         
+        '''
+    
+##############################################
 # Task class
-#############
+##############################################
 class pglTask:
     # this are set every trial, which allows us to
     # randomize the length of each segment (based on segmin/segmax)
@@ -439,8 +461,30 @@ class pglTask:
         '''
         # set current segment length to 0 to force jump
         self._thisTrialSeglen[self.currentSegment] = 0
+    
+    def save(self, dataDir):
+        '''
+        Save the task settings, state and data.
+        '''
+        try:
+            dataDir = dataDir / self.settings.taskSaveName
+            dataDir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            print(f"(pglTask:save) ❌ Could not create task data directory {dataDir}: {e}")
+            return
+        
+        print(f"(pglTask:save) Saving task data to: {dataDir}")
+        self.settings.save(dataDir / "settings.json")
 
+    def load(self):
+        '''
+        Load the task data.
+        '''
+        pass
+
+##############################################
 # test task for testing settings
+##############################################
 class pglTestTask(pglTask):
     responseText = ""
     def updateScreen(self):
@@ -462,10 +506,10 @@ class pglTestTask(pglTask):
         for response in responses:
             self.responseText = f"Subject response received: {response} at {updateTime - self.e.startTime:.2f} seconds"
 
-from .pglSettings import _pglSettings
-from traitlets import List, Float, TraitError, TraitError, observe, Instance, Int, Unicode, Dict, validate
-from .pglParameter import pglParameter, pglParameterBlock
 
+##############################################
+# Settings for pglExperiment
+##############################################
 class pglExperimentSettings(_pglSettings):
     experimentName = Unicode("Default experiment", help="Name of the experiment")
     experimentSaveName = Unicode("defaultExperiment", help="Name to use when saving experiment data (defaults to camelCase version of experimentName)")
@@ -495,7 +539,10 @@ class pglExperimentSettings(_pglSettings):
         ):
             raise TraitError("(experimentSettings) ❌ Error: subjectID must be in format 'sXXXX' where X is a digit.")
         return value           
-    
+
+##############################################
+# Settings for pglTask
+##############################################
 class pglTaskSettings(_pglSettings):
     taskName = Unicode("Default task", help="Name of the task")
     taskSaveName = Unicode("defaultTask", help="Name to use when saving task data (defaults to camelCase version of taskName)")

@@ -28,6 +28,7 @@ import subprocess
 import platform
 import copy
 from .pglBase import pglDisplayMessage
+from .pglParameter import pglParameter, pglParameterBlock
 
 displayDuration = 5  # seconds
 #######################################
@@ -197,6 +198,24 @@ class customJSONEncoder(json.JSONEncoder):
                 '__module__': obj.__class__.__module__,
                 **{key: getattr(obj, key) for key in obj.trait_names() if not key.startswith('_')}
             }
+
+        if isinstance(obj, pglParameterBlock):
+            return {
+                "__class__": "pglParameterBlock",
+                "__module__": obj.__class__.__module__,
+                "parameters": obj.parameters,  # encoder will recurse
+                "description": obj.description,
+            }
+
+        if isinstance(obj, pglParameter):
+            return {
+                "__class__": "pglParameter",
+                "__module__": obj.__class__.__module__,
+                "name": obj.name,
+                "validValues": obj.validValues,
+                "description": obj.description,
+            }
+
         return super().default(obj)
 
 class customJSONDecoder(json.JSONDecoder):
@@ -223,19 +242,31 @@ class customJSONDecoder(json.JSONDecoder):
         if '__class__' in obj and '__module__' in obj:
             try:
                 import importlib
-                module = importlib.import_module(obj['__module__'])
-                cls = getattr(module, obj['__class__'])
-                
-                # Remove metadata keys
-                data = {k: v for k, v in obj.items() if not k.startswith('__')}
-                
-                # Create instance and set attributes
+
+                cls_name = obj["__class__"]
+                module = importlib.import_module(obj["__module__"])
+                cls = getattr(module, cls_name)
+
+                data = {k: v for k, v in obj.items() if not k.startswith("__")}
+
+                # Special handling
+                if cls_name == "pglParameter":
+                    return cls(
+                        name=data["name"],
+                        validValues=data["validValues"],
+                        description=data.get("description", "")
+                    )
+
+                if cls_name == "pglParameterBlock":
+                    return cls(
+                        parameters=data["parameters"],
+                        description=data.get("description", "")
+                    )
+
+                # fallback for HasTraits
                 instance = cls()
                 for key, value in data.items():
-                    try:
-                        setattr(instance, key, value)
-                    except:
-                        pass  # Skip if trait validation fails
+                    setattr(instance, key, value)
                 return instance
             except Exception as e:
                 print(f"(pglSettings) Could not reconstruct {obj.get('__class__')}: {e}")
@@ -264,6 +295,7 @@ class _pglSettings(HasTraits):
         
     # Serialize to JSON file
     def save(self, filename):
+        print(f"(pglSettings:onSave) Saving settings to '{filename}'")
         try:
             filename = Path(filename).with_suffix(".json")
             data = {key: getattr(self, key) for key in self.getOrderedTraits().keys()}
