@@ -437,7 +437,7 @@ class pglTestTask(pglTask):
             self.responseText = f"Subject response received: {response} at {updateTime - self.e.startTime:.2f} seconds"
 
 from .pglSettings import _pglSettings
-from traitlets import List, Float, observe, Instance, Int, Unicode, Dict
+from traitlets import List, Float, observe, Instance, Int, Unicode, Dict, validate
 from .pglParameter import pglParameter, pglParameterBlock
 
 class taskSettings(_pglSettings):
@@ -494,6 +494,7 @@ class taskSettings(_pglSettings):
                 self.seglen = [(minVal + maxVal) / 2.0 for minVal, maxVal in zip(self.segmin, self.segmax)]
         
         self.nSegments = len(self.seglen)
+        
     '''
     Settings for pglTask
     '''
