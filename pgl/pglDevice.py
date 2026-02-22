@@ -240,6 +240,13 @@ class pglKeyboardMouse(pglDevice):
         Check if the keyboard listener is running.
         '''
         return hasattr(self, 'listener') and self.listener.isRunning()
+    
+    def clear(self):
+        '''
+        Clear any pending events in the queue.
+        '''
+        if self.isRunning():
+            self.listener.clearQueues()
 
     def poll(self): 
         '''

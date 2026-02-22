@@ -160,6 +160,12 @@ class pglEventListener:
             self._keyboardQueue.clear()
             return events
     
+    def clearQueues(self) -> None:
+        """Clear any pending events in both keyboard and mouse queues."""
+        with self._lock:
+            self._keyboardQueue.clear()
+            self._mouseQueue.clear()
+            
     def getMouseEvent(self) -> Optional[Dict]:
         """
         Get the oldest mouse event and remove it from queue.

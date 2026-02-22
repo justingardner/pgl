@@ -89,6 +89,7 @@ class pglExperiment(pglSettingsManager):
         # add keyboard device if not already loaded
         keyboardDevices = self.pgl.devicesGet(pglKeyboardMouse)
         if not keyboardDevices:
+            # nothing loaded, so create it
             keyboardMouse = pglKeyboardMouse(eatKeys=None)
             self.pgl.devicesAdd(keyboardMouse)
             # check if listener is running
@@ -100,6 +101,11 @@ class pglExperiment(pglSettingsManager):
         else:
             # if already loaded, just grab it
             keyboardMouse = keyboardDevices[0]
+            # and if it is not running, start it
+            if not keyboardMouse.isRunning():
+                keyboardMouse.start()
+                # and clear its queue
+                keyboardMouse.clear()
         
         # If response keys is a comma-separated list, split it into a list (this is so you can do "1,space,F1,2"
         if ',' in self.settings.responseKeys:
@@ -149,6 +155,8 @@ class pglExperiment(pglSettingsManager):
         keyboardDevices = self.pgl.devicesGet(pglKeyboardMouse)
         if keyboardDevices is not []:
             for keyboardDevice in keyboardDevices:
+                print("(pglExperiment:endScreen) Stopping keyboard/mouse device.")
+                print(keyboardDevice)
                 keyboardDevice.stop()
 
         if self.settings.closeScreenOnEnd:
