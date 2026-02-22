@@ -62,6 +62,9 @@ class pglDraw:
         # Read the command results
         self.commandResults = self.s.readCommandResults()
         
+        # keep background coor
+        self.clearScreenColor = color.flatten().tolist()
+        
     ################################################################
     # dots
     ################################################################

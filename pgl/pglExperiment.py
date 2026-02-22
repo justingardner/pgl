@@ -16,6 +16,7 @@ import itertools
 import random
 import math
 from datetime import datetime
+from dataclasses import dataclass
 
 from numpy.ma import resize
 from . import pglKeyboardMouse
@@ -25,7 +26,7 @@ from IPython.display import display, HTML
 from .pglBase import pglDisplayMessage
 from traitlets import List, Float, TraitError, TraitError, observe, Instance, Int, Unicode, Dict, validate
 from .pglParameter import pglParameter, pglParameterBlock
-
+from .pglData import pglData
 
 ##############################################s
 # Experiment class
@@ -48,9 +49,9 @@ class pglExperiment(pglSettingsManager):
         # save pgl
         self.pgl = pgl
         
-        # starting values for some variables
-        self.currentPhase = 0
-        self.openScreen = False
+        # initialize experiment state and data
+        self.state = pglExperimentState()
+        self.data = pglExperimentData()
         
         # initialize tasks
         self.task = [[]]
@@ -110,6 +111,8 @@ class pglExperiment(pglSettingsManager):
                 pglDisplayMessage("On macOS, go to System Preferences -> Security & Privacy -> Privacy -> Accessibility, and add your terminal application (e.g. Terminal, iTerm, etc) to the list of apps allowed to control your computer.", useHTML=True)
                 pglDisplayMessage("If you are running VS Code and it already has permissions granted, try running directly from a terminal with:", useHTML=True)
                 pglDisplayMessage("              /Applications/Visual\\ Studio\\ Code.app/Contents/MacOS/Electron", useHTML=True)
+                self.endScreen()
+                return
         else:
             # if already loaded, just grab it
             keyboardMouse = keyboardDevices[0]
@@ -158,7 +161,7 @@ class pglExperiment(pglSettingsManager):
         self.pgl.flush()
         
         # mark that we have opened the screen
-        self.openScreen = True
+        self.state.openScreen = True
 
     def endScreen(self):
         '''
@@ -175,6 +178,7 @@ class pglExperiment(pglSettingsManager):
         if self.settings.closeScreenOnEnd:
             # close screen
             self.pgl.close()
+            self.state.openScreen = False
 
     def addTask(self, task, phaseNum = None):
         '''
@@ -203,58 +207,58 @@ class pglExperiment(pglSettingsManager):
         '''
         Run the experiment.
         '''
-        if self.openScreen == False:
+        if self.state.openScreen == False:
             pglDisplayMessage("(pglExperiment:run) ❌ Screen is not open. Call initScreen() before running the experiment.",useHTML=True, duration=5)
             return
         
-        experimentDone = False
-        self.volumeNumber = 0
+        self.state.experimentDone = False
+        self.state.volumeNumber = 0
 
         # wait for key press to start experiment
         if self.settings.startKey is not [] or self.settings.startOnVolumeTrigger:
-            experimentStarted = False
+            self.state.experimentStarted = False
             if self.settings.startOnVolumeTrigger:
                 self.pgl.text("Waiting for volume trigger to start experiment",y=0)
             else:
                 self.pgl.text(f"Press {self.settings.startKey} key to start experiment",y=0)
             # flush to display text
             self.pgl.flush()
-            while not experimentStarted:
+            while not self.state.experimentStarted:
                 # poll for events
                 events = self.pgl.poll()
 
                 # see if we have a match to startKey
                 if [e for e in events if e.type == "keyboard" and e.keyChar in self.settings.startKey]:
-                    experimentStarted = True
+                    self.state.experimentStarted = True
                 
                 # if waiting to startOnVolumeTrigger, check for that key                
                 if self.settings.startOnVolumeTrigger:
                     if [e for e in events if e.type == "keyboard" and e.keyChar in self.settings.volumeTriggerKey]:
-                        experimentStarted = True
-                        self.volumeNumber += 1
+                        self.state.experimentStarted = True
+                        self.state.volumeNumber += 1
                 
                 # Check for end key to allow aborting before starting    
                 if [e for e in events if e.type == "keyboard" and e.keyChar in self.settings.endKey]:
-                    experimentStarted = True
-                    experimentDone = True
+                    self.state.experimentStarted = True
+                    self.state.experimentDone = True
 
         self.startPhase()
         print(f"(pglExperiment:run) Experiment started.")
-        self.startTime = self.pgl.getSecs()
+        self.data.startTime = self.pgl.getSecs()
 
-        while not experimentDone:
+        while not self.state.experimentDone:
             
             # poll for events
             events = self.pgl.poll()
 
             # see if we have a match to endKey
             if [e for e in events if e.type == "keyboard" and e.keyChar in self.settings.endKey]:
-                experimentDone = True
+                self.state.experimentDone = True
                 continue
 
             # Check for volume trigger key
             if [e for e in events if e.type == "keyboard" and e.keyChar in self.settings.volumeTriggerKey and e.eventType == "keydown"]:    
-                self.volumeNumber += 1
+                self.state.volumeNumber += 1
 
             # grab any events that match the keyList and return their index within that list
             subjectResponse = [keyIndex for e in events if e.type == "keyboard" and e.eventType == "keydown" and e.keyChar in self.responseKeysList for keyIndex in [self.responseKeysList.index(e.keyChar)]]
@@ -262,9 +266,9 @@ class pglExperiment(pglSettingsManager):
             # update tasks in current phase
             phaseDone = False
             updateTime = self.pgl.getSecs()
-            for task in self.task[self.currentPhase]:
+            for task in self.task[self.state.currentPhase]:
                 # update task
-                task.update(updateTime=updateTime, subjectResponse=subjectResponse, phaseNum=self.currentPhase, tasks=self.task[self.currentPhase], experiment=self)
+                task.update(updateTime=updateTime, subjectResponse=subjectResponse, phaseNum=self.state.currentPhase, tasks=self.task[self.state.currentPhase], experiment=self)
                 # check if task is done
                 if task.done(): phaseDone = True
             
@@ -274,14 +278,14 @@ class pglExperiment(pglSettingsManager):
             # go to next phase or end experiment
             if phaseDone:
                 # update phase
-                self.currentPhase += 1
+                self.state.currentPhase += 1
                 # check if we have ended all phases
-                if self.currentPhase >= len(self.task):
-                    experimentDone = True
+                if self.state.currentPhase >= len(self.task):
+                    self.state.experimentDone = True
                 else:
                     self.startPhase()
         
-        self.endTime = self.pgl.getSecs()
+        self.data.endTime = self.pgl.getSecs()
         print("(pglExperiment:run) Experiment done.")
         
         # close screen
@@ -291,9 +295,9 @@ class pglExperiment(pglSettingsManager):
         '''
         Start the current phase of the experiment.
         '''
-        print(f"(pglExperiment:startPhase) Starting phase: {self.currentPhase+1}/{len(self.task)}")
+        print(f"(pglExperiment:startPhase) Starting phase: {self.state.currentPhase+1}/{len(self.task)}")
         startTime = self.pgl.getSecs()
-        for task in self.task[self.currentPhase]:
+        for task in self.task[self.state.currentPhase]:
             task.start(startTime)
     
     def save(self):
@@ -312,7 +316,14 @@ class pglExperiment(pglSettingsManager):
         print(f"(pglExperiment:save) Saving experiment data to: {dataDir}")
         
         # save settings
-        self.settings.save(dataDir / "experimentSettings.json")
+        self.settings.save(dataDir / "settings.json")
+        self.experimentSettings.save(dataDir / "experimentSettings.json")
+
+        # save state
+        self.state.save(dataDir / "state.json")
+        
+        # save data
+        self.data.save(dataDir / "data.json")
 
         # save each task
         for phaseTasks in self.task:
@@ -494,7 +505,7 @@ class pglTestTask(pglTask):
         # This will just update every trial
         self.pgl.text(f"Trial {self.currentTrial+1}",xAlign=1)
         if self.e is not None:
-            self.pgl.text(f"Volume {self.e.volumeNumber}",xAlign=1)
+            self.pgl.text(f"Volume {self.e.state.volumeNumber}",xAlign=1)
             elapsed = self.pgl.getSecs() - self.e.startTime
             minutes = int(elapsed // 60)
             seconds = int(elapsed % 60)
@@ -539,6 +550,25 @@ class pglExperimentSettings(_pglSettings):
         ):
             raise TraitError("(experimentSettings) ❌ Error: subjectID must be in format 'sXXXX' where X is a digit.")
         return value           
+
+##############################################
+# Data for pglExperiment
+##############################################
+@dataclass
+class pglExperimentData(pglData):
+    startTime: float = 0.0
+    endTime: float = 0.0
+##############################################
+# State for pglExperiment
+##############################################
+@dataclass
+class pglExperimentState(pglData):
+    currentPhase: int = 0
+    openScreen: bool = False
+    volumeNumber: int = 0
+    experimentStarted: bool = False
+    experimentDone: bool = False
+    
 
 ##############################################
 # Settings for pglTask
