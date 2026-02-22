@@ -17,7 +17,7 @@ from .pglTimestamp import pglTimestamp
 from dataclasses import dataclass, field
 from traitlets import Float, Int, List
 from .pglData import pglData
-from .pglSettings import _pglSettings
+from .pglSettings import pglSettingsEditable
     
 ##########################
 # Staircase class
@@ -315,7 +315,7 @@ class pglStaircaseData(pglData):
             ax.legend()
         return ax
 
-class pglStaircaseSettings(_pglSettings):
+class pglStaircaseSettings(pglSettingsEditable):
     nDown = Int(2, min=0, step=1, help="Number of trials in a row before increasing difficulty")
     nUp = Int(1, min=0, step=1, help="Number of trials in a row before increasing difficulty")
     startVal = Float(default_value=None, allow_none=True, help="Starting value for the staircase")

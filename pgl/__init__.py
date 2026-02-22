@@ -17,7 +17,7 @@ from .pglStaircase import pglStaircase, pglStaircaseUpDown
 from ._pglComm import pglSerial
 from .pglCalibration import pglCalibration, pglCalibrationDeviceMinolta, pglCalibrationData, pglCalibrationDeviceDebug
 from .pglGammaTable import pglGammaTable 
-from .pglSettings import _pglSettings, pglMainSettingsManager
+from .pglSettings import pglSettingsEditable, pglMainSettingsManager
 # Device specific imports (eye trackers, etc.)
 from .pglVPixx import pglProPixx, pglDataPixx
 from .pglEyeTracker import pglEyeTracker

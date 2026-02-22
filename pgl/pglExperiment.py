@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from numpy.ma import resize
 from . import pglKeyboardMouse
 from pathlib import Path
-from .pglSettings import pglSettingsManager, pglSettings, _pglSettings
+from .pglSettings import pglSettingsManager, pglSettings, pglSettingsEditable
 from IPython.display import display, HTML
 from .pglBase import pglDisplayMessage
 from traitlets import List, Float, TraitError, TraitError, observe, Instance, Int, Unicode, Dict, validate
@@ -353,7 +353,10 @@ class pglTask:
     def __init__(self, pgl=None):
         self.pgl = pgl
         self.settings = pglTaskSettings()
+        self.state = pglTaskState()
         
+        # default seglen
+        self.settings.seglen = [1.0]
         self.phaseNum = None
         self.tasks = None
         self.e = None
@@ -373,7 +376,7 @@ class pglTask:
         '''
         Start a segment.
         '''
-        self.currentSegment += 1
+        self.state.currentSegment += 1
         self.segmentStartTime = startTime
 
     def startTrial(self, startTime):
@@ -385,7 +388,7 @@ class pglTask:
         self.trialStartTime = startTime
         
         # start segment (startSegment will update currentSegment to 0)
-        self.currentSegment = -1
+        self.state.currentSegment = -1
         self.startSegment(startTime)
         
         # get a random length for each segment. If segmin==segmax, then fixed length
@@ -430,16 +433,17 @@ class pglTask:
         self.updateScreen()
 
         # check for end of segment
-        if updateTime - self.segmentStartTime >= self._thisTrialSeglen[self.currentSegment]:
+        print(self.state.currentSegment, len(self._thisTrialSeglen))
+        if updateTime - self.segmentStartTime >= self._thisTrialSeglen[self.state.currentSegment]:
             # if the segment len is set to 0, it is a jump segment command
             # so reset the segment length to how long actually elapsed
             # so there is a record of how long we were in that segment
-            if self._thisTrialSeglen[self.currentSegment] == 0:
-                self._thisTrialSeglen[self.currentSegment] = updateTime - self.segmentStartTime
+            if self._thisTrialSeglen[self.state.currentSegment] == 0:
+                self._thisTrialSeglen[self.state.currentSegment] = updateTime - self.segmentStartTime
             # call startSegment to begin next segment
             self.startSegment(updateTime)
             # check for end of trial
-            if self.currentSegment >= self.settings.nSegments: 
+            if self.state.currentSegment >= self.settings.nSegments: 
                 # new trial
                 self.startTrial(updateTime)
         
@@ -506,7 +510,7 @@ class pglTestTask(pglTask):
         self.pgl.text(f"Trial {self.currentTrial+1}",xAlign=1)
         if self.e is not None:
             self.pgl.text(f"Volume {self.e.state.volumeNumber}",xAlign=1)
-            elapsed = self.pgl.getSecs() - self.e.startTime
+            elapsed = self.pgl.getSecs() - self.e.data.startTime
             minutes = int(elapsed // 60)
             seconds = int(elapsed % 60)
             self.pgl.text(f"{minutes:02d}:{seconds:02d}",xAlign=1)
@@ -515,13 +519,13 @@ class pglTestTask(pglTask):
     
     def handleSubjectResponse(self, responses, updateTime):
         for response in responses:
-            self.responseText = f"Subject response received: {response} at {updateTime - self.e.startTime:.2f} seconds"
+            self.responseText = f"Subject response received: {response} at {updateTime - self.e.data.startTime:.2f} seconds"
 
 
 ##############################################
 # Settings for pglExperiment
 ##############################################
-class pglExperimentSettings(_pglSettings):
+class pglExperimentSettings(pglSettingsEditable):
     experimentName = Unicode("Default experiment", help="Name of the experiment")
     experimentSaveName = Unicode("defaultExperiment", help="Name to use when saving experiment data (defaults to camelCase version of experimentName)")
     subjectID = Unicode("s0000", help="Identifier for the subject participating in the experiment.")
@@ -558,6 +562,7 @@ class pglExperimentSettings(_pglSettings):
 class pglExperimentData(pglData):
     startTime: float = 0.0
     endTime: float = 0.0
+
 ##############################################
 # State for pglExperiment
 ##############################################
@@ -568,12 +573,11 @@ class pglExperimentState(pglData):
     volumeNumber: int = 0
     experimentStarted: bool = False
     experimentDone: bool = False
-    
 
 ##############################################
 # Settings for pglTask
 ##############################################
-class pglTaskSettings(_pglSettings):
+class pglTaskSettings(pglSettingsEditable):
     taskName = Unicode("Default task", help="Name of the task")
     taskSaveName = Unicode("defaultTask", help="Name to use when saving task data (defaults to camelCase version of taskName)")
     seglen = List(Float(), help="List of segment lengths in seconds.")
@@ -647,3 +651,10 @@ class pglTaskSettings(_pglSettings):
     '''
     def __init__(self):
         super().__init__()
+
+##############################################
+# State for pglTask
+##############################################
+@dataclass
+class pglTaskState(pglData):
+    currentSegment: int = 0
