@@ -43,6 +43,7 @@ class pglBase:
     screenWidth = SimpleNamespace(pix = 0, cm = 0.0, deg = 0.0)
     screenHeight = SimpleNamespace(pix = 0, cm = 0.0, deg = 0.0)
     distanceToScreen = SimpleNamespace(cm = 0.0)
+    clearScreenColor = [0.0, 0.0, 0.0]
 
     ################################################################
     # Init Function
