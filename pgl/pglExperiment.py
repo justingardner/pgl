@@ -28,6 +28,10 @@ from .pglEvent import pglEvent
 from .pglSerialize import pglSerialize
 from typing import List as ListType
 from traitlets import List
+from matplotlib import pyplot as plt
+import matplotlib.patches as patches
+from matplotlib.lines import Line2D
+import numpy as np
 
 ##############################################s
 # Experiment class
@@ -568,6 +572,17 @@ class pglExperimentData(pglSerialize):
     startTime: float = 0.0
     endTime: float = 0.0
     events: ListType[pglEvent] = field(default_factory=list) 
+    
+    def display(self):
+        '''
+        Display the experiment data.
+        '''
+        timeline = timelinePlot(startTime=0, endTime=self.endTime-self.startTime)
+        for event in self.events:
+            if event.type == "keyboard" and (event.eventType == "keydown" or event.keyChar == "escape"):
+                timeline.addTriangleMarker(time=event.timestamp - self.startTime, color='red', label=f'{event.keyChar}')
+        timeline.setTitle("Experiment Events")
+        timeline.show()
 
 ##############################################
 # State for pglExperiment
@@ -664,3 +679,150 @@ class pglTaskSettings(pglSettingsEditable):
 @dataclass
 class pglTaskState(pglSerialize):
     currentSegment: int = 0
+
+##############################################
+# timelinePlot
+##############################################
+class timelinePlot:
+    """
+    A timeline visualization with triangular event markers and vertical line markers.
+    
+    Usage:
+        timeline = TimelinePlot(startTime=0, endTime=100)
+        timeline.addTriangleMarker(time=10, color='red', label='Start')
+        timeline.addVerticalMarker(time=50, color='blue', label='Checkpoint', labelSide='right')
+        timeline.show()
+    """
+    
+    def __init__(self, startTime=0, endTime=100, figsize=(12, 4)):
+        """
+        Initialize the timeline plot.
+        
+        Args:
+            startTime (float): Start time for the timeline
+            endTime (float): End time for the timeline
+            figsize (tuple): Figure size (width, height)
+        """
+        self.startTime = startTime
+        self.endTime = endTime
+        
+        # Create figure and axis
+        self.fig, self.ax = plt.subplots(figsize=figsize)
+        
+        # Setup the timeline axis
+        self.ax.set_xlim(startTime, endTime)
+        self.ax.set_ylim(-1, 2)  # Room for markers above and below
+        
+        # Draw the main timeline (horizontal line)
+        self.ax.axhline(y=0, color='black', linewidth=2)
+        
+        # Axis labels
+        self.ax.set_xlabel('Time (sec)', fontsize=12)
+        self.ax.set_yticks([])  # Hide y-axis ticks
+        self.ax.spines['left'].set_visible(False)
+        self.ax.spines['right'].set_visible(False)
+        self.ax.spines['top'].set_visible(False)
+        
+        # Storage for markers (for legend if needed)
+        self.markers = []
+    
+    def addTriangleMarker(self, time, color='red', label='', labelOffset=0.3, 
+                          markerSize=10, fontsize=10):
+        """
+        Add a downward-pointing triangle marker at a specific time.
+        
+        Args:
+            time (float): Time position for the marker
+            color (str): Color of the triangle
+            label (str): Text label above the triangle
+            labelOffset (float): Vertical offset for the label
+            markerSize (float): Size of the triangle marker
+            fontsize (int): Font size for the label
+        """
+        # Draw downward-pointing triangle
+        self.ax.plot(time, 0, marker='v', markersize=markerSize, 
+                    color=color, markeredgecolor='black', markeredgewidth=0.5)
+        
+        # Add label above if provided
+        if label:
+            self.ax.text(time, labelOffset, label, 
+                        ha='center', va='bottom', fontsize=fontsize,
+                        bbox=dict(boxstyle='round,pad=0.3', facecolor='white', 
+                                 edgecolor=color, alpha=0.8))
+        
+        self.markers.append({'type': 'triangle', 'time': time, 'label': label, 'color': color})
+    
+    def addVerticalMarker(self, time, color='blue', label='', labelSide='right',
+                          lineHeight=1.5, linewidth=2, fontsize=9, rotation=90):
+        """
+        Add a vertical line marker at a specific time.
+        
+        Args:
+            time (float): Time position for the marker
+            color (str): Color of the vertical line
+            label (str): Text label for the marker
+            labelSide (str): 'left' or 'right' - side for the label
+            lineHeight (float): Height of the vertical line
+            linewidth (float): Width of the vertical line
+            fontsize (int): Font size for the label
+            rotation (int): Text rotation (90 for vertical, 0 for horizontal)
+        """
+        # Draw vertical line
+        yBottom = -lineHeight / 2
+        yTop = lineHeight / 2
+        self.ax.plot([time, time], [yBottom, yTop], 
+                    color=color, linewidth=linewidth)
+        
+        # Add label if provided
+        if label:
+            # Position label on left or right
+            if labelSide == 'right':
+                xOffset = 0.02 * (self.endTime - self.startTime)  # 2% of range
+                ha = 'left'
+            else:  # left
+                xOffset = -0.02 * (self.endTime - self.startTime)
+                ha = 'right'
+            
+            self.ax.text(time + xOffset, 0, label,
+                        ha=ha, va='center', fontsize=fontsize,
+                        rotation=rotation, color=color)
+        
+        self.markers.append({'type': 'vertical', 'time': time, 'label': label, 'color': color})
+    
+    def addTimeRange(self, start, end, color='lightgray', alpha=0.3, label=''):
+        """
+        Add a shaded time range (useful for highlighting periods).
+        
+        Args:
+            start (float): Start time of the range
+            end (float): End time of the range
+            color (str): Color of the shaded region
+            alpha (float): Transparency (0-1)
+            label (str): Optional label for the range
+        """
+        self.ax.axvspan(start, end, color=color, alpha=alpha, label=label)
+    
+    def setTitle(self, title, fontsize=14):
+        """Set the plot title."""
+        self.ax.set_title(title, fontsize=fontsize, fontweight='bold')
+    
+    def show(self):
+        """Display the plot."""
+        plt.tight_layout()
+        plt.show()
+    
+    def save(self, filename, dpi=300):
+        """
+        Save the plot to a file.
+        
+        Args:
+            filename (str): Output filename
+            dpi (int): Resolution in dots per inch
+        """
+        plt.tight_layout()
+        plt.savefig(filename, dpi=dpi, bbox_inches='tight')
+        print(f"Timeline saved to {filename}")
+    
+    def getMarkers(self):
+        """Return list of all markers added."""
+        return self.markers
