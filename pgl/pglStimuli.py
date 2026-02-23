@@ -317,13 +317,16 @@ class pglStimuli:
     ####################################################
     # bar
     ####################################################
-    def bar(self, width=1.0, speed=1.0, dir=0):
+    def bar(self, width=1.0, speed=1.0, dir=0, sweepWidth=None, sweepHeight=None, nVolumesPerSweep=None):
         '''
         Create a bar stimulus. Used for pRF mapping
         
         Args:
             width (float): The width of the bar stimulus in degrees
             speed (float): The speed in deg/s the bar stimulus moves across screen
+            sweepWidth (float, optional): The width of the sweep area in degrees. If None, defaults to screen width.
+            sweepHeight (float, optional): The height of the sweep area in degrees. If None, defaults to screen height.
+            nVolumesPerSweep (int, optional): Number of volumes per sweep period.bar
         '''
         # Validate inputs
         if not isinstance(width, (int, float)) or width <= 0:
@@ -335,7 +338,7 @@ class pglStimuli:
             return None
 
         # Create the bar stimulus
-        barStimulus = pglStimulusBar(self, width=width, speed=speed, dir=dir)
+        barStimulus = pglStimulusBar(self, width=width, speed=speed, dir=dir, sweepWidth=sweepWidth, sweepHeight=sweepHeight, nVolumesPerSweep=nVolumesPerSweep)
         return barStimulus
 
     ####################################################
@@ -1079,7 +1082,7 @@ class pglStimulusRadialCheckerboardSliding(_pglStimulusRadialCheckerboard):
 # Bar stimulus class
 ################################################################
 class pglStimulusBar(_pglStimulus):
-    def __init__(self, pgl, width=1.0, speed=1.0, dir=0, stepPosition=True):
+    def __init__(self, pgl, width=1.0, speed=1.0, dir=0, nVolumesPerSweep=None, stepPosition=True, sweepWidth=None, sweepHeight=None, volumeNumber=0):
         super().__init__(pgl)
         
         # save parameters
@@ -1087,22 +1090,34 @@ class pglStimulusBar(_pglStimulus):
         self.speed = speed
         self.dir = dir
         self.stepPosition = stepPosition
+        self.nVolumesPerSweep = nVolumesPerSweep
+        
+        # get the screen width and height if not provided
+        self.sweepWidth = pgl.screenWidth.deg if sweepWidth is None else sweepWidth
+        self.sweepHeight = pgl.screenHeight.deg if sweepHeight is None else sweepHeight
+
         # set the height to the diagonal length (so that the bars
         # display full screen even if they are moving in an oblique direction)
-        self.height = np.sqrt(pgl.screenHeight.deg**2 + pgl.screenWidth.deg**2)
+        self.height = np.sqrt(self.sweepHeight**2 + self.sweepWidth**2)
                 
         # create the bar stimulus
         self.barStimulus = pglStimulusCheckerboardSliding(pgl, width=self.width, height=self.height)
 
         # start the pass
-        self.initPass()
+        self.initPass(volumeNumber=volumeNumber)
         
-    def display(self, dir=0):
+    def display(self, dir=0, volumeNumber=0):
         '''
         Display the bar stimulus.
         '''
-        # Update the bar stimulus position
-        if self.stepPosition:
+        # rotate coordinate frame accordingly
+        self.pgl.setTransformRotation(dir)
+
+        # Update the bar stimulus position 
+        if self.nVolumesPerSweep is not None:
+            # update position in steps based on volume number
+            self.barStimulus.x = self.passStartX + self.stepSizePerVolume * (volumeNumber - self.volumeNumber)
+        elif self.stepPosition:
             # only update, every time the stimulus moves a full width
             self.thisX = self.passStartX + self.speed * (self.pgl.getSecs() - self.passStartTime)
             if self.thisX - self.barStimulus.x > self.width:
@@ -1115,11 +1130,19 @@ class pglStimulusBar(_pglStimulus):
         self.barStimulus.display()
         
         # check for end of pass
-        if self.barStimulus.x > self.passEndX:
+        if self.nVolumesPerSweep is not None:
+            if volumeNumber - self.volumeNumber >= self.nVolumesPerSweep:
+                # reset for next pass
+                self.initPass(volumeNumber=volumeNumber)
+        # handle for modes in which passes are not synced to volumes
+        elif self.barStimulus.x > self.passEndX:
             # reset for next pass
-            self.initPass()
+            self.initPass(volumeNumber=volumeNumber)
+
+        # rotate coordinate frame back
+        self.pgl.setTransformRotation(0)
                   
-    def initPass(self):
+    def initPass(self, volumeNumber=0):
         '''
         Initialize the pass parameters for the bar stimulus.
         '''
@@ -1128,10 +1151,11 @@ class pglStimulusBar(_pglStimulus):
 
         # set time
         self.passStartTime = self.pgl.getSecs()
+        self.volumeNumber = volumeNumber
         
         # set the x, y start and end positions
-        self.passStartX = -self.pgl.screenWidth.deg/2 - self.width/2
-        self.passEndX = self.pgl.screenWidth.deg/2 + self.width/2
+        self.passStartX = -self.sweepWidth/2 - self.width/2
+        self.passEndX = self.sweepWidth/2 + self.width/2
         self.passStartY = 0
         self.passEndY = 0
         
@@ -1139,9 +1163,11 @@ class pglStimulusBar(_pglStimulus):
         self.barStimulus.x = self.passStartX
         self.barStimulus.y = self.passStartY
         
-        # rotate coordinate frame accordingly
-        self.pgl.setTransformRotation(self.passDir)
-
+        # if volumesPerSweepPeriod is set, calculate step size accordingly
+        if self.nVolumesPerSweep is not None:
+            self.stepSizePerVolume = (self.passEndX-self.passStartX)/(self.nVolumesPerSweep-1)
+            
+    
 
 ################################################################
 # Movie stimulus class
