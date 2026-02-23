@@ -16,6 +16,7 @@ from typing import Optional
 from pgl import pglTimestamp
 from .pglEvent import pglEvent
 from .pglEventListener import pglEventListener
+from dataclasses import dataclass
 
 #################################################################
 # Parent class for devices

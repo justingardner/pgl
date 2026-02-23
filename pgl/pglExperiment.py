@@ -16,17 +16,18 @@ import itertools
 import random
 import math
 from datetime import datetime
-from dataclasses import dataclass
-
-from numpy.ma import resize
+from dataclasses import dataclass, field
 from . import pglKeyboardMouse
 from pathlib import Path
 from .pglSettings import pglSettingsManager, pglSettings, pglSettingsEditable
 from IPython.display import display, HTML
 from .pglBase import pglDisplayMessage
-from traitlets import List, Float, TraitError, TraitError, observe, Instance, Int, Unicode, Dict, validate
+from traitlets import Float, TraitError, TraitError, observe, Instance, Int, Unicode, Dict, validate
 from .pglParameter import pglParameter, pglParameterBlock
-from .pglData import pglData
+from .pglEvent import pglEvent
+from .pglSerialize import pglSerialize
+from typing import List as ListType
+from traitlets import List
 
 ##############################################s
 # Experiment class
@@ -226,6 +227,7 @@ class pglExperiment(pglSettingsManager):
             while not self.state.experimentStarted:
                 # poll for events
                 events = self.pgl.poll()
+                self.data.events.extend(events)
 
                 # see if we have a match to startKey
                 if [e for e in events if e.type == "keyboard" and e.keyChar in self.settings.startKey]:
@@ -250,6 +252,7 @@ class pglExperiment(pglSettingsManager):
             
             # poll for events
             events = self.pgl.poll()
+            self.data.events.extend(events)
 
             # see if we have a match to endKey
             if [e for e in events if e.type == "keyboard" and e.keyChar in self.settings.endKey]:
@@ -357,6 +360,8 @@ class pglTask:
         
         # default seglen
         self.settings.seglen = [1.0]
+        
+        # these get set by update
         self.phaseNum = None
         self.tasks = None
         self.e = None
@@ -559,15 +564,16 @@ class pglExperimentSettings(pglSettingsEditable):
 # Data for pglExperiment
 ##############################################
 @dataclass
-class pglExperimentData(pglData):
+class pglExperimentData(pglSerialize):
     startTime: float = 0.0
     endTime: float = 0.0
+    events: ListType[pglEvent] = field(default_factory=list) 
 
 ##############################################
 # State for pglExperiment
 ##############################################
 @dataclass
-class pglExperimentState(pglData):
+class pglExperimentState(pglSerialize):
     currentPhase: int = 0
     openScreen: bool = False
     volumeNumber: int = 0
@@ -656,5 +662,5 @@ class pglTaskSettings(pglSettingsEditable):
 # State for pglTask
 ##############################################
 @dataclass
-class pglTaskState(pglData):
+class pglTaskState(pglSerialize):
     currentSegment: int = 0
