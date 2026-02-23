@@ -85,6 +85,13 @@ class pglEyelink(pglEyeTracker):
             print("             C: (C)alibrate V: (V)alidate")
             print("             0 or Q: (Q)uit calibration")
             try:
+                # Put tracker in offline mode before calibration
+                self.eyelink.setOfflineMode()
+            
+                # Wait briefly for mode switch
+                pylink.msecDelay(50)
+            
+                # Now do the setup
                 self.eyelink.doTrackerSetup()
             except Exception as e:
                 print(f"(pglEyelink) Error during calibration: {e}")
@@ -128,34 +135,28 @@ if _HAVE_PYLINK:
             
             # setup keymap
             self.keyMap = {
-                # Function keys
-                keyboard.Key.f1: pylink.F1_KEY,
-                keyboard.Key.f2: pylink.F2_KEY,
-                keyboard.Key.f3: pylink.F3_KEY,
-                keyboard.Key.f4: pylink.F4_KEY,
-                keyboard.Key.f5: pylink.F5_KEY,
-                keyboard.Key.f6: pylink.F6_KEY,
-                keyboard.Key.f7: pylink.F7_KEY,
-                keyboard.Key.f8: pylink.F8_KEY,
-                keyboard.Key.f9: pylink.F9_KEY,
-                keyboard.Key.f10: pylink.F10_KEY,
-
-                # Arrow keys    
-                keyboard.Key.up: pylink.CURS_UP,
-                keyboard.Key.down: pylink.CURS_DOWN,
-                keyboard.Key.left: pylink.CURS_LEFT,
-                keyboard.Key.right: pylink.CURS_RIGHT,
-
-                # Page up/down
-                keyboard.Key.page_up: pylink.PAGE_UP,
-                keyboard.Key.page_down: pylink.PAGE_DOWN,
-
-                # Control keys
-                keyboard.Key.backspace: ord('\b'),
-                keyboard.Key.enter: pylink.ENTER_KEY,
-                keyboard.Key.space: ord(' '),
-                keyboard.Key.esc: pylink.ESC_KEY,
-                keyboard.Key.tab: ord('\t'),
+                'f1': pylink.F1_KEY,
+                'f2': pylink.F2_KEY,
+                'f3': pylink.F3_KEY,
+                'f4': pylink.F4_KEY,
+                'f5': pylink.F5_KEY,
+                'f6': pylink.F6_KEY,
+                'f7': pylink.F7_KEY,
+                'f8': pylink.F8_KEY,
+                'f9': pylink.F9_KEY,
+                'f10': pylink.F10_KEY,
+                'up': pylink.CURS_UP,
+                'down': pylink.CURS_DOWN,
+                'left': pylink.CURS_LEFT,
+                'right': pylink.CURS_RIGHT,
+                'page_up': pylink.PAGE_UP,
+                'page_down': pylink.PAGE_DOWN,
+                'delete': ord('\b'),
+                'return': pylink.ENTER_KEY,
+                'enter': pylink.ENTER_KEY,
+                'space': ord(' '),
+                'escape': pylink.ESC_KEY,
+                'tab': ord('\t'),
             }
             
         def __str__(self):
@@ -245,26 +246,49 @@ if _HAVE_PYLINK:
         def get_input_key(self):
             """ handle key input and send it over to the tracker"""
             keyboardEvents = []
-            # poll for keyboard events
-            events = self.pgl.devicesPoll()
-            for event in events:
-                if isinstance(event, pglEventKeyboard):                    
-                    # convert modifier
-                    modifier = 0
-                    #if event.shift: modifier |= pylink.KEY_SHIFT
-                    #if event.ctrl: modifier |= pylink.KEY_CTRL
-                    #if event.alt: modifier |= pylink.KEY_ALT
-                    #if event.cmd: modifier |= pylink.KEY_CMD
-                        
-                    # see if it is in the keyMap
-                    if event.key in self.keyMap:
-                        print(f"KeyMap: {event.keyStr}={self.keyMap[event.key]}")
-                        keyboardEvents.append(pylink.KeyInput(self.keyMap[event.key], modifier))
-                    else:
-                        print(f"Key: {event.keyStr}={event.keyCode}")
-                        keyboardEvents.append(pylink.KeyInput(event.keyCode, modifier))
             
-            # return keyboard events
+            # poll for keyboard events
+            events = self.pgl.poll()
+            
+            for event in events:
+                if isinstance(event, pglEventKeyboard):
+                    # Only process keydown events, ignore keyup
+                    if event.eventType != 'keydown':
+                        continue
+                    
+                    # Build modifier mask
+                    modifier = 0
+                    if event.shift: modifier |= pylink.KMOD_SHIFT
+                    if event.ctrl: modifier |= pylink.KMOD_CTRL
+                    if event.alt: modifier |= pylink.KMOD_ALT
+                    if event.cmd: modifier |= pylink.KMOD_META
+                    
+                    # Use keyChar (the string), not key (the dictionary)
+                    keyChar = event.keyChar
+                    keyCode = event.keyCode
+                    
+                    print(f">>> Processing keydown: '{keyChar}' (code: {keyCode})")
+                    
+                    # Check if it's a special key in our map
+                    if keyChar in self.keyMap:
+                        pylinkKey = self.keyMap[keyChar]
+                        print(f">>> Mapped special key '{keyChar}' -> {pylinkKey}")
+                        keyboardEvents.append(pylink.KeyInput(pylinkKey, modifier))
+                    
+                    # Single character (letters, numbers, symbols)
+                    elif keyChar and len(keyChar) == 1:
+                        pylinkKey = ord(keyChar)
+                        print(f">>> Single char '{keyChar}' -> {pylinkKey}")
+                        keyboardEvents.append(pylink.KeyInput(pylinkKey, modifier))
+                    
+                    # Fallback to keyCode
+                    elif keyCode is not None:
+                        print(f">>> Using keyCode: {keyCode}")
+                        keyboardEvents.append(pylink.KeyInput(keyCode, modifier))
+                    
+                    else:
+                        print(f">>> Skipping unknown key")
+            
             return keyboardEvents
         def draw_line(self, x1, y1, x2, y2, colorindex):
             """ draw lines"""
