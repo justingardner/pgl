@@ -22,7 +22,7 @@ from pathlib import Path
 from .pglSettings import pglSettingsManager, pglSettings, pglSettingsEditable
 from IPython.display import display, HTML
 from .pglBase import pglDisplayMessage
-from traitlets import Float, TraitError, TraitError, observe, Instance, Int, Unicode, Dict, validate
+from traitlets import Float, TraitError, TraitError, observe, Instance, Int, Unicode, Dict, validate, Bool
 from .pglParameter import pglParameter, pglParameterBlock
 from .pglEvent import pglEvent
 from .pglSerialize import pglSerialize
@@ -386,12 +386,28 @@ class pglTask:
         self.currentTrial = -1
         self.startTrial(startTime)
         
-    def startSegment(self, startTime):
+    def startSegment(self, updateTime):
         '''
         Start a segment.
         '''
+        # if the segment len is set to 0, it is a jump segment command
+        # so reset the segment length to how long actually elapsed
+        # so there is a record of how long we were in that segment
+        if self.state.currentSegment >=0 and self._thisTrialSeglen[self.state.currentSegment] == 0:
+            self._thisTrialSeglen[self.state.currentSegment] = updateTime - self.segmentStartTime
+
         self.state.currentSegment += 1
-        self.segmentStartTime = startTime
+        self.segmentStartTime = updateTime
+        
+        # default to false, this will get reset
+        # at end of segment clock if set for this segment
+        self.waitUntilVolumeTrigger = False
+        
+        # check for end of trial
+        if self.state.currentSegment >= self.settings.nSegments: 
+            # new trial
+            self.startTrial(updateTime)
+
 
     def startTrial(self, startTime):
         '''
@@ -401,6 +417,11 @@ class pglTask:
         self.currentTrial += 1
         self.trialStartTime = startTime
         
+        # get current parameters
+        self.currentParams = {}
+        for parameter in self.settings.parameters: 
+            self.currentParams.update(parameter.get())
+
         # start segment (startSegment will update currentSegment to 0)
         self.state.currentSegment = -1
         self.startSegment(startTime)
@@ -414,11 +435,6 @@ class pglTask:
             for min_val, max_val in zip(self.settings.segmin, self.settings.segmax)
         ]
         print("seglen: ",[f"{x:.2g}" for x in self._thisTrialSeglen])
-
-        # get current parameters
-        self.currentParams = {}
-        for parameter in self.settings.parameters: 
-            self.currentParams.update(parameter.get())
 
         # print trial
         print(f"({self.settings.taskName}) Trial {self.currentTrial+1}: ", end='')
@@ -447,19 +463,18 @@ class pglTask:
         self.updateScreen()
 
         # check for end of segment
-        print(self.state.currentSegment, len(self._thisTrialSeglen))
-        if updateTime - self.segmentStartTime >= self._thisTrialSeglen[self.state.currentSegment]:
-            # if the segment len is set to 0, it is a jump segment command
-            # so reset the segment length to how long actually elapsed
-            # so there is a record of how long we were in that segment
-            if self._thisTrialSeglen[self.state.currentSegment] == 0:
-                self._thisTrialSeglen[self.state.currentSegment] = updateTime - self.segmentStartTime
-            # call startSegment to begin next segment
-            self.startSegment(updateTime)
-            # check for end of trial
-            if self.state.currentSegment >= self.settings.nSegments: 
-                # new trial
-                self.startTrial(updateTime)
+        if self.waitUntilVolumeTrigger:
+            if self.e.state.volumeNumber > self.lastVolumeNumber:
+                # volume trigger received, end segment
+                self.startSegment(updateTime)
+        if  updateTime - self.segmentStartTime >= self._thisTrialSeglen[self.state.currentSegment]:
+            # check if we need to wait until volume trigger
+            if self.settings.waitUntilVolumeTrigger[self.state.currentSegment]:
+                self.waitUntilVolumeTrigger = True
+                self.lastVolumeNumber = self.e.state.volumeNumber
+            else:
+                # call startSegment to begin next segment
+                self.startSegment(updateTime)
         
         # if there are responses, call response callback
         if subjectResponse is not []:
@@ -625,6 +640,7 @@ class pglTaskSettings(pglSettingsEditable):
     seglen = List(Float(), help="List of segment lengths in seconds.")
     segmin = List(Float(), help="Minimum length of a segment.")
     segmax = List(Float(), help="Maximum length of a segment.")
+    waitUntilVolumeTrigger = List(Bool(), help="List of nSegments where if set to true will run through the segment length and then wait for a volume trigger to continue.")
     nSegments = Int(help="Number of segments in the task.")
     nTrials = Float(np.inf, help="Number of trials to run for.")
     parameters = List(Instance(pglParameter), default_value=[], help="List of parameters (type pglParameter) for the task.")
@@ -688,6 +704,13 @@ class pglTaskSettings(pglSettingsEditable):
         
         self.nSegments = len(self.seglen)
         
+        # make length of waitUntilVolumeTrigger same as nSegments
+        self.waitUntilVolumeTrigger = (self.waitUntilVolumeTrigger + [False] * self.nSegments)[:self.nSegments]
+    
+    @observe("waitUntilVolumeTrigger")
+    def _updateWaitUntilVolumeTrigger(self, change):
+        # make same length as seglen
+        self.waitUntilVolumeTrigger = (self.waitUntilVolumeTrigger + [False] * self.nSegments)[:self.nSegments]
     '''
     Settings for pglTask
     '''
