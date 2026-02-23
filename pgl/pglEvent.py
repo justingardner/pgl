@@ -9,43 +9,61 @@
 #############
 # Import modules
 #############
+from .pglSerialize import pglSerialize
+from dataclasses import dataclass, field
+from typing import List, Optional
 
-#############
-# pglEvents
-#############
-class pglEvents:
+#################################################################
+# Parent class for events
+#################################################################
+class pglEvent(pglSerialize):
     """
-    Initialize the pglEvents class.
-
-    This class provides methods for handling events related to keyboard, mouse, and other device interactions.
-
-    Args:
-        None
-
-    Returns:
-        None
+    Parent class for all pglEvent types
     """
-    def __init__(self):
+    
+    def __init__(self, type="pglEvent"):
         """
-        Initialize the pglEvents instance.
+        Initialize the pglEvent instance.
         
         Args:
-            None
-        
-        Returns:
-            None
+            type (str): The type/category of this event
         """
-        self.events = []
+        self.type = type
 
+    def __repr__(self):
+        return f"<pglEvent type={self.type}>"
+
+    def print(self):
+        """
+        Print the details of the pglEvent instance.
+        """
+        print(f"(pglEvent) Type: {self.type}")
+
+#############
+# pglEvents - Event container using dataclass
+#############
+@dataclass
+class pglEvents():
+    """
+    Container for managing multiple pglEvent instances.
+
+    This class provides methods for handling events related to keyboard, 
+    mouse, and other device interactions.
+    
+    Attributes:
+        events (List[pglEvent]): FIFO queue of events
+    """
+    events: List[pglEvent] = field(default_factory=list)
+    
     ################################################################
     # Add events to the event list
     ################################################################
-    def eventsAdd(self,events):
+    def eventsAdd(self, events):
         """
         Add events to the event list.
 
         Args:
-            events (list): A list of events to add.
+            events (pglEvent or list): Event(s) to add.
 
         Returns:
             None
@@ -56,21 +74,19 @@ class pglEvents:
             self.events.append(events)
 
     ################################################################
-    # Gets an event
+    # Get an event
     ################################################################
-    def eventsGet(self):
-        '''
-        Get events from the event list (which will be populated by polling devices)
-
-        Args:
-            None
+    def eventsGet(self) -> Optional[pglEvent]:
+        """
+        Get and remove the next event from the queue (FIFO).
 
         Returns:
-            pglEvent: An instance of pglEvent containing the event data.
-        ''' 
+            pglEvent or None: The next event, or None if queue is empty.
+        """ 
         if self.events:
             return self.events.pop(0)
         return None
+    
     ################################################################
     # eventsWaitFor
     ################################################################
@@ -79,46 +95,15 @@ class pglEvents:
         Wait for specific events to occur.
 
         Args:
-            waitForList (list): A list of event types to wait for.
+            waitForList (list): A list of event types/IDs to wait for.
 
         Returns:
-            pglEvent: An instance of pglEvent containing the event data.
+            pglEvent: The first matching event.
         """
         while True:
-            # Poll for events
             events = self.devicesPoll()
             if events:
                 for event in events:
-                    if event.id in waitForList:
+                    if hasattr(event, 'id') and event.id in waitForList:
                         return event
             self.waitSecs(0.01)
-
-#################################################################
-# Parent classes for events
-#################################################################
-class pglEvent:
-    """
-    Parent class for all pglEvent types
-    """
-    
-    def __init__(self, type="pglEvent"):
-        """
-        Initialize the pglEvent instance.
-        """
-        self.type = type
-
-    def __repr__(self):
-        return f"<pglEvent type={self.deviceType}>"
-
-    def __del__(self):
-        """
-        Clean up the pglEvent instance.
-        """
-        # Perform any necessary cleanup here
-        pass
-    
-    def print(self):
-        """
-        Print the details of the pglEvent instance.
-        """
-        print(f"(pglEvent) Device Type: {self.deviceType}: {self.__repr__()}")
