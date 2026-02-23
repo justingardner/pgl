@@ -29,7 +29,7 @@ try:
     import pylink
     from .pglEyelink import pglEyelinkCustomDisplay, pglEyelink
 except ImportError:
-    print("(pgl) Warning: pylink not found, pglEyelink class will not be available.")
+    print("(pgl) Warning: pylink not found, pglEyelink class will not be available. Download with: pip install sr-research-pylink")
 
 class pgl(pglBase, pglResolution, pglDraw, pglTransform, pglProfile, pglBatch, pglImage, pglStimuli, pglTimestamp, pglDevices, pglEvents, pglCommandReplayer, pglFrameGrab, pglGammaTable, pglMainSettingsManager):
     """
