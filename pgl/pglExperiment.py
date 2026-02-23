@@ -340,6 +340,11 @@ class pglExperiment(pglSettingsManager):
         '''
         Load the experiment settings, state and data.         
         '''
+    def display(self):
+        '''
+        Display a timeline of experiment events.
+        '''
+        self.data.display(self)
     
 ##############################################
 # Task class
@@ -573,15 +578,31 @@ class pglExperimentData(pglSerialize):
     endTime: float = 0.0
     events: ListType[pglEvent] = field(default_factory=list) 
     
-    def display(self):
+    def display(self, e=None):
         '''
         Display the experiment data.
         '''
+        # get infor from experiment if provided
+        if e is not None:
+            self.volumeTriggerKey = e.settings.volumeTriggerKey
+        else:
+            self.volumeTriggerKey = ""
+        
+        # init timeline
         timeline = timelinePlot(startTime=0, endTime=self.endTime-self.startTime)
+        
+        # for each event, add to timeline
         for event in self.events:
-            if event.type == "keyboard" and (event.eventType == "keydown" or event.keyChar == "escape"):
-                timeline.addTriangleMarker(time=event.timestamp - self.startTime, color='red', label=f'{event.keyChar}')
+            if event.type == "keyboard":
+                if event.eventType == "keydown":
+                    if event.keyChar == self.volumeTriggerKey:
+                        timeline.addTriangleMarker(time=event.timestamp - self.startTime, color='blue', direction='up')
+                    else:
+                        timeline.addTriangleMarker(time=event.timestamp - self.startTime, color='green', label=f'{event.keyChar}', direction='down')
+                elif (event.keyChar == "escape"):
+                    timeline.addTriangleMarker(time=event.timestamp - self.startTime, color='red', label=f'{event.keyChar}', direction='down')
         timeline.setTitle("Experiment Events")
+        timeline.addLegend([{'label': 'Keypress', 'color': 'green'},{'label': 'Volumes', 'color': 'blue'}])
         timeline.show()
 
 ##############################################
@@ -725,32 +746,60 @@ class timelinePlot:
         
         # Storage for markers (for legend if needed)
         self.markers = []
-    
+ 
     def addTriangleMarker(self, time, color='red', label='', labelOffset=0.3, 
-                          markerSize=10, fontsize=10):
+                          markerSize=10, fontsize=10, direction='down'):
         """
-        Add a downward-pointing triangle marker at a specific time.
+        Add a triangle marker at a specific time with tip touching the timeline.
         
         Args:
             time (float): Time position for the marker
             color (str): Color of the triangle
-            label (str): Text label above the triangle
-            labelOffset (float): Vertical offset for the label
-            markerSize (float): Size of the triangle marker
+            label (str): Text label for the triangle
+            labelOffset (float): Vertical offset for the label from the triangle edge
+            markerSize (float): Size of the triangle (height in data units)
             fontsize (int): Font size for the label
+            direction (str): 'down' for downward-pointing (▼) or 'up' for upward-pointing (▲)
         """
-        # Draw downward-pointing triangle
-        self.ax.plot(time, 0, marker='v', markersize=markerSize, 
-                    color=color, markeredgecolor='black', markeredgewidth=0.5)
+        # Convert markerSize to data coordinates (approximate)
+        height = markerSize * 0.02  # Scale factor for visual size
+        width = height * 0.8  # Make it slightly narrower
         
-        # Add label above if provided
+        # Create triangle vertices based on direction
+        if direction == 'down':
+            # Downward triangle: tip at timeline, base above
+            vertices = [
+                [time, 0],                    # Tip at timeline
+                [time - width/2, height],     # Top left
+                [time + width/2, height],     # Top right
+            ]
+            labelY = height + labelOffset
+            labelVa = 'bottom'
+        else:  # direction == 'up'
+            # Upward triangle: tip at timeline, base below
+            vertices = [
+                [time, 0],                    # Tip at timeline
+                [time - width/2, -height],    # Bottom left
+                [time + width/2, -height],    # Bottom right
+            ]
+            labelY = -height - labelOffset
+            labelVa = 'top'
+        
+        # Draw triangle as polygon
+        triangle = patches.Polygon(vertices, closed=True, 
+                                  facecolor=color, edgecolor='black', 
+                                  linewidth=0.5, clip_on=False)
+        self.ax.add_patch(triangle)
+        
+        # Add label if provided
         if label:
-            self.ax.text(time, labelOffset, label, 
-                        ha='center', va='bottom', fontsize=fontsize,
+            self.ax.text(time, labelY, label, 
+                        ha='center', va=labelVa, fontsize=fontsize,
                         bbox=dict(boxstyle='round,pad=0.3', facecolor='white', 
                                  edgecolor=color, alpha=0.8))
         
-        self.markers.append({'type': 'triangle', 'time': time, 'label': label, 'color': color})
+        self.markers.append({'type': 'triangle', 'time': time, 'label': label, 
+                            'color': color, 'direction': direction})
     
     def addVerticalMarker(self, time, color='blue', label='', labelSide='right',
                           lineHeight=1.5, linewidth=2, fontsize=9, rotation=90):
@@ -806,6 +855,38 @@ class timelinePlot:
         """Set the plot title."""
         self.ax.set_title(title, fontsize=fontsize, fontweight='bold')
     
+    def addLegend(self, items, location='upper right', fontsize=10):
+        """
+        Add a legend with colored text labels (no symbols).
+        
+        Args:
+            items (list): List of dicts with 'label' and 'color' keys
+                         Example: [{'label': 'Keypress', 'color': 'red'}, ...]
+            location (str): Legend location ('upper right', 'upper left', 'lower right', 'lower left', etc.)
+            fontsize (int): Font size for legend text
+        """
+        from matplotlib.lines import Line2D
+        
+        # Create dummy line objects with the colors
+        handles = []
+        labels = []
+        
+        for item in items:
+            # Create invisible line with the desired color
+            handle = Line2D([0], [0], marker='', linestyle='', 
+                          markersize=0, color=item['color'])
+            handles.append(handle)
+            labels.append(item['label'])
+        
+        # Create legend
+        legend = self.ax.legend(handles, labels, loc=location, 
+                               fontsize=fontsize, framealpha=0.9,
+                               handlelength=0, handletextpad=0.5,
+                               labelcolor='linecolor')  # KEY: Use line color for labels
+        
+        # Make text bold (optional)
+        for text in legend.get_texts():
+            text.set_weight('bold') 
     def show(self):
         """Display the plot."""
         plt.tight_layout()
