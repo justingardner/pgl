@@ -434,7 +434,6 @@ class pglTask:
             else random.uniform(min_val, max_val)
             for min_val, max_val in zip(self.settings.segmin, self.settings.segmax)
         ]
-        print("seglen: ",[f"{x:.2g}" for x in self._thisTrialSeglen])
 
         # print trial
         print(f"({self.settings.taskName}) Trial {self.currentTrial+1}: ", end='')
@@ -442,7 +441,6 @@ class pglTask:
         # and variable settings
         for name,value in self.currentParams.items():
             print(f'{name}={value}', end=' ')
-        print()
 
     def addParameter(self, param):
         '''
