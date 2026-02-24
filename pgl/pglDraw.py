@@ -533,7 +533,7 @@ class pglDraw:
 
         # get vertex data
         vertexData = [x, y, 0, *color, innerRadius, outerRadius, innerRadius, outerRadius, startAngle, stopAngle, borderSize]
-        print(np.array(vertexData, dtype=np.double))
+        
         # send arc command
         self.s.writeCommand("mglArcs")
         ack = self.s.readAck()
