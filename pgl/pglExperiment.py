@@ -784,7 +784,7 @@ class pglTaskData(pglSerialize):
     events: ListType[pglEvent] = field(default_factory=list) 
     params: ListType[dict] = field(default_factory=list)
     
-    def display(self, taskName="task", responseMapping={True:('c','green'), False:('i','red')}):
+    def display(self, taskName="task", responseMapping={True:('Correct','green'), False:('Incorrect','red')}):
         '''
         Display the experiment data.
         '''
@@ -802,20 +802,28 @@ class pglTaskData(pglSerialize):
         
         # for each event, add to timeline
         trialStart = None
+        gotResponse = False
         for event in self.events:
             # if we find a new trial event, reset the beginning time
             if isinstance(event, pglEventTrial):
                 trialStart = event.timestamp
             elif trialStart is not None:
                 # display segment events
-                if isinstance(event, pglEventSegment):
+                if isinstance(event, pglEventSegment) and event.boundary == pglEventSegment.boundaryType.START.value:
                     timeline.addTriangleMarker(time=event.timestamp - trialStart, color='blue', label=f'{event.segmentNum}', direction='up')
                 # display subject response events
                 elif isinstance(event, pglEventSubjectResponse):
+                    gotResponse = True
                     label, color = responseMapping.get(event.responseType, ('?', 'gray'))
-                    timeline.addTriangleMarker(time=event.timestamp - trialStart, color=color, label=label, direction='down')   
+                    timeline.addTriangleMarker(time=event.timestamp - trialStart, color=color, label=label[0], direction='down')   
         timeline.setTitle(f"{taskName}: Trial Events")
-        timeline.addLegend([{'label': 'Segment', 'color': 'blue'},{'label': 'Correct response', 'color': 'green'},{'label': 'Incorrect response', 'color': 'red'}])
+        # display legend
+        legend = [{'label': 'Segment', 'color': 'blue'}]
+        # add the response values
+        if gotResponse:
+            for respType, (label, color) in responseMapping.items():
+                legend.append({'label': label, 'color': color})
+        timeline.addLegend(legend)
         timeline.show()
 
 
