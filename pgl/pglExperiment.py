@@ -354,7 +354,14 @@ class pglExperiment(pglSettingsManager):
         '''
         Display a timeline of experiment events.
         '''
+        # display experiment data
         self.data.display(self)
+        
+        # display task data
+        for phaseTasks in self.task:
+            for task in phaseTasks:
+                task.display()   
+
     
 ##############################################
 # Task class
@@ -561,6 +568,12 @@ class pglTask:
         Load the task data.
         '''
         pass
+
+    def display(self):
+        '''
+        Display the task data
+        '''
+        self.data.display(self.settings.taskName)
 
 ##############################################
 # test task for testing settings
@@ -770,6 +783,41 @@ class pglTaskData(pglSerialize):
     endTime: float = 0.0
     events: ListType[pglEvent] = field(default_factory=list) 
     params: ListType[dict] = field(default_factory=list)
+    
+    def display(self, taskName="task", responseMapping={True:('c','green'), False:('i','red')}):
+        '''
+        Display the experiment data.
+        '''
+        # get trial timestamps
+        trialTimestamps = np.array([e.timestamp for e in self.events if isinstance(e, pglEventTrial)])
+        if len(trialTimestamps) == 0:
+            print("(pglTaskData:display) No trial events found to display.")
+            return
+        
+        # get the max trial length
+        maxTrialLength = np.diff(trialTimestamps).max()
+        
+        # init timeline
+        timeline = timelinePlot(startTime=0, endTime=maxTrialLength)
+        
+        # for each event, add to timeline
+        trialStart = None
+        for event in self.events:
+            # if we find a new trial event, reset the beginning time
+            if isinstance(event, pglEventTrial):
+                trialStart = event.timestamp
+            elif trialStart is not None:
+                # display segment events
+                if isinstance(event, pglEventSegment):
+                    timeline.addTriangleMarker(time=event.timestamp - trialStart, color='blue', label=f'{event.segmentNum}', direction='up')
+                # display subject response events
+                elif isinstance(event, pglEventSubjectResponse):
+                    label, color = responseMapping.get(event.responseType, ('?', 'gray'))
+                    timeline.addTriangleMarker(time=event.timestamp - trialStart, color=color, label=label, direction='down')   
+        timeline.setTitle(f"{taskName}: Trial Events")
+        timeline.addLegend([{'label': 'Segment', 'color': 'blue'},{'label': 'Correct response', 'color': 'green'},{'label': 'Incorrect response', 'color': 'red'}])
+        timeline.show()
+
 
 ##############################################
 # timelinePlot
