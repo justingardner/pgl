@@ -24,7 +24,7 @@ from IPython.display import display, HTML
 from .pglBase import pglDisplayMessage
 from traitlets import Float, TraitError, TraitError, observe, Instance, Int, Unicode, Dict, validate, Bool
 from .pglParameter import pglParameter, pglParameterBlock
-from .pglEvent import pglEvent
+from .pglEvent import pglEvent, pglEventTrial, pglEventSegment
 from .pglSerialize import pglSerialize
 from typing import List as ListType
 from traitlets import List
@@ -261,6 +261,8 @@ class pglExperiment(pglSettingsManager):
             # see if we have a match to endKey
             if [e for e in events if e.type == "keyboard" and e.keyChar in self.settings.endKey]:
                 self.state.experimentDone = True
+                # end all running tasks
+                for task in self.task[self.state.currentPhase]: task.end()
                 continue
 
             # Check for volume trigger key
@@ -284,6 +286,8 @@ class pglExperiment(pglSettingsManager):
 
             # go to next phase or end experiment
             if phaseDone:
+                # end all tasks in current phase
+                for task in self.task[self.state.currentPhase]: task.end()
                 # update phase
                 self.state.currentPhase += 1
                 # check if we have ended all phases
@@ -292,8 +296,12 @@ class pglExperiment(pglSettingsManager):
                 else:
                     self.startPhase()
         
+        # mark end time
         self.data.endTime = self.pgl.getSecs()
         print("(pglExperiment:run) Experiment done.")
+        
+        # save data
+        self.save()
         
         # close screen
         self.endScreen()
@@ -335,7 +343,8 @@ class pglExperiment(pglSettingsManager):
         # save each task
         for phaseTasks in self.task:
             for task in phaseTasks:
-                task.save(dataDir)        
+                task.save(dataDir)   
+                     
     def load(self):
         '''
         Load the experiment settings, state and data.         
@@ -366,6 +375,7 @@ class pglTask:
         self.pgl = pgl
         self.settings = pglTaskSettings()
         self.state = pglTaskState()
+        self.data = pglTaskData()
         
         # default seglen
         self.settings.seglen = [1.0]
@@ -380,10 +390,10 @@ class pglTask:
         Start the task.
         '''
         # set task start time
-        self.taskStartTime = startTime
+        self.data.startTime = startTime
         
         # start trial
-        self.currentTrial = -1
+        self.state.currentTrial = -1
         self.startTrial(startTime)
         
     def startSegment(self, updateTime):
@@ -396,8 +406,10 @@ class pglTask:
         if self.state.currentSegment >=0 and self._thisTrialSeglen[self.state.currentSegment] == 0:
             self._thisTrialSeglen[self.state.currentSegment] = updateTime - self.segmentStartTime
 
+        # update to next segment
         self.state.currentSegment += 1
         self.segmentStartTime = updateTime
+        self.data.events.append(pglEventSegment(self.state.currentSegment, updateTime))
         
         # default to false, this will get reset
         # at end of segment clock if set for this segment
@@ -414,13 +426,14 @@ class pglTask:
         Start a trial.
         '''
         # update values
-        self.currentTrial += 1
-        self.trialStartTime = startTime
+        self.state.currentTrial += 1
+        self.data.events.append(pglEventTrial(self.state.currentTrial, startTime))
         
         # get current parameters
-        self.currentParams = {}
+        self.data.params.append({})
+        self.currentParams = self.data.params[-1]
         for parameter in self.settings.parameters: 
-            self.currentParams.update(parameter.get())
+            self.data.params[-1].update(parameter.get())
 
         # start segment (startSegment will update currentSegment to 0)
         self.state.currentSegment = -1
@@ -436,11 +449,11 @@ class pglTask:
         ]
 
         # print trial
-        print(f"({self.settings.taskName}) Trial {self.currentTrial+1}: ", end='')
+        print(f"({self.settings.taskName}) Trial {self.state.currentTrial+1}: ", end='')
         
         # and variable settings
-        for name,value in self.currentParams.items():
-            print(f'{name}={value}', end=' ')
+        #for name,value in self.data.params[-1].items():
+        #    print(f'{name}={value}', end=' ')
 
     def addParameter(self, param):
         '''
@@ -476,6 +489,9 @@ class pglTask:
         
         # if there are responses, call response callback
         if subjectResponse is not []:
+            # save the events as responses
+            self.data.events.extend(subjectResponse)
+            # call the subject response handler
             self.handleSubjectResponse(subjectResponse, updateTime)
 
     def handleSubjectResponse(self, responses, updateTime):
@@ -495,14 +511,29 @@ class pglTask:
         '''
         Check if the task is done.
         '''
-        return self.currentTrial >= self.settings.nTrials
+        # check if we are done
+        taskDone = self.state.currentTrial >= self.settings.nTrials
+        if taskDone: self.end()
+        return taskDone
+
+    def end(self):
+        '''
+        end of task
+        '''
+        # record end time
+        endTime = self.pgl.getSecs()
+        self.data.endTime = endTime
+        
+        # put in time stamps for end of last segment and trial
+        self.data.events.append(pglEventSegment(self.state.currentSegment, endTime, boundary=pglEventSegment.boundaryType.END))
+        self.data.events.append(pglEventTrial(self.state.currentTrial, endTime, boundary=pglEventTrial.boundaryType.END))
 
     def jumpSegment(self):
         '''
         Jump to the next segment.
         '''
         # set current segment length to 0 to force jump
-        self._thisTrialSeglen[self.currentSegment] = 0
+        self._thisTrialSeglen[self.state.currentSegment] = 0
     
     def save(self, dataDir):
         '''
@@ -515,8 +546,9 @@ class pglTask:
             print(f"(pglTask:save) ❌ Could not create task data directory {dataDir}: {e}")
             return
         
-        print(f"(pglTask:save) Saving task data to: {dataDir}")
         self.settings.save(dataDir / "settings.json")
+        self.state.save(dataDir / "state.json")
+        self.data.save(dataDir / "data.json")
 
     def load(self):
         '''
@@ -720,7 +752,18 @@ class pglTaskSettings(pglSettingsEditable):
 ##############################################
 @dataclass
 class pglTaskState(pglSerialize):
+    currentTrial: int = 0
     currentSegment: int = 0
+
+##############################################
+# State for pglTask
+##############################################
+@dataclass
+class pglTaskData(pglSerialize):
+    startTime: float = 0.0
+    endTime: float = 0.0
+    events: ListType[pglEvent] = field(default_factory=list) 
+    params: ListType[dict] = field(default_factory=list)
 
 ##############################################
 # timelinePlot

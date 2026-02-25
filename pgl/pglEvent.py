@@ -12,6 +12,7 @@
 from .pglSerialize import pglSerialize
 from dataclasses import dataclass, field
 from typing import List, Optional
+from enum import Enum
 
 #################################################################
 # Parent class for events
@@ -107,3 +108,53 @@ class pglEvents():
                     if hasattr(event, 'id') and event.id in waitForList:
                         return event
             self.waitSecs(0.01)
+            
+#################################################################
+# Events that specify trial timing
+#################################################################
+class pglEventTrial(pglEvent):
+
+    class boundaryType(Enum):
+        START = 'start'
+        END = 'end'
+
+    def __init__(self, trialNum=None, timestamp=None, boundary=None):
+        super().__init__(type="pglEventTrial")
+
+        # handle default
+        if boundary is None:
+            boundary = self.boundaryType.START
+            
+        # set attributes
+        self.trialNum = trialNum
+        self.timestamp = timestamp
+        self.boundary = boundary.value
+
+    def print(self):
+        print(f"(pglEventTrial) Trial {self.boundary} at: {self.timestamp}")
+        
+#################################################################
+# Events that specify segment timing
+#################################################################
+class pglEventSegment(pglEvent):
+
+    class boundaryType(Enum):
+        START = 'start'
+        END = 'end'
+
+    def __init__(self, segmentNum = None, timestamp=None, boundary=None):
+        super().__init__(type="pglEventSegment")
+
+        # handle default
+        if boundary is None:
+            boundary = self.boundaryType.START
+        
+        # set attributes
+        self.segmentNum = segmentNum
+        self.boundary = boundary.value
+        self.timestamp = timestamp
+
+    def print(self):
+        print(f"(pglEventSegment) Segment {self.boundary} at: {self.timestamp}")
+        
+

@@ -31,7 +31,6 @@ class pglSerialize:
             filename = Path(filename).with_suffix(".json")
             with open(filename, 'w') as f:
                 f.write(self.toJSON())
-            print(f"(pglSerialize) Successfully saved to '{filename}'")
         except PermissionError:
             print(f"(pglSerialize) No permission to write to '{filename}'")
         except IsADirectoryError:
