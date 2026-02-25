@@ -24,7 +24,7 @@ from IPython.display import display, HTML
 from .pglBase import pglDisplayMessage
 from traitlets import Float, TraitError, TraitError, observe, Instance, Int, Unicode, Dict, validate, Bool
 from .pglParameter import pglParameter, pglParameterBlock
-from .pglEvent import pglEvent, pglEventTrial, pglEventSegment
+from .pglEvent import pglEvent
 from .pglSerialize import pglSerialize
 from typing import List as ListType
 from traitlets import List
@@ -32,6 +32,7 @@ from matplotlib import pyplot as plt
 import matplotlib.patches as patches
 from matplotlib.lines import Line2D
 import numpy as np
+from enum import Enum
 
 ##############################################s
 # Experiment class
@@ -489,18 +490,23 @@ class pglTask:
         
         # if there are responses, call response callback
         if subjectResponse is not []:
-            # save the events as responses
-            self.data.events.extend(subjectResponse)
             # call the subject response handler
-            self.handleSubjectResponse(subjectResponse, updateTime)
+            responseType = self.handleSubjectResponse(subjectResponse, updateTime)
+            # save as an event if responseType is not None
+            # responseType can be used to specify different types of responsees
+            # and is defined by the subclass
+            if responseType is not None:
+                self.data.events.append(pglEventSubjectResponse(response=subjectResponse, timestamp=updateTime, responseType=responseType))
+                
 
-    def handleSubjectResponse(self, responses, updateTime):
+    def handleSubjectResponse(self, responses, updateTime) -> None:
         '''
-        Handle subject responses.
+        Handle subject responses. To handle subject responses, override this method
+        If you provide a return value (e.g. 1 or 0, or 'correct'/'incorrect'), then
+        that value will be stored in the pglEventSubjectResponse event.
         '''
-        for response in responses:
-            print(f"(pglExperiment) Subject response received: {response} at {updateTime}")
-
+        pass
+    
     def updateScreen(self):
         '''
         Update the screen.
@@ -971,3 +977,65 @@ class timelinePlot:
     def getMarkers(self):
         """Return list of all markers added."""
         return self.markers
+
+#################################################################
+# Events that specify trial timing
+#################################################################
+class pglEventTrial(pglEvent):
+
+    class boundaryType(Enum):
+        START = 'start'
+        END = 'end'
+
+    def __init__(self, trialNum=None, timestamp=None, boundary=None):
+        super().__init__(type="pglEventTrial")
+
+        # handle default
+        if boundary is None:
+            boundary = self.boundaryType.START
+            
+        # set attributes
+        self.trialNum = trialNum
+        self.timestamp = timestamp
+        self.boundary = boundary.value
+
+    def print(self):
+        print(f"(pglEventTrial) Trial {self.boundary} at: {self.timestamp}")
+        
+#################################################################
+# Events that specify segment timing
+#################################################################
+class pglEventSegment(pglEvent):
+
+    class boundaryType(Enum):
+        START = 'start'
+        END = 'end'
+
+    def __init__(self, segmentNum = None, timestamp=None, boundary=None):
+        super().__init__(type="pglEventSegment")
+
+        # handle default
+        if boundary is None:
+            boundary = self.boundaryType.START
+        
+        # set attributes
+        self.segmentNum = segmentNum
+        self.boundary = boundary.value
+        self.timestamp = timestamp
+
+    def print(self):
+        print(f"(pglEventSegment) Segment {self.boundary} at: {self.timestamp}")
+        
+
+#################################################################
+# Events that specify subject response
+#################################################################
+class pglEventSubjectResponse(pglEvent):
+    
+    def __init__(self, response=None, timestamp=None, responseType=None):
+        super().__init__(type="pglEventSubjectResponse")
+        
+        # set attributes
+        self.response = response
+        self.timestamp = timestamp
+        self.responseType = responseType
