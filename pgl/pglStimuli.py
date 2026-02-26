@@ -1241,6 +1241,20 @@ class pglStimulusMovie(_pglStimulus):
         # set the display position
         self.setDisplayPosition(x, y, displayWidth, displayHeight, xAlign, yAlign)
 
+    def delete(self):
+        '''
+        delete the movie stimulus
+        '''
+        if self.movieNum is None:
+            print(f"(pglStimulusMovie:setDisplayPosition) ❌ Movie has been deleted")
+            return False
+        self.pgl.s.writeCommand("mglMovieDelete")
+        ackTime = self.pgl.s.readAck()
+        self.pgl.s.write(np.uint32(self.movieNum))
+        success = self.pgl.s.read(np.float64)
+        self.commandResults = self.pgl.s.readCommandResults(ackTime)
+        self.movieNum = None
+        return success
 
     def __repr__(self):
         return f"<pglStimulusMovie: {self.filename} {self.width}x{self.height}pix, duration={self.duration}s, {self.frameRate}fps, totalFrames={self.totalFrames}>"
@@ -1259,6 +1273,9 @@ class pglStimulusMovie(_pglStimulus):
         -  xAlign: xAlginment (-1 left, 0 center, 1 right: default = 0)
         -  yAlign: xAlginment (-1 top, 0 center, 1 bottom: default = 0)
         '''
+        if self.movieNum is None:
+            print(f"(pglStimulusMovie:setDisplayPosition) ❌ Movie has been deleted")
+            return False
         # handle width and height defaults
         if displayWidth == 0 and displayHeight == 0:
             # no width or height, maximize to fill screen
@@ -1324,6 +1341,10 @@ class pglStimulusMovie(_pglStimulus):
         play the Movie.
         
         '''
+        if self.movieNum is None:
+            print(f"(pglStimulusMovie:setDisplayPosition) ❌ Movie has been deleted")
+            return False
+
         self.pgl.s.writeCommand("mglMoviePlay")
         ackTime = self.pgl.s.readAck()
         self.pgl.s.write(np.uint32(self.movieNum))
@@ -1487,6 +1508,10 @@ class pglStimulusMovie(_pglStimulus):
         '''
         draw the current frame of the movie (requires a pgl.flush() to display).
         '''
+        if self.movieNum is None:
+            print(f"(pglStimulusMovie:setDisplayPosition) ❌ Movie has been deleted")
+            return False
+
         self.pgl.s.writeCommand("mglMovieDrawFrame")
         ackTime = self.pgl.s.readAck()
         self.pgl.s.write(np.uint32(self.movieNum))
@@ -1502,6 +1527,10 @@ class pglStimulusMovie(_pglStimulus):
         get the status of the Movie.
         
         '''
+        if self.movieNum is None:
+            print(f"(pglStimulusMovie:setDisplayPosition) ❌ Movie has been deleted")
+            return False
+
         self.pgl.s.writeCommand("mglMovieStatus")
         ackTime = self.pgl.s.readAck()
         self.pgl.s.write(np.uint32(self.movieNum))
