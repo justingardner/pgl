@@ -10,19 +10,19 @@
 		</data>
 		<key>Resources/Assets.car</key>
 		<data>
-		RTw0kCLyLQBf59aK3O7VKVhIboc=
+		DQJ6KQWvxkiwnH/sATD2+AbHJR8=
 		</data>
 		<key>Resources/Base.lproj/Main.storyboardc/Info.plist</key>
 		<data>
-		WipXp9dNgOAttVyKWhaIaZ89UMw=
+		3aSRLFI61s8Ci+zS8zn6J3J5h5w=
 		</data>
 		<key>Resources/Base.lproj/Main.storyboardc/MainMenu.nib</key>
 		<data>
-		8vT+La07WQu5YGDsh8SG5xPr56g=
+		AiKM+Rl4ZdDnY/WgihQjP2yFD/c=
 		</data>
 		<key>Resources/Base.lproj/Main.storyboardc/NSWindowController-B8D-0N-5wS.nib</key>
 		<data>
-		hvktWAXnDP7LowVZnqxCUqodimM=
+		OkPaxj4d+t33OXJibQ2CjoWmbwc=
 		</data>
 		<key>Resources/Base.lproj/Main.storyboardc/XfG-lQ-9wD-view-m2S-Jp-Qdl.nib</key>
 		<data>
@@ -30,7 +30,11 @@
 		</data>
 		<key>Resources/default.metallib</key>
 		<data>
-		MO+mZ+DY7FwXwz8qCuzt4WEq+VI=
+		zsr/7zA7ahehklt3n2wWGK7ou1g=
+		</data>
+		<key>Resources/shibuya.mp4</key>
+		<data>
+		ZpWFrkfSi16QZKKBXJ3WipcnjvA=
 		</data>
 	</dict>
 	<key>files2</key>
@@ -39,19 +43,19 @@
 		<dict>
 			<key>cdhash</key>
 			<data>
-			yMo7oeNR/HyedcoCtY+ntUmex/I=
+			dvoPcUR05p6+1Gi9INUwcR6PRCM=
 			</data>
 			<key>requirement</key>
-			<string>cdhash H"c8ca3ba1e351fc7c9e75ca02b58fa7b5499ec7f2"</string>
+			<string>cdhash H"76fa0f714474e69ebed468bd20d530711e8f4423"</string>
 		</dict>
 		<key>MacOS/mglMetal.debug.dylib</key>
 		<dict>
 			<key>cdhash</key>
 			<data>
-			qHg1UI6YiUT8GwlPwZz+m0IcPJA=
+			IVNo+zS+N09HN9Vj8JYbVpwrKuo=
 			</data>
 			<key>requirement</key>
-			<string>cdhash H"a87835508e988944fc1b094fc19cfe9b421c3c90"</string>
+			<string>cdhash H"215368fb34be374f4737d563f0961b569c2b2aea"</string>
 		</dict>
 		<key>Resources/AppIcon.icns</key>
 		<dict>
@@ -64,28 +68,28 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			Gi3VxcdhECgP7nmM8xpfalMHYXd5leugH5zCJiJA1ks=
+			o4p1jFj2HrEMgSfic++ZuNJfMx10oRRFxX3Olg8Q2jE=
 			</data>
 		</dict>
 		<key>Resources/Base.lproj/Main.storyboardc/Info.plist</key>
 		<dict>
 			<key>hash2</key>
 			<data>
-			Cuhf8Uj7hSfzQmsnJORkXXvcERPr/jxZI68iv6OPsRI=
+			QFgQvqywTMfFS9MyG0E/p/IfSsS29ibIiGYeWX7wKGE=
 			</data>
 		</dict>
 		<key>Resources/Base.lproj/Main.storyboardc/MainMenu.nib</key>
 		<dict>
 			<key>hash2</key>
 			<data>
-			7xekhWNigMe17vwuQoA1nIpuVfLKyKqrRLxa5IHi/Vg=
+			H649b3Ee4CYtnJogfZzgv1Sue2TPvSrIo5b/SLWPJ0o=
 			</data>
 		</dict>
 		<key>Resources/Base.lproj/Main.storyboardc/NSWindowController-B8D-0N-5wS.nib</key>
 		<dict>
 			<key>hash2</key>
 			<data>
-			z2gxgAQrD0lXLdHSG88Vv/R6UzQ91xrvpIARSrHNzCY=
+			nKyxHq/LpysiYxD3gvRGN/leKLaH2q17Q15Wf8BxZNM=
 			</data>
 		</dict>
 		<key>Resources/Base.lproj/Main.storyboardc/XfG-lQ-9wD-view-m2S-Jp-Qdl.nib</key>
@@ -99,7 +103,14 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			l32e1rg8zD5P+SZXK617TsAE62F9Z6reNDdUiDg+K0o=
+			m7IvEdu2VVmlKADAfZzwwMJy79HrTu1dO4py5QpPOBU=
+			</data>
+		</dict>
+		<key>Resources/shibuya.mp4</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			NvHPtIlBww5PGBst++ce3e0ujDzd69mAOqXGXg7c5UM=
 			</data>
 		</dict>
 	</dict>
