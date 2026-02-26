@@ -14,15 +14,15 @@
 		</data>
 		<key>Resources/Base.lproj/Main.storyboardc/Info.plist</key>
 		<data>
-		3aSRLFI61s8Ci+zS8zn6J3J5h5w=
+		4VLDQs0oEHmykBjihe69sFK96i4=
 		</data>
 		<key>Resources/Base.lproj/Main.storyboardc/MainMenu.nib</key>
 		<data>
-		AiKM+Rl4ZdDnY/WgihQjP2yFD/c=
+		Jit1EupxtAqf/H2caoaW3ldG83k=
 		</data>
 		<key>Resources/Base.lproj/Main.storyboardc/NSWindowController-B8D-0N-5wS.nib</key>
 		<data>
-		OkPaxj4d+t33OXJibQ2CjoWmbwc=
+		cL52PMxoo6CXaah7GXe+2XZK/TA=
 		</data>
 		<key>Resources/Base.lproj/Main.storyboardc/XfG-lQ-9wD-view-m2S-Jp-Qdl.nib</key>
 		<data>
@@ -30,7 +30,7 @@
 		</data>
 		<key>Resources/default.metallib</key>
 		<data>
-		zsr/7zA7ahehklt3n2wWGK7ou1g=
+		tIDaN7O/CMVT59WdHyzl6teEmWE=
 		</data>
 		<key>Resources/shibuya.mp4</key>
 		<data>
@@ -39,24 +39,6 @@
 	</dict>
 	<key>files2</key>
 	<dict>
-		<key>MacOS/__preview.dylib</key>
-		<dict>
-			<key>cdhash</key>
-			<data>
-			dvoPcUR05p6+1Gi9INUwcR6PRCM=
-			</data>
-			<key>requirement</key>
-			<string>cdhash H"76fa0f714474e69ebed468bd20d530711e8f4423"</string>
-		</dict>
-		<key>MacOS/mglMetal.debug.dylib</key>
-		<dict>
-			<key>cdhash</key>
-			<data>
-			IVNo+zS+N09HN9Vj8JYbVpwrKuo=
-			</data>
-			<key>requirement</key>
-			<string>cdhash H"215368fb34be374f4737d563f0961b569c2b2aea"</string>
-		</dict>
 		<key>Resources/AppIcon.icns</key>
 		<dict>
 			<key>hash2</key>
@@ -75,21 +57,21 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			QFgQvqywTMfFS9MyG0E/p/IfSsS29ibIiGYeWX7wKGE=
+			gDok8j7bb10VjWEjOdVB4Oz7jujgBXAIRkBcvcaqWQs=
 			</data>
 		</dict>
 		<key>Resources/Base.lproj/Main.storyboardc/MainMenu.nib</key>
 		<dict>
 			<key>hash2</key>
 			<data>
-			H649b3Ee4CYtnJogfZzgv1Sue2TPvSrIo5b/SLWPJ0o=
+			7quAbWNdVyWUbtadLVNOoo20TCVpRdRPZynPPRHt17c=
 			</data>
 		</dict>
 		<key>Resources/Base.lproj/Main.storyboardc/NSWindowController-B8D-0N-5wS.nib</key>
 		<dict>
 			<key>hash2</key>
 			<data>
-			nKyxHq/LpysiYxD3gvRGN/leKLaH2q17Q15Wf8BxZNM=
+			LxjAUx523BiCgrV0emBBtfKSILq6OLgNptptvoMOmX0=
 			</data>
 		</dict>
 		<key>Resources/Base.lproj/Main.storyboardc/XfG-lQ-9wD-view-m2S-Jp-Qdl.nib</key>
@@ -103,7 +85,7 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			m7IvEdu2VVmlKADAfZzwwMJy79HrTu1dO4py5QpPOBU=
+			eAMLBTrWPKYEZWYUVm2ZqKhIn/fpHLOeFVYag7qPazc=
 			</data>
 		</dict>
 		<key>Resources/shibuya.mp4</key>
