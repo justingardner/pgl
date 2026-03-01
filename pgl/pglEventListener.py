@@ -42,10 +42,12 @@ class pglEventListener:
         self._keyStatus: Dict[int, float] = {}  # keyCode -> last press time
         self._lock = threading.Lock()
         self._running = False
-        self._eatKeys: Set[int] = set()
         
         self._lastEscTime = 0.0
         self.DOUBLE_PRESS_WINDOW = 0.5
+        
+        # set this to prevent all keys from passing through to other applications
+        self.eatAllKeys = False
 
         # Register cleanup
         atexit.register(self.stop)
@@ -87,19 +89,20 @@ class pglEventListener:
         """Check if listener is currently running."""
         return _pglEventListener.isRunning()
     
-    def _eventCallback(self, event: Dict) -> None:
+    def _eventCallback(self, event: Dict) -> bool:
         """
         Internal callback called from C extension.
         Runs in separate thread - must be thread-safe!
         """
         eventType = event.get('eventType', '')
         
-        # handle ESC key for failsafe shutdown
-        if eventType == 'keydown' and event.get('keyCode') == 53:
-            self._handleEscPress()
-            return
-        
         with self._lock:
+            returnValue = False
+            # handle ESC key for failsafe shutdown
+            if eventType == 'keydown' and event.get('keyCode') == 53:
+                self._handleEscPress()
+                return returnValue
+        
             if eventType in ('keydown', 'keyup'):
                 keyCode = event['keyCode']
                 
@@ -109,12 +112,15 @@ class pglEventListener:
                 else:  # keyup
                     self._keyStatus.pop(keyCode, None)
                 
-                # Check if we should eat this key
-                if keyCode not in self._eatKeys:
-                    self._keyboardQueue.append(event)
+                # add to keyboard queue
+                self._keyboardQueue.append(event)
+                returnValue = self.eatAllKeys
                 
             elif 'mouse' in eventType:
                 self._mouseQueue.append(event)
+        # returning False indicates that the event should be passed through
+        # unless it is an eat key (which is handled in the c-code)
+        return returnValue
     
     def _handleEscPress(self) -> None:
         """

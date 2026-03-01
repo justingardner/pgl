@@ -23,6 +23,7 @@ static pthread_mutex_t eatKeysMutex;
 static int eatKeys[MAX_EAT_KEYS];
 static int numEatKeys = 0;
 
+
 // Forward declarations
 static void* eventLoopThread(void* arg);
 static CGEventRef eventCallback(CGEventTapProxy proxy, CGEventType type, 
@@ -334,6 +335,10 @@ static CGEventRef eventCallback(CGEventTapProxy proxy, CGEventType type,
     if (result == NULL) {
         PyErr_Print();
     } else {
+        // If callback returns True, eat the event
+        if (PyBool_Check(result) && (result == Py_True)) returnEvent = NULL;
+
+        // Decrement reference count for result
         Py_DECREF(result);
     }
     

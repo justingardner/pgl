@@ -186,6 +186,16 @@ class pglExperiment(pglSettingsManager):
             self.pgl.close()
             self.state.openScreen = False
 
+    def eatAllKeys(self, eat=False):
+        '''
+        Args: 
+            eat: bool (whether to eat all keys or not)
+        '''
+        keyboardDevices = self.pgl.devicesGet(pglKeyboardMouse)
+        if keyboardDevices is not []:
+            for keyboardDevice in keyboardDevices:
+                keyboardDevice.listener.eatAllKeys = eat
+
     def addTask(self, task, phaseNum = None):
         '''
         Add a task to the experiment.
@@ -203,8 +213,9 @@ class pglExperiment(pglSettingsManager):
         if phaseNum == len(self.task):
             self.task.append([])
 
-        # give it a reference to pgl
+        # give it a reference to pgl and experiment
         task.pgl = self.pgl
+        task.e = self
 
         # add the task
         self.task[phaseNum].append(task)
@@ -278,7 +289,7 @@ class pglExperiment(pglSettingsManager):
             updateTime = self.pgl.getSecs()
             for task in self.task[self.state.currentPhase]:
                 # update task
-                task.update(updateTime=updateTime, subjectResponse=subjectResponse, phaseNum=self.state.currentPhase, tasks=self.task[self.state.currentPhase], experiment=self)
+                task.update(updateTime=updateTime, subjectResponse=subjectResponse, phaseNum=self.state.currentPhase, tasks=self.task[self.state.currentPhase])
                 # check if task is done
                 if task.done(): phaseDone = True
             
@@ -469,14 +480,13 @@ class pglTask:
         '''
         self.settings.parameters.append(param)
 
-    def update(self, updateTime, subjectResponse, phaseNum, tasks, experiment):
+    def update(self, updateTime, subjectResponse, phaseNum, tasks):
         '''
         Update the task.
         '''
         # store references
         self.phaseNum = phaseNum
         self.tasks = tasks
-        self.e = experiment
         
         # update the screen
         self.updateScreen()
@@ -511,6 +521,13 @@ class pglTask:
         Handle subject responses. To handle subject responses, override this method
         If you provide a return value (e.g. 1 or 0, or 'correct'/'incorrect'), then
         that value will be stored in the pglEventSubjectResponse event.
+        '''
+        pass
+    
+    def handleKeyboardEvents(self, keyboardEvents) -> None:
+        '''
+        Handle keyboard events. For subclasses that need to handle keyboard
+        events (for example to handle typing text), subclass this method.
         '''
         pass
     
