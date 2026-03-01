@@ -198,7 +198,7 @@ class pglImage:
             return
         
         # Delete texture
-        if self.verbose>=1: print(f"(pglImage:imageDelete) Deleting image {imageInstance.imageNum} ({imageInstance.width.pix}x{imageInstance.height.pix})")
+        if self.verbose>1: print(f"(pglImage:imageDelete) Deleting image {imageInstance.imageNum} ({imageInstance.width.pix}x{imageInstance.height.pix})")
         # send the deleteTexture command
         self.s.writeCommand("mglDeleteTexture")
         self.s.write(np.uint32(imageInstance.imageNum))

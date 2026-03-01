@@ -7,7 +7,8 @@ from .pglBatch import pglBatch
 from .pglImage import pglImage
 from .pglStimuli import pglStimuli
 from .pglTimestamp import pglTimestamp
-from .pglDevice import pglDevice, pglDevices, pglKeyboardMouse, pglEventKeyboard
+from .pglDevice import pglDevice, pglDevices
+from .pglKeyboardMouse import pglKeyboardMouse, pglEventKeyboard
 from .pglEvent import pglEvent, pglEvents
 from .pglCommandReplayer import pglCommandReplayer
 from .pglFrameGrab import pglFrameGrab
