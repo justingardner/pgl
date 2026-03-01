@@ -17,7 +17,7 @@ import random
 import math
 from datetime import datetime
 from dataclasses import dataclass, field
-from . import pglKeyboardMouse
+from .pglKeyboardMouse import pglKeyboardMouse
 from pathlib import Path
 from .pglSettings import pglSettingsManager, pglSettings, pglSettingsEditable
 from IPython.display import display, HTML
@@ -135,28 +135,27 @@ class pglExperiment(pglSettingsManager):
         else:
             # if no commas, then just make a list of characters
             self.responseKeysList = list(self.settings.responseKeys)
-
+            
+        # get keyCodes
+        self.state.responseKeyCodesList = [keyboardMouse.charToKeyCode(k) for k in self.responseKeysList]
+        self.state.startKeyCode = keyboardMouse.charToKeyCode(self.settings.startKey)
+        self.state.endKeyCode = keyboardMouse.charToKeyCode(self.settings.endKey)
+        self.state.volumeTriggerKeyCode = keyboardMouse.charToKeyCode(self.settings.volumeTriggerKey)
+        
         # if eatKeys is set, then compose a list of all keys as keyCodes
         if self.settings.eatKeys:
-            eatKeyCodes = []
-    
             # Collect all individual keys
-            allKeys = self.responseKeysList.copy()  # Start with response keys list
+            eatKeyCodes = self.state.responseKeyCodesList.copy()  # Start with response keys list
     
             # Add single keys if they exist
             if self.settings.startKey:
-                allKeys.append(self.settings.startKey)
+                eatKeyCodes.append(self.state.startKeyCode)
             if self.settings.endKey:
-                allKeys.append(self.settings.endKey)
+                eatKeyCodes.append(self.state.endKeyCode)
             if self.settings.volumeTriggerKey:
-                allKeys.append(self.settings.volumeTriggerKey)
+                eatKeyCodes.append(self.state.volumeTriggerKeyCode)
     
-            # Convert all to keycodes
-            for keyChar in allKeys:
-                keyCode = keyboardMouse.charToKeyCode(keyChar)
-                if keyCode is not None:
-                    eatKeyCodes.append(keyCode)
-    
+            # Register these as keys to be eaten
             keyboardMouse.setEatKeys(eatKeyCodes)
             
         # wait half a second for metal app to initialize
@@ -246,17 +245,17 @@ class pglExperiment(pglSettingsManager):
                 self.data.events.extend(events)
 
                 # see if we have a match to startKey
-                if [e for e in events if e.type == "keyboard" and e.keyChar in self.settings.startKey]:
+                if [e for e in events if e.type == "keyboard" and e.keyCode == self.state.startKeyCode]:
                     self.state.experimentStarted = True
                 
                 # if waiting to startOnVolumeTrigger, check for that key                
                 if self.settings.startOnVolumeTrigger:
-                    if [e for e in events if e.type == "keyboard" and e.keyChar in self.settings.volumeTriggerKey]:
+                    if [e for e in events if e.type == "keyboard" and e.keyCode == self.state.volumeTriggerKeyCode]:
                         self.state.experimentStarted = True
                         self.state.volumeNumber += 1
                 
                 # Check for end key to allow aborting before starting    
-                if [e for e in events if e.type == "keyboard" and e.keyChar in self.settings.endKey]:
+                if [e for e in events if e.type == "keyboard" and e.keyCode == self.state.endKeyCode]:
                     self.state.experimentStarted = True
                     self.state.experimentDone = True
 
@@ -271,25 +270,30 @@ class pglExperiment(pglSettingsManager):
             self.data.events.extend(events)
 
             # see if we have a match to endKey
-            if [e for e in events if e.type == "keyboard" and e.keyChar in self.settings.endKey]:
+            if [e for e in events if e.type == "keyboard" and e.keyCode == self.state.endKeyCode]:
                 self.state.experimentDone = True
                 # end all running tasks
                 for task in self.task[self.state.currentPhase]: task.end()
                 continue
 
             # Check for volume trigger key
-            if [e for e in events if e.type == "keyboard" and e.keyChar in self.settings.volumeTriggerKey and e.eventType == "keydown"]:    
-                self.state.volumeNumber += 1
+            for i, e in enumerate(events):
+                if e.type == "keyboard" and e.keyCode == self.state.volumeTriggerKeyCode and e.eventType == "keydown":
+                    # remove it from the events list 
+                    events.pop(i)
+                    # and update volumeNumber
+                    self.state.volumeNumber += 1
+                    break
 
             # grab any events that match the keyList and return their index within that list
-            subjectResponse = [keyIndex for e in events if e.type == "keyboard" and e.eventType == "keydown" and e.keyChar in self.responseKeysList for keyIndex in [self.responseKeysList.index(e.keyChar)]]
+            subjectResponse = [keyIndex for e in events if e.type == "keyboard" and e.eventType == "keydown" and e.keyCode in self.state.responseKeyCodesList for keyIndex in [self.state.responseKeyCodesList.index(e.keyCode)]]
 
             # update tasks in current phase
             phaseDone = False
             updateTime = self.pgl.getSecs()
             for task in self.task[self.state.currentPhase]:
                 # update task
-                task.update(updateTime=updateTime, subjectResponse=subjectResponse, phaseNum=self.state.currentPhase, tasks=self.task[self.state.currentPhase])
+                task.update(updateTime=updateTime, subjectResponse=subjectResponse, phaseNum=self.state.currentPhase, tasks=self.task[self.state.currentPhase], events=events)
                 # check if task is done
                 if task.done(): phaseDone = True
             
@@ -480,13 +484,16 @@ class pglTask:
         '''
         self.settings.parameters.append(param)
 
-    def update(self, updateTime, subjectResponse, phaseNum, tasks):
+    def update(self, updateTime, subjectResponse, phaseNum, tasks, events):
         '''
         Update the task.
         '''
         # store references
         self.phaseNum = phaseNum
         self.tasks = tasks
+        
+        # custom handling of events
+        self.handleEvents(events)
         
         # update the screen
         self.updateScreen()
@@ -524,9 +531,9 @@ class pglTask:
         '''
         pass
     
-    def handleKeyboardEvents(self, keyboardEvents) -> None:
+    def handleEvents(self, events) -> None:
         '''
-        Handle keyboard events. For subclasses that need to handle keyboard
+        Handle keyboard/mouse events. For subclasses that need to handle keyboard or mouse
         events (for example to handle typing text), subclass this method.
         '''
         pass
@@ -696,6 +703,10 @@ class pglExperimentState(pglSerialize):
     volumeNumber: int = 0
     experimentStarted: bool = False
     experimentDone: bool = False
+    responseKeyCodesList: ListType[int] = field(default_factory=list)
+    startKeyCode: int = 0
+    endKeyCode: int = 0
+    volumeTriggerKeyCode: int = 0
 
 ##############################################
 # Settings for pglTask
