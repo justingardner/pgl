@@ -563,3 +563,197 @@ class pglEventKeyboard(pglEvent):
         if self.alt: modifierStr += "Alt "
         if self.cmd: modifierStr += "Cmd "
         return f"(pglEventKeyboard) Key: {self.keyChar}, KeyCode: {self.keyCode}, Timestamp: {self.timestamp}, Modifiers: {modifierStr.strip()}, Event Type: {self.eventType}"
+
+
+######################################
+# Keyboard input buffer for text entry
+######################################
+class pglKeyBuffer:
+    def __init__(self):
+        self.buffer = ""
+        self.cursorPosition = 0
+        
+        # MacOS key codes
+        self.keyCodeMap = {
+            # Letters
+            0: 'a', 1: 's', 2: 'd', 3: 'f', 4: 'h', 5: 'g', 6: 'z', 7: 'x',
+            8: 'c', 9: 'v', 11: 'b', 12: 'q', 13: 'w', 14: 'e', 15: 'r',
+            16: 'y', 17: 't', 31: 'o', 32: 'u', 34: 'i', 35: 'p', 37: 'l',
+            38: 'j', 40: 'k', 45: 'n', 46: 'm',
+            
+            # Numbers
+            18: '1', 19: '2', 20: '3', 21: '4', 23: '5', 22: '6', 26: '7',
+            28: '8', 25: '9', 29: '0',
+            
+            # Special characters
+            27: '-', 24: '=', 33: '[', 30: ']', 41: ';', 39: "'", 42: '\\',
+            43: ',', 47: '.', 44: '/',
+            
+            # Space
+            49: ' ',
+            
+            # Keypad
+            65: '.', 67: '*', 69: '+', 75: '/', 78: '-', 81: '=',
+            82: '0', 83: '1', 84: '2', 85: '3', 86: '4', 87: '5',
+            88: '6', 89: '7', 91: '8', 92: '9',
+            
+            # Special keys (Return, Tab, etc.)
+            36: '\n',  # Return
+            76: '\n',  # Enter (keypad)
+            48: '\t',  # Tab
+        }
+        
+        # Shift-modified characters
+        self.shiftMap = {
+            '1': '!', '2': '@', '3': '#', '4': '$', '5': '%',
+            '6': '^', '7': '&', '8': '*', '9': '(', '0': ')',
+            '-': '_', '=': '+', '[': '{', ']': '}', '\\': '|',
+            ';': ':', "'": '"', ',': '<', '.': '>', '/': '?',
+        }
+        
+        # Special function key codes
+        self.deleteKey = 51        # Backspace
+        self.forwardDeleteKey = 117 # Delete (forward)
+        self.leftArrowKey = 123
+        self.rightArrowKey = 124
+        self.upArrowKey = 126
+        self.downArrowKey = 125
+        self.homeKey = 115
+        self.endKey = 119
+        
+    def processEvent(self, event):
+        """
+        Process a keyboard event
+        """
+        modifiers = {'shift': event.shift, 'command': event.cmd, 'option': event.alt}
+        self.processKeyCode(event.keyCode, modifiers)
+        
+    def processKeyCode(self, keyCode, modifiers=None):
+        """
+        Process a key code and update the buffer.
+        
+        Args:
+            keyCode: The MacOS key code
+            modifiers: Optional dict with modifier states (shift, command, etc.)
+        
+        Returns:
+            bool: True if buffer was modified, False otherwise
+        """
+        if modifiers is None:
+            modifiers = {'shift': False, 'command': False, 'option': False}
+        
+        # Handle special editing keys
+        if keyCode == self.deleteKey:
+            return self.backspace()
+        elif keyCode == self.forwardDeleteKey:
+            return self.delete()
+        elif keyCode == self.leftArrowKey:
+            return self.moveCursorLeft(modifiers.get('command', False))
+        elif keyCode == self.rightArrowKey:
+            return self.moveCursorRight(modifiers.get('command', False))
+        elif keyCode == self.homeKey:
+            return self.moveCursorToStart()
+        elif keyCode == self.endKey:
+            return self.moveCursorToEnd()
+        
+        # Handle regular character input
+        elif keyCode in self.keyCodeMap:
+            char = self.keyCodeMap[keyCode]
+            
+            # Apply shift modifier for uppercase and special chars
+            if modifiers.get('shift', False):
+                if char.isalpha():
+                    char = char.upper()
+                elif char in self.shiftMap:
+                    char = self.shiftMap[char]
+            
+            return self.insertCharacter(char)
+        
+        return False
+    
+    def insertCharacter(self, char):
+        """Insert a character at the cursor position."""
+        self.buffer = (self.buffer[:self.cursorPosition] + 
+                      char + 
+                      self.buffer[self.cursorPosition:])
+        self.cursorPosition += len(char)
+        return True
+    
+    def backspace(self):
+        """Delete character before cursor."""
+        if self.cursorPosition > 0:
+            self.buffer = (self.buffer[:self.cursorPosition - 1] + 
+                          self.buffer[self.cursorPosition:])
+            self.cursorPosition -= 1
+            return True
+        return False
+    
+    def delete(self):
+        """Delete character after cursor."""
+        if self.cursorPosition < len(self.buffer):
+            self.buffer = (self.buffer[:self.cursorPosition] + 
+                          self.buffer[self.cursorPosition + 1:])
+            return True
+        return False
+    
+    def moveCursorLeft(self, jumpToStart=False):
+        """Move cursor left by one position, or to start if jumpToStart."""
+        if jumpToStart:
+            self.cursorPosition = 0
+        elif self.cursorPosition > 0:
+            self.cursorPosition -= 1
+        else:
+            return False
+        return True
+    
+    def moveCursorRight(self, jumpToEnd=False):
+        """Move cursor right by one position, or to end if jumpToEnd."""
+        if jumpToEnd:
+            self.cursorPosition = len(self.buffer)
+        elif self.cursorPosition < len(self.buffer):
+            self.cursorPosition += 1
+        else:
+            return False
+        return True
+    
+    def moveCursorToStart(self):
+        """Move cursor to the start of the buffer."""
+        if self.cursorPosition != 0:
+            self.cursorPosition = 0
+            return True
+        return False
+    
+    def moveCursorToEnd(self):
+        """Move cursor to the end of the buffer."""
+        if self.cursorPosition != len(self.buffer):
+            self.cursorPosition = len(self.buffer)
+            return True
+        return False
+    
+    def getText(self):
+        """Get the current buffer text."""
+        return self.buffer
+    
+    def getTextWithCursor(self, cursorChar='|'):
+        """Get the buffer text with a cursor indicator."""
+        return (self.buffer[:self.cursorPosition] + 
+                cursorChar + 
+                self.buffer[self.cursorPosition:])
+    
+    def clear(self):
+        """Clear the buffer and reset cursor."""
+        self.buffer = ""
+        self.cursorPosition = 0
+    
+    def setText(self, text):
+        """Set the buffer to a specific text."""
+        self.buffer = text
+        self.cursorPosition = len(text)
+    
+    def getCursorPosition(self):
+        """Get the current cursor position."""
+        return self.cursorPosition
+    
+    def setCursorPosition(self, position):
+        """Set the cursor position (clamped to valid range)."""
+        self.cursorPosition = max(0, min(position, len(self.buffer)))
