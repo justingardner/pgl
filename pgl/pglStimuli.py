@@ -1206,7 +1206,7 @@ class pglStimulusMovie(_pglStimulus):
         # make sure that a screen is open
         if self.pgl.isOpen() is False: 
             print(f"(pglStimulusMovie) ❌ No screen is open")
-            return False
+            return
         
 
         self.pgl.s.writeCommand("mglMovieCreate")
@@ -1217,7 +1217,7 @@ class pglStimulusMovie(_pglStimulus):
         if (result < 0): 
             print(f"(pglStimulusMovie:init) Error creating movie: {self.movieError.get(int(result),"Unrecogonized Error")}")
             self.commandResults = self.pgl.s.readCommandResults(ackTime)
-            return None
+            return
         
         # means we have details for mvoe
         if result>1.0:
