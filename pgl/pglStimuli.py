@@ -1283,18 +1283,18 @@ class pglStimulusMovie(_pglStimulus):
             displayHeight = self.pgl.screenHeight.deg  
         elif displayWidth == 0:
             # get width based on aspect ration of movie
-            if width == 0 and height == 0:
+            if self.width == 0 and self.height == 0:
                 displayWidth = self.pgl.screenWidth.deg
             else:
                 # set according to aspect ratio
-                displayWidth = (width / height) * displayHeight
+                displayWidth = (self.width / self.height) * displayHeight
         elif displayHeight == 0:
             # get width based on aspect ration of movie
-            if width == 0 and height == 0:
+            if self.width == 0 and self.height == 0:
                 displayHeight = self.pgl.screenHeight.deg
             else:
                 # set according to aspect ratio
-                displayHeight = (height / width) * displayWidth               
+                displayHeight = (self.height / self.width) * displayWidth               
         
         # vertex coordinates in device coordinates
         displayLeft = x - (xAlign + 1) / 2 * displayWidth
