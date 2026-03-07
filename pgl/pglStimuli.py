@@ -1167,7 +1167,44 @@ class pglStimulusBar(_pglStimulus):
         if self.nVolumesPerSweep is not None:
             self.stepSizePerVolume = (self.passEndX-self.passStartX)/(self.nVolumesPerSweep-1)
             
+################################################################
+# videoTransform which specifies preferred orientation of movies
+################################################################
+class videoTransform:
+    def __init__(self):
+        # Init to identity transform
+        self.a, self.b, self.c, self.d, self.tx, self.ty = 1, 0, 0, 1, 0, 0
     
+    @property
+    def matrix(self):
+        """Returns 3x3 transformation matrix"""
+        return np.array([
+            [self.a,  self.c,  self.tx],
+            [self.b,  self.d,  self.ty],
+            [0,       0,       1      ]
+        ], dtype=np.float32)
+    
+    def rotationAngle(self):
+        """Extract rotation angle in degrees"""
+        import math
+        angle = math.atan2(self.b, self.a)
+        degrees = math.degrees(angle)
+        # Normalize to 0, 90, 180, 270
+        return round(degrees / 90) * 90 % 360
+    
+    def print(self):
+        """Print the transform"""
+        print (f"VideoTransform(rotation={self.rotationAngle()}°)\n"
+                f"  a={self.a:7.2f}  c={self.c:7.2f}  tx={self.tx:7.2f}\n"
+                f"  b={self.b:7.2f}  d={self.d:7.2f}  ty={self.ty:7.2f}\n"
+                f"Matrix:\n"
+                f"  [{self.a:7.2f}  {self.c:7.2f}  {self.tx:7.2f}]\n"
+                f"  [{self.b:7.2f}  {self.d:7.2f}  {self.ty:7.2f}]\n"
+                f"  [   0.00     0.00     1.00]")
+    
+    def __repr__(self):
+        """Compact representation"""
+        return f"videoTransform(a={self.a}, b={self.b}, c={self.c}, d={self.d}, tx={self.tx}, ty={self.ty})"
 
 ################################################################
 # Movie stimulus class
@@ -1219,7 +1256,10 @@ class pglStimulusMovie(_pglStimulus):
             self.commandResults = self.pgl.s.readCommandResults(ackTime)
             return
         
-        # means we have details for mvoe
+        # initialize preferredTransform
+        self.preferredTransform = videoTransform()
+        
+        # means we have details for movie
         if result>1.0:
             # read details of movie
             self.frameRate = self.pgl.s.read(np.float64)
@@ -1227,7 +1267,13 @@ class pglStimulusMovie(_pglStimulus):
             self.totalFrames = self.pgl.s.read(np.uint32)
             self.width = self.pgl.s.read(np.uint32)
             self.height = self.pgl.s.read(np.uint32)
-            print(self)
+            self.preferredTransform.a = self.pgl.s.read(np.float64)
+            self.preferredTransform.b = self.pgl.s.read(np.float64)
+            self.preferredTransform.c = self.pgl.s.read(np.float64)
+            self.preferredTransform.d = self.pgl.s.read(np.float64)
+            self.preferredTransform.tx = self.pgl.s.read(np.float64)
+            self.preferredTransform.ty = self.pgl.s.read(np.float64)
+            
 
         # Read the movie number
         self.movieNum = self.pgl.s.read(np.uint32)
@@ -1544,7 +1590,12 @@ class pglStimulusMovie(_pglStimulus):
             self.totalFrames = self.pgl.s.read(np.uint32)
             self.width = self.pgl.s.read(np.uint32)
             self.height = self.pgl.s.read(np.uint32)
-
+            self.preferredTransform.a = self.pgl.s.read(np.float64)
+            self.preferredTransform.b = self.pgl.s.read(np.float64)
+            self.preferredTransform.c = self.pgl.s.read(np.float64)
+            self.preferredTransform.d = self.pgl.s.read(np.float64)
+            self.preferredTransform.tx = self.pgl.s.read(np.float64)
+            self.preferredTransform.ty = self.pgl.s.read(np.float64)
 
         self.commandResults = self.pgl.s.readCommandResults(ackTime)
         print(self.pgl.commandResults)
@@ -1555,3 +1606,4 @@ class pglStimulusMovie(_pglStimulus):
         Print information about the stimulus.
         '''
         print(self.__repr__())
+        self.preferredTransform.print()
