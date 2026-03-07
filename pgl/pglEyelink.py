@@ -77,6 +77,40 @@ class pglEyelink(pglEyeTracker):
                     print(f"(pglEyelink) Error closing Eyelink: {e}")
 
 
+    def start(self):
+        """Start eye tracking."""
+       
+        error = self.eyelink.startRecording(1,1,1,1)
+        pylink.pumpDelay(100)
+
+        # check for errors
+        if error == 0:
+            if self.eyelink.isRecording() == 0:
+                print("(pglEyeTracker) Eye tracking started.")
+            else:
+                print("(pglEyeTracker) Recording command sent but not confirmed")
+        else:
+            print(f"(pglEyeTracker) Could not start recording. Error: {error}")
+
+    def stop(self):
+        """Stop eye tracking."""
+        # Add small delay before stopping
+        pylink.pumpDelay(100)
+    
+        # Stop recording
+        self.eyelink.stopRecording()
+    
+        # Wait for stop to complete
+        pylink.msecDelay(500)
+    
+        # Verify stopped
+        if self.eyelink.isRecording() != 0:
+            print("(pglEyeTracker) Eye tracking stopped.")
+            return True
+        else:
+            print("(pglEyeTracker) Warning: Still recording after stop command")
+            return False        
+        
     def calibrate(self):
         """Calibrate the eye tracker."""
         if self.eyelink is not None:
@@ -115,7 +149,7 @@ if _HAVE_PYLINK:
             self.targetSizePixels = round((self.pgl.xDeg2Pix + self.pgl.yDeg2Pix)/2)
             
             # sounds, Fix, Fix, fix to play sounds
-            self.beeTarget = None
+            self.beepTarget = None
             self.beepDone = None
             self.beepError = None
             
