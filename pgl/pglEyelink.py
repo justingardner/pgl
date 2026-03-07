@@ -92,6 +92,35 @@ class pglEyelink(pglEyeTracker):
         else:
             print(f"(pglEyeTracker) Could not start recording. Error: {error}")
 
+    def openEDF(self, filename):
+        """Open an EDF file on the Host PC.
+    
+        Args:
+            filename (str): Name of file (max 8 chars, no extension needed)
+    
+        Returns:
+            bool: True if file opened successfully, False otherwise.
+        """
+        # Ensure file name is valid (max 8 chars for DOS compatibility)
+        if len(filename) > 8:
+            print(f"(pglEyeTracker) Warning: File name '{filename}' too long. Truncating to 8 chars.")
+            filename = filename[:8]
+    
+        # Open file on Host PC
+        try:
+            error = self.eyelink.openDataFile(filename + ".edf")
+        
+            if error == 0:
+                print(f"(pglEyeTracker) Data file opened: {filename}.edf")
+                return True
+            else:
+                print(f"(pglEyeTracker) Failed to open data file. Error: {error}")
+                return False
+            
+        except Exception as e:
+            print(f"(pglEyeTracker) Exception opening file: {e}")
+            return False
+        
     def stop(self):
         """Stop eye tracking."""
         # Add small delay before stopping
@@ -109,8 +138,53 @@ class pglEyelink(pglEyeTracker):
             return True
         else:
             print("(pglEyeTracker) Warning: Still recording after stop command")
-            return False        
+            return False    
+
+    def getEDF(self, hostFilename, localFilepath):
+        """Stop recording and retrieve data file.
         
+        Args:
+            hostFilename (str): Name of file on Host PC (max 8 chars, no .edf)
+            localFilepath (str): Full path where to save file locally
+            
+        Returns:
+            bool: True if stopped and saved successfully, False otherwise.
+        """
+        import os
+        
+        # Stop recording first
+        if not self.stop():
+            print("(pglEyeTracker) Warning: Issue stopping recording")
+        
+        # Close file on Host PC
+        print("(pglEyeTracker) Closing data file...")
+        self.eyelink.closeDataFile()
+        pylink.msecDelay(100)
+        
+        # Ensure local directory exists
+        localDir = os.path.dirname(localFilepath)
+        if localDir:
+            os.makedirs(localDir, exist_ok=True)
+        
+        # create the filename
+        localFilename = os.path.join(localFilepath, hostFilename + ".edf")
+        
+        # Transfer file
+        print(f"(pglEyeTracker) Transferring data file...")
+        result = self.eyelink.receiveDataFile(hostFilename + ".edf", localFilename)
+        
+        if result > 0:
+            if os.path.exists(localFilename):
+                filesize = os.path.getsize(localFilename)
+                print(f"(pglEyeTracker) Successfully saved: {localFilename} ({filesize} bytes)")
+                return True
+            else:
+                print(f"(pglEyeTracker) Transfer reported success but file not found locally")
+                return False
+        else:
+            print(f"(pglEyeTracker) Transfer failed. Error code: {result}")
+            return False        
+    
     def calibrate(self):
         """Calibrate the eye tracker."""
         if self.eyelink is not None:
