@@ -1196,11 +1196,7 @@ class videoTransform:
         """Print the transform"""
         print (f"VideoTransform(rotation={self.rotationAngle()}°)\n"
                 f"  a={self.a:7.2f}  c={self.c:7.2f}  tx={self.tx:7.2f}\n"
-                f"  b={self.b:7.2f}  d={self.d:7.2f}  ty={self.ty:7.2f}\n"
-                f"Matrix:\n"
-                f"  [{self.a:7.2f}  {self.c:7.2f}  {self.tx:7.2f}]\n"
-                f"  [{self.b:7.2f}  {self.d:7.2f}  {self.ty:7.2f}]\n"
-                f"  [   0.00     0.00     1.00]")
+                f"  b={self.b:7.2f}  d={self.d:7.2f}  ty={self.ty:7.2f}\n")
     
     def __repr__(self):
         """Compact representation"""
@@ -1321,32 +1317,53 @@ class pglStimulusMovie(_pglStimulus):
         if self.movieNum is None:
             print(f"(pglStimulusMovie:setDisplayPosition) ❌ Movie has been deleted")
             return False
-        # handle width and height defaults
-        if displayWidth == 0 and displayHeight == 0:
-            # no width or height, maximize to fill screen
-            displayWidth = self.pgl.screenWidth.deg
-            displayHeight = self.pgl.screenHeight.deg  
-        elif displayWidth == 0:
-            # get width based on aspect ratio of movie
-            if self.width == 0 and self.height == 0:
-                displayWidth = self.pgl.screenWidth.deg
-            else:
-                # set according to aspect ratio
-                displayWidth = (self.width / self.height) * displayHeight
-        elif displayHeight == 0:
-            # get height based on aspect ratio of movie
-            if self.width == 0 and self.height == 0:
-                displayHeight = self.pgl.screenHeight.deg
-            else:
-                # set according to aspect ratio
-                displayHeight = (self.height / self.width) * displayWidth               
         
         # get rotation. This will default to 0 degrees if not 
         # recovered by mglMetal from avplayer
         rotation = self.preferredTransform.rotationAngle()
         print(f"(pglMovie:setDisplayPosition) Rotation: {rotation} degrees")
         
-        # texture coordinates which map to vertex coordinates,
+        # Calculate aspect ratio if video dimensions are known
+        if self.width == 0 or self.height == 0:
+            aspectRatio = None
+        else:
+            aspectRatio = self.width / self.height
+
+        # Handle width and height defaults
+        if rotation in (90, 270):
+            # swap desired displayWidth and displayHeight
+            displayWidth, displayHeight = displayHeight, displayWidth
+            
+            # Swap dimensions for 90/270 degree rotations
+            if displayWidth == 0 and displayHeight == 0:
+                displayWidth = self.pgl.screenHeight.deg
+                displayHeight = self.pgl.screenWidth.deg  
+            elif displayWidth == 0:
+                if aspectRatio is None:
+                    displayWidth = self.pgl.screenHeight.deg
+                else:
+                    displayWidth = (1 / aspectRatio) * displayHeight
+            elif displayHeight == 0:
+                if aspectRatio is None:
+                    displayHeight = self.pgl.screenWidth.deg
+                else:
+                    displayHeight = aspectRatio * displayWidth
+        else:
+            # Normal dimensions for 0/180 degree rotations
+            if displayWidth == 0 and displayHeight == 0:
+                displayWidth = self.pgl.screenWidth.deg
+                displayHeight = self.pgl.screenHeight.deg  
+            elif displayWidth == 0:
+                if aspectRatio is None:
+                    displayWidth = self.pgl.screenWidth.deg
+                else:
+                    displayWidth = aspectRatio * displayHeight
+            elif displayHeight == 0:
+                if aspectRatio is None:
+                    displayHeight = self.pgl.screenHeight.deg
+                else:
+                    displayHeight = (1 / aspectRatio) * displayWidth      
+        
         # allow for 0, 90, 180 or 270 rotation
         if rotation == 0:
             # tex coords for 0 degrees
