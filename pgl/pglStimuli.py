@@ -1274,7 +1274,6 @@ class pglStimulusMovie(_pglStimulus):
             self.preferredTransform.tx = self.pgl.s.read(np.float64)
             self.preferredTransform.ty = self.pgl.s.read(np.float64)
             
-
         # Read the movie number
         self.movieNum = self.pgl.s.read(np.uint32)
         nMovies = self.pgl.s.read(np.uint32)      
@@ -1328,20 +1327,62 @@ class pglStimulusMovie(_pglStimulus):
             displayWidth = self.pgl.screenWidth.deg
             displayHeight = self.pgl.screenHeight.deg  
         elif displayWidth == 0:
-            # get width based on aspect ration of movie
+            # get width based on aspect ratio of movie
             if self.width == 0 and self.height == 0:
                 displayWidth = self.pgl.screenWidth.deg
             else:
                 # set according to aspect ratio
                 displayWidth = (self.width / self.height) * displayHeight
         elif displayHeight == 0:
-            # get width based on aspect ration of movie
+            # get height based on aspect ratio of movie
             if self.width == 0 and self.height == 0:
                 displayHeight = self.pgl.screenHeight.deg
             else:
                 # set according to aspect ratio
                 displayHeight = (self.height / self.width) * displayWidth               
         
+        # get rotation. This will default to 0 degrees if not 
+        # recovered by mglMetal from avplayer
+        rotation = self.preferredTransform.rotationAngle()
+        print(f"(pglMovie:setDisplayPosition) Rotation: {rotation} degrees")
+        
+        # texture coordinates which map to vertex coordinates,
+        # allow for 0, 90, 180 or 270 rotation
+        if rotation == 0:
+            # tex coords for 0 degrees
+            texCoords = [
+                (1, 0), (0, 0), (0, 1),  # First triangle
+                (1, 0), (0, 1), (1, 1)   # Second triangle
+            ]
+        elif rotation == 270:
+            # swap displayWidth and displayHeight
+            displayWidth, displayHeight = displayHeight, displayWidth
+            # tex coords for 270 degree rotation
+            texCoords = [
+                (1, 1), (1, 0), (0, 0),
+                (1, 1), (0, 0), (0, 1)
+            ]
+        elif rotation == 180:
+            # tex coords for 180 degree rotation
+            texCoords = [
+                (0, 1), (1, 1), (1, 0),
+                (0, 1), (1, 0), (0, 0)
+            ]
+        elif rotation == 90:
+            # swap displayWidth and displayHeight
+            displayWidth, displayHeight = displayHeight, displayWidth
+            # tex coords for 90 degree rotation
+            texCoords = [
+                (0, 0), (0, 1), (1, 1),
+                (0, 0), (1, 1), (1, 0)
+            ]
+        else:
+            print(f"(pglMovie:setDisplayPosition) Warning: Invalid rotation {rotation}, using 0 degrees")
+            texCoords = [
+                (1, 0), (0, 0), (0, 1),
+                (1, 0), (0, 1), (1, 1)
+            ]
+
         # vertex coordinates in device coordinates
         displayLeft = x - (xAlign + 1) / 2 * displayWidth
         displayRight = displayLeft + displayWidth
@@ -1351,23 +1392,17 @@ class pglStimulusMovie(_pglStimulus):
         # no z coordinate
         z = 0
 
-        # texture coordinates which map to vertex coordinates
-        texRight = 1
-        texLeft = 0
-        texTop = 0
-        texBottom = 1
-        
         # create the two triangles which map the texture (ie image)
         # to vertices in device coordinates
         vertices = np.array([
-            [displayRight, displayTop, z, texRight, texTop],
-            [displayLeft, displayTop, z, texLeft, texTop],
-            [displayLeft, displayBottom, z, texLeft, texBottom],
+            [displayRight, displayTop, z, texCoords[0][0], texCoords[0][1]],
+            [displayLeft, displayTop, z, texCoords[1][0], texCoords[1][1]],
+            [displayLeft, displayBottom, z, texCoords[2][0], texCoords[2][1]],
 
-            [displayRight, displayTop, z, texRight, texTop],
-            [displayLeft, displayBottom, z, texLeft, texBottom],
-            [displayRight, displayBottom, z, texRight, texBottom]
-        ], dtype=np.float32) 
+            [displayRight, displayTop, z, texCoords[3][0], texCoords[3][1]],
+            [displayLeft, displayBottom, z, texCoords[4][0], texCoords[4][1]],
+            [displayRight, displayBottom, z, texCoords[5][0], texCoords[5][1]]
+        ], dtype=np.float32)
         nVertices = np.float32(vertices.shape[0])
 
         # write command for display position
