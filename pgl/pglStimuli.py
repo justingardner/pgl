@@ -9,6 +9,9 @@
 #############
 # Import modules
 #############
+from datetime import time
+import threading
+
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -344,12 +347,13 @@ class pglStimuli:
     ####################################################
     # movie
     ####################################################
-    def movie(self, filename, x=0, y=0, displayWidth=0, displayHeight=0, xAlign=0, yAlign=0):
+    def movie(self, filename, **positionParams):
         '''
         Create a movie stimulus. 
 
         Args:
             filename (str): The file name of the movie file
+            Can also take positionParams such as (x,y,displayWidth,displayHeight,xAlign,yAlign - see pglMovie.setDisplayPosition)
         '''
         # Validate inputs
         if not isinstance(filename, str):
@@ -357,7 +361,7 @@ class pglStimuli:
             return None
 
         # Create the movie stimulus
-        movieStimulus = pglStimulusMovie(self, filename=filename, x=x, y=y, displayWidth=displayWidth, displayHeight=displayHeight, xAlign=xAlign, yAlign=yAlign)
+        movieStimulus = pglStimulusMovie(self, filename=filename, **positionParams)
         return movieStimulus
 
     ####################################################
@@ -1217,6 +1221,7 @@ class pglStimulusMovie(_pglStimulus):
                   -4.0: "Error reading vertices",
                   -5.0: "Error creating movie",
                   -6.0: "Error adding movie"}
+    
     # default dimensions
     width = 0
     height = 0
@@ -1226,26 +1231,35 @@ class pglStimulusMovie(_pglStimulus):
     targetPresentationTimestamps = []
     movieTimes = []
     
-    def __init__(self, pgl, filename="", x=0, y=0, displayWidth=0, displayHeight=0, xAlign=0, yAlign=0):
+    # whether dimensions have been read from movie
+    hasDimensions = False
+    
+    def __init__(self, pgl, filename="", **positionParams):
         '''
         Initialize the movie stimulus with a movie instance.
 
         Args:
+            pgl: reference to pgl
+            filename: name of movie file
+            positionParams - you can set any parameter that setDisplayPosition takes (x, y, displayWidth, displayHeight, xAlign, yAlign)
+                but, be aware that this will block until dimensions are read from the movie file.
+                see setDisplayPosition for more info
         '''
         super().__init__(pgl)
         self.pgl = pgl
         self.filename = filename
-
+        
         # make sure that a screen is open
         if self.pgl.isOpen() is False: 
             print(f"(pglStimulusMovie) ❌ No screen is open")
             return
         
-
+        # send movie create command
         self.pgl.s.writeCommand("mglMovieCreate")
         ackTime = self.pgl.s.readAck()
         self.pgl.s.write(filename)
         
+        # get result
         result = self.pgl.s.read(np.float64)
         if (result < 0): 
             print(f"(pglStimulusMovie:init) Error creating movie: {self.movieError.get(int(result),"Unrecogonized Error")}")
@@ -1255,20 +1269,11 @@ class pglStimulusMovie(_pglStimulus):
         # initialize preferredTransform
         self.preferredTransform = videoTransform()
         
-        # means we have details for movie
+        # If details are ready for the movie, read them
+        self.dimensionsReady = threading.Event()
         if result>1.0:
             # read details of movie
-            self.frameRate = self.pgl.s.read(np.float64)
-            self.duration = self.pgl.s.read(np.float64)
-            self.totalFrames = self.pgl.s.read(np.uint32)
-            self.width = self.pgl.s.read(np.uint32)
-            self.height = self.pgl.s.read(np.uint32)
-            self.preferredTransform.a = self.pgl.s.read(np.float64)
-            self.preferredTransform.b = self.pgl.s.read(np.float64)
-            self.preferredTransform.c = self.pgl.s.read(np.float64)
-            self.preferredTransform.d = self.pgl.s.read(np.float64)
-            self.preferredTransform.tx = self.pgl.s.read(np.float64)
-            self.preferredTransform.ty = self.pgl.s.read(np.float64)
+            self.readDimensions()
             
         # Read the movie number
         self.movieNum = self.pgl.s.read(np.uint32)
@@ -1279,8 +1284,34 @@ class pglStimulusMovie(_pglStimulus):
         # get command results
         self.commandResults = self.pgl.s.readCommandResults(ackTime)
         
-        # set the display position
-        self.setDisplayPosition(x, y, displayWidth, displayHeight, xAlign, yAlign)
+        # do positionParams if given, this can block as setDisplayPosition
+        # will keep calling status until dimensions are read
+        if positionParams:
+            self.setDisplayPosition(**positionParams)
+            
+    def readDimensions(self):
+        '''
+        Read the dimensions of the movie
+        '''
+        if self.movieNum is None:
+            print(f"(pglStimulusMovie:readDimensions) ❌ Movie has been deleted")
+            return False
+        
+        # read details of movie
+        self.frameRate = self.pgl.s.read(np.float64)
+        self.duration = self.pgl.s.read(np.float64)
+        self.totalFrames = self.pgl.s.read(np.uint32)
+        self.width = self.pgl.s.read(np.uint32)
+        self.height = self.pgl.s.read(np.uint32)
+        self.preferredTransform.a = self.pgl.s.read(np.float64)
+        self.preferredTransform.b = self.pgl.s.read(np.float64)
+        self.preferredTransform.c = self.pgl.s.read(np.float64)
+        self.preferredTransform.d = self.pgl.s.read(np.float64)
+        self.preferredTransform.tx = self.pgl.s.read(np.float64)
+        self.preferredTransform.ty = self.pgl.s.read(np.float64)
+        self.dimensionsReady.set() 
+
+        return True
 
     def delete(self):
         '''
@@ -1300,11 +1331,22 @@ class pglStimulusMovie(_pglStimulus):
     def __repr__(self):
         return f"<pglStimulusMovie: {self.filename} {self.width}x{self.height}pix, duration={self.duration}s, {self.frameRate}fps, totalFrames={self.totalFrames}>"
 
-    def setDisplayPosition(self, x = 0, y = 0, displayWidth = 0, displayHeight = 0, xAlign = 0, yAlign = 0):
+    def setDisplayPosition(self, dimensionsReadMaxAttempts=100, dimensionsReadTimeout=1, **positionParams):
         '''
-        Sets the display position
+        Sets the display position. This function should be called before display (either through init, play or displayFrame
+            or through a direct call). It needs to have information read from the movie file. Specifically the
+            field preferredTransform which sets the rotation of the image. It also needs width/height
+            for aspectRatio. It takes a small (2-3 ms) amount of time after the file is open
+            for these parameters to be read by the AVPlayer. So, it is often good to call init
+            on the movie, do something else, and then come back setDisplayPosition so that you
+            don't block while waiting for these parameters to be available. This function
+            will repeatedly call self.status() which checks status from mglMetal and reads
+            the parameters if they are ready. If the dimensions have already been read, it will
+            not block and call status again, but will set the parameters directly
         
         args:
+        -  dimensionsReadMaxAttempts: number of attempts to get dimensions before giving up (default=10)
+        -  dimensionsReadTimeout: time to wait in ms between attempts to get dimensions (default=1ms)
         -  x: x location for movie (default = 0)
         -  y: y location for movie (default = 0)
         -  displayWidth: width for movie (default = 0) If height is set, and width is 0 
@@ -1317,6 +1359,36 @@ class pglStimulusMovie(_pglStimulus):
         if self.movieNum is None:
             print(f"(pglStimulusMovie:setDisplayPosition) ❌ Movie has been deleted")
             return False
+        
+        # check that dimension parameters have been read from mglMetal
+        if not self.dimensionsReady.is_set():
+            startTime = self.pgl.getSecs()
+            # if not, attempt to read them by calling status
+            for attempt in range(dimensionsReadMaxAttempts):
+                # Try to update dimensions
+                self.status()  
+                # wait
+                if self.dimensionsReady.wait(timeout=dimensionsReadTimeout / 1000):
+                    # Got dimensions
+                    break
+            else:
+                print(f"(pglStimulusMovie:setDisplayPosition) ❌ Failed to read dimensions after {dimensionsReadMaxAttempts} attempts")
+                return False
+            print(f"(pglStimulusMovie:setDisplayPosition) Time taken to read dimensions: {1000*(self.pgl.getSecs() - startTime):.3f} ms")
+           
+        # handle default
+        defaultPositionParams = {
+            'x': 0,
+            'y': 0,
+            'displayWidth': 0,
+            'displayHeight': 0,
+            'xAlign': 0,
+            'yAlign': 0
+        }
+        
+        # merge defaults with passed in values
+        defaultPositionParams.update(positionParams)
+        self.positionParams = defaultPositionParams
         
         # get rotation. This will default to 0 degrees if not 
         # recovered by mglMetal from avplayer
@@ -1331,6 +1403,8 @@ class pglStimulusMovie(_pglStimulus):
         screenAspect = self.pgl.screenWidth.deg / self.pgl.screenHeight.deg
 
         # Handle width and height defaults
+        displayWidth = self.positionParams['displayWidth']
+        displayHeight = self.positionParams['displayHeight']
         if rotation in (90, 270):
             # swap desired displayWidth and displayHeight
             displayWidth, displayHeight = displayHeight, displayWidth
@@ -1424,9 +1498,9 @@ class pglStimulusMovie(_pglStimulus):
             ]
 
         # vertex coordinates in device coordinates
-        displayLeft = x - (xAlign + 1) / 2 * displayWidth
+        displayLeft = self.positionParams['x'] - (self.positionParams['xAlign'] + 1) / 2 * displayWidth
         displayRight = displayLeft + displayWidth
-        displayTop = y + (yAlign + 1) / 2 * displayHeight
+        displayTop = self.positionParams['y'] + (self.positionParams['yAlign'] + 1) / 2 * displayHeight
         displayBottom = displayTop - displayHeight
 
         # no z coordinate
@@ -1457,15 +1531,22 @@ class pglStimulusMovie(_pglStimulus):
         # get command results
         self.commandResults = self.pgl.s.readCommandResults(ackTime)
 
-    def play(self):
+    def play(self, **positionParams):
         '''
         play the Movie.
+        
+        Args:
+            Any args that setDisplayPosition takes (x,y,displayWidth,displayHeight,xAlign,yAlign)
         
         '''
         if self.movieNum is None:
             print(f"(pglStimulusMovie:setDisplayPosition) ❌ Movie has been deleted")
             return False
-
+        
+        # Check for positionParams or if we not yet gotten dimensions
+        if positionParams or not self.dimensionsReady.is_set():
+            self.setDisplayPosition(**positionParams)
+        
         self.pgl.s.writeCommand("mglMoviePlay")
         ackTime = self.pgl.s.readAck()
         self.pgl.s.write(np.uint32(self.movieNum))
@@ -1625,14 +1706,22 @@ class pglStimulusMovie(_pglStimulus):
             unclassifiedString = " ".join(f"{i} ({t*1000:.2f}ms)" for i, t in unclassified)
             print(f"{count} frames ({percent:.1f}%) unclassified: {unclassifiedString}")
         
-    def drawFrame(self):
+    def drawFrame(self, **positionParams):
         '''
         draw the current frame of the movie (requires a pgl.flush() to display).
+        
+        Args:
+            Any args that setDisplayPosition takes (x,y,displayWidth,displayHeight,xAlign,yAlign)
+        
         '''
         if self.movieNum is None:
             print(f"(pglStimulusMovie:setDisplayPosition) ❌ Movie has been deleted")
             return False
 
+        # Check for positionParams
+        if positionParams or not self.dimensionsReady.is_set():
+            self.setDisplayPosition(**positionParams)
+            
         self.pgl.s.writeCommand("mglMovieDrawFrame")
         ackTime = self.pgl.s.readAck()
         self.pgl.s.write(np.uint32(self.movieNum))
@@ -1657,23 +1746,14 @@ class pglStimulusMovie(_pglStimulus):
         self.pgl.s.write(np.uint32(self.movieNum))
 
         status = self.pgl.s.read(np.float64)
-        print(f"(pglStimulusMovie:status) Movie status: {status}")
+        if self.pgl.verbose>1: print(f"(pglStimulusMovie:status) Movie status: {status}")
+        
         if status>0:
             # read details of movie
-            self.frameRate = self.pgl.s.read(np.float64)
-            self.duration = self.pgl.s.read(np.float64)
-            self.totalFrames = self.pgl.s.read(np.uint32)
-            self.width = self.pgl.s.read(np.uint32)
-            self.height = self.pgl.s.read(np.uint32)
-            self.preferredTransform.a = self.pgl.s.read(np.float64)
-            self.preferredTransform.b = self.pgl.s.read(np.float64)
-            self.preferredTransform.c = self.pgl.s.read(np.float64)
-            self.preferredTransform.d = self.pgl.s.read(np.float64)
-            self.preferredTransform.tx = self.pgl.s.read(np.float64)
-            self.preferredTransform.ty = self.pgl.s.read(np.float64)
+            self.readDimensions()
 
         self.commandResults = self.pgl.s.readCommandResults(ackTime)
-        print(self.pgl.commandResults)
+        if self.pgl.verbose>1: print(self.pgl.commandResults)
 
         
     def print(self):
