@@ -1328,6 +1328,7 @@ class pglStimulusMovie(_pglStimulus):
             aspectRatio = None
         else:
             aspectRatio = self.width / self.height
+        screenAspect = self.pgl.screenWidth.deg / self.pgl.screenHeight.deg
 
         # Handle width and height defaults
         if rotation in (90, 270):
@@ -1336,8 +1337,19 @@ class pglStimulusMovie(_pglStimulus):
             
             # Swap dimensions for 90/270 degree rotations
             if displayWidth == 0 and displayHeight == 0:
-                displayWidth = self.pgl.screenHeight.deg
-                displayHeight = self.pgl.screenWidth.deg  
+                # If no aspectRatio then just set to full screen
+                if aspectRatio is None:
+                    displayWidth = self.pgl.screenHeight.deg
+                    displayHeight = self.pgl.screenWidth.deg
+                else:
+                    if aspectRatio < screenAspect:
+                        # Video is wider than screen - fit to width
+                        displayWidth = self.pgl.screenHeight.deg
+                        displayHeight = displayWidth * aspectRatio
+                    else:
+                        # Video is taller than screen - fit to height
+                        displayHeight = self.pgl.screenWidth.deg
+                        displayWidth = displayHeight / aspectRatio 
             elif displayWidth == 0:
                 if aspectRatio is None:
                     displayWidth = self.pgl.screenHeight.deg
@@ -1351,8 +1363,19 @@ class pglStimulusMovie(_pglStimulus):
         else:
             # Normal dimensions for 0/180 degree rotations
             if displayWidth == 0 and displayHeight == 0:
-                displayWidth = self.pgl.screenWidth.deg
-                displayHeight = self.pgl.screenHeight.deg  
+                # If no aspectRatio then just set to full screen
+                if aspectRatio is None:
+                    displayWidth = self.pgl.screenWidth.deg
+                    displayHeight = self.pgl.screenHeight.deg
+                else:
+                    if aspectRatio > screenAspect:
+                        # Video is wider than screen - fit to width
+                        displayWidth = self.pgl.screenWidth.deg
+                        displayHeight = displayWidth / aspectRatio
+                    else:
+                        # Video is taller than screen - fit to height
+                        displayHeight = self.pgl.screenHeight.deg
+                        displayWidth = displayHeight * aspectRatio 
             elif displayWidth == 0:
                 if aspectRatio is None:
                     displayWidth = self.pgl.screenWidth.deg
