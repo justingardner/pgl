@@ -84,7 +84,7 @@ class pglExperiment(pglSettingsManager):
     def __repr__(self):
         return f"<pglExperiment: {len(self.task)} phases>"
     
-    def initScreen(self, backgroundColor=None):
+    def initScreen(self, backgroundColor=-1):
         '''
         Initialize the screen for the experiment. This will call pgl.open() and
         set parameters according to what is set in setParameters
@@ -96,7 +96,7 @@ class pglExperiment(pglSettingsManager):
             print("(pglExperiment:initScreen) No settings found to open screen.")
             return
         # get background color
-        if backgroundColor is None:
+        if backgroundColor == -1:
             backgroundColor = self.settings.backgroundColor
         
         # open screen
