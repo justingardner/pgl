@@ -84,20 +84,26 @@ class pglExperiment(pglSettingsManager):
     def __repr__(self):
         return f"<pglExperiment: {len(self.task)} phases>"
     
-    def initScreen(self):
+    def initScreen(self, backgroundColor=None):
         '''
         Initialize the screen for the experiment. This will call pgl.open() and
         set parameters according to what is set in setParameters
+        
+        Args:
+            backgroundColor: The background color as a list of RGB values, each between 0 and 1. If omitted, will use the color from settings.
         '''        
         if self.settings is None:
             print("(pglExperiment:initScreen) No settings found to open screen.")
             return
+        # get background color
+        if backgroundColor is None:
+            backgroundColor = self.settings.backgroundColor
         
         # open screen
         if self.settings.displayNumber == 0:
-            self.pgl.open(0, self.settings.windowWidth, self.settings.windowHeight)        
+            self.pgl.open(whichScreen=0, screenWidth=self.settings.windowWidth, screenHeight=self.settings.windowHeight, backgroundColor=backgroundColor)        
         else:
-            self.pgl.open(self.settings.displayNumber-1)        
+            self.pgl.open(whichScreen=self.settings.displayNumber-1, backgroundColor=backgroundColor)        
         if not self.pgl.isOpen():   
             pglDisplayMessage("<b>(pglExperiment:initScreen)</b> ❌ Failed to open screen.", useHTML=True, duration=5)
             return
@@ -609,7 +615,7 @@ class pglTestTask(pglTask):
         self.pgl.bullseye()
         # and text for what trial we are on 
         # This will just update every trial
-        self.pgl.text(f"Trial {self.currentTrial+1}",xAlign=1)
+        self.pgl.text(f"Trial {self.state.currentTrial+1}",xAlign=1)
         if self.e is not None:
             self.pgl.text(f"Volume {self.e.state.volumeNumber}",xAlign=1)
             elapsed = self.pgl.getSecs() - self.e.data.startTime
