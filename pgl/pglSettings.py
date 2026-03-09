@@ -386,7 +386,60 @@ class pglSettingsEditable(HasTraits, pglSerialize):
                 link((self, traitName), (wBool, 'value'))
                 widgetRows.append(wBool)
                 self.widgetMap[traitName] = wBool
-
+            elif (isinstance(trait, List) and trait.metadata.get("isRGB", False)):
+                # Create three float inputs for R, G, B
+                r_input = widgets.BoundedFloatText(
+                    value=getattr(self, traitName)[0] if getattr(self, traitName) else 0.0,
+                    min=0.0, max=1.0, step=0.01,
+                    description='R:',
+                    style={'description_width': '20px'},
+                    layout=widgets.Layout(width='120px'),
+                    tooltip=f"{helpText} - Red channel"
+                )
+                g_input = widgets.BoundedFloatText(
+                    value=getattr(self, traitName)[1] if getattr(self, traitName) else 0.0,
+                    min=0.0, max=1.0, step=0.01,
+                    description='G:',
+                    style={'description_width': '20px'},
+                    layout=widgets.Layout(width='120px'),
+                    tooltip=f"{helpText} - Green channel"
+                )
+                b_input = widgets.BoundedFloatText(
+                    value=getattr(self, traitName)[2] if getattr(self, traitName) else 0.0,
+                    min=0.0, max=1.0, step=0.01,
+                    description='B:',
+                    style={'description_width': '20px'},
+                    layout=widgets.Layout(width='120px'),
+                    tooltip=f"{helpText} - Blue channel"
+                )
+                
+                # Label for the RGB group
+                label = widgets.Label(value=traitName, style=style)
+                label.layout.width = '125px'
+                
+                # Combine in HBox
+                rgb_box = widgets.HBox([label, r_input, g_input, b_input])
+                
+                # Update the trait when any input changes
+                def update_rgb(change, name=traitName, inputs=(r_input, g_input, b_input)):
+                    setattr(self, name, [inputs[0].value, inputs[1].value, inputs[2].value])
+                
+                r_input.observe(update_rgb, names='value')
+                g_input.observe(update_rgb, names='value')
+                b_input.observe(update_rgb, names='value')
+                
+                # Optional: Update inputs when trait changes externally
+                def update_inputs(change, inputs=(r_input, g_input, b_input)):
+                    if change['new'] and len(change['new']) == 3:
+                        inputs[0].value = change['new'][0]
+                        inputs[1].value = change['new'][1]
+                        inputs[2].value = change['new'][2]
+                
+                self.observe(update_inputs, names=traitName)
+                
+                widgetRows.append(rgb_box)
+                self.widgetMap[traitName] = rgb_box
+    
             # List
             elif isinstance(trait, List):
                 currentList = getattr(self, traitName)
@@ -732,6 +785,7 @@ class pglSettings(pglSettingsEditable):
     eatKeys = Bool(True, help="Whether to eat keypresses so they don't propagate to the OS. Will only eat the keys specified above.")
     startOnVolumeTrigger = Bool(False, help="Whether to start the experiment on the volume trigger key")
     closeScreenOnEnd = Bool(True, help="Whether to close the screen when the experiment ends")
+    backgroundColor = List(trait=Float(min=0.0, max=1.0), default_value=[0.5, 0.5, 0.5],minlen=3,maxlen=3,help="Background color as a list of RGB values").tag(isRGB=True)
     
     # link back to settings select class
     settingsSelect = None 

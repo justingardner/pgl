@@ -110,7 +110,7 @@ class pglBase:
     ################################################################
     # Open a screen
     ################################################################
-    def open(self, whichScreen=None, screenWidth=None, screenHeight=None, screenX=None, screenY=None, stable=False, mglMetalPath=None):
+    def open(self, whichScreen=None, screenWidth=None, screenHeight=None, screenX=None, screenY=None, backgroundColor=None, stable=False, mglMetalPath=None):
         """
         Open a screen on the specified display.
 
@@ -127,7 +127,7 @@ class pglBase:
             stable (bool, optional): If True, forces the use of a stable version of the mglMetal application,
                                      rather than looking for a later compiled version.
             mglMetalPath (str, optional): The file path to the mglMetal application, if omitted will search in the pgl directory
-
+            backgroundColor (list, optional): The background color as a list of RGB values, each between 0 and 1.
         Returns:
             bool: True if the screen was opened successfully, False otherwise.
         """
@@ -214,7 +214,9 @@ class pglBase:
         self.frameRate = self.getFrameRate(whichScreen)
 
         # clear screen
-        self.clearScreen([0.4, 0.2, 0.5])
+        if backgroundColor is None:
+            backgroundColor = [0.4, 0.2, 0.5]
+        self.clearScreen(backgroundColor)
         self.flush()
         
         self.printHeader()
