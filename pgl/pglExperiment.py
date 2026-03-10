@@ -68,6 +68,12 @@ class pglExperiment(pglSettingsManager):
             self.experimentSettings.experimentName = experimentName
         self.experimentSettings.subjectID = subjectID
 
+        if (settings is None) and (settingsName is None):
+            # if no settings provided, then just use default settings
+            self.settings = pglSettings()
+            print("(pglExperiment) No settings provided, using default settings.")
+            return
+
         # get settings
         self.settings = settings
         if self.settings is None:
@@ -98,7 +104,7 @@ class pglExperiment(pglSettingsManager):
         # get background color
         if backgroundColor == -1:
             backgroundColor = self.settings.backgroundColor
-        
+            
         # open screen
         if self.settings.displayNumber == 0:
             self.pgl.open(whichScreen=0, screenWidth=self.settings.windowWidth, screenHeight=self.settings.windowHeight, backgroundColor=backgroundColor)        
