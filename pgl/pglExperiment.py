@@ -11,6 +11,7 @@
 # Import modules
 #############
 from datetime import datetime
+import json
 import numpy as np
 import itertools
 import random
@@ -33,6 +34,7 @@ import matplotlib.patches as patches
 from matplotlib.lines import Line2D
 import numpy as np
 from enum import Enum
+from . import pglTimestamp
 
 ##############################################s
 # Experiment class
@@ -42,7 +44,7 @@ class pglExperiment(pglSettingsManager):
     Experiment class which handles timing, parameter randomization,
     subject response, synchronizing with measurement hardware etc
     '''
-    def __init__(self, pgl, settingsName=None, settings=None, subjectID="s0000", experimentName=""):
+    def __init__(self, pgl=None, settingsName=None, settings=None, subjectID="s0000", experimentName=""):
         '''
         Initialize the pglExperiment class.
         
@@ -52,8 +54,20 @@ class pglExperiment(pglSettingsManager):
             settings (pglSettings): An instance of the pglSettings class. If set, will supersede settingsName.
             subjectID (str): The identifier for the subject participating in the experiment.
         '''
-        # save pgl
-        self.pgl = pgl
+        # load settings
+        self.loadSettings(settingsName=settingsName, settings=settings)
+
+        if pgl is None:
+            # If pgl is none, then this is a load
+            if experimentName == "":
+                print(f"(pglExperiment) No exerimentName provided for loading experiment data")
+                return
+            # load the experimentName
+            self.load(experimentName=experimentName, subjectID=subjectID)
+            return
+        else:
+            # save pgl
+            self.pgl = pgl
         
         # initialize experiment state and data
         self.state = pglExperimentState()
@@ -67,26 +81,7 @@ class pglExperiment(pglSettingsManager):
         if experimentName != "":
             self.experimentSettings.experimentName = experimentName
         self.experimentSettings.subjectID = subjectID
-
-        if (settings is None) and (settingsName is None):
-            # if no settings provided, then just use default settings
-            self.settings = pglSettings()
-            print("(pglExperiment) No settings provided, using default settings.")
-            return
-
-        # get settings
-        self.settings = settings
-        if self.settings is None:
-            self.settings = self.getSettings(settingsName)
-        
-        # if there was some error, then display it
-        if self.settings is None:
-            # display error in HTML
-            pglDisplayMessage("<b>(pglExperiment:initScreen)</b> ❌ Could not find settings, using default settings.")
-            # create default settings
-            self.settings = pglSettings()
-            
-        
+                
     def __repr__(self):
         return f"<pglExperiment: {len(self.task)} phases>"
     
@@ -373,10 +368,83 @@ class pglExperiment(pglSettingsManager):
             for task in phaseTasks:
                 task.save(dataDir)   
                      
-    def load(self):
+    def loadSettings(self, settingsName=None, settings=None):
+        
+        if (settings is None) and (settingsName is None):
+            # if no settings provided, then just use default settings
+            self.settings = pglSettings()
+            print("(pglExperiment) No settings provided, using default settings.")
+            return
+
+        # get settings
+        self.settings = settings
+        if self.settings is None:
+            self.settings = self.getSettings(settingsName)
+        
+        # if there was some error, then display it
+        if self.settings is None:
+            # display error in HTML
+            pglDisplayMessage("<b>(pglExperiment:initScreen)</b> ❌ Could not find settings, using default settings.")
+            # create default settings
+            self.settings = pglSettings()
+
+    def load(self, experimentName="", subjectID=""):
         '''
         Load the experiment settings, state and data.         
         '''
+        self.pglTimestamp = pglTimestamp()
+        dataDir = Path(self.settings.dataPath).expanduser() / experimentName / subjectID 
+        # check that data path exists
+        if not dataDir.exists() or not dataDir.is_dir():
+            print(f"(pglExperiment:load) ❌ Could not find data directory: {dataDir}")
+            return
+        
+        # Get all directories in the dataPath
+        dirList = [d for d in dataDir.iterdir() if d.is_dir()]
+        dirList = sorted(dirList, key=lambda d: d.name)
+        
+        # print the experiment name and subjetID
+        print(f"(pglExperiment:load) Data directory: {dataDir}")
+        print(f"Experiment name: {experimentName} | Subject ID: {subjectID}")
+        
+        # Print all the directories
+        for i, d in enumerate(dirList, start=1):
+            try:
+                # for typical data files, parse into a datatime
+                dt = datetime.strptime(d.name, "%Y%m%d_%H%M%S")
+                # and print a more user-friendly name
+                dataPrintname = dt.strftime("%A %B %-d, %Y %-I:%M%p")
+                # try to read the data.json file
+                dataFilename = dataDir / d.name / "data.json"
+                if dataFilename.exists():
+                    try:
+                        with open(dataFilename, "r") as f:
+                            data = json.load(f)
+                        # get start and end time
+                        startTime = data.get("startTime")
+                        endTime = data.get("endTime")
+
+                        if startTime is not None and endTime is not None:
+                            duration = endTime - startTime
+                            dataPrintname += f" | Duration: {self.pglTimestamp.formatDuration(duration)}"
+                    except:
+                        pass
+                # Add the filename
+                dataPrintname = f"{dataPrintname} ({d.name})"
+            except:
+                # not a typical name, just display
+                dataPrintname = d.name
+            print(f"{i}. {dataPrintname}")
+                
+        # Ask the user to choose
+        choice = int(input("\nSelect a directory number: "))
+
+        # Get the selected directory
+        selectedDir = dirList[choice - 1]
+
+        print("\nYou selected:", selectedDir)
+
+
     def display(self):
         '''
         Display a timeline of experiment events.

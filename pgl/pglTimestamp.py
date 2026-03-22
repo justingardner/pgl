@@ -47,3 +47,22 @@ class pglTimestamp:
             str: Current system date and time as a formatted string.
         '''
         return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    
+    def formatDuration(self, seconds):
+        """
+        Convert a number of seconds into a human-readable string.
+        """
+        seconds = int(seconds)  # make sure it's an integer
+        hours = seconds // 3600
+        minutes = (seconds % 3600) // 60
+        secs = seconds % 60
+
+        parts = []
+        if hours:
+            parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
+        if minutes:
+            parts.append(f"{minutes} min{'s' if minutes != 1 else ''}")
+        if secs or not parts:
+            parts.append(f"{secs}s")
+
+        return " ".join(parts)
