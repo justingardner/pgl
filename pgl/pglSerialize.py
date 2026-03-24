@@ -43,38 +43,43 @@ class pglSerialize:
     ##########################
     # Load from JSON file
     ##########################
-    def load(self, filename):
-        """Load object from JSON file"""
-        try:
-            filename = Path(filename).with_suffix(".json")
-            with open(filename, 'r') as f:
-                jsonString = f.read()
-            
-            # Deserialize using pglSerialize
-            data = pglSerialize.fromJSON(jsonString)
-            
-            # If it's the same class as self, copy its attributes
-            if isinstance(data, self.__class__):
-                self.copyTraitsFrom(data)
-                return
-            
-            # Otherwise treat as dict
-            if isinstance(data, dict):
-                self.updateTraitsFromDict(data, str(filename))
-            else:
-                print(f"(pglSerialize) Invalid data format in '{filename}'")
-                
-        except FileNotFoundError:
+    @classmethod
+    def load(cls, filename):
+        """Load a pglSerialize (or subclass) object from a JSON file and return it"""
+        filename = Path(filename).with_suffix(".json")
+
+        if not filename.exists():
             print(f"(pglSerialize) File '{filename}' not found.")
+            return None
+
+        if not filename.is_file():
+            print(f"(pglSerialize) '{filename}' is not a file.")
+            return None
+
+        try:
+            jsonString = filename.read_text()
+            obj = cls.fromJSON(jsonString)  # uses your existing fromJSON
+            return obj
         except PermissionError:
             print(f"(pglSerialize) No permission to read '{filename}'.")
-        except IsADirectoryError:
-            print(f"(pglSerialize) '{filename}' is a directory, not a file.")
         except OSError as e:
-            print(f"(pglSerialize) Error accessing '{filename}': {e}")
+            print(f"(pglSerialize) OS error reading '{filename}': {e}")
+        except json.JSONDecodeError as e:
+            print(f"(pglSerialize) JSON decode error in '{filename}': {e}")
         except Exception as e:
-            print(f"(pglSerialize) Error reading '{filename}': {e}")
+            print(f"(pglSerialize) Unknown error loading '{filename}': {type(e).__name__}: {e}")
 
+        return None
+    ##########################
+    # update instance function - updates this instance in place from a JSON file
+    # (useful for updating an existing object rather than creating a new one)
+    ##########################
+    def updateFromFile(self, filename):
+        """Update this object in place from a JSON file"""
+        obj = self.__class__.load(filename)  # call the class method
+        if obj is not None:
+            self.copyTraitsFrom(obj)  # reuse existing copy logic
+    
     ##########################
     # toJSON
     ##########################
