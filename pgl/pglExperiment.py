@@ -225,6 +225,9 @@ class pglExperiment(pglSettingsManager):
 
         # add the task
         self.task[phaseNum].append(task)
+        
+        # save in experimentSettings
+        self.experimentSettings.tasks[task.settings.taskSaveName] = phaseNum
 
     def run(self):
         '''
@@ -396,6 +399,10 @@ class pglExperiment(pglSettingsManager):
         '''
         Load the experiment settings, state and data.         
         '''
+        # default values
+        self.pgl = None
+        self.task = [[]]
+
         self.pglTimestamp = pglTimestamp()
         dataDir = Path(self.settings.dataPath).expanduser() / experimentName / subjectID 
         # check that data path exists
@@ -422,14 +429,18 @@ class pglExperiment(pglSettingsManager):
                 dataFilename = dataDir / d.name / "data.json"
                 if dataFilename.exists():
                     try:
+                        # load the data so that we can print information about the experiment
                         experimentData = pglSerialize.load(dataDir / d.name / "data.json")
+                        experimentSettings = pglSerialize.load(dataDir / d.name / "experimentSettings.json")
                         # print number of volumes
                         numVols = experimentData.getNumEvents(type="pglEventVolumeTrigger")
                         if numVols==0:
                             numVols = experimentData.getNumEvents(type="keyboard", eventType="keydown", keyChar="5")
                         dataPrintname += f" | nVols: {numVols}"
                         # print duration
-                        dataPrintname += f" | Duration: {self.pglTimestamp.formatDuration(experimentData.endTime-experimentData.startTime)}"
+                        dataPrintname += f" | {self.pglTimestamp.formatDuration(experimentData.endTime-experimentData.startTime)}"
+                        # print experiment name
+                        dataPrintname += f" | {experimentSettings.experimentName}"
                     except:
                         pass
                 # Add the filename
@@ -441,13 +452,33 @@ class pglExperiment(pglSettingsManager):
                 
         # Ask the user to choose
         choice = int(input("\nSelect a directory number: "))
+        if choice < 1 or choice > len(dirList):
+            print(f"(pglExperiment:load) ❌ Invalid choice: {choice}")
+            return
 
         # Get the selected directory
-        selectedDir = dirList[choice - 1]
+        selectedDir = dataDir / dirList[choice - 1]
 
-        print("\nYou selected:", selectedDir)
-
-
+        # load the experiment data, settings, and state
+        self.data = pglSerialize.load(selectedDir / "data.json")
+        self.settings = pglSerialize.load(selectedDir / "settings.json")
+        self.experimentSettings = pglSerialize.load(selectedDir / "experimentSettings.json")
+        self.state = pglSerialize.load(selectedDir / "state.json")
+        
+        # load all the tasks
+        dirList = [d for d in selectedDir.iterdir() if d.is_dir()]
+        dirList = sorted(dirList, key=lambda d: d.name)
+        for i, d in enumerate(dirList, start=1):
+            # get the task directory
+            taskDir = selectedDir / d.name
+            # load the task data, settings, and state
+            task = pglTask()
+            task.settings = pglSerialize.load(taskDir / "settings.json")
+            task.state = pglSerialize.load(taskDir / "state.json")
+            task.data = pglSerialize.load(taskDir / "data.json")
+            # add the task to the experiment
+            self.addTask(task)
+            
     def display(self):
         '''
         Display a timeline of experiment events.
@@ -456,9 +487,10 @@ class pglExperiment(pglSettingsManager):
         self.data.display(self)
         
         # display task data
-        for phaseTasks in self.task:
-            for task in phaseTasks:
-                task.display()   
+        if hasattr(self, "task"):
+            for phaseTasks in self.task:
+                for task in phaseTasks:
+                    task.display()   
 
     
 ##############################################
@@ -714,7 +746,8 @@ class pglExperimentSettings(pglSettingsEditable):
     experimentName = Unicode("Default experiment", help="Name of the experiment")
     experimentSaveName = Unicode("defaultExperiment", help="Name to use when saving experiment data (defaults to camelCase version of experimentName)")
     subjectID = Unicode("s0000", help="Identifier for the subject participating in the experiment.")
-    
+    tasks = Dict(key_trait=Unicode(), value_trait=Int(), default_value={}, 
+                      help="Task names with what phases they are")
     # observe changes to experimentName and if experimentSaveName is not set
     # set experimentSaveName to a camelCase version of experimentName
     @observe("experimentName")
