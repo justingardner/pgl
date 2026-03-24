@@ -260,6 +260,8 @@ class pglExperiment(pglSettingsManager):
                     if [e for e in events if e.type == "keyboard" and e.keyCode == self.state.volumeTriggerKeyCode]:
                         self.state.experimentStarted = True
                         self.state.volumeNumber += 1
+                        # and add a volume event
+                        self.data.events.append(pglEventVolumeTrigger(timestamp=e.timestamp))
                 
                 # Check for end key to allow aborting before starting    
                 if [e for e in events if e.type == "keyboard" and e.keyCode == self.state.endKeyCode]:
@@ -290,6 +292,8 @@ class pglExperiment(pglSettingsManager):
                     events.pop(i)
                     # and update volumeNumber
                     self.state.volumeNumber += 1
+                    # and add a volume trigger event
+                    self.data.events.append(pglEventVolumeTrigger(timestamp=e.timestamp))
                     break
 
             # grab any events that match the keyList and return their index within that list
@@ -418,15 +422,14 @@ class pglExperiment(pglSettingsManager):
                 dataFilename = dataDir / d.name / "data.json"
                 if dataFilename.exists():
                     try:
-                        with open(dataFilename, "r") as f:
-                            data = json.load(f)
-                        # get start and end time
-                        startTime = data.get("startTime")
-                        endTime = data.get("endTime")
-
-                        if startTime is not None and endTime is not None:
-                            duration = endTime - startTime
-                            dataPrintname += f" | Duration: {self.pglTimestamp.formatDuration(duration)}"
+                        experimentData = pglSerialize.load(dataDir / d.name / "data.json")
+                        # print number of volumes
+                        numVols = experimentData.getNumEvents(type="pglEventVolumeTrigger")
+                        if numVols==0:
+                            numVols = experimentData.getNumEvents(type="keyboard", eventType="keydown", keyChar="5")
+                        dataPrintname += f" | nVols: {numVols}"
+                        # print duration
+                        dataPrintname += f" | Duration: {self.pglTimestamp.formatDuration(experimentData.endTime-experimentData.startTime)}"
                     except:
                         pass
                 # Add the filename
@@ -745,6 +748,22 @@ class pglExperimentData(pglSerialize):
     startTime: float = 0.0
     endTime: float = 0.0
     events: ListType[pglEvent] = field(default_factory=list) 
+    
+    def __repr__(self):
+        return f"pglExperimentData(startTime={self.startTime}, endTime={self.endTime}, {len(self.events)} events)"
+    
+    def getNumEvents(self, type=None, eventType=None, keyChar=None):
+        # filter for type
+        if type is None:
+            return len(self.events)
+        filteredEvents = [event for event in self.events if event.type == type]
+        # filter for events
+        if eventType is not None:
+            filteredEvents = [event for event in filteredEvents if event.eventType == eventType]
+        # filter for keyChar
+        if keyChar is not None:
+            filteredEvents = [event for event in filteredEvents if getattr(event, "keyChar", None) == keyChar]
+        return len(filteredEvents)
     
     def display(self, e=None):
         '''
@@ -1203,3 +1222,14 @@ class pglEventSubjectResponse(pglEvent):
         self.response = response
         self.timestamp = timestamp
         self.responseType = responseType
+
+#################################################################
+# Events that specifys mri volume trigger
+#################################################################
+class pglEventVolumeTrigger(pglEvent):
+    
+    def __init__(self, timestamp=None):
+        super().__init__(type="pglEventVolumeTrigger")
+        
+        # set attributes
+        self.timestamp = timestamp
