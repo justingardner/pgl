@@ -476,6 +476,7 @@ class pglExperiment(pglSettingsManager):
             task.settings = pglSerialize.load(taskDir / "settings.json")
             task.state = pglSerialize.load(taskDir / "state.json")
             task.data = pglSerialize.load(taskDir / "data.json")
+            
             # add the task to the experiment
             self.addTask(task)
             
@@ -963,10 +964,13 @@ class pglTaskData(pglSerialize):
         # for each event, add to timeline
         trialStart = None
         gotResponse = False
+        nTrials = 1
         for event in self.events:
             # if we find a new trial event, reset the beginning time
             if isinstance(event, pglEventTrial):
                 trialStart = event.timestamp
+                if event.boundary == "start":
+                    nTrials += 1
             elif trialStart is not None:
                 # display segment events
                 if isinstance(event, pglEventSegment) and event.boundary == pglEventSegment.boundaryType.START.value:
@@ -976,7 +980,7 @@ class pglTaskData(pglSerialize):
                     gotResponse = True
                     label, color = responseMapping.get(event.responseType, ('?', 'gray'))
                     timeline.addTriangleMarker(time=event.timestamp - trialStart, color=color, label=label[0], direction='down')   
-        timeline.setTitle(f"{taskName}: Trial Events")
+        timeline.setTitle(f"{taskName}: {nTrials} trials")
         # display legend
         legend = [{'label': 'Segment', 'color': 'blue'}]
         # add the response values
