@@ -486,7 +486,7 @@ class pglExperiment(pglSettingsManager):
         self.data.display(self)
         
         # display task data
-        if hasattr(self, "task"):
+        if hasattr(self, "tasks"):
             for task in self.tasks:
                 task.display()   
 
@@ -552,8 +552,13 @@ class pglTask:
         if (self.state.currentSegment+1) >= self.settings.nSegments: 
             # end the trial
             self.endTrial(updateTime)
-            # start a new trial
-            self.startTrial(updateTime)
+            # if we are done with all trials
+            if self.done(self.state.currentTrial+1):
+                # just update currentTrial, but do not start a new trial
+                self.state.currentTrial+=1
+            else:
+                # start a new trial
+                self.startTrial(updateTime)
         else:    
             # update to next segment
             self.state.currentSegment += 1
@@ -597,8 +602,9 @@ class pglTask:
         print(f"({self.settings.taskName}) Trial {self.state.currentTrial+1}: ", end='')
         
         # and variable settings
-        #for name,value in self.data.params[-1].items():
-        #    print(f'{name}={value}', end=' ')
+        for name,value in self.data.params[-1].items():
+            print(f'{name}={value}', end=' ')
+        print(f"")
 
     def endTrial(self, endTime):
         '''
@@ -674,12 +680,14 @@ class pglTask:
         '''
         pass
     
-    def done(self):
+    def done(self, trialNum=None):
         '''
         Check if the task is done.
         '''
+        # check current trial number by default
+        if trialNum is None: trialNum = self.state.currentTrial
         # check if we are done
-        taskDone = self.state.currentTrial >= self.settings.nTrials
+        taskDone = trialNum >= self.settings.nTrials
         if taskDone: self.end()
         return taskDone
 
@@ -687,7 +695,11 @@ class pglTask:
         '''
         end of task
         '''
+        # Guard against calling end() twice
+        if self.data.endTime is not None: return
+
         # record end time
+        print(f"Ending task {self.settings.taskName}")
         endTime = self.pgl.getSecs()
         self.data.endTime = endTime
         
@@ -977,9 +989,6 @@ class pglTaskData(pglSerialize):
             return
         
         # get the max trial length
-        for trialEvent in [e for e in self.events if isinstance(e, pglEventTrial)]:
-            print(f"Trial Event {trialEvent.trialNum}: {trialEvent.boundary}")
-
         maxTrialLength = np.diff(trialTimestamps).max()
         
         # init timeline
@@ -988,7 +997,7 @@ class pglTaskData(pglSerialize):
         # for each event, add to timeline
         trialStart = None
         gotResponse = False
-        nTrials = 1
+        nTrials = 0
         for event in self.events:
             # if we find a new trial event, reset the beginning time
             if isinstance(event, pglEventTrial):
