@@ -189,7 +189,7 @@ class pglSettingsEditable(HasTraits, pglSerialize):
         super().__init__()
         # Load from file if provided
         if filename:
-            self.load(filename)
+            self.updateFromFile(filename)
     
    # display parameters
     def __repr__(self):
