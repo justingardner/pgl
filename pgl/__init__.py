@@ -15,6 +15,7 @@ from .pglFrameGrab import pglFrameGrab
 from .pglExperiment import pglExperiment, pglTask, pglTestTask
 from .pglParameter import pglParameter, pglParameterBlock
 from .pglStaircase import pglStaircase, pglStaircaseUpDown
+from .pglTasks import pglFixationTaskLeftRight, pglBarTask
 from ._pglComm import pglSerial
 from .pglCalibration import pglCalibration, pglCalibrationDeviceMinolta, pglCalibrationData, pglCalibrationDeviceDebug
 from .pglGammaTable import pglGammaTable 
