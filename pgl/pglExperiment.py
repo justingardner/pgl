@@ -57,6 +57,9 @@ class pglExperiment(pglSettingsManager):
         # load settings
         self.loadSettings(settingsName=settingsName, settings=settings)
 
+        # initialize tasks
+        self.tasks = []
+        
         if pgl is None:
             # If pgl is none, then this is a load
             if experimentName == "":
@@ -72,9 +75,6 @@ class pglExperiment(pglSettingsManager):
         # initialize experiment state and data
         self.state = pglExperimentState()
         self.data = pglExperimentData()
-        
-        # initialize tasks
-        self.tasks = []
         
         # get experiment settings
         self.experimentSettings = pglExperimentSettings()
