@@ -1242,7 +1242,7 @@ class pglEventTrial(pglEvent):
         END = 'end'
 
     def __init__(self, trialNum=None, timestamp=None, boundary=None):
-        super().__init__(type="pglEventTrial")
+        super().__init__(type="trial")
 
         # handle default
         if boundary is None:
@@ -1266,7 +1266,7 @@ class pglEventSegment(pglEvent):
         END = 'end'
 
     def __init__(self, segmentNum = None, timestamp=None, boundary=None):
-        super().__init__(type="pglEventSegment")
+        super().__init__(type="segment")
 
         # handle default
         if boundary is None:
@@ -1287,7 +1287,7 @@ class pglEventSegment(pglEvent):
 class pglEventSubjectResponse(pglEvent):
     
     def __init__(self, response=None, timestamp=None, responseType=None):
-        super().__init__(type="pglEventSubjectResponse")
+        super().__init__(type="subjectResponse")
         
         # set attributes
         self.response = response
@@ -1300,7 +1300,7 @@ class pglEventSubjectResponse(pglEvent):
 class pglEventVolumeTrigger(pglEvent):
     
     def __init__(self, timestamp=None):
-        super().__init__(type="pglEventVolumeTrigger")
+        super().__init__(type="volumeTrigger")
         
         # set attributes
         self.timestamp = timestamp
