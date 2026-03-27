@@ -6,6 +6,7 @@
 
 ```bash
 conda env create -f pgl.yml
+```
 
 ### Keyboard and mouse events
 
