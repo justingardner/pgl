@@ -1336,7 +1336,7 @@ class pglStimulusMovie(_pglStimulus):
         Sets the display position. This function should be called before display (either through init, play or displayFrame
             or through a direct call). It needs to have information read from the movie file. Specifically the
             field preferredTransform which sets the rotation of the image. It also needs width/height
-            for aspectRatio. It takes a small (2-3 ms) amount of time after the file is open
+            for aspectRatio. It takes a small (2-3 ms, but possibly longer depending on file system) amount of time after the file is open
             for these parameters to be read by the AVPlayer. So, it is often good to call init
             on the movie, do something else, and then come back setDisplayPosition so that you
             don't block while waiting for these parameters to be available. This function

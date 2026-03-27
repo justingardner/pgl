@@ -11,6 +11,7 @@
 from datetime import datetime
 import glob
 import inspect
+import json
 import platform, subprocess, random, string, os
 from pprint import pprint
 import sys
@@ -24,6 +25,9 @@ import psutil
 from IPython.display import display, HTML
 import time
 import threading
+from pathlib import Path
+from dataclasses import dataclass, field
+from .pglSerialize import pglSerialize
 
 #############
 # Main class
@@ -658,8 +662,34 @@ class pglBase:
             # not macOS
             print("(pgl:checkOS) PGL is only supported on macOS")
             return False
+    
+    
     ################################################################
-    # Clean up open windows (which may be orphaned) and there socket connections
+    # save 
+    ################################################################
+    def save(self, filepath = None):
+        if filepath is None:
+            print("(pglBase:save) No filepath given, saving to Desktop.")
+            filepath = str(Path.home() / "Desktop" / "pgl.json")
+        try:
+            # initialize state (FIX: this should go in init!)            
+            self.state = pglState()
+            
+            # set some fields
+            self.state.screenWidthPixels = self.screenWidth.pix
+            self.state.screenHeightPixels = self.screenHeight.pix
+            self.state.screenWidthDegrees = self.screenWidth.deg
+            self.state.screenHeightDegrees = self.screenHeight.deg
+            self.state.frameRate = self.frameRate   
+            
+            # save
+            self.state.save(filepath)
+
+        except Exception as e:
+            print(f"(pglBase:save) Failed to save to {filepath}: {e}")
+
+    ################################################################
+    # Clean up open windows (which may be orphaned) and their socket connections
     ################################################################
     def cleanUp(self):
         '''
@@ -1002,3 +1032,14 @@ def printHeader(str="", len=80, fillChar="="):
         print(fillChar * len)
     else:
         print(f" {str} ".center(len, fillChar))
+
+##############################################
+# State for pglState
+##############################################
+@dataclass
+class pglState(pglSerialize):
+    screenWidthPixels: int = 0
+    screenHeightPixels: int = 0
+    screenWidthDegrees: int = 0
+    screenHeightDegrees: int = 0
+    frameRate: int = 0

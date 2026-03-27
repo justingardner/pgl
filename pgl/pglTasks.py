@@ -132,9 +132,9 @@ class pglBarTask(pglTask):
         barSweepPeriod = nVolumesPerSweep * volumePeriod
 
         # set seglens
-        self.settings.seglen = [volumePeriod/2] * nVolumesPerSweep
+        self.settings.seglen = [volumePeriod/2] * (nVolumesPerSweep)
         # ensure we wait for volume trigger at end of last segment
-        self.settings.waitUntilVolumeTrigger[:] = [True] * nVolumesPerSweep
+        self.settings.waitUntilVolumeTrigger[:] = [True] * (nVolumesPerSweep)
         # set number of directions
         directions = np.arange(0,360,45)
         nDirections = len(directions)
