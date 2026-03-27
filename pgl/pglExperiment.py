@@ -112,6 +112,10 @@ class pglExperiment(pglSettingsManager):
         # set visual angle coordinates
         self.pgl.visualAngle(self.settings.displayDistance,self.settings.displayWidth,self.settings.displayHeight)
         
+        # flip left-right and/or up-down if specified in settings
+        if self.settings.flipLeftRight: self.pgl.flipLeftRight()
+        if self.settings.flipUpDown: self.pgl.flipUpDown()
+        print(f"(pglExperiment:initScreen) flipLeftRight={self.settings.flipLeftRight}, flipUpDown={self.settings.flipUpDown}")
         # add keyboard device if not already loaded
         keyboardDevices = self.pgl.devicesGet(pglKeyboardMouse)
         if not keyboardDevices:
@@ -1251,10 +1255,10 @@ class pglEventTrial(pglEvent):
         # set attributes
         self.trialNum = trialNum
         self.timestamp = timestamp
-        self.boundary = boundary.value
+        self.eventType = boundary.value
 
     def print(self):
-        print(f"(pglEventTrial) Trial {self.boundary} at: {self.timestamp}")
+        print(f"(pglEventTrial) Trial {self.eventType} at: {self.timestamp}")
         
 #################################################################
 # Events that specify segment timing
@@ -1274,11 +1278,11 @@ class pglEventSegment(pglEvent):
         
         # set attributes
         self.segmentNum = segmentNum
-        self.boundary = boundary.value
+        self.eventType = boundary.value
         self.timestamp = timestamp
 
     def print(self):
-        print(f"(pglEventSegment) Segment {self.boundary} at: {self.timestamp}")
+        print(f"(pglEventSegment) Segment {self.eventType} at: {self.timestamp}")
         
 
 #################################################################
