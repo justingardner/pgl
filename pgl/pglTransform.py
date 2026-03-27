@@ -132,6 +132,48 @@ class pglTransform:
         self.setTransform(self.xform)
 
     ################################################################
+    # Set scale of transform
+    ################################################################
+    def flipLeftRight(self, keepCurrent=True):
+        '''
+        Flip the transformation left-right.
+
+        Args:
+            keepCurrent (bool): If True, keep the current transformation and apply the flip on top of it.
+        '''
+        # Create a xform that flips left-right
+        xformFlip = np.eye(4)
+        xformFlip[0,0] = -1
+        # multiply with current transform
+        if keepCurrent:
+            self.xform = np.matmul(xformFlip,self.xform)
+        else:
+            self.xform = xformFlip
+        # now update the xform on the application
+        self.setTransform(self.xform)
+
+    ################################################################
+    # Flip the transformation up-down
+    ################################################################
+    def flipUpDown(self, keepCurrent=True):
+        '''
+        Flip the transformation up-down.
+
+        Args:
+            keepCurrent (bool): If True, keep the current transformation and apply the flip on top of it.
+        '''
+        # Create a xform that flips up-down
+        xformFlip = np.eye(4)
+        xformFlip[1,1] = -1
+        # multiply with current transform
+        if keepCurrent:
+            self.xform = np.matmul(xformFlip,self.xform)
+        else:
+            self.xform = xformFlip
+        # now update the xform on the application
+        self.setTransform(self.xform)
+
+    ################################################################
     # Set translation of transform
     ################################################################
     def setTransformOffset(self, xOffset = 0.0, yOffset = 0.0, zOffset = 0.0):
