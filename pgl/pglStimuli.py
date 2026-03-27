@@ -1086,7 +1086,7 @@ class pglStimulusRadialCheckerboardSliding(_pglStimulusRadialCheckerboard):
 # Bar stimulus class
 ################################################################
 class pglStimulusBar(_pglStimulus):
-    def __init__(self, pgl, width=1.0, speed=1.0, dir=0, nVolumesPerSweep=None, stepPosition=True, sweepWidth=None, sweepHeight=None, volumeNumber=0):
+    def __init__(self, pgl, width=1.0, speed=1.0, dir=0, nVolumesPerSweep=None, stepPosition=True, sweepWidth=None, sweepHeight=None, volumeNumber=None):
         super().__init__(pgl)
         
         # save parameters
@@ -1108,12 +1108,19 @@ class pglStimulusBar(_pglStimulus):
         self.barStimulus = pglStimulusCheckerboardSliding(pgl, width=self.width, height=self.height)
 
         # start the pass
-        self.initPass(volumeNumber=volumeNumber)
+        if volumeNumber is not None:
+            self.initPass(volumeNumber=volumeNumber)
+        else:
+            # signal that we need to initPass when we get the first volume
+            self.volumeNumber = None
         
     def display(self, dir=0, volumeNumber=0):
         '''
         Display the bar stimulus.
         '''
+        if self.volumeNumber is None:
+            self.initPass(volumeNumber=volumeNumber)
+
         # rotate coordinate frame accordingly
         self.pgl.setTransformRotation(dir)
 
