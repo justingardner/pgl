@@ -115,7 +115,11 @@ class pglExperiment(pglSettingsManager):
         # flip left-right and/or up-down if specified in settings
         if self.settings.flipLeftRight: self.pgl.flipLeftRight()
         if self.settings.flipUpDown: self.pgl.flipUpDown()
-        print(f"(pglExperiment:initScreen) flipLeftRight={self.settings.flipLeftRight}, flipUpDown={self.settings.flipUpDown}")
+        
+        # save screenWidth and screenHeight
+        self.state.screenWidth = self.pgl.screenWidth
+        self.state.screenHeight = self.pgl.screenHeight
+        
         # add keyboard device if not already loaded
         keyboardDevices = self.pgl.devicesGet(pglKeyboardMouse)
         if not keyboardDevices:
@@ -708,8 +712,8 @@ class pglTask:
         self.data.endTime = endTime
         
         # put in time stamps for end of last segment and trial
-        self.data.events.append(pglEventSegment(self.state.currentSegment, endTime, boundary=pglEventSegment.boundaryType.END))
-        self.data.events.append(pglEventTrial(self.state.currentTrial, endTime, boundary=pglEventTrial.boundaryType.END))
+        self.data.events.append(pglEventSegment(self.state.currentSegment, endTime, eventType=pglEventSegment.boundaryType.END))
+        self.data.events.append(pglEventTrial(self.state.currentTrial, endTime, eventType=pglEventTrial.boundaryType.END))
 
     def jumpSegment(self):
         '''
@@ -1006,11 +1010,11 @@ class pglTaskData(pglSerialize):
             # if we find a new trial event, reset the beginning time
             if isinstance(event, pglEventTrial):
                 trialStart = event.timestamp
-                if event.boundary == "start":
+                if event.eventType == "start":
                     nTrials += 1
             elif trialStart is not None:
                 # display segment events
-                if isinstance(event, pglEventSegment) and event.boundary == pglEventSegment.boundaryType.START.value:
+                if isinstance(event, pglEventSegment) and event.eventType == pglEventSegment.boundaryType.START.value:
                     timeline.addTriangleMarker(time=event.timestamp - trialStart, color='blue', label=f'{event.segmentNum}', direction='up')
                 # display subject response events
                 elif isinstance(event, pglEventSubjectResponse):
@@ -1245,17 +1249,17 @@ class pglEventTrial(pglEvent):
         START = 'start'
         END = 'end'
 
-    def __init__(self, trialNum=None, timestamp=None, boundary=None):
+    def __init__(self, trialNum=None, timestamp=None, eventType=None):
         super().__init__(type="trial")
 
         # handle default
-        if boundary is None:
-            boundary = self.boundaryType.START
+        if eventType is None:
+            eventType = self.boundaryType.START
             
         # set attributes
         self.trialNum = trialNum
         self.timestamp = timestamp
-        self.eventType = boundary.value
+        self.eventType = eventType.value
 
     def print(self):
         print(f"(pglEventTrial) Trial {self.eventType} at: {self.timestamp}")
@@ -1269,16 +1273,16 @@ class pglEventSegment(pglEvent):
         START = 'start'
         END = 'end'
 
-    def __init__(self, segmentNum = None, timestamp=None, boundary=None):
+    def __init__(self, segmentNum = None, timestamp=None, eventType=None):
         super().__init__(type="segment")
 
         # handle default
-        if boundary is None:
-            boundary = self.boundaryType.START
+        if eventType is None:
+            eventType = self.boundaryType.START
         
         # set attributes
         self.segmentNum = segmentNum
-        self.eventType = boundary.value
+        self.eventType = eventType.value
         self.timestamp = timestamp
 
     def print(self):
