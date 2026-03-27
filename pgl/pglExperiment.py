@@ -117,8 +117,8 @@ class pglExperiment(pglSettingsManager):
         if self.settings.flipUpDown: self.pgl.flipUpDown()
         
         # save screenWidth and screenHeight
-        self.state.screenWidth = self.pgl.screenWidth
-        self.state.screenHeight = self.pgl.screenHeight
+        self.state.screenWidthPixels = self.pgl.screenWidth.pix
+        self.state.screenHeightPixels = self.pgl.screenHeight.pix
         
         # add keyboard device if not already loaded
         keyboardDevices = self.pgl.devicesGet(pglKeyboardMouse)
@@ -239,31 +239,43 @@ class pglExperiment(pglSettingsManager):
         self.state.experimentDone = False
         self.state.volumeNumber = 0
 
+        # set manual pre-start (this will put up a screen and wait for start key
+        # before waiting for volume trigger
+        manualPreStart = True if self.settings.manualPreStart else False
+        
         # wait for key press to start experiment
         if self.settings.startKey is not [] or self.settings.startOnVolumeTrigger:
             self.state.experimentStarted = False
-            if self.settings.startOnVolumeTrigger:
-                self.pgl.text("Waiting for volume trigger to start experiment",y=0)
-            else:
-                self.pgl.text(f"Press {self.settings.startKey} key to start experiment",y=0)
-            # flush to display text
-            self.pgl.flush()
             while not self.state.experimentStarted:
+                if manualPreStart:
+                    self.pgl.text(f"Press {self.settings.startKey} key to make experiment start",y=0)
+                elif self.settings.startOnVolumeTrigger:
+                    self.pgl.text("Waiting for volume trigger to start experiment",y=0)
+                else:
+                    self.pgl.text(f"Press {self.settings.startKey} key to start experiment",y=0)
+                # flush to display text
+                self.pgl.flush()
                 # poll for events
                 events = self.pgl.poll()
                 self.data.events.extend(events)
 
                 # see if we have a match to startKey
-                if [e for e in events if e.type == "keyboard" and e.keyCode == self.state.startKeyCode]:
-                    self.state.experimentStarted = True
+                if [e for e in events if e.type == "keyboard" and e.eventType == "keydown" and e.keyCode == self.state.startKeyCode]:
+                    # end manual pre-start
+                    if manualPreStart:
+                        manualPreStart = False
+                    # or start experiment
+                    else:
+                        self.state.experimentStarted = True
                 
                 # if waiting to startOnVolumeTrigger, check for that key                
-                if self.settings.startOnVolumeTrigger:
-                    if [e for e in events if e.type == "keyboard" and e.keyCode == self.state.volumeTriggerKeyCode]:
-                        self.state.experimentStarted = True
-                        self.state.volumeNumber += 1
-                        # and add a volume event
-                        self.data.events.append(pglEventVolumeTrigger(timestamp=e.timestamp))
+                if self.settings.startOnVolumeTrigger and not manualPreStart:
+                    for e in events:
+                        if e.type == "keyboard" and e.eventType == "keydown" and e.keyCode == self.state.volumeTriggerKeyCode:
+                            self.state.experimentStarted = True
+                            self.state.volumeNumber += 1
+                            # and add a volume event
+                            self.data.events.append(pglEventVolumeTrigger(timestamp=e.timestamp))
                 
                 # Check for end key to allow aborting before starting    
                 if [e for e in events if e.type == "keyboard" and e.keyCode == self.state.endKeyCode]:
@@ -285,7 +297,7 @@ class pglExperiment(pglSettingsManager):
             if [e for e in events if e.type == "keyboard" and e.keyCode == self.state.endKeyCode]:
                 self.state.experimentDone = True
                 # end all running tasks
-                for task in self.state.currentTasks: task.end()
+                for task in self.currentTasks: task.end()
                 continue
 
             # Check for volume trigger key
@@ -305,9 +317,9 @@ class pglExperiment(pglSettingsManager):
             # update tasks in current phase
             phaseDone = False
             updateTime = self.pgl.getSecs()
-            for task in self.state.currentTasks:
+            for task in self.currentTasks:
                 # update task
-                task.update(updateTime=updateTime, subjectResponses=subjectResponses, phaseNum=self.state.phaseNum, tasks=self.state.currentTasks, events=events)
+                task.update(updateTime=updateTime, subjectResponses=subjectResponses, phaseNum=self.state.phaseNum, tasks=self.currentTasks, events=events)
                 # check if task is done
                 if task.done(): phaseDone = True
             
@@ -317,7 +329,7 @@ class pglExperiment(pglSettingsManager):
             # go to next phase or end experiment
             if phaseDone:
                 # end all tasks in current phase
-                for task in self.state.currentTasks: task.end()
+                for task in self.currentTasks: task.end()
                 # check if we have ended all phases
                 if self.state.phaseNum >= len(self.state.phaseNums)-1:
                     self.state.experimentDone = True
@@ -343,11 +355,11 @@ class pglExperiment(pglSettingsManager):
         self.state.phaseNum = phaseNum
         
         # get the current tasks based on the current phase number
-        self.state.currentTasks = [task for task in self.tasks if task.settings.phaseNum is None or task.settings.phaseNum == self.state.phaseNum]
+        self.currentTasks = [task for task in self.tasks if task.settings.phaseNum is None or task.settings.phaseNum == self.state.phaseNum]
 
         # set start time
         startTime = self.pgl.getSecs()
-        for task in self.state.currentTasks:
+        for task in self.currentTasks:
             task.start(startTime)
 
         print(f"(pglExperiment:startPhase) Starting phase: {self.state.phaseNum}/{len(self.state.phaseNums)}")
@@ -869,7 +881,7 @@ class pglExperimentState(pglSerialize):
     phaseNum: Optional[int] = None
     phaseNums: Optional[ListType[int]] = None    
     currentPhaseIndex: int = 0
-    currentTasks: ListType[pglTask] = field(default_factory=list)
+    #currentTasks: ListType[pglTask] = field(default_factory=list)
     openScreen: bool = False
     volumeNumber: int = 0
     experimentStarted: bool = False
@@ -878,6 +890,9 @@ class pglExperimentState(pglSerialize):
     startKeyCode: int = 0
     endKeyCode: int = 0
     volumeTriggerKeyCode: int = 0
+    screenWidthPixels: int = 0
+    screenHeightPixels: int = 0
+
 
 ##############################################
 # Settings for pglTask
