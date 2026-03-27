@@ -785,7 +785,7 @@ class pglSettings(pglSettingsEditable):
     endKey = Unicode("escape", allow_none=True, help="Key to end experiment")
     volumeTriggerKey = Unicode("`", allow_none=True, help="Key press that signals scanner volume acquisition trigger")
     responseKeys = Unicode("1234", help="Keys used for subject responses. Can be a string like \"1234\" or a comma-separated list like 'left,right,up,down' and will map to response 0,1,2,etc")
-    ignoreInitalVolumes = Int(0, min=0, step=1, help="Number of initial volumes to ignore")
+    ignoreInitialVolumes = Int(0, min=0, step=1, help="Number of initial volumes to ignore")
     eatKeys = Bool(True, help="Whether to eat keypresses so they don't propagate to the OS. Will only eat the keys specified above.")
     startOnVolumeTrigger = Bool(False, help="Whether to start the experiment on the volume trigger key")
     manualPreStart = Bool(False, help="Whether to manually start the experiment before the volume trigger")

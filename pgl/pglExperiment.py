@@ -242,6 +242,7 @@ class pglExperiment(pglSettingsManager):
         # set manual pre-start (this will put up a screen and wait for start key
         # before waiting for volume trigger
         manualPreStart = True if self.settings.manualPreStart else False
+        ignoreInitialVolumes = self.settings.ignoreInitialVolumes
         
         # wait for key press to start experiment
         if self.settings.startKey is not [] or self.settings.startOnVolumeTrigger:
@@ -272,10 +273,15 @@ class pglExperiment(pglSettingsManager):
                 if self.settings.startOnVolumeTrigger and not manualPreStart:
                     for e in events:
                         if e.type == "keyboard" and e.eventType == "keydown" and e.keyCode == self.state.volumeTriggerKeyCode:
-                            self.state.experimentStarted = True
-                            self.state.volumeNumber += 1
-                            # and add a volume event
-                            self.data.events.append(pglEventVolumeTrigger(timestamp=e.timestamp))
+                            if ignoreInitialVolumes>0:
+                                # ignore initial volumes
+                                ignoreInitialVolumes -= 1
+                            else:
+                                print(f"(pglExperiment:run) Ignored {self.settings.ignoreInitialVolumes} initial volumes.")
+                                self.state.experimentStarted = True
+                                self.state.volumeNumber += 1
+                                # and add a volume event
+                                self.data.events.append(pglEventVolumeTrigger(timestamp=e.timestamp))
                 
                 # Check for end key to allow aborting before starting    
                 if [e for e in events if e.type == "keyboard" and e.keyCode == self.state.endKeyCode]:
