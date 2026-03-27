@@ -116,10 +116,6 @@ class pglExperiment(pglSettingsManager):
         if self.settings.flipLeftRight: self.pgl.flipLeftRight()
         if self.settings.flipUpDown: self.pgl.flipUpDown()
         
-        # save screenWidth and screenHeight
-        self.state.screenWidthPixels = self.pgl.screenWidth.pix
-        self.state.screenHeightPixels = self.pgl.screenHeight.pix
-        
         # add keyboard device if not already loaded
         keyboardDevices = self.pgl.devicesGet(pglKeyboardMouse)
         if not keyboardDevices:
@@ -242,6 +238,7 @@ class pglExperiment(pglSettingsManager):
         # set manual pre-start (this will put up a screen and wait for start key
         # before waiting for volume trigger
         manualPreStart = True if self.settings.manualPreStart else False
+        manualPreStartVolumes = 0
         ignoreInitialVolumes = self.settings.ignoreInitialVolumes
         
         # wait for key press to start experiment
@@ -265,15 +262,19 @@ class pglExperiment(pglSettingsManager):
                     # end manual pre-start
                     if manualPreStart:
                         manualPreStart = False
+                        print(f"(pglExperiment:run) Manual pre-start ended after {manualPreStartVolumes} volumes.")
                     # or start experiment
                     else:
                         self.state.experimentStarted = True
                 
                 # if waiting to startOnVolumeTrigger, check for that key                
-                if self.settings.startOnVolumeTrigger and not manualPreStart:
+                if self.settings.startOnVolumeTrigger:
                     for e in events:
                         if e.type == "keyboard" and e.eventType == "keydown" and e.keyCode == self.state.volumeTriggerKeyCode:
-                            if ignoreInitialVolumes>0:
+                            if manualPreStart:
+                                # keep count of volumes
+                                manualPreStartVolumes += 1
+                            elif ignoreInitialVolumes>0:
                                 # ignore initial volumes
                                 ignoreInitialVolumes -= 1
                             else:
@@ -385,6 +386,9 @@ class pglExperiment(pglSettingsManager):
         
         # give user feedback where things are being saved
         print(f"(pglExperiment:save) Saving experiment data to: {dataDir}")
+        
+        # save pgl state
+        self.pgl.save(dataDir / "pgl.json")
         
         # save settings
         self.settings.save(dataDir / "settings.json")
@@ -896,9 +900,6 @@ class pglExperimentState(pglSerialize):
     startKeyCode: int = 0
     endKeyCode: int = 0
     volumeTriggerKeyCode: int = 0
-    screenWidthPixels: int = 0
-    screenHeightPixels: int = 0
-
 
 ##############################################
 # Settings for pglTask
