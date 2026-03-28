@@ -860,15 +860,18 @@ class pglExperimentData(pglSerialize):
         '''
         Display the experiment data.
         '''
-        # get infor from experiment if provided
+        if len(self.events) == 0:
+            print("(pglExperimentData) No events to display.")
+            return
+
+        # get info from experiment if provided
         if e is not None:
             self.volumeTriggerKey = e.settings.volumeTriggerKey
         else:
             self.volumeTriggerKey = ""
         
         # init timeline
-        timeline = timelinePlot(startTime=0, endTime=self.endTime-self.startTime)
-        
+        timeline = timelinePlot(startTime=0, endTime=max(self.endTime-self.startTime,10))
         # for each event, add to timeline
         for event in self.events:
             if event.type == "keyboard":
@@ -927,7 +930,9 @@ class pglTaskSettings(pglSettingsEditable):
             if not words:
                 return
             # convert to camelCase and save as taskSaveName
-            self.taskSaveName = words[0].lower() + "".join(word.capitalize() for word in words[1:])
+            firstWord = words[0][0].lower() + words[0][1:] if words[0] else ""
+            restWords = "".join(word[0].upper() + word[1:] if word else "" for word in words[1:])
+            self.taskSaveName = firstWord + restWords
         
     # observe changes in seglen, segmin, segmax to keep them in sync
     @observe("seglen", "segmin", "segmax")
