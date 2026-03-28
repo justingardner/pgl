@@ -1019,8 +1019,8 @@ class pglTaskData(pglSerialize):
         '''
         # get trial timestamps
         trialTimestamps = np.array([e.timestamp for e in self.events if isinstance(e, pglEventTrial)])
-        if len(trialTimestamps) == 0:
-            print("(pglTaskData:display) No trial events found to display.")
+        if len(trialTimestamps) < 2:
+            print("(pglTaskData:display) Insufficient trial events found to display.")
             return
         
         # get the max trial length
