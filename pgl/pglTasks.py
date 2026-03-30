@@ -121,7 +121,7 @@ class pglFixationTaskLeftRight(pglTask):
 class pglBarTask(pglTask):
     
     ########################
-    def __init__(self, pgl, volumePeriod=1.0, barSweepPeriod=12.0,sweepWidth=None,sweepHeight=None):
+    def __init__(self, pgl, volumePeriod=1.0, barSweepPeriod=15.0,sweepWidth=None,sweepHeight=None):
         super().__init__()
         
         # set task parameters, these will automatically be saved in the settings file
