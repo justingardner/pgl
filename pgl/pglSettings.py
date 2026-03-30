@@ -671,6 +671,7 @@ class pglSettingsSelect(pglSettingsEditable):
     
     # traits that can be edited
     settingsNames = List(Unicode(), help="Settings names")
+    #default = Bool(False, help="Whether this is the default settings")
     
     # Variable containing all the settings, this is set by calling class
     settings = []
