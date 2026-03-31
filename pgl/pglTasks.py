@@ -121,7 +121,7 @@ class pglFixationTaskLeftRight(pglTask):
 class pglBarTask(pglTask):
     
     ########################
-    def __init__(self, pgl, volumePeriod=1.0, barSweepPeriod=24.0,sweepWidth=None,sweepHeight=None):
+    def __init__(self, pgl, volumePeriod=1.0, barSweepPeriod=24.0,sweepWidth=None,sweepHeight=None,randomSeed=None):
         super().__init__()
         
         # set task parameters, these will automatically be saved in the settings file
@@ -157,7 +157,9 @@ class pglBarTask(pglTask):
         p = self.settings.fixedParameters
 
         # direction of bars
-        self.addParameter(pglParameter('directions',p['directions']))
+        dirParam = pglParameter('directions',p['directions'], randomSeed=randomSeed)
+        self.addParameter(dirParam)
+        self.settings.randomSeed = dirParam.randomSeed
         
         # initalize stimulus
         self.bars = pgl.bar(width=p['barWidth'], nVolumesPerSweep=p['nVolumesPerSweep'], sweepWidth=p['sweepWidth'], sweepHeight=p['sweepHeight'])
