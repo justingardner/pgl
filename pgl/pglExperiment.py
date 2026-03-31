@@ -493,6 +493,9 @@ class pglExperiment(pglSettingsManager):
         self.experimentSettings = pglSerialize.load(selectedDir / "experimentSettings.json")
         self.state = pglSerialize.load(selectedDir / "state.json")
         
+        # load pgl state
+        self.pglState = pglSerialize.load(selectedDir / "pgl.json")
+        
         # load all the tasks
         dirList = [d for d in selectedDir.iterdir() if d.is_dir()]
         dirList = sorted(dirList, key=lambda d: d.name)

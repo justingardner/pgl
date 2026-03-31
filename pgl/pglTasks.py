@@ -167,13 +167,11 @@ class pglBarTask(pglTask):
         self.bars.display(dir=self.currentParams['directions'], volumeNumber=self.e.state.volumeNumber)
         
     ########################
-    def getStimulusFrames(self, pgl, events, settings):
+    def getStimulusFrames(self, pgl, events, settings, screenWidth=800, screenHeight=600):
         p = self.settings.fixedParameters
         
         print(f"(pglBarTask:getStimulusFrames) Initializing bar stimulus with width={p['barWidth']}, nVolumesPerSweep={p['nVolumesPerSweep']}, sweepWidth={p['sweepWidth']}, sweepHeight={p['sweepHeight']}")
         self.bars = pgl.bar(width=p['barWidth'], nVolumesPerSweep=p['nVolumesPerSweep'], sweepWidth=p['sweepWidth'], sweepHeight=p['sweepHeight'])
-        screenWidth = 800
-        screenHeight = 600
         
         # initialize volume and trial number
         volumeNumber = 0
@@ -188,8 +186,17 @@ class pglBarTask(pglTask):
         frames = np.zeros((nVols, screenHeight, screenWidth, 4))
         print(f"(pglBarTask:getStimulusFrames) Capturing {nVols} frames")
 
+        # compute x and y coordinates
+        y, x = np.indices((screenHeight, screenWidth))
+        xDeg = np.degrees(2*np.arctan(((x - screenWidth/2)*(settings.displayWidth/screenWidth))/(2*settings.displayDistance)))
+        yDeg = np.degrees(2*np.arctan(((y - screenHeight/2)*(settings.displayHeight/screenHeight))/(2*settings.displayDistance)))        
+        
+        # compute time in seconds
+        timeStamps = [e.timestamp for e in events if e.type == 'volumeTrigger']
+        timeStamps = [t - timeStamps[0] for t in timeStamps]
+        
         # open screen for off screen rendering
-        pgl.open(0,settings.windowWidth,settings.windowHeight)
+        pgl.open(0,screenWidth,screenHeight)
         pgl.visualAngle(settings.displayDistance, settings.displayWidth, settings.displayHeight)
         pgl.clearScreen(0.5)
         pgl.frameGrabInit()
@@ -222,4 +229,4 @@ class pglBarTask(pglTask):
         pgl.close()
         
         # return frames
-        return frames
+        return frames, xDeg, yDeg, timeStamps
