@@ -1118,8 +1118,14 @@ class pglStimulusBar(_pglStimulus):
         '''
         Display the bar stimulus.
         '''
-        if self.volumeNumber is None:
-            self.initPass(volumeNumber=volumeNumber)
+        # If we are counting in volumes
+        if self.nVolumesPerSweep is not None:
+            if self.volumeNumber is None:
+                self.initPass(volumeNumber=volumeNumber)
+            # or end of pass
+            elif (volumeNumber - self.volumeNumber) == self.nVolumesPerSweep:
+                # reset for next pass
+                self.initPass(volumeNumber=volumeNumber)
 
         # rotate coordinate frame accordingly
         self.pgl.setTransformRotation(dir)
@@ -1140,18 +1146,14 @@ class pglStimulusBar(_pglStimulus):
         # display the bar
         self.barStimulus.display()
         
-        # check for end of pass
-        if self.nVolumesPerSweep is not None:
-            if volumeNumber - self.volumeNumber >= self.nVolumesPerSweep:
-                # reset for next pass
-                self.initPass(volumeNumber=volumeNumber)
+        # rotate coordinate frame back
+        self.pgl.setTransformRotation(0)
+
         # handle for modes in which passes are not synced to volumes
-        elif self.barStimulus.x > self.passEndX:
+        if self.nVolumesPerSweep is None and self.barStimulus.x > self.passEndX:
             # reset for next pass
             self.initPass(volumeNumber=volumeNumber)
 
-        # rotate coordinate frame back
-        self.pgl.setTransformRotation(0)
                   
     def initPass(self, volumeNumber=0):
         '''

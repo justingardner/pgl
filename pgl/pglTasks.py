@@ -121,7 +121,7 @@ class pglFixationTaskLeftRight(pglTask):
 class pglBarTask(pglTask):
     
     ########################
-    def __init__(self, pgl, volumePeriod=1.0, barSweepPeriod=15.0,sweepWidth=None,sweepHeight=None):
+    def __init__(self, pgl, volumePeriod=1.0, barSweepPeriod=24.0,sweepWidth=None,sweepHeight=None):
         super().__init__()
         
         # set task parameters, these will automatically be saved in the settings file
@@ -169,6 +169,8 @@ class pglBarTask(pglTask):
     ########################
     def getStimulusFrames(self, pgl, events, settings):
         p = self.settings.fixedParameters
+        
+        print(f"(pglBarTask:getStimulusFrames) Initializing bar stimulus with width={p['barWidth']}, nVolumesPerSweep={p['nVolumesPerSweep']}, sweepWidth={p['sweepWidth']}, sweepHeight={p['sweepHeight']}")
         self.bars = pgl.bar(width=p['barWidth'], nVolumesPerSweep=p['nVolumesPerSweep'], sweepWidth=p['sweepWidth'], sweepHeight=p['sweepHeight'])
         screenWidth = 800
         screenHeight = 600
@@ -182,7 +184,7 @@ class pglBarTask(pglTask):
         events = sorted(events + self.data.events, key=lambda event: event.timestamp)
 
         # pre-allocate frames array
-        nVols = len([e for e in events if e.type == 'keyboard' and e.eventType == 'keydown' and e.keyChar == "5"])
+        nVols = len([e for e in events if e.type == 'volumeTrigger'])
         frames = np.zeros((nVols, screenHeight, screenWidth, 4))
         print(f"(pglBarTask:getStimulusFrames) Capturing {nVols} frames")
 
@@ -195,27 +197,26 @@ class pglBarTask(pglTask):
 
         # cycle over events
         for e in events:
-            # find volume trigger events (Note, this is the old type, need to fix later
-            # for when we have actual pglVolumeTrigger events)
-            if e.type == 'keyboard' and e.eventType == 'keydown' and e.keyChar == "5":
+            # find volume trigger events
+            if e.type == 'volumeTrigger':
                 volumeNumber += 1
-            # This will need to be fixed to be trial, and e.eventType == 'start'
-            if e.type == 'pglEventTrial' and e.boundary== 'start':
+            # Find trial start events
+            if e.type == 'trial' and e.eventType == 'start':
+                #if (trialNumber == 0): startVolumeNumber = volumeNumber
                 # get the current direction for this trial
                 dir = self.data.params[trialNumber].get('directions',0)
                 # update trial number
                 trialNumber += 1
-            # once we are at the first volume, then make an image
-            if trialNumber >= 1 and volumeNumber >= 1:
+            # for each segment start, draw the bar stimulus
+            if e.type == 'segment' and e.eventType == 'start':
                 # draw the bar stimulus
                 self.bars.display(dir=dir, volumeNumber=volumeNumber)
                 pgl.flush()
                 # capture the frame
                 frames[volumeNumber-1] = pgl.frameGrab()
                 # print what frame we got
-                print(f"(pglBarTask:getStimulusFrames) Captured frame for dir={dir} volumeNumber={volumeNumber}/{nVols}")
+                print(f"(pglBarTask:getStimulusFrames) Captured frame for dir={dir} segmentNum = {e.segmentNum} volumeNumber={volumeNumber}/{nVols} phase: {volumeNumber-self.bars.volumeNumber})")
             
-
         # close screen        
         pgl.frameGrabEnd()
         pgl.close()
