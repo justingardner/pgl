@@ -659,9 +659,6 @@ class pglTask:
         # custom handling of events
         self.handleEvents(events)
         
-        # update the screen
-        self.updateScreen()
-
         # check for end of segment
         if self.waitUntilVolumeTrigger:
             if self.e.state.volumeNumber > self.lastVolumeNumber:
@@ -688,6 +685,9 @@ class pglTask:
                 if responseType is not None:
                     self.data.events.append(pglEventSubjectResponse(response=subjectResponse, timestamp=updateTime, responseType=responseType))
                 
+        # update the screen
+        self.updateScreen()
+
 
     def handleSubjectResponse(self, response, updateTime) -> None:
         '''
