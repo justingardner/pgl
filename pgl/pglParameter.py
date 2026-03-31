@@ -20,7 +20,7 @@ class pglParameter:
     '''
     Class representing a parameter in the experiment.
     '''
-    def __init__(self, name: str, validValues: list|tuple|np.ndarray, description: str=""):
+    def __init__(self, name: str, validValues: list|tuple|np.ndarray, description: str="", randomSeed=None):
         '''
         Initialize the parameter.
         
@@ -48,6 +48,9 @@ class pglParameter:
         self.currentTrial = -1
         self.blockNum = -1
         self.blockLen = 1
+        
+        # initialize random number generation
+        self.setRandomSeed(randomSeed)
 
     def __repr__(self):
         return f"pglParameter(name={self.name}, validValues={self.validValues}, description={self.description})"
@@ -61,6 +64,19 @@ class pglParameter:
 
         # display full string
         return f"{description}{self.name}: {self.validValues} (randomizationBlock={self.randomizationBlock})"
+
+    def setRandomSeed(self, randomSeed=None):
+        '''
+        Set the random seed for the parameter.
+        '''
+        # initialize random number generation
+        if randomSeed is None:
+            randomSeed = np.random.default_rng().integers(0, 2**32)
+        
+        # save randomSeed and start random number generator
+        self.randomSeed = randomSeed
+        self.rng = np.random.default_rng(randomSeed)
+
 
     def get(self):
         '''
@@ -85,7 +101,7 @@ class pglParameter:
         # compatible with tuples of parameters
         # from above and then shuffle
         parameterBlock = [(v,) for v in self.validValues]
-        random.shuffle(parameterBlock)
+        self.rng.shuffle(parameterBlock)
         
         # return the block
         return (paramNames, parameterBlock)
@@ -113,7 +129,7 @@ class pglParameterBlock(pglParameter):
     This is a subclass of pglParameter which allows you to group
     multiple parameters together into a single block.
     '''
-    def __init__(self, parameters: list, description: str=""):
+    def __init__(self, parameters: list, description: str="", randomSeed=None):
         '''
         Initialize the parameter block.
         
@@ -121,6 +137,8 @@ class pglParameterBlock(pglParameter):
             name (str): The name of the parameter block.
             parameters (list): A list of pglParameter instances to include in the block.
             description (str, optional): Description string describing the parameter block.
+            randomSeed (int, optional): Seed for random number generation. If None, a random seed is used.
+
         '''
         # validate parameters
         if not isinstance(parameters, list) or not all(isinstance(p, pglParameter) for p in parameters):
@@ -143,6 +161,9 @@ class pglParameterBlock(pglParameter):
         # get cartesian combination
         self.allParameterValues = list(itertools.product(*allParameterValues))
         self.name = ""
+        
+        # set random seed for the block
+        self.setRandomSeed(randomSeed)
 
     def __repr__(self):
         return f"pglParameterBlock(parameters={self.parameters}, description={self.description})"
@@ -166,6 +187,6 @@ class pglParameterBlock(pglParameter):
         calculate all combination of those parameters and return them for the task
         to run as a block of trials.
         '''
-        random.shuffle(self.allParameterValues)
+        self.rng.shuffle(self.allParameterValues)
         return (self.paramNames, self.allParameterValues)
 
