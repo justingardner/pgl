@@ -342,6 +342,11 @@ if _HAVE_PYLINK:
             """ draw the calibration target, i.e., a bull's eye"""
             
             print(f"(pglEyelink) Calibration target at ({x},{y})")
+            # this is a hack for now FIX, FIX, FIX to control the eccentricity
+            #w=self.pgl.screenWidth.pix
+            #h=self.pgl.screenHeight.pix
+            #x = (x-w/2)/2 + w/2
+            #y = (y-h/2)/2 + h/2
             # draw target as a filled circle with a cross
             self.pgl.circle(x=x, y=y, radius=self.targetSizePixels/2, color=self.foregroundColor, fill=True, units='pix')
             self.pgl.fixationCross(x=x, y=y, size=self.targetSizePixels, color=self.backgroundColor, units='pix')
