@@ -185,6 +185,59 @@ class pglEyelink(pglEyeTracker):
             print(f"(pglEyeTracker) Transfer failed. Error code: {result}")
             return False        
     
+    def setCustomCalibrationPoints(self, margin=0.2, numPoints=9):
+        """Set custom calibrtion points
+        
+        Args: 
+            margin: Location relative to edge for targets (percent of screen)            
+        """
+        # Set custom calibration targets based on screen size
+        # Margin as percentage from edge (0.2 = 20% from edge)
+        screenWidth = self.pgl.screenWidth.pix
+        screenHeight = self.pgl.screenHeight.pix
+        
+        # Calculate calibration positions based on number of points
+        # Default to 9-point calibration
+        points = [
+            (screenWidth//2, screenHeight//2),  # center
+            (screenWidth//2, int(screenHeight * margin)),  # top
+            (screenWidth//2, int(screenHeight * (1 - margin))),  # bottom
+            (int(screenWidth * margin), screenHeight//2),  # left
+            (int(screenWidth * (1 - margin)), screenHeight//2),  # right
+            (int(screenWidth * margin), int(screenHeight * margin)),  # top-left
+            (int(screenWidth * (1 - margin)), int(screenHeight * margin)),  # top-right
+            (int(screenWidth * margin), int(screenHeight * (1 - margin))),  # bottom-left
+            (int(screenWidth * (1 - margin)), int(screenHeight * (1 - margin))),  # bottom-right
+        ]
+
+        match numPoints:
+            case 5:
+                # Just use first 5 points
+                points = points[:5]  
+                self.eyelink.sendCommand("calibration_type = HV5")
+            case 9:
+                # Already set as default
+                self.eyelink.sendCommand("calibration_type = HV9")
+                pass
+            case 13:
+                # Add 4 mid-edge points to the 9-point layout
+                points.extend([
+                    (screenWidth//2, int(screenHeight * 0.5 * margin + screenHeight * 0.5 * 0.5)),  # top-mid
+                    (screenWidth//2, int(screenHeight * 0.5 * (1 - margin) + screenHeight * 0.5 * 0.5)),  # bottom-mid
+                    (int(screenWidth * 0.5 * margin + screenWidth * 0.5 * 0.5), screenHeight//2),  # left-mid
+                    (int(screenWidth * 0.5 * (1 - margin) + screenWidth * 0.5 * 0.5), screenHeight//2),  # right-mid
+                ])
+                self.eyelink.sendCommand("calibration_type = HV13")
+            case _:
+                print(f"(pglEyelink) Warning: {numPoints} points not supported, defaulting to 9")
+                self.eyelink.sendCommand("calibration_type = HV9")
+            
+        # send the calibration targets
+        calTargets = " ".join([f"{x},{y}" for x, y in points])
+        self.eyelink.sendCommand(f"calibration_targets = {calTargets}")
+        self.eyelink.sendCommand(f"validation_targets = {calTargets}")
+
+ 
     def calibrate(self):
         """Calibrate the eye tracker."""
         if self.eyelink is not None:
@@ -345,6 +398,7 @@ if _HAVE_PYLINK:
             # this is a hack for now FIX, FIX, FIX to control the eccentricity
             #w=self.pgl.screenWidth.pix
             #h=self.pgl.screenHeight.pix
+
             #x = (x-w/2)/2 + w/2
             #y = (y-h/2)/2 + h/2
             # draw target as a filled circle with a cross

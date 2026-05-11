@@ -51,6 +51,8 @@ class pglKeyboardMouse(pglDevice):
         # if eatKeys are passed in, set them
         if eatKeys is not None:
             self.listener.setEatKeys(keyString=eatKeys)
+        else:
+            self.eatKeyCodes = []
     
     def stop(self):
         '''
@@ -170,6 +172,7 @@ class pglKeyboardMouse(pglDevice):
         Args:
             keyCodes (list): List of key codes to eat.
         '''
+        self.eatKeyCodes = keyCodes
         if self.isRunning():
             self.listener.setEatKeys(keyCodes)
     
@@ -184,6 +187,10 @@ class pglKeyboardMouse(pglDevice):
         Returns:
             Character string or special key name
         """
+        # Handle list input recursively
+        if isinstance(keyCode, list):
+            return [self.keyCodeToChar(k) for k in keyCode]
+
         # Lowercase letter keycodes (without shift)
         keycodeMapLower = {
             0: 'a', 11: 'b', 8: 'c', 2: 'd', 14: 'e', 3: 'f', 5: 'g', 4: 'h',
@@ -272,11 +279,15 @@ class pglKeyboardMouse(pglDevice):
         Convert character representation to macOS keycode.
         
         Args:
-            char: Character string or special key name
+            char: Character string or special key name. If list, runs recursively on each element of list
             
         Returns:
             The macOS keycode, or None if not found
         """
+        # Handle list input recursively
+        if isinstance(char, list):
+            return [self.charToKeyCode(c) for c in char]
+
         # Letter keycodes (case-insensitive)
         charMapLetters = {
             'a': 0, 'b': 11, 'c': 8, 'd': 2, 'e': 14, 'f': 3, 'g': 5, 'h': 4,

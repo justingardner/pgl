@@ -139,6 +139,9 @@ class pglExperiment(pglSettingsManager):
         
         # clear the mouse and keyboard queues of any pending events
         keyboardMouse.clear()
+
+        # keep a pointer to keyboardMouse
+        self.keyboardMouse = keyboardMouse
         
         # If response keys is a comma-separated list, split it into a list (this is so you can do "1,space,F1,2"
         if ',' in self.settings.responseKeys:
@@ -201,11 +204,15 @@ class pglExperiment(pglSettingsManager):
         Args: 
             eat: bool (whether to eat all keys or not)
         '''
-        keyboardDevices = self.pgl.devicesGet(pglKeyboardMouse)
-        if keyboardDevices is not []:
-            for keyboardDevice in keyboardDevices:
-                keyboardDevice.listener.eatAllKeys = eat
+        return self.pgl.eatAllKeys(eat)
 
+    def setEatKeys(self, eatKeys=""):
+        '''
+        Args: 
+            eatKeys (list): list of characters to eat. e.g. ['return','esc','1']
+        '''
+        return self.pgl.setEatKeys(eatKeys)
+    
     def addTask(self, task):
         '''
         Add a task to the experiment.
