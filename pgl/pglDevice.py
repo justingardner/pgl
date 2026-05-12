@@ -14,7 +14,7 @@ import sys
 from time import sleep
 from typing import Optional
 from pgl import pglTimestamp
-from .pglEvent import pglEvent
+from .pglEvent import List, pglEvent
 from .pglEventListener import pglEventListener
 from dataclasses import dataclass
 
@@ -127,6 +127,30 @@ class pglDevices:
             pglDevice: The device instance if found, None otherwise.
         '''
         return [d for d in self.devices if isinstance(d, deviceType)]
+
+    def devicesGetKeyboard(self):
+        '''
+        Get a pglKeyboardMouse device from pgl. This assumes that there is only
+        one pglKeyboardMouse device in the devices list.
+
+        Returns:
+            pglDevice: The device instance if found, None otherwise.
+        '''
+        from .pglKeyboardMouse import pglKeyboardMouse
+        d = self.devicesGet(pglKeyboardMouse)
+        return d[0] if len(d) > 0 else None
+
+    def setEatKeys(self, keyCodes=None, keyChars=None):
+        '''
+        Set eat keys for keyboard device. This calls the function setEatKeys on the pglKeyboardMouse device if it exists.
+
+        Args:
+            keyCodes (list, optional): List of key codes to eat. Defaults to None.
+            keyChars (list, optional): List of key characters to eat. Defaults to None.
+        '''
+        keyboardDevice = self.devicesGetKeyboard()
+        if keyboardDevice is not None:
+            keyboardDevice.setEatKeys(keyCodes=keyCodes, keyChars=keyChars)
 
     def poll(self):
         """

@@ -13,7 +13,7 @@ import sys
 from time import sleep
 from typing import Optional
 from .pglEvent import pglEvent
-from .pglEventListener import pglEventListener
+from .pglEventListener import pglEventListener, keyCodeToChar, charToKeyCode
 from .pglDevice import pglDevice
 
 #############################
@@ -50,7 +50,7 @@ class pglKeyboardMouse(pglDevice):
         
         # if eatKeys are passed in, set them
         if eatKeys is not None:
-            self.listener.setEatKeys(keyString=eatKeys)
+            self.eatKeyCodes = self.listener.setEatKeys(keyString=eatKeys)
         else:
             self.eatKeyCodes = []
     
@@ -148,7 +148,7 @@ class pglKeyboardMouse(pglDevice):
             cmd = keyEvent.get('command', False)
             
             # Convert keycode to character (if possible)
-            keyChar = self.keyCodeToChar(keyCode, shift)
+            keyChar = keyCodeToChar(keyCode, shift)
             
             # Create event object
             eventList.append(pglEventKeyboard(
@@ -165,185 +165,30 @@ class pglKeyboardMouse(pglDevice):
 
         return eventList
     
-    def setEatKeys(self, keyCodes):
+    def setEatKeys(self, keyCodes=None, keyChars=None):
         '''
-        Set keys to eat so they don't propagate to the OS.
+        Set keys to eat so they don't propagate to the OS. 
 
         Args:
             keyCodes (list): List of key codes to eat.
+            keyChars (list): List of characters to eat (e.g., ["a", "b", "c", "space"]). Each character is converted to its key code.
         '''
-        self.eatKeyCodes = keyCodes
         if self.isRunning():
-            self.listener.setEatKeys(keyCodes)
+            self.eatKeyCodes = self.listener.setEatKeys(keyCodes, keyChars)
     
-    def keyCodeToChar(self, keyCode: int, shift: bool = False) -> Optional[str]:
-        """
-        Convert macOS keycode to character representation.
-        
-        Args:
-            keyCode: The macOS keycode
-            shift: Whether shift is pressed
-            
-        Returns:
-            Character string or special key name
-        """
-        # Handle list input recursively
-        if isinstance(keyCode, list):
-            return [self.keyCodeToChar(k) for k in keyCode]
+    def charToKeyCode(self, char):
+        '''
+        Convert a character to a key code using the charToKeyCode function.
+        '''
+        return charToKeyCode(char)
 
-        # Lowercase letter keycodes (without shift)
-        keycodeMapLower = {
-            0: 'a', 11: 'b', 8: 'c', 2: 'd', 14: 'e', 3: 'f', 5: 'g', 4: 'h',
-            34: 'i', 38: 'j', 40: 'k', 37: 'l', 46: 'm', 45: 'n', 31: 'o',
-            35: 'p', 12: 'q', 15: 'r', 1: 's', 17: 't', 32: 'u', 9: 'v',
-            13: 'w', 7: 'x', 16: 'y', 6: 'z',
-        }
+    def keyCodeToChar(self, keyCode, shift=False):
+        '''
+        Convert a key code to a character using the keyCodeToChar function.
+        '''
+        return keyCodeToChar(keyCode, shift)
         
-        # Uppercase letters (with shift)
-        keycodeMapUpper = {
-            0: 'A', 11: 'B', 8: 'C', 2: 'D', 14: 'E', 3: 'F', 5: 'G', 4: 'H',
-            34: 'I', 38: 'J', 40: 'K', 37: 'L', 46: 'M', 45: 'N', 31: 'O',
-            35: 'P', 12: 'Q', 15: 'R', 1: 'S', 17: 'T', 32: 'U', 9: 'V',
-            13: 'W', 7: 'X', 16: 'Y', 6: 'Z',
-        }
-        
-        # Numbers (without shift)
-        numberMap = {
-            29: '0', 18: '1', 19: '2', 20: '3', 21: '4',
-            23: '5', 22: '6', 26: '7', 28: '8', 25: '9',
-        }
-        
-        # Numbers with shift (symbols)
-        numberShiftMap = {
-            29: ')', 18: '!', 19: '@', 20: '#', 21: '$',
-            23: '%', 22: '^', 26: '&', 28: '*', 25: '(',
-        }
-        
-        # Punctuation without shift
-        punctuationMap = {
-            27: '-', 24: '=', 33: '[', 30: ']', 42: '\\',
-            41: ';', 39: "'", 43: ',', 47: '.', 44: '/', 50: '`',
-        }
-        
-        # Punctuation with shift
-        punctuationShiftMap = {
-            27: '_', 24: '+', 33: '{', 30: '}', 42: '|',
-            41: ':', 39: '"', 43: '<', 47: '>', 44: '?', 50: '~',
-        }
-        
-        # Special keys
-        specialKeys = {
-            49: 'space',
-            36: 'return',
-            48: 'tab',
-            51: 'delete',
-            53: 'escape',
-            76: 'enter',  # Numpad enter
-            123: 'left',
-            124: 'right',
-            125: 'down',
-            126: 'up',
-            122: 'f1', 120: 'f2', 99: 'f3', 118: 'f4', 96: 'f5', 97: 'f6',
-            98: 'f7', 100: 'f8', 101: 'f9', 109: 'f10', 103: 'f11', 111: 'f12',
-        }
-       
-        # Check special keys first
-        if keyCode in specialKeys:
-            return specialKeys[keyCode]
-        
-        # Check letters
-        if shift:
-            if keyCode in keycodeMapUpper:
-                return keycodeMapUpper[keyCode]
-        else:
-            if keyCode in keycodeMapLower:
-                return keycodeMapLower[keyCode]
-        
-        # Check numbers and symbols
-        if shift:
-            if keyCode in numberShiftMap:
-                return numberShiftMap[keyCode]
-            if keyCode in punctuationShiftMap:
-                return punctuationShiftMap[keyCode]
-        else:
-            if keyCode in numberMap:
-                return numberMap[keyCode]
-            if keyCode in punctuationMap:
-                return punctuationMap[keyCode]
-        
-        # Unknown keycode
-        return f'<keycode:{keyCode}>'
-    
-    def charToKeyCode(self, char: str) -> Optional[int]:
-        """
-        Convert character representation to macOS keycode.
-        
-        Args:
-            char: Character string or special key name. If list, runs recursively on each element of list
-            
-        Returns:
-            The macOS keycode, or None if not found
-        """
-        # Handle list input recursively
-        if isinstance(char, list):
-            return [self.charToKeyCode(c) for c in char]
 
-        # Letter keycodes (case-insensitive)
-        charMapLetters = {
-            'a': 0, 'b': 11, 'c': 8, 'd': 2, 'e': 14, 'f': 3, 'g': 5, 'h': 4,
-            'i': 34, 'j': 38, 'k': 40, 'l': 37, 'm': 46, 'n': 45, 'o': 31,
-            'p': 35, 'q': 12, 'r': 15, 's': 1, 't': 17, 'u': 32, 'v': 9,
-            'w': 13, 'x': 7, 'y': 16, 'z': 6,
-            'A': 0, 'B': 11, 'C': 8, 'D': 2, 'E': 14, 'F': 3, 'G': 5, 'H': 4,
-            'I': 34, 'J': 38, 'K': 40, 'L': 37, 'M': 46, 'N': 45, 'O': 31,
-            'P': 35, 'Q': 12, 'R': 15, 'S': 1, 'T': 17, 'U': 32, 'V': 9,
-            'W': 13, 'X': 7, 'Y': 16, 'Z': 6,
-        }
-        
-        # Numbers and symbols
-        charMapNumbers = {
-            '0': 29, '1': 18, '2': 19, '3': 20, '4': 21,
-            '5': 23, '6': 22, '7': 26, '8': 28, '9': 25,
-            ')': 29, '!': 18, '@': 19, '#': 20, '$': 21,
-            '%': 23, '^': 22, '&': 26, '*': 28, '(': 25,
-        }
-        
-        # Punctuation
-        charMapPunctuation = {
-            '-': 27, '_': 27, '=': 24, '+': 24,
-            '[': 33, '{': 33, ']': 30, '}': 30,
-            '\\': 42, '|': 42, ';': 41, ':': 41,
-            "'": 39, '"': 39, ',': 43, '<': 43,
-            '.': 47, '>': 47, '/': 44, '?': 44,
-            '`': 50, '~': 50,
-        }
-        
-        # Special keys (case-insensitive)
-        charMapSpecial = {
-            'space': 49, 'return': 36, 'tab': 48, 'delete': 51,
-            'escape': 53, 'esc': 53, 'enter': 76,
-            'left': 123, 'right': 124, 'down': 125, 'up': 126,
-            'f1': 122, 'f2': 120, 'f3': 99, 'f4': 118, 'f5': 96, 'f6': 97,
-            'f7': 98, 'f8': 100, 'f9': 101, 'f10': 109, 'f11': 103, 'f12': 111,
-        }
-        
-        # Try letters first
-        if char in charMapLetters:
-            return charMapLetters[char]
-        
-        # Try numbers/symbols
-        if char in charMapNumbers:
-            return charMapNumbers[char]
-        
-        # Try punctuation
-        if char in charMapPunctuation:
-            return charMapPunctuation[char]
-        
-        # Try special keys (case-insensitive)
-        if char.lower() in charMapSpecial:
-            return charMapSpecial[char.lower()]
-        
-        return None
 #############################
 # keyboard device (pynput implementation)
 # Pynput does not provide ability to
@@ -510,7 +355,7 @@ class pglPynputKeyboard(pglDevice):
         Poll the key queue for events.
         '''
         eventList = []
-        if not self.isRunning: return eventList
+        if not self.isRunning(): return eventList
 
         while not self.keyQueue.empty():
             key, timestamp, shift, ctrl, alt, cmd = self.keyQueue.get()
@@ -526,6 +371,8 @@ class pglPynputKeyboard(pglDevice):
             # put in event list
             eventList.append(pglEventKeyboard(keyChar, keyCode, key, timestamp, shift, ctrl, alt, cmd, "keydown"))
         return eventList
+    
+    
 
 ###################################
 # Keyboard event

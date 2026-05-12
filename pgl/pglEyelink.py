@@ -46,6 +46,7 @@ class pglEyelink(pglEyeTracker):
         
         if not self.eyelinkIsAvailable(eyelinkAddress=eyelinkAddress):
             print(f"(pglEyelink) No Eyelink found at {eyelinkAddress}.")
+            self.eyelink = None
             return
         
         # create an eyelink instance
