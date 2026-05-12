@@ -13,6 +13,7 @@ import numpy as np
 from pynput import keyboard
 from pgl import pglEyeTracker
 from pgl import pglEventKeyboard
+import socket
 
 try:
     import pylink
@@ -36,12 +37,17 @@ class pglEyelink(pglEyeTracker):
         """
         # call superclass constructor
         super().__init__(pgl, deviceType)
-
         # get library
         if not _HAVE_PYLINK:
             print("(pglEyelink) pylink is not installed. Please install it from SR-Research website to use Eyelink.")
             return
-
+        
+        print(f"(pglEyelink) Attempting to connect to Eyelink at {eyelinkAddress}...")
+        
+        if not self.eyelinkIsAvailable(eyelinkAddress=eyelinkAddress):
+            print(f"(pglEyelink) No Eyelink found at {eyelinkAddress}.")
+            return
+        
         # create an eyelink instance
         try:
             self.eyelink = pylink.EyeLink(eyelinkAddress)
@@ -65,6 +71,16 @@ class pglEyelink(pglEyeTracker):
             pylink.openGraphicsEx(self.customDisplay)
             
             print(f"(pglEyelink) Using pgl display for Eyelink calibration and validation.")
+
+    @staticmethod
+    def eyelinkIsAvailable(eyelinkAddress="100.1.1.1", eyelinkPort=4000, timeout=3.0):
+        """Check if EyeLink host PC is reachable before initializing pylink."""
+        try:
+            sock = socket.create_connection((eyelinkAddress, eyelinkPort), timeout=timeout)
+            sock.close()
+            return True
+        except (socket.timeout, socket.error, OSError):
+            return False
 
     def __del__(self):
         """Destructor to clean up resources."""
