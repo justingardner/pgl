@@ -74,15 +74,36 @@ class pglEyelink(pglEyeTracker):
             print(f"(pglEyelink) Using pgl display for Eyelink calibration and validation.")
 
     @staticmethod
-    def eyelinkIsAvailable(eyelinkAddress="100.1.1.1", eyelinkPort=4000, timeout=3.0):
+    def eyelinkIsAvailable(eyelinkAddress="100.1.1.1", timeout=3.0):
         """Check if EyeLink host PC is reachable before initializing pylink."""
-        try:
-            sock = socket.create_connection((eyelinkAddress, eyelinkPort), timeout=timeout)
-            sock.close()
-            return True
-        except (socket.timeout, socket.error, OSError):
+        import threading        
+        result = {'available': False, 'tracker': None}
+        
+        def tryConnect():
+            try:
+                tracker = pylink.EyeLink(eyelinkAddress)
+                result['available'] = True
+                result['tracker'] = tracker
+            except Exception:
+                result['available'] = False
+        
+        thread = threading.Thread(target=tryConnect)
+        thread.daemon = True
+        thread.start()
+        thread.join(timeout)
+        
+        if thread.is_alive():
+            # Timeout occurred - connection attempt still hanging
             return False
-
+        
+        # Clean up if connection succeeded
+        if result['tracker'] is not None:
+            try:
+                result['tracker'].close()
+            except Exception:
+                pass
+        
+        return result['available']
     def __del__(self):
         """Destructor to clean up resources."""
         if self.eyelink is not None:
@@ -278,19 +299,24 @@ class pglEyelink(pglEyeTracker):
             
                 # Wait briefly for mode switch
                 pylink.msecDelay(50)
-            
+
+                # get current eat codes
+                k = self.pgl.devicesGetKeyboard()            
+                eatKeys = k.eatKeyCodes
+
                 # eat relevant keys
-                eatKeys = self.pgl.eatKeyCodes
-                self.pgl.setEatKeys(keyChars=['enter', 'c', 'v', 'q', '0'])
+                self.pgl.setEatKeys(keyChars=['return', 'c', 'v', 'q', '0'])
                 
                 # Now do the setup
                 self.eyelink.doTrackerSetup()
-                
-                # reset eatkeys
-                self.pgl.setEatKeys(eatKeys)
-                
+
             except Exception as e:
                 print(f"(pglEyelink) Error during calibration: {e}")
+
+            finally:
+                # reset eatkeys
+                self.pgl.setEatKeys(eatKeys)
+  
         else:
             print("(pglEyelink) ❌ Eyelink is not initialized.")
 
@@ -353,6 +379,9 @@ if _HAVE_PYLINK:
                 'space': ord(' '),
                 'escape': pylink.ESC_KEY,
                 'tab': ord('\t'),
+                # Map q and 0 to ESC for quitting calibration
+                'q': pylink.ESC_KEY,
+                '0': pylink.ESC_KEY,
             }
             
         def __str__(self):
@@ -455,11 +484,11 @@ if _HAVE_PYLINK:
                     
                     # Build modifier mask
                     modifier = 0
-                    if event.shift: modifier |= pylink.KMOD_SHIFT
-                    if event.ctrl: modifier |= pylink.KMOD_CTRL
-                    if event.alt: modifier |= pylink.KMOD_ALT
-                    if event.cmd: modifier |= pylink.KMOD_META
-                    
+                    if event.shift: modifier |= 0x0001  # KMOD_LSHIFT
+                    if event.ctrl:  modifier |= 0x0040  # KMOD_LCTRL
+                    if event.alt:   modifier |= 0x0100  # KMOD_LALT
+                    if event.cmd:   modifier |= 0x0400  # KMOD_LMETA (Mac Command key)
+                      
                     # Use keyChar (the string), not key (the dictionary)
                     keyChar = event.keyChar
                     keyCode = event.keyCode
