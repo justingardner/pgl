@@ -39,13 +39,13 @@ class pglEyelink(pglEyeTracker):
         super().__init__(pgl, deviceType)
         # get library
         if not _HAVE_PYLINK:
-            print("(pglEyelink) pylink is not installed. Please install it from SR-Research website to use Eyelink.")
+            print("(pglEyelink) ❌ pylink is not installed. Please install it from SR-Research website to use Eyelink.")
             return
         
         print(f"(pglEyelink) Attempting to connect to Eyelink at {eyelinkAddress}...")
         
         if not self.eyelinkIsAvailable(eyelinkAddress=eyelinkAddress):
-            print(f"(pglEyelink) No Eyelink found at {eyelinkAddress}.")
+            print(f"(pglEyelink) ❌ No Eyelink found at {eyelinkAddress}.")
             self.eyelink = None
             return
         
@@ -96,7 +96,10 @@ class pglEyelink(pglEyeTracker):
 
     def start(self):
         """Start eye tracking."""
-       
+        if self.eyelink is None:
+            print("(pglEyelink) ❌ Cannot start recording: Eyelink is not initialized")
+            return
+                  
         error = self.eyelink.startRecording(1,1,1,1)
         pylink.pumpDelay(100)
 
@@ -140,6 +143,10 @@ class pglEyelink(pglEyeTracker):
         
     def stop(self):
         """Stop eye tracking."""
+        if self.eyelink is None:
+            print("(pglEyelink) ❌ Cannot stop recording: Eyelink is not initialized")
+            return False
+        
         # Add small delay before stopping
         pylink.pumpDelay(100)
     
@@ -208,6 +215,10 @@ class pglEyelink(pglEyeTracker):
         Args: 
             margin: Location relative to edge for targets (percent of screen)            
         """
+        if self.eyelink is None:
+            print("(pglEyelink:setCustomCalibrationPoints) ❌ Eyelink is not initialized.")
+            return
+        
         # Set custom calibration targets based on screen size
         # Margin as percentage from edge (0.2 = 20% from edge)
         screenWidth = self.pgl.screenWidth.pix
@@ -254,11 +265,10 @@ class pglEyelink(pglEyeTracker):
         self.eyelink.sendCommand(f"calibration_targets = {calTargets}")
         self.eyelink.sendCommand(f"validation_targets = {calTargets}")
 
- 
     def calibrate(self):
         """Calibrate the eye tracker."""
         if self.eyelink is not None:
-            print("(pglEyelink) Starting calibration routine")
+            print("(pglEyelink:calibrate) Starting calibration routine")
             print("             Enter: Show camera image")
             print("             C: (C)alibrate V: (V)alidate")
             print("             0 or Q: (Q)uit calibration")
@@ -269,12 +279,20 @@ class pglEyelink(pglEyeTracker):
                 # Wait briefly for mode switch
                 pylink.msecDelay(50)
             
+                # eat relevant keys
+                eatKeys = self.pgl.eatKeyCodes
+                self.pgl.setEatKeys(keyChars=['enter', 'c', 'v', 'q', '0'])
+                
                 # Now do the setup
                 self.eyelink.doTrackerSetup()
+                
+                # reset eatkeys
+                self.pgl.setEatKeys(eatKeys)
+                
             except Exception as e:
                 print(f"(pglEyelink) Error during calibration: {e}")
         else:
-            print("(pglEyelink) Eyelink is not initialized.")
+            print("(pglEyelink) ❌ Eyelink is not initialized.")
 
 # define the custom display class for eyelink
 if _HAVE_PYLINK:
@@ -412,12 +430,7 @@ if _HAVE_PYLINK:
             """ draw the calibration target, i.e., a bull's eye"""
             
             print(f"(pglEyelink) Calibration target at ({x},{y})")
-            # this is a hack for now FIX, FIX, FIX to control the eccentricity
-            #w=self.pgl.screenWidth.pix
-            #h=self.pgl.screenHeight.pix
 
-            #x = (x-w/2)/2 + w/2
-            #y = (y-h/2)/2 + h/2
             # draw target as a filled circle with a cross
             self.pgl.circle(x=x, y=y, radius=self.targetSizePixels/2, color=self.foregroundColor, fill=True, units='pix')
             self.pgl.fixationCross(x=x, y=y, size=self.targetSizePixels, color=self.backgroundColor, units='pix')

@@ -272,14 +272,13 @@ class pglEventListener:
                     print(f"(pglEventListener) Warning: Could not convert '{char}' to keycode")
     
         # Remove duplicates
-        print(allKeyCodes)
         allKeyCodes = list(set(allKeyCodes))
     
         # Call C extension to set which keys to suppress at OS level
         _pglEventListener.setEatKeys(allKeyCodes)
     
         if allKeyCodes:
-            print(f"(pglEventListener) Eating {len(allKeyCodes)} keys: {sorted(allKeyCodes)}")
+            print(f"(pglEventListener) Eating {len(allKeyCodes)} keys: {sorted(keyCodeToChar(allKeyCodes))}")
         else:
             print("(pglEventListener) Not eating any keys")
             
