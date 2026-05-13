@@ -162,6 +162,11 @@ class pglEyelink(pglEyeTracker):
             print(f"(pglEyeTracker) Exception opening file: {e}")
             return False
         
+    def sendMessage(self, message):
+        '''sendMessage'''
+        print(f"(pglEyelink:sendMessage) Sending message {message}")
+        self.eyelink.sendMessage(message)
+
     def stop(self):
         """Stop eye tracking."""
         if self.eyelink is None:
