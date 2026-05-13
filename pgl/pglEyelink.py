@@ -14,6 +14,7 @@ from pynput import keyboard
 from pgl import pglEyeTracker
 from pgl import pglEventKeyboard
 import socket
+import os
 
 try:
     import pylink
@@ -572,4 +573,544 @@ if _HAVE_PYLINK:
         def alert_printf(self, msg):
             print(msg)
 
+class pglEyelinkData:
+    """Parser for EyeLink .asc files."""
+    
+    def __init__(self, filename):
+        self.filename = filename
+        self.data = {
+            'messages': [],
+            'metadata': [],
+            'recordingBlocks': []
+        }
+        self.tempSamples = []
+        self.tempMessages = []
+        self.tempFixations = []
+        self.tempSaccades = []
+        self.tempBlinks = []
+        self.currentBlock = None
+        self.inRecording = False
+        self.isBinocular = None  # Explicitly None until determined
+        self.hasVelocity = False
+        self.hasResolution = False
+        
+        self._validateFile()
+        self.parse()
+    def __str__(self):
+        """String representation of parsed data."""
+        numSamples = len(self.tempSamples) if hasattr(self, 'tempSamples') else len(self.data.get('samples', {}).get('time', []))
+        numBlocks = len(self.data.get('recordingBlocks', []))
+        
+        # Calculate duration of each block
+        blockDurations = []
+        for block in self.data.get('recordingBlocks', []):
+            if block.get('startTime') is not None and block.get('endTime') is not None:
+                durationMs = block['endTime'] - block['startTime']
+                durationSec = durationMs / 1000.0  # Convert from milliseconds to seconds
+                blockDurations.append(durationSec)
+        
+        durationsStr = ', '.join([f"{d:.2f}s" for d in blockDurations]) if blockDurations else "N/A"
+        
+        return f"pglEyelinkData('{self.filename}', {numSamples} samples, {numBlocks} blocks, durations: [{durationsStr}])"
 
+    def __repr__(self):
+        """String representation of parsed data."""
+        return self.__str__()
+    
+    def _validateFile(self):
+        """Validate that the file exists and appears to be an .asc file."""
+        # Check file exists
+        if not os.path.exists(self.filename):
+            raise FileNotFoundError(f"File not found: {self.filename}")
+        
+        # Check file extension
+        if not self.filename.lower().endswith('.asc'):
+            raise ValueError(f"File does not have .asc extension: {self.filename}")
+        
+        # Check file is readable and not empty
+        if not os.path.isfile(self.filename):
+            raise ValueError(f"Not a file: {self.filename}")
+        
+        if os.path.getsize(self.filename) == 0:
+            raise ValueError(f"File is empty: {self.filename}")
+        
+        # Try to open and read first line to verify it's readable
+        try:
+            with open(self.filename, 'r') as f:
+                firstLine = f.readline()
+                if not firstLine:
+                    raise ValueError(f"Could not read from file: {self.filename}")
+        except Exception as e:
+            raise IOError(f"Error opening file {self.filename}: {e}")
+    
+    def parse(self):
+        """Parse the .asc file and return structured data."""
+        try:
+            lineCount = 0
+            sampleLineCount = 0
+            
+            with open(self.filename, 'r') as f:
+                for line in f:
+                    lineCount += 1
+                    line = line.strip()
+                    if not line:
+                        continue
+                    
+                    tokens = line.split()
+                    if not tokens:
+                        continue
+                    
+                    # Debug: check if we're finding sample lines
+                    if tokens[0].isdigit():
+                        sampleLineCount += 1
+                        if sampleLineCount <= 3:  # Print first few
+                            print(f"Sample line {sampleLineCount}: {line}")
+                            print(f"  inRecording: {self.inRecording}")
+                            print(f"  isBinocular: {self.isBinocular}")
+                    
+                    self._parseLine(tokens, line)
+            
+            print(f"\nTotal lines: {lineCount}")
+            print(f"Sample lines found: {sampleLineCount}")
+            print(f"Samples parsed: {len(self.tempSamples)}")
+            print(f"isBinocular was set to: {self.isBinocular}")
+            print(f"inRecording was: {self.inRecording}")
+            
+        except Exception as e:
+            raise IOError(f"Error parsing file {self.filename}: {e}")
+            
+        # Finalize last block if still recording
+        if self.inRecording:
+            self._finalizeCurrentBlock()
+        
+        # Verify that we determined the recording format
+        if self.isBinocular is None and len(self.tempSamples) > 0:
+            raise ValueError("Could not determine if recording is monocular or binocular. Missing SAMPLES configuration line.")
+        
+        # Convert lists to arrays (for the entire file)
+        self.data['samples'] = self._listsToArrays(self.tempSamples)
+        self.data['fixations'] = self._listsToArrays(self.tempFixations)
+        self.data['saccades'] = self._listsToArrays(self.tempSaccades)
+        self.data['blinks'] = self._listsToArrays(self.tempBlinks)
+        self.data['messages'] = self._listsToArrays(self.tempMessages) 
+        
+        return self.data
+    
+    def _parseLine(self, tokens, rawLine):
+        """Route line to appropriate parser based on first token."""
+        firstToken = tokens[0]
+        
+        if firstToken.startswith('**'):
+            self.data['metadata'].append(rawLine)
+            
+        elif firstToken == 'START':
+            self._handleStart(tokens)
+            
+        elif firstToken == 'END':
+            self._handleEnd(tokens)
+            
+        elif firstToken == 'SAMPLES':
+            self._parseSamplesConfig(tokens)
+            
+        elif firstToken == 'EVENTS':
+            self._parseEventsConfig(tokens)
+            
+        elif firstToken == 'MSG':
+            self.tempMessages.append(self._parseMsgLine(tokens))  
+            
+        elif firstToken == 'EFIX':
+            if self.inRecording:
+                self.tempFixations.append(self._parseFixationLine(tokens))
+            
+        elif firstToken == 'ESACC':
+            if self.inRecording:
+                self.tempSaccades.append(self._parseSaccadeLine(tokens))
+            
+        elif firstToken == 'EBLINK':
+            if self.inRecording:
+                self.tempBlinks.append(self._parseBlinkLine(tokens))
+            
+        elif firstToken in ['SFIX', 'SSACC', 'SBLINK']:
+            pass
+            
+        elif firstToken.isdigit():
+            if self.inRecording:
+                # Check if we know the format before parsing samples
+                if self.isBinocular is None:
+                    raise ValueError(f"Encountered sample data before SAMPLES configuration line at: {rawLine}")
+                self.tempSamples.append(self._parseSampleLine(tokens))
+            
+        elif firstToken in ['PRESCALER', 'VPRESCALER', 'PUPIL']:
+            # Recording configuration lines
+            self.data['metadata'].append(rawLine)
+            
+        else:
+            self.data['metadata'].append(rawLine)
+    
+    def _handleStart(self, tokens):
+        """Handle START line: START timestamp eye SAMPLES EVENTS"""
+        self.inRecording = True
+        self.currentBlock = {
+            'startTime': int(tokens[1]) if len(tokens) > 1 else None,
+            'eye': tokens[2] if len(tokens) > 2 else None,
+            'startIndex': len(self.tempSamples)
+        }
+    
+    def _handleEnd(self, tokens):
+        """Handle END line: END timestamp eye SAMPLES EVENTS RES..."""
+        if self.inRecording:
+            self._finalizeCurrentBlock()
+            if self.currentBlock:
+                self.currentBlock['endTime'] = int(tokens[1]) if len(tokens) > 1 else None
+                self.currentBlock['endIndex'] = len(self.tempSamples)
+                self.data['recordingBlocks'].append(self.currentBlock)
+            self.currentBlock = None
+            self.inRecording = False
+    
+    def _finalizeCurrentBlock(self):
+        """Finalize the current recording block."""
+        if self.currentBlock:
+            self.currentBlock['endIndex'] = len(self.tempSamples)
+    
+    def _parseSamplesConfig(self, tokens):
+        """Parse SAMPLES configuration line to determine data format."""
+        config = {
+            'dataType': tokens[1] if len(tokens) > 1 else None,  # GAZE, HREF, etc.
+            'eyes': [],
+            'rate': None,
+            'tracking': None,
+            'filter': None
+        }
+        
+        # Find which eyes are recorded
+        eyesFound = []
+        if 'LEFT' in tokens:
+            eyesFound.append('LEFT')
+        if 'RIGHT' in tokens:
+            eyesFound.append('RIGHT')
+        
+        config['eyes'] = eyesFound
+        
+        # Set binocular flag - must have exactly 2 eyes
+        if len(eyesFound) == 2:
+            self.isBinocular = True
+        elif len(eyesFound) == 1:
+            self.isBinocular = False
+        else:
+            raise ValueError(f"Could not determine eye configuration from SAMPLES line: {' '.join(tokens)}")
+        
+        # Get sample rate
+        if 'RATE' in tokens:
+            rateIdx = tokens.index('RATE')
+            if rateIdx + 1 < len(tokens):
+                config['rate'] = float(tokens[rateIdx + 1])
+        
+        # Get tracking mode
+        if 'TRACKING' in tokens:
+            trackIdx = tokens.index('TRACKING')
+            if trackIdx + 1 < len(tokens):
+                config['tracking'] = tokens[trackIdx + 1]
+        
+        # Get filter level
+        if 'FILTER' in tokens:
+            filterIdx = tokens.index('FILTER')
+            if filterIdx + 1 < len(tokens):
+                config['filter'] = int(tokens[filterIdx + 1])
+        
+        self.data['samplesConfig'] = config
+    
+    def _parseEventsConfig(self, tokens):
+        """Parse EVENTS configuration line."""
+        config = {
+            'dataType': tokens[1] if len(tokens) > 1 else None,
+            'eyes': [],
+            'rate': None,
+            'tracking': None,
+            'filter': None
+        }
+        
+        # Find which eyes are recorded
+        if 'LEFT' in tokens:
+            config['eyes'].append('LEFT')
+        if 'RIGHT' in tokens:
+            config['eyes'].append('RIGHT')
+        
+        # Get event rate
+        if 'RATE' in tokens:
+            rateIdx = tokens.index('RATE')
+            if rateIdx + 1 < len(tokens):
+                config['rate'] = float(tokens[rateIdx + 1])
+        
+        # Get tracking mode
+        if 'TRACKING' in tokens:
+            trackIdx = tokens.index('TRACKING')
+            if trackIdx + 1 < len(tokens):
+                config['tracking'] = tokens[trackIdx + 1]
+        
+        # Get filter level
+        if 'FILTER' in tokens:
+            filterIdx = tokens.index('FILTER')
+            if filterIdx + 1 < len(tokens):
+                config['filter'] = int(tokens[filterIdx + 1])
+        
+        self.data['eventsConfig'] = config
+    
+    def _parseSampleLine(self, tokens):
+        """Parse a sample line into a dict based on monocular/binocular format."""        # Remove trailing '...' if present
+        # Remove trailing '...' if present (must check before counting tokens)
+        if len(tokens) > 0 and tokens[-1] == '...':
+            tokens = tokens[:-1]
+    
+        
+        numTokens = len(tokens)
+        sample = {}
+        
+        # Parse timestamp (always first)
+        sample['time'] = int(tokens[0])
+        
+        if self.isBinocular:
+            # Binocular formats
+            if numTokens == 7:
+                # Binocular: time xpl ypl psl xpr ypr psr
+                sample['xLeft'] = float(tokens[1])
+                sample['yLeft'] = float(tokens[2])
+                sample['pupilLeft'] = float(tokens[3])
+                sample['xRight'] = float(tokens[4])
+                sample['yRight'] = float(tokens[5])
+                sample['pupilRight'] = float(tokens[6])
+                
+            elif numTokens == 11:
+                # Binocular with velocity: time xpl ypl psl xpr ypr psr xvl yvl xvr yvr
+                sample['xLeft'] = float(tokens[1])
+                sample['yLeft'] = float(tokens[2])
+                sample['pupilLeft'] = float(tokens[3])
+                sample['xRight'] = float(tokens[4])
+                sample['yRight'] = float(tokens[5])
+                sample['pupilRight'] = float(tokens[6])
+                sample['xVelLeft'] = float(tokens[7])
+                sample['yVelLeft'] = float(tokens[8])
+                sample['xVelRight'] = float(tokens[9])
+                sample['yVelRight'] = float(tokens[10])
+                self.hasVelocity = True
+                
+            elif numTokens == 9:
+                # Binocular with resolution: time xpl ypl psl xpr ypr psr xr yr
+                sample['xLeft'] = float(tokens[1])
+                sample['yLeft'] = float(tokens[2])
+                sample['pupilLeft'] = float(tokens[3])
+                sample['xRight'] = float(tokens[4])
+                sample['yRight'] = float(tokens[5])
+                sample['pupilRight'] = float(tokens[6])
+                sample['xRes'] = float(tokens[7])
+                sample['yRes'] = float(tokens[8])
+                self.hasResolution = True
+                
+            elif numTokens == 13:
+                # Binocular with velocity and resolution: time xpl ypl psl xpr ypr psr xvl yvl xvr yvr xr yr
+                sample['xLeft'] = float(tokens[1])
+                sample['yLeft'] = float(tokens[2])
+                sample['pupilLeft'] = float(tokens[3])
+                sample['xRight'] = float(tokens[4])
+                sample['yRight'] = float(tokens[5])
+                sample['pupilRight'] = float(tokens[6])
+                sample['xVelLeft'] = float(tokens[7])
+                sample['yVelLeft'] = float(tokens[8])
+                sample['xVelRight'] = float(tokens[9])
+                sample['yVelRight'] = float(tokens[10])
+                sample['xRes'] = float(tokens[11])
+                sample['yRes'] = float(tokens[12])
+                self.hasVelocity = True
+                self.hasResolution = True
+            else:
+                raise ValueError(f"Unexpected number of tokens ({numTokens}) in binocular sample line: {' '.join(tokens)}")
+                
+        else:
+            # Monocular formats
+            if numTokens == 4:
+                # Monocular: time xp yp ps
+                sample['x'] = float(tokens[1])
+                sample['y'] = float(tokens[2])
+                sample['pupil'] = float(tokens[3])
+                
+            elif numTokens == 6:
+                # Monocular with velocity: time xp yp ps xv yv
+                # OR Monocular with resolution: time xp yp ps xr yr
+                # Ambiguous - default to velocity (more common)
+                sample['x'] = float(tokens[1])
+                sample['y'] = float(tokens[2])
+                sample['pupil'] = float(tokens[3])
+                sample['xVel'] = float(tokens[4])
+                sample['yVel'] = float(tokens[5])
+                self.hasVelocity = True
+                
+            elif numTokens == 8:
+                # Monocular with velocity and resolution: time xp yp ps xv yv xr yr
+                sample['x'] = float(tokens[1])
+                sample['y'] = float(tokens[2])
+                sample['pupil'] = float(tokens[3])
+                sample['xVel'] = float(tokens[4])
+                sample['yVel'] = float(tokens[5])
+                sample['xRes'] = float(tokens[6])
+                sample['yRes'] = float(tokens[7])
+                self.hasVelocity = True
+                self.hasResolution = True
+            else:
+                raise ValueError(f"Unexpected number of tokens ({numTokens}) in monocular sample line: {' '.join(tokens)}")
+        
+        return sample
+    
+    def _parseFixationLine(self, tokens):
+        """Parse EFIX line into a dict."""
+        # Format: EFIX eye startTime endTime duration avgX avgY avgPupil [xRes yRes]
+        if len(tokens) < 8:
+            raise ValueError(f"EFIX line has too few tokens: {' '.join(tokens)}")
+        
+        fixation = {}
+        
+        fixation['eye'] = tokens[1]  # L or R
+        
+        try:
+            fixation['startTime'] = int(tokens[2])
+            fixation['endTime'] = int(tokens[3])
+            fixation['duration'] = int(tokens[4])
+            fixation['avgX'] = float(tokens[5])
+            fixation['avgY'] = float(tokens[6])
+            fixation['avgPupil'] = float(tokens[7])
+            
+            # Check if resolution data is included
+            if len(tokens) == 10:
+                # EFIX with resolution: eye stime etime dur axp ayp aps xr yr
+                fixation['xRes'] = float(tokens[8])
+                fixation['yRes'] = float(tokens[9])
+            elif len(tokens) == 8:
+                # EFIX without resolution: eye stime etime dur axp ayp aps
+                pass
+            else:
+                raise ValueError(f"Unexpected number of tokens ({len(tokens)}) in EFIX line")
+                
+        except (ValueError, IndexError) as e:
+            raise ValueError(f"Error parsing EFIX line: {' '.join(tokens)}, error: {e}")
+        
+        return fixation    
+    
+    def _parseSaccadeLine(self, tokens):
+        """Parse ESACC line into a dict."""
+        # Format: ESACC eye startTime endTime duration startX startY endX endY amplitude peakVel [xRes yRes]
+        if len(tokens) < 11:
+            raise ValueError(f"ESACC line has too few tokens: {' '.join(tokens)}")
+        
+        saccade = {}
+        
+        saccade['eye'] = tokens[1]  # L or R
+        
+        try:
+            saccade['startTime'] = int(tokens[2])
+            saccade['endTime'] = int(tokens[3])
+            saccade['duration'] = int(tokens[4])
+            saccade['startX'] = float(tokens[5])
+            saccade['startY'] = float(tokens[6])
+            saccade['endX'] = float(tokens[7])
+            saccade['endY'] = float(tokens[8])
+            saccade['amplitude'] = float(tokens[9])
+            saccade['peakVel'] = float(tokens[10])
+            
+            # Check if resolution data is included
+            if len(tokens) == 13:
+                # ESACC with resolution: eye stime etime dur sxp syp exp eyp ampl pv xr yr
+                saccade['xRes'] = float(tokens[11])
+                saccade['yRes'] = float(tokens[12])
+            elif len(tokens) == 11:
+                # ESACC without resolution: eye stime etime dur sxp syp exp eyp ampl pv
+                pass
+            else:
+                raise ValueError(f"Unexpected number of tokens ({len(tokens)}) in ESACC line")
+                
+        except (ValueError, IndexError) as e:
+            raise ValueError(f"Error parsing ESACC line: {' '.join(tokens)}, error: {e}")
+        
+        return saccade    
+
+    def _parseBlinkLine(self, tokens):
+        """Parse EBLINK line into a dict."""
+        # Format: EBLINK eye startTime endTime duration
+        if len(tokens) < 5:
+            raise ValueError(f"EBLINK line has too few tokens: {' '.join(tokens)}")
+        
+        blink = {}
+        
+        blink['eye'] = tokens[1]  # L or R
+        
+        try:
+            blink['startTime'] = int(tokens[2])
+            blink['endTime'] = int(tokens[3])
+            blink['duration'] = int(tokens[4])
+        except (ValueError, IndexError) as e:
+            raise ValueError(f"Error parsing EBLINK line: {' '.join(tokens)}, error: {e}")
+        
+        return blink
+
+    def _parseMsgLine(self, tokens):
+        """Parse MSG line into a dict."""
+        # Format: MSG timestamp message_text...
+        if len(tokens) < 2:
+            raise ValueError(f"MSG line has too few tokens: {' '.join(tokens)}")
+        
+        msg = {}
+        
+        # Parse timestamp
+        try:
+            msg['time'] = int(tokens[1])
+        except ValueError:
+            raise ValueError(f"Could not parse timestamp from MSG line: {tokens[1]}")
+        
+        # Join remaining tokens as the message text
+        if len(tokens) > 2:
+            msg['text'] = ' '.join(tokens[2:])
+        else:
+            msg['text'] = ''
+        
+        return msg    
+    def _listsToArrays(self, listOfDicts):
+        """Convert list of dicts to dict of numpy arrays."""
+        # Handle empty list
+        if not listOfDicts:
+            return {}
+        
+        # Filter out None values (in case any snuck through)
+        listOfDicts = [d for d in listOfDicts if d is not None]
+        
+        # Check again after filtering
+        if not listOfDicts:
+            return {}
+        
+        result = {}
+        keys = listOfDicts[0].keys()
+        for key in keys:
+            result[key] = np.array([d[key] for d in listOfDicts])
+        
+        return result
+    @property
+    def samples(self):
+        return self.data.get('samples', {})
+
+    @property
+    def messages(self):
+        return self.data.get('messages', {})
+
+    @property
+    def fixations(self):
+        return self.data.get('fixations', {})
+
+    @property
+    def saccades(self):
+        return self.data.get('saccades', {})
+
+    @property
+    def blinks(self):
+        return self.data.get('blinks', {})
+
+# Usage:
+# try:
+#     parser = AscFileParser('mydata.asc')
+#     data = parser.parse()
+#     print(f"
