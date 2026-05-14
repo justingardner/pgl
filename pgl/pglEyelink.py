@@ -15,6 +15,8 @@ from pgl import pglEyeTracker
 from pgl import pglEventKeyboard
 import socket
 import os
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
 
 try:
     import pylink
@@ -583,6 +585,8 @@ class pglEyelinkData:
             'metadata': [],
             'recordingBlocks': []
         }
+        
+        # some variables used for parsing the edf/asc file
         self.tempSamples = []
         self.tempMessages = []
         self.tempFixations = []
@@ -594,8 +598,13 @@ class pglEyelinkData:
         self.hasVelocity = False
         self.hasResolution = False
         
+        # validate and parse file
         self._validateFile()
         self.parse()
+        
+        # parse pgl message
+        self.parseMessages()
+    
     def __str__(self):
         """String representation of parsed data."""
         numSamples = len(self.tempSamples) if hasattr(self, 'tempSamples') else len(self.data.get('samples', {}).get('time', []))
@@ -642,6 +651,153 @@ class pglEyelinkData:
                     raise ValueError(f"Could not read from file: {self.filename}")
         except Exception as e:
             raise IOError(f"Error opening file {self.filename}: {e}")
+
+    def parseMessages(self):
+        """Parse the PGL messages and restructure data into trials."""
+        
+        # init variables
+        self.nTrials = 0
+        trialStartTimes = []
+        trialEndTimes = []
+
+        # time of messages (in Eyelink clock)
+        messageTimesEyelink = self.messages['time']
+
+        # parse PGL messages
+        for i, messageText in enumerate(self.messages['text']):
+            # convert message text to a structured format
+            messageValues = self.parseMessageLine(messageText)
+            # check for vaild pgl message
+            if messageValues:
+                # if it's a trialStart message
+                if messageValues.get('messageType') == 'trialStart':
+                    # increment trial count
+                    self.nTrials += 1
+                    # save trial start time
+                    trialStartTimes.append(messageTimesEyelink[i])
+        
+        # compute trial end times as next trial start time
+        if len(trialStartTimes) > 1:
+            trialEndTimes = trialStartTimes[1:]
+            trialStartTimes = trialStartTimes[:-1]
+            self.nTrials -= 1
+        
+        # create trial array with relative times
+        self.trials = []
+
+        for trialNum in range(self.nTrials):
+            # get trial start and end times
+            startTime = trialStartTimes[trialNum]
+            endTime = trialEndTimes[trialNum]
+            
+            # find samples within this trial's time window
+            trialMask = (self.samples['time'] >= startTime) & (self.samples['time'] < endTime)
+            
+            # find saccades within this trial's time window
+            saccadeMask = (self.saccades['startTime'] >= startTime) & (self.saccades['startTime'] < endTime)
+            
+            # extract trial data
+            trialData = {
+                'x': self.samples['x'][trialMask],
+                'y': self.samples['y'][trialMask],
+                'pupil': self.samples['pupil'][trialMask],
+                'time': self.samples['time'][trialMask],
+                'saccades': {
+                    'eye': self.saccades['eye'][saccadeMask],
+                    'startTime': self.saccades['startTime'][saccadeMask],
+                    'endTime': self.saccades['endTime'][saccadeMask],
+                    'duration': self.saccades['duration'][saccadeMask],
+                    'startX': self.saccades['startX'][saccadeMask],
+                    'startY': self.saccades['startY'][saccadeMask],
+                    'endX': self.saccades['endX'][saccadeMask],
+                    'endY': self.saccades['endY'][saccadeMask],
+                    'amplitude': self.saccades['amplitude'][saccadeMask],
+                    'peakVel': self.saccades['peakVel'][saccadeMask]
+                }
+            }
+            
+            self.trials.append(trialData)
+            
+        print(f"(pglEyelinkData) Parsed {self.nTrials} trials from messages.")
+
+    def displayTrials(self):
+        """
+        Display eye tracking data trial by trial with rainbow colors
+        
+        Each trial shows:
+        - x,y samples as small dots
+        - saccade endpoints as larger filled circles with white outline
+        """
+        # create figure
+        fig, ax = plt.subplots(figsize=(10, 8))
+        
+        # create rainbow color palette
+        colors = cm.rainbow(np.linspace(0, 1, self.nTrials))
+        
+        # plot each trial
+        for trialNum in range(self.nTrials):
+            trial = self.trials[trialNum]
+            color = colors[trialNum]
+            
+            # plot x,y samples as small dots
+            ax.plot(trial['x'], trial['y'], '.', color=color, markersize=2, 
+                    label=f'Trial {trialNum}')
+            
+            # plot saccade endpoints as larger filled circles with white outline
+            if len(trial['saccades']['endX']) > 0:
+                ax.plot(trial['saccades']['endX'], trial['saccades']['endY'], 
+                    'o', color=color, markersize=8, markerfacecolor=color,
+                    markeredgecolor='white', markeredgewidth=1.5)
+        
+        ax.set_xlabel('X Position')
+        ax.set_ylabel('Y Position')
+        ax.set_title('Eye Tracking Data by Trial')
+        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        ax.set_aspect('equal')
+        plt.tight_layout()
+        plt.show()
+
+    def parseMessageLine(self,line):
+        """
+        Parse pgl log line and extract messageType and key=value pairs
+        
+        Parameters
+        ----------
+        line : str
+            Log line like 'pgl: segmentStart segmentNum=0 trialNum=10 timestamp=1152971.4257527918'
+        
+        Returns
+        -------
+        dict
+            Dictionary with messageType and extracted values, e.g., 
+            {'messageType': 'segmentStart', 'segmentNum': 0, 'trialNum': 10, 'timestamp': 1152971.4257527918}
+            Returns empty dict if first token is not 'pgl:'
+        """
+        tokens = line.split()
+        
+        # Check if first token is 'pgl:'
+        if not tokens or tokens[0] != 'pgl:':
+            return {}
+        
+        # Need at least two tokens (pgl: and messageType)
+        if len(tokens) < 2:
+            return {}
+        
+        result = {'messageType': tokens[1]}
+        
+        # Parse remaining tokens for key=value pairs
+        for token in tokens[2:]:
+            if '=' in token:
+                key, value = token.split('=', 1)
+                try:
+                    result[key] = int(value)
+                except ValueError:
+                    try:
+                        result[key] = float(value)
+                    except ValueError:
+                        result[key] = value
+        
+        return result
     
     def parse(self):
         """Parse the .asc file and return structured data."""
@@ -663,18 +819,9 @@ class pglEyelinkData:
                     # Debug: check if we're finding sample lines
                     if tokens[0].isdigit():
                         sampleLineCount += 1
-                        if sampleLineCount <= 3:  # Print first few
-                            print(f"Sample line {sampleLineCount}: {line}")
-                            print(f"  inRecording: {self.inRecording}")
-                            print(f"  isBinocular: {self.isBinocular}")
                     
                     self._parseLine(tokens, line)
             
-            print(f"\nTotal lines: {lineCount}")
-            print(f"Sample lines found: {sampleLineCount}")
-            print(f"Samples parsed: {len(self.tempSamples)}")
-            print(f"isBinocular was set to: {self.isBinocular}")
-            print(f"inRecording was: {self.inRecording}")
             
         except Exception as e:
             raise IOError(f"Error parsing file {self.filename}: {e}")
@@ -1109,8 +1256,4 @@ class pglEyelinkData:
     def blinks(self):
         return self.data.get('blinks', {})
 
-# Usage:
-# try:
-#     parser = AscFileParser('mydata.asc')
-#     data = parser.parse()
-#     print(f"
+    
