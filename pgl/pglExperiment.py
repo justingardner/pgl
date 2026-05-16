@@ -495,6 +495,7 @@ class pglExperiment(pglSettingsManager):
         selectedDir = dataDir / dirList[choice - 1]
 
         # load the experiment data, settings, and state
+        print(f"(pglExperiment:load) Loading experimentdata from: {selectedDir}")
         self.data = pglSerialize.load(selectedDir / "data.json")
         self.settings = pglSerialize.load(selectedDir / "settings.json")
         self.experimentSettings = pglSerialize.load(selectedDir / "experimentSettings.json")
@@ -511,6 +512,7 @@ class pglExperiment(pglSettingsManager):
             taskDir = selectedDir / d.name
             # load the task data, settings, and state
             task = pglTask()
+            print(f"(pglExperiment:load) Loading task data from: {taskDir}")
             task.settings = pglSerialize.load(taskDir / "settings.json")
             task.state = pglSerialize.load(taskDir / "state.json")
             task.data = pglSerialize.load(taskDir / "data.json")
@@ -529,6 +531,15 @@ class pglExperiment(pglSettingsManager):
         if hasattr(self, "tasks"):
             for task in self.tasks:
                 task.display()   
+
+    def print(self):
+        '''
+        Print a summary of the experiment events.
+        '''
+        # print task data
+        if hasattr(self, "tasks"):
+            for task in self.tasks:
+                task.print()   
 
     
 ##############################################
@@ -780,6 +791,19 @@ class pglTask:
         Display the task data
         '''
         self.data.display(self.settings.taskName)
+    def print(self):
+        '''
+        Print a summary of the task data
+        '''
+        # print task name and number of trials
+        print(f"Task: {self.settings.taskName} | Trials: {self.state.currentTrial+1}")
+        print(f"duration={self.data.endTime - self.data.startTime:.2f}s | startTime={self.data.startTime:.2f} | endTime={self.data.endTime:.2f}")
+
+        for iTrial, params in enumerate(self.data.params):
+            # find matching trial event
+            trialEvent = next((event for event in self.data.events if isinstance(event, pglEventTrial) and event.trialNum == iTrial), None)
+            trialStart = trialEvent.timestamp-self.data.startTime if trialEvent else "No trial event found"
+            print(f"Trial {iTrial+1} at {trialStart:.2f}s: " + ', '.join(f"{key}={value}" for key, value in params.items()))
 
 ##############################################
 # test task for testing settings
@@ -1002,7 +1026,44 @@ class pglTaskSettings(pglSettingsEditable):
     '''
     def __init__(self):
         super().__init__()
-
+        
+    def updateTraitsFromDict(self, data, filename="<dict>", typeConverter=None):
+        """
+        Override to convert parameter dicts to pglParameter instances.
+        Only converts items in the 'parameters' list, not other dict values.
+        """
+        # Make a copy to avoid modifying the original
+        data = data.copy()
+        
+        # ONLY convert the 'parameters' key specifically
+        if 'parameters' in data and isinstance(data['parameters'], list):
+            converted_params = []
+            for item in data['parameters']:
+                if isinstance(item, dict):
+                    # Extract the two required positional arguments
+                    name = item.get('name', 'unnamed')
+                    validValues = item.get('validValues', [])
+                    
+                    # Create pglParameter with those two args
+                    param = pglParameter(name, validValues)
+                    
+                    # Update any other attributes that might be stored
+                    # (like blockNum, currentTrial, etc. from your serialized data)
+                    for key, value in item.items():
+                        if key not in ['name', 'validValues'] and hasattr(param, key):
+                            setattr(param, key, value)
+                    
+                    converted_params.append(param)
+                elif isinstance(item, pglParameter):
+                    # Already correct type
+                    converted_params.append(item)
+                else:
+                    print(f"Warning: Unexpected type in parameters: {type(item)}")
+                    converted_params.append(item)
+            data['parameters'] = converted_params
+        
+        # Call parent implementation to handle ALL other traits normally
+        pglSettingsEditable.updateTraitsFromDict(self, data, filename, typeConverter)
 ##############################################
 # State for pglTask
 ##############################################

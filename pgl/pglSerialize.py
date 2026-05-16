@@ -266,6 +266,9 @@ class pglSerialize:
             filename: Source filename for error messages
             typeConverter: Optional callable(key, value) -> converted_value for custom type conversions
         """
+        import traceback
+        import inspect
+        
         if not isinstance(self, HasTraits):
             # Fall back to simple dict update for non-HasTraits objects
             self.__dict__.update(data)
@@ -283,25 +286,93 @@ class pglSerialize:
                     # Set the attribute
                     setattr(self, key, value)
                     
-                except TraitError:
+                except TraitError as e:
                     trait = self.traits()[key]
                     expectedType = trait.__class__
-                    gotType = type(data[key])
-                    print(f"(pglSerialize) '{key}' has wrong type in '{filename}' "
-                          f"(expected {expectedType.__name__}, got {gotType.__name__}), "
-                          f"using default {getattr(self, key)}")
+                    gotValue = data[key]
+                    gotType = type(gotValue)
+                    
+                    # Get more detailed type information
+                    expectedTypeInfo = self._getDetailedTypeInfo(trait)
+                    gotTypeInfo = self._getDetailedTypeInfo(gotValue)
+                    
+                    print(f"\n{'='*80}")
+                    print(f"(pglSerialize) TRAIT TYPE MISMATCH ERROR")
+                    print(f"{'='*80}")
+                    print(f"Trait name:     '{key}'")
+                    print(f"Source:         '{filename}'")
+                    print(f"Object class:   {self.__class__.__name__}")
+                    print(f"Object:         {self}")
+                    print(f"-" * 80)
+                    print(f"Expected type:  {expectedTypeInfo}")
+                    print(f"Got type:       {gotTypeInfo}")
+                    print(f"Got value:      {repr(gotValue)[:200]}")  # Truncate long values
+                    print(f"Using default:  {repr(getattr(self, key))[:200]}")
+                    print(f"-" * 80)
+                    print(f"Original error: {e}")
+                    print(f"-" * 80)
+                    print("Call stack:")
+                    # Print abbreviated stack trace (skip first 2 frames - this function)
+                    for frame_info in traceback.extract_stack()[:-2]:
+                        print(f"  File '{frame_info.filename}', line {frame_info.lineno}, in {frame_info.name}")
+                        if frame_info.line:
+                            print(f"    {frame_info.line}")
+                    print(f"{'='*80}\n")
+                    
                 except Exception as e:
-                    print(f"(pglSerialize) Error setting '{key}': {e}. "
-                          f"Using default value: {getattr(self, key)}")
+                    print(f"\n{'='*80}")
+                    print(f"(pglSerialize) UNEXPECTED ERROR")
+                    print(f"{'='*80}")
+                    print(f"Trait name:     '{key}'")
+                    print(f"Source:         '{filename}'")
+                    print(f"Object class:   {self.__class__.__name__}")
+                    print(f"Value:          {repr(data[key])[:200]}")
+                    print(f"Error type:     {type(e).__name__}")
+                    print(f"Error message:  {e}")
+                    print(f"Using default:  {repr(getattr(self, key))[:200]}")
+                    print(f"-" * 80)
+                    print("Full traceback:")
+                    traceback.print_exc()
+                    print(f"{'='*80}\n")
             else:
                 print(f"(pglSerialize) '{key}' not found in '{filename}', "
-                      f"using default {getattr(self, key)}")
+                    f"using default {getattr(self, key)}")
         
         # Warn about unknown keys
         extraKeys = set(data.keys()) - set(self.trait_names())
         if extraKeys:
             print(f"(pglSerialize) Unknown keys in '{filename}' (ignored): {list(extraKeys)}")
+
+
+    def _getDetailedTypeInfo(self, obj):
+        """
+        Helper to get detailed type information for better error messages.
+        """
+        if hasattr(obj, '__class__'):
+            typeName = obj.__class__.__name__
             
+            # For trait types, get additional info
+            if hasattr(obj, 'info'):
+                return f"{typeName} ({obj.info()})"
+            
+            # For list/dict, show element types if possible
+            if isinstance(obj, list):
+                if obj:
+                    elementTypes = set(type(x).__name__ for x in obj[:5])  # Sample first 5
+                    return f"list (contains: {', '.join(elementTypes)})"
+                return "list (empty)"
+            
+            if isinstance(obj, dict):
+                if obj:
+                    keyTypes = set(type(k).__name__ for k in list(obj.keys())[:5])
+                    valueTypes = set(type(v).__name__ for v in list(obj.values())[:5])
+                    return f"dict (keys: {', '.join(keyTypes)}, values: {', '.join(valueTypes)})"
+                return "dict (empty)"
+            
+            return typeName
+        
+        return str(type(obj).__name__)
+          
     ##########################
     # copyTraitsFrom - Copy traits from another object
     ##########################
