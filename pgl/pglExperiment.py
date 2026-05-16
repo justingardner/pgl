@@ -469,8 +469,6 @@ class pglExperiment(pglSettingsManager):
                         experimentSettings = pglSerialize.load(dataDir / d.name / "experimentSettings.json")
                         # print number of volumes
                         numVols = experimentData.getNumEvents(type="pglEventVolumeTrigger")
-                        if numVols==0:
-                            numVols = experimentData.getNumEvents(type="keyboard", eventType="keydown", keyChar="5")
                         dataPrintname += f" | nVols: {numVols}"
                         # print duration
                         dataPrintname += f" | {self.pglTimestamp.formatDuration(experimentData.endTime-experimentData.startTime)}"
@@ -536,9 +534,30 @@ class pglExperiment(pglSettingsManager):
         '''
         Print a summary of the experiment events.
         '''
+        from pgl import pglTimestamp
+        timestamp = pglTimestamp()
+        # print separator
+        print("=" * 80)
+        
+        # print experiment name, subject ID, and duration
+        print(f"Experiment: {self.experimentSettings.experimentName} | Subject ID: {self.experimentSettings.subjectID}")
+        print(f"Duration: {timestamp.formatDuration(self.data.endTime - self.data.startTime)}")
+        
+        displayInfo = f"Display: {self.settings.displayName[0]} "
+        displayInfo += f"{self.pglState.screenWidthPixels}x{self.pglState.screenHeightPixels} @ {self.pglState.frameRate}Hz "
+        displayInfo += f"{self.pglState.screenWidthDegrees:.2f}x{self.pglState.screenHeightDegrees:.2f} deg "
+        displayInfo += f"{self.settings.displayWidth:.2f}x{self.settings.displayHeight:.2f} cm at {self.settings.displayDistance:.2f} cm "
+        print(displayInfo)
+        
+        numVols = self.data.getNumEvents(type="pglEventVolumeTrigger")
+        print(f"Number of volume triggers: {numVols}")
+        
         # print task data
         if hasattr(self, "tasks"):
             for task in self.tasks:
+                # print separtor
+                print("=" * 80)
+                # print task
                 task.print()   
 
     
@@ -791,13 +810,17 @@ class pglTask:
         Display the task data
         '''
         self.data.display(self.settings.taskName)
+    
     def print(self):
         '''
         Print a summary of the task data
         '''
+        from pgl import pglTimestamp
+        timestamp = pglTimestamp()
+        
         # print task name and number of trials
         print(f"Task: {self.settings.taskName} | Trials: {self.state.currentTrial+1}")
-        print(f"duration={self.data.endTime - self.data.startTime:.2f}s | startTime={self.data.startTime:.2f} | endTime={self.data.endTime:.2f}")
+        print(f"Duration={timestamp.formatDuration(self.data.endTime - self.data.startTime)} | startTime={self.data.startTime} | endTime={self.data.endTime}")
 
         for iTrial, params in enumerate(self.data.params):
             # find matching trial event
