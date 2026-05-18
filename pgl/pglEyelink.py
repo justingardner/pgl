@@ -652,6 +652,66 @@ class pglEyelinkData:
         except Exception as e:
             raise IOError(f"Error opening file {self.filename}: {e}")
 
+    def convertPix2Deg(self, screenWidthPix, screenHeightPix, screenWidthDeg, screenHeightDeg):
+        """Convert pixel coordinates to degrees of visual angle."""
+        # save dimensions
+        self.screenWidthPix = screenWidthPix
+        self.screenHeightPix = screenHeightPix
+        self.screenWidthDeg = screenWidthDeg
+        self.screenHeightDeg = screenHeightDeg
+        
+        # calculate degrees per pixel
+        self.xDegPerPix = screenWidthDeg / screenWidthPix
+        self.yDegPerPix = screenHeightDeg / screenHeightPix
+        
+        # now apply the transformation, this will add deg fields
+        self.applyPix2Deg(self.samples)
+        self.applyPix2Deg(self.saccades)
+
+    def applyPix2Deg(self, data):
+        # possible fields and info on how to convert them to degrees
+        keys = [
+            ('x', 'coordX'),
+            ('y', 'coordY'),
+            ('pupil', 'pupil'),
+            ('xLeft', 'coordX'),
+            ('yLeft', 'coordY'),
+            ('pupilLeft', 'pupil'),
+            ('xRight', 'coordX'),
+            ('yRight', 'coordY'),
+            ('pupilRight', 'pupil'),
+            ('xVelLeft', 'velX'),
+            ('yVelLeft', 'velY'),
+            ('xVelRight', 'velX'),
+            ('yVelRight', 'velY'),
+            ('startX', 'coordX'),
+            ('startY', 'coordY'),
+            ('endX', 'coordX'),
+            ('endY', 'coordY'),
+            ('amplitude','radial'),
+            ('peakVel','radial')
+        ]
+        
+        # now look for each key and convert to degrees if found
+        for key, transformType in keys:
+            if key in data:
+                # convert x and y coordiantes to degrees of visual angle relative to center of screen
+                if transformType == 'coordX':
+                    data[key + 'Deg'] = (data[key] - self.screenWidthPix / 2) * self.xDegPerPix
+                elif transformType == 'coordY':
+                    data[key + 'Deg'] = (data[key] - self.screenHeightPix / 2) * self.yDegPerPix
+                # convert pupil size to degrees of visual angle using geometric mean of x and y degrees per pixel
+                elif transformType == 'pupil':
+                    data[key + 'Deg'] = data[key] * (self.xDegPerPix * self.yDegPerPix)
+                # convert velocity to degrees per second
+                elif transformType == 'velX':
+                    data[key + 'Deg'] = data[key] * self.xDegPerPix
+                elif transformType == 'velY':
+                    data[key + 'Deg'] = data[key] * self.yDegPerPix
+                # radial transformation
+                elif transformType == 'radial':
+                    data[key + 'Deg'] = data[key] * (self.xDegPerPix**2 + self.yDegPerPix**2) ** 0.5
+                    
     def parseMessages(self):
         """Parse the PGL messages and restructure data into trials."""
         
