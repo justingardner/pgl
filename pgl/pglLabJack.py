@@ -200,7 +200,7 @@ class pglLabJack(pglDevice):
 
         return True
             
-    def startAnalogRead(self, duration=2, channels=[0], scanRate=1000, scansPerRead=1000):
+    def startAnalogRead(self, duration=2, channels=[0], scanRate=1000, scansPerRead=1000, range=10.0):
         '''
         Start analog input reading from specified channels.
         
@@ -209,6 +209,8 @@ class pglLabJack(pglDevice):
             channels (list): List of channel numbers or names
             scanRate (int): Sampling rate in Hz
             scansPerRead (int): Number of scans per read operation
+            range (float): Voltage range for analog inputs. Options: 10.0V, 1.0V, 0.1V, 0.01V
+
         '''
         if self.h is None:
             print("(pglLabJack:startAnalogRead) LabJack device not connected.")
@@ -222,10 +224,24 @@ class pglLabJack(pglDevice):
             else:
                 channelAddresses.append(ch)  # Already a string like "AIN0"
         
+        # validate range 
+        validRanges = [10.0, 1.0, 0.1, 0.01]
+        if range not in validRanges:
+            print(f"(pglLabJack:startAnalogRead) Invalid range {range}V. Valid options: {validRanges}")
+            return
+        try:
+            # set each channel to the specified range
+            for channel in channelAddresses:
+                self.ljm.eWriteName(self.h, f"{channel}_RANGE", range)
+        except Exception as e:
+            print(f"(pglLabJack:startAnalogRead) Error setting range: {e}")
+            return
+
         # save parameters
         self.channels = channelAddresses
         self.scanRate = scanRate
         self.scansPerRead = scansPerRead
+        self.range = range
         self.analogStreamDuration = duration
 
         # derived parameters
@@ -436,7 +452,7 @@ class pglLabJack(pglDevice):
             # Calculate cycle length from detected triggers
             cycleLengths = np.diff(risingEdges)
             samplesPerCycle = int(np.median(cycleLengths))
-            cycleLen = samplesPerCycle * np.mean(np.diff(time))
+            cycleLen = samplesPerCycle * np.median(np.diff(time))
             
             # Use detected trigger indices as cycle starts
             cycleStarts = risingEdges[:-1]  # Exclude last one to ensure complete cycles
@@ -529,8 +545,21 @@ class pglLabJack(pglDevice):
             digitalSyncThreshold (float): Voltage threshold for detecting digital pulse rising edge
             ignoreInitial (float): Time in seconds to ignore at the beginning of the recording for
                 displaying cycles (e.g., to exclude initial transients). If None, no data is ignored. Must be non-negative.
-            displayStartEnd (float): If not None, will display the first displayStartEnd seconds as separate graphs   
+            displayStartEnd (float): If not None, will display the first displayStartEnd seconds as separate graphs  
+            
+        Returns:
+            dict: Dictionary containing:
+            - 'fig': Figure object
+            - 'cycleData': dict from getCycles function (if cycleLen or digitalSyncChannel is provided), otherwise None
+            - 'axes': Dictionary of axis objects with keys:
+                - 'fullTrace': Full trace axis (always present)
+                - 'start': Start segment axis (if displayStartEnd is set)
+                - 'end': End segment axis (if displayStartEnd is set)
+                - 'cycle': Cycle-averaged axis (if cycleLen or digitalSyncChannel is set)
+   
         '''
+        retval = {}
+
         if time is None or data is None:
             print("(pglLabJack:plotAnalogRead) No data to plot.")
             return
@@ -549,11 +578,12 @@ class pglLabJack(pglDevice):
         else:
             fig = plt.figure(figsize=(16, 6))
             gs = fig.add_gridspec(1, 1)
-        
+        retval['fig'] = fig
         currentRow = 0
         
         # First row: Full analog trace (spans both columns)
         axFullTrace = fig.add_subplot(gs[currentRow, :])
+        retval['fullTrace'] = axFullTrace
         if data.ndim == 1:
             # Single channel
             axFullTrace.plot(time, data, label=self.channels[0])
@@ -578,6 +608,7 @@ class pglLabJack(pglDevice):
             
             # Left column: First displayStartEnd seconds
             axStart = fig.add_subplot(gs[currentRow, 0])
+            retval['start'] = axStart
             startIdx = int(displayStartEnd * self.scanRate)
             timeStart = time[:startIdx] * timeMultiplier
             if data.ndim == 1:
@@ -594,6 +625,7 @@ class pglLabJack(pglDevice):
             
             # Right column: Last displayStartEnd seconds
             axEnd = fig.add_subplot(gs[currentRow, 1])
+            retval['end'] = axEnd
             endIdx = int(displayStartEnd * self.scanRate)
             timeEnd = time[-endIdx:] * timeMultiplier
             if data.ndim == 1:
@@ -612,9 +644,11 @@ class pglLabJack(pglDevice):
         # Next row: Cycle-averaged data (if requested, spans both columns)
         if cycleLen is not None or digitalSyncChannel is not None:
             axCycle = fig.add_subplot(gs[currentRow, :])
+            retval['cycle'] = axCycle
             
             # Get cycles using the getCycles function
             cycleData = self.getCycles(time, data, cycleLen, digitalSyncChannel, digitalSyncThreshold, ignoreInitial)
+            retval['cycleData'] = cycleData
             
             if cycleData is None:
                 axCycle.text(0.5, 0.5, 'Unable to extract cycles', 
@@ -635,21 +669,14 @@ class pglLabJack(pglDevice):
                     
                 for ch in range(numChannels):
                     cycles = cycleData['cycles'][ch]
-                    meanCycle = cycleData['mean'][ch]
-                    stdCycle = cycleData['std'][ch]
+                    medianCycle = cycleData['median'][ch]
                     
                     # Plot individual trials as thin lines in background
                     for i in range(cycles.shape[0]):
                         axCycle.plot(cycleTime, cycles[i, :], color=f'C{ch}', alpha=0.2, linewidth=0.5)
-                    
-                    # Plot standard deviation as filled polygon
-                    axCycle.fill_between(cycleTime, 
-                                         meanCycle - stdCycle, 
-                                         meanCycle + stdCycle,
-                                         color=f'C{ch}', alpha=0.3)
-                    
-                    # Plot mean as solid line
-                    axCycle.plot(cycleTime, meanCycle, color=f'C{ch}', 
+                                        
+                    # Plot median as solid line
+                    axCycle.plot(cycleTime, medianCycle, color=f'C{ch}', 
                                linewidth=2, label=self.channels[ch])
                 
                 titleStr = "Trigger-Averaged Data" if digitalSyncChannel is not None else "Cycle-Averaged Data"
@@ -659,8 +686,12 @@ class pglLabJack(pglDevice):
                 axCycle.legend()
                 axCycle.grid(True)
         
-        plt.tight_layout()
-        plt.show()    
+        #plt.tight_layout()
+        #plt.show(block=False)    
+        
+        # Return figure and axes dictionary
+        return retval
+        
               
     def start(self):
         '''
