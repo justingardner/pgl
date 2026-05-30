@@ -35,6 +35,7 @@ from matplotlib.lines import Line2D
 import numpy as np
 from enum import Enum
 from . import pglTimestamp
+from .pglEyelink import pglEyeTracker
 
 ##############################################s
 # Experiment class
@@ -71,10 +72,19 @@ class pglExperiment(pglSettingsManager):
         else:
             # save pgl
             self.pgl = pgl
-        
+
         # initialize experiment state and data
         self.state = pglExperimentState()
         self.data = pglExperimentData()
+        
+        # initialize eye tracker
+        if self.settings.eyetracker[0] == "Eyelink":
+            print("(pglExperiment) Initialize Eyelink")
+            self.state.eyeTracker = pglEyeTracker()        
+        elif self.settings.eyetracker[0] == "None":
+            self.state.eyeTracker = None
+        else:
+            print("(pglExperiment) ❌ Unknown eye tracker type {self.settings.eyetracker[0]}")
         
         # get experiment settings
         self.experimentSettings = pglExperimentSettings()
@@ -960,6 +970,7 @@ class pglExperimentState(pglSerialize):
     startKeyCode: int = 0
     endKeyCode: int = 0
     volumeTriggerKeyCode: int = 0
+    eyeTracker: pglEyeTracker = None
 
 ##############################################
 # Settings for pglTask

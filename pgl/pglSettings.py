@@ -189,7 +189,7 @@ class pglSettingsEditable(HasTraits, pglSerialize):
         super().__init__()
         # Load from file if provided
         if filename:
-            print(f"(pglSettingsEditable:init) Loading settings from '{filename}'.")
+            #print(f"(pglSettingsEditable:init) Loading settings from '{filename}'.")
             self.updateFromFile(filename)
     
    # display parameters
@@ -239,7 +239,7 @@ class pglSettingsEditable(HasTraits, pglSerialize):
         }
         </style>
         """))
-        
+
     # gets the traits in the order that they are defined
     @classmethod
     def getOrderedTraits(cls):
@@ -792,6 +792,7 @@ class pglSettings(pglSettingsEditable):
     manualPreStart = Bool(False, help="Whether to manually start the experiment before the volume trigger")
     closeScreenOnEnd = Bool(True, help="Whether to close the screen when the experiment ends")
     backgroundColor = List(trait=Float(min=0.0, max=1.0), default_value=[0.5, 0.5, 0.5],minlen=3,maxlen=3,help="Background color as a list of RGB values").tag(isRGB=True)
+    eyetracker =  List(Unicode(), default_value=['None', 'Eyelink'], help="Eyetracker")
     
     # link back to settings select class
     settingsSelect = None 

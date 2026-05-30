@@ -11,7 +11,7 @@
 import sys, array
 import numpy as np
 from pynput import keyboard
-from pgl import pglEyeTracker
+from .pglEyeTracker import pglEyeTracker
 from pgl import pglEventKeyboard
 import socket
 import os
