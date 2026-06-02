@@ -11,7 +11,7 @@
 import sys, array
 import numpy as np
 from pynput import keyboard
-from .pglEyeTracker import pglEyeTracker
+from .pglEyeTracker import pglEyeTracker, pglEyeTrackerData
 from pgl import pglEventKeyboard
 import socket
 import os
@@ -226,7 +226,7 @@ class pglEyelink(pglEyeTracker):
             self.edfFilename = filename
             return False
         
-    def saveData(self, filename):
+    def save(self, filename):
         """Stop recording and retrieve data file.
         
         Args:
@@ -610,7 +610,7 @@ if _HAVE_PYLINK:
         def alert_printf(self, msg):
             print(msg)
 
-class pglEyelinkData:
+class pglEyelinkData(pglEyeTrackerData):
     """Parser for EyeLink .asc files."""
     
     def __init__(self, filename):
@@ -1114,53 +1114,53 @@ class pglEyelinkData:
             # Binocular formats
             if numTokens == 7:
                 # Binocular: time xpl ypl psl xpr ypr psr
-                sample['xLeft'] = float(tokens[1])
-                sample['yLeft'] = float(tokens[2])
-                sample['pupilLeft'] = float(tokens[3])
-                sample['xRight'] = float(tokens[4])
-                sample['yRight'] = float(tokens[5])
-                sample['pupilRight'] = float(tokens[6])
+                sample['xLeft'] = self.toFloat(tokens[1])
+                sample['yLeft'] = self.toFloat(tokens[2])
+                sample['pupilLeft'] = self.toFloat(tokens[3])
+                sample['xRight'] = self.toFloat(tokens[4])
+                sample['yRight'] = self.toFloat(tokens[5])
+                sample['pupilRight'] = self.toFloat(tokens[6])
                 
             elif numTokens == 11:
                 # Binocular with velocity: time xpl ypl psl xpr ypr psr xvl yvl xvr yvr
-                sample['xLeft'] = float(tokens[1])
-                sample['yLeft'] = float(tokens[2])
-                sample['pupilLeft'] = float(tokens[3])
-                sample['xRight'] = float(tokens[4])
-                sample['yRight'] = float(tokens[5])
-                sample['pupilRight'] = float(tokens[6])
-                sample['xVelLeft'] = float(tokens[7])
-                sample['yVelLeft'] = float(tokens[8])
-                sample['xVelRight'] = float(tokens[9])
-                sample['yVelRight'] = float(tokens[10])
+                sample['xLeft'] = self.toFloat(tokens[1])
+                sample['yLeft'] = self.toFloat(tokens[2])
+                sample['pupilLeft'] = self.toFloat(tokens[3])
+                sample['xRight'] = self.toFloat(tokens[4])
+                sample['yRight'] = self.toFloat(tokens[5])
+                sample['pupilRight'] = self.toFloat(tokens[6])
+                sample['xVelLeft'] = self.toFloat(tokens[7])
+                sample['yVelLeft'] = self.toFloat(tokens[8])
+                sample['xVelRight'] = self.toFloat(tokens[9])
+                sample['yVelRight'] = self.toFloat(tokens[10])
                 self.hasVelocity = True
                 
             elif numTokens == 9:
                 # Binocular with resolution: time xpl ypl psl xpr ypr psr xr yr
-                sample['xLeft'] = float(tokens[1])
-                sample['yLeft'] = float(tokens[2])
-                sample['pupilLeft'] = float(tokens[3])
-                sample['xRight'] = float(tokens[4])
-                sample['yRight'] = float(tokens[5])
-                sample['pupilRight'] = float(tokens[6])
-                sample['xRes'] = float(tokens[7])
-                sample['yRes'] = float(tokens[8])
+                sample['xLeft'] = self.toFloat(tokens[1])
+                sample['yLeft'] = self.toFloat(tokens[2])
+                sample['pupilLeft'] = self.toFloat(tokens[3])
+                sample['xRight'] = self.toFloat(tokens[4])
+                sample['yRight'] = self.toFloat(tokens[5])
+                sample['pupilRight'] = self.toFloat(tokens[6])
+                sample['xRes'] = self.toFloat(tokens[7])
+                sample['yRes'] = self.toFloat(tokens[8])
                 self.hasResolution = True
                 
             elif numTokens == 13:
                 # Binocular with velocity and resolution: time xpl ypl psl xpr ypr psr xvl yvl xvr yvr xr yr
-                sample['xLeft'] = float(tokens[1])
-                sample['yLeft'] = float(tokens[2])
-                sample['pupilLeft'] = float(tokens[3])
-                sample['xRight'] = float(tokens[4])
-                sample['yRight'] = float(tokens[5])
-                sample['pupilRight'] = float(tokens[6])
-                sample['xVelLeft'] = float(tokens[7])
-                sample['yVelLeft'] = float(tokens[8])
-                sample['xVelRight'] = float(tokens[9])
-                sample['yVelRight'] = float(tokens[10])
-                sample['xRes'] = float(tokens[11])
-                sample['yRes'] = float(tokens[12])
+                sample['xLeft'] = self.toFloat(tokens[1])
+                sample['yLeft'] = self.toFloat(tokens[2])
+                sample['pupilLeft'] = self.toFloat(tokens[3])
+                sample['xRight'] = self.toFloat(tokens[4])
+                sample['yRight'] = self.toFloat(tokens[5])
+                sample['pupilRight'] = self.toFloat(tokens[6])
+                sample['xVelLeft'] = self.toFloat(tokens[7])
+                sample['yVelLeft'] = self.toFloat(tokens[8])
+                sample['xVelRight'] = self.toFloat(tokens[9])
+                sample['yVelRight'] = self.toFloat(tokens[10])
+                sample['xRes'] = self.toFloat(tokens[11])
+                sample['yRes'] = self.toFloat(tokens[12])
                 self.hasVelocity = True
                 self.hasResolution = True
             else:
@@ -1170,36 +1170,43 @@ class pglEyelinkData:
             # Monocular formats
             if numTokens == 4:
                 # Monocular: time xp yp ps
-                sample['x'] = float(tokens[1])
-                sample['y'] = float(tokens[2])
-                sample['pupil'] = float(tokens[3])
+                sample['x'] = self.toFloat(tokens[1])
+                sample['y'] = self.toFloat(tokens[2])
+                sample['pupil'] = self.toFloat(tokens[3])
                 
             elif numTokens == 6:
                 # Monocular with velocity: time xp yp ps xv yv
                 # OR Monocular with resolution: time xp yp ps xr yr
                 # Ambiguous - default to velocity (more common)
-                sample['x'] = float(tokens[1])
-                sample['y'] = float(tokens[2])
-                sample['pupil'] = float(tokens[3])
-                sample['xVel'] = float(tokens[4])
-                sample['yVel'] = float(tokens[5])
+                sample['x'] = self.toFloat(tokens[1])
+                sample['y'] = self.toFloat(tokens[2])
+                sample['pupil'] = self.toFloat(tokens[3])
+                sample['xVel'] = self.toFloat(tokens[4])
+                sample['yVel'] = self.toFloat(tokens[5])
                 self.hasVelocity = True
                 
             elif numTokens == 8:
                 # Monocular with velocity and resolution: time xp yp ps xv yv xr yr
-                sample['x'] = float(tokens[1])
-                sample['y'] = float(tokens[2])
-                sample['pupil'] = float(tokens[3])
-                sample['xVel'] = float(tokens[4])
-                sample['yVel'] = float(tokens[5])
-                sample['xRes'] = float(tokens[6])
-                sample['yRes'] = float(tokens[7])
+                sample['x'] = self.toFloat(tokens[1])
+                sample['y'] = self.toFloat(tokens[2])
+                sample['pupil'] = self.toFloat(tokens[3])
+                sample['xVel'] = self.toFloat(tokens[4])
+                sample['yVel'] = self.toFloat(tokens[5])
+                sample['xRes'] = self.toFloat(tokens[6])
+                sample['yRes'] = self.toFloat(tokens[7])
                 self.hasVelocity = True
                 self.hasResolution = True
             else:
                 raise ValueError(f"Unexpected number of tokens ({numTokens}) in monocular sample line: {' '.join(tokens)}")
         
         return sample
+    
+    def toFloat(self, value):
+        ''' parse string to float, and handle values like . which convert to nan'''
+        try:
+            return float(value)
+        except ValueError:
+            return float('nan')
     
     def _parseFixationLine(self, tokens):
         """Parse EFIX line into a dict."""

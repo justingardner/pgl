@@ -9,8 +9,9 @@
 # Import
 ##########
 from pgl import pglDevice
+
 #################################################################
-# Parent class for devices
+# Parent class for eye tracker devices
 #################################################################
 class pglEyeTracker(pglDevice):
     """
@@ -64,7 +65,7 @@ class pglEyeTracker(pglDevice):
         self.isTracking = False
         print("(pglEyeTracker) Eye tracking stopped.")
 
-    def saveData(self, filename):
+    def save(self, filename):
         """Stop recording and retrieve data file.
         
         Args:
@@ -72,3 +73,9 @@ class pglEyeTracker(pglDevice):
         """
         # This method should be implemented by subclasses to save the eye tracking data
         raise NotImplementedError("saveData method must be implemented by subclasses of pglEyeTracker.")
+    
+#################################################################
+# Parent class for eye tracker data
+#################################################################
+class pglEyeTrackerData():
+    

@@ -22,6 +22,7 @@ from .pglKeyboardMouse import pglKeyboardMouse
 from pathlib import Path
 from .pglSettings import pglSettingsManager, pglSettings, pglSettingsEditable
 from IPython.display import display, HTML
+import ipywidgets as widgets
 from .pglBase import pglDisplayMessage
 from traitlets import Float, TraitError, TraitError, observe, Instance, Int, Unicode, Dict, validate, Bool
 from .pglParameter import pglParameter, pglParameterBlock
@@ -36,7 +37,7 @@ import numpy as np
 from enum import Enum
 from . import pglTimestamp
 from .pglEyeTracker import pglEyeTracker
-from .pglEyelink import pglEyelink
+from .pglEyelink import pglEyelink, pglEyelinkData
 
 ##############################################s
 # Experiment class
@@ -56,6 +57,9 @@ class pglExperiment(pglSettingsManager):
             settings (pglSettings): An instance of the pglSettings class. If set, will supersede settingsName.
             subjectID (str): The identifier for the subject participating in the experiment.
         '''
+        # default
+        self.eyeTracker = None
+
         # load settings
         self.loadSettings(settingsName=settingsName, settings=settings)
 
@@ -83,7 +87,7 @@ class pglExperiment(pglSettingsManager):
         if experimentName != "":
             self.experimentSettings.experimentName = experimentName
         self.experimentSettings.subjectID = subjectID
-                
+        
     def __repr__(self):
         return f"<pglExperiment: {len(self.task)} phases>"
     
@@ -228,7 +232,7 @@ class pglExperiment(pglSettingsManager):
         task.taskID = len(self.tasks)
 
         # set whether to save eye tracker info
-        if self.state.eyeTracker is not None:
+        if self.eyeTracker is not None:
             task.settings.saveEyeTracker = True
 
         # add the task
@@ -247,8 +251,8 @@ class pglExperiment(pglSettingsManager):
         
 
         # start eye tracker recording if we have an eye tracker
-        if self.state.eyeTracker is not None:
-            self.state.eyeTracker.start()
+        if self.eyeTracker is not None:
+            self.eyeTracker.start()
 
         # calculate the phases that we will need to cover
         self.state.phaseNums = sorted(task.settings.phaseNum for task in self.tasks if task.settings.phaseNum is not None) or None
@@ -372,8 +376,8 @@ class pglExperiment(pglSettingsManager):
                     self.startPhase(phaseNum=self.state.phaseNums[self.state.currentPhaseIndex])
 
         # stop eye tracker recording if we have an eye tracker
-        if self.state.eyeTracker is not None:
-            self.state.eyeTracker.stop()
+        if self.eyeTracker is not None:
+            self.eyeTracker.stop()
 
         # mark end time
         self.data.endTime = self.pgl.getSecs()
@@ -394,23 +398,23 @@ class pglExperiment(pglSettingsManager):
 
             # init the eyeink
             print(f"(pglExperiment) Initialize Eyelink with filename: {self.settings.edfFilename}")
-            self.state.eyeTracker = pglEyelink(pgl=self.pgl, edfFilename=self.settings.edfFilename)        
+            self.eyeTracker = pglEyelink(pgl=self.pgl, edfFilename=self.settings.edfFilename)        
 
             # FIX: these should come from some settings
-            self.state.eyeTracker.setCustomCalibrationPoints(margin=0.7, numPoints=9)
+            self.eyeTracker.setCustomCalibrationPoints(margin=0.7, numPoints=9)
 
         elif self.settings.eyetracker[0] == "None":
-            self.state.eyeTracker = None
+            self.eyeTracker = None
         else:
             print("(pglExperiment) ❌ Unknown eye tracker type {self.settings.eyetracker[0]}")
-            self.state.eyeTracker = None
+            self.eyeTracker = None
 
 
     def calibrateEyeTracker(self):
         '''
         Run eye tracker calibration if we have an eye tracker and it is not calibrated yet.
         '''
-        if self.state.eyeTracker is not None:
+        if self.eyeTracker is not None:
             # wait for key press to calibrate
             self.state.waitingForCalibration = True
             self.state.runCalibration = False
@@ -442,11 +446,11 @@ class pglExperiment(pglSettingsManager):
                 
             # if we should run calibration, then do it
             if self.state.runCalibration:
-                self.state.eyeTracker.calibrate()
+                self.eyeTracker.calibrate()
 
     def saveEyeTrackerEvent(self, eventType="segment", taskID=None, trialNum=None, segmentNum=None, timestamp=None):
         '''Save an eye tracker event for synchronization. This is called by tasks during updates if settings.saveEyeTracker is True.'''
-        self.state.eyeTracker.sendMessage(f"pgl: {eventType} taskID={taskID} trialNum={trialNum} segmentNum={segmentNum} timestamp={timestamp}")
+        self.eyeTracker.sendMessage(f"pgl: {eventType} taskID={taskID} trialNum={trialNum} segmentNum={segmentNum} timestamp={timestamp}")
 
     def startPhase(self, phaseNum=0):
         '''
@@ -481,9 +485,9 @@ class pglExperiment(pglSettingsManager):
         print(f"(pglExperiment:save) Saving experiment data to: {dataDir}")
         
         # save eye tracker data if we have an eye tracker
-        if self.state.eyeTracker is not None:
+        if self.eyeTracker is not None:
             eyeTrackerFilename = dataDir / f"{self.settings.eyetracker[0].lower()}"
-            self.state.eyeTracker.saveData(eyeTrackerFilename)
+            self.eyeTracker.save(eyeTrackerFilename)
 
         # save pgl state
         self.pgl.save(dataDir / "pgl.json")
@@ -574,10 +578,11 @@ class pglExperiment(pglSettingsManager):
             except:
                 # not a typical name, just display
                 dataPrintname = d.name
-            print(f"{i}. {dataPrintname}")
-                
+            print(f"{i}. {dataPrintname}", flush=True)
+
         # Ask the user to choose
-        choice = int(input("\nSelect a directory number: "))
+        print("\nSelect a directory number: ", flush=True)
+        choice = int(input())
         if choice < 1 or choice > len(dirList):
             print(f"(pglExperiment:load) ❌ Invalid choice: {choice}")
             return
@@ -610,6 +615,17 @@ class pglExperiment(pglSettingsManager):
             
             # add the task to the experiment
             self.addTask(task)
+        
+        # load the eye tracker data
+        if self.settings.eyetracker[0] == "Eyelink":
+            eyeTrackerFilename = selectedDir / f"{self.settings.eyetracker[0].lower()}.asc"
+            self.eyeTrackerData = pglEyelinkData(str(eyeTrackerFilename))
+        elif self.settings.eyetracker[0] == "None":
+            self.eyeTracker = None
+        else:
+            print("(pglExperiment) ❌ Unknown eye tracker type {self.settings.eyetracker[0]}")
+            self.eyeTracker = None
+
             
     def display(self):
         '''
@@ -1060,7 +1076,6 @@ class pglExperimentState(pglSerialize):
     startKeyCode: int = 0
     endKeyCode: int = 0
     volumeTriggerKeyCode: int = 0
-    eyeTracker: pglEyeTracker = None
 
 ##############################################
 # Settings for pglTask
