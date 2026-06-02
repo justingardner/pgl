@@ -49,32 +49,10 @@ class pglEyeTracker(pglDevice):
         self.isCalibrated = True
         self.calibrationTime = self.pglTimestamp.getDateAndTime()
 
-    def calibrateEyeImage(self):
-        """
-        Calibrate the eye image.
-
-        This method should be implemented by subclasses to display the eye image and
-        Allow experimenter/subject to adjust the illuminator intensity, focus, position
-        and other paramteres to optimize view of the eye
-        """
-        print("(pglEyeTracker:calibrateEyeImage) This method should be implemented by the specific eye tracker subclass.")
-        return None
-  
-    def getCameraImage(self):
-        """
-        Get the current camera image from the eye tracker.
-        To be implemented by subclasses.
-
-        Returns:
-            pglImage: The current camera image from the eye tracker.
-        """
-        print("(pglEyeTracker:getCameraImage) This method should be implemented by the specific eye tracker subclass.")
-        return None
-
     def start(self):
         """Start eye tracking."""
         if not self.isCalibrated:
-            print("(pglEyeTracker:start) Eye tracker must be calibrated before starting tracking.")
+            print("(pglEyeTracker:start) ❌ Eye tracker must be calibrated before starting tracking.")
             return
         # start tracking
         self.isTracking = True
@@ -84,4 +62,13 @@ class pglEyeTracker(pglDevice):
     def stop(self):
         """Stop eye tracking."""
         self.isTracking = False
-        print("Eye tracking stopped.")
+        print("(pglEyeTracker) Eye tracking stopped.")
+
+    def saveData(self, filename):
+        """Stop recording and retrieve data file.
+        
+        Args:
+            filename (str): Name of the file to save locally
+        """
+        # This method should be implemented by subclasses to save the eye tracking data
+        raise NotImplementedError("saveData method must be implemented by subclasses of pglEyeTracker.")
