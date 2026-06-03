@@ -78,4 +78,20 @@ class pglEyeTracker(pglDevice):
 # Parent class for eye tracker data
 #################################################################
 class pglEyeTrackerData():
+    def __init__(self, filename):
+        """
+        init loads the tracker data from file
+        """
+        pass
+
+    def print(self):
+        """
+        print information about the eye tracker data
+        """
+        pass
     
+    def display(self):
+        """
+        display plots of data
+        """
+        pass

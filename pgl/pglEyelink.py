@@ -661,6 +661,24 @@ class pglEyelinkData(pglEyeTrackerData):
         """String representation of parsed data."""
         return self.__str__()
     
+    def print(self):
+        ''' print information about eye tracker data'''
+        print(f"Fileame: {self.filename}")
+        # print info on each start/stop block
+        print(f"Blocks of data: {len(self.startValues)}")
+        for iBlock in range(len(self.startValues)):
+            # calculate duration
+            start = datetime.fromisoformat(self.startValues[iBlock]['isoformat'])
+            stop = datetime.fromisoformat(self.stopValues[iBlock]['isoformat'])
+            duration = stop - start
+            print(f"Block {iBlock}:")
+            print(f" date: {self.startValues[iBlock]['date']}")
+            print(f" time: {self.startValues[iBlock]['time']} -> {self.stopValues[iBlock]['time']}")
+            print(f" duration: {duration.total_seconds()//60:.0f} min {duration.total_seconds()%60:.0f} s")
+            print(f" screen dimensions: {self.startValues[iBlock]['screenWidthPix']} x {self.startValues[iBlock]['screenHeightPix']} ")
+            print(f" screen degrees: {self.startValues[iBlock]['screenWidthDeg']:.2f} x {self.startValues[iBlock]['screenHeightDeg']:.2f} ")
+        print(f"nTrials: {self.nTrials}")
+
     def _validateFile(self):
         """Validate that the file exists and appears to be an .asc file."""
         # Check file exists
@@ -758,19 +776,50 @@ class pglEyelinkData(pglEyeTrackerData):
         # time of messages (in Eyelink clock)
         messageTimesEyelink = self.messages['time']
 
+        # initialize dictionaries with start / stop values
+        currentValues = {}
+        self.startValues = []
+        self.stopValues = []
+        processingStart = False
+        processingStop = False
+
         # parse PGL messages
         for i, messageText in enumerate(self.messages['text']):
             # convert message text to a structured format
             messageValues = self.parseMessageLine(messageText)
             # check for vaild pgl message
             if messageValues:
-                # if it's a trialStart message
-                if messageValues.get('messageType') == 'trialStart':
+                # if it's a start message then collect its values
+                if messageValues.get('messageType') == 'start':
+                    # append the last values on to stop
+                    if processingStop:
+                        self.stopValues.append(currentValues)
+                        currentValues = {}
+                        processingStop = False
+                    processingStart = True
+                    currentValues.update(messageValues)
+
+                # if it's a stop message then collect its values
+                if messageValues.get('messageType') == 'stop':
+                    # append the last values on to start
+                    if processingStart:
+                        self.startValues.append(currentValues)
+                        currentValues = {}
+                        processingStart = False
+                    processingStop = True
+                    currentValues.update(messageValues)
+                    
+                # if it's a trial start message
+                if messageValues.get('messageType') == 'trial':
                     # increment trial count
                     self.nTrials += 1
                     # save trial start time
                     trialStartTimes.append(messageTimesEyelink[i])
         
+        # keep the stop values
+        if processingStop:
+            self.stopValues.append(currentValues)
+
         # compute trial end times as next trial start time
         if len(trialStartTimes) > 1:
             trialEndTimes = trialStartTimes[1:]
