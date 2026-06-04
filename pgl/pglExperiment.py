@@ -652,7 +652,7 @@ class pglExperiment(pglSettingsManager):
         print(f"Experiment: {self.experimentSettings.experimentName} | Subject ID: {self.experimentSettings.subjectID}")
         print(f"Duration: {timestamp.formatDuration(self.data.endTime - self.data.startTime)}")
         
-        displayInfo = f"Display: {self.settings.displayName[0]} "
+        displayInfo = f"Display: {self.settings.displayName[0] if self.settings.displayName and len(self.settings.displayName) > 0 else 'Unknown'} "
         displayInfo += f"{self.pglState.screenWidthPixels}x{self.pglState.screenHeightPixels} @ {self.pglState.frameRate}Hz "
         displayInfo += f"{self.pglState.screenWidthDegrees:.2f}x{self.pglState.screenHeightDegrees:.2f} deg "
         displayInfo += f"{self.settings.displayWidth:.2f}x{self.settings.displayHeight:.2f} cm at {self.settings.displayDistance:.2f} cm "
