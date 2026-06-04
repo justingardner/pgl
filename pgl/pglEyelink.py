@@ -693,9 +693,9 @@ class pglEyelinkData(pglEyeTrackerData):
                     trialInfo += f" {nSaccades} saccade(s)"
                     for iSaccade in range(nSaccades):
                         trialInfo += f" {self.trials[iTrial]['saccades']['startTime'][iSaccade]}ms"
-                        trialInfo += f" {self.trials[iTrial]['saccades']['startX'][iSaccade]},{self.trials[iTrial]['saccades']['startY'][iSaccade]}"
-                        trialInfo += f"->{self.trials[iTrial]['saccades']['endX'][iSaccade]},{self.trials[iTrial]['saccades']['endY'][iSaccade]}"
-                        trialInfo += f" {self.trials[iTrial]['saccades']['amplitude'][iSaccade]}"
+                        trialInfo += f" {self.trials[iTrial]['saccades']['startX'][iSaccade]:.1f},{self.trials[iTrial]['saccades']['startY'][iSaccade]:.1f}"
+                        trialInfo += f"->{self.trials[iTrial]['saccades']['endX'][iSaccade]:.1f},{self.trials[iTrial]['saccades']['endY'][iSaccade]:.1f}"
+                        trialInfo += f" {self.trials[iTrial]['saccades']['amplitude'][iSaccade]:.1f}"
                 nBlinks = len(self.trials[iTrial]['blinks']['eye'])
                 if nBlinks > 0:
                     trialInfo += f" {nBlinks} blink(s)"   
@@ -845,6 +845,7 @@ class pglEyelinkData(pglEyeTrackerData):
         if processingStop:
             currentValues['trialNum'] = self.nTrials-1
             self.stopValues.append(currentValues)
+        self.convertPix2Deg(self.startValues[0]['screenWidthPix'], self.startValues[0]['screenHeightPix'], self.startValues[0]['screenWidthDeg'], self.startValues[0]['screenHeightDeg'])
 
         # compute trial end times as next trial start time
         if len(trialStartTimes) > 1:
@@ -880,12 +881,12 @@ class pglEyelinkData(pglEyeTrackerData):
                     'startTime': self.saccades['startTime'][saccadeMask]-startTime,
                     'endTime': self.saccades['endTime'][saccadeMask]-startTime,
                     'duration': self.saccades['duration'][saccadeMask],
-                    'startX': self.saccades['startX'][saccadeMask],
-                    'startY': self.saccades['startY'][saccadeMask],
-                    'endX': self.saccades['endX'][saccadeMask],
-                    'endY': self.saccades['endY'][saccadeMask],
-                    'amplitude': self.saccades['amplitude'][saccadeMask],
-                    'peakVel': self.saccades['peakVel'][saccadeMask]
+                    'startX': self.saccades['startXDeg'][saccadeMask],
+                    'startY': self.saccades['startYDeg'][saccadeMask],
+                    'endX': self.saccades['endXDeg'][saccadeMask],
+                    'endY': self.saccades['endYDeg'][saccadeMask],
+                    'amplitude': self.saccades['amplitudeDeg'][saccadeMask],
+                    'peakVel': self.saccades['peakVelDeg'][saccadeMask]
                 },
                 'blinks': {
                     'eye': self.blinks['eye'][blinkMask],
