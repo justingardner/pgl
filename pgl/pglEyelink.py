@@ -664,8 +664,14 @@ class pglEyelinkData(pglEyeTrackerData):
     def print(self):
         ''' print information about eye tracker data'''
         print(f"Fileame: {self.filename}")
+        print(f"nTrials: {self.nTrials}")
+        print(f"nSamples: {len(self.tempSamples) if hasattr(self, 'tempSamples') else len(self.data.get('samples', {}).get('time', []))}")
+        print(f"nBlinks: {len(self.blinks['eye'])}")
+        print(f"nSaccades: {len(self.saccades['eye'])}")
+              
         # print info on each start/stop block
         print(f"Blocks of data: {len(self.startValues)}")
+        print("="*40)
         for iBlock in range(len(self.startValues)):
             # calculate duration
             start = datetime.fromisoformat(self.startValues[iBlock]['isoformat'])
@@ -677,7 +683,24 @@ class pglEyelinkData(pglEyeTrackerData):
             print(f" duration: {duration.total_seconds()//60:.0f} min {duration.total_seconds()%60:.0f} s")
             print(f" screen dimensions: {self.startValues[iBlock]['screenWidthPix']} x {self.startValues[iBlock]['screenHeightPix']} ")
             print(f" screen degrees: {self.startValues[iBlock]['screenWidthDeg']:.2f} x {self.startValues[iBlock]['screenHeightDeg']:.2f} ")
-        print(f"nTrials: {self.nTrials}")
+            print(f" trials: {self.startValues[iBlock]['trialNum']}-{self.stopValues[iBlock]['trialNum']}")
+            # print trial-by-trial info
+            for iTrial in range(self.startValues[iBlock]['trialNum'],self.stopValues[iBlock]['trialNum']):
+                trialInfo = f" {iTrial}: "
+                trialInfo += f"{self.trials[iTrial]['time'][0]}-{self.trials[iTrial]['time'][-1]}"
+                nSaccades = len(self.trials[iTrial]['saccades']['eye'])
+                if nSaccades > 0:
+                    trialInfo += f" {nSaccades} saccade(s)"
+                    for iSaccade in range(nSaccades):
+                        trialInfo += f" {self.trials[iTrial]['saccades']['startTime'][iSaccade]}ms"
+                        trialInfo += f" {self.trials[iTrial]['saccades']['startX'][iSaccade]},{self.trials[iTrial]['saccades']['startY'][iSaccade]}"
+                        trialInfo += f"->{self.trials[iTrial]['saccades']['endX'][iSaccade]},{self.trials[iTrial]['saccades']['endY'][iSaccade]}"
+                        trialInfo += f" {self.trials[iTrial]['saccades']['amplitude'][iSaccade]}"
+                nBlinks = len(self.trials[iTrial]['blinks']['eye'])
+                if nBlinks > 0:
+                    trialInfo += f" {nBlinks} blink(s)"   
+                print(trialInfo)         
+            print("="*40)
 
     def _validateFile(self):
         """Validate that the file exists and appears to be an .asc file."""
@@ -777,7 +800,7 @@ class pglEyelinkData(pglEyeTrackerData):
         messageTimesEyelink = self.messages['time']
 
         # initialize dictionaries with start / stop values
-        currentValues = {}
+        currentValues = {'trialNum': 1}
         self.startValues = []
         self.stopValues = []
         processingStart = False
@@ -793,8 +816,10 @@ class pglEyelinkData(pglEyeTrackerData):
                 if messageValues.get('messageType') == 'start':
                     # append the last values on to stop
                     if processingStop:
+                        # set endTrial
+                        currentValues['trialNum'] = self.nTrials-1
                         self.stopValues.append(currentValues)
-                        currentValues = {}
+                        currentValues['trialNum'] = self.nTrials
                         processingStop = False
                     processingStart = True
                     currentValues.update(messageValues)
@@ -818,6 +843,7 @@ class pglEyelinkData(pglEyeTrackerData):
         
         # keep the stop values
         if processingStop:
+            currentValues['trialNum'] = self.nTrials-1
             self.stopValues.append(currentValues)
 
         # compute trial end times as next trial start time
@@ -840,6 +866,9 @@ class pglEyelinkData(pglEyeTrackerData):
             # find saccades within this trial's time window
             saccadeMask = (self.saccades['startTime'] >= startTime) & (self.saccades['startTime'] < endTime)
             
+            # find blinks within this trial's time window
+            blinkMask = (self.blinks['startTime'] >= startTime) & (self.blinks['startTime'] < endTime)
+            
             # extract trial data
             trialData = {
                 'x': self.samples['x'][trialMask],
@@ -848,8 +877,8 @@ class pglEyelinkData(pglEyeTrackerData):
                 'time': self.samples['time'][trialMask],
                 'saccades': {
                     'eye': self.saccades['eye'][saccadeMask],
-                    'startTime': self.saccades['startTime'][saccadeMask],
-                    'endTime': self.saccades['endTime'][saccadeMask],
+                    'startTime': self.saccades['startTime'][saccadeMask]-startTime,
+                    'endTime': self.saccades['endTime'][saccadeMask]-startTime,
                     'duration': self.saccades['duration'][saccadeMask],
                     'startX': self.saccades['startX'][saccadeMask],
                     'startY': self.saccades['startY'][saccadeMask],
@@ -857,6 +886,12 @@ class pglEyelinkData(pglEyeTrackerData):
                     'endY': self.saccades['endY'][saccadeMask],
                     'amplitude': self.saccades['amplitude'][saccadeMask],
                     'peakVel': self.saccades['peakVel'][saccadeMask]
+                },
+                'blinks': {
+                    'eye': self.blinks['eye'][blinkMask],
+                    'startTime': self.blinks['startTime'][blinkMask]-startTime,
+                    'endTime': self.blinks['endTime'][blinkMask]-startTime,
+                    'duration': self.blinks['duration'][blinkMask],
                 }
             }
             
