@@ -1301,10 +1301,13 @@ class pglTaskData(pglSerialize):
             return
         
         # get the max trial length
-        maxTrialLength = np.diff(trialTimestamps).max()
+        maxTrialLength = np.diff(trialTimestamps[:-1]).max()
         
         # init timeline
         timeline = timelinePlot(startTime=0, endTime=maxTrialLength)
+        
+        # init a dict for counting the number of different responseTypes found in the events
+        responseCounts = {respType: 0 for respType in responseMapping}
         
         # for each event, add to timeline
         trialStart = None
@@ -1325,6 +1328,10 @@ class pglTaskData(pglSerialize):
                     gotResponse = True
                     label, color = responseMapping.get(event.responseType, ('?', 'gray'))
                     timeline.addTriangleMarker(time=event.timestamp - trialStart, color=color, label=label[0], direction='down')   
+                    # update response counts
+                    if event.responseType in responseCounts:
+                        responseCounts[event.responseType] += 1
+                        
         timeline.setTitle(f"{taskName}: {nTrials} trials")
         
         # display legend
@@ -1332,7 +1339,10 @@ class pglTaskData(pglSerialize):
         # add the response values
         if gotResponse:
             for respType, (label, color) in responseMapping.items():
-                legend.append({'label': label, 'color': color})
+                # get statistics for this response type
+                count = responseCounts.get(respType, 0)
+                percent = (count / sum(responseCounts.values()) * 100) if nTrials > 0 else 0
+                legend.append({'label': f'{label} (n={count}: {percent:.1f}%)', 'color': color})
         timeline.addLegend(legend)
         timeline.show()
 
