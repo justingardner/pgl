@@ -53,11 +53,15 @@ class pglExperimentBase(pglSettingsManager):
         # init super
         super().__init__()
         
-        # initialize settings, state and data
+        # initialize variables
         self.settings = None
         self.state = None
         self.data = None
         self.experimentSettings = None
+        self.pgl = None
+        self.eyeTracker = None
+        self.tasks = []
+                
     def loadSettings(self, settingsName=None, settings=None):
         
         if (settings is None) and (settingsName is None):
@@ -178,6 +182,26 @@ class pglExperimentBase(pglSettingsManager):
         else:
             print("(pglExperiment) ❌ Unknown eye tracker type {self.settings.eyetracker[0]}")
             self.eyeTracker = None
+   
+    def addTask(self, task):
+        '''
+        Add a task to the experiment.
+        '''
+        # give it a reference to pgl and experiment
+        task.pgl = self.pgl
+        task.e = self
+        task.taskID = len(self.tasks)
+
+        # set whether to save eye tracker info
+        if self.eyeTracker is not None:
+            task.settings.saveEyeTracker = True
+
+        # add the task
+        self.tasks.append(task)
+        
+        # save in experimentSettings
+        self.experimentSettings.tasks.append(task.settings.taskSaveName)
+
 
             
     def display(self):
@@ -243,15 +267,9 @@ class pglExperiment(pglExperimentBase):
         # init super
         super().__init__()
 
-        # default
-        self.eyeTracker = None
-
         # load settings
         self.loadSettings(settingsName=settingsName, settings=settings)
 
-        # initialize tasks
-        self.tasks = []
-        
         if pgl is None:
             # If pgl is none, then this is a load
             if experimentName == "":
@@ -408,25 +426,6 @@ class pglExperiment(pglExperimentBase):
         '''
         return self.pgl.setEatKeys(eatKeys)
     
-    def addTask(self, task):
-        '''
-        Add a task to the experiment.
-        '''
-        # give it a reference to pgl and experiment
-        task.pgl = self.pgl
-        task.e = self
-        task.taskID = len(self.tasks)
-
-        # set whether to save eye tracker info
-        if self.eyeTracker is not None:
-            task.settings.saveEyeTracker = True
-
-        # add the task
-        self.tasks.append(task)
-        
-        # save in experimentSettings
-        self.experimentSettings.tasks.append(task.settings.taskSaveName)
-
     def run(self):
         '''
         Run the experiment.
@@ -690,7 +689,34 @@ class pglExperiment(pglExperimentBase):
 
         # save each task
         for task in self.tasks: task.save(dataDir)   
-                         
+
+##############################################s
+# experiment analysis class
+##############################################
+class pglExperimentAnalysis(pglExperimentBase):
+    '''
+    Experiment analysis class loads, data, settings and state
+    of experiment, provides functions for displaying the data
+    and members for extracting the data from the experiment
+    in various ways
+    '''
+    def __init__(self, experimentName, subjectID="s0000", settingsName=None, settings=None):
+        '''
+        Initialize the pglExperimentAnalysis class.
+        
+        Args:
+            subjectID (str): The identifier for the subject participating in the experiment.
+            ExperimentName (str): The name of the experiment to load.
+        '''
+        # init super
+        super().__init__()
+
+        # load settings - this is primarily to get the data dir
+        self.loadSettings(settingsName=settingsName, settings=settings)
+
+        # load the experimentName
+        self.load(experimentName=experimentName, subjectID=subjectID)
+                            
 ##############################################
 # Task class
 ##############################################
