@@ -39,6 +39,17 @@ from . import pglTimestamp
 from .pglEyeTracker import pglEyeTracker
 from .pglEyelink import pglEyelink, pglEyelinkData
 
+#######################
+# for returning stats
+#######################
+@dataclass
+class Stats:
+    mean: float
+    median: float
+    std: float
+    min: float
+    max: float
+
 ##############################################s
 # Experiment base class
 ##############################################
@@ -202,8 +213,6 @@ class pglExperimentBase(pglSettingsManager):
         # save in experimentSettings
         self.experimentSettings.tasks.append(task.settings.taskSaveName)
 
-
-            
     def display(self):
         '''
         Display a timeline of experiment events.
@@ -237,6 +246,10 @@ class pglExperimentBase(pglSettingsManager):
         
         numVols = self.data.getNumEvents(type="volumeTrigger")
         print(f"Number of volume triggers: {numVols}")
+        if numVols > 1:
+            triggerStats = self.data.getTriggerStats()
+            print(f"Median time between triggers: {triggerStats.median:.3f}s")
+            print(f"Mean ± std time between triggers: {triggerStats.mean:.3f} ± {triggerStats.std:.6f}s")
         
         # print task data
         if hasattr(self, "tasks"):
@@ -245,6 +258,7 @@ class pglExperimentBase(pglSettingsManager):
                 print("=" * 80)
                 # print task
                 task.print()   
+                
     def experimentDuration(self,data=None):
         '''
         Return the total time of the experiment in seconds.
@@ -259,13 +273,16 @@ class pglExperimentBase(pglSettingsManager):
         if data.getNumEvents(type="volumeTrigger") > 1:        
             # get the timestamps of the first and last volume triggers
             volumeTimestamps = [e.timestamp for e in data.events if e.type == "volumeTrigger"]
+            volumeTR = np.median(np.diff(volumeTimestamps))
             # return the difference between the first and last timestamp
             # because the experiment type as recorded by endTime and startTIme
             # will typically record longer until the experimenter pressed the ESC key to end
-            return volumeTimestamps[-1] - volumeTimestamps[0]
+            # add one TR to account for the last volume trigger
+            return volumeTimestamps[-1] - volumeTimestamps[0] + volumeTR
         else:
             # return timestamps for end compared to start
             return data.endTime - data.startTime
+
 ##############################################s
 # Experiment class
 ##############################################
@@ -1143,7 +1160,25 @@ class pglExperimentData(pglSerialize):
         timeline.setTitle("Experiment Events")
         timeline.addLegend([{'label': f'Keypress (n={nKeys})', 'color': 'green'},{'label': f'Volumes (n={nVols})', 'color': 'blue'}])
         timeline.show()
-
+    def getTriggerStats(self):
+        '''
+        Get the median time between volume triggers.
+        '''
+        # get all volume trigger events
+        volumeTriggerEvents = [event for event in self.events if event.type == "volumeTrigger"]
+        # get the timestamps of the volume trigger events
+        timestamps = [event.timestamp for event in volumeTriggerEvents]
+        # get the differences between the timestamps
+        diffs = np.diff(timestamps)
+        # return the median of the differences
+        return Stats(
+            mean=np.mean(diffs) if len(diffs) > 0 else None,
+            median=np.median(diffs) if len(diffs) > 0 else None,
+            std=np.std(diffs) if len(diffs) > 0 else None,
+            min=np.min(diffs) if len(diffs) > 0 else None,
+            max=np.max(diffs) if len(diffs) > 0 else None
+        )
+    
 ##############################################
 # State for pglExperiment
 ##############################################
