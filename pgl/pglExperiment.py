@@ -1090,18 +1090,28 @@ class pglExperimentData(pglSerialize):
         else:
             self.volumeTriggerKey = ""
         
+        # Get the time at which start the timeline, if there is a keyboard
+        # event that happens before the start of the experiment (like when the experimenter
+        # hits space to start the experiment), then adjust the start time to show that as a negative time)
+        firstKeydownEvent = next((event for event in self.events if event.type == "keyboard" and event.eventType == "keydown"), None)
+        if firstKeydownEvent is not None:
+            if firstKeydownEvent.timestamp < self.startTime:
+                startTime = firstKeydownEvent.timestamp - self.startTime
+        else:
+            startTime = 0
+            
         # init timeline
-        timeline = timelinePlot(startTime=0, endTime=max(self.endTime-self.startTime,10))
+        timeline = timelinePlot(startTime=startTime, endTime=max(self.endTime-self.startTime,10))
         # for each event, add to timeline
         for event in self.events:
             if event.type == "keyboard":
                 if event.eventType == "keydown":
-                    if event.keyChar == self.volumeTriggerKey:
-                        timeline.addTriangleMarker(time=event.timestamp - self.startTime, color='blue', direction='up')
-                    else:
+                    if event.keyChar != self.volumeTriggerKey:
                         timeline.addTriangleMarker(time=event.timestamp - self.startTime, color='green', label=f'{event.keyChar}', direction='down')
                 elif (event.keyChar == "escape"):
                     timeline.addTriangleMarker(time=event.timestamp - self.startTime, color='red', label=f'{event.keyChar}', direction='down')
+            elif event.type == "volumeTrigger":
+                timeline.addTriangleMarker(time=event.timestamp - self.startTime, color='blue', direction='up')
         timeline.setTitle("Experiment Events")
         timeline.addLegend([{'label': 'Keypress', 'color': 'green'},{'label': 'Volumes', 'color': 'blue'}])
         timeline.show()
