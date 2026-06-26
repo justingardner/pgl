@@ -125,7 +125,7 @@ class pglExperimentBase(pglSettingsManager):
                             numVols = experimentData.getNumEvents(type="keyboard", eventType="keydown", keyChar="5")
                         dataPrintname += f" | nVols: {numVols}"
                         # print duration
-                        dataPrintname += f" | {self.pglTimestamp.formatDuration(experimentData.endTime-experimentData.startTime)}"
+                        dataPrintname += f" | {self.pglTimestamp.formatDuration(self.experimentDuration(experimentData))}"
                         # print experiment name
                         dataPrintname += f" | {experimentSettings.experimentName}"
                     except:
@@ -227,7 +227,7 @@ class pglExperimentBase(pglSettingsManager):
         
         # print experiment name, subject ID, and duration
         print(f"Experiment: {self.experimentSettings.experimentName} | Subject ID: {self.experimentSettings.subjectID}")
-        print(f"Duration: {timestamp.formatDuration(self.data.endTime - self.data.startTime)}")
+        print(f"Duration: {timestamp.formatDuration(self.experimentDuration())}")
         
         displayInfo = f"Display: {self.settings.displayName[0] if self.settings.displayName and len(self.settings.displayName) > 0 else 'Unknown'} "
         displayInfo += f"{self.pglState.screenWidthPixels}x{self.pglState.screenHeightPixels} @ {self.pglState.frameRate}Hz "
@@ -245,7 +245,27 @@ class pglExperimentBase(pglSettingsManager):
                 print("=" * 80)
                 # print task
                 task.print()   
-
+    def experimentDuration(self,data=None):
+        '''
+        Return the total time of the experiment in seconds.
+        '''
+        # work on passed in data or self data
+        if data is None:
+            data = self.data
+        # check for no data
+        if data is None or data.startTime is None or data.endTime is None:
+            return 0
+        # check to see if this has volumes recorded
+        if data.getNumEvents(type="volumeTrigger") > 1:        
+            # get the timestamps of the first and last volume triggers
+            volumeTimestamps = [e.timestamp for e in data.events if e.type == "volumeTrigger"]
+            # return the difference between the first and last timestamp
+            # because the experiment type as recorded by endTime and startTIme
+            # will typically record longer until the experimenter pressed the ESC key to end
+            return volumeTimestamps[-1] - volumeTimestamps[0]
+        else:
+            # return timestamps for end compared to start
+            return data.endTime - data.startTime
 ##############################################s
 # Experiment class
 ##############################################

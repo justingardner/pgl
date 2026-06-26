@@ -52,17 +52,22 @@ class pglTimestamp:
         """
         Convert a number of seconds into a human-readable string.
         """
-        seconds = int(seconds)  # make sure it's an integer
-        hours = seconds // 3600
-        minutes = (seconds % 3600) // 60
-        secs = seconds % 60
+        ms = int(seconds * 1000)  # convert to milliseconds for precision
+        hours = ms // 3600000
+        ms %= 3600000
+        minutes = ms // 60000
+        ms %= 60000
+        secs = ms // 1000
+        ms %= 1000
 
         parts = []
         if hours:
             parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
         if minutes:
             parts.append(f"{minutes} min{'s' if minutes != 1 else ''}")
-        if secs or not parts:
+        if secs:
             parts.append(f"{secs}s")
+        if ms or not parts:
+            parts.append(f"{ms}ms")
 
         return " ".join(parts)
