@@ -1100,6 +1100,10 @@ class pglExperimentData(pglSerialize):
         else:
             startTime = 0
             
+        # track number of volumes
+        nVols = 0
+        nKeys = 0
+        
         # init timeline
         timeline = timelinePlot(startTime=startTime, endTime=max(self.endTime-self.startTime,10))
         # for each event, add to timeline
@@ -1108,12 +1112,16 @@ class pglExperimentData(pglSerialize):
                 if event.eventType == "keydown":
                     if event.keyChar != self.volumeTriggerKey:
                         timeline.addTriangleMarker(time=event.timestamp - self.startTime, color='green', label=f'{event.keyChar}', direction='down')
+                        nKeys += 1
                 elif (event.keyChar == "escape"):
                     timeline.addTriangleMarker(time=event.timestamp - self.startTime, color='red', label=f'{event.keyChar}', direction='down')
+                    nKeys += 1
             elif event.type == "volumeTrigger":
                 timeline.addTriangleMarker(time=event.timestamp - self.startTime, color='blue', direction='up')
+                nVols += 1
+                
         timeline.setTitle("Experiment Events")
-        timeline.addLegend([{'label': 'Keypress', 'color': 'green'},{'label': 'Volumes', 'color': 'blue'}])
+        timeline.addLegend([{'label': f'Keypress (n={nKeys})', 'color': 'green'},{'label': f'Volumes (n={nVols})', 'color': 'blue'}])
         timeline.show()
 
 ##############################################
