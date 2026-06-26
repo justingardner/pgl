@@ -40,9 +40,192 @@ from .pglEyeTracker import pglEyeTracker
 from .pglEyelink import pglEyelink, pglEyelinkData
 
 ##############################################s
+# Experiment base class
+##############################################
+class pglExperimentBase(pglSettingsManager):
+    '''
+    Base class for pglExperiment which runs experiments
+    and pglExperimentAnalysis which is used for loading and
+    analyzing experimental data. This class handles loading
+    and saving settings, state and data.
+    '''
+    def __init__(self):
+        # init super
+        super().__init__()
+        
+        # initialize settings, state and data
+        self.settings = None
+        self.state = None
+        self.data = None
+        self.experimentSettings = None
+    def loadSettings(self, settingsName=None, settings=None):
+        
+        if (settings is None) and (settingsName is None):
+            # if no settings provided, then just use default settings
+            self.settings = pglSettings()
+            print("(pglExperiment) No settings provided, using default settings.")
+            return
+
+        # get settings
+        self.settings = settings
+        if self.settings is None:
+            self.settings = self.getSettings(settingsName)
+        
+        # if there was some error, then display it
+        if self.settings is None:
+            # display error in HTML
+            pglDisplayMessage("<b>(pglExperiment:initScreen)</b> ❌ Could not find settings, using default settings.")
+            # create default settings
+            self.settings = pglSettings()
+
+    def load(self, experimentName="", subjectID=""):
+        '''
+        Load the experiment settings, state and data.         
+        '''
+        # default values
+        self.pgl = None
+        self.task = []
+
+        self.pglTimestamp = pglTimestamp()
+        dataDir = Path(self.settings.dataPath).expanduser() / experimentName / subjectID 
+        # check that data path exists
+        if not dataDir.exists() or not dataDir.is_dir():
+            print(f"(pglExperiment:load) ❌ Could not find data directory: {dataDir}")
+            return
+        
+        # Get all directories in the dataPath
+        dirList = [d for d in dataDir.iterdir() if d.is_dir()]
+        dirList = sorted(dirList, key=lambda d: d.name)
+        
+        # print the experiment name and subjetID
+        print(f"(pglExperiment:load) Data directory: {dataDir}")
+        print(f"Experiment name: {experimentName} | Subject ID: {subjectID}")
+        
+        # Print all the directories
+        for i, d in enumerate(dirList, start=1):
+            try:
+                # for typical data files, parse into a datatime
+                dt = datetime.strptime(d.name, "%Y%m%d_%H%M%S")
+                # and print a more user-friendly name
+                dataPrintname = dt.strftime("%A %B %-d, %Y %-I:%M%p")
+                # try to read the data.json file
+                dataFilename = dataDir / d.name / "data.json"
+                if dataFilename.exists():
+                    try:
+                        # load the data so that we can print information about the experiment
+                        experimentData = pglSerialize.load(dataDir / d.name / "data.json")
+                        experimentSettings = pglSerialize.load(dataDir / d.name / "experimentSettings.json")
+                        # print number of volumes
+                        numVols = experimentData.getNumEvents(type="pglEventVolumeTrigger")
+                        if numVols==0:
+                            numVols = experimentData.getNumEvents(type="keyboard", eventType="keydown", keyChar="5")
+                        dataPrintname += f" | nVols: {numVols}"
+                        # print duration
+                        dataPrintname += f" | {self.pglTimestamp.formatDuration(experimentData.endTime-experimentData.startTime)}"
+                        # print experiment name
+                        dataPrintname += f" | {experimentSettings.experimentName}"
+                    except:
+                        pass
+                # Add the filename
+                dataPrintname = f"{dataPrintname} ({d.name})"
+            except:
+                # not a typical name, just display
+                dataPrintname = d.name
+            print(f"{i}. {dataPrintname}", flush=True)
+
+        # Ask the user to choose
+        print("\nSelect a directory number: ", flush=True)
+        choice = int(input())
+        if choice < 1 or choice > len(dirList):
+            print(f"(pglExperiment:load) ❌ Invalid choice: {choice}")
+            return
+
+        # Get the selected directory
+        selectedDir = dataDir / dirList[choice - 1]
+
+        # load the experiment data, settings, and state
+        print(f"(pglExperiment:load) Loading experimentdata from: {selectedDir}")
+        self.data = pglSerialize.load(selectedDir / "data.json")
+        self.settings = pglSerialize.load(selectedDir / "settings.json")
+        self.experimentSettings = pglSerialize.load(selectedDir / "experimentSettings.json")
+        self.state = pglSerialize.load(selectedDir / "state.json")
+        
+        # load pgl state
+        self.pglState = pglSerialize.load(selectedDir / "pgl.json")
+        
+        # load all the tasks
+        dirList = [d for d in selectedDir.iterdir() if d.is_dir()]
+        dirList = sorted(dirList, key=lambda d: d.name)
+        for i, d in enumerate(dirList, start=1):
+            # get the task directory
+            taskDir = selectedDir / d.name
+            # load the task data, settings, and state
+            task = pglTask()
+            print(f"(pglExperiment:load) Loading task data from: {taskDir}")
+            task.settings = pglSerialize.load(taskDir / "settings.json")
+            task.state = pglSerialize.load(taskDir / "state.json")
+            task.data = pglSerialize.load(taskDir / "data.json")
+            
+            # add the task to the experiment
+            self.addTask(task)
+        
+        # load the eye tracker data
+        if self.settings.eyetracker[0] == "Eyelink":
+            eyeTrackerFilename = selectedDir / f"{self.settings.eyetracker[0].lower()}.asc"
+            self.eyeTrackerData = pglEyelinkData(str(eyeTrackerFilename))
+        elif self.settings.eyetracker[0] == "None":
+            self.eyeTracker = None
+        else:
+            print("(pglExperiment) ❌ Unknown eye tracker type {self.settings.eyetracker[0]}")
+            self.eyeTracker = None
+
+            
+    def display(self):
+        '''
+        Display a timeline of experiment events.
+        '''
+        # display experiment data
+        self.data.display(self)
+        
+        # display task data
+        if hasattr(self, "tasks"):
+            for task in self.tasks:
+                task.display()   
+
+    def print(self):
+        '''
+        Print a summary of the experiment events.
+        '''
+        from pgl import pglTimestamp
+        timestamp = pglTimestamp()
+        # print separator
+        print("=" * 80)
+        
+        # print experiment name, subject ID, and duration
+        print(f"Experiment: {self.experimentSettings.experimentName} | Subject ID: {self.experimentSettings.subjectID}")
+        print(f"Duration: {timestamp.formatDuration(self.data.endTime - self.data.startTime)}")
+        
+        displayInfo = f"Display: {self.settings.displayName[0] if self.settings.displayName and len(self.settings.displayName) > 0 else 'Unknown'} "
+        displayInfo += f"{self.pglState.screenWidthPixels}x{self.pglState.screenHeightPixels} @ {self.pglState.frameRate}Hz "
+        displayInfo += f"{self.pglState.screenWidthDegrees:.2f}x{self.pglState.screenHeightDegrees:.2f} deg "
+        displayInfo += f"{self.settings.displayWidth:.2f}x{self.settings.displayHeight:.2f} cm at {self.settings.displayDistance:.2f} cm "
+        print(displayInfo)
+        
+        numVols = self.data.getNumEvents(type="pglEventVolumeTrigger")
+        print(f"Number of volume triggers: {numVols}")
+        
+        # print task data
+        if hasattr(self, "tasks"):
+            for task in self.tasks:
+                # print separtor
+                print("=" * 80)
+                # print task
+                task.print()   
+
+##############################################s
 # Experiment class
 ##############################################
-class pglExperiment(pglSettingsManager):
+class pglExperiment(pglExperimentBase):
     '''
     Experiment class which handles timing, parameter randomization,
     subject response, synchronizing with measurement hardware etc
@@ -57,6 +240,9 @@ class pglExperiment(pglSettingsManager):
             settings (pglSettings): An instance of the pglSettings class. If set, will supersede settingsName.
             subjectID (str): The identifier for the subject participating in the experiment.
         '''
+        # init super
+        super().__init__()
+
         # default
         self.eyeTracker = None
 
@@ -504,172 +690,7 @@ class pglExperiment(pglSettingsManager):
 
         # save each task
         for task in self.tasks: task.save(dataDir)   
-                     
-    def loadSettings(self, settingsName=None, settings=None):
-        
-        if (settings is None) and (settingsName is None):
-            # if no settings provided, then just use default settings
-            self.settings = pglSettings()
-            print("(pglExperiment) No settings provided, using default settings.")
-            return
-
-        # get settings
-        self.settings = settings
-        if self.settings is None:
-            self.settings = self.getSettings(settingsName)
-        
-        # if there was some error, then display it
-        if self.settings is None:
-            # display error in HTML
-            pglDisplayMessage("<b>(pglExperiment:initScreen)</b> ❌ Could not find settings, using default settings.")
-            # create default settings
-            self.settings = pglSettings()
-
-    def load(self, experimentName="", subjectID=""):
-        '''
-        Load the experiment settings, state and data.         
-        '''
-        # default values
-        self.pgl = None
-        self.task = []
-
-        self.pglTimestamp = pglTimestamp()
-        dataDir = Path(self.settings.dataPath).expanduser() / experimentName / subjectID 
-        # check that data path exists
-        if not dataDir.exists() or not dataDir.is_dir():
-            print(f"(pglExperiment:load) ❌ Could not find data directory: {dataDir}")
-            return
-        
-        # Get all directories in the dataPath
-        dirList = [d for d in dataDir.iterdir() if d.is_dir()]
-        dirList = sorted(dirList, key=lambda d: d.name)
-        
-        # print the experiment name and subjetID
-        print(f"(pglExperiment:load) Data directory: {dataDir}")
-        print(f"Experiment name: {experimentName} | Subject ID: {subjectID}")
-        
-        # Print all the directories
-        for i, d in enumerate(dirList, start=1):
-            try:
-                # for typical data files, parse into a datatime
-                dt = datetime.strptime(d.name, "%Y%m%d_%H%M%S")
-                # and print a more user-friendly name
-                dataPrintname = dt.strftime("%A %B %-d, %Y %-I:%M%p")
-                # try to read the data.json file
-                dataFilename = dataDir / d.name / "data.json"
-                if dataFilename.exists():
-                    try:
-                        # load the data so that we can print information about the experiment
-                        experimentData = pglSerialize.load(dataDir / d.name / "data.json")
-                        experimentSettings = pglSerialize.load(dataDir / d.name / "experimentSettings.json")
-                        # print number of volumes
-                        numVols = experimentData.getNumEvents(type="pglEventVolumeTrigger")
-                        if numVols==0:
-                            numVols = experimentData.getNumEvents(type="keyboard", eventType="keydown", keyChar="5")
-                        dataPrintname += f" | nVols: {numVols}"
-                        # print duration
-                        dataPrintname += f" | {self.pglTimestamp.formatDuration(experimentData.endTime-experimentData.startTime)}"
-                        # print experiment name
-                        dataPrintname += f" | {experimentSettings.experimentName}"
-                    except:
-                        pass
-                # Add the filename
-                dataPrintname = f"{dataPrintname} ({d.name})"
-            except:
-                # not a typical name, just display
-                dataPrintname = d.name
-            print(f"{i}. {dataPrintname}", flush=True)
-
-        # Ask the user to choose
-        print("\nSelect a directory number: ", flush=True)
-        choice = int(input())
-        if choice < 1 or choice > len(dirList):
-            print(f"(pglExperiment:load) ❌ Invalid choice: {choice}")
-            return
-
-        # Get the selected directory
-        selectedDir = dataDir / dirList[choice - 1]
-
-        # load the experiment data, settings, and state
-        print(f"(pglExperiment:load) Loading experimentdata from: {selectedDir}")
-        self.data = pglSerialize.load(selectedDir / "data.json")
-        self.settings = pglSerialize.load(selectedDir / "settings.json")
-        self.experimentSettings = pglSerialize.load(selectedDir / "experimentSettings.json")
-        self.state = pglSerialize.load(selectedDir / "state.json")
-        
-        # load pgl state
-        self.pglState = pglSerialize.load(selectedDir / "pgl.json")
-        
-        # load all the tasks
-        dirList = [d for d in selectedDir.iterdir() if d.is_dir()]
-        dirList = sorted(dirList, key=lambda d: d.name)
-        for i, d in enumerate(dirList, start=1):
-            # get the task directory
-            taskDir = selectedDir / d.name
-            # load the task data, settings, and state
-            task = pglTask()
-            print(f"(pglExperiment:load) Loading task data from: {taskDir}")
-            task.settings = pglSerialize.load(taskDir / "settings.json")
-            task.state = pglSerialize.load(taskDir / "state.json")
-            task.data = pglSerialize.load(taskDir / "data.json")
-            
-            # add the task to the experiment
-            self.addTask(task)
-        
-        # load the eye tracker data
-        if self.settings.eyetracker[0] == "Eyelink":
-            eyeTrackerFilename = selectedDir / f"{self.settings.eyetracker[0].lower()}.asc"
-            self.eyeTrackerData = pglEyelinkData(str(eyeTrackerFilename))
-        elif self.settings.eyetracker[0] == "None":
-            self.eyeTracker = None
-        else:
-            print("(pglExperiment) ❌ Unknown eye tracker type {self.settings.eyetracker[0]}")
-            self.eyeTracker = None
-
-            
-    def display(self):
-        '''
-        Display a timeline of experiment events.
-        '''
-        # display experiment data
-        self.data.display(self)
-        
-        # display task data
-        if hasattr(self, "tasks"):
-            for task in self.tasks:
-                task.display()   
-
-    def print(self):
-        '''
-        Print a summary of the experiment events.
-        '''
-        from pgl import pglTimestamp
-        timestamp = pglTimestamp()
-        # print separator
-        print("=" * 80)
-        
-        # print experiment name, subject ID, and duration
-        print(f"Experiment: {self.experimentSettings.experimentName} | Subject ID: {self.experimentSettings.subjectID}")
-        print(f"Duration: {timestamp.formatDuration(self.data.endTime - self.data.startTime)}")
-        
-        displayInfo = f"Display: {self.settings.displayName[0] if self.settings.displayName and len(self.settings.displayName) > 0 else 'Unknown'} "
-        displayInfo += f"{self.pglState.screenWidthPixels}x{self.pglState.screenHeightPixels} @ {self.pglState.frameRate}Hz "
-        displayInfo += f"{self.pglState.screenWidthDegrees:.2f}x{self.pglState.screenHeightDegrees:.2f} deg "
-        displayInfo += f"{self.settings.displayWidth:.2f}x{self.settings.displayHeight:.2f} cm at {self.settings.displayDistance:.2f} cm "
-        print(displayInfo)
-        
-        numVols = self.data.getNumEvents(type="pglEventVolumeTrigger")
-        print(f"Number of volume triggers: {numVols}")
-        
-        # print task data
-        if hasattr(self, "tasks"):
-            for task in self.tasks:
-                # print separtor
-                print("=" * 80)
-                # print task
-                task.print()   
-
-    
+                         
 ##############################################
 # Task class
 ##############################################
