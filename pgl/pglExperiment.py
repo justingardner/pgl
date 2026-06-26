@@ -120,7 +120,7 @@ class pglExperimentBase(pglSettingsManager):
                         experimentData = pglSerialize.load(dataDir / d.name / "data.json")
                         experimentSettings = pglSerialize.load(dataDir / d.name / "experimentSettings.json")
                         # print number of volumes
-                        numVols = experimentData.getNumEvents(type="pglEventVolumeTrigger")
+                        numVols = experimentData.getNumEvents(type="volumeTrigger")
                         if numVols==0:
                             numVols = experimentData.getNumEvents(type="keyboard", eventType="keydown", keyChar="5")
                         dataPrintname += f" | nVols: {numVols}"
@@ -235,7 +235,7 @@ class pglExperimentBase(pglSettingsManager):
         displayInfo += f"{self.settings.displayWidth:.2f}x{self.settings.displayHeight:.2f} cm at {self.settings.displayDistance:.2f} cm "
         print(displayInfo)
         
-        numVols = self.data.getNumEvents(type="pglEventVolumeTrigger")
+        numVols = self.data.getNumEvents(type="volumeTrigger")
         print(f"Number of volume triggers: {numVols}")
         
         # print task data
