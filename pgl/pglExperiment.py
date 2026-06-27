@@ -283,6 +283,45 @@ class pglExperimentBase(pglSettingsManager):
             # return timestamps for end compared to start
             return data.endTime - data.startTime
 
+    def getNearestVolumeTrigger(self, event=None, direction='nearest'):
+        '''
+        Find the nearest volume trigger to a given event.
+        
+        Args:
+            event: The event to find the nearest volume trigger for
+            direction: 'nearest' (default), 'before', or 'after'
+        
+        Returns:
+            int: volume_number (starting at 1) or None if not found
+        '''
+        if event is None:
+            return None
+        
+        # Get only the volume triggers and number them sequentially
+        volumeTriggers = [(i + 1, e.timestamp) for i, e in 
+                        enumerate([e for e in self.data.events if e.type == "volumeTrigger"])]
+        
+        if not volumeTriggers:
+            return None
+        
+        if direction == 'before':
+            # Find closest timestamp before the event
+            beforeTriggers = [vt for vt in volumeTriggers if vt[1] <= event.timestamp]
+            if not beforeTriggers:
+                return None
+            volumeNumber, nearestTimestamp = max(beforeTriggers, key=lambda x: x[1])
+        elif direction == 'after':
+            # Find closest timestamp after the event
+            afterTriggers = [vt for vt in volumeTriggers if vt[1] >= event.timestamp]
+            if not afterTriggers:
+                return None
+            volumeNumber, nearestTimestamp = min(afterTriggers, key=lambda x: x[1])
+        else:  # direction == 'nearest' (default)
+            # Find closest timestamp in either direction
+            volumeNumber, nearestTimestamp = min(volumeTriggers, key=lambda x: abs(x[1] - event.timestamp))
+        
+        print(f"(pglExperiment:getNearestVolumeTrigger) Nearest volume trigger to event at {event.timestamp:.3f}s is volume {volumeNumber} at {nearestTimestamp:.3f}s")
+        return volumeNumber
 ##############################################s
 # Experiment class
 ##############################################
@@ -1026,7 +1065,8 @@ class pglTask:
             # find matching trial event
             trialEvent = next((event for event in self.data.events if isinstance(event, pglEventTrial) and event.trialNum == iTrial), None)
             trialStart = trialEvent.timestamp-self.data.startTime if trialEvent else "No trial event found"
-            print(f"Trial {iTrial+1} at {trialStart:.2f}s: " + ', '.join(f"{key}={value}" for key, value in params.items()))
+            trialVolume = self.e.getNearestVolumeTrigger(trialEvent)
+            print(f"Trial {iTrial+1} at {trialStart:.2f}s (vol={trialVolume}): " + ', '.join(f"{key}={value}" for key, value in params.items()))
 
 ##############################################
 # test task for testing settings
