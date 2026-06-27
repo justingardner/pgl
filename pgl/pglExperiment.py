@@ -320,7 +320,6 @@ class pglExperimentBase(pglSettingsManager):
             # Find closest timestamp in either direction
             volumeNumber, nearestTimestamp = min(volumeTriggers, key=lambda x: abs(x[1] - event.timestamp))
         
-        print(f"(pglExperiment:getNearestVolumeTrigger) Nearest volume trigger to event at {event.timestamp:.3f}s is volume {volumeNumber} at {nearestTimestamp:.3f}s")
         return volumeNumber
 ##############################################s
 # Experiment class
@@ -1060,13 +1059,25 @@ class pglTask:
         # print task name and number of trials
         print(f"Task: {self.settings.taskName} | Trials: {self.state.currentTrial+1}")
         print(f"Duration={timestamp.formatDuration(self.data.endTime - self.data.startTime)} | startTime={self.data.startTime} | endTime={self.data.endTime}")
-
+        
+        # print fixedParameters
+        print('\n'.join(f"{key}={value}" for key, value in self.settings.fixedParameters.items()))
+        print('-' * 40)
+        
+        # print parameters
+        for p in self.settings.parameters:
+            print(f"{p.name}")
+        
+        # print trial by trial information
         for iTrial, params in enumerate(self.data.params):
             # find matching trial event
             trialEvent = next((event for event in self.data.events if isinstance(event, pglEventTrial) and event.trialNum == iTrial), None)
             trialStart = trialEvent.timestamp-self.data.startTime if trialEvent else "No trial event found"
             trialVolume = self.e.getNearestVolumeTrigger(trialEvent)
-            print(f"Trial {iTrial+1} at {trialStart:.2f}s (vol={trialVolume}): " + ', '.join(f"{key}={value}" for key, value in params.items()))
+            if trialVolume is None:
+                print(f"Trial {iTrial+1} at {trialStart:.2f}s: " + ', '.join(f"{key}={value}" for key, value in params.items()))
+            else:
+                print(f"Trial {iTrial+1} at {trialStart:.2f}s (vol={trialVolume}): " + ', '.join(f"{key}={value}" for key, value in params.items()))
 
 ##############################################
 # test task for testing settings
