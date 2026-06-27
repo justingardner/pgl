@@ -174,12 +174,9 @@ class pglExperimentBase(pglSettingsManager):
         for i, d in enumerate(dirList, start=1):
             # get the task directory
             taskDir = selectedDir / d.name
-            # load the task data, settings, and state
+            # load the task data
             task = pglTask()
-            print(f"(pglExperiment:load) Loading task data from: {taskDir}")
-            task.settings = pglSerialize.load(taskDir / "settings.json")
-            task.state = pglSerialize.load(taskDir / "state.json")
-            task.data = pglSerialize.load(taskDir / "data.json")
+            task.load(taskDir)
             
             # add the task to the experiment
             self.addTask(task)
@@ -813,6 +810,7 @@ class pglTask:
         self.settings = pglTaskSettings()
         self.state = pglTaskState()
         self.data = pglTaskData()
+        self.parameters: List[pglParameter] = []
         
         # default segment length
         self.settings.seglen = [1.0]
@@ -823,6 +821,8 @@ class pglTask:
         # these get set by update
         self.tasks = None
         self.e = None
+        self.waitUntilVolumeTrigger = False
+
 
     def start(self, startTime):
         '''
@@ -890,7 +890,7 @@ class pglTask:
         # get current parameters
         self.data.params.append({})
         self.currentParams = self.data.params[-1]
-        for parameter in self.settings.parameters: 
+        for parameter in self.parameters: 
             self.data.params[-1].update(parameter.get())
 
         # start segment (startSegment will update currentSegment to 0)
@@ -923,7 +923,7 @@ class pglTask:
         '''
         Add a parameter to the task.
         '''
-        self.settings.parameters.append(param)
+        self.parameters.append(param)
 
     def update(self, updateTime, subjectResponses, phaseNum, tasks, events):
         '''
@@ -1033,15 +1033,44 @@ class pglTask:
             print(f"(pglTask:save) ❌ Could not create task data directory {dataDir}: {e}")
             return
         
+        # save settings, state and data
         self.settings.save(dataDir / "settings.json")
         self.state.save(dataDir / "state.json")
         self.data.save(dataDir / "data.json")
+        
+        # save parameters
+        try:
+            paramDir = dataDir / "parameters"
+            paramDir.mkdir(parents=True, exist_ok=True)
+            for i, param in enumerate(self.parameters):
+                #param.save(paramDir)
+                param.save(paramDir)
+        except Exception as e:
+            print(f"(pglTask:save) ❌ Could not save task parameters to {dataDir}: {e}")
 
-    def load(self):
+    def load(self, taskDir):
         '''
         Load the task data.
         '''
-        pass
+        print(f"(pglTask:load) Loading task data from: {taskDir}")
+        
+        # load settings, state and data
+        try:
+            self.settings = pglSerialize.load(taskDir / "settings.json")
+            self.state = pglSerialize.load(taskDir / "state.json")
+            self.data = pglSerialize.load(taskDir / "data.json")
+        except Exception as e:
+            print(f"(pglTask:load) ❌ Could not load task data from {taskDir}: {e}")    
+        
+        try:
+            # load parameters
+            self.parameters = []
+            for paramDir in (taskDir / "parameters").iterdir():
+                param = pglParameter()
+                param.load(paramDir)
+                self.parameters.append(param)
+        except Exception as e:
+            print(f"(pglTask:load) ❌ Could not load task parameters from {taskDir / 'parameters'}: {e}")
 
     def display(self):
         '''
@@ -1065,7 +1094,7 @@ class pglTask:
         print('-' * 40)
         
         # print parameters
-        for p in self.settings.parameters:
+        for p in self.parameters:
             print(f"{p.name}")
         
         # print trial by trial information
@@ -1261,7 +1290,6 @@ class pglTaskSettings(pglSettingsEditable):
     waitUntilVolumeTrigger = List(Bool(), help="List of nSegments where if set to true will run through the segment length and then wait for a volume trigger to continue.")
     nSegments = Int(help="Number of segments in the task.")
     nTrials = Float(np.inf, help="Number of trials to run for.")
-    parameters = List(Instance(pglParameter), default_value=[], help="List of parameters (type pglParameter) for the task.")
     fixedParameters = Dict(default_value={}, help="Dictionary of fixed parameters for the task.")
     saveEyeTracker = Bool(False, help="Whether to save eye tracker events this task (if we have an eye tracker).")    
     taskID = Int(0, help="Numeric identifier for the task, used for pglExperiment to keep track of tasks.")
