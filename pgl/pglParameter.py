@@ -64,17 +64,17 @@ class pglParameter:
         self.setRandomSeed(randomSeed)
 
     def __repr__(self):
-        return f"pglParameter(name={self.name}, validValues={self.validValues}, description={self.description})"
+        return f"pglParameter(name={self.settings.name}, validValues={self.settings.validValues}, description={self.settings.description})"
 
     def __str__(self):
         # display description
-        if self.description == "":
+        if self.settings.description == "":
             description = ""
         else:
-            description = f"# {self.description} #\n"
+            description = f"# {self.settings.description} #\n"
 
         # display full string
-        return f"{description}{self.name}: {self.validValues} (randomizationBlock={self.randomizationBlock})"
+        return f"{description}{self.settings.name}: {self.settings.validValues}"
 
     def setRandomSeed(self, randomSeed=None):
         '''
@@ -179,29 +179,44 @@ class pglParameter:
         self.state.save(dataDir / "state.json")
         self.data.save(dataDir / "data.json")
     
-    def load(self, parameterDir='.'):
+    @classmethod
+    def from_file(cls, parameterDir):
+        obj = cls.__new__(cls)
+        
+        # initialize some variables
+        obj.settings = pglParameterSettings()
+        obj.state = pglParameterState()
+        obj.data = pglParameterData()
+
+        # call load to load from the directory
+        obj.load(Path(parameterDir))
+        
+        # return the created object
+        return obj
+        
+    def load(self, parameterDir):
         '''
         Load the parameter settings, state and data.         
         '''
         # Create the directory to load data from
         try:
-            dataDir = Path(parameterDir) / f"{self.settings.name}"
-            if not dataDir.exists():
-                raise FileNotFoundError(f"Data directory {dataDir} does not exist.")
+            if not parameterDir.exists():
+                raise FileNotFoundError(f"Data directory {parameterDir} does not exist.")
         except Exception as e:
-            print(f"(pglParameter:load) ❌ Could not access data directory {dataDir}: {e}")
+            print(f"(pglParameter:load) ❌ Could not access data directory {parameterDir}: {e}")
             return
         
-        # give user feedback where things are being loaded from
-        print(f"(pglParameter:load) Loading parameter {self.settings.name} from: {dataDir}")
-        
         # load settings, state and data
-        self.settings.load(dataDir / "settings.json")
-        self.state.load(dataDir / "state.json")
-        self.data.load(dataDir / "data.json")
+        self.settings = pglParameterSettings.load(parameterDir / "settings.json")
+        self.state = pglParameterState.load(parameterDir / "state.json")
+        self.data = pglParameterData.load(parameterDir / "data.json")        
         
         # update random number generator state
-        self._rng.__setstate__(self.state.randomSeed)
+        self._rng = np.random.default_rng()
+        self._rng.__setstate__(self.state.randomNumberGeneratorState)
+        
+        # give user feedback on load
+        print(f"(pglParameter:load) Loaded parameter {self.settings.name} from: {parameterDir}")        
 
 ##########################
 # Parameter block class

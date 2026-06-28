@@ -1066,8 +1066,7 @@ class pglTask:
             # load parameters
             self.parameters = []
             for paramDir in (taskDir / "parameters").iterdir():
-                param = pglParameter()
-                param.load(paramDir)
+                param = pglParameter.from_file(paramDir)
                 self.parameters.append(param)
         except Exception as e:
             print(f"(pglTask:load) ❌ Could not load task parameters from {taskDir / 'parameters'}: {e}")
@@ -1095,7 +1094,7 @@ class pglTask:
         
         # print parameters
         for p in self.parameters:
-            print(f"{p.name}")
+            print(f"{p.settings.name}")
         
         # print trial by trial information
         for iTrial, params in enumerate(self.data.params):
