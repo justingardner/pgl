@@ -183,11 +183,6 @@ class pglParameter:
     def from_file(cls, parameterDir):
         obj = cls.__new__(cls)
         
-        # initialize some variables
-        obj.settings = pglParameterSettings()
-        obj.state = pglParameterState()
-        obj.data = pglParameterData()
-
         # call load to load from the directory
         obj.load(Path(parameterDir))
         
