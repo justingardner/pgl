@@ -681,6 +681,7 @@ class pglBase:
             self.state.screenWidthDegrees = self.screenWidth.deg
             self.state.screenHeightDegrees = self.screenHeight.deg
             self.state.frameRate = self.frameRate   
+            self.state.repoRevision = self.getRepoRevision()
             
             # save
             self.state.save(filepath)
@@ -871,7 +872,19 @@ class pglBase:
             return None
         
         return whichScreen
-    
+    #################################################################
+    # get the github revision
+    #################################################################
+    def getRepoRevision(self):
+        '''
+        Get the github revision        
+        '''
+        try:
+            result = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True, cwd=self.pglDir)
+            return result.stdout.strip()
+        except subprocess.CalledProcessError:
+            return "Unknown"
+   
 def pglDisplayMessage(message, useHTML=False, duration=None):
     """
     Display an HTML message that disappears after a specified duration.
@@ -1043,3 +1056,4 @@ class pglState(pglSerialize):
     screenWidthDegrees: int = 0
     screenHeightDegrees: int = 0
     frameRate: int = 0
+    repoRevision: str = ""
