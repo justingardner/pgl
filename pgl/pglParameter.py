@@ -10,15 +10,16 @@
 # Import modules
 #############
 from dataclasses import dataclass
+import json
 from pathlib import Path
-from .pglSerialize import pglSerialize
+from .pglSerialize import pglSerialize, pglGetAllSubclasses
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Any
 
 import numpy as np
 import itertools
 import random
-    
+
 #############
 # Parameter class
 #############
@@ -39,6 +40,9 @@ class pglParameter:
         self.settings = pglParameterSettings()
         self.state = pglParameterState()
         self.data = pglParameterData()
+        
+        # save the className
+        self.settings.className = self.__class__.__name__
         
         # validate name
         if not isinstance(name, str):
@@ -181,7 +185,44 @@ class pglParameter:
     
     @classmethod
     def from_file(cls, parameterDir):
-        obj = cls.__new__(cls)
+        '''
+        Instatiates a pglParameter class by loading from parameterDir
+        used for loading saved parameters.
+        
+        Note that this will correctly read the class name from settings
+        Which allows it to create subclasses. Though to work, the classMap
+        has to be updated whenever a new subclass is created that needs
+        to be serialized
+        '''
+        
+        # check parameterDir
+        try:
+            if not parameterDir.exists():
+                raise FileNotFoundError(f"Data directory {parameterDir} does not exist.")
+        except Exception as e:
+            print(f"(pglParameter:from_file) ❌ Could not access data directory {parameterDir}: {e}")
+            return
+
+        try:
+            # peek at settings to see what class to instantiate
+            settingsPath = Path(parameterDir) / "settings.json"
+            data = json.loads(settingsPath.read_text())
+        except Exception as e:
+            print(f"(pglParameter) Could not load settings.json from {parameterDir}: {e}")
+            return
+        
+        # get the className
+        className = data.get('__class__', 'pglParameter')
+
+        # create hte classMap of all subtypes, this just creates
+        # a dictionary of strings and matching class types i.e. {'pglParameter',pglParameter}  
+        classMap = {pglParameter.__name__: pglParameter, **pglGetAllSubclasses(pglParameter)}      
+
+        # dispatch to right class
+        targetClass = classMap.get(className, pglParameter)
+        
+        # now instantiate and load the right type
+        obj = targetClass.__new__(targetClass)
         
         # call load to load from the directory
         obj.load(Path(parameterDir))
@@ -200,7 +241,7 @@ class pglParameter:
         except Exception as e:
             print(f"(pglParameter:load) ❌ Could not access data directory {parameterDir}: {e}")
             return
-        
+
         # load settings, state and data
         self.settings = pglParameterSettings.load(parameterDir / "settings.json")
         self.state = pglParameterState.load(parameterDir / "state.json")
@@ -222,56 +263,36 @@ class pglParameterBlock(pglParameter):
     This is a subclass of pglParameter which allows you to group
     multiple parameters together into a single block.
     '''
-    def __init__(self, parameters: list, description: str="", randomSeed=None):
+    def __init__(self, parameters: list, name: str="", description: str="", randomSeed=None):
         '''
         Initialize the parameter block.
         
         Args:
-            name (str): The name of the parameter block.
             parameters (list): A list of pglParameter instances to include in the block.
+            name (str, optional): Name to override default of paramname1_paramname2...
             description (str, optional): Description string describing the parameter block.
             randomSeed (int, optional): Seed for random number generation. If None, a random seed is used.
-
         '''
-        # validate parameters
+
+        # validate parameters first, since we need them to build validValues
         if not isinstance(parameters, list) or not all(isinstance(p, pglParameter) for p in parameters):
             raise TypeError("(pglParameterBlock) ❌ Error: parameters must be a list of pglParameter instances.")
-        self.parameters = parameters
-
-        # validate description
-        if not isinstance(description, str):
-            raise TypeError("(pglParameterBlock) ❌ Error: description must be a string.")
-        self.description = description
-
-        # set to trigger a new block for first trial
-        self.currentTrial = -1
-        self.blockNum = -1
-        self.blockLen = 1
-
-        # parameter names and valid values from each parameter in the list
-        self.paramNames = [p.name for p in self.parameters]
-        allParameterValues = [p.validValues for p in self.parameters]
-        # get cartesian combination
-        self.allParameterValues = list(itertools.product(*allParameterValues))
-        self.name = ""
         
-        # set random seed for the block
-        self.setRandomSeed(randomSeed)
+        # build the cartesian product of all parameter values
+        self.parameters = parameters
+        paramNames = [p.settings.name for p in self.parameters]
+        allParameterValues = [p.settings.validValues for p in self.parameters]
+        allParameterValues = list(itertools.product(*allParameterValues))
 
-    def __repr__(self):
-        return f"pglParameterBlock(parameters={self.parameters}, description={self.description})"
-
-    def __str__(self):
-        # display description
-        if self.description == "":
-            description = ""
-        else:
-            description = f"# {self.description} #\n"
-
-        # display full string
-        paramStrs = [str(p) for p in self.parameters]
-        paramStr = "\n".join(paramStrs)
-        return f"{description}:\n{paramStr}"
+        # join names of parameters, e.g. "direction_coherence"
+        if name == "":
+            name = "_".join(paramNames)
+            
+        # call super().__init__ 
+        super().__init__(name=name, validValues=allParameterValues,description=description,randomSeed=randomSeed)
+        
+        # subclass-specific state
+        self.paramNames = paramNames
 
     def getParameterBlock(self):
         '''
@@ -280,8 +301,12 @@ class pglParameterBlock(pglParameter):
         calculate all combination of those parameters and return them for the task
         to run as a block of trials.
         '''
-        self.rng.shuffle(self.allParameterValues)
-        return (self.paramNames, self.allParameterValues)
+        # create a copy of allParameterValues
+        block = self.settings.validValues
+        # randomly shuffle
+        self._rng.shuffle(block)
+        # and return
+        return (self.paramNames, block)
 
 
 ##############################################
@@ -290,6 +315,7 @@ class pglParameterBlock(pglParameter):
 @dataclass
 class pglParameterSettings(pglSerialize):
     name: str = ""
+    className: str = "pglParameter" 
     validValues: List = field(default_factory=list)
     description: str = ""
     randomSeed: int = 0

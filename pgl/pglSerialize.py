@@ -18,9 +18,27 @@ from datetime import datetime
 from traitlets import HasTraits, TraitError
 
 ##########################
+# Recursively collect all subclasses
+##########################
+def pglGetAllSubclasses(baseClass):
+    allSubclasses = {}
+    for subclass in baseClass.__subclasses__():
+        allSubclasses[subclass.__name__] = subclass
+        allSubclasses.update(pglGetAllSubclasses(subclass))
+    return allSubclasses
+
+##########################
 # pglSerialize class
 ##########################
 class pglSerialize:
+    '''
+    Base class for serializing and deserializing objects to/from JSON
+    If you inherit from this, then you can save and load to JSON files.
+    If you have a standard class then it will use __dict__ to save and load attributes.
+    If you have a HasTraits class, then it will use trait_names() to save and load attributes.
+    If you have a dataclass, then it will use fields() to save and load attributes
+    '''
+    
     ##########################
     # Save to JSON file
     ##########################
@@ -164,25 +182,20 @@ class pglSerialize:
                 if not f.name.startswith('_')
             }
     
-       # Otherwise use __dict__
-        return self.__dict__.copy()
-
+        # Otherwise use __dict__, skipping private attributes
+        return {
+            key: value
+            for key, value in self.__dict__.items()
+            if not key.startswith("_")
+        }
     ##########################
     # fromJSON
     ##########################
     @classmethod
     def fromJSON(cls, jsonString):
-        
-        # Recursively collect all subclasses of pglSerialize
-        def getAllSubclasses(baseClass):
-            allSubclasses = {}
-            for subclass in baseClass.__subclasses__():
-                allSubclasses[subclass.__name__] = subclass
-                allSubclasses.update(getAllSubclasses(subclass))
-            return allSubclasses
-        
+                
         # Build registry of all known pglSerialize subclasses
-        CLASS_REGISTRY = getAllSubclasses(pglSerialize)
+        CLASS_REGISTRY = pglGetAllSubclasses(pglSerialize)
         
         # Decode each dict, restoring objects by type markers
         def decodeObject(dct):
