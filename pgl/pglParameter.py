@@ -37,9 +37,12 @@ class pglParameter:
             description (str, optional): Description string describing the parameter.
         '''
         # initialize state, data, and settings
-        self.settings = pglParameterSettings()
-        self.state = pglParameterState()
-        self.data = pglParameterData()
+        if not hasattr(self, 'settings') or self.settings is None:
+            self.settings = pglParameterSettings()
+        if not hasattr(self, 'state') or self.state is None:
+            self.state = pglParameterState()
+        if not hasattr(self, 'data') or self.data is None:
+            self.data = pglParameterData()
         
         # save the className
         self.settings.className = self.__class__.__name__
@@ -255,6 +258,66 @@ class pglParameter:
         print(f"(pglParameter:load) Loaded parameter {self.settings.name} from: {parameterDir}")        
 
 ##########################
+# Parameter batch class
+##########################
+class pglParameterBatch(pglParameter):
+    '''
+    This works like a regular parameter, but for each trial it gives a batch of values
+    So, for example, say you have validValues = [0,1,2,3,4,5,6,7,8]
+    and you have batchSize = 3
+    then on each trial you will get 3 random values until all values are visited. e.g.:
+    trial 1: [3,7,2]
+    trial 2: [4,1,0]
+    trial 3: [8,5,6]
+    ...
+    NOTE: This is designed to work with pglParameterNestedBlock, but not for pglParameterBlock
+    '''
+    def __init__(self, name: str, validValues: list|tuple|np.ndarray, batchSize: int, description: str="", randomSeed=None):
+        '''
+        Initialize the parameter.
+        
+        Args:
+            name (str): The name of the parameter.
+            batchSize (int): Size of the batch of parameters that will be provided on each trial
+              The number of validValues must be evenly divisible by batchSize
+            validValues (list, optional): A list of valid values for the parameter. 
+            description (str, optional): Description string describing the parameter.
+        '''
+        # specialized setting for this
+        self.settings = pglParameterSettingsBatch()
+        
+        # call super init
+        super().__init__(name=name, validValues=validValues, description=description, randomSeed=randomSeed)
+
+        # validate the batchSize
+        self.settings.batchSize = batchSize
+        if len(validValues) % batchSize != 0:
+            raise ValueError(f"(pglParameterBatch) ❌ Error: batchSize ({batchSize}) must evenly divide the number of validValues ({len(validValues)}).")
+
+    def getParameterBlock(self):
+        '''
+        Get a set of parameters to run over, will
+        produce a random ordering of that parameter
+        in batches of batchSize values per trial.
+        '''
+        paramNames = [self.settings.name]
+        
+        # shuffle the valid values
+        parameterBlock = list(self.settings.validValues)
+        self._rng.shuffle(parameterBlock)
+        
+        # split into batches of batchSize
+        batches = [tuple(parameterBlock[i:i+self.settings.batchSize]) 
+                for i in range(0, len(parameterBlock), self.settings.batchSize)]
+        
+        # wrap in list of tuples to be compatible with other parameter blocks
+        batches = [(b,) for b in batches]
+        
+        return (paramNames, batches)        
+        
+    
+
+##########################
 # Parameter block class
 ##########################
 class pglParameterBlock(pglParameter):
@@ -288,7 +351,7 @@ class pglParameterBlock(pglParameter):
         if name == "":
             name = "_".join(paramNames)
             
-        # call super().__init__ 
+        # call super init
         super().__init__(name=name, validValues=allParameterValues,description=description,randomSeed=randomSeed)
         
         # subclass-specific state
@@ -356,11 +419,23 @@ class pglParameterNestedBlock(pglParameterBlock):
     Note how every 3 trials param1 will go through all of its values. Every 6 trials
     each value of param1 will see each value of param2    
     '''
+    def __init__(self, parameters: list, name: str="", description: str="", randomSeed=None):
+        # validate parameters, in particular the parameters can only include pglParameterBatch
+        # if it is in the last place of the list 
+        for i, p in enumerate(parameters):
+            if isinstance(p, pglParameterBatch) and i != len(parameters) - 1:
+                raise TypeError(f"(pglParameterNestedBlock) ❌ Error: pglParameterBatch can only be the last parameter in the list, but found one at position {i}.")
+        
+        # init using super
+        super().__init__(parameters=parameters, name=name, description=description, randomSeed=randomSeed)
+
     def getParameterBlock(self):
+        # recursive function used to build the nested blocks
         def buildNestedBlock(parameters):
-            # Base case: no parameters left
-            if len(parameters) == 0:
-                return [()]
+            # Base case: only one parameter left, just return its block
+            if len(parameters) == 1:
+                _, block = parameters[0].getParameterBlock()
+                return block
             
             # Recursively build rest blocks for each value of the top parameter
             restBlocks = {}
@@ -384,6 +459,7 @@ class pglParameterNestedBlock(pglParameterBlock):
             
             return result
         
+        # generate the block, using the recursive function
         block = buildNestedBlock(self.parameters)
         return (self.paramNames, block)
 
@@ -397,6 +473,10 @@ class pglParameterSettings(pglSerialize):
     validValues: List = field(default_factory=list)
     description: str = ""
     randomSeed: int = 0
+
+@dataclass
+class pglParameterSettingsBatch(pglParameterSettings):
+    batchSize: int = 1
     
 ##############################################
 # Data for pglParameter
