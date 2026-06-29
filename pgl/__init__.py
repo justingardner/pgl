@@ -13,7 +13,7 @@ from .pglEvent import pglEvent, pglEvents
 from .pglCommandReplayer import pglCommandReplayer
 from .pglFrameGrab import pglFrameGrab
 from .pglExperiment import pglExperiment, pglTask, pglTestTask, pglExperimentAnalysis
-from .pglParameter import pglParameter, pglParameterBlock
+from .pglParameter import pglParameter, pglParameterBlock, pglParameterNestedBlock
 from .pglStaircase import pglStaircase, pglStaircaseUpDown
 from .pglTasks import pglFixationTaskLeftRight, pglBarTask
 from ._pglComm import pglSerial

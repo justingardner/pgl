@@ -308,6 +308,84 @@ class pglParameterBlock(pglParameter):
         # and return
         return (self.paramNames, block)
 
+##########################
+# Parameter nested block class
+##########################
+class pglParameterNestedBlock(pglParameterBlock):
+    '''
+    Class representing a nested block of parameters in the experiment.
+    This is a subclass of pglParameter which allows you to do nested blocking
+    of parameters. 
+    
+    e.g. Given param1 = [1, 2, 3] and param2 = [A, B] an unrandomized sequence looks like:
+
+    Trial  1: param1=1, param2=A  -|
+    Trial  2: param1=1, param2=A   | param1 block 1 (param2 block 1 for param1=1)
+    Trial  3: param1=1, param2=A  -|
+    Trial  4: param1=2, param2=B  -|
+    Trial  5: param1=2, param2=B   | param1 block 2 (param2 block 1 for param1=2)
+    Trial  6: param1=2, param2=B  -|
+    Trial  7: param1=3, param2=A  -|
+    Trial  8: param1=3, param2=A   | param1 block 3 (param2 block 1 for param1=3)
+    Trial  9: param1=3, param2=A  -|
+    Trial 10: param1=1, param2=B  -|
+    Trial 11: param1=1, param2=B   | param1 block 4 (param2 block 2 for param1=1)
+    Trial 12: param1=1, param2=B  -|
+
+    Note that param1=1 has seen param2=A then param2=B across its two blocks,
+    completing one full param2 cycle. param1=2 and param1=3 each track their
+    own independent param2 cycles. With randomization, the order of blocks and
+    the assignment of param2 values within each param1's cycle are both shuffled.
+    
+    Here is a randomized example:
+
+    Trial  1: param1 = 1, param2 = B  -|
+    Trial  2: param1 = 3, param2 = A   | Param1 block 1 (param2 block 1)
+    Trial  3: param1 = 2, param2 = B  -|
+    Trial  4: param1 = 2, param2 = A  -|
+    Trial  5: param1 = 3, param2 = B   | Param1 block 2 (param2 block 2)
+    Trial  6: param1 = 1, param2 = A  -|
+    Trial  7: param1 = 3, param2 = B  -|
+    Trial  8: param1 = 1, param2 = B   | Param1 block 3 (param2 block 3)
+    Trial  9: param1 = 2, param2 = A  -|
+    Trial 10: param1 = 2, param2 = B  -|
+    Trial 11: param1 = 3, param2 = A   | Param 1 block 4 (param2 block 4)
+    Trial 12: param1 = 1, param2 = A  -|
+    ...
+
+    Note how every 3 trials param1 will go through all of its values. Every 6 trials
+    each value of param1 will see each value of param2    
+    '''
+    def getParameterBlock(self):
+        def buildNestedBlock(parameters):
+            # Base case: no parameters left
+            if len(parameters) == 0:
+                return [()]
+            
+            # Recursively build rest blocks for each value of the top parameter
+            restBlocks = {}
+            for val in parameters[0].settings.validValues:
+                restBlocks[val] = buildNestedBlock(parameters[1:])
+            
+            # Generate len(restBlocks[val]) blocks of the top parameter
+            nBlocks = len(restBlocks[parameters[0].settings.validValues[0]])
+            topBlock = []
+            for _ in range(nBlocks):
+                _, block = parameters[0].getParameterBlock()
+                topBlock.extend(block)
+            
+            # Combine topBlock with restBlocks using a pointer per val
+            pointers = {val: 0 for val in parameters[0].settings.validValues}
+            result = []
+            for (val,) in topBlock:
+                restTuple = restBlocks[val][pointers[val]]
+                pointers[val] += 1
+                result.append((val,) + restTuple)
+            
+            return result
+        
+        block = buildNestedBlock(self.parameters)
+        return (self.paramNames, block)
 
 ##############################################
 # Settings for pglParameter
