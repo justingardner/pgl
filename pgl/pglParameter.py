@@ -215,24 +215,32 @@ class pglParameter:
             return
         
         # get the className
-        className = data.get('__class__', 'pglParameter')
-
-        # create hte classMap of all subtypes, this just creates
-        # a dictionary of strings and matching class types i.e. {'pglParameter',pglParameter}  
-        classMap = {pglParameter.__name__: pglParameter, **pglGetAllSubclasses(pglParameter)}      
-
-        # dispatch to right class
-        targetClass = classMap.get(className, pglParameter)
+        className = data.get('className', 'pglParameter')
         
-        # now instantiate and load the right type
-        obj = targetClass.__new__(targetClass)
+        # create the instance
+        obj = cls.createClassInstance(cls, className)
         
         # call load to load from the directory
         obj.load(Path(parameterDir))
         
         # return the created object
         return obj
-        
+
+    def createClassInstance(self, className):
+        '''
+            create an instance of pglParameter with the correct class give in className
+        '''
+        # create tte classMap of all subtypes, this just creates
+        # a dictionary of strings and matching class types i.e. {'pglParameter',pglParameter}  
+        classMap = {pglParameter.__name__: pglParameter, **pglGetAllSubclasses(pglParameter)}      
+
+        # dispatch to right class
+        targetClass = classMap.get(className, pglParameter)
+
+        # now instantiate and load the right type
+        obj = targetClass.__new__(targetClass)
+        return obj
+
     def load(self, parameterDir):
         '''
         Load the parameter settings, state and data.         
@@ -256,7 +264,24 @@ class pglParameter:
         
         # give user feedback on load
         print(f"(pglParameter:load) Loaded parameter {self.settings.name} from: {parameterDir}")        
+    
+    @classmethod
+    def from_settings_state_data(cls, settings, state, data):
+        '''
+        Instatiates a pglParameter class given settings state and data.
+        '''
+        obj = cls.createClassInstance(cls, settings.__class__)
+        
+        # set data classes
+        obj.settings = settings
+        obj.state = state
+        obj.data = data
+        
+        # update random number generator state
+        obj._rng = np.random.default_rng()
+        obj._rng.__setstate__(obj.state.randomNumberGeneratorState)
 
+        return(obj)
 ##########################
 # Parameter batch class
 ##########################
@@ -315,8 +340,6 @@ class pglParameterBatch(pglParameter):
         
         return (paramNames, batches)        
         
-    
-
 ##########################
 # Parameter block class
 ##########################
@@ -336,27 +359,26 @@ class pglParameterBlock(pglParameter):
             description (str, optional): Description string describing the parameter block.
             randomSeed (int, optional): Seed for random number generation. If None, a random seed is used.
         '''
-
         # validate parameters first, since we need them to build validValues
         if not isinstance(parameters, list) or not all(isinstance(p, pglParameter) for p in parameters):
             raise TypeError("(pglParameterBlock) ❌ Error: parameters must be a list of pglParameter instances.")
-        
+
+        # keep the list of pglParameters
+        self.settings = pglParameterSettingsBlock()        
+        self.settings.parameters = parameters
+        self.settings.parameterNames = [p.settings.name for p in self.settings.parameters]
+
         # build the cartesian product of all parameter values
-        self.parameters = parameters
-        paramNames = [p.settings.name for p in self.parameters]
-        allParameterValues = [p.settings.validValues for p in self.parameters]
+        allParameterValues = [p.settings.validValues for p in self.settings.parameters]
         allParameterValues = list(itertools.product(*allParameterValues))
 
         # join names of parameters, e.g. "direction_coherence"
         if name == "":
-            name = "_".join(paramNames)
+            name = "_".join(self.settings.parameterNames)
             
         # call super init
         super().__init__(name=name, validValues=allParameterValues,description=description,randomSeed=randomSeed)
         
-        # subclass-specific state
-        self.paramNames = paramNames
-
     def getParameterBlock(self):
         '''
         This  will create a block over all of the parameters in the
@@ -369,8 +391,30 @@ class pglParameterBlock(pglParameter):
         # randomly shuffle
         self._rng.shuffle(block)
         # and return
-        return (self.paramNames, block)
+        return (self.settings.parameterNames, block)
+    
+    def load(self, parameterDir):
+        '''
+        Load function handles recreation of self.settings.parameters list
+        As these will just get saved out as a dicts because they are not
+        derived from pglSerialize.
+        '''
+        # call super
+        super().load(parameterDir)
 
+        # now for each parameter recreate the structure
+        parameters = []
+        for i, p in enumerate(self.settings.parameters):
+            # get the saved structures
+            settings = p['settings']
+            state = p['state']
+            data = p['data']
+
+            # and recreate the parameter
+            parameters.append(pglParameter.from_settings_state_data(settings,state,data))
+        
+        # now reset the parameters
+        self.settings.parameters = parameters
 ##########################
 # Parameter nested block class
 ##########################
@@ -428,7 +472,7 @@ class pglParameterNestedBlock(pglParameterBlock):
         
         # init using super
         super().__init__(parameters=parameters, name=name, description=description, randomSeed=randomSeed)
-
+        
     def getParameterBlock(self):
         # recursive function used to build the nested blocks
         def buildNestedBlock(parameters):
@@ -460,8 +504,8 @@ class pglParameterNestedBlock(pglParameterBlock):
             return result
         
         # generate the block, using the recursive function
-        block = buildNestedBlock(self.parameters)
-        return (self.paramNames, block)
+        block = buildNestedBlock(self.settings.parameters)
+        return (self.settings.parameterNames, block)
 
 ##############################################
 # Settings for pglParameter
@@ -477,6 +521,11 @@ class pglParameterSettings(pglSerialize):
 @dataclass
 class pglParameterSettingsBatch(pglParameterSettings):
     batchSize: int = 1
+
+@dataclass
+class pglParameterSettingsBlock(pglParameterSettings):
+    parameters: List[pglParameter] = field(default_factory=list)
+    parameterNames: List[str] = field(default_factory=list)
     
 ##############################################
 # Data for pglParameter
