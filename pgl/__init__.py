@@ -27,6 +27,7 @@ from .pglTrackPixx import pglTrackPixx3
 from .pglLabJack import pglLabJack
 from .pglEventListener import pglEventListener
 from .pglEyelink import pglEyelinkData
+from .pglVWFA import pglVWFATask
 
 try:
     import pylink

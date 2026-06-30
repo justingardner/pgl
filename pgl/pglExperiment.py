@@ -788,6 +788,101 @@ class pglExperimentAnalysis(pglExperimentBase):
 
         # load the experimentName
         self.load(experimentName=experimentName, subjectID=subjectID)
+    
+    def getTrialsByParameter(self, parameterName: str, taskName: str = None):
+        '''
+        Extracts trial data grouped by parameterName
+        
+        Args:
+            parameterName (str): Name of parameter to group data by
+        
+        Returns:
+            dictionary with fields
+                parameterName (str): Name of parameter that the trials are sorted by
+                nParameterValues (int): Number of different parameter values
+                parameterValues (list): List of all parameter values
+                trialNum: 
+                volumeNum:
+                tiralTime:
+        '''
+        # figure out what task we are working on
+        if taskName is None:
+            task = self.tasks[0]
+        else:
+            # search for the taskName (case insensitive)
+            task = next((t for t in self.tasks if t.settings.taskName.lower() == taskName.lower()), None)
+            # if not found, check if they meant the taskSaveName
+            if task is None:
+                task = next((t for t in self.tasks if t.settings.taskSaveName.lower() == taskName.lower()), None)
+        
+        if task is None:
+            print(f"(pglExperimentAnalysis:getTrialsByParameter) ❌ Could not find {taskName} in experiemnt.\nValid tasks are: {' '.join(t.settings.taskName for t in self.tasks)}")
+            return None
+                
+        # gather all the different parameter names
+        parameters = task.parameters
+        # get all the parameters recursively
+        # so that we get all parameters in blocks 
+        def collectParameters(parameterList):
+            parameters = []
+            for p in parameterList:
+                if isinstance(p, pglParameterBlock):
+                    parameters.extend(collectParameters(p.settings.parameters))
+                else:
+                    parameters.append(p)
+            return parameters
+        parameters = collectParameters(parameters)
+        
+        # get the matching parameter
+        parameter = next((p for p in parameters if p.settings.name == parameterName), None)
+        if parameter is None:
+            print(f"(pglExperimentAnalysis:getTrialsByParameter) ❌ Could not find '{parameterName}' in parameters {[p.settings.name for p in parameters]}")
+            return
+        
+        # initialize the list of lists for volumes by conditions        
+        validValues = parameter.settings.validValues
+        volumes = [[] for _ in range(len(validValues))]
+        startTimes = [[] for _ in range(len(validValues))]
+        trialNums = [[] for _ in range(len(validValues))]
+        nTrials = [0 for _ in range(len(validValues))]
+        nTrialsTotal = 0
+        
+        # loop over trials, collecting the params dictionary for each trial
+        for iTrial, params in enumerate(task.data.params):
+            # find matching trial event
+            trialEvent = next((event for event in task.data.events if isinstance(event, pglEventTrial) and event.trialNum == iTrial), None)
+            
+            # get the trials tart time and volume
+            trialStart = trialEvent.timestamp - task.data.startTime if trialEvent else "No trial event found"
+            trialVolume = self.getNearestVolumeTrigger(trialEvent)
+
+            # if we found a volume trigger
+            if trialVolume is not None:
+                # get the value that was set for this trial
+                trialValue = params.get(parameter.settings.name,None)
+                # if it matches the valid values
+                if trialValue in validValues:
+                    # get the index
+                    conditionIndex = validValues.index(trialValue)
+                    
+                    # and populate arrays with data
+                    volumes[conditionIndex].append(trialVolume)
+                    startTimes[conditionIndex].append(trialStart)
+                    trialNums[conditionIndex].append(iTrial+1)
+                    nTrials[conditionIndex] += 1
+                    nTrialsTotal += 1
+        
+        # pack everything up
+        return {
+            'parameterName': parameter.settings.name,
+            'parameterValues': validValues,
+            'parameter': parameter,
+            'nTrialsTotal': nTrialsTotal,
+            'volumes': volumes,
+            'startTimes': startTimes,
+            'trialNums': trialNums,
+            'nTrials': nTrials
+        }
                             
 ##############################################
 # Task class
