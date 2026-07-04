@@ -296,7 +296,9 @@ class pglDataMatrix:
     def shape(self):
         return self._dataset().shape
 
-
+#######################
+# # pglTimeSeries
+#######################
 class pglTimeSeries(pglDataMatrix):
     
     def print(self):
@@ -325,3 +327,20 @@ class pglTimeSeries(pglDataMatrix):
         endIndex = int(endTime * self.sampleRate)
 
         return self._dataset()[startIndex:endIndex, :]
+    
+#######################
+# pglEventsData
+#######################
+class pglEventsData(pglTimeSeries):
+    def print(self):
+        """Print a summary of the time series."""
+
+        print("pglEventsData")
+        print("-" * 40)
+        print(f"nEvents    : {self.shape[0]}")
+        print(f"nFields    : {self.shape[1]}")
+
+        print("\nFields:")
+        for i, channelName in enumerate(self.channelNames):
+            unit = self.units[i] if i < len(self.units) else ""
+            print(f"  {i:2d}: {channelName:<12} ({unit})")

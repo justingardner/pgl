@@ -9,7 +9,7 @@
 # Import
 ##########
 from pgl import pglDevice
-from .pglData import pglTimeSeries
+from .pglData import pglTimeSeries, pglEventsData
 
 #################################################################
 # Parent class for eye tracker devices
@@ -85,7 +85,7 @@ class pglEyeTrackerData():
         """
         # initializes time series and events
         self.timeSeries = None
-        self.events = None
+        self.trialEvents = None
 
     def addTimeseries(self, timeSeries, channelNames, units, sampleRate):
         '''
@@ -100,7 +100,7 @@ class pglEyeTrackerData():
         # set the timeseries
         self.timeSeries = pglTimeSeries.fromArray(data=timeSeries, channelNames=channelNames, units=units, sampleRate=sampleRate)
     
-    def addTrialEvents(self, taskID, trialStart, segmentStart):
+    def addTrialEvents(self, data, fieldNames, units):
         '''
         Add trial events which specify when the trials start and stop
         
@@ -109,6 +109,7 @@ class pglEyeTrackerData():
             trialStart (List): List of timestamps of trials
             segmentStart (List): List of segment start times
         '''
+        self.trialEvents = pglEventsData.fromArray(data=data, channelNames=fieldNames, units=units)
         
         pass
     
@@ -126,6 +127,10 @@ class pglEyeTrackerData():
         # if there is timeSeries data then print information about that
         if self.timeSeries is not None:
             self.timeSeries.print()
+            
+        # print trial events
+        if self.trialEvents is not None:
+            self.trialEvents.print()
     
     def display(self):
         """

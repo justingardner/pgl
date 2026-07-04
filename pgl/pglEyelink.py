@@ -665,7 +665,12 @@ class pglEyelinkData(pglEyeTrackerData):
         '''
         Convert the eyeTrackerData to a pglEyeTrackerData
         '''
+        # ---------------------
+        # Init eye tracker data 
         eyeTrackerData = pglEyeTrackerData()
+        
+        # ---------------------
+        # create the time series
         
         # get the channels that we are going to pass
         channelNames = ["time", "x", "y", "pupil"]
@@ -676,9 +681,33 @@ class pglEyelinkData(pglEyeTrackerData):
             self.data["samples"][channel]
             for channel in channelNames
         ])
-
+        
+        # and store in structure
         eyeTrackerData.addTimeseries(data,channelNames,units,sampleRate=1000)
-        #eyeTrackerData.addTrialEvents()
+        
+        # ---------------------
+        # create trial events
+        data = []
+        trialEventFields = ['taskID', 'trialNum', 'segmentNum', 'timestamp']
+        units = ['n','n','n','s']
+        
+        # loop over messages
+        for messageText in self.messages["text"]:
+            # convert message text to a structured format
+            messageValues = self.parseMessageLine(messageText)
+            # if it is a trial message
+            if messageValues.get("messageType") == "trial":
+                # then add it to the data
+                row = [
+                    messageValues.get(field, np.nan)
+                    for field in trialEventFields
+                ]
+                data.append(row)
+        
+        # and store in structure
+        eyeTrackerData.addTrialEvents(np.array(data), trialEventFields, units)
+
+        # return the pglEyeTrackerData structure
         return eyeTrackerData
     
     def print(self):
