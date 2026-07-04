@@ -687,6 +687,7 @@ class pglEyelinkData(pglEyeTrackerData):
             # print trial-by-trial info
             for iTrial in range(self.startValues[iBlock]['trialNum'],self.stopValues[iBlock]['trialNum']):
                 trialInfo = f" {iTrial}: "
+                print(f"{iTrial}: {self.trials[iTrial]['time']}")
                 trialInfo += f"{self.trials[iTrial]['time'][0]}-{self.trials[iTrial]['time'][-1]}"
                 nSaccades = len(self.trials[iTrial]['saccades']['eye'])
                 if nSaccades > 0:
@@ -1286,12 +1287,21 @@ class pglEyelinkData(pglEyeTrackerData):
         
         return sample
     
+    def toInt(self, value):
+        """Convert a value to int. Return NaN if conversion fails."""
+        try:
+            return int(value)
+        except (ValueError, TypeError):
+            return np.nan
+
     def toFloat(self, value):
-        ''' parse string to float, and handle values like . which convert to nan'''
+        """Convert a value to float. Return NaN for missing or invalid values."""
+        if value in (None, ".", ""):
+            return float("nan")
         try:
             return float(value)
-        except ValueError:
-            return float('nan')
+        except (ValueError, TypeError):
+            return float("nan")
     
     def _parseFixationLine(self, tokens):
         """Parse EFIX line into a dict."""
@@ -1304,18 +1314,18 @@ class pglEyelinkData(pglEyeTrackerData):
         fixation['eye'] = tokens[1]  # L or R
         
         try:
-            fixation['startTime'] = int(tokens[2])
-            fixation['endTime'] = int(tokens[3])
-            fixation['duration'] = int(tokens[4])
-            fixation['avgX'] = float(tokens[5])
-            fixation['avgY'] = float(tokens[6])
-            fixation['avgPupil'] = float(tokens[7])
+            fixation['startTime'] = self.toInt(tokens[2])
+            fixation['endTime'] = self.toInt(tokens[3])
+            fixation['duration'] = self.toInt(tokens[4])
+            fixation['avgX'] = self.toFloat(tokens[5])
+            fixation['avgY'] = self.toFloat(tokens[6])
+            fixation['avgPupil'] = self.toFloat(tokens[7])
             
             # Check if resolution data is included
             if len(tokens) == 10:
                 # EFIX with resolution: eye stime etime dur axp ayp aps xr yr
-                fixation['xRes'] = float(tokens[8])
-                fixation['yRes'] = float(tokens[9])
+                fixation['xRes'] = self.toFloat(tokens[8])
+                fixation['yRes'] = self.toFloat(tokens[9])
             elif len(tokens) == 8:
                 # EFIX without resolution: eye stime etime dur axp ayp aps
                 pass
@@ -1338,21 +1348,21 @@ class pglEyelinkData(pglEyeTrackerData):
         saccade['eye'] = tokens[1]  # L or R
         
         try:
-            saccade['startTime'] = int(tokens[2])
-            saccade['endTime'] = int(tokens[3])
-            saccade['duration'] = int(tokens[4])
-            saccade['startX'] = float(tokens[5])
-            saccade['startY'] = float(tokens[6])
-            saccade['endX'] = float(tokens[7])
-            saccade['endY'] = float(tokens[8])
-            saccade['amplitude'] = float(tokens[9])
-            saccade['peakVel'] = float(tokens[10])
+            saccade['startTime'] = self.toInt(tokens[2])
+            saccade['endTime'] = self.toInt(tokens[3])
+            saccade['duration'] = self.toInt(tokens[4])
+            saccade['startX'] = self.toFloat(tokens[5])
+            saccade['startY'] = self.toFloat(tokens[6])
+            saccade['endX'] = self.toFloat(tokens[7])
+            saccade['endY'] = self.toFloat(tokens[8])
+            saccade['amplitude'] = self.toFloat(tokens[9])
+            saccade['peakVel'] = self.toFloat(tokens[10])
             
             # Check if resolution data is included
             if len(tokens) == 13:
                 # ESACC with resolution: eye stime etime dur sxp syp exp eyp ampl pv xr yr
-                saccade['xRes'] = float(tokens[11])
-                saccade['yRes'] = float(tokens[12])
+                saccade['xRes'] = self.toFloat(tokens[11])
+                saccade['yRes'] = self.toFloat(tokens[12])
             elif len(tokens) == 11:
                 # ESACC without resolution: eye stime etime dur sxp syp exp eyp ampl pv
                 pass
@@ -1375,9 +1385,9 @@ class pglEyelinkData(pglEyeTrackerData):
         blink['eye'] = tokens[1]  # L or R
         
         try:
-            blink['startTime'] = int(tokens[2])
-            blink['endTime'] = int(tokens[3])
-            blink['duration'] = int(tokens[4])
+            blink['startTime'] = self.toInt(tokens[2])
+            blink['endTime'] = self.toInt(tokens[3])
+            blink['duration'] = self.toInt(tokens[4])
         except (ValueError, IndexError) as e:
             raise ValueError(f"Error parsing EBLINK line: {' '.join(tokens)}, error: {e}")
         
@@ -1393,7 +1403,7 @@ class pglEyelinkData(pglEyeTrackerData):
         
         # Parse timestamp
         try:
-            msg['time'] = int(tokens[1])
+            msg['time'] = self.toInt(tokens[1])
         except ValueError:
             raise ValueError(f"Could not parse timestamp from MSG line: {tokens[1]}")
         
