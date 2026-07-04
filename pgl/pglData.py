@@ -24,7 +24,7 @@ class pglDataMatrix:
     # Construction
     # --------------------------------------------------------
     @classmethod
-    def fromArray(cls, data, channelNames, units, samplingRate=None):
+    def fromArray(cls, data, channelNames, units, sampleRate=None):
         '''
         initialize the data matrix from array data - stored internally
         as a numpy array until save is called when it gets backed by an hdf5
@@ -32,7 +32,7 @@ class pglDataMatrix:
         Args:
             data: matrix of data. Channels are in columns
             channelNames (list): string labels for each channel
-            samplingRate (float): samplingRate of data
+            sampleRate (float): sampleRate of data
             units (list): string labels of units
         '''
         
@@ -64,8 +64,8 @@ class pglDataMatrix:
             )
         obj.units = list(units)
         
-        # save samplingRate
-        obj.samplingRate = samplingRate
+        # save sampleRate
+        obj.sampleRate = sampleRate
 
         # not used for memory backed storage
         obj._h5 = None
@@ -152,7 +152,7 @@ class pglDataMatrix:
         # -----------------------------
         # metadata
         # -----------------------------
-        obj.samplingRate = obj._h5.attrs.get("samplingRate", None)
+        obj.sampleRate = obj._h5.attrs.get("sampleRate", None)
 
         return obj
     
@@ -200,22 +200,22 @@ class pglDataMatrix:
 
         return dataset[key]
 
-    def __getattr__(self, name):
-        '''
-        ALlows access like
-        dataMatrix.key
-        '''
-        # check first to make sure that channelNames is 
-        # a field - otherwise this code we end up in 
-        # ifinite recursion trying to find non-existient fields
-        if "channelNames" in self.__dict__:
-
-            # if the name exist in channels, then return it
-            if name in self.channelNames:
-                return self[name]
-        
-        # throw error if not found
-        raise AttributeError(name)
+    #def __getattr__(self, name):
+    #    '''
+    #    ALlows access like
+    #    dataMatrix.key
+    #    '''
+    #    # check first to make sure that channelNames is 
+    #    # a field - otherwise this code we end up in 
+    #    # ifinite recursion trying to find non-existient fields
+    #    if "channelNames" in self.__dict__:
+    #
+    #        # if the name exist in channels, then return it
+    #        if name in self.channelNames:
+    #            return self[name]
+    #    
+    #    # throw error if not found
+    #    raise AttributeError(name)
 
     def get(self, channelName):
         '''
@@ -266,9 +266,9 @@ class pglDataMatrix:
                 data=np.array(self.units, dtype="S")
             )
             
-            # create sampling rate
-            if self.samplingRate is not None:
-                f.attrs["samplingRate"] = self.samplingRate
+            # create samlpleRate rate
+            if self.sampleRate is not None:
+                f.attrs["sampleRate"] = self.sampleRate
 
         # save filename
         self.filePath = filePath
@@ -297,14 +297,31 @@ class pglDataMatrix:
         return self._dataset().shape
 
 
-class pglTimeseriesData(pglDataMatrix):
+class pglTimeSeries(pglDataMatrix):
+    
+    def print(self):
+        """Print a summary of the time series."""
+
+        print("pglTimeSeries")
+        print("-" * 40)
+        print(f"nSamples    : {self.shape[0]}")
+        print(f"nChannels   : {self.shape[1]}")
+        print(f"Sample Rate : {self.sampleRate:g} Hz")
+
+        if self.sampleRate > 0:
+            print(f"Duration    : {self.shape[0] / self.sampleRate:.2f}s")
+
+        print("\nChannels:")
+        for i, channelName in enumerate(self.channelNames):
+            unit = self.units[i] if i < len(self.units) else ""
+            print(f"  {i:2d}: {channelName:<12} ({unit})")
 
     def timeSlice(self, startTime, endTime):
 
-        if self.samplingRate is None:
-            raise ValueError("samplingRate is not defined.")
+        if self.sampleRate is None:
+            raise ValueError("sampleRate is not defined.")
 
-        startIndex = int(startTime * self.samplingRate)
-        endIndex = int(endTime * self.samplingRate)
+        startIndex = int(startTime * self.sampleRate)
+        endIndex = int(endTime * self.sampleRate)
 
         return self._dataset()[startIndex:endIndex, :]

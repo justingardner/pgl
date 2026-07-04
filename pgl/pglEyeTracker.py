@@ -9,6 +9,7 @@
 # Import
 ##########
 from pgl import pglDevice
+from .pglData import pglTimeSeries
 
 #################################################################
 # Parent class for eye tracker devices
@@ -78,17 +79,53 @@ class pglEyeTracker(pglDevice):
 # Parent class for eye tracker data
 #################################################################
 class pglEyeTrackerData():
-    def __init__(self, filename):
+    def __init__(self):
         """
-        init loads the tracker data from file
+        initializes the eye tracker data. 
         """
+        # initializes time series and events
+        self.timeSeries = None
+        self.events = None
+
+    def addTimeseries(self, timeSeries, channelNames, units, sampleRate):
+        '''
+        Add time series data
+        
+        Args:
+            timeSeries (Array): Array of timeSeries data, rows are time, columns are different variables
+            channelNames (List): List of string names of each column of data
+            units (List): List of strings which identify units of each column of data
+            samplingRate (Int): Sampling rate of data
+        '''
+        # set the timeseries
+        self.timeSeries = pglTimeSeries.fromArray(data=timeSeries, channelNames=channelNames, units=units, sampleRate=sampleRate)
+    
+    def addTrialEvents(self, taskID, trialStart, segmentStart):
+        '''
+        Add trial events which specify when the trials start and stop
+        
+        Args:
+            taskID (int): The taskID which specifies which task the trials belong to
+            trialStart (List): List of timestamps of trials
+            segmentStart (List): List of segment start times
+        '''
+        
         pass
+    
+    def addSaccadeEvents(self):
+        pass
+    
+    def addBlinkEvents(self):
+        pass
+        
 
     def print(self):
         """
         print information about the eye tracker data
         """
-        pass
+        # if there is timeSeries data then print information about that
+        if self.timeSeries is not None:
+            self.timeSeries.print()
     
     def display(self):
         """

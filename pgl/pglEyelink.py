@@ -661,6 +661,26 @@ class pglEyelinkData(pglEyeTrackerData):
         """String representation of parsed data."""
         return self.__str__()
     
+    def toPGL(self):
+        '''
+        Convert the eyeTrackerData to a pglEyeTrackerData
+        '''
+        eyeTrackerData = pglEyeTrackerData()
+        
+        # get the channels that we are going to pass
+        channelNames = ["time", "x", "y", "pupil"]
+        units = ["ms", "pix", "pix", "pix x pix"]
+
+        # pack the data into a numpy array
+        data = np.column_stack([
+            self.data["samples"][channel]
+            for channel in channelNames
+        ])
+
+        eyeTrackerData.addTimeseries(data,channelNames,units,sampleRate=1000)
+        #eyeTrackerData.addTrialEvents()
+        return eyeTrackerData
+    
     def print(self):
         ''' print information about eye tracker data'''
         print(f"Fileame: {self.filename}")
