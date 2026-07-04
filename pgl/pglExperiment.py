@@ -10,13 +10,12 @@
 #############
 # Import modules
 #############
-from datetime import datetime
+from datetime import date as Date, datetime
 import json
 import numpy as np
 import itertools
 import random
 import math
-from datetime import datetime
 from dataclasses import dataclass, field
 from .pglKeyboardMouse import pglKeyboardMouse
 from pathlib import Path
@@ -93,7 +92,7 @@ class pglExperimentBase(pglSettingsManager):
             # create default settings
             self.settings = pglSettings()
 
-    def load(self, experimentName="", subjectID=""):
+    def load(self, experimentName="", subjectID="", date = None):
         '''
         Load the experiment settings, state and data.         
         '''
@@ -110,6 +109,23 @@ class pglExperimentBase(pglSettingsManager):
         
         # Get all directories in the dataPath
         dirList = [d for d in dataDir.iterdir() if d.is_dir()]
+
+        # check date setting, so that we can filter out experiments by date        
+        if date is not None:
+            # Convert to YYYYMMDD string
+            if isinstance(date, str):
+                dateStr = date
+            elif isinstance(date, datetime):
+                dateStr = date.strftime("%Y%m%d")
+            elif isinstance(date, Date):
+                dateStr = date.strftime("%Y%m%d")
+            else:
+                raise TypeError("date must be a string, datetime.date, datetime.datetime, or None")
+
+            # Keep only directories whose names start with the date
+            dirList = [d for d in dirList if d.name.startswith(dateStr)]
+
+        # sort directory list
         dirList = sorted(dirList, key=lambda d: d.name)
         
         # print the experiment name and subjetID
@@ -772,7 +788,7 @@ class pglExperimentAnalysis(pglExperimentBase):
     and members for extracting the data from the experiment
     in various ways
     '''
-    def __init__(self, experimentName, subjectID="s0000", settingsName=None, settings=None):
+    def __init__(self, experimentName, subjectID="s0000", date=None, settingsName=None, settings=None):
         '''
         Initialize the pglExperimentAnalysis class.
         
@@ -787,7 +803,7 @@ class pglExperimentAnalysis(pglExperimentBase):
         self.loadSettings(settingsName=settingsName, settings=settings)
 
         # load the experimentName
-        self.load(experimentName=experimentName, subjectID=subjectID)
+        self.load(experimentName=experimentName, subjectID=subjectID, date=date)
     
     def getTrialsByParameter(self, parameterName: str, taskName: str = None):
         '''

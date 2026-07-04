@@ -16,8 +16,8 @@ import matplotlib.pyplot as plt
 from .pglTimestamp import pglTimestamp
 from dataclasses import dataclass, field
 from traitlets import Float, Int, List
-from .pglData import pglData
 from .pglSettings import pglSettingsEditable
+from .pglSerialize import pglSerialize
     
 ##########################
 # Staircase class
@@ -287,7 +287,7 @@ class pglStaircaseUpDown(pglStaircase):
 
             
 @dataclass
-class pglStaircaseData(pglData):
+class pglStaircaseData(pglSerialize):
     '''
     Class representing the data from a staircase.
     This is used to save/load staircase data.
