@@ -74,6 +74,47 @@ class pglEyeTracker(pglDevice):
         """
         # This method should be implemented by subclasses to save the eye tracking data
         raise NotImplementedError("saveData method must be implemented by subclasses of pglEyeTracker.")
+
+#################################################################
+# saccade events
+#################################################################
+class pglEventSaccade(pglEvent):
+    timeStart: float
+    timeEnd: float    
+    xStart: float
+    yStart: float
+    xEnd: float
+    yEnd: float
+    maxVelocity: float
+    duration: float
+    amplitude: float
+    direction: float
+    
+    def __init__(self, timeStart, timeEnd, xStart, yStart, xEnd, yEnd, maxVelocity=None):
+        '''
+        init with field names from annotation above
+        
+        Args:
+            timeStart: float timestamp for start of saccade
+            timeEnd: float timestamp for end of saccade   
+            xStart: float x position of start of saccade
+            yStart: float y position of start of saccade
+            xEnd: float x position of end of saccade
+            yEnd: float y position of end of saccade
+            maxVelocity: float max velocity of saccade
+        '''
+        # compute fields
+        duration = timeEnd-timeStart
+        amplitude = np.sqrt((xEnd-xStart)**2 + (yEnd-yStart)**2)
+        if amplitude > 0:
+            direction = np.degrees(np.arctan2(yEnd - yStart, xEnd - xStart))
+        else:
+            direction = np.nan
+        
+        # and use super init to set them (as super set all annotation fields)
+        super().__init__("saccadeEvent", timeStart, timeEnd, xStart, yStart, xEnd, yEnd, maxVelocity, duration, amplitude, direction)
+    
+    
     
 #################################################################
 # Parent class for eye tracker data
@@ -109,12 +150,21 @@ class pglEyeTrackerData():
             trialStart (List): List of timestamps of trials
             segmentStart (List): List of segment start times
         '''
-        self.trialEvents = pglEventsData.fromArray(data=data, channelNames=fieldNames, units=units)
+        #self.trialEvents = pglEventsData.fromArray(pglEventTrialEyeTracker, data=data, channelNames=fieldNames, units=units)
         
         pass
     
     def addSaccadeEvents(self):
+        '''
+        Add saccade events as a data matrix
+        
+        FIX, FIX, FIX - not tested yet
+        '''
         pass
+        self.trialEvents = pglEventsData.fromArray(pglEventSaccade, data=data, channelNames=fieldNames, units=units)
+        
+    def addSaccadeEvents(self):
+    
     
     def addBlinkEvents(self):
         pass

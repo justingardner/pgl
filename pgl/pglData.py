@@ -10,6 +10,9 @@
 ##############
 import numpy as np
 import h5py
+from dataclasses import fields, is_dataclass
+from pathlib import Path
+from .pglEvent import pglEvent
 
 ############################
 # pglDataMatrix
@@ -100,62 +103,123 @@ class pglDataMatrix:
         obj._h5 = h5py.File(path, mode)
         obj._data = None
 
-        # -----------------------------
-        # required dataset checks
-        # -----------------------------
-        required = ["data", "channelNames", "units"]
+        try:
+            # -----------------------------
+            # required dataset checks
+            # -----------------------------
+            required = ["data", "channelNames", "units"]
 
-        for key in required:
-            if key not in obj._h5:
-                raise ValueError(f"(pglDataMatrix:fromFile) missing dataset '{key}'")
+            for key in required:
+                if key not in obj._h5:
+                    raise ValueError(f"(pglDataMatrix:fromFile) missing dataset '{key}'")
 
-        data = obj._h5["data"]
+            data = obj._h5["data"]
 
-        if data.ndim != 2:
-            raise ValueError("(pglDataMatrix:fromFile) 'data' must be 2D (samples x channels)")
+            if data.ndim != 2:
+                raise ValueError("(pglDataMatrix:fromFile) 'data' must be 2D (samples x channels)")
 
-        numChannels = data.shape[1]
+            numChannels = data.shape[1]
 
-        # -----------------------------
-        # channelNames
-        # -----------------------------
-        obj.channelNames = [
-            c.decode() if isinstance(c, bytes) else c
-            for c in obj._h5["channelNames"][()]
-        ]
+            # -----------------------------
+            # channelNames
+            # -----------------------------
+            obj.channelNames = [
+                c.decode() if isinstance(c, bytes) else c
+                for c in obj._h5["channelNames"][()]
+            ]
 
-        if len(obj.channelNames) != numChannels:
-            raise ValueError(
-                f"(pglDataMatrix:fromFile) channelNames has {len(obj.channelNames)} entries "
-                f"but data has {numChannels} columns."
-            )
+            if len(obj.channelNames) != numChannels:
+                raise ValueError(
+                    f"(pglDataMatrix:fromFile) channelNames has {len(obj.channelNames)} entries "
+                    f"but data has {numChannels} columns."
+                )
 
-        if len(set(obj.channelNames)) != len(obj.channelNames):
-            raise ValueError(
-                "(pglDataMatrix:fromFile) channelNames must be unique."
-            )
+            if len(set(obj.channelNames)) != len(obj.channelNames):
+                raise ValueError(
+                    "(pglDataMatrix:fromFile) channelNames must be unique."
+                )
 
-        # -----------------------------
-        # units
-        # -----------------------------
-        obj.units = [
-            u.decode() if isinstance(u, bytes) else u
-            for u in obj._h5["units"][()]
-        ]
+            # -----------------------------
+            # units
+            # -----------------------------
+            obj.units = [
+                u.decode() if isinstance(u, bytes) else u
+                for u in obj._h5["units"][()]
+            ]
 
-        if len(obj.units) != numChannels:
-            raise ValueError(
-                f"(pglDataMatrix:fromFile) units has {len(obj.units)} entries "
-                f"but data has {numChannels} columns."
-            )
+            if len(obj.units) != numChannels:
+                raise ValueError(
+                    f"(pglDataMatrix:fromFile) units has {len(obj.units)} entries "
+                    f"but data has {numChannels} columns."
+                )
 
-        # -----------------------------
-        # metadata
-        # -----------------------------
-        obj.sampleRate = obj._h5.attrs.get("sampleRate", None)
+            # -----------------------------
+            # metadata
+            # -----------------------------
+            obj.sampleRate = obj._h5.attrs.get("sampleRate", None)
+        
+        except Exception:
+            
+            obj._h5.close()
+            raise
 
         return obj
     
+    # ---------------------------------------------------------
+    # Mutation
+    # ---------------------------------------------------------
+    def addRow(self, row):
+        '''
+        Append one or more rows of data to the matrix.
+
+        Args:
+            row: 1D array-like (single row) or 2D array-like (multiple rows).
+                 Number of columns must match len(self.channelNames).
+        '''
+        row = np.asarray(row)
+
+        # normalize a single row into shape (1, numChannels)
+        if row.ndim == 1:
+            row = row[np.newaxis, :]
+
+        if row.ndim != 2:
+            raise ValueError(
+                f"(pglDataMatrix:addRow) row must be 1D or 2D, got {row.ndim}D"
+            )
+
+        numChannels = len(self.channelNames)
+        if row.shape[1] != numChannels:
+            raise ValueError(
+                f"(pglDataMatrix:addRow) row has {row.shape[1]} columns, "
+                f"expected {numChannels} to match channelNames"
+            )
+
+        if self._h5 is None:
+            # in-memory: just stack onto the numpy array
+            self._data = np.vstack([self._data, row])
+        else:
+            # make sure we can append to the file
+            if self._h5.mode == "r":
+                raise ValueError(
+                    "(pglDataMatrix:addRow) file was opened read-only "
+                    "(mode='r'); reopen with fromFile(path, mode='r+') to add rows"
+                )
+                
+            # hdf5-backed: resize dataset and write new rows in place
+            dataset = self._h5["data"]
+            oldRows = dataset.shape[0]
+            newRows = oldRows + row.shape[0]
+
+            try:
+                dataset.resize(newRows, axis=0)
+            except TypeError as e:
+                raise TypeError(
+                    "(pglDataMatrix:addRow) underlying hdf5 dataset is not "
+                    "resizable (was it created with maxshape=(None, numChannels))?"
+                ) from e
+
+            dataset[oldRows:newRows, :] = row
+            
     # ---------------------------------------------------------
     # Internal helpers
     # ---------------------------------------------------------
@@ -228,30 +292,46 @@ class pglDataMatrix:
     # ---------------------------------------------------------
     def save(self, filePath=None, overwrite=True):
         '''
-        save the data matrix to hdf5
-        
-        Args:
-            filePath (str): Path to save to. If ommitted overwrites existig file
-            overwrite (bool): whether to overwrite files or not
-        '''
-        if filePath is None:
-            filePath = self.filePath
+        Save the data matrix to hdf5.
 
+        If this object is backed by an in-memory NumPy array (created via
+        fromArray), this creates a new hdf5 file at filePath.
+
+        If this object is already file-backed (created via fromFile), any
+        rows added via addRow are already live in the open hdf5 file, so
+        this just flushes pending writes to disk. filePath is ignored in
+        this case since the object is already tied to its own file.
+
+        Args:
+            filePath (str): Path to save to. Only used for in-memory-backed
+              objects. Ignored for file-backed objects.
+            overwrite (bool): whether to overwrite an existing file when
+              creating a new hdf5 file. Only used for in-memory-backed objects.
+        '''
+        # already file-backed: nothing to create, just flush pending writes
+        if self._h5 is not None:
+            self._h5.flush()
+            return
+
+        # in-memory-backed: need a filePath to create a new file
         if filePath is None:
             raise ValueError("(pglDataMatrix:save) No file path specified.")
 
-        # handle overwrite
-        mode = "w" if overwrite else "a"
+        if Path(filePath).exists() and not overwrite:
+            raise FileExistsError(
+                f"(pglDataMatrix:save) '{filePath}' already exists and overwrite=False"
+            )
 
         # open file
-        with h5py.File(filePath, mode) as f:
-            
-            # create the dataset 
+        with h5py.File(filePath, "w") as f:
+
+            # create the dataset, resizable so addRow can grow it later
             f.create_dataset(
                 "data",
                 data=self._dataset(),
                 compression="gzip",
-                chunks=True
+                chunks=True,
+                maxshape=(None, len(self.channelNames)),
             )
 
             # create channel names
@@ -259,20 +339,31 @@ class pglDataMatrix:
                 "channelNames",
                 data=np.array(self.channelNames, dtype="S")
             )
-            
+
             # create units
             f.create_dataset(
                 "units",
                 data=np.array(self.units, dtype="S")
             )
-            
-            # create samlpleRate rate
+
+            # create sampleRate
             if self.sampleRate is not None:
                 f.attrs["sampleRate"] = self.sampleRate
+                
+            # subclass hook to save metadata
+            f.attrs["className"] = self.__class__.__name__
+            self._saveMetadata(f)
 
         # save filename
         self.filePath = filePath
-
+        
+    def _saveMetadata(self, h5file):
+        """
+        Save class-specific metadata.
+        Subclasses can override.
+        """
+        pass
+        
     def close(self):
         '''
         Close file if there is one open
@@ -308,10 +399,11 @@ class pglTimeSeries(pglDataMatrix):
         print("-" * 40)
         print(f"nSamples    : {self.shape[0]}")
         print(f"nChannels   : {self.shape[1]}")
-        print(f"Sample Rate : {self.sampleRate:g} Hz")
+        if self.sampleRate is not None:
+            print(f"Sample Rate : {self.sampleRate:g} Hz")
 
-        if self.sampleRate > 0:
-            print(f"Duration    : {self.shape[0] / self.sampleRate:.2f}s")
+            if self.sampleRate > 0:
+                print(f"Duration    : {self.shape[0] / self.sampleRate:.2f}s")
 
         print("\nChannels:")
         for i, channelName in enumerate(self.channelNames):
@@ -331,7 +423,128 @@ class pglTimeSeries(pglDataMatrix):
 #######################
 # pglEventsData
 #######################
-class pglEventsData(pglTimeSeries):
+class pglEventsData(pglDataMatrix):
+    '''
+    Wrapper for pglDataMatrix which provides member functions
+    for data that has events (but is internally stored as a matrix
+    '''
+    # ---------------------------------------------------------
+    # Construction
+    # --------------------------------------------------------
+    def __init__(self, eventClass):
+        '''
+        Init registers the eventClass that will be used for adding / retrieving data
+        and providing required fields
+        Args:
+            eventClass: Either an instance or type of pglEvent
+        '''
+        self._registerEventClass(eventClass)
+        
+        # create memory backed storage for adding events to
+        self._data = np.empty((0, len(self.channelNames)), dtype=float)
+        
+        # not used for memory backed storage
+        self._h5 = None
+        self.filePath = None
+
+    def _registerEventClass(self, eventClass):
+        '''
+        Helper function that retrieves requiredFields and units from eventClass
+        '''
+        # accept either an instance or the class itself
+        self.eventClass = eventClass if isinstance(eventClass, type) else type(eventClass)
+        self.eventClassName = self.eventClass.__name__
+        if not is_dataclass(self.eventClass):
+            raise TypeError("(pglEventsData:_registerEventClass) eventClass needs to be a dataclass")
+        
+        # check the annotation of the eventClass for required fields
+        self._eventFields = fields(self.eventClass)
+        self.requiredFields = [f.name for f in self._eventFields]
+        self.channelNames = self.requiredFields
+        
+        # get units from dataclass field metadata
+        self.units = [f.metadata.get("units", "unknown") for f in self._eventFields]
+        
+        # no sample rate for events
+        self.sampleRate = None
+        
+    def addEvent(self, event):
+        # Check event type
+        if not isinstance(event, self.eventClass):
+            raise TypeError(f"Expected event of type {self.eventClass.__name__}, got {type(event).__name__}")
+
+        # convert into a row of data
+        row = np.array([getattr(event, field) for field in self.requiredFields], dtype=float)
+
+        # Append to data matrix
+        self.addRow(row)
+    
+    @classmethod
+    def fromArray(cls, eventClass, data):
+
+        obj = cls(eventClass)
+
+        obj._data = np.asarray(data, dtype=float)
+
+        if obj._data.ndim != 2:
+            raise ValueError("data must be 2D")
+
+        if obj._data.shape[1] != len(obj.channelNames):
+            raise ValueError(
+                "data columns do not match event fields"
+            )
+
+        return obj
+    
+    @classmethod
+    def fromFile(cls, filePath, mode="r"):
+
+        # First let pglDataMatrix do the normal HDF5 loading
+        obj = super().fromFile(filePath, mode)
+
+        try:
+            # Retrieve saved event class name
+            if "eventClassName" not in obj._h5.attrs:
+                raise ValueError(
+                    "(pglEventsData:fromFile) missing eventClassName attribute"
+                )
+
+            eventClassName = obj._h5.attrs["eventClassName"]
+
+            # Convert bytes if needed
+            if isinstance(eventClassName, bytes):
+                eventClassName = eventClassName.decode()
+
+            # Recover actual Python class
+            eventClass = pglEvent.getClass(eventClassName)
+
+            # Register it
+            obj._registerEventClass(eventClass)
+            
+            # check that requiredFeidsl mach channelNames
+            if obj.requiredFields != obj.channelNames:
+                raise ValueError(
+                    "(pglEventsData:fromFile) event fields do not match saved channel names"
+                )
+
+        except Exception:
+            obj.close()
+            raise
+
+        return obj   
+    
+    def getEvents(self):
+        '''
+        '''
+        pass
+
+    def _saveMetadata(self, h5file):
+        ''' 
+        save eventClassname
+        '''
+        h5file.attrs["eventClassName"] = self.eventClassName
+    
+    
     def print(self):
         """Print a summary of the time series."""
 

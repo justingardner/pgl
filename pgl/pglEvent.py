@@ -20,8 +20,7 @@ class pglEvent(pglSerialize):
     """
     Parent class for all pglEvent types
     """
-    
-    def __init__(self, type="pglEvent"):
+    def __init__(self, type="pglEvent", **kwargs):
         """
         Initialize the pglEvent instance.
         
@@ -29,7 +28,29 @@ class pglEvent(pglSerialize):
             type (str): The type/category of this event
         """
         self.type = type
+        
+        # if the subclass event has set annotations and there
+        # are passed i n kwargs, then set those fields
+        fields = vars(self.__class__).get('__annotations__', {})
+        # for every field in annotations
+        for f in fields:
+            # if it ia an input field
+            if f in kwargs:
+                # set the attribute
+                setattr(self, f, kwargs[f])
+    
+    # keep a registry of pglEvent subclasses             
+    _registry = {}
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
 
+        # Automatically register every subclass
+        pglEvent._registry[cls.__name__] = cls
+        
+    @classmethod
+    def getClass(cls, className):
+        return cls._registry[className]
+    
     def __repr__(self):
         return f"<pglEvent type={self.type}>"
 
