@@ -349,9 +349,12 @@ class pglDataMatrix:
             # create sampleRate
             if self.sampleRate is not None:
                 f.attrs["sampleRate"] = self.sampleRate
+
+            # class name and version number
+            f.attrs["className"] = self.__class__.__name__
+            f.attrs["dataMatrixVersion"] = 1.0
                 
             # subclass hook to save metadata
-            f.attrs["className"] = self.__class__.__name__
             self._saveMetadata(f)
 
         # save filename
@@ -392,6 +395,12 @@ class pglDataMatrix:
 #######################
 class pglTimeSeries(pglDataMatrix):
     
+    def _saveMetadata(self, h5file):
+        ''' 
+        save version
+        '''
+        h5file.attrs["timeSeriesVersion"] = 1.0
+
     def print(self):
         """Print a summary of the time series."""
 
@@ -540,10 +549,10 @@ class pglEventsData(pglDataMatrix):
 
     def _saveMetadata(self, h5file):
         ''' 
-        save eventClassname
+        save eventClassname and version
         '''
         h5file.attrs["eventClassName"] = self.eventClassName
-    
+        h5file.attrs["eventsDataVersion"] = 1.0
     
     def print(self):
         """Print a summary of the time series."""
