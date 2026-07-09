@@ -561,14 +561,20 @@ class pglEventsData(pglDataMatrix):
             getEvents("fieldName", 1)                 # exact match
             getEvents("fieldName", minVal=100, maxVal=200)  # range between and including 100-200
         '''
+        # get the column (field) to check
+        col = self[fieldName]
+        if col is None:
+            return(np.array([]))
+        
         if value is not None:
-            mask = self[fieldName] == value
+            mask = col == value
         elif minVal is not None and maxVal is not None:
-            mask = (self[fieldName] >= minVal) & (self[fieldName] <= maxVal)
+            mask = (col >= minVal) & (col <= maxVal)
         elif minVal is not None:
-            mask = self[fieldName] >= minVal
+            mask = col >= minVal
         elif maxVal is not None:
-            mask = self[fieldName] <= maxVal
+            mask = col <= maxVal
+        
         # get matching rows
         matchingRows =self._data[mask,:]
         
