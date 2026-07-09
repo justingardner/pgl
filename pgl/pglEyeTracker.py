@@ -10,6 +10,8 @@
 ##########
 from pgl import pglDevice
 from .pglData import pglTimeSeries, pglEventsData
+from .pglEvent import pglEvent
+from dataclasses import dataclass, field
 
 #################################################################
 # Parent class for eye tracker devices
@@ -78,17 +80,18 @@ class pglEyeTracker(pglDevice):
 #################################################################
 # saccade events
 #################################################################
+@dataclass
 class pglEventSaccade(pglEvent):
-    timeStart: float
-    timeEnd: float    
-    xStart: float
-    yStart: float
-    xEnd: float
-    yEnd: float
-    maxVelocity: float
-    duration: float
-    amplitude: float
-    direction: float
+    timeStart: float = field(metadata={"units": "s"})
+    timeEnd: float = field(metadata={"units": "s"})
+    xStart: float = field(metadata={"units": "deg"})
+    yStart: float = field(metadata={"units": "deg"})
+    xEnd: float = field(metadata={"units": "deg"})
+    yEnd: float = field(metadata={"units": "deg"})
+    maxVelocity: float = field(metadata={"units": "deg/s"})
+    duration: float = field(metadata={"units": "s"})
+    amplitude: float = field(metadata={"units": "deg"})
+    direction: float = field(metadata={"units": "deg"})
     
     def __init__(self, timeStart, timeEnd, xStart, yStart, xEnd, yEnd, maxVelocity=None):
         '''
@@ -114,7 +117,16 @@ class pglEventSaccade(pglEvent):
         # and use super init to set them (as super set all annotation fields)
         super().__init__("saccadeEvent", timeStart, timeEnd, xStart, yStart, xEnd, yEnd, maxVelocity, duration, amplitude, direction)
     
-    
+#################################################################
+# trial events
+#################################################################
+@dataclass
+class pglEventEyeTrackerTrial(pglEvent):
+    taskID: float = field(metadata={"units": "n"})
+    trialNum: float = field(metadata={"units": "n"})
+    segmentNum: float = field(metadata={"units": "n"})
+    timestamp: float = field(metadata={"units": "s"})
+ 
     
 #################################################################
 # Parent class for eye tracker data
@@ -126,7 +138,8 @@ class pglEyeTrackerData():
         """
         # initializes time series and events
         self.timeSeries = None
-        self.trialEvents = None
+        self.trialEvents = pglEventsData(pglEventEyeTrackerTrial)
+        self.saccadeEvents = pglEventsData(pglEventSaccade)
 
     def addTimeseries(self, timeSeries, channelNames, units, sampleRate):
         '''
@@ -141,35 +154,6 @@ class pglEyeTrackerData():
         # set the timeseries
         self.timeSeries = pglTimeSeries.fromArray(data=timeSeries, channelNames=channelNames, units=units, sampleRate=sampleRate)
     
-    def addTrialEvents(self, data, fieldNames, units):
-        '''
-        Add trial events which specify when the trials start and stop
-        
-        Args:
-            taskID (int): The taskID which specifies which task the trials belong to
-            trialStart (List): List of timestamps of trials
-            segmentStart (List): List of segment start times
-        '''
-        #self.trialEvents = pglEventsData.fromArray(pglEventTrialEyeTracker, data=data, channelNames=fieldNames, units=units)
-        
-        pass
-    
-    def addSaccadeEvents(self):
-        '''
-        Add saccade events as a data matrix
-        
-        FIX, FIX, FIX - not tested yet
-        '''
-        pass
-        self.trialEvents = pglEventsData.fromArray(pglEventSaccade, data=data, channelNames=fieldNames, units=units)
-        
-    def addSaccadeEvents(self):
-    
-    
-    def addBlinkEvents(self):
-        pass
-        
-
     def print(self):
         """
         print information about the eye tracker data

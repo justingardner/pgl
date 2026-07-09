@@ -49,17 +49,31 @@ class pglEvent(pglSerialize):
         
     @classmethod
     def getClass(cls, className):
+        '''
+        get sub classes from classNames as created by registry above
+        '''
+        if className not in cls._registry:
+            raise ValueError(
+                f"(pglEvent:getClass) Unknown event class '{className}'"
+            )
         return cls._registry[className]
     
     def __repr__(self):
-        return f"<pglEvent type={self.type}>"
+        if hasattr(self, 'type'):
+            return f"<pglEvent type={self.type}>"
+        else:
+            return f"<pglEvent type={self.__class__.__name__}>"
 
     def print(self):
         """
         Print the details of the pglEvent instance.
         """
-        print(f"(pglEvent) Type: {self.type}")
-
+        if hasattr(self, 'type'):
+            print(f"(pglEvent) Type: {self.type}")
+        else:
+            print(f"<pglEvent type={self.__class__.__name__}>")
+        for name, value in vars(self).items():
+            print(f"  {name}: {value}")
 #############
 # pglEvents - Event container using dataclass
 #############

@@ -542,11 +542,37 @@ class pglEventsData(pglDataMatrix):
 
         return obj   
     
-    def getEvents(self):
+    def getEvents(self, fieldName, value=None, minVal=None, maxVal=None):
         '''
+        Get events in which the fieldName matches the value or range of values
+        
+        Args:
+            fieldName (string): The name of the field to search by
+            value (float): If set, search for an exact match
+            minVal (float): If set, returns events that are >= minVal
+            maxVal (float): If set, returns event that are <= maxVal
+        e.g.:
+            getEvents("fieldName", 1)                 # exact match
+            getEvents("fieldName", minVal=100, maxVal=200)  # range between and including 100-200
         '''
-        pass
-
+        if value is not None:
+            mask = self[fieldName] == value
+        elif minVal is not None and maxVal is not None:
+            mask = (self[fieldName] >= minVal) & (self[fieldName] <= maxVal)
+        elif minVal is not None:
+            mask = self[fieldName] >= minVal
+        elif maxVal is not None:
+            mask = self[fieldName] <= maxVal
+        # get matching rows
+        matchingRows =self._data[mask,:]
+        
+        # Create event instances from matching rows
+        events = [
+            self.eventClass(**dict(zip(self.channelNames, row)))
+            for row in matchingRows
+        ]
+        return events
+        
     def _saveMetadata(self, h5file):
         ''' 
         save eventClassname and version

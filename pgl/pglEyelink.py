@@ -11,7 +11,7 @@
 import sys, array
 import numpy as np
 from pynput import keyboard
-from .pglEyeTracker import pglEyeTracker, pglEyeTrackerData
+from .pglEyeTracker import pglEyeTracker, pglEyeTrackerData, pglEventSaccade, pglEventEyeTrackerTrial
 from pgl import pglEventKeyboard
 import socket
 import os
@@ -698,14 +698,14 @@ class pglEyelinkData(pglEyeTrackerData):
             # if it is a trial message
             if messageValues.get("messageType") == "trial":
                 # then add it to the data
-                row = [
-                    messageValues.get(field, np.nan)
-                    for field in trialEventFields
-                ]
-                data.append(row)
-        
-        # and store in structure
-        eyeTrackerData.addTrialEvents(np.array(data), trialEventFields, units)
+                t = pglEventEyeTrackerTrial(
+                    taskID=messageValues.get("taskID", np.nan),
+                    trialNum=messageValues.get("trialNum", np.nan),
+                    segmentNum=messageValues.get("segmentNum", np.nan),
+                    timestamp=messageValues.get("timestamp", np.nan),
+                )        
+                # and store in structure
+                eyeTrackerData.trialEvents.addEvent(t)
 
         # return the pglEyeTrackerData structure
         return eyeTrackerData
