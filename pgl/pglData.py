@@ -246,7 +246,8 @@ class pglDataMatrix:
             return self.channelNames.index(channelName)
 
         except ValueError:
-            raise KeyError(f"Unknown channel '{channelName}'")
+            print(f"(pglDataMatrix:_channelIndex) Unknown channel '{channelName}'")
+            return None
 
     # ---------------------------------------------------------
     # Data access
@@ -260,9 +261,12 @@ class pglDataMatrix:
 
         if isinstance(key, str):
             index = self._channelIndex(key)
-            return dataset[:, index]
-
-        return dataset[key]
+            if index is None:
+                return None
+            else:
+                return dataset[:, index]
+        print("(pglDataMatrix:__getitem__) Key must be a string of field in channelNames")
+        return None
 
     #def __getattr__(self, name):
     #    '''
@@ -285,6 +289,8 @@ class pglDataMatrix:
         '''
         explicit call
         '''
+        if channelName not in self.channelNames:
+            return None
         return self[channelName]
 
     # ---------------------------------------------------------
