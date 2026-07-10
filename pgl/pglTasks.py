@@ -159,7 +159,7 @@ class pglBarTask(pglTask):
         # direction of bars
         dirParam = pglParameter('directions',p['directions'], randomSeed=randomSeed)
         self.addParameter(dirParam)
-        self.settings.randomSeed = dirParam.randomSeed
+        self.settings.randomSeed = dirParam.settings.randomSeed
         
         # initalize stimulus
         self.bars = pgl.bar(width=p['barWidth'], nVolumesPerSweep=p['nVolumesPerSweep'], sweepWidth=p['sweepWidth'], sweepHeight=p['sweepHeight'])
@@ -232,3 +232,4 @@ class pglBarTask(pglTask):
         
         # return frames
         return frames, xDeg, yDeg, timeStamps
+    
