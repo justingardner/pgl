@@ -139,6 +139,34 @@ class pglEventSaccade(pglEvent):
         )
     
 #################################################################
+# saccade events
+#################################################################
+@dataclass
+class pglEventBlink(pglEvent):
+    timeStart: float = field(metadata={"units": "s"})
+    timeEnd: float = field(metadata={"units": "s"})
+    duration: float = field(metadata={"units": "s"})
+    
+    def __init__(self, timeStart, timeEnd, duration=None):
+        '''
+        init with field names from annotation above
+        
+        Args:
+            timeStart: float timestamp for start of blink
+            timeEnd: float timestamp for end of blink
+            duration: float duration of blink
+        '''
+        # compute fields
+        if duration is None: duration = timeEnd - timeStart
+        
+        # and use super init to set them (as super set all annotation fields)
+        super().__init__(
+            type="blinkEvent",
+            timeStart=timeStart,
+            timeEnd=timeEnd,
+            duration=duration,
+        )
+#################################################################
 # trial events
 #################################################################
 @dataclass
@@ -161,6 +189,7 @@ class pglEyeTrackerData():
         self.timeSeries = None
         self.trialEvents = pglEventsData(pglEventEyeTrackerTrial)
         self.saccadeEvents = pglEventsData(pglEventSaccade)
+        self.blinkEvents = pglEventsData(pglEventBlink)
 
     def addTimeseries(self, timeSeries, channelNames, units, sampleRate):
         '''

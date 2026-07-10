@@ -11,7 +11,7 @@
 import sys, array
 import numpy as np
 from pynput import keyboard
-from .pglEyeTracker import pglEyeTracker, pglEyeTrackerData, pglEventSaccade, pglEventEyeTrackerTrial
+from .pglEyeTracker import pglEventBlink, pglEyeTracker, pglEyeTrackerData, pglEventSaccade, pglEventEyeTrackerTrial
 from pgl import pglEventKeyboard
 import socket
 import os
@@ -721,6 +721,16 @@ class pglEyelinkData(pglEyeTrackerData):
                 maxVelocity=self.saccades['peakVel'][i]
             )
             eyeTrackerData.saccadeEvents.addEvent(s)
+
+        # loop through each saccade event
+        nBlinks = len(self.blinks['startTime'])
+        print(f"Converting {nBlinks} blink events to pglEyeTrackerData...")
+        for i in range(nBlinks):
+            b = pglEventBlink(
+                timeStart=self.blinks['startTime'][i],
+                timeEnd=self.blinks['endTime'][i]
+            )
+            eyeTrackerData.blinkEvents.addEvent(b)  
 
         # return the pglEyeTrackerData structure
         return eyeTrackerData
