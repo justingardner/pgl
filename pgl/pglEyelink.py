@@ -687,7 +687,6 @@ class pglEyelinkData(pglEyeTrackerData):
         
         # ---------------------
         # create trial events
-        data = []
         trialEventFields = ['taskID', 'trialNum', 'segmentNum', 'timestamp']
         units = ['n','n','n','s']
         
@@ -697,7 +696,7 @@ class pglEyelinkData(pglEyeTrackerData):
             messageValues = self.parseMessageLine(messageText)
             # if it is a trial message
             if messageValues.get("messageType") == "trial":
-                # then add it to the data
+                # then add it to the data as a trial event
                 t = pglEventEyeTrackerTrial(
                     taskID=messageValues.get("taskID", np.nan),
                     trialNum=messageValues.get("trialNum", np.nan),
@@ -706,6 +705,22 @@ class pglEyelinkData(pglEyeTrackerData):
                 )        
                 # and store in structure
                 eyeTrackerData.trialEvents.addEvent(t)
+
+        # loop through each saccade event
+        nSaccades = len(self.saccades['startTime'])
+        eye = np.where(self.saccades['eye'] == 'L', -1, 1)
+        for i in range(nSaccades):
+            s = pglEventSaccade(
+                eye=eye[i],
+                timeStart=self.saccades['startTime'][i],
+                timeEnd=self.saccades['endTime'][i],
+                xStart=self.saccades['startX'][i],
+                yStart=self.saccades['startY'][i],
+                xEnd=self.saccades['endX'][i],
+                yEnd=self.saccades['endY'][i],
+                maxVelocity=self.saccades['peakVel'][i]
+            )
+            eyeTrackerData.saccadeEvents.addEvent(s)
 
         # return the pglEyeTrackerData structure
         return eyeTrackerData

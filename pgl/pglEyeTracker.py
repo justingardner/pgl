@@ -12,6 +12,7 @@ from pgl import pglDevice
 from .pglData import pglTimeSeries, pglEventsData
 from .pglEvent import pglEvent
 from dataclasses import dataclass, field
+import numpy as np
 
 #################################################################
 # Parent class for eye tracker devices
@@ -82,6 +83,7 @@ class pglEyeTracker(pglDevice):
 #################################################################
 @dataclass
 class pglEventSaccade(pglEvent):
+    eye: float = field(metadata={"units": "eye: -1 = left, 1 = right"})
     timeStart: float = field(metadata={"units": "s"})
     timeEnd: float = field(metadata={"units": "s"})
     xStart: float = field(metadata={"units": "deg"})
@@ -93,11 +95,12 @@ class pglEventSaccade(pglEvent):
     amplitude: float = field(metadata={"units": "deg"})
     direction: float = field(metadata={"units": "deg"})
     
-    def __init__(self, timeStart, timeEnd, xStart, yStart, xEnd, yEnd, maxVelocity=None):
+    def __init__(self, eye, timeStart, timeEnd, xStart, yStart, xEnd, yEnd, maxVelocity=None, duration=None, amplitude=None, direction=None):
         '''
         init with field names from annotation above
         
         Args:
+            eye: float indicating which eye ( -1 = left, 1 = right)
             timeStart: float timestamp for start of saccade
             timeEnd: float timestamp for end of saccade   
             xStart: float x position of start of saccade
@@ -105,17 +108,35 @@ class pglEventSaccade(pglEvent):
             xEnd: float x position of end of saccade
             yEnd: float y position of end of saccade
             maxVelocity: float max velocity of saccade
+            duration: float duration of saccade
+            amplitude: float amplitude of saccade
+            direction: float direction of saccade
         '''
         # compute fields
-        duration = timeEnd-timeStart
-        amplitude = np.sqrt((xEnd-xStart)**2 + (yEnd-yStart)**2)
-        if amplitude > 0:
-            direction = np.degrees(np.arctan2(yEnd - yStart, xEnd - xStart))
-        else:
-            direction = np.nan
+        if duration is None: duration = timeEnd - timeStart
+        if amplitude is None:
+            amplitude = np.sqrt((xEnd-xStart)**2 + (yEnd-yStart)**2)
+        if direction is None:
+            if amplitude > 0:
+                direction = np.degrees(np.arctan2(yEnd - yStart, xEnd - xStart))
+            else:
+                direction = np.nan
         
         # and use super init to set them (as super set all annotation fields)
-        super().__init__("saccadeEvent", timeStart, timeEnd, xStart, yStart, xEnd, yEnd, maxVelocity, duration, amplitude, direction)
+        super().__init__(
+            type="saccadeEvent",
+            eye=eye,
+            timeStart=timeStart,
+            timeEnd=timeEnd,
+            xStart=xStart,
+            yStart=yStart,
+            xEnd=xEnd,
+            yEnd=yEnd,
+            maxVelocity=maxVelocity,
+            duration=duration,
+            amplitude=amplitude,
+            direction=direction
+        )
     
 #################################################################
 # trial events
