@@ -513,6 +513,7 @@ class pglBase:
             bool: True if a screen is open, False otherwise.
         """
         return self.s is not None
+    
     ################################################################
     # printCommandResults
     ################################################################
@@ -571,6 +572,26 @@ class pglBase:
                 print(f"{prefix} {field}: {((value / 1000000.0)-relativeToTime):.3f} ms")
             else:
                 print(f"{prefix} {field}: {value}")
+
+    def oneTimeWarning(self, warningStr):
+        """
+        Print a one-time warning message.
+
+        Args:
+            warningStr (str): The warning message to print.
+        """
+        # check to see if we have already printed this warning
+        if not hasattr(self, '_oneTimeWarnings'):
+            self._oneTimeWarnings = set()
+        if warningStr in self._oneTimeWarnings:
+            return
+        # add the warning to the set of printed warnings
+        self._oneTimeWarnings.add(warningStr)
+        
+        # print the warning
+        print("❌"*80)
+        print(f"(pgl:oneTimeWarning) {warningStr}")
+        print("❌"*80)
 
     ################################################################
     # Check OS compatibility

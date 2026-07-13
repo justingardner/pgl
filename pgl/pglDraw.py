@@ -65,6 +65,18 @@ class pglDraw:
         # keep background coor
         self.clearScreenColor = color.flatten().tolist()
         
+        # FIX: FIX: FIX, this draws a quad because clearScreen is not functioning properly
+        w = self.screenWidth.pix
+        h = self.screenHeight.pix
+        fullScreenQuad = np.array([
+            [0, 0],   # bottom-left
+            [w, 0],   # bottom-right
+            [w, h],   # top-right
+            [0, h],   # top-left
+        ])
+        self.quad(fullScreenQuad, color= self.clearScreenColor, units="pix")
+        self.oneTimeWarning("(pgl:clearScreen) Need to fix clearScreen which is not functioning properly, drawing a full screen quad instead.")
+        
     ################################################################
     # dots
     ################################################################
