@@ -8,12 +8,14 @@
 #############
 # Import modules
 #############
+import re
+
 import numpy as np
 import matplotlib.pyplot as plt
 from ._pglComm import pglSerial
 from .pglBase import printHeader
 from .pglSettings import filename, pglSettingsEditable, pglSettings, pglSettingsManager
-from traitlets import Unicode, Int, Instance, Dict, Tuple
+from traitlets import Unicode, Int, Instance, Dict, Tuple, Float
 from datetime import datetime
 from .pglExperiment import pglExperiment
 from tqdm.notebook import tqdm
@@ -159,7 +161,7 @@ class pglCalibrationDeviceMinolta(pglCalibrationDevice):
 ##########################
 class pglCalibration():
     '''
-    Runs calibrtion for a display
+    Runs calibration for a display
     '''
     def __init__(self, pgl, calibrationDevice : pglCalibrationDevice):
         '''
@@ -212,8 +214,103 @@ class pglCalibration():
         Destructor for the calibration class.
         '''
         pass
+
+    def calibrate(self, settingsName, nRepeats=4, nSteps=256, runValidation=True, runGammaValidation=True):
+        '''
+        User facing function which runs the calibration process.
+        
+        Args:
+            settingsName (str): Name of the screen settings to calibrate.
+            nRepeats (int): Number of times to repeat each measurement.
+            nSteps (int): Number of steps in the calibration.
+            runValidation (bool): If True, run validation after calibration.
+            runGammaValidation (bool): If True, run gamma validation after calibration. This can validate
+                for making a gamma of 2.2 for videos
+        '''
+        
+        # initialize calibration data
+        self.calibrationData = None
+        self.validationData = None
+        self.gammaValidationData = None
+        
+        # open the display with specified settings
+        e = pglExperiment(self.pgl, settingsName)
+        e.initScreen()
+        if self.pgl.isOpen() is False:
+            print(f"(pglCalibration:calibrate) Display {settingsName} did not open, cannot calibrate.")
+            return None
+        
+        # run calibraiton
+        self.calibrationData = self._calibrate(e, settingsName, nRepeats, nSteps, validate=False)
+        self.calibrationData.display()
+        
+        # run validation
+        if runValidation:
+            self.validationData = self.validate(e, gamma=1.0)
+            self.validationData.display(gamma=1.0)
     
-    def calibrate(self, settingsName, nRepeats=4, nSteps=256, validate=False, inverseGammaTable=None):
+        if runGammaValidation:
+            self.gammaValidationData = self.validate(e, gamma=2.2)
+            self.gammaValidationData.display(gamma=2.2)
+
+        # and save
+        self.save()
+        
+        # close screen
+        e.endScreen()
+
+    def validate(self, e=None, nRepeats=None, nSteps=None, gamma=1.0):
+        '''
+        Validate the display calibration by applying inverse gamma and re-measuring. Usually
+        run automatically by calibrate() after calibration is complete.
+        
+        Args:
+            e: The experiment variable which contains the display settings (None will start a new one)
+            nRepeats (int): Number of times to repeat each measurement (None will use the same as calibration)
+            nSteps (int): Number of steps in the validation. (None will use the same as calibration)
+        '''
+        if not self.checkCalibrationData(self.calibrationData):
+            print("(pglCalibration:validate) Calibration data is not valid. Cannot run validation.")
+            return None
+        print("(pglCalibration) Starting validation with inverse gamma correction...")
+        
+        closeScreenOnEnd = False
+        if e is None:
+            # open the display with specified settings
+            e = pglExperiment(self.pgl, self.calibrationData.settingsName)
+            e.initScreen()
+            closeScreenOnEnd = True
+            if self.pgl.isOpen() is False:
+                print(f"(pglCalibration:validate) Display {self.calibrationData.settingsName} did not open, cannot validate.")
+                return None
+        
+        # defaults for nRepeats and nSteps
+        if nRepeats is None:
+            nRepeats = self.calibrationData.nRepeats
+        if nSteps is None:
+            nSteps = self.calibrationData.nSteps
+            
+        # Calculate inverse gamma table from calibration measurements
+        inverseGammaTable = self.calculateInverseGamma(self.calibrationData, gamma=gamma)
+        
+        # Run calibration with the inverse gamma table
+        validationData = self._calibrate(
+            e,
+            self.calibrationData.settingsName,
+            nRepeats=nRepeats, 
+            nSteps=nSteps,
+            validate=True,
+            inverseGammaTable=inverseGammaTable
+        )
+        
+        if closeScreenOnEnd:
+            self.validationData = validationData
+            e.endScreen()
+            self.save()
+            
+        return validationData
+ 
+    def _calibrate(self, e, settingsName, nRepeats=4, nSteps=256, validate=False, inverseGammaTable=None):
         '''
         Measure the display characteristics.
         
@@ -229,7 +326,7 @@ class pglCalibration():
             return None
         
         # initialize calibration data
-        self.calibrationData = pglCalibrationData()
+        self.currentCalibrationData = pglCalibrationData()
         self.calibrationIndex = 0
         self.fullCalibrationIndex = None
         self.findMinIndex = None
@@ -240,22 +337,15 @@ class pglCalibration():
         # start with trying to measure min and max
         self.calibrationMode = "minmax"
         
-        # open the display with specified settings
-        e = pglExperiment(self.pgl, settingsName)
-        e.initScreen()
-        if self.pgl.isOpen() is False:
-            print(f"(pglCalibration) Display {settingsName} did not open, cannot calibrate.")
-            return None
-        
         # get calibration date and time
-        self.calibrationData.creationDateTime = datetime.now()
+        self.currentCalibrationData.creationDateTime = datetime.now()
 
         # save settings name
-        self.calibrationData.settingsName = settingsName
-        self.calibrationData.settings = e.getSettings(settingsName)
+        self.currentCalibrationData.settingsName = settingsName
+        self.currentCalibrationData.settings = e.getSettings(settingsName)
         
         # save the current gamma table so we can replace it
-        displayNumber = self.calibrationData.settings.displayNumber
+        displayNumber = self.currentCalibrationData.settings.displayNumber
         if displayNumber > 0: displayNumber -= 1
         self.currentGammaTable = self.pgl.getGammaTable(displayNumber)
         
@@ -266,20 +356,20 @@ class pglCalibration():
             self.pgl.setGammaTableLinear(displayNumber)
         
         # get the gamma table and save it
-        self.calibrationData.gammaTableSize = self.pgl.getGammaTableSize(displayNumber)
+        self.currentCalibrationData.gammaTableSize = self.pgl.getGammaTableSize(displayNumber)
         gammaTable = self.pgl.getGammaTable(displayNumber)
-        self.calibrationData.gammaTable = tuple(np.array(table) for table in gammaTable)
+        self.currentCalibrationData.gammaTable = tuple(np.array(table) for table in gammaTable)
 
         # set number of repeats and steps
-        self.calibrationData.nRepeats = nRepeats
-        self.calibrationData.nSteps = nSteps
+        self.currentCalibrationData.nRepeats = nRepeats
+        self.currentCalibrationData.nSteps = nSteps
 
         # get the display info
         try:
             # get display info if available
             gpu = next(iter(self.pgl.gpuInfo.values()))
             displays = gpu.get('Displays', [])
-            self.calibrationData.displayInfo = displays[displayNumber]
+            self.currentCalibrationData.displayInfo = displays[displayNumber]
         except Exception as ex:
             print(f"(pglCalibration) Warning: Could not get display info: {ex}")
         
@@ -306,70 +396,69 @@ class pglCalibration():
         # restore the original gamma table
         self.pgl.setGammaTable(displayNumber, self.currentGammaTable[0], self.currentGammaTable[1], self.currentGammaTable[2])
         
-        # close the screen
-        e.endScreen()
+        # collect min and max measurements
+        _, measurements, _, _ = self.currentCalibrationData.getMedianMeasurements()
+        self.currentCalibrationData.minLuminance = measurements[0]
+        self.currentCalibrationData.maxLuminance = measurements[-1]
         
-        # display results when done (skip for validation)
-        if not validate:
-            self.calibrationData.display()
-            # and save
-            self.save()
-  
-    def display(self, validation=False):
+        # return the calibration data
+        calibrationData = self.currentCalibrationData
+        self.currentCalibrationData = None
+        return(calibrationData)
+    
+    def checkCalibrationData(self, calibrationData):
         '''
-        Display calibration or validation results.
+        Check if the calibration data is valid.
         
         Args:
-            validation (bool): If True, display validation data instead of calibration data.
+            calibrationData: The calibration data to check.
+        
+        Returns:
+            True if valid, False otherwise.
         '''
-        # Select which data to display
-        if validation:
-            if not hasattr(self.calibrationData, 'validationData'):
-                print("(pglCalibration) No validation data available.")
-                return
-            data = self.calibrationData.validationData
-            gammaTable = self.calibrationData.validationGammaTable
-            titlePrefix = "Validation"
-        else:
-            data = self.calibrationData
-            gammaTable = self.calibrationData.gammaTable
-            titlePrefix = "Calibration"
         
-        # Create figure with two subplots
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+        if calibrationData is None:
+            print("(pglCalibration) No calibration data available. Please run calibrate() first.")
+            return False
         
-        # First graph - Display Calibration/Validation
-        ax1.plot(data.calibrationValues, data.calibrationMeasurements, 'o-')
-        ax1.set_xlabel("Display Value")
-        ax1.set_ylabel("Measured Luminance")
-        ax1.set_title(f"Display {titlePrefix}")
-        ax1.grid(True)
+        # Check that calibration data is complete
+        if not hasattr(self.calibrationData, 'calibrationValues') or \
+        not hasattr(self.calibrationData, 'calibrationMeasurements'):
+            print("(pglCalibration) Calibration data is incomplete. Please run calibrate() first.")
+            return False
         
-        # Second graph - Gamma Table
-        ax2.plot(range(data.gammaTableSize), gammaTable[0], 'r-', label='Red')
-        ax2.plot(range(data.gammaTableSize), gammaTable[1], 'g-', label='Green')
-        ax2.plot(range(data.gammaTableSize), gammaTable[2], 'b-', label='Blue')
-        ax2.legend()
-        ax2.set_xlabel("Index")
-        ax2.set_ylabel("Gamma Value")
-        ax2.set_title(f"{titlePrefix} Gamma Table")
-        ax2.grid(True)
-        
-        plt.tight_layout()
-        plt.show() 
-             
+        # Verify the calibration data matches expected size
+        expectedSize = self.calibrationData.nRepeats * self.calibrationData.nSteps
+        if len(self.calibrationData.calibrationValues) != expectedSize or \
+        len(self.calibrationData.calibrationMeasurements) != expectedSize:
+            print(f"(pglCalibration) Calibration data size mismatch. Expected {expectedSize}, got {len(self.calibrationData.calibrationValues)}")
+            return False
+        return True 
+
+    def display(self):
+        '''
+        Display results of calibration and validation
+        '''
+        if self.checkCalibrationData(self.calibrationData):
+            self.calibrationData.display()
+        if self.checkCalibrationData(self.validationData):
+            self.validationData.display(gamma=1.0)
+        if self.checkCalibrationData(self.gammaValidationData):
+            self.gammaValidationData.display(gamma=2.2)
+
     def displayProgress(self, startProgress=False):
         '''
         Display the progress of the calibration.
         '''
         if startProgress:
-            self.progressBar = tqdm(total=self.calibrationData.nSteps*self.calibrationData.nRepeats, desc="Calibrating", unit="measurements")
+            self.progressBar = tqdm(total=self.currentCalibrationData.nSteps*self.currentCalibrationData.nRepeats, desc="Calibrating", unit="measurements")
         else:
             if self.calibrationMode == "minmax":
                 print(f"(pglCalibration) {self.calibrationValueGet(-1)}: {self.calibrationMeasurementGet(-1)}")
             elif self.calibrationMode == "minsearch":
                 print(f"(pglCalibration) {self.calibrationValueGet(-1)}: {self.calibrationMeasurementGet(-1)}")
             elif self.calibrationMode == "full":
+                print(f"{self.calibrationMeasurementGet(-1):<6} ", end="")
                 if self.progressBar is not None:
                     self.progressBar.update(1)
         
@@ -382,8 +471,8 @@ class pglCalibration():
         '''
         # if we already have a calibration value that hasn't been measured
         # then return that
-        if self.calibrationData.hasLastMeasurement(self.saveLocation) is False:
-            return self.calibrationData.getLastValue(self.saveLocation)
+        if self.currentCalibrationData.hasLastMeasurement(self.saveLocation) is False:
+            return self.currentCalibrationData.getLastValue(self.saveLocation)
         # check for minmax mode to get min and max values
         if self.calibrationMode == "minmax":
             return self.getMinMaxCalibrationValue()
@@ -403,17 +492,17 @@ class pglCalibration():
         the min and max measurable values
         '''
         # first show the max value (this should always be measurable
-        if self.calibrationIndex < self.calibrationData.nRepeats:
+        if self.calibrationIndex < self.currentCalibrationData.nRepeats:
             self.calibrationValueAppend(1.0)
         # next show the min value (this may not be measurable)
-        elif self.calibrationIndex < 2*self.calibrationData.nRepeats:
+        elif self.calibrationIndex < 2*self.currentCalibrationData.nRepeats:
             self.calibrationValueAppend(0.0)
         # Check if we have valid min and max values
         else:
             # get the measured min and max
             self.maxCalibrationVal = self.calibrationValueGet(0)
             # see how many measurement failures we had for min
-            nMeasurementFailures = sum(x is None for x in self.calibrationMeasurementGet(self.calibrationData.nRepeats, 2*self.calibrationData.nRepeats))
+            nMeasurementFailures = sum(x is None for x in self.calibrationMeasurementGet(self.currentCalibrationData.nRepeats, 2*self.currentCalibrationData.nRepeats))
             if nMeasurementFailures == 0:
                 # get the min value
                 self.minCalibrationVal = self.calibrationValueGet(-1)
@@ -475,16 +564,16 @@ class pglCalibration():
             printHeader(f"Starting Full Calibration between {self.minCalibrationVal} and {self.maxCalibrationVal}")
             self.displayProgress(startProgress=True)
 
-        if ((self.calibrationIndex-self.fullCalibrationIndex) % self.calibrationData.nRepeats) == 0:
+        if ((self.calibrationIndex-self.fullCalibrationIndex) % self.currentCalibrationData.nRepeats) == 0:
             # set the next value to measure
-            step = (self.calibrationIndex-self.fullCalibrationIndex) // self.calibrationData.nRepeats
-            if step == self.calibrationData.nSteps:
+            self.currentStep = (self.calibrationIndex-self.fullCalibrationIndex) // self.currentCalibrationData.nRepeats
+            if self.currentStep == self.currentCalibrationData.nSteps:
+                print(f"")
                 printHeader("Full calibration complete.")
                 self.calibrationMode = "done"
                 return -1
-            value = self.minCalibrationVal + (self.maxCalibrationVal - self.minCalibrationVal) * (step / (self.calibrationData.nSteps - 1))
-            print(f"(pglCalibration) Measuring step {step+1} of {self.calibrationData.nSteps}: {value}")
-            #print(f"(pglCalibration) Measured step {step+1} of {self.calibrationData.nSteps}: {value} = {np.median(self.calibrationMeasurementGet(-1,-self.calibrationData.nRepeats+1))}")
+            value = self.minCalibrationVal + (self.maxCalibrationVal - self.minCalibrationVal) * (self.currentStep / (self.currentCalibrationData.nSteps - 1))
+            print(f"\n(pglCalibration) Measuring step {self.currentStep+1:>3d}/{self.currentCalibrationData.nSteps}: {value:.4f} = ", end="")
             self.calibrationValueAppend(value)
         else:
             # repeat last value
@@ -496,28 +585,32 @@ class pglCalibration():
         '''
         Append a calibration value to calibrationData
         '''
-        self.calibrationData.appendValue(value, self.saveLocation)
+        self.currentCalibrationData.appendValue(value, self.saveLocation)
+    
     def calibrationValueGet(self, startIndex, endIndex=None):
         '''
         Get calibration value(s) from calibrationData
         '''
         if endIndex is None:
-            return self.calibrationData.getValues(startIndex, None, self.saveLocation)
+            return self.currentCalibrationData.getValues(startIndex, None, self.saveLocation)
         else:
-            return self.calibrationData.getValues(startIndex, endIndex, self.saveLocation)
+            return self.currentCalibrationData.getValues(startIndex, endIndex, self.saveLocation)
+    
     def calibrationMeasurementAppend(self, measurement):
         '''
         Append a calibration measurement to calibrationData
         '''
-        self.calibrationData.appendMeasurement(measurement, self.saveLocation)
+        self.currentCalibrationData.appendMeasurement(measurement, self.saveLocation)
+    
     def calibrationMeasurementGet(self, startIndex, endIndex=None):
         '''
         Get calibration measurement(s) from calibrationData
         '''
         if endIndex is None:
-            return self.calibrationData.getMeasurements(startIndex, None, self.saveLocation)
+            return self.currentCalibrationData.getMeasurements(startIndex, None, self.saveLocation)
         else:
-            return self.calibrationData.getMeasurements(startIndex, endIndex, self.saveLocation)
+            return self.currentCalibrationData.getMeasurements(startIndex, endIndex, self.saveLocation)
+    
     def setDisplay(self):
         '''
         Set the display to the calibration value
@@ -563,88 +656,56 @@ class pglCalibration():
             filename (str, optional): The filename to save the calibration data to.
             If None, a default filename based on the current date will be used.
         '''
+        # check calibration data
+        if not self.checkCalibrationData(self.calibrationData):
+            print("(pglCalibration) Calibration data is not valid. Cannot save.")
+            return None
+        
         if filename is None:
             # make the path be a directory
             settingsPath = pglSettingsManager().getCalibrationsDir()
-            fileStem = datetime.now().strftime("%Y%m%d")
-            filePath = settingsPath / fileStem
+            settingsPath = settingsPath / self.makeValidFilename(self.calibrationData.settingsName)
+            dateStem = datetime.now().strftime("%Y%m%d")
+            filePath = settingsPath / dateStem
         
             # Check if directory exists, if so add time
             if filePath.exists():
-                fileStem = datetime.now().strftime("%Y%m%d_%H%M%S")
-                filePath = settingsPath / fileStem
+                dateStem = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filePath = settingsPath / dateStem
         else:
             filePath = filename
-            fileStem = filename
             
         # Create the directory
         filePath.mkdir(parents=True, exist_ok=True)
         
         # save the calibration data
-        self.calibrationData.save(filePath / fileStem)    
-        print(f"(pglCalibration) Calibration data saved to {filePath / fileStem}")
+        self.calibrationData.save(filePath / "calibration")    
+        if self.checkCalibrationData(self.validationData):
+            self.validationData.save(filePath / "validation")
+        if self.checkCalibrationData(self.gammaValidationData):
+            self.gammaValidationData.save(filePath / "gammaValidation")
+        print(f"(pglCalibration) Calibration data saved to {filePath / dateStem}")
         
-    def apply(self, value):
+    def makeValidFilename(self, nameStr):
+        # replace anything that isn't a letter, number, dash or underscore with an underscore
+        cleanStr = re.sub(r'[^A-Za-z0-9_-]', '_', nameStr)
+        # collapse runs of underscores into one
+        cleanStr = re.sub(r'_+', '_', cleanStr)
+        # strip leading/trailing underscores and dots
+        cleanStr = cleanStr.strip('_.')
+        # guard against an empty result
+        return cleanStr or 'unnamed'
+    def linearizeDisplay(self, value):
         '''
-        Apply the calibration to a given value.
-        '''
-        pass
-    
-    def validate(self, nRepeats=4, nSteps=256):
-        '''
-        Validate the display calibration by applying inverse gamma and re-measuring.
-        
-        Args:
-            nRepeats (int): Number of times to repeat each measurement.
-            nSteps (int): Number of steps in the validation.
+        Apply the calibration to a display to achieve a linear luminance
         '''
         if self.calibrationData is None:
             print("(pglCalibration) No calibration data available. Please run calibrate() first.")
             return None
         
-        # Check that calibration data is complete
-        if not hasattr(self.calibrationData, 'calibrationValues') or \
-        not hasattr(self.calibrationData, 'calibrationMeasurements'):
-            print("(pglCalibration) Calibration data is incomplete. Please run calibrate() first.")
-            return None
-        
-        # Verify the calibration data matches expected size
-        expectedSize = self.calibrationData.nRepeats * self.calibrationData.nSteps
-        if len(self.calibrationData.calibrationValues) != expectedSize or \
-        len(self.calibrationData.calibrationMeasurements) != expectedSize:
-            print(f"(pglCalibration) Calibration data size mismatch. Expected {expectedSize}, got {len(self.calibrationData.calibrationValues)}")
-            return None
-        
-        print("(pglCalibration) Starting validation with inverse gamma correction...")
-        
-        # Store the original calibration data
-        originalCalibrationData = self.calibrationData
-        
-        # Calculate inverse gamma table from calibration measurements
-        inverseGammaTable = self.calculateInverseGamma(originalCalibrationData)
-        
-        # Run calibration with the inverse gamma table
-        self.calibrate(originalCalibrationData.settingsName, 
-                    nRepeats=nRepeats, 
-                    nSteps=nSteps,
-                    validate=True,
-                    inverseGammaTable=inverseGammaTable)
-        
-        # Store validation results
-        validationData = self.calibrationData
-        
-        # Restore original calibration data
-        self.calibrationData = originalCalibrationData
-        
-        # Store validation results in the calibration data
-        self.calibrationData.validationData = validationData
-        self.calibrationData.validationGammaTable = inverseGammaTable
-        
-        # Display comparison
-        self.display(validation=True)
-        
-        return validationData
-    def calculateInverseGamma(self, calibrationData):
+        # get the inverse calibration table
+    
+    def calculateInverseGamma(self, calibrationData, gamma = 1.0):
         '''
         Calculate inverse gamma table from calibration measurements.
         
@@ -664,17 +725,17 @@ class pglCalibration():
         calValues = np.array(calibrationData.calibrationValues).reshape(nSteps, nRepeats)
         calMeasurements = np.array(calibrationData.calibrationMeasurements).reshape(nSteps, nRepeats)
         
-        avgValues = np.mean(calValues, axis=1)
-        avgMeasurements = np.mean(calMeasurements, axis=1)
+        medianValues = np.median(calValues, axis=1)
+        medianMeasurements = np.median(calMeasurements, axis=1)
         
         # Normalize measurements to 0-1 range
-        minLum = np.min(avgMeasurements)
-        maxLum = np.max(avgMeasurements)
-        normalizedMeasurements = (avgMeasurements - minLum) / (maxLum - minLum)
+        minLum = np.min(medianMeasurements)
+        maxLum = np.max(medianMeasurements)
+        normalizedMeasurements = (medianMeasurements - minLum) / (maxLum - minLum)
         
         # Create interpolation function: maps desired linear output to required input
         # We want: given a desired output level, what input do we need?
-        interpFunc = interp1d(normalizedMeasurements, avgValues, 
+        interpFunc = interp1d(normalizedMeasurements, medianValues, 
                             kind='cubic', 
                             bounds_error=False, 
                             fill_value='extrapolate')
@@ -682,7 +743,8 @@ class pglCalibration():
         # Create inverse gamma table
         gammaTableSize = calibrationData.gammaTableSize
         linearOutput = np.linspace(0, 1, gammaTableSize)
-        inverseGamma = interpFunc(linearOutput)
+        gammaOutput = np.power(linearOutput, gamma)
+        inverseGamma = interpFunc(gammaOutput)
         
         # Clip to valid range [0, 1] and convert to float32
         inverseGamma = np.clip(inverseGamma, 0, 1).astype(np.float32)
@@ -690,7 +752,6 @@ class pglCalibration():
         # For RGB, use the same correction for all channels (can be modified for per-channel)
         return (inverseGamma, inverseGamma.copy(), inverseGamma.copy())
     
-
 # Calibration settings, subclass of pglSettings to inherit load/save functionality
 class pglCalibrationData(HasTraits, pglSerialize):
     
@@ -706,7 +767,65 @@ class pglCalibrationData(HasTraits, pglSerialize):
     initMeasurements = Instance(np.ndarray, allow_none=True, help="Measured luminance values corresponding to initValues calibration")
     calibrationValues = Instance(np.ndarray, allow_none=True, help="Display values used in calibration")
     calibrationMeasurements = Instance(np.ndarray, allow_none=True, help="Measured luminance values from calibration")
-      
+    minLuminance = Float(-1.0, help="Minimum measured luminance from calibration")
+    maxLuminance = Float(-1.0, help="Maximum measured luminance from calibration")
+    
+    def print(self, verbose=False):
+        '''
+        print the calibration data in a readable format.
+        
+        Args:
+            verbose (bool): If True, print detailed information.
+        '''   
+        print("="*80)
+        print (f"Calibration Data for settings: {self.settingsName}")
+        if self.gammaTableSize > 0:
+            print (f"Gamma Table Size: {self.gammaTableSize}")
+        print (f"Creation Date and Time: {self.creationDateTime}")
+        print (f"Number of Repeats: {self.nRepeats} number of Steps: {self.nSteps}")
+        if verbose:
+            values, measurements, minMeasurements, maxMeasurements = self.getMedianMeasurements()
+            for iStep in range(self.nSteps):
+                print(f"Step {iStep:3d}/{self.nSteps}: {values[iStep]:<5.3f} = median: {measurements[iStep]:<7.3f} (min: {minMeasurements[iStep]:<7.3f}, max: {maxMeasurements[iStep]:<7.3f}, percent difference: {((maxMeasurements[iStep]-minMeasurements[iStep])/measurements[iStep]*100):<5.3f}%)")
+            # compute max difference between max and min in percentage
+            maxDiff = np.max(np.abs(maxMeasurements - minMeasurements)/measurements * 100)
+            print(f"Maximum difference between max and min measurements: {maxDiff:.3f}%")
+        
+    def display(self, gamma=None):
+        '''
+        display graph of calibration data
+        
+        Args:
+            gamma (float, optional): If provided, display the ideal gamma curve (1.0 or 2.2 or whatever) for comparison.
+        '''
+        if self.calibrationValues is None or self.calibrationMeasurements is None:
+            print("(pglCalibrationData) No calibration data to display.")
+            return
+        plt.figure(figsize=(10, 6))
+        # plot raw data points
+        plt.plot(self.calibrationValues, self.calibrationMeasurements, '.')
+        # plot median
+        values, measurements, minMeasurements, maxMeasurements = self.getMedianMeasurements()
+        if gamma is not None:
+            # plot points without line
+            plt.plot(values, measurements, 'o', label='Median', color='black', markeredgecolor='white', markersize=8)
+            # plot ideal gamma curve
+            idealMeasurements = np.power(values, gamma)
+            idealMeasurements = idealMeasurements * (self.maxLuminance - self.minLuminance) + self.minLuminance
+            plt.plot(values, idealMeasurements, 'r--', label=f'Ideal Gamma {gamma}')        
+        else:
+            plt.plot(values, measurements, 'o-', label='Median', color='black', markeredgecolor='white', markersize=8)
+        plt.legend()
+        plt.xlabel("Display Value")
+        plt.ylabel("Measured Luminance")
+        if gamma is None:
+            plt.title(f"Settings: {self.settingsName} nRepeats: {self.nRepeats} nSteps: {self.nSteps}\nmin = {self.minLuminance:.2f}, max = {self.maxLuminance:.2f}\nCalibration data")
+        else:
+            plt.title(f"Settings: {self.settingsName} nRepeats: {self.nRepeats} nSteps: {self.nSteps}\nmin = {self.minLuminance:.2f}, max = {self.maxLuminance:.2f}\nValidation for gamma: {gamma if gamma is not None else 'N/A'}")
+            
+        plt.grid(True)
+        plt.show()
+        
     def appendValue(self, value, mode="calibration"):
         '''
         Append a calibration value.
@@ -750,6 +869,36 @@ class pglCalibrationData(HasTraits, pglSerialize):
                 return self.calibrationValues[startIndex]
             else:
                 return self.calibrationValues[startIndex:endIndex]
+            
+    def getMedianMeasurements(self):
+        '''
+        Get the median of the calibration measurements for each step.
+        
+        Returns:
+            tuple: A tuple containing four numpy arrays: (medianValues, medianMeasurements, min_measurements, max_measurements)
+        '''
+        
+        if self.calibrationMeasurements is None:
+            return None
+        
+        values = np.zeros(self.nSteps)
+        measurements = np.zeros(self.nSteps)
+        minMeasurement = np.zeros(self.nSteps)
+        maxMeasurement = np.zeros(self.nSteps)
+        for iStep in range(self.nSteps):
+            # get value and measurements
+            value = self.calibrationValues[iStep*self.nRepeats:(iStep+1)*self.nRepeats] if self.calibrationValues is not None else None
+            measurement = self.calibrationMeasurements[iStep*self.nRepeats:(iStep+1)*self.nRepeats] if self.calibrationMeasurements is not None else None
+            # compute median if both value and measurement are available
+            if value is not None and measurement is not None:
+                values[iStep] = np.median(value)
+                measurements[iStep] = np.median(measurement)
+                # compute min and max
+                minMeasurement[iStep] = np.min(measurement)
+                maxMeasurement[iStep] = np.max(measurement)
+        
+        return (values, measurements, minMeasurement, maxMeasurement)
+
     def getMeasurements(self, startIndex, endIndex=None,mode="calibration"):
         '''
         Get calibration measurement(s).
