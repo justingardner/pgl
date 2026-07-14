@@ -309,7 +309,20 @@ class pglDraw:
         Args:
             vertices(np.array): n x 4 x 2 matrix of vertices. You can omit
             the nth dimension and just pass a 4x2 matrix for one quad
-            color:
+            color: color of quad
+            units: units of vertices, either "deg" or "pix" (default is "deg")
+        e.g.:
+            # draw a quad half the dimensions of the screen
+            w = self.screenWidth.deg/2
+            h = self.screenHeight.deg/2
+            vertices = np.array([
+                [-w/2, -h/2],   # bottom-left
+                [w/2, -h/2],   # bottom-right
+                [w/2, h/2],   # top-right
+                [-w/2, h/2],   # top-left
+            ])
+        self.quad(vertices, color=[0.2, 0.7, 0.8])
+
         '''
         
         # get the vertices as an n x 4 x 2 matrix
