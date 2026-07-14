@@ -476,7 +476,7 @@ class pglBase:
                 break
 
             # print what we got
-            if self.verbose:
+            if self.verbose>1:
                 print(f"(pgl:getInfo) {key}: {info[key]}")
                 
         # get command results

@@ -7,7 +7,7 @@ from .pglBatch import pglBatch
 from .pglImage import pglImage
 from .pglStimuli import pglStimuli
 from .pglTimestamp import pglTimestamp
-from .pglDevice import pglDevice, pglDevices
+from .pglDevice import pglDevice, pglDevices, pglDigitalIODevice
 from .pglKeyboardMouse import pglKeyboardMouse, pglEventKeyboard, pglKeyBuffer
 from .pglEvent import pglEvent, pglEvents
 from .pglCommandReplayer import pglCommandReplayer
@@ -17,15 +17,16 @@ from .pglParameter import pglParameter, pglParameterBlock, pglParameterNestedBlo
 from .pglStaircase import pglStaircase, pglStaircaseUpDown
 from .pglTasks import pglFixationTaskLeftRight, pglBarTask
 from ._pglComm import pglSerial
-from .pglCalibration import pglCalibration, pglCalibrationDeviceMinolta, pglCalibrationData, pglCalibrationDeviceDebug
+from .pglCalibration import pglDisplayCalibration, pglLuminanceCalibrationDeviceMinolta, pglDisplayLuminanceCalibrationData, pglLuminanceCalibrationDeviceDebug
 from .pglGammaTable import pglGammaTable 
 from .pglSettings import pglSettingsEditable, pglMainSettingsManager
+from .pglEventListener import pglEventListener
+from .pglEyeTracker import pglEyeTracker
+
 # Device specific imports (eye trackers, etc.)
 from .pglVPixx import pglProPixx, pglDataPixx
-from .pglEyeTracker import pglEyeTracker
 from .pglTrackPixx import pglTrackPixx3
 from .pglLabJack import pglLabJack
-from .pglEventListener import pglEventListener
 from .pglEyelink import pglEyelinkData
 from .pglVWFA import pglVWFATask
 

@@ -14,10 +14,10 @@ import threading
 import time
 import numpy as np
 from pgl import pglTimestamp
-from pgl import pglDevice
+from pgl import pglDigitalIODevice
 import matplotlib.pyplot as plt
 
-class pglLabJack(pglDevice):
+class pglLabJack(pglDigitalIODevice):
     def __init__(self):
         self.digitalOutputConfigured = False
         super().__init__(deviceType="LabJack")

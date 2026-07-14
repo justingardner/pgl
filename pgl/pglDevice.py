@@ -714,3 +714,130 @@ class pglEventKeyboard(pglEvent):
         if self.alt: modifierStr += "Alt "
         if self.cmd: modifierStr += "Cmd "
         return f"(pglEventKeyboard) Key: {self.keyChar}, KeyCode: {self.keyCode}, Timestamp: {self.timestamp}, Modifiers: {modifierStr.strip()}, Event Type: {self.eventType}"
+
+################################################################
+#  Abstract base class defining the interface for
+#  digital IO devices. Concrete devices (e.g.,
+#  pglLabJack) should inherit from this and implement
+#  the stubbed methods.
+################################################################
+class pglDigitalIODevice(pglDevice):
+    '''
+    Abstract base class for digital IO devices.
+
+    Any concrete digital IO device (e.g., a LabJack, an Arduino, a
+    National Instruments DAQ, etc.) should inherit from this class and
+    implement the stubbed methods below. This defines the common
+    interface that the rest of pgl can rely on regardless of the
+    underlying hardware.
+
+    Subclasses are expected to:
+        - Establish/close the hardware connection (in __init__ / stop)
+        - Set self.digitalOutputConfigured appropriately
+        - Implement all methods marked as NotImplementedError below
+    '''
+
+    def __init__(self, deviceType="DigitalIODevice"):
+        # whether a digital output channel has been configured
+        self.digitalOutputConfigured = False
+        super().__init__(deviceType=deviceType)
+
+    def __repr__(self):
+        return f"<pglDigitalIODevice deviceType={getattr(self, 'deviceType', 'Unknown')}>"
+
+    ################################################################
+    # Digital output interface
+    ################################################################
+    def setupDigitalOutput(self, channel=0):
+        '''
+        Configure a digital output channel.
+
+        Implementations should convert the channel argument into the
+        hardware-specific representation, set the channel as an output,
+        initialize it to a known state (typically LOW), and set
+        self.digitalOutputConfigured = True on success (False on failure).
+
+        Args:
+            channel (int or str): Digital channel number or name
+        '''
+        raise NotImplementedError("(pglDigitalIODevice:setupDigitalOutput) Subclass must implement setupDigitalOutput().")
+
+    def digitalOutput(self, state, pulseLen=None):
+        '''
+        Set the digital output state immediately.
+
+        Implementations should check self.digitalOutputConfigured first.
+        If pulseLen is provided, the output should return to the opposite
+        state after pulseLen milliseconds.
+
+        Args:
+            state (bool): True for HIGH, False for LOW
+            pulseLen (float or None): Pulse length in milliseconds
+
+        Returns:
+            timestamp (float or None): Timestamp when output was set,
+                                       or None on error.
+        '''
+        raise NotImplementedError("(pglDigitalIODevice:digitalOutput) Subclass must implement digitalOutput().")
+
+    def digitalOutputAtTime(self, targetTime, state, pulseLen=None):
+        '''
+        Set the digital output state at a specified future time.
+
+        Implementations should check self.digitalOutputConfigured first
+        and validate that targetTime is in the future.
+
+        Args:
+            targetTime (float): Timestamp (in seconds) when the pulse
+                                should be delivered.
+            state (bool): True for HIGH, False for LOW
+            pulseLen (float or None): Pulse length in milliseconds
+
+        Returns:
+            bool: True if the pulse was successfully scheduled, False otherwise
+        '''
+        raise NotImplementedError("(pglDigitalIODevice:digitalOutputAtTime) Subclass must implement digitalOutputAtTime().")
+
+    ################################################################
+    # Analog input interface
+    ################################################################
+    def startAnalogRead(self, duration=2, channels=[0], scanRate=1000, scansPerRead=1000, range=10.0):
+        '''
+        Start analog input reading from specified channels.
+
+        Args:
+            duration (float): Duration of recording in seconds
+            channels (list): List of channel numbers or names
+            scanRate (int): Sampling rate in Hz
+            scansPerRead (int): Number of scans per read operation
+            range (float): Voltage range for analog inputs
+        '''
+        raise NotImplementedError("(pglDigitalIODevice:startAnalogRead) Subclass must implement startAnalogRead().")
+
+    def stopAnalogRead(self, waitToFinish=False, doNotTruncate=False):
+        '''
+        Stop the analog reading and return time and data arrays.
+
+        Args:
+            waitToFinish (bool): If True, wait for acquisition to finish.
+            doNotTruncate (bool): If True, do not truncate to exact sample count.
+
+        Returns:
+            tuple: (time, data) arrays, or (None, None) on error.
+        '''
+        raise NotImplementedError("(pglDigitalIODevice:stopAnalogRead) Subclass must implement stopAnalogRead().")
+
+    ################################################################
+    # Lifecycle interface
+    ################################################################
+    def start(self):
+        '''
+        Start the device.
+        '''
+        raise NotImplementedError("(pglDigitalIODevice:start) Subclass must implement start().")
+
+    def stop(self):
+        '''
+        Stop the device.
+        '''
+        raise NotImplementedError("(pglDigitalIODevice:stop) Subclass must implement stop().")
