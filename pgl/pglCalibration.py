@@ -371,6 +371,10 @@ class pglCalibration():
             gpu = next(iter(self.pgl.gpuInfo.values()))
             displays = gpu.get('Displays', [])
             self.currentCalibrationData.displayInfo = displays[displayNumber]
+            
+            # get info from pgl
+            self.currentCalibrationData.metalInfo = self.pgl.info()
+            
         except Exception as ex:
             print(f"(pglCalibration) Warning: Could not get display info: {ex}")
         
@@ -662,23 +666,6 @@ class pglCalibration():
             print("(pglCalibration) Calibration data is not valid. Cannot save.")
             return None
         
-        if filename is None:
-            # make the path be a directory
-            settingsPath = pglSettingsManager().getCalibrationsDir()
-            settingsPath = settingsPath / self.pgl.makeValidFilename(self.calibrationData.settingsName)
-            dateStem = datetime.now().strftime("%Y%m%d")
-            filePath = settingsPath / dateStem
-        
-            # Check if directory exists, if so add time
-            if filePath.exists():
-                dateStem = datetime.now().strftime("%Y%m%d_%H%M%S")
-                filePath = settingsPath / dateStem
-        else:
-            filePath = filename
-            
-        # Create the directory
-        filePath.mkdir(parents=True, exist_ok=True)
-        
         # save the calibration data
         self.calibrationData.save(filePath / "calibration")    
         if self.checkCalibrationData(self.validationData):
@@ -702,7 +689,8 @@ class pglCalibrationData(HasTraits, pglSerialize):
     
     settingsName = Unicode("Default", help="Settings name used to open display")
     displayInfo = Dict(help="Display information at time of calibration")
-    settings = Instance(pglSettings, allow_none=True, help="Settings used during calibration")    
+    settings = Instance(pglSettings, allow_none=True, help="Settings used during calibration") 
+    metalInfo = Dict(help="PGL info including display info such as UUID, serial number, and other information at time of calibration")   
     gammaTableSize = Int(-1, help="Size of the gamma table at time of calibration")
     gammaTable = Tuple(Instance(np.ndarray), Instance(np.ndarray), Instance(np.ndarray), allow_none=True, help="Gamma table at time of calibration")
     creationDateTime = Instance(datetime, default_value=datetime.now(), help="Date and time of calibration creation")
@@ -715,6 +703,159 @@ class pglCalibrationData(HasTraits, pglSerialize):
     minLuminance = Float(-1.0, help="Minimum measured luminance from calibration")
     maxLuminance = Float(-1.0, help="Maximum measured luminance from calibration")
     
+    def save(self, filename=None, filepath=None):
+        '''
+        save
+        
+        Args:
+            filename: If none defaults to calibration.json
+            filepath: If none defaults to calibrationDir / display name / data
+        '''
+        # get the displayName
+        displayName = self.displayInfo.get("DisplayName",self.settingsName)
+
+        # get a filepath
+        filepath = self.getFilepath(filepath, displayName, makePath=True)
+        
+        # get the filename
+        if filename is None:
+            filename = "calibration"
+                           
+        # call parent to save
+        super().save(filepath / filename)
+    
+    @classmethod
+    def load(cls, displayName, filename=None, filepath=None, date=None):
+        '''
+        load
+        
+        Args:
+            displayName: displayName to load
+            filename: If none defaults to calibration.json
+            filepath: If none defaults to calibrationDir / display name / data
+        '''
+        # get a filepath
+        filepath = cls.getFilepath(filepath, displayName, makePath=False)
+        if filepath is None:
+            return
+        filepath = cls.chooseCalibrationDir(filepath, date)
+        
+        # get the filename
+        if filename is None:
+            filename = "calibration"
+           
+        # call super load to instantiate the object and load it                
+        return super(pglCalibrationData, cls).load(filepath / filename)
+    
+    @staticmethod
+    def chooseCalibrationDir(filepath, date=None):
+        '''
+        List the available calibration directories for a display and let the
+        user choose one. Returns the chosen directory Path, or None.
+
+        Args:
+            displayName: the display name whose calibrations to list
+            filepath: base calibration path; if None uses the default
+            date: optional filter (str "YYYYMMDD", datetime, or date)
+        '''
+        # get all directories
+        dirList = [d for d in filepath.iterdir() if d.is_dir()]
+        
+        # filter by date if requested
+        if date is not None:
+            if isinstance(date, str):
+                dateStr = date
+            elif isinstance(date, datetime):
+                dateStr = date.strftime("%Y%m%d")
+            elif isinstance(date, Date):
+                dateStr = date.strftime("%Y%m%d")
+            else:
+                raise TypeError("date must be a string, datetime.date, datetime.datetime, or None")
+            dirList = [d for d in dirList if d.name.startswith(dateStr)]
+
+        # sort the directory list
+        dirList = sorted(dirList, key=lambda d: d.name)
+
+        # nothing to show
+        if len(dirList) == 0:
+            print(f"(pglCalibrationData:chooseCalibrationDir) ❌ No calibration directories found in: {filepath}")
+            return None
+
+        # print header
+        print(f"(pglCalibration:chooseCalibrationDir) Calibration directory: {filepath}")
+
+        # print each directory
+        for i, d in enumerate(dirList, start=1):
+            try:
+                # try to parse the typical timestamp name
+                dt = datetime.strptime(d.name, "%Y%m%d_%H%M%S")
+                printName = dt.strftime("%A %B %-d, %Y %-I:%M%p")
+
+                # try to read a calibration file for extra info
+                calibrationFilename = calibrationDir / d.name / "calibration.json"
+                if calibrationFilename.exists():
+                    try:
+                        calibrationData = pglSerialize.load(calibrationFilename)
+                        # add some useful summary info
+                        printName += f" | nSteps: {calibrationData.nSteps}"
+                        printName += f" | nRepeats: {calibrationData.nRepeats}"
+                        printName += f" | maxLum: {calibrationData.maxLuminance:.2f}"
+                    except:
+                        pass
+
+                # add the raw folder name
+                printName = f"{printName} ({d.name})"
+            except:
+                # not a typical name, just show it
+                printName = d.name
+
+            print(f"{i}. {printName}", flush=True)
+
+        # ask the user to choose
+        print("\nSelect a directory number: ", flush=True)
+        choice = int(input())
+        if choice < 1 or choice > len(dirList):
+            print(f"(pglCalibration:chooseCalibrationDir) ❌ Invalid choice: {choice}")
+            return None
+
+        # return the chosen directory
+        chosenDir = dirList[choice - 1]
+        print(f"(pglCalibration:chooseCalibrationDir) Selected: {chosenDir}")
+        return chosenDir
+    
+    @staticmethod
+    def getFilepath(filepath, displayName, makePath=True):
+        '''
+        Gets default filepath
+        '''
+        if filepath is None:
+            from pgl import pgl
+            # make the path be a directory
+            settingsPath = pglSettingsManager().getCalibrationsDir()
+            settingsPath = settingsPath / pgl.makeValidFilename(displayName)
+        
+            # Check if directory exists, if so add time
+            if makePath:
+                # add the data
+                dateStem = datetime.now().strftime("%Y%m%d")
+                filepath = settingsPath / dateStem
+                if filepath.exists():
+                    dateStem = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    filepath = settingsPath / dateStem
+            else:
+                filepath = settingsPath
+
+        # Create the directory
+        if makePath:
+            filepath.mkdir(parents=True, exist_ok=True)
+        else:
+            # check that the path exists
+            if not filepath.exists() or not filepath.is_dir():
+                print(f"(pglCalibrationData:getFilepath) ❌ Could not find calibration directory: {filepath}")
+                return None
+        
+        return(filepath)
+        
     def print(self, verbose=False):
         '''
         print the calibration data in a readable format.

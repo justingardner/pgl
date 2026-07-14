@@ -442,7 +442,7 @@ class pglBase:
             info: dict of information about the mglMetal application
         '''
         # make sure that a screen is open
-        if self.s is None: 
+        if self.isOpen() is False or self.s is None: 
             print(f"(pglBase:getInfo) ❌ No screen is open")
             return {}
 
@@ -877,7 +877,8 @@ class pglBase:
     ###################################
     # make valid filename
     ###################################
-    def makeValidFilename(self, nameStr):
+    @staticmethod
+    def makeValidFilename(nameStr):
         
         # replace anything that isn't a letter, number, dash or underscore with an underscore
         cleanStr = re.sub(r'[^A-Za-z0-9_-]', '_', nameStr)
