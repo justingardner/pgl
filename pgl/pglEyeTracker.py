@@ -221,3 +221,20 @@ class pglEyeTrackerData():
         display plots of data
         """
         pass
+
+    def alignTimeSeriesToTrialEvents(self, trialEvents):
+        """
+        Align the time series data by trial events.
+        
+        Args:
+            trialEvents (list of pglEventEyeTrackerTrial): The list of trial events to align to.
+        """
+        # check if trialEvents is a list of pglEventEyeTrackerTrial
+        if not isinstance(trialEvents, list) or not all(isinstance(e, pglEventEyeTrackerTrial) for e in trialEvents):
+            raise ValueError("(pglEyeTrackerData:alignTimeSeriesToTrialEvents) ❌ trialEvents must be a list of pglEventEyeTrackerTrial instances.")
+
+
+        # check if timeSeries data exists
+        if self.timeSeries is None:
+            print("(pglEyeTrackerData:alignTimeSeriesToTrialEvents) ❌ No time series data to align.")
+            return

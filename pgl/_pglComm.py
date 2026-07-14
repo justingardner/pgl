@@ -177,6 +177,47 @@ class _pglComm:
         """
         return(self.commandNames.get(commandValue))
     
+    def readCommand(self):
+        """
+        Read a command code from the socket. A command code is a single
+        uint16 value (matching the Swift mglCommandCode enum, which has an
+        underlying type of uint16_t) written by writeCommand.
+
+        Returns:
+            str: The command name (e.g. "mglSendString"), or None if the
+                 value could not be read or is not a known command. The raw
+                 numeric value is available via self.getCommandName if needed.
+        """
+        if not self.s:
+            print("(pgl:_pglComm:readCommandCode) ❌ Not connected to socket")
+            return None
+
+        try:
+            # read the raw command value as a uint16
+            commandValue = self.read(np.uint16)
+            if commandValue is None:
+                print("(pgl:_pglComm:readCommandCode) ❌ Error reading command code")
+                return None
+            # convert to a plain python int so it can be used as a dict key
+            commandValue = int(commandValue)
+
+            # look up the command name from the value
+            commandName = self.getCommandName(commandValue)
+            if commandName is None:
+                print(f"(pgl:_pglComm:readCommandCode) ❌ Unknown command code: {commandValue}")
+                # still return the raw value so caller can decide what to do
+                return commandValue
+
+            # display command if high verbosity is set
+            if self.verbose > 1:
+                print(f"(pgl:_pglComm:readCommandCode) Read command: {commandName} (value: {commandValue})")
+
+            return commandName
+
+        except Exception as e:
+            print("(pgl:_pglComm:readCommandCode) ❌ Error reading command code:", e)
+            return None
+        
     def read(self, dataType, numRows=1, numCols=1, numSlices=1):
         """
         Read a message from the socket.
@@ -199,7 +240,50 @@ class _pglComm:
         except Exception as e:
             print("(pgl:_pglComm:read) ❌ Error reading message:", e)
             return None
+    
+    def readString(self):
+        """
+        Read a string from the socket that was written using the Swift
+        writeString function. That function first sends a uint16 with the
+        number of utf-16 code units, followed by the string encoded as
+        utf-16 (little endian) code units.
 
+        Returns:
+            str: The decoded string, or None if an error occurs.
+        """
+        if not self.s:
+            print("(pgl:_pglComm:readString) ❌ Not connected to socket")
+            return None
+
+        try:
+            # read the length prefix (number of utf-16 code units) as uint16
+            codeUnitCount = self.read(np.uint16)
+            if codeUnitCount is None:
+                print("(pgl:_pglComm:readString) ❌ Error reading string length")
+                return None
+            # convert to a plain python int for byte math
+            codeUnitCount = int(codeUnitCount)
+
+            # each utf-16 code unit is 2 bytes
+            numBytes = codeUnitCount * 2
+
+            # handle empty string
+            if numBytes == 0:
+                return ""
+
+            # read the raw utf-16 bytes
+            packed = self.recvBlocking(numBytes)
+            if len(packed) != numBytes:
+                print(f"(pgl:_pglComm:readString) ❌ Expected {numBytes} bytes, but received {len(packed)} bytes")
+                return None
+
+            # decode as little endian utf-16
+            return bytes(packed).decode('utf-16le')
+
+        except Exception as e:
+            print("(pgl:_pglComm:readString) ❌ Error reading string:", e)
+            return None
+    
     def readArray(self, dataType):
         """
         Read a message from the socket.

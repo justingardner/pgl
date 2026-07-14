@@ -28,6 +28,7 @@ import threading
 from pathlib import Path
 from dataclasses import dataclass, field
 from .pglSerialize import pglSerialize
+import re
 
 #############
 # Main class
@@ -429,6 +430,60 @@ class pglBase:
         self.screenHeight.pix = int(windowLocation.get('screenHeight', 0))
 
         return windowLocation
+    ################################################################
+    # getInfo
+    ################################################################
+    def info(self):
+        '''
+        Get information about the mglMetal application
+        
+        Returns:
+        
+            info: dict of information about the mglMetal application
+        '''
+        # make sure that a screen is open
+        if self.s is None: 
+            print(f"(pglBase:getInfo) ❌ No screen is open")
+            return {}
+
+        # send command
+        self.s.writeCommand("mglInfo")
+        ack = self.s.readAck()
+        
+        info = {}
+        while True:
+            command = self.s.readCommand()      # key command
+            if command == "mglSendFinished":
+                break
+            
+            # the key is always a string
+            if command != "mglSendString":
+                print(f"(pgl:getInfo) ❌ Unexpected key command: {command}")
+                break
+            key = self.s.readString()
+
+            # read the value command, then dispatch on its type
+            valueCommand = self.s.readCommand()
+
+            if valueCommand == "mglSendString":
+                info[key] = self.s.readString()
+            elif valueCommand == "mglSendDouble":
+                info[key] = self.s.read(np.double)
+            elif valueCommand == "mglSendDoubleArray":
+                info[key] = self.s.readArray(np.double)
+            else:
+                print(f"(pgl:getInfo) ❌ Unexpected value command: {valueCommand}")
+                break
+
+            # print what we got
+            if self.verbose:
+                print(f"(pgl:getInfo) {key}: {info[key]}")
+                
+        # get command results
+        self.commandResults = self.s.readCommandResults(ack)  
+        
+        # return info
+        return(info)
 
     ################################################################
     # fullScreen
@@ -820,49 +875,59 @@ class pglBase:
             print(f" {str} ".center(len, fillChar))
 
     ###################################
+    # make valid filename
+    ###################################
+    def makeValidFilename(self, nameStr):
+        
+        # replace anything that isn't a letter, number, dash or underscore with an underscore
+        cleanStr = re.sub(r'[^A-Za-z0-9_-]', '_', nameStr)
+        
+        # collapse runs of underscores into one
+        cleanStr = re.sub(r'_+', '_', cleanStr)
+        
+        # strip leading/trailing underscores and dots
+        cleanStr = cleanStr.strip('_.')
+        
+        # guard against an empty result
+        return cleanStr or 'unnamed'
+
+    ###################################
     # get the name of the mglMetalApp
     ###################################
     def getMetalAppName(self, stable=False, mglMetalPath=None):
         '''
-        Get the name of the mglMetal application. This will search in the directory where pgl is installed
-        as well as the Xcode DerivedData directory where new versions get compiled. If there is a newer
-        version available, it will be used instead of the stable version (this is helpful for debugging). You
-        can avoid this behavior and always use the stable version by setting stable here, or in open set
-        forceStableMGLMetal=True.
-
-        Args:
-            stable (bool): Whether to use the stable version of the app.
-            mglMetalPath (str, optional): The file path to the mglMetal application, if you want to force a specific path   
+        Get the mglMetal app. Picks the most recently compiled build.
         '''
-        # if forcing a path, just return that
         if mglMetalPath is not None: return mglMetalPath
-    
-        # paths to stable version and derivedData for recently compiled versions
+
         stableAppPath = os.path.join(self.pglDir, "metal/mglMetal.app")
         derivedDataDirectory = os.path.join(self.homeDir, "Library/Developer/Xcode/DerivedData")
-
-        # If runStable is True, always return the stable app path
         if stable: return stableAppPath
 
         latestBuildPath = None
         latestBuildTime = 0
-
-        # Search for all mglMetal.app instances in DerivedData
         for dirPath, dirNames, fileNames in os.walk(derivedDataDirectory):
+            # skip Xcode indexing byproducts, they are not launchable
+            if "Index.noindex" in dirPath:
+                continue
             for dirName in dirNames:
-                if dirName.endswith(".app") and "mglMetal" in dirName:
-                    appPath = os.path.join(dirPath, dirName)
-                    modificationTime = os.path.getmtime(appPath)
-                    if modificationTime > latestBuildTime:
-                        latestBuildTime = modificationTime
-                        latestBuildPath = appPath
+                # must be exactly mglMetal.app (not the UI test runner)
+                if dirName != "mglMetal.app":
+                    continue
+                appPath = os.path.join(dirPath, dirName)
+                # stat the inner binary for a reliable build time
+                binaryPath = os.path.join(appPath, "Contents/MacOS/mglMetal")
+                statPath = binaryPath if os.path.exists(binaryPath) else appPath
+                modificationTime = os.path.getmtime(statPath)
+                if modificationTime > latestBuildTime:
+                    latestBuildTime = modificationTime
+                    latestBuildPath = appPath
 
-        # Determine which app to return
         if latestBuildPath:
+            if self.verbose > 0:
+                print(f"(pglBase:getMetalAppName) Using latest build: {latestBuildPath}")
             return latestBuildPath
-        else:
-            return stableAppPath
-        
+        return stableAppPath
     #################################################################
     # validate which screen
     #################################################################

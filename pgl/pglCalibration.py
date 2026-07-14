@@ -8,8 +8,6 @@
 #############
 # Import modules
 #############
-import re
-
 import numpy as np
 import matplotlib.pyplot as plt
 from ._pglComm import pglSerial
@@ -21,6 +19,9 @@ from .pglExperiment import pglExperiment
 from tqdm.notebook import tqdm
 from traitlets import HasTraits
 from .pglSerialize import pglSerialize
+from scipy.interpolate import interp1d
+        
+
 
 ##########################
 # Calibration device class
@@ -291,7 +292,7 @@ class pglCalibration():
             nSteps = self.calibrationData.nSteps
             
         # Calculate inverse gamma table from calibration measurements
-        inverseGammaTable = self.calculateInverseGamma(self.calibrationData, gamma=gamma)
+        inverseGammaTable = self.calibrationData.calculateInverseGamma(gamma=gamma)
         
         # Run calibration with the inverse gamma table
         validationData = self._calibrate(
@@ -664,7 +665,7 @@ class pglCalibration():
         if filename is None:
             # make the path be a directory
             settingsPath = pglSettingsManager().getCalibrationsDir()
-            settingsPath = settingsPath / self.makeValidFilename(self.calibrationData.settingsName)
+            settingsPath = settingsPath / self.pgl.makeValidFilename(self.calibrationData.settingsName)
             dateStem = datetime.now().strftime("%Y%m%d")
             filePath = settingsPath / dateStem
         
@@ -686,15 +687,6 @@ class pglCalibration():
             self.gammaValidationData.save(filePath / "gammaValidation")
         print(f"(pglCalibration) Calibration data saved to {filePath / dateStem}")
         
-    def makeValidFilename(self, nameStr):
-        # replace anything that isn't a letter, number, dash or underscore with an underscore
-        cleanStr = re.sub(r'[^A-Za-z0-9_-]', '_', nameStr)
-        # collapse runs of underscores into one
-        cleanStr = re.sub(r'_+', '_', cleanStr)
-        # strip leading/trailing underscores and dots
-        cleanStr = cleanStr.strip('_.')
-        # guard against an empty result
-        return cleanStr or 'unnamed'
     def linearizeDisplay(self, value):
         '''
         Apply the calibration to a display to achieve a linear luminance
@@ -704,53 +696,6 @@ class pglCalibration():
             return None
         
         # get the inverse calibration table
-    
-    def calculateInverseGamma(self, calibrationData, gamma = 1.0):
-        '''
-        Calculate inverse gamma table from calibration measurements.
-        
-        Args:
-            calibrationData: The calibration data containing measurements.
-        
-        Returns:
-            Tuple of three numpy arrays (R, G, B) for the inverse gamma table.
-        '''
-        from scipy.interpolate import interp1d
-        
-        # Average the repeated measurements for each step
-        nSteps = calibrationData.nSteps
-        nRepeats = calibrationData.nRepeats
-        
-        # Reshape and average
-        calValues = np.array(calibrationData.calibrationValues).reshape(nSteps, nRepeats)
-        calMeasurements = np.array(calibrationData.calibrationMeasurements).reshape(nSteps, nRepeats)
-        
-        medianValues = np.median(calValues, axis=1)
-        medianMeasurements = np.median(calMeasurements, axis=1)
-        
-        # Normalize measurements to 0-1 range
-        minLum = np.min(medianMeasurements)
-        maxLum = np.max(medianMeasurements)
-        normalizedMeasurements = (medianMeasurements - minLum) / (maxLum - minLum)
-        
-        # Create interpolation function: maps desired linear output to required input
-        # We want: given a desired output level, what input do we need?
-        interpFunc = interp1d(normalizedMeasurements, medianValues, 
-                            kind='cubic', 
-                            bounds_error=False, 
-                            fill_value='extrapolate')
-        
-        # Create inverse gamma table
-        gammaTableSize = calibrationData.gammaTableSize
-        linearOutput = np.linspace(0, 1, gammaTableSize)
-        gammaOutput = np.power(linearOutput, gamma)
-        inverseGamma = interpFunc(gammaOutput)
-        
-        # Clip to valid range [0, 1] and convert to float32
-        inverseGamma = np.clip(inverseGamma, 0, 1).astype(np.float32)
-        
-        # For RGB, use the same correction for all channels (can be modified for per-channel)
-        return (inverseGamma, inverseGamma.copy(), inverseGamma.copy())
     
 # Calibration settings, subclass of pglSettings to inherit load/save functionality
 class pglCalibrationData(HasTraits, pglSerialize):
@@ -844,6 +789,7 @@ class pglCalibrationData(HasTraits, pglSerialize):
                 self.calibrationValues = np.array([value])
             else:
                 self.calibrationValues = np.append(self.calibrationValues, value)
+
     def getValues(self, startIndex, endIndex=None, mode="calibration"):
         '''
         Get calibration value(s).
@@ -924,6 +870,7 @@ class pglCalibrationData(HasTraits, pglSerialize):
                 return self.calibrationMeasurements[startIndex]
             else:
                 return self.calibrationMeasurements[startIndex:endIndex]
+ 
     def appendMeasurement(self, measurement, mode="calibration"):
         '''
         Append a calibration measurement.
@@ -968,6 +915,7 @@ class pglCalibrationData(HasTraits, pglSerialize):
             if self.calibrationMeasurements is None:
                 return False
             return len(self.calibrationMeasurements) == len(self.calibrationValues)       
+
     def getLastValue(self, mode="calibration"):
         '''
         Get the last calibration value.
@@ -986,3 +934,49 @@ class pglCalibrationData(HasTraits, pglSerialize):
             if self.calibrationValues is None or len(self.calibrationValues) == 0:
                 return None
             return self.calibrationValues[-1]
+        
+    def calculateInverseGamma(self, gamma = 1.0):
+        '''
+        Calculate inverse gamma table from calibration measurements.
+        
+        Args:
+            gamma: The target gamma value for inverse (default is 1.0 = linear table).
+        
+        Returns:
+            Tuple of three numpy arrays (R, G, B) for the inverse gamma table.
+        '''
+        # Average the repeated measurements for each step
+        nSteps = self.nSteps
+        nRepeats = self.nRepeats
+        
+        # Reshape and average
+        calValues = np.array(self.calibrationValues).reshape(nSteps, nRepeats)
+        calMeasurements = np.array(self.calibrationMeasurements).reshape(nSteps, nRepeats)
+        
+        medianValues = np.median(calValues, axis=1)
+        medianMeasurements = np.median(calMeasurements, axis=1)
+        
+        # Normalize measurements to 0-1 range
+        minLum = np.min(medianMeasurements)
+        maxLum = np.max(medianMeasurements)
+        normalizedMeasurements = (medianMeasurements - minLum) / (maxLum - minLum)
+        
+        # Create interpolation function: maps desired linear output to required input
+        # We want: given a desired output level, what input do we need?
+        interpFunc = interp1d(normalizedMeasurements, medianValues, 
+                            kind='cubic', 
+                            bounds_error=False, 
+                            fill_value='extrapolate')
+        
+        # Create inverse gamma table
+        gammaTableSize = self.gammaTableSize
+        linearOutput = np.linspace(0, 1, gammaTableSize)
+        gammaOutput = np.power(linearOutput, gamma)
+        inverseGamma = interpFunc(gammaOutput)
+        
+        # Clip to valid range [0, 1] and convert to float32
+        inverseGamma = np.clip(inverseGamma, 0, 1).astype(np.float32)
+        
+        # For RGB, use the same correction for all channels (can be modified for per-channel)
+        return (inverseGamma, inverseGamma.copy(), inverseGamma.copy())
+    
