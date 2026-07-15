@@ -1228,9 +1228,44 @@ class pglDisplayLuminanceCalibrationData(HasTraits, pglSerialize):
         except (AttributeError, ValueError) as e:
             print(f"(pglDisplayLuminanceCalibrationData:loadMatlab) Could not parse monitor ID: {e}")
             
+        c.deviceDescription = "Import from matlab"
         return(c,calib) 
-        
     
+    def attachSettings(self, pgl, settingsName):
+        '''
+        attach settings to the data (useful for import from matlab)
+        
+        Args:
+            pgl: pgl instance
+            settingsName: name of settings to attach to these data
+        '''
+        
+        e = pglExperiment(pgl, settingsName)
+        e.settings.closeScreenOnEnd = True
+        e.settings.backgroundColor = (0, 0, 0)
+        e.initScreen()
+        if pgl.isOpen() is False:
+            print(f"(pglDisplayLuminanceCalibrationData:attachSettings) Display {settingsName} did not open, cannot attach settings.")
+            return None
+        
+        # set information
+        self.settingsName = settingsName
+        self.settings = e.getSettings(settingsName)
+        
+        try:
+            # get display info if available
+            gpu = next(iter(pgl.gpuInfo.values()))
+            displays = gpu.get('Displays', [])
+            self.displayInfo = displays[self.settings.displayNumber-1]
+            
+            # get info from pgl
+            self.metalInfo = pgl.info()
+            
+        except Exception as ex:
+            print(f"(pglDisplayLuminanceCalibrationData:attachSettings) Warning: Could not get display info: {ex}")    
+    
+        e.endScreen()
+        
     def print(self, verbose=False):
         '''
         print the calibration data in a readable format.
