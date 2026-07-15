@@ -17,6 +17,9 @@ from pgl import pglTimestamp
 from .pglEvent import List, pglEvent
 from .pglEventListener import pglEventListener
 from dataclasses import dataclass
+from .pglSerialize import pglSerialize
+import matplotlib.pyplot as plt
+import numpy as np
 
 #################################################################
 # Parent class for devices
@@ -25,7 +28,7 @@ class pglDevice:
     """
     Parent class for all pglDevice types
     """
-    def __init__(self, deviceType):  
+    def __init__(self, deviceType, deviceDescription=None):  
         '''
         Initialize the _pglDevice instance.
         
@@ -38,6 +41,10 @@ class pglDevice:
         '''
         # set the device type
         self.deviceType = deviceType
+        if deviceDescription == None:
+            self.deviceDescription = deviceType
+        else:
+            self.deviceDescription = deviceDescription
         # set the initialization time
         self.pglTimestamp = pglTimestamp()
         self.startTime = self.pglTimestamp.getDateAndTime()
@@ -841,3 +848,386 @@ class pglDigitalIODevice(pglDevice):
         Stop the device.
         '''
         raise NotImplementedError("(pglDigitalIODevice:stop) Subclass must implement stop().")
+    
+class pglAnalogTraceData(pglSerialize):
+    # Stores short trains of analog data created by pglDigitalIODevice
+    # and offers functions for display
+    def __init__(self, time, data, channelNames=None):
+        '''
+        store the time and data
+        '''
+        self.time = time
+        self.data = data
+        
+        # compute number of channels
+        self.numChannels = 1 if data.ndim == 1 else data.shape[1]
+        
+        # Handle channel names
+        if channelNames is None:
+            channelNames = []
+        else:
+            channelNames = list(channelNames)
+
+        # figure out zero-padding width based on channel count
+        padWidth = max(3, len(str(self.numChannels - 1)))
+
+        # build a normalized list of channelNames (if any are missing)
+        # Will add channelNames like: CH001
+        normalizedChannelNames = []
+        for i in range(self.numChannels):
+            if i < len(channelNames) and channelNames[i] is not None and str(channelNames[i]).strip() != "":
+                # coerce existing entry to string
+                normalizedChannelNames.append(str(channelNames[i]))
+            else:
+                # fill missing/blank entry with CHnnn
+                normalizedChannelNames.append(f"CH{i:0{padWidth}d}")
+
+        # warn if caller supplied more names than there are channels
+        if len(channelNames) > self.numChannels:
+            print(f"(pglAnalogTraceData) Warning: {len(channelNames)} names given but only {self.numChannels} channels. Extra names ignored.")
+        
+        # store the normalized channel names
+        self.channelNames = normalizedChannelNames
+        
+    def __len__(self):
+        if self.time is not None:
+            return len(self.time)
+        else:
+            return 0
+    
+    @property
+    def nSamples(self):
+        return self.__len__()
+    
+    def getCycles(self, cycleLen=None, digitalSyncChannel=None, digitalSyncThreshold=None, ignoreInitial=None):
+        '''
+        Extract cycles from analog data based on fixed cycle length or digital sync triggers.
+        
+        Args:
+            cycleLen (float): Fixed cycle length in seconds (used if digitalSyncChannel is None)
+            digitalSyncChannel (int): Channel index to use for digital sync detection
+            digitalSyncThreshold (float): Voltage threshold for detecting digital pulse rising edge
+            ignoreInitial (float): Number of seconds to ignore from the beginning of data.
+                                  If None (default), no data is ignored. Must be non-negative.
+            
+        Returns:
+            dict: Dictionary containing:
+                - 'cycles': list of arrays, one per channel, each array is (numCycles, samplesPerCycle)
+                - 'cycleTime': time array for one cycle
+                - 'mean': list of mean cycles per channel
+                - 'std': list of std cycles per channel
+                - 'median': list of median cycles per channel
+                - 'numCycles': number of cycles detected
+                - 'cycleLen': actual cycle length used
+                - 'ignoredSamples': number of samples ignored from the beginning
+        '''
+        if self.time is None or self.data is None:
+            print("(pglLabJack:getCycles) No data provided.")
+            return None
+        
+        # Validate ignoreInitial parameter
+        if ignoreInitial is not None:
+            if not isinstance(ignoreInitial, (int, float)):
+                print(f"(pglLabJack:getCycles) Error: ignoreInitial must be a number or None, got {type(ignoreInitial).__name__}")
+                return None
+            if ignoreInitial < 0:
+                print(f"(pglLabJack:getCycles) Error: ignoreInitial must be non-negative, got {ignoreInitial}")
+                return None
+            if ignoreInitial >= self.time[-1] - self.time[0]:
+                print(f"(pglLabJack:getCycles) Error: ignoreInitial ({ignoreInitial}s) is greater than or equal to total data duration ({self.time[-1] - self.time[0]:.3f}s)")
+                return None
+        
+        # Filter data if ignoreInitial is specified
+        ignoredSamples = 0
+        time=self.time
+        data=self.data
+        if ignoreInitial is not None and ignoreInitial > 0:
+            # Find the index where time exceeds ignoreInitial seconds from start
+            startTime = self.time[0] + ignoreInitial
+            maskIndices = np.where(self.time >= startTime)[0]
+            
+            if len(maskIndices) == 0:
+                print(f"(pglLabJack:getCycles) Error: No data remains after ignoring initial {ignoreInitial}s")
+                return None
+            
+            startIdx = maskIndices[0]
+            ignoredSamples = startIdx
+            
+            # Slice the data
+            time = self.time[startIdx:]
+            if data.ndim == 1:
+                data = self.data[startIdx:]
+            else:
+                data = self.data[startIdx:, :]
+            
+            print(f"(pglLabJack:getCycles) Ignoring first {ignoreInitial}s ({ignoredSamples} samples)")
+        
+        # Handle single or multi-channel data
+        if data.ndim == 1:
+            dataToProcess = data.reshape(-1, 1)
+            numChannels = 1
+        else:
+            dataToProcess = data
+            numChannels = data.shape[1]
+        
+        # Determine cycle start indices and samples per cycle
+        if digitalSyncChannel is not None and digitalSyncThreshold is not None:
+            # Use digital sync channel to detect cycle starts
+            syncData = dataToProcess[:, digitalSyncChannel]
+            
+            # Detect rising edges (when signal crosses threshold from below)
+            aboveThreshold = syncData > digitalSyncThreshold
+            risingEdges = np.where(np.diff(aboveThreshold.astype(int)) > 0)[0] + 1
+            
+            if len(risingEdges) < 2:
+                print(f"(pglLabJack:getCycles) Warning: Found {len(risingEdges)} rising edges. Need at least 2 for cycle analysis.")
+                return None
+            
+            # Calculate cycle length from detected triggers
+            cycleLengths = np.diff(risingEdges)
+            samplesPerCycle = int(np.median(cycleLengths))
+            cycleLen = samplesPerCycle * np.median(np.diff(time))
+            
+            # Use detected trigger indices as cycle starts
+            cycleStarts = risingEdges[:-1]  # Exclude last one to ensure complete cycles
+            
+        else:
+            # Use fixed cycleLen
+            if cycleLen is None:
+                print("(pglLabJack:getCycles) Must provide either cycleLen or digitalSyncChannel/digitalSyncThreshold.")
+                return None
+                
+            dt = np.mean(np.diff(time))
+            samplesPerCycle = int(cycleLen / dt)
+            
+            # Check if data is long enough for at least one cycle
+            if len(time) < samplesPerCycle:
+                print(f"(pglLabJack:getCycles) Warning: Data length ({len(time)} samples) is shorter than one cycle ({samplesPerCycle} samples).")
+                return None
+            
+            # Generate regular cycle starts
+            numCycles = len(dataToProcess) // samplesPerCycle
+            cycleStarts = np.arange(numCycles) * samplesPerCycle
+        
+        # Create cycle time array
+        cycleTime = np.linspace(0, cycleLen, samplesPerCycle)
+        
+        # Extract cycles for each channel
+        allCycles = []
+        allMeans = []
+        allStds = []
+        allMedians = []
+        
+        for ch in range(numChannels):
+            channelData = dataToProcess[:, ch]
+            cycles = []
+            
+            for startIdx in cycleStarts:
+                endIdx = startIdx + samplesPerCycle
+                
+                # Skip if cycle extends beyond data
+                if endIdx > len(channelData):
+                    continue
+                
+                cycle = channelData[startIdx:endIdx]
+                
+                # Pad or trim to exact samplesPerCycle length (for digital sync with varying lengths)
+                if len(cycle) < samplesPerCycle:
+                    cycle = np.pad(cycle, (0, samplesPerCycle - len(cycle)), mode='edge')
+                elif len(cycle) > samplesPerCycle:
+                    cycle = cycle[:samplesPerCycle]
+                    
+                cycles.append(cycle)
+            
+            if len(cycles) == 0:
+                print(f"(pglLabJack:getCycles) No complete cycles found for channel {ch}.")
+                return None
+            
+            # Convert to array (numCycles, samplesPerCycle)
+            cycles = np.array(cycles)
+            
+            # Calculate statistics
+            meanCycle = np.mean(cycles, axis=0)
+            stdCycle = np.std(cycles, axis=0)
+            medianCycle = np.median(cycles, axis=0)
+            
+            allCycles.append(cycles)
+            allMeans.append(meanCycle)
+            allStds.append(stdCycle)
+            allMedians.append(medianCycle)
+        
+        return {
+            'cycles': allCycles,
+            'cycleTime': cycleTime,
+            'mean': allMeans,
+            'std': allStds,
+            'median': allMedians,
+            'numCycles': len(cycles),
+            'cycleLen': cycleLen,
+            'ignoredSamples': ignoredSamples
+        }
+    
+    def display(self, cycleLen=None, digitalSyncChannel=None, digitalSyncThreshold=3, ignoreInitial=None, displayStartEnd=None):
+        '''
+        Plot the analog read data
+
+        Args:
+            cycleLen (float): If provided, creates a second subplot showing cycle-averaged data
+            digitalSyncChannel (int): Channel index to use for digital sync detection
+            digitalSyncThreshold (float): Voltage threshold for detecting digital pulse rising edge
+            ignoreInitial (float): Time in seconds to ignore at the beginning of the recording for
+                displaying cycles (e.g., to exclude initial transients). If None, no data is ignored. Must be non-negative.
+            displayStartEnd (float): If not None, will display the first displayStartEnd seconds as separate graphs  
+            
+        Returns:
+            dict: Dictionary containing:
+            - 'fig': Figure object
+            - 'cycleData': dict from getCycles function (if cycleLen or digitalSyncChannel is provided), otherwise None
+            - 'axes': Dictionary of axis objects with keys:
+                - 'fullTrace': Full trace axis (always present)
+                - 'start': Start segment axis (if displayStartEnd is set)
+                - 'end': End segment axis (if displayStartEnd is set)
+                - 'cycle': Cycle-averaged axis (if cycleLen or digitalSyncChannel is set)
+   
+        '''
+        retval = {}
+
+        if self.time is None or self.data is None:
+            print("(pglLabJack:plotAnalogRead) No data to plot.")
+            return
+        
+        # Determine number of rows needed
+        numRows = 1  # Always have full trace row
+        if displayStartEnd is not None:
+            numRows += 1  # Add row for start/end segments
+        if cycleLen is not None or digitalSyncChannel is not None:
+            numRows += 1  # Add row for cycle-averaged data
+        
+        # Determine grid layout
+        if displayStartEnd is not None or (cycleLen is not None or digitalSyncChannel is not None):
+            fig = plt.figure(figsize=(16, 6 * numRows / 2))
+            gs = fig.add_gridspec(numRows, 2, hspace=0.3, wspace=0.3)
+        else:
+            fig = plt.figure(figsize=(16, 6))
+            gs = fig.add_gridspec(1, 1)
+        retval['fig'] = fig
+        currentRow = 0
+        
+        # First row: Full analog trace (spans both columns)
+        axFullTrace = fig.add_subplot(gs[currentRow, :])
+        retval['fullTrace'] = axFullTrace
+        if self.data.ndim == 1:
+            # Single channel
+            axFullTrace.plot(self.time, self.data, label=self.channelNames[0])
+        else:
+            # Multiple channels
+            for i in range(self.data.shape[1]):
+                axFullTrace.plot(self.time, self.data[:, i], label=self.channelNames[i])
+        
+        axFullTrace.set_xlabel("Time (s)")
+        axFullTrace.set_ylabel("Voltage (V)")
+        axFullTrace.set_title("Analog Trace Data")
+        axFullTrace.legend()
+        axFullTrace.grid(True)
+        currentRow += 1
+        
+        # Second row: Start and end segments (if requested)
+        if displayStartEnd is not None:
+            # Determine if we should use ms or s for display
+            useMilliseconds = displayStartEnd < 1.0
+            timeMultiplier = 1000 if useMilliseconds else 1
+            timeUnit = "ms" if useMilliseconds else "s"
+            
+            # Left column: First displayStartEnd seconds
+            axStart = fig.add_subplot(gs[currentRow, 0])
+            retval['start'] = axStart
+            startIdx = int(displayStartEnd * self.scanRate)
+            timeStart = self.time[:startIdx] * timeMultiplier
+            if self.data.ndim == 1:
+                axStart.plot(timeStart, self.data[:startIdx], label=self.channelNames[0])
+            else:
+                for ch in range(self.data.shape[1]):
+                    axStart.plot(timeStart, self.data[:startIdx, ch], label=self.channelNames[ch])
+            
+            axStart.set_xlabel(f"Time ({timeUnit})")
+            axStart.set_ylabel("Voltage (V)")
+            axStart.set_title(f"First {displayStartEnd} seconds")
+            axStart.legend()
+            axStart.grid(True)
+            
+            # Right column: Last displayStartEnd seconds
+            axEnd = fig.add_subplot(gs[currentRow, 1])
+            retval['end'] = axEnd
+            endIdx = int(displayStartEnd * self.scanRate)
+            timeEnd = self.time[-endIdx:] * timeMultiplier
+            if data.ndim == 1:
+                axEnd.plot(timeEnd, self.data[-endIdx:], label=self.channelNames[0])
+            else:
+                for ch in range(self.data.shape[1]):
+                    axEnd.plot(timeEnd, self.data[-endIdx:, ch], label=self.channelNames[ch])
+            
+            axEnd.set_xlabel(f"Time ({timeUnit})")
+            axEnd.set_ylabel("Voltage (V)")
+            axEnd.set_title(f"Last {displayStartEnd} seconds")
+            axEnd.legend()
+            axEnd.grid(True)
+            currentRow += 1
+        
+        # Next row: Cycle-averaged data (if requested, spans both columns)
+        if cycleLen is not None or digitalSyncChannel is not None:
+            axCycle = fig.add_subplot(gs[currentRow, :])
+            retval['cycle'] = axCycle
+            
+            # Get cycles using the getCycles function
+            cycleData = self.getCycles(cycleLen, digitalSyncChannel, digitalSyncThreshold, ignoreInitial)
+            retval['cycleData'] = cycleData
+            
+            if cycleData is None:
+                axCycle.text(0.5, 0.5, 'Unable to extract cycles', 
+                           ha='center', va='center', transform=axCycle.transAxes)
+                axCycle.set_xlabel("Time in Cycle (s)")
+                axCycle.set_ylabel("Voltage (V)")
+                axCycle.set_title("Cycle-Averaged Data")
+            else:
+                cycleTime = cycleData['cycleTime']
+                numChannels = len(cycleData['cycles'])
+                
+                # Convert time to ms, if cycle time is less than 1 second
+                if max(cycleTime) < 1.0:
+                    cycleTime = cycleTime * 1000
+                    xAxisLabel = "Time in Cycle (ms)"
+                else:
+                    xAxisLabel = "Time in Cycle (s)"
+                    
+                for ch in range(numChannels):
+                    cycles = cycleData['cycles'][ch]
+                    medianCycle = cycleData['median'][ch]
+                    
+                    # Plot individual trials as thin lines in background
+                    for i in range(cycles.shape[0]):
+                        axCycle.plot(cycleTime, cycles[i, :], color=f'C{ch}', alpha=0.2, linewidth=0.5)
+                                        
+                    # Plot median as solid line
+                    axCycle.plot(cycleTime, medianCycle, color=f'C{ch}', 
+                               linewidth=2, label=self.channelNames[ch])
+                
+                titleStr = "Trigger-Averaged Data" if digitalSyncChannel is not None else "Cycle-Averaged Data"
+                axCycle.set_xlabel(xAxisLabel)
+                axCycle.set_ylabel("Voltage (V)")
+                axCycle.set_title(f"{titleStr} (n={cycleData['numCycles']} cycles)")
+                axCycle.legend()
+                axCycle.grid(True)
+        
+        #plt.tight_layout()
+        #plt.show(block=False)    
+        
+        # Return figure and axes dictionary
+        return retval
+ 
+        
+        
+        
+    
+
+
+    

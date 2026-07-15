@@ -102,7 +102,7 @@ class pglVWFATask(pglTask):
         self.settings.waitUntilVolumeTrigger[-1] = True
 
         # every (condition, instance) pair appears exactly once per block
-        self.addParameter(pglParameterBlock([
+        self.addParameter(pglParameterNestedBlock([
             pglParameter("condition", list(range(1, self.NUM_CONDITIONS + 1))),
             pglParameter("instance",  list(range(self._instStart, self._instEnd + 1))),
         ]))

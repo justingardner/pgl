@@ -20,7 +20,8 @@ from tqdm.notebook import tqdm
 from traitlets import HasTraits
 from .pglSerialize import pglSerialize
 from scipy.interpolate import interp1d
-        
+from .pglDevice import pglDigitalIODevice, pglAnalogTraceData
+
 ##########################
 # Calibration device class
 ##########################
@@ -169,19 +170,14 @@ class pglDisplayCalibration():
     '''
     Runs calibration for a display
     '''
-    def __init__(self, pgl, luminanceCalibrationDevice : pglLuminanceCalibrationDevice = None):
+    def __init__(self, pgl, luminanceCalibrationDevice : pglLuminanceCalibrationDevice = None, digitalIODevice : pglDigitalIODevice = None):
         '''
         Initialize the calibration.
         '''
-        self.luminanceCalibrationDevice = None
-        self.digitalIODevice = None
-        
-        if not isinstance(luminanceCalibrationDevice, pglLuminanceCalibrationDevice):
-            print("(pglCalibration) luminanceCalibrationDevice must be of type pglCalibrationDevice.")
-            return
-        self.luminanceCalibrationDevice = luminanceCalibrationDevice
-        self.luminanceCalibrationDevice.verbose = False
-        
+        # set the devices
+        self.addLuminanceCalibrationDevice(luminanceCalibrationDevice)
+        self.addDigitalIODevice(digitalIODevice)
+
         # keep pgl reference
         self.pgl = pgl
 
@@ -197,6 +193,35 @@ class pglDisplayCalibration():
         # to just be considered min or max when doing the
         # search for min and max values
         self.epsilon = 0.001
+    
+    def addLuminanceCalibrationDevice(self, luminanceCalibrationDevice : pglLuminanceCalibrationDevice = None):
+        ''''
+        add a luminanceCalibrationDevice to run luminanceCalibrations
+        
+        Args:
+            luminanceCalibrationDevice: pglLuminanceCalibrationDevice for measuring luminance
+        '''
+        self.luminanceCalibrationDevice = None
+        if luminanceCalibrationDevice is not None:
+            # check luminance calibration device
+            if not isinstance(luminanceCalibrationDevice, pglLuminanceCalibrationDevice):
+                print("(pglDisplayCalibration) ❌ luminanceCalibrationDevice must be of type pglCalibrationDevice.")
+                return
+            self.luminanceCalibrationDevice = luminanceCalibrationDevice        
+            self.luminanceCalibrationDevice.verbose = False
+
+    def addDigitalIODevice(self, digitalIODevice : pglDigitalIODevice = None):
+        ''''
+        add a digitalIODevice
+        
+        Args:
+            digitalIODevice: pglDigitalIODevice for digital and analog IO
+        '''
+        self.digitalIODevice = None
+        # check digitalIO device
+        if not isinstance(digitalIODevice, pglDigitalIODevice):
+            print("(pglDisplayCalibration) ❌ digitalIODevice must be of type pglDigitalIODevice.")
+        self.digitalIODevice = digitalIODevice
 
     @property
     def calibrationMode(self):
@@ -222,9 +247,223 @@ class pglDisplayCalibration():
         '''
         pass
 
+    def calibrateTiming(self, settingsName):
+        '''
+        User faceing function which runs the timing calibration process. 
+        
+        You need to make sure that you have initialized with a digitalIODevice or run addDigitalIODevice
+        
+        Args:
+            settingsName (Str): Name of the screen settings to calibrate
+        '''
+        if self.digitalIODevice is None:
+            print("(pglDisplayCalibration) No digitalIO device specified. Please specify on initialization of pglDisplayCalibration or use addDigitalIODevice")
+            return None
+
+        self.timingCalibrationData = None
+        
+        # open the display with specified settings
+        e = pglExperiment(self.pgl, settingsName)
+        e.settings.closeScreenOnEnd = True
+        e.settings.backgroundColor = (0, 0, 0)
+        e.initScreen()
+        if self.pgl.isOpen() is False:
+            print(f"(pglCalibration:calibrate) Display {settingsName} did not open, cannot calibrate.")
+            return None
+        
+        # initialize the data structure for saving data
+        self.timingCalibrationData = pglDisplayTimingCalibrationData()
+
+        # set information
+        self.timingCalibrationData.settingsName = settingsName
+        self.timingCalibrationData.settings = e.getSettings(settingsName)
+        self.timingCalibrationData.deviceDescription = self.digitalIODevice.deviceDescription
+        
+        # get calibration date and time
+        self.timingCalibrationData.creationDateTime = datetime.now()
+
+        try:
+            # get display info if available
+            gpu = next(iter(self.pgl.gpuInfo.values()))
+            displays = gpu.get('Displays', [])
+            self.timingCalibrationData.displayInfo = displays[self.timingCalibrationData.settings.displayNumber-1]
+            
+            # get info from pgl
+            self.timingCalibrationData.metalInfo = self.pgl.info()
+            
+        except Exception as ex:
+            print(f"(pglDisplayCalibration:_calibrateTIming) Warning: Could not get display info: {ex}")
+
+        # run internal function to calibrate the timing
+        self.timingCalibrationData.analogTraceData = self._calibrateTiming()
+        
+        # and save
+        self.timingCalibrationData.save()
+        
+        # plot data
+        self.timingCalibrationData.display()
+
+        # close screen
+        e.endScreen()
+    
+    def _calibrateTiming(self):
+        
+        # set stimulus duration in frames
+        # first number is pre-stimulus black
+        # second number is the actual stimulus duration
+        # third number is post-stimulus black
+        # fourth number is inter-trial interval 
+        stimulusDurationFrames = [2, 3, 5, 0]
+
+        # size of patch to draw in the center of the screen (in degrees)
+        patchWidth = self.pgl.screenWidth.deg
+        patchHeight = self.pgl.screenHeight.deg
+
+        # number of repeats
+        numRepeats = 30
+
+        # get total number of frames
+        trialFrames = sum(stimulusDurationFrames)
+        totalFrames = numRepeats * trialFrames
+
+        # calculate stimulus time in seconds based on frame rate
+        frameRate = self.pgl.getFrameRate()
+        trialDurationSecs = trialFrames / frameRate
+        totalDurationSecs = totalFrames / frameRate
+
+        # open as full screen
+        self.pgl.fullScreen(True)
+        self.pgl.waitSecs(0.75)
+        
+        # set to black
+        self.pgl.rect(0,0,patchWidth,patchHeight,0);
+        self.pgl.flush()
+        self.pgl.waitSecs(0.25)
+
+        # setup digital output for sync pulse 
+        self.digitalIODevice.setupDigitalOutput(channel=0)
+        self.digitalIODevice.digitalOutput(0)
+
+        # read analog input for a little bit beyond stimulus duration
+        startTime = self.pgl.getSecs()
+        analogReadDurationSecs = totalDurationSecs + 0.5
+        self.digitalIODevice.startAnalogRead(duration=analogReadDurationSecs, channels=['AIN0','AIN1'], range=1.0)
+
+        # display
+        print(f"Total read time: {analogReadDurationSecs:.2f} seconds, (n={numRepeats}, trialLen={trialDurationSecs:.2f} s, totalDuration={totalDurationSecs:.2f} s)")
+
+        # length of digital output pulse in ms
+        pulseLenMilliseconds = 2 
+
+        # initialize arrays of timestamps
+        flushTime = []
+        for iRepeat in range(numRepeats):
+            trialStart = True
+            currentFrame = 0
+            self.pgl.rect(0,0,patchWidth,patchHeight,0);
+            
+            # set the digital pulse to be timelocked to the start of stimuls presentation
+            #startFrameTime = pgl.getTargetPresentationTimestamp()
+            #pglLabJack.digitalOutputAtTime(startFrameTime+((1/frameRate)*stimulusDurationFrames[0])/1000, 1, pulseLen=pulseLenMilliseconds)
+            
+            for iFrame in range(sum(stimulusDurationFrames)):
+                # compute which stimulus phase we are in based on the current frame number and the stimulusDurationFrames
+                stimulusPhase = np.searchsorted(np.cumsum(stimulusDurationFrames), iFrame, side='right')
+
+                if trialStart and stimulusPhase == 1:
+                    self.digitalIODevice.digitalOutput(1,pulseLen=pulseLenMilliseconds)
+                    trialStart = False
+
+                # set what color to draw the screen
+                if stimulusPhase == 1:
+                    self.pgl.rect(0,0,patchWidth,patchHeight,1);
+                else:
+                    self.pgl.rect(0,0,patchWidth,patchHeight,0);
+                
+                # flush the screen, recording the time of each flush for later analysis
+                flushTime.append(self.pgl.flush())
+
+        # get analog data
+        analogTraceData = self.digitalIODevice.stopAnalogRead(waitToFinish=True)
+        print(f"Analog read complete (duration={self.pgl.getSecs() - startTime:.2f} s). Read {analogTraceData.nSamples} samples.")
+
+        frameTime = np.median(np.diff(flushTime))*1000
+        print(f"Median frame time: {frameTime:.4f} ms (frame rate: {1000/frameTime:.2f} Hz)")
+        # close full screen
+        #pgl.fullScreen(False)
+
+        # return data
+        return(analogTraceData)
+    
+    def computeFrameOnsetDelay(self):
+        # try to compute onset time
+        cycleData = f['cycleData']
+        # calculate standard deviation around 0 for end of data
+        baseline = np.mean(data[1,-2500:])
+        baselineSTD = np.std(data[1,-2500:])
+        # now see when the median trace goes 2 std above the baseline
+        onset = np.argmax(cycleData['median']>baseline+baselineSTD*2)
+
+        # let's refine the search for the onset, by fitting a linear
+        # finction and finding the intersection with baseline
+
+        # let's refine the search for the onset, by fitting a linear
+        # finction and finding the intersection with baseline
+        print(f"baseline: {baseline} baselineSTD: {baselineSTD}")
+        cycle = cycleData['median'][0]
+
+        # set the thresholds for where we will do the linear fit.
+        leftThreshold = baseline + baselineSTD * 1.5
+        rightThreshold = baseline + baselineSTD * 20
+
+        # Search backwards from onset
+        leftIndex = onset
+        while leftIndex > 0 and cycle[leftIndex] > leftThreshold:
+            leftIndex -= 1
+
+        # Find right point
+        rightIndex = onset
+        while rightIndex < len(cycle) - 1 and cycle[rightIndex] < rightThreshold:
+            rightIndex += 1
+
+        leftIndex = onset-2
+        rightIndex = onset+2
+        # Make sure we have enough points to fit
+        if rightIndex - leftIndex < 3:
+            print("Warning: fitting window too small, using fallback")
+        else:
+            # Fit linear function over this adaptive window
+            xFit = np.arange(leftIndex, rightIndex + 1)
+            yFit = cycle[leftIndex:rightIndex + 1]
+            
+            coeffs = np.polyfit(xFit, yFit, 1)
+            m, c = coeffs
+            
+            # Find intercept with baseline
+            if m != 0:
+                onset = (baseline - c) / m
+            
+        print(onset)
+        times = [onset + 1000*i/frameRate for i in range(stimulusDurationFrames[1]+1)]
+        [plt.axvline(x=t, color='red', linestyle='--') for t in times]
+
+        plt.ion()
+        plt.figure(figsize=(14,7))
+        plt.plot(cycle, 'k-', label='Median trace', linewidth=1.5)
+        plt.axvline(x=58, color='r', linestyle='--', linewidth=2)
+        plt.axvline(x=onset, color='g', linestyle='--', linewidth=2)
+        xLineExtended = np.array([onset, rightIndex])
+        yLineExtended = m * xLineExtended + c
+        plt.plot(xLineExtended, yLineExtended, 'b-', linewidth=2.5, label='Fitted line', alpha=0.8)
+        plt.xlim(45, 275)
+        
     def calibrateLuminance(self, settingsName, nRepeats=4, nSteps=256, runValidation=True, runGammaValidation=True):
         '''
-        User facing function which runs the calibration process.
+        User faceing function which runs the luminance calibration process. It will get a luminance calibration
+        and then validate that you get a linear gamma (gamma=1.0) if runValidation is set and a 2.2 gamma
+        for display natural images and movies if runGammaValidation is set.
+        
+        You need to make sure that you have initialized with a luminnaceCalibrationDevice or run addLuminanceCalibrationDevice
         
         Args:
             settingsName (str): Name of the screen settings to calibrate.
@@ -235,7 +474,7 @@ class pglDisplayCalibration():
                 for making a gamma of 2.2 for videos
         '''
         if self.luminanceCalibrationDevice is None:
-            print("(pglDisplayCalibration) No luminance calibration device specified. Please specify on initialization of pglDisplayCalibration")
+            print("(pglDisplayCalibration) No luminance calibration device specified. Please specify on initialization of pglDisplayCalibration or use addLuminanceCalibrationDevice")
             return None
 
         # initialize calibration data
@@ -265,7 +504,7 @@ class pglDisplayCalibration():
             self.luminanceGammaValidationData.display(gamma=2.2)
 
         # and save
-        self.save()
+        self.saveLuminanceCalibration()
         
         # close screen
         e.endScreen()
@@ -661,7 +900,7 @@ class pglDisplayCalibration():
         self.calibrationIndex += 1
         return self.calibrationMeasurementGet(-1)
 
-    def save(self):
+    def saveLuminanceCalibration(self):
         '''
         Save calibration data to a file.
         
@@ -803,7 +1042,63 @@ class pglDisplayCalibration():
                 return None
         
         return(filepath)
-         
+
+# Calibration settings, subclass of pglSettings to inherit load/save functionality
+class pglDisplayTimingCalibrationData(HasTraits, pglSerialize):
+    
+    settingsName = Unicode("Default", help="Settings name used to open display")
+    settings = Instance(pglSettings, allow_none=True, help="Settings used during calibration") 
+    displayInfo = Dict(help="Display information at time of calibration")
+    metalInfo = Dict(help="PGL info including display info such as UUID, serial number, and other information at time of calibration")   
+    creationDateTime = Instance(datetime, default_value=datetime.now(), help="Date and time of calibration creation")
+    deviceDescription = Unicode("Unknown", help="Desciption of measurement device")
+    analogTraceData = Instance(pglAnalogTraceData, allow_none=True, default_value=None, help="analong measurement from photodiode")
+    syncChannel = Int(1, help="Channel with sync pulse on it")     
+    syncChannelThreshold = Float(0.2, help="Threshold for considering sync to be active")
+    
+    def display(self):
+        '''
+        display the timing calibration data
+        '''
+        if self.analogTraceData is None:
+            print(f"(pglDisplayTimingCalibrationData:No data to display)")
+            return
+        
+        # display the analog traces        
+        self.analogTraceData.display(digitalSyncChannel=self.syncChannel, digitalSyncThreshold=self.syncChannelThreshold, ignoreInitial=0)
+
+    def save(self, filename=None, filepath=None):
+        '''
+        save
+        
+        Args:
+            filename: If none defaults to calibration.json
+            filepath: If none defaults to calibrationDir / display name / data
+        '''
+        # get a filepath
+        if filepath is None:
+            filepath = pglDisplayCalibration.getCalibrationFilepath(self.getDisplayName(), makePath=True, calibrationType="timing")
+        
+        # get the filename
+        if filename is None:
+            filename = "timing"
+                           
+        # call parent to save
+        super().save(filepath / filename)
+    
+    def getDisplayName(self):
+        '''
+        Get the display name associated with this data
+        '''
+        return self.displayInfo.get("DisplayName",self.settingsName)
+    
+    def getUUID(self):
+        '''
+        Get the UUID associated with this data
+        '''
+        return self.metalInfo.get("display.uuid","Unknown")
+
+        
 # Calibration settings, subclass of pglSettings to inherit load/save functionality
 class pglDisplayLuminanceCalibrationData(HasTraits, pglSerialize):
     
@@ -849,7 +1144,7 @@ class pglDisplayLuminanceCalibrationData(HasTraits, pglSerialize):
         '''
         # get a filepath
         if filepath is None:
-            filepath = pglDisplayCalibration.getCalibrationFilepath(self.getDisplayName(), makePath=True)
+            filepath = pglDisplayCalibration.getCalibrationFilepath(self.getDisplayName(), makePath=True, calibrationType="luminance")
         
         # get the filename
         if filename is None:
