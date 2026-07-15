@@ -21,6 +21,7 @@ from traitlets import HasTraits
 from .pglSerialize import pglSerialize
 from scipy.interpolate import interp1d
 from .pglDevice import pglDigitalIODevice, pglAnalogTraceData
+from scipy.io import loadmat
 
 ##########################
 # Calibration device class
@@ -1175,6 +1176,60 @@ class pglDisplayLuminanceCalibrationData(HasTraits, pglSerialize):
         
         # call super load to instantiate the object and load it                
         return super(pglDisplayLuminanceCalibrationData, cls).load(filepath / filename)
+    
+    @classmethod
+    def loadMatlab(cls, filename):
+        '''
+        load a calibration from mgl Matlab file
+        
+        Args:
+            filename: The filename of the .mat calibration file
+        '''
+        try:
+            matData = loadmat(filename, squeeze_me=True, struct_as_record=False)
+        except Exception as loadError:
+            print(f"Failed to load {filename}: {loadError}")
+            return None
+
+        # check for calib strcuture
+        calib = matData.get('calib', None)
+        if calib is None:
+            print(f"(pglDisplayLuminanceCalibrationData:loadMatlab) Could not find calib structure in: {filename}")
+            return None
+        
+        # instantiate the class
+        c = cls()
+        
+        # get creation time
+        try:
+            c.creationDateTime = datetime.strptime(calib.date, '%d-%b-%Y %H:%M:%S')
+        except (AttributeError, ValueError) as dateError:
+            print(f"(pglDisplayLuminanceCalibrationData:loadMatlab) Could not parse date: {dateError}")
+            c.creationDateTime = None
+            
+        # set num repeats, because we only have the stored median value, always set to 1
+        c.nRepeats = 1
+        
+        try:
+            c.calibrationValues = np.array(calib.uncorrected.outputValues).T
+            c.calibrationMeasurements = np.array(calib.uncorrected.luminance).T
+            c.nSteps = len(c.calibrationValues)
+        except (AttributeError, ValueError) as e:
+            print(f"(pglDisplayLuminanceCalibrationData:loadMatlab) ❌❌❌ Could not parse calibration❌❌❌: {e}")
+            return None
+        
+        # get min and max luminance
+        c.minLuminance = np.min(c.calibrationMeasurements)
+        c.maxLuminance = np.max(c.calibrationMeasurements)
+
+        # get the monitor ID and set as DisplayName  
+        try:
+            c.displayInfo["DisplayName"] = calib.monitor.ID
+        except (AttributeError, ValueError) as e:
+            print(f"(pglDisplayLuminanceCalibrationData:loadMatlab) Could not parse monitor ID: {e}")
+            
+        return(c,calib) 
+        
     
     def print(self, verbose=False):
         '''
