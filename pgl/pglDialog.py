@@ -2,7 +2,7 @@
 #   filename: pglTraitsDialog.py
 #    purpose: PySide6 dialog for editing pglSettings traits
 #         by: JLG
-#       date: Feb 6, 2026
+#       date: Jul 17, 2026
 ################################################################
 
 #############
@@ -24,9 +24,12 @@ from pathlib import Path
 
 
 #######################################
-# pglTraitsDialog
+# _pglTraitsDialog
+# Actual code for the pglTraitsDialog, but this 
+# gets run by pglTraitsDialogStandalone so that it avoids
+# crashy-conflicty behavior with jupyter notebooks
 #######################################
-class pglTraitsDialog(QDialog):
+class _pglTraitsDialog(QDialog):
     """
     Puts up a PySide6 dialog to edit the traits of a settings class.
 
@@ -640,7 +643,12 @@ class pglTraitsDialog(QDialog):
         h.addWidget(plus)                          # right
         return row
 
-def pglTraitsDialogEdit(settings):
+#####################################################################
+# pglTraitsDialog: what gets called by the user. This rund
+# pglTraitsDialogStandalone which runs outside the jupyter notebook
+# to avoid crashy-conflicty behavior.
+#####################################################################
+def pglTraitsDialog(settings):
     """
     Pops up a PySide6 dialog in a separate process, blocks until closed,
     and returns edited settings (OK) or None (Cancel).
@@ -659,3 +667,492 @@ def pglTraitsDialogEdit(settings):
     if result.returncode == 0 and outFile.exists():
         return pglSerialize.load(outFile)   # OK
     return None                                # Cancel
+
+#############
+# Main class which should be subclassed for specific settings,
+# provides methods for loading/saving from JSON and displaying widgets
+# to edit the settings
+#############
+class pglSettingsEditable(HasTraits, pglSerialize):
+    def __init__(self, filename=None):
+        # Initialize HasTraits
+        super().__init__()
+        # Load from file if provided
+        if filename:
+            #print(f"(pglSettingsEditable:init) Loading settings from '{filename}'.")
+            self.updateFromFile(filename)
+    
+   # display parameters
+    def __repr__(self):
+        traitValues = ", ".join(f"{key}={getattr(self, key)!r}" for key in self.trait_names())
+        return f"{self.__class__.__name__}({traitValues})"
+    
+    # setup CSS
+    def setupDisplayStyle(self):
+        # --- Dark widget CSS ---
+        display(HTML("""
+        <style>
+        .dark-widget-card {
+            background-color: #000 !important;
+            border: 1px solid #333;
+            border-radius: 8px;
+            padding: 16px;
+        }
+
+        .dark-widget-card .widget-label {
+            color: #eaeaea !important;
+        }
+
+        .dark-widget-card input,
+        .dark-widget-card textarea,
+        .dark-widget-card select {
+            background-color: #111 !important;
+            color: #eaeaea !important;
+            border: 1px solid #444 !important;
+        }
+
+        .dark-widget-card .slider {
+            background-color: #222 !important;
+        }
+
+        .dark-widget-card select option {
+            background-color: #111 !important;
+            color: #eaeaea !important;
+        }
+
+        .help-text, .options-panel {
+            background-color: #111;
+            color: #eaeaea;
+            border: 1px solid #444;
+            border-radius: 5px;
+            padding: 8px;
+        }
+        </style>
+        """))
+
+    # gets the traits in the order that they are defined
+    @classmethod
+    def getOrderedTraits(cls):
+        """Return traits defined in this class (not inherited), in definition order."""
+        ordered = OrderedDict()
+        for name, obj in cls.__dict__.items():
+            if isinstance(obj, TraitType):
+                ordered[name] = obj
+        return ordered
+
+    def makeWidgets(self):
+        """Automatically create widgets for all traits in self."""
+        style = {'description_width': '120px'}
+        widgetRows = []
+        allHelpText = ""
+
+        # Initialize widget map
+        self.widgetMap = {}
+
+        for traitName, trait in self.getOrderedTraits().items():
+            if traitName.startswith('_'):
+                continue  # skip private traits
+            
+            helpText = getattr(trait, 'help', f"{traitName}: float value")
+            if helpText:
+                allHelpText += f"<b>{traitName}:</b> {helpText}<br>"
+            
+            # Float with min/max
+            if isinstance(trait, Float) and trait.min is not None and trait.max is not None:
+                traitStep = getattr(trait, 'step', (trait.max - trait.min) / 100)
+                slider = widgets.FloatSlider(
+                    min=trait.min, max=trait.max, step=traitStep,
+                    description=traitName,
+                    style=style,
+                    layout=widgets.Layout(width='calc(100% - 100px)'),
+                    tooltip=helpText
+                )
+                text = widgets.BoundedFloatText(
+                    min=trait.min, max=trait.max, step=traitStep,
+                    layout=widgets.Layout(width='100px'),
+                    tooltip=helpText
+                )
+                link((self, traitName), (slider, 'value'))
+                link((self, traitName), (text, 'value'))
+                row = widgets.HBox([slider, text])
+                widgetRows.append(row)
+                self.widgetMap[traitName] = row
+
+            # Float with min only
+            elif isinstance(trait, Float) and trait.min is not None:
+                wFloat = widgets.BoundedFloatText(
+                    description=traitName,
+                    min=trait.min,
+                    style=style,
+                    layout=widgets.Layout(width='100%'),
+                    tooltip=helpText
+                )
+                link((self, traitName), (wFloat, 'value'))
+                widgetRows.append(wFloat)
+                self.widgetMap[traitName] = wFloat
+
+            # Float without min/max
+            elif isinstance(trait, Float):
+                wFloat = widgets.FloatText(
+                    description=traitName,
+                    style=style,
+                    layout=widgets.Layout(width='100%'),
+                    tooltip=helpText
+                )
+                link((self, traitName), (wFloat, 'value'))
+                widgetRows.append(wFloat)
+                self.widgetMap[traitName] = wFloat
+
+            # Int
+            elif isinstance(trait, Int):
+                wInt = widgets.IntText(
+                    description=traitName,
+                    style=style,
+                    layout=widgets.Layout(width='100%'),
+                    tooltip=helpText
+                )
+                link((self, traitName), (wInt, 'value'))
+                wInt.observe(partial(self.onIntSelect, traitName), names='value')
+                widgetRows.append(wInt)
+                self.widgetMap[traitName] = wInt
+            # Bool
+            elif isinstance(trait, Bool):
+                wBool = widgets.Checkbox(
+                    value=getattr(self, traitName, False),
+                    tooltip=helpText,
+                    indent=False
+                )
+                wLabel = widgets.Label(value=traitName, style=style)
+                wLabel.layout.width = '125px' 
+                wBox = widgets.HBox([wLabel, wBool], layout=widgets.Layout(width='100%'))
+                
+                link((self, traitName), (wBool, 'value'))
+                wBool.observe(partial(self.onBoolSelect, traitName), names='value')
+                widgetRows.append(wBox)
+                self.widgetMap[traitName] = wBool
+            elif isinstance(trait, Bool):
+                wBool = widgets.Checkbox(
+                    description=traitName,
+                    style=style,
+                    layout=widgets.Layout(width='100%'),
+                    tooltip=helpText,
+                    indent=False
+                )
+                link((self, traitName), (wBool, 'value'))
+                wBool.observe(partial(self.onBoolSelect, traitName), names='value')
+                widgetRows.append(wBool)
+                self.widgetMap[traitName] = wBool
+            # Path
+            elif isinstance(trait, Unicode) and trait.metadata.get("isPath", False):
+                wPath = widgets.Text(
+                    description=traitName,
+                    style=style,
+                    layout=widgets.Layout(width='100%'),
+                    tooltip=helpText
+                )
+                link((self, traitName), (wPath, 'value'))
+                wPath.on_submit(partial(self.onPathSubmit, traitName=traitName))
+                widgetRows.append(wPath)
+                self.widgetMap[traitName] = wPath
+
+            # Unicode
+            elif isinstance(trait, Unicode):
+                wText = widgets.Text(
+                    description=traitName,
+                    style=style,
+                    layout=widgets.Layout(width='100%'),
+                    tooltip=helpText
+                )
+                link((self, traitName), (wText, 'value'))
+                widgetRows.append(wText)
+                self.widgetMap[traitName] = wText
+
+            # Bool
+            elif isinstance(trait, Bool):
+                wBool = widgets.Checkbox(
+                    description=traitName,
+                    value=getattr(self, traitName),
+                    tooltip=helpText
+                )
+                link((self, traitName), (wBool, 'value'))
+                widgetRows.append(wBool)
+                self.widgetMap[traitName] = wBool
+            elif (isinstance(trait, List) and trait.metadata.get("isRGB", False)):
+                # Create three float inputs for R, G, B
+                r_input = widgets.BoundedFloatText(
+                    value=getattr(self, traitName)[0] if getattr(self, traitName) else 0.0,
+                    min=0.0, max=1.0, step=0.01,
+                    description='R:',
+                    style={'description_width': '20px'},
+                    layout=widgets.Layout(width='120px'),
+                    tooltip=f"{helpText} - Red channel"
+                )
+                g_input = widgets.BoundedFloatText(
+                    value=getattr(self, traitName)[1] if getattr(self, traitName) else 0.0,
+                    min=0.0, max=1.0, step=0.01,
+                    description='G:',
+                    style={'description_width': '20px'},
+                    layout=widgets.Layout(width='120px'),
+                    tooltip=f"{helpText} - Green channel"
+                )
+                b_input = widgets.BoundedFloatText(
+                    value=getattr(self, traitName)[2] if getattr(self, traitName) else 0.0,
+                    min=0.0, max=1.0, step=0.01,
+                    description='B:',
+                    style={'description_width': '20px'},
+                    layout=widgets.Layout(width='120px'),
+                    tooltip=f"{helpText} - Blue channel"
+                )
+                
+                # Label for the RGB group
+                label = widgets.Label(value=traitName, style=style)
+                label.layout.width = '125px'
+                
+                # Combine in HBox
+                rgb_box = widgets.HBox([label, r_input, g_input, b_input])
+                
+                # Update the trait when any input changes
+                def update_rgb(change, name=traitName, inputs=(r_input, g_input, b_input)):
+                    setattr(self, name, [inputs[0].value, inputs[1].value, inputs[2].value])
+                
+                r_input.observe(update_rgb, names='value')
+                g_input.observe(update_rgb, names='value')
+                b_input.observe(update_rgb, names='value')
+                
+                # Optional: Update inputs when trait changes externally
+                def update_inputs(change, inputs=(r_input, g_input, b_input)):
+                    if change['new'] and len(change['new']) == 3:
+                        inputs[0].value = change['new'][0]
+                        inputs[1].value = change['new'][1]
+                        inputs[2].value = change['new'][2]
+                
+                self.observe(update_inputs, names=traitName)
+                
+                widgetRows.append(rgb_box)
+                self.widgetMap[traitName] = rgb_box
+    
+            # List
+            elif isinstance(trait, List):
+                currentList = getattr(self, traitName)
+                wDropdown = widgets.Dropdown(
+                    options=currentList,
+                    value=currentList[0] if currentList else None,
+                    description=traitName,
+                    style=style,
+                    layout=widgets.Layout(width='100%'),
+                    tooltip=helpText
+                )
+                link((self, traitName), (wDropdown, 'options'))
+                wDropdown.observe(partial(self.onListSelect, traitName), names='value')
+                widgetRows.append(wDropdown)
+                self.widgetMap[traitName] = wDropdown
+
+        # Help widget
+        helpWidget = widgets.HTML(allHelpText)
+        helpWidget.layout.display = 'none'
+        helpWidget.add_class("help-text")
+
+        helpButton = widgets.Button(
+            description="Show Help",
+            button_style='info',
+            layout=widgets.Layout(width='120px')
+        )
+        helpButton.on_click(partial(self.toggleHelp, helpWidget=helpWidget))
+
+        saveButton = widgets.Button(
+            description="Save settings",
+            button_style='info',
+            layout=widgets.Layout(width='120px')
+        )
+        if not hasattr(self, 'onSave'):
+            saveButton.layout.display = 'none'
+        else:
+            saveButton.on_click(partial(self.onSave))
+
+        testButton = widgets.Button(
+            description="Test settings",
+            button_style='info',
+            layout=widgets.Layout(width='120px')
+        )
+        if not hasattr(self, 'onTest'):
+            testButton.layout.display = 'none'
+        else:
+            testButton.on_click(partial(self.onTest))
+
+        deleteButton = widgets.Button(
+            description="Delete settings",
+            button_style='info',
+            layout=widgets.Layout(width='120px')
+        )
+        if not hasattr(self, 'onDelete'):
+            deleteButton.layout.display = 'none'
+        else:
+            deleteButton.on_click(partial(self.onDelete))
+        
+        spacer = widgets.Box(layout=widgets.Layout(width="120px"))
+        
+        cancelButton = widgets.Button(
+            description="Cancel",
+            button_style='info',
+            layout=widgets.Layout(width='120px')
+        )
+        cancelButton.on_click(partial(self.onCancel))
+
+        # Pack all widgets
+        widgetDisplay = widgetRows + [
+            widgets.HBox([
+                cancelButton,
+                deleteButton,
+                saveButton,
+                spacer,
+                testButton,
+                widgets.Box(layout=widgets.Layout(flex='1')),
+                helpButton
+            ]),
+            helpWidget
+        ]
+
+        return widgetDisplay
+    def onCancel(self, cancelButton):
+        self.hide()
+        pass
+    
+    def hide(self):
+        """
+        Hide the settings widget.
+        """
+        if hasattr(self, 'wrapper'):
+            self.wrapper.layout.display = 'none'
+        
+    def toggleHelp(self, helpButton, helpWidget):
+        helpWidget.layout.display = 'block' if helpWidget.layout.display == 'none' else 'none'
+
+    def onIntSelect(self, traitName, change):
+        pass
+        
+    def onBoolSelect(self, traitName, change):
+        pass
+        
+    def onListSelect(self, traitName, change):
+        # get the selected and currentList
+        selected = change['new']
+        currentList = list(getattr(self, traitName))
+
+        # not in current list
+        if selected not in currentList:
+            return
+
+        # Move selected item to top of list
+        newList = [selected] + [x for x in currentList if x != selected]
+
+        # now set to this newList
+        setattr(self, traitName, newList)
+
+    def onPathSubmit(self, textWidget, traitName):
+        raw = textWidget.value
+        try:
+            path = Path(raw).expanduser()
+
+            if not path.exists():
+                # set the border to indicate no change
+                textWidget.layout.border = '2px solid red'
+            else:
+                #self.dataPath = str(path)            
+                textWidget.layout.border = '2px solid green'
+        except Exception:
+            textWidget.layout.border = "2px solid red"
+            
+            
+    # ----- Put up edit dialog ---- #
+    def edit(self):
+        # setup css styles
+        self.setupDisplayStyle()
+        
+        # make widgets for each parameter
+        widgetDisplay = self.makeWidgets()
+        
+        # --- Container for widgets display ---
+        widgetsBox = widgets.Box(
+            widgetDisplay,
+            layout=widgets.Layout(
+                display='flex',
+                flex_flow='column',
+                gap='10px',
+                width='100%'
+            )
+        )
+        widgetsBox.add_class("dark-widget-card")
+
+        # --- Centering wrapper ---
+        self.wrapper = widgets.Box(
+            [widgetsBox],
+            layout=widgets.Layout(
+                display='flex',
+                justify_content='center',
+                width='95%',
+                margin='0 auto'
+            )   
+        )
+
+        # display
+        display(self.wrapper)
+
+class confirmationPanel:
+    def __init__(self, confirmMessage="Confirm?", onConfirm=None, onCancel=None):
+        """
+        onConfirm: function called if user clicks Yes
+        onCancel: function called if user clicks No
+        """
+        # Message
+        self.label = widgets.HTML(f"<b>{confirmMessage}</b>")
+
+        # Yes button (green)
+        self.yesButton = widgets.Button(
+            description="Yes",
+            button_style="success",
+            layout=widgets.Layout(width="80px")
+        )
+        self.yesButton.on_click(self._yes_clicked)
+
+        # No button (red)
+        self.noButton = widgets.Button(
+            description="No",
+            button_style="danger",
+            layout=widgets.Layout(width="80px")
+        )
+        self.noButton.on_click(self._no_clicked)
+
+        # Store callbacks
+        self.onConfirm = onConfirm
+        self.onCancel = onCancel
+
+        # Pack the panel
+        self.panel = widgets.VBox([
+            self.label,
+            widgets.HBox([self.yesButton, self.noButton])
+        ])
+        
+        # Output to display result
+        self.output = widgets.Output()
+
+    def _yes_clicked(self, b):
+        with self.output:
+            self.output.clear_output()
+        if self.onConfirm:
+            self.onConfirm()
+        self._hide_panel()
+
+    def _no_clicked(self, b):
+        with self.output:
+            self.output.clear_output()
+        if self.onCancel:
+            self.onCancel()
+        self._hide_panel()
+
+    def _hide_panel(self):
+        # Hide the panel widgets
+        self.panel.layout.display = 'none'
+
+    def display(self):
+        display(self.panel, self.output)
+      

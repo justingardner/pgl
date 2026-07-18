@@ -22,7 +22,7 @@ from .pglGammaTable import pglGammaTable
 from .pglSettings import pglSettingsEditable, pglMainSettingsManager, pglDisplaySettings
 from .pglEventListener import pglEventListener
 from .pglEyeTracker import pglEyeTracker
-from .pglDialog import pglTraitsDialog, pglTraitsDialogEdit
+from .pglDialog import pglTraitsDialog
 
 # Device specific imports (eye trackers, etc.)
 from .pglVPixx import pglProPixx, pglDataPixx
