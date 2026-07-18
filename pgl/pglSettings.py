@@ -30,6 +30,7 @@ import copy
 from .pglBase import pglDisplayMessage
 from .pglParameter import pglParameter, pglParameterBlock
 from .pglSerialize import pglSerialize
+from .pglDialog import pglSettingsEditable
 
 displayDuration = 5  # seconds
 #######################################

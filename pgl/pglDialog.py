@@ -659,7 +659,7 @@ def pglTraitsDialog(settings):
 
     settings.save(inFile)
 
-    scriptPath = Path(__file__).parent / "pglDialogStandalone.py"  # adjust path
+    scriptPath = Path(__file__).parent / "pglTraitsDialogStandalone.py"  # adjust path
     result = subprocess.run(
         [sys.executable, str(scriptPath), str(inFile), str(outFile)]
     )
