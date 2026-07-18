@@ -5,13 +5,13 @@
 import sys
 from PySide6.QtWidgets import QApplication, QDialog
 from pgl.pglDialog import pglTraitsDialog
-from pgl.pglSettings import pglSettings
+from pgl.pglSerialize import pglSerialize
 
 def main():
     inFile = sys.argv[1]      # settings to edit
     outFile = sys.argv[2]     # where to write result (only if OK)
 
-    settings = pglSettings(filename=inFile)
+    settings = pglSerialize.load(inFile)
 
     app = QApplication.instance() or QApplication(sys.argv)
     dlg = pglTraitsDialog(settings)
