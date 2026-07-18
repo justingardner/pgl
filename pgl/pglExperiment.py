@@ -498,6 +498,14 @@ class pglExperiment(pglExperimentBase):
         if self.settings.calibration[0] == "None":
             return
         
+        # get the display name
+        gpu = next(iter(self.pgl.gpuInfo.values()))
+        displays = gpu.get('Displays', [])
+        displayInfo = displays[self.settings.displayNumber-1]
+        displayName = displayInfo.get("DisplayName","Unknown")
+        
+        pglDisplayLuminanceCalibrationData.load(displayName)
+        
     def endScreen(self):
         '''
         Close the screen
