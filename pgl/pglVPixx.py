@@ -9,8 +9,8 @@
 # Import modules
 #############
 #from pgl import pglEvent
-from pgl import pglDevice
-from pgl import pglEvent
+from .pglDevice import pglDevice
+from .pglEvent import pglEvent
 import numpy as np
 
 ###################################

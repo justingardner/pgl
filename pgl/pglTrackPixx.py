@@ -31,7 +31,7 @@ class pglTrackPixx3(pglEyeTracker):
         try:
             import pypixxlib._libdpx as dp
         except ImportError: 
-            print("(pglTrackPixx3) pypixxlib is not installed. Please install it to use TrackPixx3.")
+            pgl.oneTimeWarning("(pglTrackPixx3) pypixxlib is not installed. Please install it to use TrackPixx3.")
             return
         self.dp = dp
 
@@ -178,7 +178,7 @@ class pglTrackPixx3(pglEyeTracker):
                 thisTime = self.dp.DPxGetTime()
 
                 # poll for button press events
-                events = self.pgl.devicesPoll()
+                events = self.pgl.poll()
                 if events is None: continue
                 #print(events)
                 for event in events:
