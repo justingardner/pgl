@@ -18,6 +18,9 @@ from PySide6.QtCore import Qt
 from traitlets import (
     HasTraits, Float, Int, List, Unicode, Bool, TraitType
 )
+from .pglSerialize import pglSerialize
+import sys, subprocess, tempfile
+from pathlib import Path
 
 
 #######################################
@@ -637,10 +640,6 @@ class pglTraitsDialog(QDialog):
         h.addWidget(plus)                          # right
         return row
 
-import sys, subprocess, tempfile
-from pathlib import Path
-from pgl.pglSettings import pglSettings
-
 def pglTraitsDialogEdit(settings):
     """
     Pops up a PySide6 dialog in a separate process, blocks until closed,
@@ -658,5 +657,5 @@ def pglTraitsDialogEdit(settings):
     )
 
     if result.returncode == 0 and outFile.exists():
-        return pglSettings(filename=outFile)   # OK
+        return pglSerialize.load(outFile)   # OK
     return None                                # Cancel
