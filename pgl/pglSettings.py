@@ -30,7 +30,7 @@ import copy
 from .pglBase import pglDisplayMessage
 from .pglParameter import pglParameter, pglParameterBlock
 from .pglSerialize import pglSerialize
-from .pglDialog import pglSettingsEditable
+from .pglDialog import pglSettingsEditable, pglTraitsDialog
 
 displayDuration = 5  # seconds
 #######################################
@@ -69,7 +69,7 @@ class pglMainSettingsManager:
         displaySettingsSelect.edit() 
         
         # display the selected settings
-        displaySettingsSelect.displaySettings[0].edit()
+        pglTraitsDialog(displaySettingsSelect.displaySettings[0])
     
     def getDisplayNames(self, displayIndex=None):
         
@@ -244,7 +244,8 @@ class pglDisplaySettingsSelect(pglSettingsEditable):
         clear_output(wait=True)
         
         super().__init__()
-        self.displaySettings[0].edit()
+        #self.displaySettings[0].edit()
+        pglTraitsDialog(self.displaySettings[0])
         
 class pglDisplaySettings(pglSettingsEditable):
     
@@ -258,10 +259,6 @@ class pglDisplaySettings(pglSettingsEditable):
     serialNumber = Int(0, "Serial number")
     luminanceCalibration = List(Unicode(), default_value=['Latest','None'], help="Which calibration to use")
 
-        
-  
-      
-       
 # Screen settings select
 class pglSettingsSelect(pglSettingsEditable):
     

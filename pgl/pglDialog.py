@@ -21,6 +21,11 @@ from traitlets import (
 from .pglSerialize import pglSerialize
 import sys, subprocess, tempfile
 from pathlib import Path
+from IPython.display import HTML, display
+from collections import OrderedDict
+import ipywidgets as widgets
+from traitlets import HasTraits, Float, Int, List, TraitError, Unicode, Dict, default, link, Bool, TraitType
+from functools import partial
 
 
 #######################################
@@ -176,9 +181,10 @@ class _pglTraitsDialog(QDialog):
         mainLayout.addWidget(buttonBar)
 
         # bigger default window
-        self.resize(680, 760)
         self.setMinimumWidth(560)
-
+        self.adjustSize()                       # size to content
+        h = min(self.sizeHint().height(), 760)  # cap tall forms
+        self.resize(680, h)
     def _getOrderedTraits(self):
         """Return traits in class definition order (like getOrderedTraits)."""
         from collections import OrderedDict
@@ -313,17 +319,18 @@ class _pglTraitsDialog(QDialog):
 
     # ----- Int -----
     def _addInt(self, traitName, trait, current, helpText):
-        spin = QSpinBox()
+        spin = QDoubleSpinBox()
+        spin.setDecimals(0)
         spin.setButtonSymbols(QAbstractSpinBox.PlusMinus)
-        spin.setMinimum(trait.min if trait.min is not None else -2**31)
-        spin.setMaximum(trait.max if trait.max is not None else 2**31 - 1)
+        spin.setMinimum(trait.min if trait.min is not None else -2**53)
+        spin.setMaximum(trait.max if trait.max is not None else 2**53)
         spin.setSingleStep(getattr(trait, 'step', 1) or 1)
         spin.setValue(int(current))
         spin.setToolTip(helpText)
 
         def onChange(v):
             if not self._updatingWidget:
-                self._commit(traitName, v)
+                self._commit(traitName, int(v))
 
         spin.valueChanged.connect(onChange)
         row = self._wrapSpin(spin)
@@ -429,8 +436,9 @@ class _pglTraitsDialog(QDialog):
     def _register(self, traitName, widget, setter):
         label = QLabel(traitName)
         label.setObjectName("traitLabel")
-        label.setMinimumWidth(180)          # consistent label column
-
+        #label.setMinimumWidth(180)          # consistent label column
+        label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        
         # let fields expand to fill the row
         from PySide6.QtWidgets import QSizePolicy
         widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -479,7 +487,7 @@ class _pglTraitsDialog(QDialog):
             font-size: 13px;
         }
         #traitLabel {
-            color: #a9b1bd;
+            color: #000000;
             font-weight: 600;
         }
 
@@ -526,14 +534,14 @@ class _pglTraitsDialog(QDialog):
             subcontrol-origin: padding;
             subcontrol-position: center right;
             width: 26px;
-            border-left: 1px solid #3a3d42;
+            border-left: 0px solid #3a3d42;
         }
         QComboBox::down-arrow {
-            width: 10px; height: 10px;
+            width: 0px; height: 0px;
             image: none;
-            border-left: 5px solid transparent;
-            border-right: 5px solid transparent;
-            border-top: 6px solid #d6d9de;
+            border-left: 0px solid transparent;
+            border-right: 0px solid transparent;
+            border-top: 0px solid #d6d9de;
         }
         QComboBox QAbstractItemView {
             background-color: #2b2d31;
