@@ -414,6 +414,9 @@ class pglExperiment(pglExperimentBase):
         if self.settings.flipLeftRight: self.pgl.flipLeftRight()
         if self.settings.flipUpDown: self.pgl.flipUpDown()
         
+        # set the gamma table
+        self.setGammaTable()
+        
         # add keyboard device if not already loaded
         keyboardDevices = self.pgl.devicesGet(pglKeyboardMouse)
         if not keyboardDevices:
@@ -483,6 +486,18 @@ class pglExperiment(pglExperimentBase):
         # initialize eye tracker
         self.initEyeTracker()        
 
+    def setGammaTable(self):
+        '''
+        set the gamma table based on settings
+        '''
+        # no gamma correction asked for
+        if self.settings.calibrateForGamma == 0.0:
+            return
+        
+        # No calibration
+        if self.settings.calibration[0] == "None":
+            return
+        
     def endScreen(self):
         '''
         Close the screen
@@ -1153,8 +1168,7 @@ class pglTask:
         try:
             paramDir = dataDir / "parameters"
             paramDir.mkdir(parents=True, exist_ok=True)
-            for i, param in enumerate(self.parameters):
-                #param.save(paramDir)
+            for param in self.parameters:
                 param.save(paramDir)
         except Exception as e:
             print(f"(pglTask:save) ❌ Could not save task parameters to {dataDir}: {e}")

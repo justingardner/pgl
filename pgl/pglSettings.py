@@ -44,7 +44,7 @@ class pglMainSettingsManager:
     
     def settings(self):
         """
-        Edit pgl settings. Brings up widgt interface to edit settings
+        Edit pgl settings. Brings up widget interface to edit settings
         """
         # initialize settings select class
         settingsSelect = pglSettingsSelect(self)
@@ -56,9 +56,26 @@ class pglMainSettingsManager:
         # display the selected settings
         settingsSelect.settings[0].edit() 
     
+    def displaySettings(self):
+        """
+        Edit pgl display settings. Brings up widget interface to edit display settings
+        """
+        # initialize settings select class
+        displaySettingsSelect = pglDisplaySettingsSelect(self)
+        #displaySettingsSelect.load()
+        
+        # display the settings
+        displaySettingsSelect.edit() 
+        
+        # display the selected settings
+        displaySettingsSelect.displaySettings[0].edit()
+    
     def getDisplayNames(self, displayIndex=None):
-        displayNames = ['Windowed']
+        
+                
+        displayNames.append('Windowed')
 
+        # get names from gpuInfo
         if not self.gpuInfo:
             return displayNames
 
@@ -665,6 +682,72 @@ class confirmationPanel:
 
     def display(self):
         display(self.panel, self.output)
+      
+##################################################
+# display Settings select
+##################################################
+class pglDisplaySettingsSelect(pglSettingsEditable):
+    
+    # traits that can be edited
+    displayNames = List(Unicode(), help="Settings names")
+    
+    # init
+    def __init__(self, pgl=None):
+        # keep pgl
+        self.pgl = pgl
+        
+        # close and clean up any open pgl screen
+        self.pgl.close()
+        self.pgl.cleanUp()
+        
+        # open pgl
+        pgl.open(0)
+        
+        # get info
+        info = pgl.info()
+        
+        # for each display gets its name
+        self.displayNames = []
+        self.displaySettings = []
+        numDisplays = int(info.get('display.numDisplays',None))
+        for iDisplay in range(numDisplays):
+            # get the displayName
+            displayName = info.get(f"display{iDisplay}.name","unknown")
+            self.displayNames.append(displayName)
+            # create a pglDisplaySettings
+            self.displaySettings.append(pglDisplaySettings())
+            self.displaySettings[-1].displayName = displayName
+            self.displaySettings[-1].displayWidth = int(info.get(f"display{iDisplay}.widthPixels",0))
+            self.displaySettings[-1].displayHeight = int(info.get(f"display{iDisplay}.heightPixels",0))
+            self.displaySettings[-1].refreshRate = int(info.get(f"display{iDisplay}.refreshRate",0))
+            self.displaySettings[-1].uuid = info.get(f"display{iDisplay}.uuid","")
+            self.displaySettings[-1].vendor = int(info.get(f"display{iDisplay}.vendor",""))
+            self.displaySettings[-1].model = int(info.get(f"display{iDisplay}.model",""))
+            self.displaySettings[-1].serialNumber = int(info.get(f"display{iDisplay}.serialNumber",""))
+
+        # close and clear the open/close output
+        pgl.close()
+        from IPython.display import clear_output
+        clear_output(wait=True)
+        
+        super().__init__()
+        self.displaySettings[0].edit()
+        
+class pglDisplaySettings(pglSettingsEditable):
+    
+    displayName = List(Unicode(), help="Names of screen")
+    displayWidth = Int(0, help="Display widh in pixels")
+    displayHeight = Int(0, help="Display height in pixels")
+    refreshRate = Int(0, help="Refresh rate")
+    uuid = Unicode("", "UUID of display")
+    vendor = Int(0, "Vendor number")
+    model = Int(0, "Model number")
+    serialNumber = Int(0, "Serial number")
+    luminanceCalibration = List(Unicode(), default_value=['Latest','None'], help="Which calibration to use")
+
+        
+  
+      
        
 # Screen settings select
 class pglSettingsSelect(pglSettingsEditable):
@@ -781,6 +864,8 @@ class pglSettings(pglSettingsEditable):
     displayHeight = Float(18.0, min = 0.0, step=0.1, max=None, help="Display height in cm")
     flipLeftRight = Bool(False, help="Whether to flip the display left-right")
     flipUpDown = Bool(False, help="Whether to flip the display up-down")
+    calibration = List(Unicode(), default_value=['Latest','None'], help="Which calibration to use")
+    calibrateForGamma = List(Float, default_value=[2.2, 1.0, 0], help="What gamma to target calibration for 0.0 = No calibration, 1.0=linear, 2.2 typical for images/movies")
     dataPath = Unicode("~/data",help="Path to data directory").tag(isPath=True)
     startKey = Unicode("space", allow_none=True, help="Key to start experiment")
     endKey = Unicode("escape", allow_none=True, help="Key to end experiment")
