@@ -26,7 +26,7 @@ from collections import OrderedDict
 import ipywidgets as widgets
 from traitlets import HasTraits, Float, Int, List, TraitError, Unicode, Dict, default, link, Bool, TraitType
 from functools import partial
-
+import math
 
 #######################################
 # _pglTraitsDialog
@@ -207,7 +207,7 @@ class _pglTraitsDialog(QDialog):
         current = getattr(self.settings, traitName)
 
         # Float with min and max -> slider + spinbox
-        if isinstance(trait, Float) and trait.min is not None and trait.max is not None:
+        if isinstance(trait, Float) and trait.min is not None and not math.isinf(trait.max) and not math.isinf(trait.min):
             self._addFloatRange(traitName, trait, current, helpText)
 
         # Float (min only or unbounded)
@@ -294,11 +294,12 @@ class _pglTraitsDialog(QDialog):
             spin.setValue(float(value))
             slider.setValue(toSlider(float(value)))
 
-        self._register(traitName, row, setter)
+        self._register(traitName, trait, row, setter)
 
     # ----- Float -----
     def _addFloat(self, traitName, trait, current, helpText):
         spin = QDoubleSpinBox()
+        spin.setAlignment(Qt.AlignCenter) 
         spin.setButtonSymbols(QAbstractSpinBox.PlusMinus)
         spin.setDecimals(1)
         if trait.min is not None:
@@ -315,11 +316,12 @@ class _pglTraitsDialog(QDialog):
                 self._commit(traitName, v)
 
         spin.valueChanged.connect(onChange)
-        self._register(traitName, spin, lambda v: spin.setValue(float(v)))
+        self._register(traitName, trait, spin, lambda v: spin.setValue(float(v)))
 
     # ----- Int -----
     def _addInt(self, traitName, trait, current, helpText):
         spin = QDoubleSpinBox()
+        spin.setAlignment(Qt.AlignCenter) 
         spin.setDecimals(0)
         spin.setButtonSymbols(QAbstractSpinBox.PlusMinus)
         spin.setMinimum(trait.min if trait.min is not None else -2**53)
@@ -334,7 +336,7 @@ class _pglTraitsDialog(QDialog):
 
         spin.valueChanged.connect(onChange)
         row = self._wrapSpin(spin)
-        self._register(traitName, row, lambda v: spin.setValue(int(v)))
+        self._register(traitName, trait, row, lambda v: spin.setValue(int(v)))
 
     # ----- Bool -----
     def _addBool(self, traitName, trait, current, helpText):
@@ -347,11 +349,12 @@ class _pglTraitsDialog(QDialog):
                 self._commit(traitName, check.isChecked())
 
         check.stateChanged.connect(onChange)
-        self._register(traitName, check, lambda v: check.setChecked(bool(v)))
+        self._register(traitName, trait, check, lambda v: check.setChecked(bool(v)))
 
     # ----- Text / Path -----
     def _addText(self, traitName, trait, current, helpText):
         edit = QLineEdit(str(current) if current is not None else "")
+        edit.setAlignment(Qt.AlignCenter) 
         edit.setToolTip(helpText)
 
         def onChange(text):
@@ -359,7 +362,7 @@ class _pglTraitsDialog(QDialog):
                 self._commit(traitName, text)
 
         edit.textChanged.connect(onChange)
-        self._register(traitName, edit, lambda v: edit.setText(str(v) if v is not None else ""))
+        self._register(traitName, trait, edit, lambda v: edit.setText(str(v) if v is not None else ""))
 
     # ----- List -> dropdown -----
     def _addList(self, traitName, trait, current, helpText):
@@ -395,7 +398,7 @@ class _pglTraitsDialog(QDialog):
                 combo.setCurrentIndex(0)
             combo.blockSignals(False)
 
-        self._register(traitName, combo, setter)
+        self._register(traitName, trait, combo, setter)
 
     # ----- RGB -----
     def _addRGB(self, traitName, trait, current, helpText):
@@ -428,12 +431,12 @@ class _pglTraitsDialog(QDialog):
                 if i < len(value):
                     b.setValue(float(value[i]))
 
-        self._register(traitName, row, setter)
+        self._register(traitName, trait, row, setter)
 
     #########################################
     # Helpers
     #########################################
-    def _register(self, traitName, widget, setter):
+    def _register(self, traitName, trait, widget, setter):
         label = QLabel(traitName)
         label.setObjectName("traitLabel")
         #label.setMinimumWidth(180)          # consistent label column
@@ -451,6 +454,11 @@ class _pglTraitsDialog(QDialog):
             'label': label,
             'setter': setter,
         }
+        
+        # honor default-enabled metadata
+        if trait is not None:
+            isEnabled = trait.metadata.get('enabled', True)
+            widget.setEnabled(bool(isEnabled))
 
     def _commit(self, traitName, value):
         """Push a widget change into the settings copy."""

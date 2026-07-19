@@ -1,4 +1,4 @@
-################################################################
+    ################################################################
 #   filename: pglSettings.py
 #    purpose: Provides settings management for pgl
 #         by: JLG
@@ -9,28 +9,26 @@
 # Import
 #############
 from asyncio import subprocess
-from collections import OrderedDict
 from curses import wrapper
 from http.client import responses
 from http.client import responses
 from pathlib import Path
 from urllib import response
 from IPython.display import display, HTML, clear_output
-import ipywidgets as widgets
 from fileinput import filename
 from ipywidgets.widgets import widget
 from traitlets import HasTraits, Float, Int, List, TraitError, Unicode, Dict, default, link, Bool, TraitType
-import json
-from functools import partial
 from datetime import datetime
 import numpy as np
 import subprocess
 import platform
-import copy
 from .pglBase import pglDisplayMessage
 from .pglParameter import pglParameter, pglParameterBlock
 from .pglSerialize import pglSerialize
 from .pglDialog import pglSettingsEditable, pglTraitsDialog
+import Quartz
+import CoreFoundation
+from AppKit import NSScreen
 
 displayDuration = 5  # seconds
 #######################################
@@ -62,14 +60,14 @@ class pglMainSettingsManager:
         Edit pgl display settings. Brings up widget interface to edit display settings
         """
         # initialize settings select class
-        displaySettingsSelect = pglDisplaySettingsSelect(self)
+        #displaySettingsSelect = pglDisplaySettingsSelect(self)
         #displaySettingsSelect.load()
         
         # display the settings
-        displaySettingsSelect.edit() 
+        #displaySettingsSelect.edit() 
         
         # display the selected settings
-        pglTraitsDialog(displaySettingsSelect.displaySettings[0])
+        #pglTraitsDialog(displaySettingsSelect.displaySettings[0])
     
     def getDisplayNames(self, displayIndex=None):
         
@@ -95,6 +93,64 @@ class pglMainSettingsManager:
                 displayNames.insert(0, "Unknown Display")
         
         return displayNames
+    
+    def getDisplayInfo(self):
+        '''
+        Get info on displays
+        '''
+        displays = []
+        
+        # Get CGDisplayCreateUUIDFromDisplayID
+        try:
+            from ColorSync import CGDisplayCreateUUIDFromDisplayID
+        except ImportError:
+            # fallback: some builds expose it under Quartz
+            from Quartz import CGDisplayCreateUUIDFromDisplayID
+        
+        
+        maxDisplays = 16        
+        (err, active, count) = Quartz.CGGetActiveDisplayList(maxDisplays, None, None)
+        for display in active:
+            # initialize the displaySettings
+            displaySettings = pglDisplaySettings()
+            
+            # get all supported modes
+            modes = Quartz.CGDisplayCopyAllDisplayModes(display, None)
+            modeNames = []
+            for mode in modes:
+                w = Quartz.CGDisplayModeGetWidth(mode)
+                h = Quartz.CGDisplayModeGetHeight(mode)
+                refresh = Quartz.CGDisplayModeGetRefreshRate(mode)
+                modeNames.append(f"{w} x {h} @ {refresh}Hz")
+            displaySettings.displayModes = modeNames
+            
+            # get the current mode settings
+            #mode = Quartz.CGDisplayCopyDisplayMode(display)
+            displaySettings.displayWidth = Quartz.CGDisplayModeGetWidth(mode)  
+            displaySettings.displayHeight = Quartz.CGDisplayModeGetHeight(mode)
+            displaySettings.refreshRate = Quartz.CGDisplayModeGetRefreshRate(mode)
+
+            # get UUID
+            uuidRef = CGDisplayCreateUUIDFromDisplayID(display)
+            displaySettings.uuid = str(CoreFoundation.CFUUIDCreateString(None, uuidRef))
+            
+            # get other infor from quartz
+            displaySettings.vendor        = Quartz.CGDisplayVendorNumber(display)
+            displaySettings.model         = Quartz.CGDisplayModelNumber(display)
+            displaySettings.serialNumber  = Quartz.CGDisplaySerialNumber(display)
+            displaySettings.isMain        = Quartz.CGDisplayIsMain(display)
+            displaySettings.isBuiltin     = Quartz.CGDisplayIsBuiltin(display)
+            
+            # get the display name 
+            for screen in NSScreen.screens():
+                # map back to a CGDirectDisplayID:
+                if screen.deviceDescription()["NSScreenNumber"] == display:
+                    # localizedName is available on macOS 10.15+
+                    displaySettings.displayName = screen.localizedName()
+                
+            displays.append(displaySettings)
+        return(displays)
+            
 #######################################
 # Mixin class for pglExperiment which manages pgl settings 
 #######################################
@@ -199,64 +255,23 @@ class pglSettingsManager:
 ##################################################
 # display Settings select
 ##################################################
-class pglDisplaySettingsSelect(pglSettingsEditable):
+#class pglDisplaySettingsSelect(pglSettingsEditable):
     
     # traits that can be edited
-    displayNames = List(Unicode(), help="Settings names")
-    
-    # init
-    def __init__(self, pgl=None):
-        # keep pgl
-        self.pgl = pgl
-        
-        # close and clean up any open pgl screen
-        self.pgl.close()
-        self.pgl.cleanUp()
-        
-        # open pgl
-        pgl.open(0)
-        
-        # get info
-        info = pgl.info()
-        
-        # for each display gets its name
-        self.displayNames = []
-        self.displaySettings = []
-        numDisplays = int(info.get('display.numDisplays',None))
-        for iDisplay in range(numDisplays):
-            # get the displayName
-            displayName = info.get(f"display{iDisplay}.name","unknown")
-            self.displayNames.append(displayName)
-            # create a pglDisplaySettings
-            self.displaySettings.append(pglDisplaySettings())
-            self.displaySettings[-1].displayName = displayName
-            self.displaySettings[-1].displayWidth = int(info.get(f"display{iDisplay}.widthPixels",0))
-            self.displaySettings[-1].displayHeight = int(info.get(f"display{iDisplay}.heightPixels",0))
-            self.displaySettings[-1].refreshRate = int(info.get(f"display{iDisplay}.refreshRate",0))
-            self.displaySettings[-1].uuid = info.get(f"display{iDisplay}.uuid","")
-            self.displaySettings[-1].vendor = int(info.get(f"display{iDisplay}.vendor",""))
-            self.displaySettings[-1].model = int(info.get(f"display{iDisplay}.model",""))
-            self.displaySettings[-1].serialNumber = int(info.get(f"display{iDisplay}.serialNumber",""))
-
-        # close and clear the open/close output
-        pgl.close()
-        from IPython.display import clear_output
-        clear_output(wait=True)
-        
-        super().__init__()
-        #self.displaySettings[0].edit()
-        pglTraitsDialog(self.displaySettings[0])
-        
+    #displayNames = List(Unicode(), help="Settings names")
+            
 class pglDisplaySettings(pglSettingsEditable):
-    
     displayName = List(Unicode(), help="Names of screen")
-    displayWidth = Int(0, help="Display widh in pixels")
-    displayHeight = Int(0, help="Display height in pixels")
-    refreshRate = Int(0, help="Refresh rate")
-    uuid = Unicode("", "UUID of display")
-    vendor = Int(0, "Vendor number")
-    model = Int(0, "Model number")
-    serialNumber = Int(0, "Serial number")
+    displayModes = List(Unicode(), help="List of all supported display modes")
+    displayWidth = Int(0, help="Display widh in pixels", enabled=False)
+    displayHeight = Int(0, help="Display height in pixels", enabled=False)
+    refreshRate = Float(0, help="Refresh rate", enabled=False)
+    uuid = Unicode("", help="UUID of display", enabled=False)
+    vendor = Int(0, help="Vendor number", enabled=False)
+    model = Int(0, help="Model number", enabled=False)
+    serialNumber = Int(0, help="Serial number", enabled=False)
+    isMain = Bool(False, help="Whether the display is the main display", enabled=False)
+    isBuiltin = Bool(False, help="Whether the display is the built-in display of e.g. a laptop", enabled=False)
     luminanceCalibration = List(Unicode(), default_value=['Latest','None'], help="Which calibration to use")
 
 # Screen settings select
