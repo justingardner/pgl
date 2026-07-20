@@ -304,6 +304,6 @@ class pglImageInstance:
         self.pgl.imageDisplay(self, x, y, width, height, xAlign, yAlign)
     def print(self):
        if self.displayed is not None:
-            print(f"Image {self.imageNum} ({self.width.pix}x{self.height.pix}) displayed: left: {self.displayLeft} right: {self.displayRight} bottom: {self.displayBottom} top: {self.displayTop} time: {self.displayTime}")
+            print(f"Image {self.imageNum} ({self.width.pix}x{self.height.pix}) displayed: left={self.displayLeft} right={self.displayRight} bottom={self.displayBottom} top={self.displayTop} time={self.displayTime}")
        else:
            print(f"Image: {self.imageNum} ({self.width.pix}x{self.height.pix})")

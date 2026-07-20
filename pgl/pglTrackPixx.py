@@ -143,12 +143,16 @@ class pglTrackPixx3(pglEyeTracker):
                 expectedIrisSize = self.dp.TPxGetIrisExpectedSize()
                 (ppLeftMajor, _, ppRightMajor, _) = self.dp.TPxGetPupilSize() 
                 (ppLeftX, ppLeftY, ppRightX, ppRightY) = self.dp.TPxGetPupilCoordinatesInPixels() 
+                
+                # display instructions
+                self.pgl.text("Adjust camera position and focus", line=1)
+                self.pgl.text("Press right white (thumb) button when finished",line=2)
 
                 # covert to degrees for display
-                ppLeftXDeg = ppLeftX * self.pgl.xPix2Deg + cameraImage.displayLeft
-                ppLeftYDeg = -ppLeftY * self.pgl.yPix2Deg + cameraImage.displayTop
-                ppRightXDeg = ppRightX * self.pgl.xPix2Deg + cameraImage.displayLeft
-                ppRightYDeg = -ppRightY * self.pgl.yPix2Deg + cameraImage.displayTop
+                ppLeftXDeg = cameraImage.displayLeft + (cameraImage.displayRight - cameraImage.displayLeft) * (ppLeftX / cameraImage.width.pix)
+                ppLeftYDeg = cameraImage.displayTop + (cameraImage.displayBottom - cameraImage.displayTop) * (ppLeftY / cameraImage.height.pix)
+                ppRightXDeg = cameraImage.displayLeft + (cameraImage.displayRight - cameraImage.displayLeft) * (ppRightX / cameraImage.width.pix)
+                ppRightYDeg = cameraImage.displayTop + (cameraImage.displayBottom - cameraImage.displayTop) * (ppRightY / cameraImage.height.pix)
 
                 # get center of left and right pupils in degrees
                 eyeLeft = (ppLeftXDeg, ppLeftYDeg)
@@ -156,13 +160,15 @@ class pglTrackPixx3(pglEyeTracker):
 
                 # draw cross at the pupil center
                 if ppLeftMajor > 0:
-                    self.pgl.line(eyeLeft[0], eyeLeft[1]+self.pgl.yPix2Deg * ppLeftMajor/2, eyeLeft[0], eyeLeft[1]-self.pgl.yPix2Deg * ppLeftMajor/2, color=[0,1,0])
-                    self.pgl.line(eyeLeft[0]-self.pgl.xPix2Deg * ppLeftMajor/2, eyeLeft[1], eyeLeft[0]+self.pgl.xPix2Deg * ppLeftMajor/2, eyeLeft[1], color=[0,1,0])
+                    #self.pgl.line(eyeLeft[0], eyeLeft[1]+self.pgl.yPix2Deg * ppLeftMajor/2, eyeLeft[0], eyeLeft[1]-self.pgl.yPix2Deg * ppLeftMajor/2, color=[0,1,0])
+                    #self.pgl.line(eyeLeft[0]-self.pgl.xPix2Deg * ppLeftMajor/2, eyeLeft[1], eyeLeft[0]+self.pgl.xPix2Deg * ppLeftMajor/2, eyeLeft[1], color=[0,1,0])
+                    self.pgl.fixationCross(x=eyeLeft[0],y=eyeLeft[1],color=[0,1,0])
                 else:
-                    self.pgl.fixationCross(1,cameraImage.displayLeft, cameraImage.displayTop, color=[1,0,0])
+                    self.pgl.fixationCross(1,cameraImage.displayLeft, cameraImage.displayTop, color=[0.5,0,0.5])
                 if ppRightMajor > 0:
-                    self.pgl.line(eyeRight[0], eyeRight[1]+self.pgl.yPix2Deg * ppRightMajor/2, eyeRight[0], eyeRight[1]-self.pgl.yPix2Deg * ppRightMajor/2, color=[0,1,1])
-                    self.pgl.line(eyeRight[0]-self.pgl.xPix2Deg * ppRightMajor/2, eyeRight[1], eyeRight[0]+self.pgl.xPix2Deg * ppRightMajor/2, eyeRight[1], color=[0,1,1])
+                    #self.pgl.line(eyeRight[0], eyeRight[1]+self.pgl.yPix2Deg * ppRightMajor/2, eyeRight[0], eyeRight[1]-self.pgl.yPix2Deg * ppRightMajor/2, color=[0,1,1])
+                    #self.pgl.line(eyeRight[0]-self.pgl.xPix2Deg * ppRightMajor/2, eyeRight[1], eyeRight[0]+self.pgl.xPix2Deg * ppRightMajor/2, eyeRight[1], color=[0,1,1])
+                    self.pgl.fixationCross(x=eyeRight[0],y=eyeRight[1],color=[0,1,1])
                 else:
                     self.pgl.fixationCross(1,cameraImage.displayRight, cameraImage.displayTop, color=[1,0,0])
 
