@@ -38,6 +38,9 @@ class pglTrackPixx3(pglEyeTracker):
             pgl.oneTimeWarning("(pglTrackPixx3) pypixxlib is not installed. Please install it to use TrackPixx3.")
             return
         self.dp = dp
+        
+        # set tracker (higher level API to none, and open when needed in start function)
+        self.tracker = None
 
         #-->    # It is mandatory to call 'DPxOpen()' prior to using any VPixx device
         self.dp.DPxOpen()
@@ -99,10 +102,56 @@ class pglTrackPixx3(pglEyeTracker):
         self.lens = self.dp.TPxGetLens()
         print(f"(pglTrackPixx3) TrackPixx3 initialized with LED intensity {self.ledIntensity} and lens {self.lens*25+25} mm.")
     
+    @property
+    def isCalibrated(self):
+        # this runs every time you access eyetracker.isCalibrated
+        if self.device is not None:
+            return self.device.isDeviceCalibrated()
+        else:
+            return self._calibrated
+    @isCalibrated.setter
+    def isCalibrated(self, value):
+        self._calibrated = bool(value)
+        
+    def start(self, filename):
+        '''
+        start eye tracking and save to filename
+        '''
+        if self.tracker is None:
+            try: 
+                from pypixxlib.tracker import TRACKPixx3
+            except:
+                print(f"(pglTrackPixx3:start) ❌ Could not import tracker library")
+            self.tracker = TRACKPixx3()
+            self.tracker.open()
+            
+        # check calibration
+        if not self.isCalibrated:
+            print(f"(pglTrackPixx3) ❌ Eye tracker must be calibrated before running")
+            return
+        
+        # start recording
+        self.tracker.setUpDataRecording(filename)
+
+    def stop(self):
+        '''
+        stop eye tracking
+        '''
+        if self.tracker is None:
+            print(f"(pglTrackPixx3) ❌ Not currently saving data - run start first")
+            return
+    
+        # save buffered data
+        self.tracker.saveBufferedData()
+        
+        # close tracker
+        self.tracker.close()
+        self.tracker = None
+        
     #################################################
     # calibrateEyeImage
     ################################################
-    def calibrateEyeImage(self):
+    def calibrate(self):
         """
         Calibrate the eye image.
         """
