@@ -438,7 +438,10 @@ class pglTrackPixx3(pglEyeTracker):
         rawEyePosition = np.empty((nCalibrationPoints,4))
 
         # Wait for red button press to start calibration
-        print("(pglTrackPixx3:calibrateEyePosition) Press red button to start calibration or white button to exit")
+        instructions = "Press red button to start calibration or white button to exit"
+        print(f"(pglTrackPixx3:calibrateEyePosition) {instructions}")
+        self.pgl.text(f"{instructions}", line=1)
+        self.pgl.flush()
         event = self.pgl.eventsWaitFor(["red left", "white left"])
         if event.id == "white left":
             print("(pglTrackPixx3:calibrateEyePosition) Calibration cancelled.")
