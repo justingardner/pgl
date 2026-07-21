@@ -11,10 +11,7 @@
 from pgl import pglEyeTracker
 from pgl import pglDevice
 import numpy as np
-from TPxUtils import evaluate_bestpoly
 import matplotlib.pyplot as plt
-
-
 
 ###################################
 # TrackPixx3 device
@@ -147,11 +144,24 @@ class pglTrackPixx3(pglEyeTracker):
         # close tracker
         self.tracker.close()
         self.tracker = None
+
+    def status(self):
+        '''
+        print status
+        '''
+        # First get the TPxDict from TPxSetupSchedule()
+        TPxDict = self.dp.TPxSetupSchedule()
+
+        # Update it with current status
+        self.dp.TPxGetStatus(TPxDict)
+
+        for key, value in TPxDict.items():
+            print(f"{key}: {value}")
         
     #################################################
     # calibrateEyeImage
     ################################################
-    def calibrate(self):
+    def calibrateEyeImage(self):
         """
         Calibrate the eye image.
         """
@@ -281,7 +291,7 @@ class pglTrackPixx3(pglEyeTracker):
     #################################################
     # calibrateEyePosition
     ################################################
-    def calibrateEyePosition(self, eyeToCalibrate=3, calibrationWidth=15, calibrationHeight=15):
+    def calibrateEyePosition(self, eyeToCalibrate=3, calibrationWidth=15, calibrationHeight=15, nCalibrationPoints=5):
         """
         Calibrate the eye position. Based on TPxCalibrationTesting.py example code Step 4.
         
@@ -294,7 +304,7 @@ class pglTrackPixx3(pglEyeTracker):
             calibrationPoints: array holding calibration points in degrees
             rawEyePosition: array of rawEyePosition as reported by eye tracker
         """
-         ###################################################
+        ###################################################
         ## Step 4, Calibrations and calibration results. ##
         ###################################################
         # This step uses PsychToolbox to display targets on screen and gathers
@@ -330,7 +340,7 @@ class pglTrackPixx3(pglEyeTracker):
         # 1 - calibrate left eye only
         # 2 - calibrate right eye only
         # 3 - calibrate both eyes
-        eyeToCalibrate = 3
+        #eyeToCalibrate = 3 
 
         #====================== Display ======================================
 
@@ -361,21 +371,46 @@ class pglTrackPixx3(pglEyeTracker):
         calibrationRight = calibrationWidth / 2
 
         # calibration points in degrees
-        calibrationPoints = np.array([
-            [0, 0], # point 1: center
-            [0, calibrationTop], # point 2: top
-            [calibrationRight, 0], # point 3: right
-            [0, calibrationBottom], # point 4: bottom
-            [calibrationLeft, 0], # point 5: left
-            [calibrationRight, calibrationTop], # point 6: top right corner
-            [calibrationLeft, calibrationTop], # point 7: top left corner
-            [calibrationRight, calibrationBottom], # point 8: bottom right corner
-            [calibrationLeft, calibrationBottom], # point 9: bottom left corner
-            [calibrationRight/2, calibrationTop/2], # point 10: mid top right corner
-            [calibrationLeft/2, calibrationTop/2], # point 11: mid top left corner
-            [-calibrationLeft/2, calibrationBottom/2], # point 12: mid bottom left corner
-            [calibrationRight/2, calibrationBottom/2], # point 13: mid bottom right corner
-         ])
+        if nCalibrationPoints == 13:
+            calibrationPoints = np.array([
+                [0, 0], # point 1: center
+                [0, calibrationTop], # point 2: top
+                [calibrationRight, 0], # point 3: right
+                [0, calibrationBottom], # point 4: bottom
+                [calibrationLeft, 0], # point 5: left
+                [calibrationRight, calibrationTop], # point 6: top right corner
+                [calibrationLeft, calibrationTop], # point 7: top left corner
+                [calibrationRight, calibrationBottom], # point 8: bottom right corner
+                [calibrationLeft, calibrationBottom], # point 9: bottom left corner
+                [calibrationRight/2, calibrationTop/2], # point 10: mid top right corner
+                [calibrationLeft/2, calibrationTop/2], # point 11: mid top left corner
+                [calibrationLeft/2, calibrationBottom/2], # point 12: mid bottom left corner
+                [calibrationRight/2, calibrationBottom/2], # point 13: mid bottom right corner
+            ])
+        elif nCalibrationPoints == 9:
+            calibrationPoints = np.array([
+                [0, 0], # point 1: center
+                [0, calibrationTop], # point 2: top
+                [calibrationRight, 0], # point 3: right
+                [0, calibrationBottom], # point 4: bottom
+                [calibrationLeft, 0], # point 5: left
+                [calibrationRight, calibrationTop], # point 6: top right corner
+                [calibrationLeft, calibrationTop], # point 7: top left corner
+                [calibrationRight, calibrationBottom], # point 8: bottom right corner
+                [calibrationLeft, calibrationBottom], # point 9: bottom left corner
+            ])
+        elif nCalibrationPoints==5:
+            calibrationPoints = np.array([
+                [0, 0], # point 1: center
+                [0, calibrationTop], # point 2: top
+                [calibrationRight, 0], # point 3: right
+                [0, calibrationBottom], # point 4: bottom
+                [calibrationLeft, 0], # point 5: left
+            ])
+        else:
+            print(f"(pglTrackPixx3:calibrateEyePosition) nCalibrationPoints must be 5, 9 or 13 (={nCalibrationPoints})")
+            return
+
         nCalibrationPoints = calibrationPoints.shape[0]
 
         # minimum display time between calibration points
@@ -447,8 +482,12 @@ class pglTrackPixx3(pglEyeTracker):
             print("(pglTrackPixx3:calibrateEyePosition) Calibration cancelled.")
             return False
         print("(pglTrackPixx3:calibrateEyePosition) Calibration started.")
-        self.pgl.clearScreen((0,0,0))
+        self.pgl.clearScreen(0.5)
         self.pgl.flush()
+
+        # clear old calibration
+        self.dp.TPxClearDeviceCalibration()
+        self.dp.DPxWriteRegCache()
 
         # loop until break or return
         while True:
@@ -457,21 +496,14 @@ class pglTrackPixx3(pglEyeTracker):
 
                 # get x and y coordinates of the current calibration point
                 currentCalibrationX, currentCalibrationY = calibrationPoints[iCalibrationPoint,:]
-                
+
                 # print target positin
                 if self.pgl.verbose > 0:
                     print(f"(pglTrackPixx3:calibrateEyePosition) Calibration point {iCalibrationPoint+1}/{nCalibrationPoints} at ({currentCalibrationX}, {currentCalibrationY})")
-                
-                # update calibration point 
-                iCalibrationPoint += 1
-                if iCalibrationPoint >= nCalibrationPoints:
-                    # all calibration points have been displayed, exit loop
-                    print("(pglTrackPixx3:calibrateEyePosition) All calibration points displayed.")
-                    self.pgl.clearScreen((0,0,0))
-                    self.pgl.flush()
-                    finishCalibration = 1
-                    break
 
+                # update calibration point index
+                iCalibrationPoint += 1 
+                
                 # Show new target specified by index i in xy
         #-->    # To have a valid calibration, it is necessary to ensure that the
                 # subject is looking at the correct spot when getting the eye
@@ -496,14 +528,33 @@ class pglTrackPixx3(pglEyeTracker):
                 # raw eye data to calibrate screen position.
     #-->        # It is mandatory to call this function to gather eye
                 # information for all targets included in the calibration
-                rawEyePosition[iCalibrationPoint,:] = self.dp.TPxGetEyePositionDuringCalib_returnsRaw(currentCalibrationX, currentCalibrationY, eyeToCalibrate)
-                # print
-                if self.pgl.verbose > 0:
-                    print(f"(pglTrackPixx3:calibrateEyePosition) Eye data for calibration point {iCalibrationPoint} acquired: {rawEyePosition[iCalibrationPoint,0:4]}")
+                
+                # busy wait to get a valid eye position
+                eyePosition = self.dp.TPxGetEyePosition()
+                print(eyePosition)
+                while any(x == 0 for x in eyePosition[4:8]):
+                    eyePosition = self.dp.TPxGetEyePosition()
+                    
+                # now, get raw eye position fof the calibration point
+                rawEyePosition[iCalibrationPoint-1,:] = self.dp.TPxGetEyePositionDuringCalib_returnsRaw(currentCalibrationX, currentCalibrationY, eyeToCalibrate)
+                if any(rawEyePosition[iCalibrationPoint-1]==0.0):
+                    print(f"(pglTrackPixx3:calibrateEyePosition) Eye data for calibration point {iCalibrationPoint} NOT succesfully acquired. Trying again... {rawEyePosition[iCalibrationPoint-1,0:4]}")
+                    #iCalibrationPoint -= 1
+                else:
+                    # print
+                    print(f"(pglTrackPixx3:calibrateEyePosition) Eye data for calibration point {iCalibrationPoint} acquired: {rawEyePosition[iCalibrationPoint-1,0:4]}")
                 # clear screen
-                self.pgl.clearScreen((0,0,0))
+                self.pgl.clearScreen(0.5)
                 self.pgl.flush()
-            
+                # update calibration point 
+                if iCalibrationPoint >= nCalibrationPoints:
+                    # all calibration points have been displayed, exit loop
+                    print("(pglTrackPixx3:calibrateEyePosition) All calibration points displayed.")
+                    self.pgl.clearScreen(0.5)
+                    self.pgl.flush()
+                    finishCalibration = 1
+                    break
+        
             # update timer
             self.dp.DPxUpdateRegCache()
             t = self.dp.DPxGetTime()
@@ -520,9 +571,10 @@ class pglTrackPixx3(pglEyeTracker):
         
         return (calibrationPoints, rawEyePosition)
 
-    def displayCalibration(calibrationPoints, rawEyePostion):
+    def displayCalibration(self, calibrationPoints, rawEyePosition, calibrationsCoeff=None, showInterpolation=False):
         '''
         dispaly calibration run above
+
         '''
         # This section presents results from the data gathering and
         # interpolation between calibration points to evaluate the calibration.
@@ -559,8 +611,9 @@ class pglTrackPixx3(pglEyeTracker):
         # - 0 to 8 are the coefficients for the right eye x axis.
         # - 9 to 17 are the coefficients for the right eye y axis.
         # - 18 to 26 are the coefficients for the left eye x axis.
-        # - 27 to 35 are the coefficients for the left eye y axis.                
-        calibrationsCoeff = dp.TPxGetCalibCoeffs()
+        # - 27 to 35 are the coefficients for the left eye y axis. 
+        if calibrationsCoeff is None:               
+            calibrationsCoeff = self.dp.TPxGetCalibCoeffs()
         coeffXR = calibrationsCoeff[0:9]
         coeffYR = calibrationsCoeff[9:18]
         coeffXL = calibrationsCoeff[18:27]
@@ -571,52 +624,68 @@ class pglTrackPixx3(pglEyeTracker):
         # these are returned as (x,y) tuples, so convert them to arrays, then transpose to get x and y as columns
         calibratedR = np.array( evaluate_bestpoly(rawEyePosition[:,0],rawEyePosition[:,1],coeffXR,coeffYR) ).transpose()
         calibratedL = np.array( evaluate_bestpoly(rawEyePosition[:,2],rawEyePosition[:,3],coeffXL,coeffYL) ).transpose()
-    
+
         # Initialize calibrated interpolated points
-        interpolatedCalibratedR = np.full((nPairs, nPoints, 2),np.nan)
-        interpolatedCalibratedL = np.full((nPairs, nPoints, 2),np.nan)
-        for i in range(nPairs):
-            # Interpolate raw data between calibration points
-            interpolatedRawXR = np.linspace(rawEyePosition[interpol[i,0],0],rawEyePosition[interpol[i,1],0], nPoints)
-            interpolatedRawYR = np.linspace(rawEyePosition[interpol[i,0],1],rawEyePosition[interpol[i,1],1], nPoints)
-            interpolatedRawXL = np.linspace(rawEyePosition[interpol[i,0],2],rawEyePosition[interpol[i,1],2], nPoints)
-            interpolatedRawYL = np.linspace(rawEyePosition[interpol[i,0],3],rawEyePosition[interpol[i,1],3], nPoints)
+        if showInterpolation:
+            interpolatedCalibratedR = np.full((nPairs, nPoints, 2),np.nan)
+            interpolatedCalibratedL = np.full((nPairs, nPoints, 2),np.nan)
+            for i in range(nPairs):
+                # Interpolate raw data between calibration points
+                interpolatedRawXR = np.linspace(rawEyePosition[interpol[i,0],0],rawEyePosition[interpol[i,1],0], nPoints)
+                interpolatedRawYR = np.linspace(rawEyePosition[interpol[i,0],1],rawEyePosition[interpol[i,1],1], nPoints)
+                interpolatedRawXL = np.linspace(rawEyePosition[interpol[i,0],2],rawEyePosition[interpol[i,1],2], nPoints)
+                interpolatedRawYL = np.linspace(rawEyePosition[interpol[i,0],3],rawEyePosition[interpol[i,1],3], nPoints)
             
-            # 'evaluate_bestpoly()' applies the polynomial tranformation to
-            # raw eye positions and returns calibrated gaze position on screen.
-            interpolatedCalibratedR[i,:,:] = np.dstack(evaluate_bestpoly(interpolatedRawXR, interpolatedRawYR, coeffXR, coeffYR)).squeeze()
-            interpolatedCalibratedL[i,:,:] = np.dstack(evaluate_bestpoly(interpolatedRawXL, interpolatedRawYL, coeffXL, coeffYL)).squeeze()
+                # 'evaluate_bestpoly()' applies the polynomial tranformation to
+                # raw eye positions and returns calibrated gaze position on screen.
+                interpolatedCalibratedR[i,:,:] = np.dstack(evaluate_bestpoly(interpolatedRawXR, interpolatedRawYR, coeffXR, coeffYR)).squeeze()
+                interpolatedCalibratedL[i,:,:] = np.dstack(evaluate_bestpoly(interpolatedRawXL, interpolatedRawYL, coeffXL, coeffYL)).squeeze()
             
-        # Reshape the array of interpolated points from 12x10x2 into 120x2 (x and y columns)
-        interpolatedCalibratedR = interpolatedCalibratedR.reshape(120,2)
-        interpolatedCalibratedL = interpolatedCalibratedL.reshape(120,2)
+            # Reshape the array of interpolated points from 12x10x2 into 120x2 (x and y columns)
+            interpolatedCalibratedR = interpolatedCalibratedR.reshape(120,2)
+            interpolatedCalibratedL = interpolatedCalibratedL.reshape(120,2)
 
         #>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
         #                       DISPLAY RESULT 
         #>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-        plt.figure(figsize=(8, 8))
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 12))
 
+        # Top plot: Calibrated positions
         # Original calibration targets
-        plt.scatter(calibrationPoints[:,0],calibrationPoints[:,1],s=100,marker='o',label='Calibration targets')
+        ax1.scatter(calibrationPoints[:,0], calibrationPoints[:,1], s=100, marker='o', label='Calibration targets')
 
         # Calibrated eye positions
-        plt.scatter(calibratedR[:,0],calibratedR[:,1],s=50,marker='x',label='Right eye calibrated')
-        plt.scatter(calibratedL[:,0],calibratedL[:,1],s=50,marker='+',label='Left eye calibrated')
+        ax1.scatter(calibratedR[:,0], calibratedR[:,1], s=50, marker='x', label='Right eye calibrated')
+        ax1.scatter(calibratedL[:,0], calibratedL[:,1], s=50, marker='+', label='Left eye calibrated')
 
         # Interpolated calibrated points
-        plt.scatter(interpolatedCalibratedR[:,0],interpolatedCalibratedR[:,1],s=10,label='Right eye interpolation')
-        plt.scatter(interpolatedCalibratedL[:,0],interpolatedCalibratedL[:,1],s=10,label='Left eye interpolation')
+        if showInterpolation:
+            ax1.scatter(interpolatedCalibratedR[:,0], interpolatedCalibratedR[:,1], s=10, label='Right eye interpolation')
+            ax1.scatter(interpolatedCalibratedL[:,0], interpolatedCalibratedL[:,1], s=10, label='Left eye interpolation')
 
         # Match screen coordinate convention
-        plt.gca().invert_yaxis()
-        plt.axis('equal')
-        plt.xlabel('Screen X (deg)')
-        plt.ylabel('Screen Y (deg)')
-        plt.title('TRACKPixx Calibration Validation')
-        plt.legend()
-        plt.grid(True)
-        plt.show()
-        
+        ax1.invert_yaxis()
+        ax1.axis('equal')
+        ax1.set_xlabel('Screen X (deg)')
+        ax1.set_ylabel('Screen Y (deg)')
+        ax1.set_title('TRACKPixx Calibration Validation')
+        ax1.legend()
+        ax1.grid(True)
+
+        # Bottom plot: Raw eye positions
+        ax2.scatter(rawEyePosition[:,0], rawEyePosition[:,1], s=50, marker='x', label='Right eye raw')
+        ax2.scatter(rawEyePosition[:,2], rawEyePosition[:,3], s=50, marker='+', label='Left eye raw')
+
+        ax2.invert_yaxis()
+        ax2.axis('equal')
+        ax2.set_xlabel('Screen X (deg)')
+        ax2.set_ylabel('Screen Y (deg)')
+        ax2.set_title('Raw Eye Positions')
+        ax2.legend()
+        ax2.grid(True)
+
+        plt.tight_layout()
+        plt.show()    
     #################################################
     # getCameraImage
     #################################################
@@ -657,3 +726,29 @@ class pglTrackPixx3(pglEyeTracker):
             return False
         else:
             return self.pgl.isOpen()
+
+#################################################
+# FROM TPxUtils
+#################################################
+def evaluate_bestpoly(xi,yi,cx,cy):
+    '''
+    Apply following polynomial transformation to TPxCalibration raw vector data
+    to predict Cartesian screen coordinates:
+        
+        screen = T(x,y) = b0 + b1(x) + b2(y) + b3(x^2) + b4(y^2) + b5(x^3) + b6(xy) + b7(x^2y) + b8(x^2y^2)
+        
+    args:
+        xi (ndarray): raw vector data for x dimension
+        yi (ndarray): raw vector data for y dimension
+        cx (ndarray): best fitting polynomial coefficients for x dimension
+        cy (ndarray): best fitting polynomial coefficients for y dimension
+    '''
+    xi = np.array(xi).flatten() # ensure 1D ndarray
+    yi = np.array(yi).flatten() # ensure 1D ndarray
+    cx = np.array(cx).flatten() # ensure 1D ndarray
+    cy = np.array(cy).flatten() # ensure 1D ndarray
+    
+    # create data matrix
+    m = np.dstack(( np.ones(xi.size), xi, yi, xi**2, yi**2, xi**3, xi*yi, xi**2*yi, xi**2*yi**2 )).squeeze()
+    
+    return ( m @ cx, m @ cy)

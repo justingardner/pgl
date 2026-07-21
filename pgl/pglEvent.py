@@ -136,7 +136,7 @@ class pglEvents():
             pglEvent: The first matching event.
         """
         while True:
-            events = self.devicesPoll()
+            events = self.poll()
             if events:
                 for event in events:
                     if hasattr(event, 'id') and event.id in waitForList:
