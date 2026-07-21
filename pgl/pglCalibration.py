@@ -1287,46 +1287,54 @@ class pglDisplayLuminanceCalibrationData(HasTraits, pglSerialize):
             maxDiff = np.max(np.abs(maxMeasurements - minMeasurements)/measurements * 100)
             print(f"Maximum difference between max and min measurements: {maxDiff:.3f}%")
         
-    def display(self, gamma=None):
+    def display(self, gamma=None, ax=None):
         '''
         display graph of calibration data
-        
         Args:
             gamma (float, optional): If provided, display the ideal gamma curve (1.0 or 2.2 or whatever) for comparison.
+            ax (matplotlib.axes.Axes, optional): If provided, plot into this axis instead of creating a new figure.
         '''
         if self.calibrationValues is None or self.calibrationMeasurements is None:
             print("(pglDisplayLuminanceCalibrationData) No calibration data to display.")
             return
-        
+
         # set the ideal gamma if we have one saved
         if gamma is None and self.gamma != 0:
             gamma = self.gamma
-            
-        plt.figure(figsize=(10, 6))
+
+        # use the passed-in axis, or create a new figure/axis if none given
+        createdOwnFigure = ax is None
+        if createdOwnFigure:
+            fig, ax = plt.subplots(figsize=(10, 6))
+
         # plot raw data points
-        plt.plot(self.calibrationValues, self.calibrationMeasurements, '.')
+        ax.plot(self.calibrationValues, self.calibrationMeasurements, '.')
+
         # plot median
         values, measurements, minMeasurements, maxMeasurements = self.getMedianMeasurements()
         if gamma is not None:
             # plot points without line
-            plt.plot(values, measurements, 'o', label='Median', color='black', markeredgecolor='white', markersize=8)
+            ax.plot(values, measurements, 'o', label='Median', color='black', markeredgecolor='white', markersize=8)
             # plot ideal gamma curve
             idealMeasurements = np.power(values, gamma)
             idealMeasurements = idealMeasurements * (self.maxLuminance - self.minLuminance) + self.minLuminance
-            plt.plot(values, idealMeasurements, 'r--', label=f'Ideal Gamma {gamma}')        
+            ax.plot(values, idealMeasurements, 'r--', label=f'Ideal Gamma {gamma}')
         else:
-            plt.plot(values, measurements, 'o-', label='Median', color='black', markeredgecolor='white', markersize=8)
-        plt.legend()
-        plt.xlabel("Display Value (normalized 0-1)")
-        plt.ylabel(f"Measured Luminance ({self.units})")
+            ax.plot(values, measurements, 'o-', label='Median', color='black', markeredgecolor='white', markersize=8)
+
+        ax.legend()
+        ax.set_xlabel("Display Value (normalized 0-1)")
+        ax.set_ylabel(f"Measured Luminance ({self.units})")
+
         if gamma is None:
-            plt.title(f"{self.getDisplayName()} UUID: {self.getUUID()}\n{self.deviceDescription}: {self.creationDateTime}\nnRepeats: {self.nRepeats} nSteps: {self.nSteps}\nmin = {self.minLuminance:.2f}, max = {self.maxLuminance:.2f}\nCalibration data")
+            ax.set_title(f"{self.getDisplayName()} UUID: {self.getUUID()}\n{self.deviceDescription}: {self.creationDateTime}\nnRepeats: {self.nRepeats} nSteps: {self.nSteps} min = {self.minLuminance:.2f}, max = {self.maxLuminance:.2f}\nCalibration data")
         else:
-            plt.title(f"{self.getDisplayName()} UUID: {self.getUUID()}\n{self.deviceDescription}: {self.creationDateTime}\nnRepeats: {self.nRepeats} nSteps: {self.nSteps}\nmin = {self.minLuminance:.2f}, max = {self.maxLuminance:.2f}\nValidation for gamma: {gamma if gamma is not None else 'N/A'}")
-            
-        plt.grid(True)
-        plt.show()
-        
+            ax.set_title(f"{self.getDisplayName()} UUID: {self.getUUID()}\n{self.deviceDescription}: {self.creationDateTime}\nnRepeats: {self.nRepeats} nSteps: {self.nSteps} min = {self.minLuminance:.2f}, max = {self.maxLuminance:.2f}\nValidation for gamma: {gamma if gamma is not None else 'N/A'}")
+
+        ax.grid(True)
+
+        if createdOwnFigure:
+            plt.show()        
     def appendValue(self, value, mode="calibration"):
         '''
         Append a calibration value.

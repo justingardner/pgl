@@ -27,6 +27,8 @@ import ipywidgets as widgets
 from traitlets import HasTraits, Float, Int, List, TraitError, Unicode, Dict, default, link, Bool, TraitType
 from functools import partial
 import math
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+from matplotlib.figure import Figure
 
 #######################################
 # _pglTraitsDialog
@@ -156,6 +158,14 @@ class _pglTraitsDialog(QDialog):
                 continue
             self._addTraitWidget(traitName, trait)
 
+        # Shared matplotlib axis for any plot-button traits
+        self.figure = Figure(figsize=(5, 3))
+        self.plotAxis = self.figure.add_subplot(111)
+        self.plotCanvas = FigureCanvasQTAgg(self.figure)
+        self.plotCanvas.setMinimumHeight(680)
+        self.plotCanvas.setVisible(False)
+        self.formLayout.addRow(self.plotCanvas)
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QScrollArea.NoFrame)
@@ -171,7 +181,7 @@ class _pglTraitsDialog(QDialog):
         mainLayout.setContentsMargins(0, 0, 0, 0)
         mainLayout.setSpacing(0)
         mainLayout.addWidget(scroll)
-
+        
         buttonBar = QWidget()
         buttonBar.setObjectName("buttonBar")
         bl = QHBoxLayout(buttonBar)
@@ -225,7 +235,7 @@ class _pglTraitsDialog(QDialog):
         # RGB list
         elif isinstance(trait, List) and trait.metadata.get("isRGB", False):
             self._addRGB(traitName, trait, current, helpText)
-
+            
         # Path
         elif isinstance(trait, Unicode) and trait.metadata.get("isPath", False):
             self._addText(traitName, trait, current, helpText)
@@ -233,6 +243,10 @@ class _pglTraitsDialog(QDialog):
         # Unicode
         elif isinstance(trait, Unicode):
             self._addText(traitName, trait, current, helpText)
+
+        # List with a plot button
+        elif isinstance(trait, List) and trait.metadata.get("hasPlotButton", False):
+            self._addListWithPlotButton(traitName, trait, current, helpText)
 
         # List -> dropdown
         elif isinstance(trait, List):
@@ -432,6 +446,44 @@ class _pglTraitsDialog(QDialog):
                     b.setValue(float(value[i]))
 
         self._register(traitName, trait, row, setter)
+        
+    # ----- List with dropdown + plot button -----
+    def _addListWithPlotButton(self, traitName, trait, current, helpText):
+        plotFunc = trait.metadata.get("buttonFunction", None)
+
+        combo = QComboBox()
+        combo.addItems([str(item) for item in current])
+        combo.setToolTip(helpText)
+
+        button = QPushButton(trait.metadata.get("buttonLabel", "Plot"))
+        button.setToolTip(helpText)
+
+        def onClick():
+            if plotFunc is None:
+                return
+            selected = combo.currentText()
+            # get the plotFunc (the metadata is a string which we need to bind to the class function)
+            method = getattr(self.settings, plotFunc, None)
+            if method is None:
+                return
+            self.plotAxis.clear()
+            method(self.plotAxis, selected)
+            self.plotCanvas.draw()
+            self.plotCanvas.setVisible(True)
+
+        button.clicked.connect(onClick)
+
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.addWidget(combo, 1)
+        h.addWidget(button)
+
+        def setter(value):
+            combo.clear()
+            combo.addItems([str(item) for item in value])
+
+        self._register(traitName, trait, row, setter)
 
     #########################################
     # Helpers
@@ -513,7 +565,7 @@ class _pglTraitsDialog(QDialog):
             background-color: #303338;
         }
         QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled,
-        QComboBox:disabled, QCheckBox:disabled {
+        QComboBox:disabled  {
             color: #6b7078;
             background-color: #232427;
         }

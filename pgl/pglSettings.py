@@ -29,19 +29,22 @@ from .pglDialog import pglSettingsEditable, pglTraitsDialog
 import Quartz
 import CoreFoundation
 from AppKit import NSScreen
+from .pglBase import pglBase
+import re
 
 displayDuration = 5  # seconds
 #######################################
 # Mixin class for pgl to provide settings management
 #######################################
-class pglMainSettingsManager:
+class pglSettingsManager:
     """
     Mixin class for pgl to provide settings management.
     """
     def __init__(self):   
         pass
     
-    def settings(self):
+    @classmethod
+    def settings(cls):
         """
         Edit pgl settings. Brings up widget interface to edit settings
         """
@@ -55,7 +58,8 @@ class pglMainSettingsManager:
         # display the selected settings
         settingsSelect.settings[0].edit() 
     
-    def displaySettings(self):
+    @classmethod
+    def displaySettings(cls):
         """
         Edit pgl display settings. Brings up widget interface to edit display settings
         """
@@ -69,16 +73,17 @@ class pglMainSettingsManager:
         # display the selected settings
         #pglTraitsDialog(displaySettingsSelect.displaySettings[0])
     
-    def getDisplayNames(self, displayIndex=None):
+    @classmethod
+    def getDisplayNames(cls, displayIndex=None):
         
                 
         displayNames.append('Windowed')
 
         # get names from gpuInfo
-        if not self.gpuInfo:
+        if not pglBase.gpuInfo:
             return displayNames
 
-        for gpuData in self.gpuInfo.values():
+        for gpuData in pglBase.gpuInfo.values():
             displays = gpuData.get("Displays", [])
             for display in displays:
                 name = f"{display.get('DisplayName', f'Display {len(displayNames)}')}: {display.get('Display Type', 'Unknown')}"
@@ -94,7 +99,8 @@ class pglMainSettingsManager:
         
         return displayNames
     
-    def getDisplayInfo(self):
+    @classmethod
+    def getDisplayInfo(cls):
         '''
         Get info on displays
         '''
@@ -148,19 +154,31 @@ class pglMainSettingsManager:
                     # localizedName is available on macOS 10.15+
                     displaySettings.displayName = screen.localizedName()
                 
+            # get all the luminance calibrations
+            luminanceCalibrationDir = cls.getDisplayLuminanceCalibrationDir(displaySettings=displaySettings)
+            
+            # find all YYMMDD* directories underneath that
+            pattern = re.compile(r'^\d{8}(_.*)?$')
+            matches = [p for p in luminanceCalibrationDir.rglob('*') if p.is_dir() and pattern.match(p.name)]
+
+            # check for valid calibrations in the directory
+            validLuminanceCalibrations= ['None']
+            for m in sorted(matches):
+                calibrationFile = m / "calibration.json"
+                if calibrationFile.is_file:
+                    validLuminanceCalibrations.append(m.name)
+            if len(validLuminanceCalibrations) > 1:
+                validLuminanceCalibrations.append('Latest')
+            
+            # put the luminanceCalibrations in displaySettings
+            displaySettings.luminanceCalibration = validLuminanceCalibrations
+            
+            # append to our list of all displays
             displays.append(displaySettings)
         return(displays)
-            
-#######################################
-# Mixin class for pglExperiment which manages pgl settings 
-#######################################
-class pglSettingsManager:
-    """
-    pglSettingsManager class for managing settings of pgl.
-    """
-    def __init__(self):   
-        pass
-    def getPGLDir(self):
+         
+    @staticmethod       
+    def getPGLDir():
         """
         Get the directory where settings are stored.
 
@@ -180,7 +198,9 @@ class pglSettingsManager:
                 return None
 
         return pglDir
-    def getSettingsDir(self):
+    
+    @classmethod
+    def getSettingsDir(cls):
         """
         Get the directory where screen settings are stored.
 
@@ -188,7 +208,7 @@ class pglSettingsManager:
             str: The directory path where settings are stored.
         """
         # get the settingsDir
-        settingsDir = self.getPGLDir() / "settings"
+        settingsDir = cls.getPGLDir() / "settings"
         
         # check if it exists, create if not
         if not settingsDir.exists():
@@ -201,7 +221,70 @@ class pglSettingsManager:
 
         return settingsDir
     
-    def getCalibrationsDir(self):
+    @classmethod
+    def getDisplayLuminanceCalibrationDir(cls, displaySettings=None, makeDir=False):
+        '''
+        Get the directory where luminance calibrations live
+        
+        Args:
+            displaySettings (default=None): pglDisplaySettings from which displayName and uuid will be used
+                to find the matching directory. If not specified, will just return the top level displayDir
+            makeDir (default=False): Set to True to create the directory if it does not already exist
+        
+        Returns:
+            Path: The directory path where display luminance calibrations are stored        
+        '''
+        luminanceCalibrationDir = cls.getDisplayDir(displaySettings, makeDir) / "luminance"
+        
+        # check if it exists, create if not
+        if makeDir and not luminanceCalibrationDir.exists():
+            try:
+                luminanceCalibrationDir.mkdir(parents=True, exist_ok=True)
+                display(HTML(f"<b>(pglScreenSettings:getDisplayDir)</b> Created directory: {luminanceCalibrationDir}"))
+            except Exception as e:
+                display(HTML(f"<b>(pglScreenSettings:getDisplayDir)</b> Error creating directory {luminanceCalibrationDir}: {e}"))
+                return None
+        return luminanceCalibrationDir
+
+    @classmethod
+    def getDisplayDir(cls, displaySettings=None, makeDir=False):
+        """
+        Get the directory where display settings are saved
+        
+        Args:
+            displaySettings (default=None): pglDisplaySettings from which displayName and uuid will be used
+                to find the matching directory. If not specified, will just return the top level displayDir
+            makeDir (default=False): Set to True to create the directory if it does not already exist
+        
+        Returns:
+            Path: The directory path where display settings are stored
+        """
+        # get the main directory for displays
+        displayDir = cls.getPGLDir() / "displays"
+        
+        # append display specific directory if displaySettings is passed in
+        if displaySettings is not None:
+            # get a valid filename for displayName
+            displayName = pglBase.makeValidFilename(displaySettings.displayName)
+            # and append that if it is not empty
+            if displayName != "":
+                displayDir = displayDir / displayName
+            else:
+                display(HTML(f"<b>(pglScreenSettings:getDisplayDir)</b> No valid displayName found in displaySettings"))
+                
+        # check if it exists, create if not
+        if makeDir and not displayDir.exists():
+            try:
+                displaysDir.mkdir(parents=True, exist_ok=True)
+                display(HTML(f"<b>(pglScreenSettings:getDisplayDir)</b> Created directory: {displayDir}"))
+            except Exception as e:
+                display(HTML(f"<b>(pglScreenSettings:getDisplayDir)</b> Error creating directory {displayDir}: {e}"))
+                return None
+
+        return displayDir
+
+    @classmethod
+    def getCalibrationsDir(cls):
         """
         Get the directory where screen calibrations are stored
 
@@ -209,7 +292,7 @@ class pglSettingsManager:
             str: The directory path where calibrations are stored
         """
         # get the screenSetttingsDir
-        calibrationsDir = self.getPGLDir() / "calibrations"
+        calibrationsDir = cls.getPGLDir() / "calibrations"
         
         # check if it exists, create if not
         if not calibrationsDir.exists():
@@ -221,8 +304,9 @@ class pglSettingsManager:
                 return None
 
         return calibrationsDir
-
-    def getSettings(self, settingsName=None):
+    
+    @classmethod
+    def getSettings(cls, settingsName=None):
         """
         Load settings from a JSON file and return an instance of the settings class.
         This will look in the directory returned by getSettingsDir().
@@ -240,7 +324,7 @@ class pglSettingsManager:
             settingsName = "Default"
             
         # get the settings directory and create the full path to the settings file
-        settingsDir = self.getSettingsDir()
+        settingsDir = cls.getSettingsDir()
         settingsPath = Path(settingsDir) / settingsName
         settingsPath = settingsPath.with_suffix(".json")
         
@@ -261,7 +345,7 @@ class pglSettingsManager:
     #displayNames = List(Unicode(), help="Settings names")
             
 class pglDisplaySettings(pglSettingsEditable):
-    displayName = List(Unicode(), help="Names of screen")
+    displayName = Unicode("", help="Names of screen")
     displayModes = List(Unicode(), help="List of all supported display modes")
     displayWidth = Int(0, help="Display widh in pixels", enabled=False)
     displayHeight = Int(0, help="Display height in pixels", enabled=False)
@@ -270,9 +354,22 @@ class pglDisplaySettings(pglSettingsEditable):
     vendor = Int(0, help="Vendor number", enabled=False)
     model = Int(0, help="Model number", enabled=False)
     serialNumber = Int(0, help="Serial number", enabled=False)
-    isMain = Bool(False, help="Whether the display is the main display", enabled=False)
+    isMain = Bool(False, help="Whether the display is the main display", enabled=True)
     isBuiltin = Bool(False, help="Whether the display is the built-in display of e.g. a laptop", enabled=False)
-    luminanceCalibration = List(Unicode(), default_value=['Latest','None'], help="Which calibration to use")
+    luminanceCalibration = List(Unicode(), hasPlotButton=True, buttonFunction="plotLuminanceCalibration", default_value=['Latest','None'], help="Which calibration to use")
+    
+    def plotLuminanceCalibration(self, ax, selected):
+        '''
+        load and plot the luminance calibration on the passed in axis
+        '''
+        # load the calibration
+        luminanceCalibrationDir = pglSettingsManager.getDisplayLuminanceCalibrationDir(self) / selected 
+        
+        # load the calibrtion
+        from .pglCalibration import pglDisplayLuminanceCalibrationData
+        calibration = pglDisplayLuminanceCalibrationData.load(displayName=self.displayName, filepath=luminanceCalibrationDir)
+        calibration.display(ax=ax)
+        pass
 
 # Screen settings select
 class pglSettingsSelect(pglSettingsEditable):

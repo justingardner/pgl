@@ -19,7 +19,7 @@ import math
 from dataclasses import dataclass, field
 from .pglKeyboardMouse import pglKeyboardMouse
 from pathlib import Path
-from .pglSettings import pglSettingsManager, pglSettings, pglSettingsEditable
+from .pglSettings import pglSettings, pglSettingsEditable
 from IPython.display import display, HTML
 import ipywidgets as widgets
 from .pglBase import pglDisplayMessage
@@ -37,6 +37,7 @@ from enum import Enum
 from . import pglTimestamp
 from .pglEyeTracker import pglEyeTracker
 from .pglEyelink import pglEyelink, pglEyelinkData
+from .pglSettings import pglSettingsManager
 
 #######################
 # for returning stats
@@ -52,7 +53,7 @@ class Stats:
 ##############################################s
 # Experiment base class
 ##############################################
-class pglExperimentBase(pglSettingsManager):
+class pglExperimentBase():
     '''
     Base class for pglExperiment which runs experiments
     and pglExperimentAnalysis which is used for loading and
@@ -83,7 +84,7 @@ class pglExperimentBase(pglSettingsManager):
         # get settings
         self.settings = settings
         if self.settings is None:
-            self.settings = self.getSettings(settingsName)
+            self.settings = pglSettingsManager.getSettings(settingsName)
         
         # if there was some error, then display it
         if self.settings is None:
