@@ -44,9 +44,9 @@ class pglSerialize:
     ##########################
     def save(self, filename):
         """Save object to JSON file"""
-        print(f"(pglSerialize) Saving {self.__class__.__name__} to '{filename}'")
         try:
             filename = Path(filename).with_suffix(".json")
+            print(f"(pglSerialize) Saving {self.__class__.__name__} to '{filename}'")
             with open(filename, 'w') as f:
                 f.write(self.toJSON())
         except PermissionError:

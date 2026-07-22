@@ -248,9 +248,9 @@ class pglDisplayCalibration():
         '''
         pass
 
-    def calibrateTiming(self, settingsName):
+    def calibrateTemporal(self, settingsName):
         '''
-        User faceing function which runs the timing calibration process. 
+        User faceing function which runs the temporal calibration process. 
         
         You need to make sure that you have initialized with a digitalIODevice or run addDigitalIODevice
         
@@ -261,7 +261,7 @@ class pglDisplayCalibration():
             print("(pglDisplayCalibration) No digitalIO device specified. Please specify on initialization of pglDisplayCalibration or use addDigitalIODevice")
             return None
 
-        self.timingCalibrationData = None
+        self.temporalCalibrationData = None
         
         # open the display with specified settings
         e = pglExperiment(self.pgl, settingsName)
@@ -273,41 +273,41 @@ class pglDisplayCalibration():
             return None
         
         # initialize the data structure for saving data
-        self.timingCalibrationData = pglDisplayTimingCalibrationData()
+        self.temporalCalibrationData = pglDisplayTemporalCalibrationData()
 
         # set information
-        self.timingCalibrationData.settingsName = settingsName
-        self.timingCalibrationData.settings = e.getSettings(settingsName)
-        self.timingCalibrationData.deviceDescription = self.digitalIODevice.deviceDescription
+        self.temporalCalibrationData.settingsName = settingsName
+        self.temporalCalibrationData.settings = e.getSettings(settingsName)
+        self.temporalCalibrationData.deviceDescription = self.digitalIODevice.deviceDescription
         
         # get calibration date and time
-        self.timingCalibrationData.creationDateTime = datetime.now()
+        self.temporalCalibrationData.creationDateTime = datetime.now()
 
         try:
             # get display info if available
             gpu = next(iter(self.pgl.gpuInfo.values()))
             displays = gpu.get('Displays', [])
-            self.timingCalibrationData.displayInfo = displays[self.timingCalibrationData.settings.displayNumber-1]
+            self.temporalCalibrationData.displayInfo = displays[self.temporalCalibrationData.settings.displayNumber-1]
             
             # get info from pgl
-            self.timingCalibrationData.metalInfo = self.pgl.info()
+            self.temporalCalibrationData.metalInfo = self.pgl.info()
             
         except Exception as ex:
             print(f"(pglDisplayCalibration:_calibrateTIming) Warning: Could not get display info: {ex}")
 
-        # run internal function to calibrate the timing
-        self.timingCalibrationData.analogTraceData = self._calibrateTiming()
+        # run internal function to calibrate the temporal
+        self.temporalCalibrationData.analogTraceData = self._calibrateTemporal()
         
         # and save
-        self.timingCalibrationData.save()
+        self.temporalCalibrationData.save()
         
         # plot data
-        self.timingCalibrationData.display()
+        self.temporalCalibrationData.display()
 
         # close screen
         e.endScreen()
     
-    def _calibrateTiming(self):
+    def _calibrateTemporal(self):
         
         # set stimulus duration in frames
         # first number is pre-stimulus black
@@ -1045,7 +1045,7 @@ class pglDisplayCalibration():
         return(filepath)
 
 # Calibration settings, subclass of pglSettings to inherit load/save functionality
-class pglDisplayTimingCalibrationData(HasTraits, pglSerialize):
+class pglDisplayTemporalCalibrationData(HasTraits, pglSerialize):
     
     settingsName = Unicode("Default", help="Settings name used to open display")
     settings = Instance(pglSettings, allow_none=True, help="Settings used during calibration") 
@@ -1057,16 +1057,19 @@ class pglDisplayTimingCalibrationData(HasTraits, pglSerialize):
     syncChannel = Int(1, help="Channel with sync pulse on it")     
     syncChannelThreshold = Float(0.2, help="Threshold for considering sync to be active")
     
-    def display(self):
+    def display(self, fig=None):
         '''
         display the timing calibration data
+        
+        Args:
+            fig:     matplotlib fig to plot into, None to create new plot
         '''
         if self.analogTraceData is None:
-            print(f"(pglDisplayTimingCalibrationData:No data to display)")
+            print(f"(pglDisplaytemporalCalibrationData:No data to display)")
             return
         
         # display the analog traces        
-        self.analogTraceData.display(digitalSyncChannel=self.syncChannel, digitalSyncThreshold=self.syncChannelThreshold, ignoreInitial=0)
+        self.analogTraceData.display(fig=fig, digitalSyncChannel=self.syncChannel, digitalSyncThreshold=self.syncChannelThreshold, ignoreInitial=0)
 
     def save(self, filename=None, filepath=None):
         '''
@@ -1078,14 +1081,37 @@ class pglDisplayTimingCalibrationData(HasTraits, pglSerialize):
         '''
         # get a filepath
         if filepath is None:
-            filepath = pglDisplayCalibration.getCalibrationFilepath(self.getDisplayName(), makePath=True, calibrationType="timing")
+            filepath = pglDisplayCalibration.getCalibrationFilepath(self.getDisplayName(), makePath=True, calibrationType="temporal")
         
         # get the filename
         if filename is None:
-            filename = "timing"
+            filename = "calibration"
                            
         # call parent to save
         super().save(filepath / filename)
+
+    @classmethod
+    def load(cls, displayName, filename=None, filepath=None, date=None):
+        '''
+        load
+        
+        Args:
+            displayName: displayName to load
+            filename: If none defaults to calibration.json
+            filepath: If none defaults to calibrationDir / display name / data
+        '''
+        # get a filepath
+        if filepath is None:
+            filepath = pglDisplayCalibration.chooseCalibrationFilepath(displayName, date=date, calibrationType="temporal")
+            if filepath is None: return
+        # get the filename
+        if filename is None:
+            filename = "calibration"
+        
+        print(f"(pglDisplayTemporalCalibrationData:load) Loading {filepath / filename}")
+        
+        # call super load to instantiate the object and load it                
+        return super(pglDisplayTemporalCalibrationData, cls).load(filepath / filename)    
     
     def getDisplayName(self):
         '''
@@ -1287,12 +1313,12 @@ class pglDisplayLuminanceCalibrationData(HasTraits, pglSerialize):
             maxDiff = np.max(np.abs(maxMeasurements - minMeasurements)/measurements * 100)
             print(f"Maximum difference between max and min measurements: {maxDiff:.3f}%")
         
-    def display(self, gamma=None, ax=None):
+    def display(self, gamma=None, fig=None):
         '''
         display graph of calibration data
         Args:
             gamma (float, optional): If provided, display the ideal gamma curve (1.0 or 2.2 or whatever) for comparison.
-            ax (matplotlib.axes.Axes, optional): If provided, plot into this axis instead of creating a new figure.
+            fig (matplotlib.fig, optional): If provided, plot into this figure instead of creating a new figure.
         '''
         if self.calibrationValues is None or self.calibrationMeasurements is None:
             print("(pglDisplayLuminanceCalibrationData) No calibration data to display.")
@@ -1303,10 +1329,10 @@ class pglDisplayLuminanceCalibrationData(HasTraits, pglSerialize):
             gamma = self.gamma
 
         # use the passed-in axis, or create a new figure/axis if none given
-        createdOwnFigure = ax is None
-        if createdOwnFigure:
+        if fig is None:
             fig, ax = plt.subplots(figsize=(10, 6))
-
+        else:
+            ax = fig.add_subplot(111)
         # plot raw data points
         ax.plot(self.calibrationValues, self.calibrationMeasurements, '.')
 
@@ -1333,8 +1359,8 @@ class pglDisplayLuminanceCalibrationData(HasTraits, pglSerialize):
 
         ax.grid(True)
 
-        if createdOwnFigure:
-            plt.show()        
+        plt.show()        
+        
     def appendValue(self, value, mode="calibration"):
         '''
         Append a calibration value.

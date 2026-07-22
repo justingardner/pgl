@@ -112,8 +112,19 @@ class pglSettingsManager:
         except ImportError:
             # fallback: some builds expose it under Quartz
             from Quartz import CGDisplayCreateUUIDFromDisplayID
-        
-        
+            
+        # first check saved displays
+        displayDir = cls.getDisplayDir()
+        for p in displayDir.rglob('display.json'):
+            # load json settings
+            displaySettings = pglDisplaySettings().load(p)
+            # make sure displayName matches diectory
+            displaySettings.displayName = str(p.parent.name)
+            # get the luminance calibrations
+            displaySettings.getCalibrations()
+            # and add to display list
+            displays.append(displaySettings)
+    
         maxDisplays = 16        
         (err, active, count) = Quartz.CGGetActiveDisplayList(maxDisplays, None, None)
         for display in active:
@@ -153,25 +164,9 @@ class pglSettingsManager:
                 if screen.deviceDescription()["NSScreenNumber"] == display:
                     # localizedName is available on macOS 10.15+
                     displaySettings.displayName = screen.localizedName()
-                
-            # get all the luminance calibrations
-            luminanceCalibrationDir = cls.getDisplayLuminanceCalibrationDir(displaySettings=displaySettings)
             
-            # find all YYMMDD* directories underneath that
-            pattern = re.compile(r'^\d{8}(_.*)?$')
-            matches = [p for p in luminanceCalibrationDir.rglob('*') if p.is_dir() and pattern.match(p.name)]
-
-            # check for valid calibrations in the directory
-            validLuminanceCalibrations= ['None']
-            for m in sorted(matches):
-                calibrationFile = m / "calibration.json"
-                if calibrationFile.is_file:
-                    validLuminanceCalibrations.append(m.name)
-            if len(validLuminanceCalibrations) > 1:
-                validLuminanceCalibrations.append('Latest')
-            
-            # put the luminanceCalibrations in displaySettings
-            displaySettings.luminanceCalibration = validLuminanceCalibrations
+            # get the luminance calibrations
+            displaySettings.getCalibrations()
             
             # append to our list of all displays
             displays.append(displaySettings)
@@ -221,6 +216,54 @@ class pglSettingsManager:
 
         return settingsDir
     
+    @classmethod
+    def getCalibrations(cls, calibrationDir):
+        '''
+        Get all the calibrations in the calibrationDir. These will be labeled as YYYYMMDD or YYYYMMDD_HHMMSS
+        
+        Args:
+            calibrationDir: Directory to search for calibrations under
+        '''
+        # find all YYMMDD* directories underneath the calibrationDir
+        pattern = re.compile(r'^\d{8}(_.*)?$')
+        matches = [p for p in calibrationDir.rglob('*') if p.is_dir() and pattern.match(p.name)]
+
+        # check for valid calibrations in the directory
+        validCalibrations= ['None']
+        for m in sorted(matches):
+            calibrationFile = m / "calibration.json"
+            if calibrationFile.is_file:
+                validCalibrations.append(m.name)
+        if len(validCalibrations) > 1:
+            validCalibrations.append('Latest')
+        return(validCalibrations)
+        
+    @classmethod
+    def getDisplayTemporalCalibrationDir(cls, displaySettings=None, makeDir=False):
+        '''
+        Get the directory where temporal calibrations live
+        
+        Args:
+            displaySettings (default=None): pglDisplaySettings from which displayName and uuid will be used
+                to find the matching directory. If not specified, will just return the top level displayDir
+            makeDir (default=False): Set to True to create the directory if it does not already exist
+        
+        Returns:
+            Path: The directory path where display luminance calibrations are stored        
+        '''
+        temporalCalibrationDir = cls.getDisplayDir(displaySettings, makeDir) / "temporal"
+        
+        # check if it exists, create if not
+        if makeDir and not temporalCalibrationDir.exists():
+            try:
+                temporalCalibrationDir.mkdir(parents=True, exist_ok=True)
+                display(HTML(f"<b>(pglScreenSettings:getDisplayDir)</b> Created directory: {temporalCalibrationDir}"))
+            except Exception as e:
+                display(HTML(f"<b>(pglScreenSettings:getDisplayDir)</b> Error creating directory {temporalCalibrationDir}: {e}"))
+                return None
+        return temporalCalibrationDir
+
+
     @classmethod
     def getDisplayLuminanceCalibrationDir(cls, displaySettings=None, makeDir=False):
         '''
@@ -356,9 +399,25 @@ class pglDisplaySettings(pglSettingsEditable):
     serialNumber = Int(0, help="Serial number", enabled=False)
     isMain = Bool(False, help="Whether the display is the main display", enabled=True)
     isBuiltin = Bool(False, help="Whether the display is the built-in display of e.g. a laptop", enabled=False)
-    luminanceCalibration = List(Unicode(), hasPlotButton=True, buttonFunction="plotLuminanceCalibration", default_value=['Latest','None'], help="Which calibration to use")
+    luminanceCalibration = List(Unicode(), hasPlotButton=True, buttonFunction="plotLuminanceCalibration", default_value=['None'], help="Which luminance calibration to use")
+    temporalCalibration = List(Unicode(), hasPlotButton=True, buttonFunction="plotTemporalCalibration", default_value=['None'], help="Which temporal calibration to use")
     
-    def plotLuminanceCalibration(self, ax, selected):
+    def getCalibrations(self):
+        '''
+        Looks into calibrations direcotry of display to find luminance and temporal calibrations
+        This will populate the fields luminanceCalibration and temporalCalibration with a list of
+        directory names of the calibrations
+        '''
+        
+        # get all the luminance calibrations
+        luminanceCalibrationDir = pglSettingsManager.getDisplayLuminanceCalibrationDir(displaySettings=self)
+        self.luminanceCalibration = pglSettingsManager.getCalibrations(luminanceCalibrationDir)
+        
+        # get all the temporal calibrations
+        temporalCalibrationDir = pglSettingsManager.getDisplayTemporalCalibrationDir(displaySettings=self)
+        self.temporalCalibration = pglSettingsManager.getCalibrations(temporalCalibrationDir)
+
+    def plotLuminanceCalibration(self, fig, selected):
         '''
         load and plot the luminance calibration on the passed in axis
         '''
@@ -368,8 +427,19 @@ class pglDisplaySettings(pglSettingsEditable):
         # load the calibrtion
         from .pglCalibration import pglDisplayLuminanceCalibrationData
         calibration = pglDisplayLuminanceCalibrationData.load(displayName=self.displayName, filepath=luminanceCalibrationDir)
-        calibration.display(ax=ax)
-        pass
+        calibration.display(fig=fig)
+        
+    def plotTemporalCalibration(self, fig, selected):
+        '''
+        load and plot the temporal calibration on the passed in axis
+        '''
+        # load the calibration
+        temporalCalibrationDir = pglSettingsManager.getDisplayTemporalCalibrationDir(self) / selected 
+
+        # load the calibrtion
+        from .pglCalibration import pglDisplayTemporalCalibrationData
+        calibration = pglDisplayTemporalCalibrationData.load(displayName=self.displayName, filepath=temporalCalibrationDir)
+        calibration.display(fig=fig)
 
 # Screen settings select
 class pglSettingsSelect(pglSettingsEditable):

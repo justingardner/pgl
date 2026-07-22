@@ -466,8 +466,8 @@ class _pglTraitsDialog(QDialog):
             method = getattr(self.settings, plotFunc, None)
             if method is None:
                 return
-            self.plotAxis.clear()
-            method(self.plotAxis, selected)
+            self.figure.clear()
+            method(self.figure, selected)
             self.plotCanvas.draw()
             self.plotCanvas.setVisible(True)
 

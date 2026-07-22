@@ -1067,7 +1067,7 @@ class pglAnalogTraceData(pglSerialize):
             'ignoredSamples': ignoredSamples
         }
     
-    def display(self, cycleLen=None, digitalSyncChannel=None, digitalSyncThreshold=3, ignoreInitial=None, displayStartEnd=None):
+    def display(self, cycleLen=None, digitalSyncChannel=None, digitalSyncThreshold=3, ignoreInitial=None, displayStartEnd=None, fig=None):
         '''
         Plot the analog read data
 
@@ -1078,6 +1078,7 @@ class pglAnalogTraceData(pglSerialize):
             ignoreInitial (float): Time in seconds to ignore at the beginning of the recording for
                 displaying cycles (e.g., to exclude initial transients). If None, no data is ignored. Must be non-negative.
             displayStartEnd (float): If not None, will display the first displayStartEnd seconds as separate graphs  
+            fig (matplotlib fig): If not none, will plot into the supplied fig
             
         Returns:
             dict: Dictionary containing:
@@ -1105,10 +1106,16 @@ class pglAnalogTraceData(pglSerialize):
         
         # Determine grid layout
         if displayStartEnd is not None or (cycleLen is not None or digitalSyncChannel is not None):
-            fig = plt.figure(figsize=(16, 6 * numRows / 2))
+            if fig is not None:
+                fig.clear()
+            else:
+                fig = plt.figure(figsize=(16, 6 * numRows / 2))
             gs = fig.add_gridspec(numRows, 2, hspace=0.3, wspace=0.3)
         else:
-            fig = plt.figure(figsize=(16, 6))
+            if fig is not None:
+                fig.clear()
+            else:
+                fig = plt.figure(figsize=(16, 6))
             gs = fig.add_gridspec(1, 1)
         retval['fig'] = fig
         currentRow = 0
