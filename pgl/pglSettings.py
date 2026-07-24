@@ -1,4 +1,4 @@
-    ################################################################
+################################################################
 #   filename: pglSettings.py
 #    purpose: Provides settings management for pgl
 #         by: JLG
@@ -17,8 +17,8 @@ from urllib import response
 from IPython.display import display, HTML, clear_output
 from fileinput import filename
 from ipywidgets.widgets import widget
-from traitlets import HasTraits, Float, Int, List, TraitError, Unicode, Dict, default, link, Bool, TraitType
-from datetime import datetime
+from traitlets import HasTraits, Float, Int, List, TraitError, Unicode, Dict, default, link, Bool, TraitType, Instance
+from datetime import datetime   
 import numpy as np
 import subprocess
 import platform
@@ -380,6 +380,12 @@ class pglSettingsManager:
             return pglSettings(filename=settingsPath)
 
 ##################################################
+# used for inheritence
+##################################################
+class pglTraitSettings(HasTraits, pglSerialize):
+    pass
+
+##################################################
 # display Settings select
 ##################################################
 #class pglDisplaySettingsSelect(pglSettingsEditable):
@@ -440,6 +446,15 @@ class pglDisplaySettings(pglSettingsEditable):
         from .pglCalibration import pglDisplayTemporalCalibrationData
         calibration = pglDisplayTemporalCalibrationData.load(displayName=self.displayName, filepath=temporalCalibrationDir)
         calibration.display(fig=fig)
+
+##################################################
+# List of settings
+##################################################
+class pglDisplaySettingsList(pglTraitSettings):
+
+    settingsList = List(Instance(pglDisplaySettings), settingsListKey="displayName", help="List of display settings")
+    pass
+ 
 
 # Screen settings select
 class pglSettingsSelect(pglSettingsEditable):
