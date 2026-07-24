@@ -80,7 +80,7 @@ class pglDraw:
     ################################################################
     # dots
     ################################################################
-    def dots(self, x, y, z=0, color=None, dotSize=np.ones(2)*0.2, dotShape=1, dotAntialiasingBorder=0):
+    def dots(self, x, y, z=0, color=None, dotSize=np.ones(2)*0.2, dotShape=1, dotAntialiasingBorder=0, units=None):
         """
         Draw dots
 
@@ -95,10 +95,27 @@ class pglDraw:
                     each, so size is not guaranteed if they are larger than that. Default is 0.2 degrees
             dotShape (int, optional): The shape of the dots 0=rectangular, 1=circular (default is 1).
             dotAntialiasingBorder (float, optional): The antialiasing border size in pixels(default is 0).
+            units (string, optional): Defaults to deg, but can be set to "pix" for pixels
 
         Returns:
             bool: True if the dots were drawn successfully, False otherwise.
         """
+        # Convert units if necessary
+        if units is None:
+            pass
+        elif units.lower() in ("pixels","pix","pixel","px"):
+            x, y = self.pix2deg(x, y)
+            # try to convert dotSize - note that this is a bit inaccurate if
+            # x and y are scaled differently (which is typical). Taking
+            # the larger of the two to ensure as large as
+            (x1,y1) = self.pix2deg(dotSize,dotSize)
+            (x2,y2) = self.pix2deg(0,0)
+            xDotSize = np.abs(x1-x2)
+            yDotSize = np.abs(y1-y2)
+            dotSize = np.maximum(xDotSize, yDotSize)
+        elif units != "device":
+            print(f"(pglDraw:line) Invalid units '{units}'. Using deg units.")
+
         # Convert inputs to 1D arrays (even if scalar)
         x = np.atleast_1d(np.ravel(x))
         y = np.atleast_1d(np.ravel(y))
