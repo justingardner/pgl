@@ -469,8 +469,8 @@ class _pglTraitsDialog(QDialog):
         def onChange(index):
             if self._updatingWidget:
                 return
-            selected = combo.itemText(index)
             # move selected to top, like onListSelect did
+            selected = combo.itemText(index)
             opts = [combo.itemText(i) for i in range(combo.count())]
             newList = [selected] + [x for x in opts if x != selected]
             self._commit(settingsObject, traitName, newList)
@@ -487,39 +487,6 @@ class _pglTraitsDialog(QDialog):
 
         self._register(traitName, trait, combo, setter, layout)
 
-    # ----- RGB -----
-    def _addRGB(self, traitName, trait, current, helpText, settingsObject, layout=None):
-        rgb = list(current) if current else [0.0, 0.0, 0.0]
-        boxes = []
-        row = QWidget()
-        h = QHBoxLayout(row)
-        h.setContentsMargins(0, 0, 0, 0)
-
-        for i, name in enumerate(("R", "G", "B")):
-            h.addWidget(QLabel(name))
-            spin = QDoubleSpinBox()
-            spin.setMinimum(0.0)
-            spin.setMaximum(1.0)
-            spin.setSingleStep(0.01)
-            spin.setValue(float(rgb[i]) if i < len(rgb) else 0.0)
-            spin.setToolTip(f"{helpText} - {name}")
-            h.addWidget(spin)
-            boxes.append(spin)
-
-        def onChange(_=None):
-            if not self._updatingWidget:
-                self._commit(settingsObject, traitName, [b.value() for b in boxes])
-
-        for b in boxes:
-            b.valueChanged.connect(onChange)
-
-        def setter(value):
-            for i, b in enumerate(boxes):
-                if i < len(value):
-                    b.setValue(float(value[i]))
-
-        self._register(traitName, trait, row, setter, layout)
-            
     # ----- List with toggle plot button -----
     plotButtonState = False
     _activePlotButton = None
@@ -572,12 +539,22 @@ class _pglTraitsDialog(QDialog):
                     self.plotCanvas.draw()
 
         def onSelectionChanged(index):
+            # display plot
             if self._activePlotButton is not None:
                 self._activePlotButton.setChecked(False)
             self._activePlotButton = button
             self.plotButtonState = True
             button.setChecked(True)
             updatePlot()
+            
+            # move selected to top, like onListSelect did
+            selected = combo.itemText(index)
+            opts = [combo.itemText(i) for i in range(combo.count())]
+            newList = [selected] + [x for x in opts if x != selected]
+            self._commit(settingsObject, traitName, newList)
+
+
+
         button.toggled.connect(onButtonToggled)
         combo.currentIndexChanged.connect(onSelectionChanged)
 
@@ -594,7 +571,40 @@ class _pglTraitsDialog(QDialog):
             combo.blockSignals(False)
 
         self._register(traitName, trait, row, setter, layout)
-    #########################################
+    # ----- RGB -----
+    def _addRGB(self, traitName, trait, current, helpText, settingsObject, layout=None):
+        rgb = list(current) if current else [0.0, 0.0, 0.0]
+        boxes = []
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+
+        for i, name in enumerate(("R", "G", "B")):
+            h.addWidget(QLabel(name))
+            spin = QDoubleSpinBox()
+            spin.setMinimum(0.0)
+            spin.setMaximum(1.0)
+            spin.setSingleStep(0.01)
+            spin.setValue(float(rgb[i]) if i < len(rgb) else 0.0)
+            spin.setToolTip(f"{helpText} - {name}")
+            h.addWidget(spin)
+            boxes.append(spin)
+
+        def onChange(_=None):
+            if not self._updatingWidget:
+                self._commit(settingsObject, traitName, [b.value() for b in boxes])
+
+        for b in boxes:
+            b.valueChanged.connect(onChange)
+
+        def setter(value):
+            for i, b in enumerate(boxes):
+                if i < len(value):
+                    b.setValue(float(value[i]))
+
+        self._register(traitName, trait, row, setter, layout)
+            
+   #########################################
     # Helpers
     #########################################
     def _register(self, traitName, trait, widget, setter, layout = None):
