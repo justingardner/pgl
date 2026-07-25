@@ -506,6 +506,7 @@ class _pglTraitsDialog(QDialog):
             
     # ----- List with toggle plot button -----
     plotButtonState = False
+    _activePlotButton = None
     def _addListWithPlotButton(self, traitName, trait, current, helpText, settingsObject, layout=None):
         plotFunc = trait.metadata.get("buttonFunction", None)
 
@@ -515,34 +516,52 @@ class _pglTraitsDialog(QDialog):
 
         button = QPushButton(trait.metadata.get("buttonLabel", "Display"))
         button.setToolTip(helpText)
-        button.setCheckable(True)   # makes it a toggle button
+        button.setCheckable(True)
 
         def updatePlot():
             if plotFunc is None:
                 return
-
             method = getattr(settingsObject, plotFunc, None)
             if method is None:
                 return
 
             selected = combo.currentText()
             self.figure.clear()
-            method(self.figure, selected)
+            if method(self.figure, selected):
+                self.plotCanvas.setVisible(True)
+                self.plotButtonState = True
+            else:
+                self.plotCanvas.setVisible(False)
+                self.plotButtonState = False
             self.plotCanvas.draw()
 
         def onButtonToggled(checked):
             if checked:
-                self.plotCanvas.setVisible(True)
-                self.plotButtonState = True
+                # Un-check the previously active button (if it's a different one)
+                if self._activePlotButton is not None and self._activePlotButton is not button:
+                    prev = self._activePlotButton
+                    prev.blockSignals(True)     # avoid triggering its toggled handler
+                    prev.setChecked(False)
+                    prev.blockSignals(False)
+
+                self._activePlotButton = button
                 updatePlot()
             else:
-                self.plotButtonState = False
-                self.plotCanvas.setVisible(False)
+                # Only clear state if THIS button is the active one
+                if self._activePlotButton is button:
+                    self._activePlotButton = None
+                    self.plotButtonState = False
+                    self.figure.clear()
+                    self.plotCanvas.setVisible(False)
+                    self.plotCanvas.draw()
 
         def onSelectionChanged(index):
-            if self.plotButtonState:
-                updatePlot()
-
+            if self._activePlotButton is not None:
+                self._activePlotButton.setChecked(False)
+            self._activePlotButton = button
+            self.plotButtonState = True
+            button.setChecked(True)
+            updatePlot()
         button.toggled.connect(onButtonToggled)
         combo.currentIndexChanged.connect(onSelectionChanged)
 
@@ -553,11 +572,12 @@ class _pglTraitsDialog(QDialog):
         h.addWidget(button)
 
         def setter(value):
+            combo.blockSignals(True)
             combo.clear()
             combo.addItems([str(item) for item in value])
+            combo.blockSignals(False)
 
         self._register(traitName, trait, row, setter, layout)
-
     #########################################
     # Helpers
     #########################################

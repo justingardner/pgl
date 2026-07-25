@@ -427,6 +427,9 @@ class pglDisplaySettings(pglSettingsEditable):
         '''
         load and plot the luminance calibration on the passed in axis
         '''
+        if selected == "None":
+            return False
+        
         # load the calibration
         luminanceCalibrationDir = pglSettingsManager.getDisplayLuminanceCalibrationDir(self) / selected 
         
@@ -434,11 +437,15 @@ class pglDisplaySettings(pglSettingsEditable):
         from .pglCalibration import pglDisplayLuminanceCalibrationData
         calibration = pglDisplayLuminanceCalibrationData.load(displayName=self.displayName, filepath=luminanceCalibrationDir)
         calibration.display(fig=fig)
+        return True
         
     def plotTemporalCalibration(self, fig, selected):
         '''
         load and plot the temporal calibration on the passed in axis
         '''
+        if selected == "None":
+            return False
+
         # load the calibration
         temporalCalibrationDir = pglSettingsManager.getDisplayTemporalCalibrationDir(self) / selected 
 
@@ -446,6 +453,8 @@ class pglDisplaySettings(pglSettingsEditable):
         from .pglCalibration import pglDisplayTemporalCalibrationData
         calibration = pglDisplayTemporalCalibrationData.load(displayName=self.displayName, filepath=temporalCalibrationDir)
         calibration.display(fig=fig)
+        
+        return True
 
 ##################################################
 # List of settings
