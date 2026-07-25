@@ -63,16 +63,13 @@ class pglSettingsManager:
         """
         Edit pgl display settings. Brings up widget interface to edit display settings
         """
-        # initialize settings select class
-        #displaySettingsSelect = pglDisplaySettingsSelect(self)
-        #displaySettingsSelect.load()
+        # get the display infos
+        d = cls.getDisplayInfo()
+        settingsList = pglDisplaySettingsList(d)
         
         # display the settings
-        #displaySettingsSelect.edit() 
-        
-        # display the selected settings
-        #pglTraitsDialog(displaySettingsSelect.displaySettings[0])
-    
+        settingsList = pglTraitsDialog(settingsList)
+            
     @classmethod
     def getDisplayNames(cls, displayIndex=None):
         
@@ -143,9 +140,9 @@ class pglSettingsManager:
             
             # get the current mode settings
             #mode = Quartz.CGDisplayCopyDisplayMode(display)
-            displaySettings.displayWidth = Quartz.CGDisplayModeGetWidth(mode)  
-            displaySettings.displayHeight = Quartz.CGDisplayModeGetHeight(mode)
-            displaySettings.refreshRate = Quartz.CGDisplayModeGetRefreshRate(mode)
+            #displaySettings.displayWidth = Quartz.CGDisplayModeGetWidth(mode)  
+            #displaySettings.displayHeight = Quartz.CGDisplayModeGetHeight(mode)
+            #displaySettings.refreshRate = Quartz.CGDisplayModeGetRefreshRate(mode)
 
             # get UUID
             uuidRef = CGDisplayCreateUUIDFromDisplayID(display)
@@ -395,16 +392,13 @@ class pglTraitSettings(HasTraits, pglSerialize):
             
 class pglDisplaySettings(pglSettingsEditable):
     displayName = Unicode("", help="Names of screen")
-    displayModes = List(Unicode(), help="List of all supported display modes")
-    displayWidth = Int(0, help="Display widh in pixels", enabled=False)
-    displayHeight = Int(0, help="Display height in pixels", enabled=False)
-    refreshRate = Float(0, help="Refresh rate", enabled=False)
     uuid = Unicode("", help="UUID of display", enabled=False)
     vendor = Int(0, help="Vendor number", enabled=False)
     model = Int(0, help="Model number", enabled=False)
     serialNumber = Int(0, help="Serial number", enabled=False)
-    isMain = Bool(False, help="Whether the display is the main display", enabled=True)
+    isMain = Bool(False, help="Whether the display is the main display", enabled=False)
     isBuiltin = Bool(False, help="Whether the display is the built-in display of e.g. a laptop", enabled=False)
+    displayModes = List(Unicode(), help="All supported display modes")
     luminanceCalibration = List(Unicode(), hasPlotButton=True, buttonFunction="plotLuminanceCalibration", default_value=['None'], help="Which luminance calibration to use")
     temporalCalibration = List(Unicode(), hasPlotButton=True, buttonFunction="plotTemporalCalibration", default_value=['None'], help="Which temporal calibration to use")
     
@@ -461,8 +455,12 @@ class pglDisplaySettings(pglSettingsEditable):
 ##################################################
 class pglDisplaySettingsList(pglTraitSettings):
 
-    chooseDisplaySettings = List(Instance(pglDisplaySettings), settingsListKey="displayName", help="List of display settings")
-    pass
+    chooseDisplay = List(Instance(pglDisplaySettings), settingsListKey="displayName", help="List of display settings")
+    
+    def __init__(self, settingsList=None):
+        super().__init__()
+        if settingsList is not None:
+            self.chooseDisplay = settingsList
  
 
 # Screen settings select
