@@ -73,6 +73,9 @@ class pglDataPixx(pglDevice):
         self.device.din.startDinLog()
         self.device.updateRegisterCache()
 
+        # open as DPx
+        self.openDPx()
+
     
     def __del__(self):
         """
@@ -227,7 +230,7 @@ class pglDataPixx(pglDevice):
         
 
         # Initialize the DataPixx device
-        self.openDPx()
+        #self.openDPx()
 
         #self.enableVsyncTrigger()
 
@@ -237,7 +240,7 @@ class pglDataPixx(pglDevice):
         # enable pixel mode
         self.enablePixelMode()
 
-        self.closeDPx()
+        #self.closeDPx()
 
         print("(pglDataPixx:enableButtonSchedules) DataPixx digital output setup complete.")
 
@@ -497,7 +500,7 @@ class pglDataPixx(pglDevice):
         print("(pglDataPixx:enableVsyncTrigger) vsync trigger enabled.")
 
         # Initialize the device
-        self.openDPx()
+        #self.openDPx()
 
         # stop currently running schedules
         self.stopDPxSchedules()
@@ -517,8 +520,122 @@ class pglDataPixx(pglDevice):
         self.dp.DPxUpdateRegCache()
 
         # Close 
-        self.closeDPx()
+        #self.closeDPx()
 
+    ################################################################
+    # configureDigitialOuptut, adapted form vpixx documentation
+    ################################################################
+    def _configureDigitalOutputs(self, configDict, currentAddress):
+        """
+        Configures digital outputs based on the provided trigger dictionary and
+        assigns a memory address. Each signal's bits are shifted according to the
+        specified output channel, and then written to the VPixx hardware memory.
+        
+        Parameters:
+            configDict (dict): Dictionary with entries in the format:
+                {
+                    'eventName': {'signal': [0, 1, 0, ...], 'channel': int
+                    }
+                }
+                Where the eventName is an aribtrary string to use to trigger the event
+                the signal is the shape of the digitial pulse (e.g. 0, 1, 0 starts at 0
+                rises to 1 and falls back to 0 when triggered)
+                channel is the digitial channel that will be written
+            currentAddress (int): The starting memory address for storing signal
+                                data.
+        
+        Returns:
+            configDict (dict): The updated dictionary with assigned memory addresses
+                                for each event.
+        """
+        # Loop through each event in the configuration dictionary
+        for event, details in configDict.items():
+            
+            # Ensure the currentAddress is even; if it's odd, increment by 1
+            if currentAddress % 2 != 0:
+                currentAddress += 1
+                
+            details['address'] = currentAddress
+            channel = details.get('channel')
+            signal = details.get('signal', [])
+            signalLength = len(signal)
+            
+            # Shift each bit in the signal to the left by the value of the channel.
+            # This positions the bit correctly for the digital output channel.
+            toggledSignal = [(bit << channel) for bit in signal]
+            
+            # Write the modified signal (toggledSignal) into the VPixx hardware memory
+            # at the specified address.
+            self.dp.DPxWriteRam(currentAddress, toggledSignal)
+            
+            print(f"Configured: {event} is {signal} on DOut channel {channel}")
+            
+            # Update the current memory address by adding the length of the signal.
+            # Important to multiply by 2 to reserve enough space.
+            currentAddress += signalLength * 2
+        
+        # After configuring all events, commit changes to the register cache of the
+        # hardware
+        self.dp.DPxWriteRegCache()
+        
+        return configDict
+
+    ################################################################
+    # configure the digital outputs, calls internal function
+    ################################################################
+    def configureDigitalOutputs(self):
+        '''
+        Configures some triggerst that can be sent using sendTrigger
+        '''
+        # set up triggers
+        triggers = {
+            "stimulusOn": {"signal": [1, 0], "channel": 8},
+            "stimulusOff": {"signal": [1, 0], "channel": 1},
+        }
+
+        # register the triggers, note the hardcoded address here - this is in the sample code - eeks
+        self.triggers = self._configureDigitalOutputs(triggers, currentAddress=int(8e6))        
+
+    ################################################################
+    # send a digital trigger, 
+    ################################################################
+    def sendTrigger(self, eventName, delay=0.0, samplingRate=1000):
+        """
+        Sends a digital trigger signal based on the provided dictionary entry.
+        
+        Parameters:
+            entry (dict): A dictionary entry containing keys 'signal', 'channel',
+                        and 'address'.
+            delay (float): Delay (in seconds) before the trigger signal starts
+                        (default is 0.0).
+            samplingRate (int): Sampling rate in Hz for the digital output (default
+                                is 10).
+        """
+
+        # get the entry
+        entry = self.triggers.get(eventName, None)
+        if entry is None:
+            print(f"(pglDataPixx: sendTrigger) Could not find {eventName} in configured triggers.")
+            return
+        
+        # Determine the length of the signal (number of bits) for scheduling purposes
+        signalLength = len(entry.get('signal', []))
+        
+        # Retrieve the memory address for this signal from the entry
+        address = entry.get('address')
+        
+        # Schedule the digital output signal on the hardware:
+        # - delay: when to start the signal,
+        # - samplingRate: how often to sample the signal,
+        # - signal_length: the duration of the signal,
+        # - address: the location in memory where the signal is stored.
+        self.dp.DPxSetDoutSchedule(delay, samplingRate, signalLength, address)
+
+        #self.dp.DPxSetDoutSchedRate(1,'video')
+        self.dp.DPxSetDoutSchedRate(1000,'hz')
+
+        # Start the digital output schedule to send the trigger signal
+        self.dp.DPxStartDoutSched()
     ################################################################
     # test function, can be removed once working
     ################################################################
@@ -526,7 +643,7 @@ class pglDataPixx(pglDevice):
 
 
         # Initialize the device
-        self.openDPx()
+        #self.openDPx()
 
         self.stopDPxSchedules()
         # Set digital output bit(s) high
@@ -551,7 +668,7 @@ class pglDataPixx(pglDevice):
         self.dp.DPxUpdateRegCache()
 
         # Close when done
-        self.closeDPx()
+        #self.closeDPx()
 
 ###################################
 # ProPixx device
