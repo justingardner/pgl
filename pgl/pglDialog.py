@@ -304,6 +304,13 @@ class _pglTraitsDialog(QDialog):
                     continue
                 entry['setter'](getattr(obj, name))
             self._updatingWidget = False
+            
+            # hide plot and clear button states
+            plotButtonState = False
+            _activePlotButton = None
+            self.plotCanvas.setVisible(False)
+            self.plotCanvas.draw()
+
 
         combo.currentIndexChanged.connect(showObject)
         showObject(0)
