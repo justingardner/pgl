@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
     QSlider, QPushButton, QWidget, QScrollArea, QDialogButtonBox, QAbstractSpinBox,
     QStylePainter, QStyleOptionComboBox, QStyle
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QCoreApplication
 from traitlets import (
     HasTraits, Float, Int, List, Unicode, Bool, TraitType
 )
@@ -162,7 +162,7 @@ class _pglTraitsDialog(QDialog):
         # Shared matplotlib axis for any plot-button traits
         self.figure = Figure(figsize=(5, 3))
         self.plotAxis = self.figure.add_subplot(111)
-        self.plotCanvas = FigureCanvasQTAgg(self.figure)
+        self.plotCanvas = ScrollableFigureCanvas(self.figure)
         self.plotCanvas.setMinimumHeight(680)
         self.plotCanvas.setVisible(False)
         self.formLayout.addRow(self.plotCanvas)
@@ -191,11 +191,20 @@ class _pglTraitsDialog(QDialog):
         bl.addWidget(buttonBox)
         mainLayout.addWidget(buttonBar)
 
-        # bigger default window
+        # Set overall dimensions
         self.setMinimumWidth(560)
-        self.adjustSize()                       # size to content
-        h = min(self.sizeHint().height(), 760)  # cap tall forms
-        self.resize(680, h)
+        maxDialogHeight = 760
+
+        # Height needed for the form contents
+        formHeight = formWidget.sizeHint().height()
+
+        # Add the button bar and layout margins
+        buttonHeight = buttonBar.sizeHint().height()
+        extra = mainLayout.contentsMargins().top() + mainLayout.contentsMargins().bottom()
+
+        desiredHeight = formHeight + buttonHeight + extra
+
+        self.resize(680, min(desiredHeight, maxDialogHeight))
     def _getOrderedTraits(self, obj=None):
         """Return traits in class definition order (like getOrderedTraits)."""
         if obj is None:
@@ -831,6 +840,9 @@ class _RetargetableProxy:
     def retarget(self, newTarget):
         object.__setattr__(self, "_target", newTarget)
         
+#####################################################################
+# subclassed UI elements for customization
+#####################################################################
 class CenteredComboBox(QComboBox):
     def paintEvent(self, event):
         painter = QStylePainter(self)
@@ -840,6 +852,23 @@ class CenteredComboBox(QComboBox):
         opt.currentText = ""  # suppress default left-aligned text
         painter.drawControl(QStyle.CE_ComboBoxLabel, opt)
         painter.drawText(self.rect(), Qt.AlignCenter, self.currentText())
+        
+class ScrollableFigureCanvas(FigureCanvasQTAgg):
+    def wheelEvent(self, event):
+        # Allow Ctrl+wheel for matplotlib zoom if desired
+        if event.modifiers() & Qt.ControlModifier:
+            super().wheelEvent(event)
+            return
+
+        # Otherwise let the scroll area handle scrolling
+        p = self.parent()
+        while p is not None and not isinstance(p, QScrollArea):
+            p = p.parent()
+
+        if p is not None:
+            QCoreApplication.sendEvent(p.verticalScrollBar(), event)
+        else:
+            super().wheelEvent(event)
 #####################################################################
 # pglTraitsDialog: what gets called by the user. This rund
 # pglTraitsDialogStandalone which runs outside the jupyter notebook
