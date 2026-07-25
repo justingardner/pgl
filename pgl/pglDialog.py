@@ -271,38 +271,39 @@ class _pglTraitsDialog(QDialog):
         keyTraitName = trait.metadata["settingsListKey"]
 
         combo = QComboBox()
-        combo.addItems(
-            [str(getattr(x, keyTraitName)) for x in current]
-        )
+        combo.addItems([str(getattr(x, keyTraitName)) for x in current])
         combo.setToolTip(helpText)
 
-        childWidget = QWidget()
-        childLayout = QFormLayout(childWidget)
+        self._register(traitName, trait, combo, lambda v: None, layout)
 
-        row = QWidget()
-        boxLayout = QVBoxLayout(row)
-        boxLayout.setContentsMargins(0, 0, 0, 0)
-        boxLayout.addWidget(combo)
-        boxLayout.addWidget(childWidget)
+        proxy = _RetargetableProxy(current[0])
+        childNames = []
 
-        self._register(traitName, trait, row, lambda v: None, layout)
-
-        def showObject(index):
-            # remove old child widgets
-            while childLayout.count():
-                item = childLayout.takeAt(0)
-                if item.widget():
-                    item.widget().deleteLater()
-
-            obj = getattr(settingsObject, traitName)[index]
-
-            for name, childTrait in self._getOrderedTraits(obj).items():
+        def buildRows():
+            for name, childTrait in self._getOrderedTraits(current[0]).items():  # real object, not proxy
                 if name.startswith('_'):
                     continue
-                self._addTraitWidget(name, childTrait, obj, childLayout)
+                self._addTraitWidget(name, childTrait, proxy, layout)  # proxy for commits
+                childNames.append(name)
+
+        def showObject(index):
+            obj = getattr(settingsObject, traitName)[index]
+            proxy.retarget(obj)
+
+            if not childNames:
+                buildRows()
+                return
+
+            # widgets already exist -> just repopulate their values
+            self._updatingWidget = True
+            for name in childNames:
+                entry = self.traitWidgets.get(name)
+                if entry is None:
+                    continue
+                entry['setter'](getattr(obj, name))
+            self._updatingWidget = False
 
         combo.currentIndexChanged.connect(showObject)
-
         showObject(0)
         
     # ----- Float with min/max -----
@@ -783,6 +784,23 @@ class _pglTraitsDialog(QDialog):
         h.addWidget(plus)                          # right
         return row
 
+#####################################################################
+# Helper class uses by settingsList which retargets fields
+#####################################################################
+class _RetargetableProxy:
+    """Stands in for settingsObject; forwards get/set to whatever object it currently targets."""
+    def __init__(self, target):
+        object.__setattr__(self, "_target", target)
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_target"), name)
+
+    def __setattr__(self, name, value):
+        setattr(object.__getattribute__(self, "_target"), name, value)
+
+    def retarget(self, newTarget):
+        object.__setattr__(self, "_target", newTarget)
+        
 #####################################################################
 # pglTraitsDialog: what gets called by the user. This rund
 # pglTraitsDialogStandalone which runs outside the jupyter notebook
