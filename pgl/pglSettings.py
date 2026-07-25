@@ -452,7 +452,7 @@ class pglDisplaySettings(pglSettingsEditable):
 ##################################################
 class pglDisplaySettingsList(pglTraitSettings):
 
-    settingsList = List(Instance(pglDisplaySettings), settingsListKey="displayName", help="List of display settings")
+    chooseDisplaySettings = List(Instance(pglDisplaySettings), settingsListKey="displayName", help="List of display settings")
     pass
  
 

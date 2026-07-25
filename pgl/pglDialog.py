@@ -12,7 +12,8 @@ import copy
 from PySide6.QtWidgets import (
     QApplication, QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLabel, QLineEdit, QSpinBox, QDoubleSpinBox, QCheckBox, QComboBox,
-    QSlider, QPushButton, QWidget, QScrollArea, QDialogButtonBox, QAbstractSpinBox
+    QSlider, QPushButton, QWidget, QScrollArea, QDialogButtonBox, QAbstractSpinBox,
+    QStylePainter, QStyleOptionComboBox, QStyle
 )
 from PySide6.QtCore import Qt
 from traitlets import (
@@ -270,7 +271,8 @@ class _pglTraitsDialog(QDialog):
 
         keyTraitName = trait.metadata["settingsListKey"]
 
-        combo = QComboBox()
+        #combo = QComboBox()
+        combo = CenteredComboBox()
         combo.addItems([str(getattr(x, keyTraitName)) for x in current])
         combo.setToolTip(helpText)
 
@@ -434,7 +436,8 @@ class _pglTraitsDialog(QDialog):
 
     # ----- List -> dropdown -----
     def _addList(self, traitName, trait, current, helpText, settingsObject, layout=None):
-        combo = QComboBox()
+        #combo = QComboBox()
+        combo = CenteredComboBox()
         options = list(current) if current else []
         combo.addItems([str(o) for o in options])
         if options:
@@ -506,7 +509,7 @@ class _pglTraitsDialog(QDialog):
     def _addListWithPlotButton(self, traitName, trait, current, helpText, settingsObject, layout=None):
         plotFunc = trait.metadata.get("buttonFunction", None)
 
-        combo = QComboBox()
+        combo = CenteredComboBox()
         combo.addItems([str(item) for item in current])
         combo.setToolTip(helpText)
 
@@ -801,6 +804,15 @@ class _RetargetableProxy:
     def retarget(self, newTarget):
         object.__setattr__(self, "_target", newTarget)
         
+class CenteredComboBox(QComboBox):
+    def paintEvent(self, event):
+        painter = QStylePainter(self)
+        opt = QStyleOptionComboBox()
+        self.initStyleOption(opt)
+        painter.drawComplexControl(QStyle.CC_ComboBox, opt)
+        opt.currentText = ""  # suppress default left-aligned text
+        painter.drawControl(QStyle.CE_ComboBoxLabel, opt)
+        painter.drawText(self.rect(), Qt.AlignCenter, self.currentText())
 #####################################################################
 # pglTraitsDialog: what gets called by the user. This rund
 # pglTraitsDialogStandalone which runs outside the jupyter notebook
