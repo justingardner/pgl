@@ -39,9 +39,13 @@ class pglDataPixx(pglDevice):
         # get library
         try:
             from pypixxlib.datapixx import DATAPixx3
+            from pypixxlib import _libdpx as dp
         except ImportError: 
             print("(pglDataPixx) pypixxlib is not installed. Please install it to use DataPixx.")
             return
+
+        # keep reference to library
+        self.dp = dp        
         
         # Initialize the DATAPixx3 instance
         try:
@@ -68,6 +72,9 @@ class pglDataPixx(pglDevice):
         # start logging
         self.device.din.startDinLog()
         self.device.updateRegisterCache()
+
+        # open as DPx
+        self.openDPx()
 
     
     def __del__(self):
@@ -163,6 +170,53 @@ class pglDataPixx(pglDevice):
             return(events)
 
     ################################################################
+    # open device for low0level DPx ibrary
+    ################################################################
+    def openDPx(self):
+        '''
+        Open datapixx device using DPx
+        '''
+        self.dp.DPxOpen()
+        if not self.dp.DPxIsReady():
+            self.getError()
+            return
+
+        # print status
+        print(f"(pglDataPixx): Opened DataPixx with firmware version: {self.dp.DPxGetFirmwareRev()}")
+        print(f"(pglDataPixx): Current pixel mode: {self.dp.DPxIsDoutPixelMode()}")
+        print(f"(pglDataPixx): DAC scheudle: {self.dp.DPxIsDacSchedRunning()}")
+        
+    ################################################################
+    # close device for low-level DPX library
+    ################################################################
+    def closeDPx(self):
+        '''
+        Close datapixx device using DPx
+        '''
+        try:
+            # close
+            self.dp.DPxClose()
+
+            print("(pglDataPixx) Closed DataPixx DPx")
+        except Exception as e:
+            self.getError()
+
+    ################################################################
+    # clear schedules
+    ################################################################
+    def stopDPxSchedules(self):
+        # close schedules
+        self.dp.DPxDisableDoutPixelMode()
+        self.dp.DPxDisableDoutPixelModeB()
+        self.dp.DPxDisableDoutPixelModeGB()
+        
+        # stop all schedules
+        self.dp.DPxStopAllScheds()
+        
+        # write changes 
+        self.dp.DPxWriteRegCache()
+
+    ################################################################
     # setup digital output
     ################################################################
     def setupDigitalOutput(self):
@@ -174,22 +228,19 @@ class pglDataPixx(pglDevice):
             print("(pglDataPixx:enableButtonSchedules) DataPixx device is not initialized.")
             return
         
-        # load the dp library
-        try:
-            from pypixxlib import _libdpx as dp
-        except ImportError:
-            print("(pglDataPixx:enableButtonSchedules) pypixxlib is not installed. Please install it to use DataPixx button schedules.")
-            return
-    
+
         # Initialize the DataPixx device
-        dp.DPxOpen()
-        
+        #self.openDPx()
+
+        #self.enableVsyncTrigger()
+
         # enable button scheduless
         self.enableButtonSchedules()
 
         # enable pixel mode
         self.enablePixelMode()
 
+        #self.closeDPx()
 
         print("(pglDataPixx:enableButtonSchedules) DataPixx digital output setup complete.")
 
@@ -207,22 +258,16 @@ class pglDataPixx(pglDevice):
             print("(pglDataPixx:enablePixelMode) DataPixx device is not initialized.")
             return
         
-        # load the dp library
-        try:
-            from pypixxlib import _libdpx as dp
-        except ImportError:
-            print("(pglDataPixx:enablePixelMode) pypixxlib is not installed. Please install it to use DataPixx pixel mode.")
-            return
 
         # Enable pixel mode
-        #dp.DPxOpen()
-        dp.DPxEnableDoutPixelModeB()
-        #dp.DPxEnableDoutPixelModeGB()
-        #dp.DPxEnableDoutPixelMode()
-        dp.DPxWriteRegCache()
+        self.dp.DPxEnableDoutPixelModeB()
+        #self.dp.DPxEnableDoutPixelModeGB()
+        #self.dp.DPxEnableDoutPixelMode()
+        self.dp.DPxWriteRegCache()
 
         print("(pglDataPixx:enablePixelMode) Pixel mode enabled.")
 
+ 
     ################################################################
     # getError: Modified from VPIxx example code
     ################################################################
@@ -278,13 +323,6 @@ class pglDataPixx(pglDevice):
                 None
         """
 
-        # load the dp library
-        try:
-            from pypixxlib import _libdpx as dp
-        except ImportError:
-            print("(pglDataPixx:enableButtonSchedules) pypixxlib is not installed. Please install it to use DataPixx button schedules.")
-            return
-        
         allPressRelease =  {
                 'redLeft': 1, 'yellowLeft': 2, 'greenLeft': 3, 'blueLeft': 4, 'whiteLeft': 5,
                 'redLeftRelease': 6, 'yellowLeftRelease': 7, 'greenLeftRelease': 8, 'blueLeftRelease': 9, 'whiteLeftRelease': 10,
@@ -414,87 +452,223 @@ class pglDataPixx(pglDevice):
         whiteRightReleaseAddress = buttonAddressOffset*9 + releaseOffset
 
         #write schedules into ram
-        dp.DPxWriteRam(redLeftAddress, redLeftWaveform)
-        dp.DPxWriteRam(redLeftReleaseAddress, redLeftReleaseWaveform)
-        dp.DPxWriteRam(yellowLeftAddress, yellowLeftWaveform)
-        dp.DPxWriteRam(yellowLeftReleaseAddress, yellowLeftReleaseWaveform)
-        dp.DPxWriteRam(greenLeftAddress, greenLeftWaveform)
-        dp.DPxWriteRam(greenLeftReleaseAddress, greenLeftReleaseWaveform)
-        dp.DPxWriteRam(blueLeftAddress, blueLeftWaveform)
-        dp.DPxWriteRam(blueLeftReleaseAddress, blueLeftReleaseWaveform)
-        dp.DPxWriteRam(whiteLeftAddress, whiteLeftWaveform)
-        dp.DPxWriteRam(whiteLeftReleaseAddress, whiteLeftReleaseWaveform)
+        self.dp.DPxWriteRam(redLeftAddress, redLeftWaveform)
+        self.dp.DPxWriteRam(redLeftReleaseAddress, redLeftReleaseWaveform)
+        self.dp.DPxWriteRam(yellowLeftAddress, yellowLeftWaveform)
+        self.dp.DPxWriteRam(yellowLeftReleaseAddress, yellowLeftReleaseWaveform)
+        self.dp.DPxWriteRam(greenLeftAddress, greenLeftWaveform)
+        self.dp.DPxWriteRam(greenLeftReleaseAddress, greenLeftReleaseWaveform)
+        self.dp.DPxWriteRam(blueLeftAddress, blueLeftWaveform)
+        self.dp.DPxWriteRam(blueLeftReleaseAddress, blueLeftReleaseWaveform)
+        self.dp.DPxWriteRam(whiteLeftAddress, whiteLeftWaveform)
+        self.dp.DPxWriteRam(whiteLeftReleaseAddress, whiteLeftReleaseWaveform)
         
-        dp.DPxWriteRam(redRightAddress, redRightWaveform)
-        dp.DPxWriteRam(redRightReleaseAddress, redRightReleaseWaveform)
-        dp.DPxWriteRam(yellowRightAddress, yellowRightWaveform)
-        dp.DPxWriteRam(yellowRightReleaseAddress, yellowRightReleaseWaveform)
-        dp.DPxWriteRam(greenRightAddress, greenRightWaveform)
-        dp.DPxWriteRam(greenRightReleaseAddress, greenRightReleaseWaveform)
-        dp.DPxWriteRam(blueRightAddress, blueRightWaveform)
-        dp.DPxWriteRam(blueRightReleaseAddress, blueRightReleaseWaveform)
-        dp.DPxWriteRam(whiteRightAddress, whiteRightWaveform)
-        dp.DPxWriteRam(whiteRightReleaseAddress, whiteRightReleaseWaveform)
+        self.dp.DPxWriteRam(redRightAddress, redRightWaveform)
+        self.dp.DPxWriteRam(redRightReleaseAddress, redRightReleaseWaveform)
+        self.dp.DPxWriteRam(yellowRightAddress, yellowRightWaveform)
+        self.dp.DPxWriteRam(yellowRightReleaseAddress, yellowRightReleaseWaveform)
+        self.dp.DPxWriteRam(greenRightAddress, greenRightWaveform)
+        self.dp.DPxWriteRam(greenRightReleaseAddress, greenRightReleaseWaveform)
+        self.dp.DPxWriteRam(blueRightAddress, blueRightWaveform)
+        self.dp.DPxWriteRam(blueRightReleaseAddress, blueRightReleaseWaveform)
+        self.dp.DPxWriteRam(whiteRightAddress, whiteRightWaveform)
+        self.dp.DPxWriteRam(whiteRightReleaseAddress, whiteRightReleaseWaveform)
 
         #configure buffer-- only need to configure the first one, rest will follow the same format
-        dp.DPxSetDoutBuff(redLeftAddress, len(redLeftWaveform)*2)
-        dp.DPxSetDoutSched(0, np.round(1000/pulseWidth).astype(int), 'hz', len(redLeftWaveform)+1)
-        dp.DPxUpdateRegCache()
+        self.dp.DPxSetDoutBuff(redLeftAddress, len(redLeftWaveform)*2)
+        self.dp.DPxSetDoutSched(0, np.round(1000/pulseWidth).astype(int), 'hz', len(redLeftWaveform)+1)
+        self.dp.DPxUpdateRegCache()
 
         #turn on debounce so button jitter is suppressed
-        dp.DPxEnableDinDebounce()
+        self.dp.DPxEnableDinDebounce()
 
         # Enable button schedules
-        dp.DPxEnableDoutButtonSchedules()
+        self.dp.DPxEnableDoutButtonSchedules()
         # Set the button schedules mode to 2 for button push and release events (1 for push only)
-        dp.DPxSetDoutButtonSchedulesMode(2)
-        dp.DPxWriteRegCache()
+        self.dp.DPxSetDoutButtonSchedulesMode(2)
+        self.dp.DPxWriteRegCache()
 
+    ################################################################
+    # enableVsyncTrigger: Modified from VPIxx example code
+    ################################################################
+    def enableVsyncTrigger(self):
+        """
+        Enable vsync trigger for ProPixx
         
-        
+        This method enables the vsync trigger for the ProPixx device
+        """
+        print("(pglDataPixx:enableVsyncTrigger) vsync trigger enabled.")
 
+        # Initialize the device
+        #self.openDPx()
+
+        # stop currently running schedules
+        self.stopDPxSchedules()
+
+        # setup schedule
+        base_address = self.dp.DPxGetDoutBuffBaseAddr()
+        buffer_dout = [0xFFFF, 0]
+        self.dp.DPxSetDoutBuff(base_address, 4)
+        self.dp.DPxWriteRam(base_address, buffer_dout)
+        self.dp.DPxSetDoutSched(0, 2, 'video', 0) 
+
+        # updae cache
+        self.dp.DPxUpdateRegCache()
+
+        # start schedule
+        self.dp.DPxStartDoutSched()
+        self.dp.DPxUpdateRegCache()
+
+        # Close 
+        #self.closeDPx()
+
+    ################################################################
+    # configureDigitialOuptut, adapted form vpixx documentation
+    ################################################################
+    def _configureDigitalOutputs(self, configDict, currentAddress):
+        """
+        Configures digital outputs based on the provided trigger dictionary and
+        assigns a memory address. Each signal's bits are shifted according to the
+        specified output channel, and then written to the VPixx hardware memory.
+        
+        Parameters:
+            configDict (dict): Dictionary with entries in the format:
+                {
+                    'eventName': {'signal': [0, 1, 0, ...], 'channel': int
+                    }
+                }
+                Where the eventName is an aribtrary string to use to trigger the event
+                the signal is the shape of the digitial pulse (e.g. 0, 1, 0 starts at 0
+                rises to 1 and falls back to 0 when triggered)
+                channel is the digitial channel that will be written
+            currentAddress (int): The starting memory address for storing signal
+                                data.
+        
+        Returns:
+            configDict (dict): The updated dictionary with assigned memory addresses
+                                for each event.
+        """
+        # Loop through each event in the configuration dictionary
+        for event, details in configDict.items():
+            
+            # Ensure the currentAddress is even; if it's odd, increment by 1
+            if currentAddress % 2 != 0:
+                currentAddress += 1
+                
+            details['address'] = currentAddress
+            channel = details.get('channel')
+            signal = details.get('signal', [])
+            signalLength = len(signal)
+            
+            # Shift each bit in the signal to the left by the value of the channel.
+            # This positions the bit correctly for the digital output channel.
+            toggledSignal = [(bit << channel) for bit in signal]
+            
+            # Write the modified signal (toggledSignal) into the VPixx hardware memory
+            # at the specified address.
+            self.dp.DPxWriteRam(currentAddress, toggledSignal)
+            
+            print(f"Configured: {event} is {signal} on DOut channel {channel}")
+            
+            # Update the current memory address by adding the length of the signal.
+            # Important to multiply by 2 to reserve enough space.
+            currentAddress += signalLength * 2
+        
+        # After configuring all events, commit changes to the register cache of the
+        # hardware
+        self.dp.DPxWriteRegCache()
+        
+        return configDict
+
+    ################################################################
+    # configure the digital outputs, calls internal function
+    ################################################################
+    def configureDigitalOutputs(self):
+        '''
+        Configures some triggerst that can be sent using sendTrigger
+        '''
+        # set up triggers
+        triggers = {
+            "stimulusOn": {"signal": [1, 0], "channel": 8},
+            "stimulusOff": {"signal": [1, 0], "channel": 1},
+        }
+
+        # register the triggers, note the hardcoded address here - this is in the sample code - eeks
+        self.triggers = self._configureDigitalOutputs(triggers, currentAddress=int(8e6))        
+
+    ################################################################
+    # send a digital trigger, 
+    ################################################################
+    def sendTrigger(self, eventName, delay=0.0, samplingRate=1000):
+        """
+        Sends a digital trigger signal based on the provided dictionary entry.
+        
+        Parameters:
+            entry (dict): A dictionary entry containing keys 'signal', 'channel',
+                        and 'address'.
+            delay (float): Delay (in seconds) before the trigger signal starts
+                        (default is 0.0).
+            samplingRate (int): Sampling rate in Hz for the digital output (default
+                                is 10).
+        """
+
+        # get the entry
+        entry = self.triggers.get(eventName, None)
+        if entry is None:
+            print(f"(pglDataPixx: sendTrigger) Could not find {eventName} in configured triggers.")
+            return
+        
+        # Determine the length of the signal (number of bits) for scheduling purposes
+        signalLength = len(entry.get('signal', []))
+        
+        # Retrieve the memory address for this signal from the entry
+        address = entry.get('address')
+        
+        # Schedule the digital output signal on the hardware:
+        # - delay: when to start the signal,
+        # - samplingRate: how often to sample the signal,
+        # - signal_length: the duration of the signal,
+        # - address: the location in memory where the signal is stored.
+        self.dp.DPxSetDoutSchedule(delay, samplingRate, signalLength, address)
+
+        #self.dp.DPxSetDoutSchedRate(1,'video')
+        self.dp.DPxSetDoutSchedRate(1000,'hz')
+
+        # Start the digital output schedule to send the trigger signal
+        self.dp.DPxStartDoutSched()
     ################################################################
     # test function, can be removed once working
     ################################################################
     def test(self):
-        exitButton = 'blue'
-        #self.deviceLog = self.device.din.setDinLog(12e6, 1000)
-        self.device.din.startDinLog()
-        self.device.updateRegisterCache()
-        finished = False
 
 
-        #let's create a loop which checks the schedule at 0.25 s intervals for button presses.
-        #Any time a button press is found, we print the timestamp and button pressed.
-        #If a designated exit button is pressed, we disconnect.
-        while finished == False:
-            #read device status
-            self.device.updateRegisterCache()
-            self.device.din.getDinLogStatus(self.deviceLog)
-            newEvents = self.deviceLog["newLogFrames"]
+        # Initialize the device
+        #self.openDPx()
 
-            if newEvents > 0:
-                eventList = self.device.din.readDinLog(self.deviceLog, newEvents)
+        self.stopDPxSchedules()
+        # Set digital output bit(s) high
+        #self.dp.DPxSetDoutValue(0xFFFFFFFF, 0xFFFFFFFF)
+        #self.dp.DPxSetDoutValue(0x0, 0xFFFFFFFF)
+        #self.dp.DPxUpdateRegCache()
 
-                for x in eventList:
-                    if x[1] in self.buttonCodes:
-                        #look up the name of the button
-                        buttonID = self.buttonCodes[x[1]]
+        #value = self.dp.DPxGetDoutValue()
+        #print(hex(value))
 
-                        #get the time of the press, since we started logging
-                        time = round(x[0] - self.deviceStartTime, 2)
-                        printStr = 'Button pressed! Button code: ' + str(x[1]) + ', Button ID: ' + buttonID + ', Time:' + str(time)
-                        print(printStr)
-                        if buttonID == exitButton:
-                            finished = True
-            #wait for 0.25 seconds
-            self.pglTimestamp.waitSecs(0.25)
-            #Finished=True
 
-        #Stop logging
-        #self.device.din.stopDinLog()
-        #self.device.updateRegisterCache()
 
+        base_address = self.dp.DPxGetDoutBuffBaseAddr()
+        buffer_dout = [0xFFFF, 0]
+        self.dp.DPxSetDoutBuff(base_address, 4)
+        self.dp.DPxWriteRam(base_address, buffer_dout)
+        self.dp.DPxSetDoutSched(0, 2, 'video', 0) 
+
+        self.dp.DPxUpdateRegCache()
+
+        self.dp.DPxStartDoutSched()
+        self.dp.DPxUpdateRegCache()
+
+        # Close when done
+        #self.closeDPx()
 
 ###################################
 # ProPixx device
@@ -618,7 +792,6 @@ class pglProPixx(pglDevice):
             self.currentStatus = 0
 
         return self.currentStatus
-
 
 ###################################
 # ResponsePixx events (buttons)
