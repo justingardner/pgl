@@ -282,6 +282,7 @@ class _pglTraitsDialog(QDialog):
 
         #combo = QComboBox()
         combo = CenteredComboBox()
+        combo.setObjectName("settingsSelector")
         combo.addItems([str(getattr(x, keyTraitName)) for x in current])
         combo.setToolTip(helpText)
 
@@ -740,6 +741,24 @@ class _pglTraitsDialog(QDialog):
             padding: 2px 8px;
         }
 
+        QComboBox#settingsSelector {
+            background-color: #263b4d;
+            color: #ffffff;
+            font-weight: bold;
+            border: 2px solid #4fa3d1;
+            border-radius: 4px;
+            padding: 4px 8px;
+        }
+
+        QComboBox#settingsSelector:hover {
+            border: 2px solid #88c0d0;
+            background-color: #434c5e;
+        }
+
+        QComboBox#settingsSelector:focus {
+            border: 2px solid #8fbcbb;
+        }
+        
         /* Checkboxes */
         QCheckBox {
             color: #d6d9de;
