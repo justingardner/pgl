@@ -69,6 +69,10 @@ class pglSettingsManager:
         
         # display the settings
         settingsList = pglTraitsDialog(settingsList)
+        
+        # save the settings if user clicked OK
+#        if settingsList is not None:
+#            for iDisplay in settingsList
             
     @classmethod
     def getDisplayNames(cls, displayIndex=None):
@@ -385,7 +389,7 @@ class pglTraitSettings(HasTraits, pglSerialize):
 ##################################################
 # display Settings select
 ##################################################
-#class pglDisplaySettingsSelect(pglSettingsEditable):
+#class pglDisplaySettingsSelect(pglTraitSettings):
     
     # traits that can be edited
     #displayNames = List(Unicode(), help="Settings names")
@@ -455,12 +459,12 @@ class pglDisplaySettings(pglSettingsEditable):
 ##################################################
 class pglDisplaySettingsList(pglTraitSettings):
 
-    chooseDisplay = List(Instance(pglDisplaySettings), settingsListKey="displayName", help="List of display settings")
+    settingsList = List(Instance(pglDisplaySettings), settingsListKey="displayName", traitDisplayName="Choose display", help="List of display settings")
     
     def __init__(self, settingsList=None):
         super().__init__()
         if settingsList is not None:
-            self.chooseDisplay = settingsList
+            self.settingsList = settingsList
  
 
 # Screen settings select

@@ -612,7 +612,8 @@ class _pglTraitsDialog(QDialog):
         if layout is None:
             layout = self.formLayout
 
-        label = QLabel(traitName)
+        traitLabel = trait.metadata["traitDisplayName"] if "traitDisplayName" in trait.metadata else traitName
+        label = QLabel(traitLabel)
         label.setObjectName("traitLabel")
         #label.setMinimumWidth(180)          # consistent label column
         label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
