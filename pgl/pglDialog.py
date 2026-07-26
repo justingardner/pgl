@@ -921,8 +921,11 @@ def pglTraitsDialog(settings):
     )
 
     if result.returncode == 0 and outFile.exists():
-        return pglSerialize.load(outFile)   # OK
-    return None                                # Cancel
+        # OK
+        return pglSerialize.load(outFile)
+    else:
+        # Cancel
+        return None                               
 
 #############
 # Main class which should be subclassed for specific settings,

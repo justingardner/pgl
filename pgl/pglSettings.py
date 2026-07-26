@@ -31,6 +31,7 @@ import CoreFoundation
 from AppKit import NSScreen
 from .pglBase import pglBase
 import re
+from collections import OrderedDict
 
 displayDuration = 5  # seconds
 #######################################
@@ -64,20 +65,27 @@ class pglSettingsManager:
         Edit pgl display settings. Brings up widget interface to edit display settings
         """
         # get the display infos
-        d = cls.getDisplayInfo()
-        settingsList = pglDisplaySettingsList(d)
+        original = pglDisplaySettingsList(cls.getDisplaySettings())
         
         # display the settings
-        settingsList = pglTraitsDialog(settingsList)
-        
+        modified = pglTraitsDialog(original)
+
         # save the settings if user clicked OK
-#        if settingsList is not None:
-#            for iDisplay in settingsList
+        if modified is not None:
+            # for each display in modified list
+            for modifiedDisplay in modified.settingsList:
+                # compare to original
+                matchingOriginalDisplay = next((originalDisplay for originalDisplay in original.settingsList if originalDisplay == modifiedDisplay), None)
+                if matchingOriginalDisplay is not None:
+                    # and if it is not equal (field by field) then save it
+                    if not matchingOriginalDisplay.equals(modifiedDisplay):
+                        modifiedDisplay.save()
             
     @classmethod
     def getDisplayNames(cls, displayIndex=None):
-        
-                
+        '''
+        Get display names
+        '''
         displayNames.append('Windowed')
 
         # get names from gpuInfo
@@ -101,7 +109,7 @@ class pglSettingsManager:
         return displayNames
     
     @classmethod
-    def getDisplayInfo(cls):
+    def getDisplaySettings(cls):
         '''
         Get info on displays
         '''
@@ -121,7 +129,7 @@ class pglSettingsManager:
             displaySettings = pglDisplaySettings().load(p)
             # make sure displayName matches diectory
             displaySettings.displayName = str(p.parent.name)
-            # get the luminance calibrations
+            # get the calibrations
             displaySettings.getCalibrations()
             # and add to display list
             displays.append(displaySettings)
@@ -169,8 +177,15 @@ class pglSettingsManager:
             # get the luminance calibrations
             displaySettings.getCalibrations()
             
-            # append to our list of all displays
-            displays.append(displaySettings)
+            # check if we already have it in our list
+            matchingDisplay = next((d for d in displays if displaySettings == d), None)
+            if matchingDisplay is not None:
+                # if so, update a few fields to the settings found above
+                matchingDisplay.isMain = displaySettings.isMain
+                matchingDisplay.isBuiltin = displaySettings.isBuiltin
+            else:
+                # append to our list of all displays
+                displays.append(displaySettings)
         return(displays)
          
     @staticmethod       
@@ -218,12 +233,14 @@ class pglSettingsManager:
         return settingsDir
     
     @classmethod
-    def getCalibrations(cls, calibrationDir):
+    def getCalibrations(cls, calibrationDir, oldCalibrations=None):
         '''
         Get all the calibrations in the calibrationDir. These will be labeled as YYYYMMDD or YYYYMMDD_HHMMSS
         
         Args:
             calibrationDir: Directory to search for calibrations under
+            oldCalibrtions: List of old calibrations - if not None, will make sure the selected one
+                is on top of the returned list
         '''
         # find all YYMMDD* directories underneath the calibrationDir
         pattern = re.compile(r'^\d{8}(_.*)?$')
@@ -231,14 +248,34 @@ class pglSettingsManager:
 
         # check for valid calibrations in the directory
         validCalibrations= ['None']
+        hasLatest = False
         for m in sorted(matches):
             calibrationFile = m / "calibration.json"
             if calibrationFile.is_file:
                 validCalibrations.append(m.name)
         if len(validCalibrations) > 1:
             validCalibrations.append('Latest')
-        return(validCalibrations)
+            hasLatest = True
+            
+        # check our existing calibrations list
+        if oldCalibrations is not None:
+            # get the top of the list (this is the user selected one)
+            currentCalibration = oldCalibrations[0]
+
+            # find it in the new list and put it on top
+            if currentCalibration in validCalibrations:
+                validCalibrations.remove(currentCalibration)
+                validCalibrations.insert(0, currentCalibration)
+            else:
+                # not found, complain
+                swapWith = "Latest" if hasLatest else "None"
+                print(f"(pglSettingsManager:getCalibrations) Selected calibration {currentCalibration} not found anymore, defaulting to {swapWith}")
+                validCalibrations.remove(swapWith)
+                validCalibrations.insert(0,swapWith)
         
+        return(validCalibrations)
+    
+    
     @classmethod
     def getDisplayTemporalCalibrationDir(cls, displaySettings=None, makeDir=False):
         '''
@@ -384,7 +421,49 @@ class pglSettingsManager:
 # used for inheritence
 ##################################################
 class pglTraitSettings(HasTraits, pglSerialize):
-    pass
+    
+    def _getOrderedTraits(self):
+        """Return traits in class definition order."""
+        ordered = OrderedDict()
+
+        # Walk MRO from base class to subclass
+        for cls in reversed(type(self).__mro__):
+            for name, obj in cls.__dict__.items():
+                if isinstance(obj, TraitType):
+                    ordered[name] = obj
+
+        return ordered
+
+    def print(self):
+        '''
+        print
+        '''
+        print(f"{self.__class__.__name__}:")
+        print("-" * 40)
+
+        for name, trait in self._getOrderedTraits().items():
+
+            # skip private/internal traits
+            if name.startswith("_"):
+                continue
+
+            label = trait.metadata.get("traitDisplayName", name)
+            value = getattr(self, name)
+
+            print(f"{label:<30} {value}")
+
+    def equals(self, other):
+        '''
+        Check for all traitlet field match between two settings
+        '''
+        if not isinstance(other, self.__class__):
+            return False
+
+        for name in self._getOrderedTraits():
+            if getattr(self, name) != getattr(other, name):
+                return False
+
+        return True
 
 ##################################################
 # display Settings select
@@ -394,18 +473,29 @@ class pglTraitSettings(HasTraits, pglSerialize):
     # traits that can be edited
     #displayNames = List(Unicode(), help="Settings names")
             
-class pglDisplaySettings(pglSettingsEditable):
+class pglDisplaySettings(pglTraitSettings):
     displayName = Unicode("", help="Names of screen")
     uuid = Unicode("", help="UUID of display", enabled=False)
     vendor = Int(0, help="Vendor number", enabled=False)
     model = Int(0, help="Model number", enabled=False)
     serialNumber = Int(0, help="Serial number", enabled=False)
-    isMain = Bool(False, help="Whether the display is the main display", enabled=False)
-    isBuiltin = Bool(False, help="Whether the display is the built-in display of e.g. a laptop", enabled=False)
+    isMain = Bool(False, help="Whether the display is the main display", enabled=True)
+    isBuiltin = Bool(False, help="Whether the display is the built-in display of e.g. a laptop", enabled=True)
     displayModes = List(Unicode(), help="All supported display modes")
     luminanceCalibration = List(Unicode(), hasPlotButton=True, buttonFunction="plotLuminanceCalibration", default_value=['None'], help="Which luminance calibration to use")
     temporalCalibration = List(Unicode(), hasPlotButton=True, buttonFunction="plotTemporalCalibration", default_value=['None'], help="Which temporal calibration to use")
     
+    def save(self, filename=None):
+        '''
+        save
+        
+        Args:
+            filename: Filename to save to, if ommitted, will generate path and filename using pglSettingsManager.getDisplayDir
+        '''
+        if filename is None:
+            filename = pglSettingsManager.getDisplayDir(self) / "display.json"
+        super().save(filename=filename)
+        
     def getCalibrations(self):
         '''
         Looks into calibrations direcotry of display to find luminance and temporal calibrations
@@ -415,11 +505,12 @@ class pglDisplaySettings(pglSettingsEditable):
         
         # get all the luminance calibrations
         luminanceCalibrationDir = pglSettingsManager.getDisplayLuminanceCalibrationDir(displaySettings=self)
-        self.luminanceCalibration = pglSettingsManager.getCalibrations(luminanceCalibrationDir)
+        self.luminanceCalibration = pglSettingsManager.getCalibrations(luminanceCalibrationDir, self.luminanceCalibration)
         
         # get all the temporal calibrations
         temporalCalibrationDir = pglSettingsManager.getDisplayTemporalCalibrationDir(displaySettings=self)
-        self.temporalCalibration = pglSettingsManager.getCalibrations(temporalCalibrationDir)
+        self.temporalCalibration = pglSettingsManager.getCalibrations(temporalCalibrationDir, self.temporalCalibration)
+
 
     def plotLuminanceCalibration(self, fig, selected):
         '''
@@ -453,6 +544,16 @@ class pglDisplaySettings(pglSettingsEditable):
         calibration.display(fig=fig)
         
         return True
+    
+    def __eq__(self, other):
+        '''
+        Define equality as when the two displays share the same uuid
+        '''
+        
+        if not isinstance(other, pglDisplaySettings):
+            return NotImplemented
+
+        return self.uuid == other.uuid
 
 ##################################################
 # List of settings
