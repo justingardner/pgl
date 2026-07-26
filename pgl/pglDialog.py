@@ -280,7 +280,7 @@ class _pglTraitsDialog(QDialog):
 
         keyTraitName = trait.metadata["settingsListKey"]
 
-        #combo = QComboBox()
+        # create the dropdown which selects which settings to display
         combo = CenteredComboBox()
         combo.setObjectName("settingsSelector")
         combo.addItems([str(getattr(x, keyTraitName)) for x in current])
@@ -288,20 +288,41 @@ class _pglTraitsDialog(QDialog):
 
         self._register(traitName, trait, combo, lambda v: None, layout)
 
+        # update combo whenever the keyTrait changes
+        def updateComboName(change, obj):
+            index = current.index(obj)
+            combo.blockSignals(True)
+            combo.setItemText(index, str(change["new"]))
+            combo.blockSignals(False)
+  
+        # observe the key trait
+        for obj in current:
+            obj.observe(
+                lambda change, obj=obj: updateComboName(change, obj),
+                names=keyTraitName
+            )
+            
         proxy = _RetargetableProxy(current[0])
         childNames = []
 
+        # build the rows for the settings
         def buildRows():
+            # get each one of the trait fields
             for name, childTrait in self._getOrderedTraits(current[0]).items():  # real object, not proxy
+                # ignore internal ones
                 if name.startswith('_'):
                     continue
+                # add the trait
                 self._addTraitWidget(name, childTrait, proxy, layout)  # proxy for commits
                 childNames.append(name)
 
+        # displays the settings
         def showObject(index):
             obj = getattr(settingsObject, traitName)[index]
             proxy.retarget(obj)
 
+            # first time we are called, then we will need to build the rows
+            # this happens when showObject is called below
             if not childNames:
                 buildRows()
                 return
@@ -321,8 +342,10 @@ class _pglTraitsDialog(QDialog):
             self.plotCanvas.setVisible(False)
             self.plotCanvas.draw()
 
-
+        # tells the combo to connect the settings when the index has changed
         combo.currentIndexChanged.connect(showObject)
+        
+        # show the top of list
         showObject(0)
         
     # ----- Float with min/max -----
