@@ -79,6 +79,18 @@ class pglSettingsManager:
                 if matchingOriginalDisplay is not None:
                     # and if it is not equal (field by field) then save it
                     if not matchingOriginalDisplay.equals(modifiedDisplay):
+                        # if the displayName changed, we need to change the name of the directory
+                        if modifiedDisplay.displayName != matchingOriginalDisplay.displayName:
+                            oldPath = cls.getDisplayDir(matchingOriginalDisplay)
+                            newPath = cls.getDisplayDir(modifiedDisplay)
+                            try:
+                                # rename to the new path
+                                oldPath.rename(newPath)
+                            except OSError as e:
+                                # if it did not work, provide an error
+                                print(f"(pglSettingsManager:displaySettings) Could not change directory name from {oldPath.name} to {newPath.name}, keeping {oldPath.name}")
+                                modifiedDisplay.displayName = matchingOriginalDisplay.displayName
+                        # save the modified display
                         modifiedDisplay.save()
             
     @classmethod
@@ -128,7 +140,8 @@ class pglSettingsManager:
             # load json settings
             displaySettings = pglDisplaySettings().load(p)
             # make sure displayName matches diectory
-            displaySettings.displayName = str(p.parent.name)
+            if pglBase.makeValidFilename(displaySettings.displayName) != str(p.parent.name):
+                displaySettings.displayName= str(p.parent.name)
             # get the calibrations
             displaySettings.getCalibrations()
             # and add to display list
@@ -479,8 +492,8 @@ class pglDisplaySettings(pglTraitSettings):
     vendor = Int(0, help="Vendor number", enabled=False)
     model = Int(0, help="Model number", enabled=False)
     serialNumber = Int(0, help="Serial number", enabled=False)
-    isMain = Bool(False, help="Whether the display is the main display", enabled=True)
-    isBuiltin = Bool(False, help="Whether the display is the built-in display of e.g. a laptop", enabled=True)
+    isMain = Bool(False, help="Whether the display is the main display", enabled=False)
+    isBuiltin = Bool(False, help="Whether the display is the built-in display of e.g. a laptop", enabled=False)
     displayModes = List(Unicode(), help="All supported display modes")
     luminanceCalibration = List(Unicode(), hasPlotButton=True, buttonFunction="plotLuminanceCalibration", default_value=['None'], help="Which luminance calibration to use")
     temporalCalibration = List(Unicode(), hasPlotButton=True, buttonFunction="plotTemporalCalibration", default_value=['None'], help="Which temporal calibration to use")
