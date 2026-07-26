@@ -23,6 +23,7 @@ from .pglSettings import pglSettingsEditable, pglSettingsManager, pglDisplaySett
 from .pglEventListener import pglEventListener
 from .pglEyeTracker import pglEyeTracker
 from .pglDialog import pglTraitsDialog
+from .pglMessages import pglMessages
 
 # Device specific imports (eye trackers, etc.)
 from .pglVPixx import pglProPixx, pglDataPixx
@@ -37,7 +38,7 @@ try:
 except ImportError:
     print("(pgl) Warning: pylink not found, pglEyelink class will not be available. Download with: pip install sr-research-pylink")
 
-class pgl(pglBase, pglResolution, pglDraw, pglTransform, pglProfile, pglBatch, pglImage, pglStimuli, pglTimestamp, pglDevices, pglEvents, pglCommandReplayer, pglFrameGrab, pglGammaTable, pglSettingsManager):
+class pgl(pglBase, pglResolution, pglDraw, pglTransform, pglProfile, pglBatch, pglImage, pglStimuli, pglTimestamp, pglDevices, pglEvents, pglCommandReplayer, pglFrameGrab, pglGammaTable, pglSettingsManager, pglMessages):
     """
     purpose: psychophysics and experiment library for Python.
     License: MIT License — see LICENSE file for details.

@@ -32,6 +32,7 @@ from AppKit import NSScreen
 from .pglBase import pglBase
 import re
 from collections import OrderedDict
+from .pglMessages import pglMessages
 
 displayDuration = 5  # seconds
 #######################################
@@ -85,11 +86,10 @@ class pglSettingsManager:
                             newPath = cls.getDisplayDir(modifiedDisplay)
                             try:
                                 # rename to the new path
-                                if oldPath.exists():
-                                    oldPath.rename(newPath)
+                                if oldPath.exists(): oldPath.rename(newPath)
                             except OSError as e:
                                 # if it did not work, provide an error
-                                print(f"(pglSettingsManager:displaySettings) Could not change directory name from {oldPath.name} to {newPath.name}, keeping {oldPath.name}")
+                                pglMessages.warning("Could not change directory name from {oldPath.name} to {newPath.name}, keeping {oldPath.name}")
                                 modifiedDisplay.displayName = matchingOriginalDisplay.displayName
                         # save the modified display
                         modifiedDisplay.save()
@@ -214,7 +214,12 @@ class pglSettingsManager:
             displaySettings.getCalibrations()
             
             # check if we already have it in our list
-            matchingDisplay = next((d for d in displays if displaySettings == d), None)
+            matchingDisplays = [d for d in displays if displaySettings == d]
+            if len(matchingDisplays) > 1:
+                raise RuntimeError(
+                    f"Found multiple displays with UUID {displaySettings.uuid}"
+                )
+            matchingDisplay = matchingDisplays[0] if matchingDisplays else None
             if matchingDisplay is not None:
                 # if so, update a few fields to the settings found above
                 matchingDisplay.isMain = displaySettings.isMain
