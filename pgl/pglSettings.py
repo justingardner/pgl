@@ -17,7 +17,7 @@ from urllib import response
 from IPython.display import display, HTML, clear_output
 from fileinput import filename
 from ipywidgets.widgets import widget
-from traitlets import HasTraits, Float, Int, List, TraitError, Unicode, Dict, default, link, Bool, TraitType, Instance
+from traitlets import HasTraits, Float, Int, List, Tuple, TraitError, Unicode, Dict, default, link, Bool, TraitType, Instance
 from datetime import datetime   
 import numpy as np
 import subprocess
@@ -85,7 +85,8 @@ class pglSettingsManager:
                             newPath = cls.getDisplayDir(modifiedDisplay)
                             try:
                                 # rename to the new path
-                                oldPath.rename(newPath)
+                                if oldPath.exists():
+                                    oldPath.rename(newPath)
                             except OSError as e:
                                 # if it did not work, provide an error
                                 print(f"(pglSettingsManager:displaySettings) Could not change directory name from {oldPath.name} to {newPath.name}, keeping {oldPath.name}")
@@ -155,14 +156,36 @@ class pglSettingsManager:
             
             # get all supported modes
             modes = Quartz.CGDisplayCopyAllDisplayModes(display, None)
-            modeNames = []
+            displayModes = []
+
             for mode in modes:
+                # get info about the mode
                 w = Quartz.CGDisplayModeGetWidth(mode)
                 h = Quartz.CGDisplayModeGetHeight(mode)
-                refresh = Quartz.CGDisplayModeGetRefreshRate(mode)
-                modeNames.append(f"{w} x {h} @ {refresh}Hz")
-            displaySettings.displayModes = modeNames
-            
+                refreshRate = Quartz.CGDisplayModeGetRefreshRate(mode)
+
+                # make into a tuple
+                pixelDims = (w, h)
+
+                # See if we already have this resolution
+                existingMode = next(
+                    (m for m in displayModes if m.pixelDims == pixelDims),
+                    None
+                )
+
+                if existingMode is not None:
+                    # Add refresh rate if it is not already there
+                    if refreshRate not in existingMode.refreshRate:
+                        existingMode.refreshRate.append(refreshRate)
+                else:
+                    displayModeSettings = pglDisplayModeSettings()
+                    displayModeSettings.modeName = f"{w} x {h}"
+                    displayModeSettings.pixelDims = pixelDims
+                    displayModeSettings.refreshRate = [refreshRate]
+                    displayModes.append(displayModeSettings)
+
+            displaySettings.displayModes = displayModes     
+                   
             # get the current mode settings
             #mode = Quartz.CGDisplayCopyDisplayMode(display)
             #displaySettings.displayWidth = Quartz.CGDisplayModeGetWidth(mode)  
@@ -485,7 +508,11 @@ class pglTraitSettings(HasTraits, pglSerialize):
     
     # traits that can be edited
     #displayNames = List(Unicode(), help="Settings names")
-            
+class pglDisplayModeSettings(pglTraitSettings):
+    modeName = Unicode("", help="Temp")
+    pixelDims = Tuple(Int(), Int(), default_value=None, allow_none=True, help="Pixel dimensions of screen")
+    refreshRate = List(Float(), help="Refresh rates supported for this pixel dimension")
+
 class pglDisplaySettings(pglTraitSettings):
     displayName = Unicode("", help="Names of screen")
     uuid = Unicode("", help="UUID of display", enabled=False)
@@ -494,10 +521,10 @@ class pglDisplaySettings(pglTraitSettings):
     serialNumber = Int(0, help="Serial number", enabled=False)
     isMain = Bool(False, help="Whether the display is the main display", enabled=False)
     isBuiltin = Bool(False, help="Whether the display is the built-in display of e.g. a laptop", enabled=False)
-    displayModes = List(Unicode(), help="All supported display modes")
+    displayModes = List(Instance(pglDisplayModeSettings), settingsListKey="modeName", hideKey=True, highlightSelector=False, traitDisplayName="pixelDims", help="All supported display modes")
     luminanceCalibration = List(Unicode(), hasPlotButton=True, buttonFunction="plotLuminanceCalibration", default_value=['None'], help="Which luminance calibration to use")
     temporalCalibration = List(Unicode(), hasPlotButton=True, buttonFunction="plotTemporalCalibration", default_value=['None'], help="Which temporal calibration to use")
-    
+            
     def save(self, filename=None):
         '''
         save

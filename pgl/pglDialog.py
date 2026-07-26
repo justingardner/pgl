@@ -261,6 +261,10 @@ class _pglTraitsDialog(QDialog):
         elif isinstance(trait, Unicode) and trait.metadata.get("isPath", False):
             self._addText(traitName, trait, current, helpText, settingsObject, layout)
 
+        # Unicode with button
+        elif isinstance(trait, Unicode) and trait.metadata.get("hasSetButton", False):
+            self._addTextWithSetButton(traitName, trait, current, helpText, settingsObject, layout)
+
         # Unicode
         elif isinstance(trait, Unicode):
             self._addText(traitName, trait, current, helpText, settingsObject, layout)
@@ -274,15 +278,18 @@ class _pglTraitsDialog(QDialog):
             self._addList(traitName, trait, current, helpText, settingsObject, layout)
 
     # ----- Setting list -----
+    _selectedSettings = {}
     def _addSettingsList(self, traitName, trait, current, helpText, settingsObject, layout=None):
         if layout is None:
             layout = self.formLayout
 
         keyTraitName = trait.metadata["settingsListKey"]
+        hideKey = trait.metadata.get("hideKey",False)
 
         # create the dropdown which selects which settings to display
         combo = CenteredComboBox()
-        combo.setObjectName("settingsSelector")
+        if trait.metadata.get("highlightSelector",True):
+            combo.setObjectName("settingsSelector")
         combo.addItems([str(getattr(x, keyTraitName)) for x in current])
         combo.setToolTip(helpText)
 
@@ -304,6 +311,12 @@ class _pglTraitsDialog(QDialog):
             
         proxy = _RetargetableProxy(current[0])
         childNames = []
+        
+        self._selectedSettings[traitName] = {
+           "list": current,
+            "object": current[0],
+            "key": keyTraitName
+        }
 
         # build the rows for the settings
         def buildRows():
@@ -312,6 +325,9 @@ class _pglTraitsDialog(QDialog):
                 # ignore internal ones
                 if name.startswith('_'):
                     continue
+                if hideKey and name==keyTraitName:
+                    continue
+                
                 # add the trait
                 self._addTraitWidget(name, childTrait, proxy, layout)  # proxy for commits
                 childNames.append(name)
@@ -320,6 +336,9 @@ class _pglTraitsDialog(QDialog):
         def showObject(index):
             obj = getattr(settingsObject, traitName)[index]
             proxy.retarget(obj)
+            
+            # keep which object is currently selected
+            self._selectedSettings[traitName]["object"] = obj
 
             # first time we are called, then we will need to build the rows
             # this happens when showObject is called below
@@ -476,41 +495,56 @@ class _pglTraitsDialog(QDialog):
 
     # ----- List -> dropdown -----
     def _addList(self, traitName, trait, current, helpText, settingsObject, layout=None):
-        #combo = QComboBox()
         combo = CenteredComboBox()
+
         options = list(current) if current else []
-        combo.addItems([str(o) for o in options])
-        if options:
+        comboValues = options.copy()   # preserve original types
+
+        combo.addItems([str(o) for o in comboValues])
+
+        if comboValues:
             combo.setCurrentIndex(0)
+
         combo.setToolTip(helpText)
 
         combo.setMinimumWidth(280)
         combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
-        # make the popup as wide as its widest item, and tall enough to read
         combo.view().setMinimumWidth(combo.sizeHint().width())
         combo.setMaxVisibleItems(12)
-        
+
         def onChange(index):
             if self._updatingWidget:
                 return
-            # move selected to top, like onListSelect did
-            selected = combo.itemText(index)
-            opts = [combo.itemText(i) for i in range(combo.count())]
-            newList = [selected] + [x for x in opts if x != selected]
+
+            selected = comboValues[index]
+
+            # move selected to top while preserving types
+            newList = [selected] + [x for x in comboValues if x != selected]
+
             self._commit(settingsObject, traitName, newList)
+
+            # update local ordering
+            comboValues[:] = newList
 
         combo.currentIndexChanged.connect(onChange)
 
         def setter(value):
+            nonlocal comboValues
+
             combo.blockSignals(True)
+
+            comboValues = list(value) if value else []
+
             combo.clear()
-            combo.addItems([str(o) for o in value])
-            if value:
+            combo.addItems([str(o) for o in comboValues])
+
+            if comboValues:
                 combo.setCurrentIndex(0)
+
             combo.blockSignals(False)
 
         self._register(traitName, trait, combo, setter, layout)
-
+        
     # ----- List with toggle plot button -----
     plotButtonState = False
     _activePlotButton = None
@@ -577,8 +611,6 @@ class _pglTraitsDialog(QDialog):
             newList = [selected] + [x for x in opts if x != selected]
             self._commit(settingsObject, traitName, newList)
 
-
-
         button.toggled.connect(onButtonToggled)
         combo.currentIndexChanged.connect(onSelectionChanged)
 
@@ -595,6 +627,45 @@ class _pglTraitsDialog(QDialog):
             combo.blockSignals(False)
 
         self._register(traitName, trait, row, setter, layout)
+
+    # ----- Text with a set button -----
+    def _addTextWithSetButton(self, traitName, trait, current, helpText, settingsObject, layout=None):
+
+        buttonFunc = trait.metadata.get("buttonFunction", None)
+
+        edit = QLineEdit(str(current) if current is not None else "")
+        edit.setAlignment(Qt.AlignCenter) 
+        edit.setToolTip(helpText)
+
+        button = QPushButton(trait.metadata.get("buttonLabel", "Set"))
+        button.setToolTip(helpText)
+        button.setCheckable(True)
+        
+        def onButtonClicked():
+            if buttonFunc is None:
+                return
+            method = getattr(settingsObject, buttonFunc, None)
+            if method is None:
+                return
+            edit.setText(method())
+
+
+        def onChange(text):
+            if not self._updatingWidget:
+                self._commit(settingsObject, traitName, text)
+
+        edit.textChanged.connect(onChange)
+        button.clicked.connect(onButtonClicked)
+        
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.addWidget(edit, 1)
+        h.addWidget(button)
+
+        self._register(traitName, trait, row, lambda v: edit.setText(str(v) if v is not None else ""), layout)
+
+
     # ----- RGB -----
     def _addRGB(self, traitName, trait, current, helpText, settingsObject, layout=None):
         rgb = list(current) if current else [0.0, 0.0, 0.0]
@@ -668,6 +739,23 @@ class _pglTraitsDialog(QDialog):
             print(f"(pglTraitsDialog:_commit) Could not set {traitName}: {e}")
 
     def _onOk(self):
+        for info in self._selectedSettings.values():
+            settingsList = info["list"]
+            selectedObject = info["object"]
+            keyTraitName = info["key"]
+
+            if selectedObject in settingsList:
+                # remove selected object
+                settingsList.remove(selectedObject)
+
+                # sort everything else alphabetically
+                settingsList.sort(
+                    key=lambda x: str(getattr(x, keyTraitName)).lower()
+                )
+
+                # put selected object first
+                settingsList.insert(0, selectedObject)
+
         self.accepted_ = True
         self.accept()
 
