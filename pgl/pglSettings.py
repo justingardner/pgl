@@ -601,7 +601,12 @@ class pglDisplaySettings(pglTraitSettings):
 class pglDisplaySettingsList(pglTraitSettings):
 
     settingsList = List(Instance(pglDisplaySettings), settingsListKey="displayName", traitDisplayName="Choose display", help="List of display settings")
-    
+    buttons = [("Test", "testDisplay")]
+
+    def testDisplay(self):
+        print(f"Testing: {self.settingsList[0].displayName}")
+        print(self.settingsList[0].print())
+        
     def __init__(self, settingsList=None):
         super().__init__()
         if settingsList is not None:

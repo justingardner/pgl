@@ -172,23 +172,42 @@ class _pglTraitsDialog(QDialog):
         scroll.setFrameShape(QScrollArea.NoFrame)
         scroll.setWidget(formWidget)
 
+        # Standard OK/Cancel buttons (right side)
         buttonBox = QDialogButtonBox(
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel
         )
         buttonBox.accepted.connect(self._onOk)
         buttonBox.rejected.connect(self._onCancel)
 
+        # Left-side custom actions
+        customButtonBox = QDialogButtonBox()
+
+        for label, callbackName in getattr(self.settings, "buttons", []):
+            button = QPushButton(label)
+            callback = getattr(self.settings, callbackName)
+            button.clicked.connect(callback)
+            customButtonBox.addButton(button, QDialogButtonBox.ActionRole)
+
         mainLayout = QVBoxLayout(self)
         mainLayout.setContentsMargins(0, 0, 0, 0)
         mainLayout.setSpacing(0)
         mainLayout.addWidget(scroll)
-        
+
         buttonBar = QWidget()
         buttonBar.setObjectName("buttonBar")
+
         bl = QHBoxLayout(buttonBar)
         bl.setContentsMargins(24, 8, 24, 8)
+
+        # Left side
+        bl.addWidget(customButtonBox)
+
+        # Push OK/Cancel to the right
         bl.addStretch(1)
+
+        # Right side
         bl.addWidget(buttonBox)
+
         mainLayout.addWidget(buttonBar)
 
         # Set overall dimensions
