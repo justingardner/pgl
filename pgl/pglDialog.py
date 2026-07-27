@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QCoreApplication
 from traitlets import (
-    HasTraits, Float, Int, List, Unicode, Bool, TraitType
+    HasTraits, Float, Int, List, Unicode, Bool, Tuple, TraitType
 )
 from .pglSerialize import pglSerialize
 import sys, subprocess, tempfile
@@ -233,8 +233,15 @@ class _pglTraitsDialog(QDialog):
         helpText = self._helpText(traitName, trait)
         current = getattr(settingsObject, traitName)
 
+        # a tuple
+        if not trait.metadata.get('visible',True):
+            return
+        
+        if isinstance(trait, Tuple):
+            self._addTuple(traitName, trait, current, helpText, settingsObject, layout)
+        
         # a settings list
-        if isinstance(trait, List) and "settingsListKey" in trait.metadata:
+        elif isinstance(trait, List) and "settingsListKey" in trait.metadata:
             self._addSettingsList(traitName, trait, current, helpText, settingsObject, layout)
         
         # Float with min and max -> slider + spinbox
@@ -445,7 +452,10 @@ class _pglTraitsDialog(QDialog):
                 self._commit(settingsObject, traitName, v)
 
         spin.valueChanged.connect(onChange)
-        self._register(traitName, trait, spin, lambda v: spin.setValue(float(v)), layout)
+        
+        # wrap with - and + buttons
+        row = self._wrapSpinDoubleStep(spin, bigStep = 1.0)
+        self._register(traitName, trait, row, lambda v: spin.setValue(float(v)), layout)
 
     # ----- Int -----
     def _addInt(self, traitName, trait, current, helpText, settingsObject, layout=None):
@@ -464,9 +474,87 @@ class _pglTraitsDialog(QDialog):
                 self._commit(settingsObject, traitName, int(v))
 
         spin.valueChanged.connect(onChange)
-        row = self._wrapSpin(spin)
+        
+        # wrap with - and + buttons
+        row = self._wrapSpinSingleStep(spin)
         self._register(traitName, trait, row, lambda v: spin.setValue(int(v)), layout)
 
+    # ----- Tuple -----
+    def _addTuple(self, traitName, trait, current, helpText, settingsObject, layout=None):
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(6)
+
+        spins = []
+
+        # get tuple Labels if it exits
+        tupleLabels = trait.metadata.get("labels", None)
+        
+        # get the elementTraits, so we can get the type of each element
+        tupleTraits = getattr(trait, "_traits", None)
+        
+        for i, value in enumerate(current):
+            if tupleLabels is not None:
+                label = QLabel(f"{tupleLabels[i]}:")
+                label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                label.setObjectName("tupleLabel")
+                h.addWidget(label)
+            
+            # Get the trait for this tuple element
+            elementTrait = tupleTraits[i] if tupleTraits else None           
+
+            if isinstance(elementTrait, Int):
+                spin = QSpinBox()
+                # set min and max
+                spin.setMinimum(elementTrait.min if elementTrait.min is not None else -2**31)
+                spin.setMaximum(elementTrait.max if elementTrait.max is not None else 2**31 - 1)
+                # set value
+                spin.setValue(int(value))
+
+            else:
+                spin = QDoubleSpinBox()
+                spin.setDecimals(1)
+                # set min and max
+                spin.setMinimum(elementTrait.min if elementTrait.min is not None else -1e12)
+                spin.setMaximum(elementTrait.max if elementTrait.max is not None else 1e12)
+                # set value
+                spin.setValue(float(value))
+
+            spin.setAlignment(Qt.AlignCenter)
+            spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
+
+            spin.setSingleStep(getattr(trait, "step", 1) or 1)
+            spin.setToolTip(helpText)
+
+            spins.append(spin)
+            h.addWidget(spin)
+
+        def onChange(_):
+            if not self._updatingWidget:
+                if tupleTraits:
+                    values = tuple(
+                        int(spin.value()) if isinstance(elementTrait, Int)
+                        else float(spin.value())
+                        for spin, elementTrait in zip(spins, tupleTraits)
+                    )
+                else:
+                    values = tuple(spin.value() for spin in spins)
+
+                self._commit(settingsObject, traitName, values)
+
+        for spin in spins:
+            spin.valueChanged.connect(onChange)
+
+        def setValue(values):
+            self._updatingWidget = True
+            try:
+                for spin, value in zip(spins, values):
+                    spin.setValue(value)
+            finally:
+                self._updatingWidget = False
+
+        self._register(traitName, trait, row, setValue, layout)
     # ----- Bool -----
     def _addBool(self, traitName, trait, current, helpText, settingsObject, layout=None):
         check = QCheckBox()
@@ -781,7 +869,7 @@ class _pglTraitsDialog(QDialog):
             color: #d6d9de;
             font-size: 13px;
         }
-        #traitLabel {
+        #traitLabel, #tupleLabel {
             color: #000000;
             font-weight: 600;
         }
@@ -937,8 +1025,14 @@ class _pglTraitsDialog(QDialog):
             color: #ffffff;
         }
         QPushButton:default:hover { background-color: #5a97ff; }
+
+        /* Spin box adjustment buttons */
+        QPushButton#halfSizeButton {
+            min-width: 36px;
+            padding: 7px 20px;
+        }
         """
-    def _wrapSpin(self, spin):
+    def _wrapSpinSingleStep(self, spin):
         """Wrap a spinbox with a large - on the left and + on the right."""
         spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
         spin.setAlignment(Qt.AlignCenter)          # center the number between buttons
@@ -962,6 +1056,46 @@ class _pglTraitsDialog(QDialog):
         h.addWidget(minus)                         # left
         h.addWidget(spin, 1)                       # middle, expands
         h.addWidget(plus)                          # right
+        return row
+    
+    def _wrapSpinDoubleStep(self, spin, bigStep=None):
+        spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        if bigStep is None:
+            bigStep = spin.singleStep() * 10
+
+        minusBig = QPushButton("--")
+        minus = QPushButton("-")
+        plus = QPushButton("+")
+        plusBig = QPushButton("++")
+        
+        minusBig.setObjectName("halfSizeButton")
+        plusBig.setObjectName("halfSizeButton")
+        minus.setObjectName("halfSizeButton")
+        plus.setObjectName("halfSizeButton")
+
+        # get natural size of a normal button
+        normalWidth = minus.sizeHint().width()
+        smallWidth = normalWidth // 2
+
+        for button in (minusBig, minus, plus, plusBig):
+            button.setFixedWidth(smallWidth)
+
+        minus.clicked.connect(lambda: spin.setValue(spin.value() - spin.singleStep()))
+        minusBig.clicked.connect(lambda: spin.setValue(spin.value() - bigStep))
+        plus.clicked.connect(lambda: spin.setValue(spin.value() + spin.singleStep()))
+        plusBig.clicked.connect(lambda: spin.setValue(spin.value() + bigStep))
+
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(6)
+
+        h.addWidget(minusBig)
+        h.addWidget(minus)
+        h.addWidget(spin, 1)
+        h.addWidget(plus)
+        h.addWidget(plusBig)
+
         return row
 
 #####################################################################

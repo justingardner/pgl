@@ -507,15 +507,11 @@ class pglTraitSettings(HasTraits, pglSerialize):
         return True
 
 ##################################################
-# display Settings select
+# display Settings 
 ##################################################
-#class pglDisplaySettingsSelect(pglTraitSettings):
-    
-    # traits that can be edited
-    #displayNames = List(Unicode(), help="Settings names")
 class pglDisplayModeSettings(pglTraitSettings):
     modeName = Unicode("", help="Temp")
-    pixelDims = Tuple(Int(), Int(), default_value=None, allow_none=True, help="Pixel dimensions of screen")
+    pixelDims = Tuple(Int(), Int(), default_value=(0,0), visible=False, help="Pixel dimensions of screen")
     refreshRate = List(Float(), help="Refresh rates supported for this pixel dimension")
 
 class pglDisplaySettings(pglTraitSettings):
@@ -526,6 +522,8 @@ class pglDisplaySettings(pglTraitSettings):
     serialNumber = Int(0, help="Serial number", enabled=False)
     isMain = Bool(False, help="Whether the display is the main display", enabled=False)
     isBuiltin = Bool(False, help="Whether the display is the built-in display of e.g. a laptop", enabled=False)
+    displayDistance = Float(57, min=0.0, help="Distance from subject eyes to display in cm, used to calculate degress of visual angle")
+    displaySize = Tuple(Float, Float, labels=("width","height"), default_value=(30, 20), help="Width and height of display in cm, used to calculate degrees of visual angle")
     displayModes = List(Instance(pglDisplayModeSettings), settingsListKey="modeName", hideKey=True, highlightSelector=False, traitDisplayName="pixelDims", help="All supported display modes")
     luminanceCalibration = List(Unicode(), hasPlotButton=True, buttonFunction="plotLuminanceCalibration", default_value=['None'], help="Which luminance calibration to use")
     temporalCalibration = List(Unicode(), hasPlotButton=True, buttonFunction="plotTemporalCalibration", default_value=['None'], help="Which temporal calibration to use")
@@ -600,9 +598,6 @@ class pglDisplaySettings(pglTraitSettings):
 
         return self.uuid == other.uuid
 
-##################################################
-# List of settings
-##################################################
 class pglDisplaySettingsList(pglTraitSettings):
 
     settingsList = List(Instance(pglDisplaySettings), settingsListKey="displayName", traitDisplayName="Choose display", help="List of display settings")
@@ -611,6 +606,8 @@ class pglDisplaySettingsList(pglTraitSettings):
         super().__init__()
         if settingsList is not None:
             self.settingsList = settingsList
+
+
  
 
 # Screen settings select
