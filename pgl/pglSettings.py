@@ -606,6 +606,7 @@ class pglDisplaySettingsList(pglTraitSettings):
     def testDisplay(self):
         print(f"Testing: {self.settingsList[0].displayName}")
         print(self.settingsList[0].print())
+        print(self.settingsList[0].displayModes[0].print())
         
     def __init__(self, settingsList=None):
         super().__init__()

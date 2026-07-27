@@ -185,9 +185,14 @@ class _pglTraitsDialog(QDialog):
         for label, callbackName in getattr(self.settings, "buttons", []):
             button = QPushButton(label)
             callback = getattr(self.settings, callbackName)
-            button.clicked.connect(callback)
-            customButtonBox.addButton(button, QDialogButtonBox.ActionRole)
 
+            # run the callback member function, using the values selected at top of their lists
+            def wrappedCallback(checked=False, callback=callback):
+                self._withSelectedSettingsPromoted(callback)
+
+            button.clicked.connect(wrappedCallback)
+            customButtonBox.addButton(button, QDialogButtonBox.ActionRole)
+            
         mainLayout = QVBoxLayout(self)
         mainLayout.setContentsMargins(0, 0, 0, 0)
         mainLayout.setSpacing(0)
@@ -845,24 +850,46 @@ class _pglTraitsDialog(QDialog):
             # keep the dialog alive on a bad value
             print(f"(pglTraitsDialog:_commit) Could not set {traitName}: {e}")
 
-    def _onOk(self):
+    def _prepareSelectedSettings(self):
+        '''
+        puts the selected settings on top of list
+        ''' 
         for info in self._selectedSettings.values():
             settingsList = info["list"]
             selectedObject = info["object"]
             keyTraitName = info["key"]
 
             if selectedObject in settingsList:
-                # remove selected object
                 settingsList.remove(selectedObject)
 
-                # sort everything else alphabetically
                 settingsList.sort(
                     key=lambda x: str(getattr(x, keyTraitName)).lower()
                 )
 
-                # put selected object first
-                settingsList.insert(0, selectedObject)
+                settingsList.insert(0, selectedObject)  
+                
+    def _withSelectedSettingsPromoted(self, callback):
+        ''' 
+        temporarily puts selected settings at top of list, but returns them back
+        '''
+        originalLists = {}
 
+        # save current ordering
+        for traitName, info in self._selectedSettings.items():
+            originalLists[traitName] = list(info["list"])
+
+        try:
+            self._prepareSelectedSettings()
+            callback()
+
+        finally:
+            # restore original ordering
+            for traitName, originalList in originalLists.items():
+                info = self._selectedSettings[traitName]
+                info["list"][:] = originalList              
+    def _onOk(self):
+       
+        self._prepareSelectedSettings()
         self.accepted_ = True
         self.accept()
 
