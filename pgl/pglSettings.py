@@ -221,7 +221,6 @@ class pglSettingsManager:
                 )
             matchingDisplay = matchingDisplays[0] if matchingDisplays else None
             if matchingDisplay is not None:
-                print("found match !!")
                 # if so, update a few fields to the settings found above
                 matchingDisplay.isMain = displaySettings.isMain
                 matchingDisplay.isBuiltin = displaySettings.isBuiltin
@@ -239,7 +238,7 @@ class pglSettingsManager:
             if screen.deviceDescription()["NSScreenNumber"] == display:
                 # localizedName is available on macOS 10.15+
                 displayName = screen.localizedName()
-        displayName = None
+
         if displayName is not None:
             return displayName
         

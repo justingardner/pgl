@@ -182,15 +182,12 @@ class _pglTraitsDialog(QDialog):
         # Left-side custom actions
         customButtonBox = QDialogButtonBox()
 
+        # create extra buttons that have callbacks
         for label, callbackName in getattr(self.settings, "buttons", []):
             button = QPushButton(label)
             callback = getattr(self.settings, callbackName)
 
-            # run the callback member function, using the values selected at top of their lists
-            def wrappedCallback(checked=False, callback=callback):
-                self._withSelectedSettingsPromoted(callback)
-
-            button.clicked.connect(wrappedCallback)
+            button.clicked.connect(callback)
             customButtonBox.addButton(button, QDialogButtonBox.ActionRole)
             
         mainLayout = QVBoxLayout(self)
@@ -310,92 +307,157 @@ class _pglTraitsDialog(QDialog):
 
     # ----- Setting list -----
     _selectedSettings = {}
-    def _addSettingsList(self, traitName, trait, current, helpText, settingsObject, layout=None):
+    def _addSettingsList(self, traitName, trait, current, helpText,
+                        settingsObject, layout=None):
+
+        # Build widgets once
+        #--------------------
+        def buildRows():
+            for name, childTrait in self._getOrderedTraits(current[0]).items():
+                if name.startswith("_"):
+                    continue
+
+                if hideKey and name == keyTraitName:
+                    continue
+
+                self._addTraitWidget(name, childTrait, proxy, layout)
+                childNames.append(name)
+
+        # Commit current selection
+        # this function will reorder the list so that the selection is at top
+        #--------------------------
+        def commitSelection(updateCombo=True):
+            lst = state["list"]
+            obj = state["object"]
+
+            if len(lst) <= 1:
+                return
+
+            # sort the remaining values
+            remaining = [x for x in lst if x is not obj]
+            remaining.sort(
+                key=lambda x: str(getattr(x, keyTraitName))
+            )
+
+            # make list with selected item at top with 
+            # the remaining items alphabetically sorted afterwards
+            lst[:] = [obj] + remaining
+
+            # update selector order in combo
+            if updateCombo:
+                combo.blockSignals(True)
+                combo.clear()
+                combo.addItems(
+                    [str(getattr(x, keyTraitName)) for x in lst]
+                )
+                combo.setCurrentIndex(0)
+                combo.blockSignals(False)
+            
+        # Retarget this settings list to another backing list
+        # used for recursive calls such that if we change a setting list
+        # and there is a subfield that is also a settings list,
+        # that settings list will get retargeted to the appropriate
+        # new settings from the parent settings list
+        #----------------------------
+        def retargetList(newList):
+
+            # Save current selection before leaving
+            commitSelection()
+            state["list"] = newList
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(
+                [str(getattr(x, keyTraitName)) for x in newList]
+            )
+            combo.setCurrentIndex(0)
+            combo.blockSignals(False)
+            state["object"] = newList[0]
+            proxy.retarget(state["object"])
+            updateFields(state["object"])
+
+        # Update widgets from one object
+        #------------------------------
+        def updateFields(obj):
+            self._updatingWidget = True
+
+            try:
+                for name in childNames:
+                    value = getattr(obj, name)
+                    entry = self.traitWidgets.get(name)
+
+                    # ordinary widget
+                    if entry is not None and "setter" in entry:
+                        entry["setter"](value)
+
+                    # nested settings list
+                    nestedKey = (obj.__class__.__name__,name)
+                    nested = self._selectedSettings.get(nestedKey)
+
+                    if nested is not None:
+                        nested["retargetList"](value)
+
+            finally:
+                self._updatingWidget = False
+
+        # User changed combo selection
+        #------------------------------
+        def showObject(index):
+
+            # first commit selection order
+            state["object"] = state["list"][index]
+            commitSelection()
+            obj = state["list"][0]
+            state["object"] = obj
+            
+            # retarget and update all the fields
+            proxy.retarget(obj)
+            updateFields(obj)
+            if hasattr(self, "plotCanvas"):
+                self.plotCanvas.setVisible(False)
+                self.plotCanvas.draw()
+                
         if layout is None:
             layout = self.formLayout
 
+        # get metadata settings
         keyTraitName = trait.metadata["settingsListKey"]
-        hideKey = trait.metadata.get("hideKey",False)
+        hideKey = trait.metadata.get("hideKey", False)
 
-        # create the dropdown which selects which settings to display
+        # keep the state, with a key which is used by updateFields to
+        # find settings list object which need to be recursed on
+        # key is the class name and the traitname. Note that
+        # we use _RetargetableProxy helper class because recursed
+        # settings list will need to have what they are updating retargeted
+        # if there is a parent change.
+        objectName = settingsObject.__class__.__name__ if not isinstance(settingsObject, _RetargetableProxy) else settingsObject.getClassName()
+        settingsKey = (objectName, traitName)
+        state = {"list": current, "object": current[0], "key":settingsKey}
+        self._selectedSettings[settingsKey] = state
+
+        # make sure the order of the list is selected on top
+        # and the rest alphabetical
+        commitSelection(updateCombo=False)
+        
+        # make the combo box which selects the list
         combo = CenteredComboBox()
-        if trait.metadata.get("highlightSelector",True):
-            combo.setObjectName("settingsSelector")
         combo.addItems([str(getattr(x, keyTraitName)) for x in current])
-        combo.setToolTip(helpText)
 
+        # register the combo
         self._register(traitName, trait, combo, lambda v: None, layout)
-
-        # update combo whenever the keyTrait changes
-        def updateComboName(change, obj):
-            index = current.index(obj)
-            combo.blockSignals(True)
-            combo.setItemText(index, str(change["new"]))
-            combo.blockSignals(False)
-  
-        # observe the key trait
-        for obj in current:
-            obj.observe(
-                lambda change, obj=obj: updateComboName(change, obj),
-                names=keyTraitName
-            )
-            
+        
+        # set what the widget is updating
         proxy = _RetargetableProxy(current[0])
         childNames = []
         
-        self._selectedSettings[traitName] = {
-           "list": current,
-            "object": current[0],
-            "key": keyTraitName
-        }
+        state["retargetList"] = retargetList
 
-        # build the rows for the settings
-        def buildRows():
-            # get each one of the trait fields
-            for name, childTrait in self._getOrderedTraits(current[0]).items():  # real object, not proxy
-                # ignore internal ones
-                if name.startswith('_'):
-                    continue
-                if hideKey and name==keyTraitName:
-                    continue
-                
-                # add the trait
-                self._addTraitWidget(name, childTrait, proxy, layout)  # proxy for commits
-                childNames.append(name)
+        # build the widgets
+        if not childNames: buildRows()
 
-        # displays the settings
-        def showObject(index):
-            obj = getattr(settingsObject, traitName)[index]
-            proxy.retarget(obj)
-            
-            # keep which object is currently selected
-            self._selectedSettings[traitName]["object"] = obj
-
-            # first time we are called, then we will need to build the rows
-            # this happens when showObject is called below
-            if not childNames:
-                buildRows()
-                return
-
-            # widgets already exist -> just repopulate their values
-            self._updatingWidget = True
-            for name in childNames:
-                entry = self.traitWidgets.get(name)
-                if entry is None:
-                    continue
-                entry['setter'](getattr(obj, name))
-            self._updatingWidget = False
-            
-            # hide plot and clear button states
-            plotButtonState = False
-            _activePlotButton = None
-            self.plotCanvas.setVisible(False)
-            self.plotCanvas.draw()
-
-        # tells the combo to connect the settings when the index has changed
+        # connect showObject to changes in the index
         combo.currentIndexChanged.connect(showObject)
-        
-        # show the top of list
+
+        # and show the first item in the list
         showObject(0)
         
     # ----- Float with min/max -----
@@ -849,47 +911,8 @@ class _pglTraitsDialog(QDialog):
         except Exception as e:
             # keep the dialog alive on a bad value
             print(f"(pglTraitsDialog:_commit) Could not set {traitName}: {e}")
-
-    def _prepareSelectedSettings(self):
-        '''
-        puts the selected settings on top of list
-        ''' 
-        for info in self._selectedSettings.values():
-            settingsList = info["list"]
-            selectedObject = info["object"]
-            keyTraitName = info["key"]
-
-            if selectedObject in settingsList:
-                settingsList.remove(selectedObject)
-
-                settingsList.sort(
-                    key=lambda x: str(getattr(x, keyTraitName)).lower()
-                )
-
-                settingsList.insert(0, selectedObject)  
-                
-    def _withSelectedSettingsPromoted(self, callback):
-        ''' 
-        temporarily puts selected settings at top of list, but returns them back
-        '''
-        originalLists = {}
-
-        # save current ordering
-        for traitName, info in self._selectedSettings.items():
-            originalLists[traitName] = list(info["list"])
-
-        try:
-            self._prepareSelectedSettings()
-            callback()
-
-        finally:
-            # restore original ordering
-            for traitName, originalList in originalLists.items():
-                info = self._selectedSettings[traitName]
-                info["list"][:] = originalList              
-    def _onOk(self):
-       
-        self._prepareSelectedSettings()
+            
+    def _onOk(self):       
         self.accepted_ = True
         self.accept()
 
@@ -1160,6 +1183,9 @@ class _RetargetableProxy:
 
     def retarget(self, newTarget):
         object.__setattr__(self, "_target", newTarget)
+        
+    def getClassName(self):
+        return self._target.__class__.__name__
         
 #####################################################################
 # subclassed UI elements for customization
