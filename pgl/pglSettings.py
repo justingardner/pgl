@@ -60,13 +60,12 @@ class pglSettingsManager:
         # display the selected settings
         settingsSelect.settings[0].edit() 
     
-    @classmethod
-    def displaySettings(cls):
+    def displaySettings(self):
         """
         Edit pgl display settings. Brings up widget interface to edit display settings
         """
         # get the display infos
-        original = pglDisplaySettingsList(cls.getDisplaySettings())
+        original = pglDisplaySettingsList(self.getDisplaySettings())
         
         # display the settings
         modified = pglTraitsDialog(original)
@@ -82,8 +81,8 @@ class pglSettingsManager:
                     if not matchingOriginalDisplay.equals(modifiedDisplay):
                         # if the displayName changed, we need to change the name of the directory
                         if modifiedDisplay.displayName != matchingOriginalDisplay.displayName:
-                            oldPath = cls.getDisplayDir(matchingOriginalDisplay)
-                            newPath = cls.getDisplayDir(modifiedDisplay)
+                            oldPath = self.getDisplayDir(matchingOriginalDisplay)
+                            newPath = self.getDisplayDir(modifiedDisplay)
                             try:
                                 # rename to the new path
                                 if oldPath.exists(): oldPath.rename(newPath)
@@ -94,26 +93,32 @@ class pglSettingsManager:
                         # save the modified display
                         modifiedDisplay.save()
             
-    @classmethod
-    def getDisplayNames(cls, displayIndex=None):
+    def getDisplayNames(self, displayIndex=None):
         '''
         Get display names
         '''
-        displayNames.append('Windowed')
+
+        displayNames = ['Windowed']
 
         # get names from gpuInfo
-        if not pglBase.gpuInfo:
+        if not self.gpuInfo:
+            print(self.gpuInfo)
             return displayNames
 
-        for gpuData in pglBase.gpuInfo.values():
+        for gpuData in self.gpuInfo.values():
             displays = gpuData.get("Displays", [])
             for display in displays:
-                name = f"{display.get('DisplayName', f'Display {len(displayNames)}')}: {display.get('Display Type', 'Unknown')}"
+                displayType = display.get('Display Type', None)
+                displayName = display.get('DisplayName', 'Unknown')
+                if displayType is not None:
+                    name = f"{displayName}: {displayType}"
+                else:
+                    name = f"{displayName}"
                 if name:
                     displayNames.append(name)
 
         if displayIndex is not None:
-            if displayIndex < len(displayNames) and displayIndex >= 0:
+            if displayIndex <= len(displayNames) and displayIndex > 0:
                 # move the selected display to the top
                 displayNames.insert(0, displayNames.pop(displayIndex))
             else:
@@ -121,8 +126,7 @@ class pglSettingsManager:
         
         return displayNames
     
-    @classmethod
-    def getDisplaySettings(cls):
+    def getDisplaySettings(self):
         '''
         Get info on displays
         '''
@@ -136,7 +140,7 @@ class pglSettingsManager:
             from Quartz import CGDisplayCreateUUIDFromDisplayID
             
         # first check saved displays
-        displayDir = cls.getDisplayDir()
+        displayDir = self.getDisplayDir()
         for p in displayDir.rglob('display.json'):
             # load json settings
             displaySettings = pglDisplaySettings().load(p)
@@ -147,7 +151,7 @@ class pglSettingsManager:
             displaySettings.getCalibrations()
             # and add to display list
             displays.append(displaySettings)
-    
+                
         maxDisplays = 16        
         (err, active, count) = Quartz.CGGetActiveDisplayList(maxDisplays, None, None)
         for display in active:
@@ -203,12 +207,8 @@ class pglSettingsManager:
             displaySettings.isMain        = Quartz.CGDisplayIsMain(display)
             displaySettings.isBuiltin     = Quartz.CGDisplayIsBuiltin(display)
             
-            # get the display name 
-            for screen in NSScreen.screens():
-                # map back to a CGDirectDisplayID:
-                if screen.deviceDescription()["NSScreenNumber"] == display:
-                    # localizedName is available on macOS 10.15+
-                    displaySettings.displayName = screen.localizedName()
+            # get display human readable name
+            displaySettings.displayName = self.getMatchingDisplayName(display)                    
             
             # get the luminance calibrations
             displaySettings.getCalibrations()
@@ -221,6 +221,7 @@ class pglSettingsManager:
                 )
             matchingDisplay = matchingDisplays[0] if matchingDisplays else None
             if matchingDisplay is not None:
+                print("found match !!")
                 # if so, update a few fields to the settings found above
                 matchingDisplay.isMain = displaySettings.isMain
                 matchingDisplay.isBuiltin = displaySettings.isBuiltin
@@ -228,7 +229,27 @@ class pglSettingsManager:
                 # append to our list of all displays
                 displays.append(displaySettings)
         return(displays)
-         
+
+    def getMatchingDisplayName(self, display):
+        
+        displayName = None
+        # get the display name from Appkit
+        for screen in NSScreen.screens():
+            # map back to a CGDirectDisplayID:
+            if screen.deviceDescription()["NSScreenNumber"] == display:
+                # localizedName is available on macOS 10.15+
+                displayName = screen.localizedName()
+        displayName = None
+        if displayName is not None:
+            return displayName
+        
+        # if Appkit fails, then get through the system profiler info we have
+        displayNames = self.getDisplayNames(displayIndex=display)
+
+        if len(displayNames) >= 1:
+            return displayNames[0]
+        else:
+            return "Unknown display name"
     @staticmethod       
     def getPGLDir():
         """
