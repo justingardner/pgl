@@ -12,7 +12,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from ._pglComm import pglSerial
 from .pglBase import printHeader
-from .pglSettings import pglSettings, pglSettingsManager
+from .pglSettings import pglSettings, pglDisplaySettings, pglSettingsManager
 from traitlets import Unicode, Int, Instance, Dict, Tuple, Float
 from datetime import datetime
 from .pglExperiment import pglExperiment
@@ -311,6 +311,7 @@ class pglDisplayCalibration():
         # set information
         self.temporalCalibrationData.settingsName = settingsName
         self.temporalCalibrationData.settings = e.settings
+        self.temporalCalibrationData.displaySettings = e.settings.displays[0]
         self.temporalCalibrationData.digitalIOdeviceDescription = self.digitalIODevice.deviceDescription
         self.temporalCalibrationData.analogInputDescription = self.analogInputDevice.deviceDescription
         
@@ -321,7 +322,7 @@ class pglDisplayCalibration():
             # get display info if available
             gpu = next(iter(self.pgl.gpuInfo.values()))
             displays = gpu.get('Displays', [])
-            self.temporalCalibrationData.displayInfo = displays[self.temporalCalibrationData.settings.displayNumber-1]
+            self.temporalCalibrationData.displayInfo = displays[self.temporalCalibrationData.displaySettings.currentDisplayNum-1]
             
             # get info from pgl
             self.temporalCalibrationData.metalInfo = self.pgl.info()
@@ -1083,6 +1084,7 @@ class pglDisplayTemporalCalibrationData(HasTraits, pglSerialize):
     
     settingsName = Unicode("Default", help="Settings name used to open display")
     settings = Instance(pglSettings, allow_none=True, help="Settings used during calibration") 
+    displaySettings = Instance(pglDisplaySettings, allow_none=True, help="Display settings used during calibration")
     displayInfo = Dict(help="Display information at time of calibration")
     metalInfo = Dict(help="PGL info including display info such as UUID, serial number, and other information at time of calibration")   
     creationDateTime = Instance(datetime, default_value=datetime.now(), help="Date and time of calibration creation")
