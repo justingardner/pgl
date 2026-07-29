@@ -75,7 +75,7 @@ class pglDraw:
             [0, h],   # top-left
         ])
         self.quad(fullScreenQuad, color= self.clearScreenColor, units="pix")
-        self.oneTimeWarning("(pgl:clearScreen) Need to fix clearScreen which is not functioning properly, drawing a full screen quad instead.")
+        self.oneTimeWarning("Need to fix clearScreen which is not functioning properly, drawing a full screen quad instead.")
         
     ################################################################
     # dots

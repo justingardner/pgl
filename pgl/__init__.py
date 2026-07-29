@@ -1,4 +1,4 @@
-from .pglBase import pglBase, pglDisplayMessage
+from .pglBase import pglBase
 from .pglResolution import pglResolution
 from .pglDraw import pglDraw
 from .pglTransform import pglTransform
