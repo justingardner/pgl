@@ -22,7 +22,6 @@ from pathlib import Path
 from .pglSettings import pglSettings, pglTraitSettings
 from IPython.display import display, HTML
 import ipywidgets as widgets
-from .pglBase import pglDisplayMessage
 from traitlets import Float, TraitError, TraitError, observe, Instance, Int, Unicode, Dict, validate, Bool
 from .pglParameter import pglParameter, pglParameterBlock
 from .pglEvent import pglEvent
@@ -89,7 +88,7 @@ class pglExperimentBase():
         # if there was some error, then display it
         if self.settings is None:
             # display error in HTML
-            pglDisplayMessage("<b>(pglExperiment:initScreen)</b> ❌ Could not find settings, using default settings.")
+            pglMessages.warning("Could not find settings, using default settings.")
             # create default settings
             self.settings = pglSettings()
 
@@ -252,11 +251,12 @@ class pglExperimentBase():
         print(f"Experiment: {self.experimentSettings.experimentName} | Subject ID: {self.experimentSettings.subjectID}")
         print(f"Duration: {timestamp.formatDuration(self.experimentDuration())}")
         
-        displayInfo = f"Display: {self.settings.displayName[0] if self.settings.displayName and len(self.settings.displayName) > 0 else 'Unknown'} "
-        displayInfo += f"{self.pglState.screenWidthPixels}x{self.pglState.screenHeightPixels} @ {self.pglState.frameRate}Hz "
-        displayInfo += f"{self.pglState.screenWidthDegrees:.2f}x{self.pglState.screenHeightDegrees:.2f} deg "
-        displayInfo += f"{self.settings.displayWidth:.2f}x{self.settings.displayHeight:.2f} cm at {self.settings.displayDistance:.2f} cm "
-        print(displayInfo)
+        # FIX, FIX, FIX - old way
+        #displayInfo = f"Display: {self.settings.displayName[0] if self.settings.displayName and len(self.settings.displayName) > 0 else 'Unknown'} "
+        #displayInfo += f"{self.pglState.screenWidthPixels}x{self.pglState.screenHeightPixels} @ {self.pglState.frameRate}Hz "
+        #displayInfo += f"{self.pglState.screenWidthDegrees:.2f}x{self.pglState.screenHeightDegrees:.2f} deg "
+        #displayInfo += f"{self.settings.displayWidth:.2f}x{self.settings.displayHeight:.2f} cm at {self.settings.displayDistance:.2f} cm "
+        #print(displayInfo)
         
         numVols = self.data.getNumEvents(type="volumeTrigger")
         print(f"Number of volume triggers: {numVols}")
@@ -403,24 +403,30 @@ class pglExperiment(pglExperimentBase):
         if backgroundColor == -1:
             backgroundColor = self.settings.backgroundColor
             
-        # open screen
-        if self.settings.displayNumber == 0:
-            self.pgl.open(whichScreen=0, screenWidth=self.settings.windowWidth, screenHeight=self.settings.windowHeight, backgroundColor=backgroundColor)        
-        else:
-            self.pgl.open(whichScreen=self.settings.displayNumber-1, backgroundColor=backgroundColor)        
+        # get screen parameters
+        if len(self.settings.displays) < 1:
+            pglMessages.warning("Settings {self.settings.settingsName} is not associated with a display")
+            return
+        display = self.settings.displays[0]
+        if display.currentDisplayNum == -1:
+            pglMessage.warning("Could not open display {display.name} because it is not connected")
+            return
+        
+        # open the screen
+        self.pgl.open(whichScreen=display.currentDisplayNum-1, backgroundColor=backgroundColor)        
         if not self.pgl.isOpen():   
-            pglDisplayMessage("<b>(pglExperiment:initScreen)</b> ❌ Failed to open screen.", useHTML=True, duration=5)
+            pglMessages.transientWarning("Failed to open screen.", duration=5)
             return
         
         # set visual angle coordinates
-        self.pgl.visualAngle(self.settings.displayDistance,self.settings.displayWidth,self.settings.displayHeight)
+        self.pgl.visualAngle(display.displayDistance,display.displaySize(0),display.displaySize(1))
         
         # flip left-right and/or up-down if specified in settings
-        if self.settings.flipLeftRight: self.pgl.flipLeftRight()
-        if self.settings.flipUpDown: self.pgl.flipUpDown()
+        if display.flipLeftRight: self.pgl.flipLeftRight()
+        if display.flipUpDown: self.pgl.flipUpDown()
         
         # set the gamma table
-        self.setGammaTable()
+        self.setGamma(self.settings, display)
         
         # add keyboard device if not already loaded
         keyboardDevices = self.pgl.devicesGet(pglKeyboardMouse)
@@ -491,25 +497,26 @@ class pglExperiment(pglExperimentBase):
         # initialize eye tracker
         self.initEyeTracker()        
 
-    def setGammaTable(self):
+    def setGamma(self, settings, display):
         '''
         set the gamma table based on settings
+        
+        Args:
+            settings (pglSettings): Used for determining what gamma to use
+            display (pglDisplaySettings): Used to determine what displayNum to set the gamma on
         '''
         # no gamma correction asked for
-        if self.settings.calibrateForGamma == 0.0:
+        if settings.calibrateForGamma == 0.0:
             return
         
         # No calibration
-        if self.settings.calibration[0] == "None":
+        if display.calibration[0] == "None":
+            pglMessages.warning("Settings are set to calibrte for gamma {settings.calibrateForGamma} but no calibration found for display {display.name}")
             return
         
-        # get the display name
-        gpu = next(iter(self.pgl.gpuInfo.values()))
-        displays = gpu.get('Displays', [])
-        displayInfo = displays[self.settings.displayNumber-1]
-        displayName = displayInfo.get("DisplayName","Unknown")
-        
-        pglDisplayLuminanceCalibrationData.load(displayName)
+        # set the gamma
+        display.setGamma(self.pgl, settings.calibrateForGamma)
+     
         
     def endScreen(self):
         '''
