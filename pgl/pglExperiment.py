@@ -19,7 +19,7 @@ import math
 from dataclasses import dataclass, field
 from .pglKeyboardMouse import pglKeyboardMouse
 from pathlib import Path
-from .pglSettings import pglSettings, pglSettingsEditable
+from .pglSettings import pglSettings, pglTraitSettings
 from IPython.display import display, HTML
 import ipywidgets as widgets
 from .pglBase import pglDisplayMessage
@@ -343,7 +343,7 @@ class pglExperiment(pglExperimentBase):
     Experiment class which handles timing, parameter randomization,
     subject response, synchronizing with measurement hardware etc
     '''
-    def __init__(self, pgl=None, settingsName=None, settings=None, subjectID="s0000", experimentName=""):
+    def __init__(self, pgl=None, settingsName=None, settings=None, displayName=None, displaySettings=None, subjectID="s0000", experimentName=""):
         '''
         Initialize the pglExperiment class.
         
@@ -351,6 +351,10 @@ class pglExperiment(pglExperimentBase):
             pgl (pgl): An instance of the pgl class.
             settingsName (str): The name of the settings to use. If not set (and settings not set), will use default settings
             settings (pglSettings): An instance of the pglSettings class. If set, will supersede settingsName.
+            displayName (str): The name of the display to use. If set, will be incorporated into settings (and supersede any
+                conflicting settings). If there is no settings/settingsName will use default settings
+            displaySettings (pglDisplaySettings): The settings of the dispaly to use, will supersed the displayName if set and
+                behave in a similar fashion
             subjectID (str): The identifier for the subject participating in the experiment.
         '''
         # init super
@@ -1270,7 +1274,7 @@ class pglTestTask(pglTask):
 ##############################################
 # Settings for pglExperiment
 ##############################################
-class pglExperimentSettings(pglSettingsEditable):
+class pglExperimentSettings(pglTraitSettings):
     experimentName = Unicode("Default experiment", help="Name of the experiment")
     experimentSaveName = Unicode("defaultExperiment", help="Name to use when saving experiment data (defaults to camelCase version of experimentName)")
     subjectID = Unicode("s0000", help="Identifier for the subject participating in the experiment.")
@@ -1413,7 +1417,7 @@ class pglExperimentState(pglSerialize):
 ##############################################
 # Settings for pglTask
 ##############################################
-class pglTaskSettings(pglSettingsEditable):
+class pglTaskSettings(pglTraitSettings):
     taskName = Unicode("Default task", help="Name of the task")
     taskSaveName = Unicode("defaultTask", help="Name to use when saving task data (defaults to camelCase version of taskName)")    
     phaseNum = Int(default_value=None, allow_none=True, help="Phase number for the task. Set to None if this should run in all phases")

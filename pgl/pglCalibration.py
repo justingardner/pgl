@@ -12,7 +12,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from ._pglComm import pglSerial
 from .pglBase import printHeader
-from .pglSettings import filename, pglSettingsEditable, pglSettings, pglSettingsManager
+from .pglSettings import filename, pglSettings, pglSettingsManager
 from traitlets import Unicode, Int, Instance, Dict, Tuple, Float
 from datetime import datetime
 from .pglExperiment import pglExperiment
@@ -20,8 +20,9 @@ from tqdm.notebook import tqdm
 from traitlets import HasTraits
 from .pglSerialize import pglSerialize
 from scipy.interpolate import interp1d
-from .pglDevice import pglDigitalIODevice, pglAnalogTraceData
+from .pglDevice import pglDigitalIODevice, pglAnalogInputDevice, pglAnalogTraceData
 from scipy.io import loadmat
+from .pglMessages import pglMessages
 
 ##########################
 # Calibration device class
@@ -171,13 +172,14 @@ class pglDisplayCalibration():
     '''
     Runs calibration for a display
     '''
-    def __init__(self, pgl, luminanceCalibrationDevice : pglLuminanceCalibrationDevice = None, digitalIODevice : pglDigitalIODevice = None):
+    def __init__(self, pgl, luminanceCalibrationDevice : pglLuminanceCalibrationDevice = None, digitalIODevice : pglDigitalIODevice = None, analogInputDevice: pglAnalogInputDevice = None):
         '''
         Initialize the calibration.
         '''
         # set the devices
-        self.addLuminanceCalibrationDevice(luminanceCalibrationDevice)
-        self.addDigitalIODevice(digitalIODevice)
+        if not self.addLuminanceCalibrationDevice(luminanceCalibrationDevice): return
+        if not self.addDigitalIODevice(digitalIODevice): return
+        if not self.addAnalogInputDevice(analogInputDevice): return
 
         # keep pgl reference
         self.pgl = pgl
@@ -206,23 +208,46 @@ class pglDisplayCalibration():
         if luminanceCalibrationDevice is not None:
             # check luminance calibration device
             if not isinstance(luminanceCalibrationDevice, pglLuminanceCalibrationDevice):
-                print("(pglDisplayCalibration) ❌ luminanceCalibrationDevice must be of type pglCalibrationDevice.")
-                return
+                pglMessages.warning("luminanceCalibrationDevice must be of type pglCalibrationDevice.", level=2)
+                return False
             self.luminanceCalibrationDevice = luminanceCalibrationDevice        
             self.luminanceCalibrationDevice.verbose = False
+        return True
 
     def addDigitalIODevice(self, digitalIODevice : pglDigitalIODevice = None):
         ''''
         add a digitalIODevice
         
         Args:
-            digitalIODevice: pglDigitalIODevice for digital and analog IO
+            digitalIODevice: pglDigitalIODevice for digital IO
         '''
         self.digitalIODevice = None
+        
         # check digitalIO device
-        if not isinstance(digitalIODevice, pglDigitalIODevice):
-            print("(pglDisplayCalibration) ❌ digitalIODevice must be of type pglDigitalIODevice.")
-        self.digitalIODevice = digitalIODevice
+        if digitalIODevice is not None:
+            if not isinstance(digitalIODevice, pglDigitalIODevice):
+                pglMessages.warning("digitalIODevice must be of type pglDigitalIODevice.", level=2)
+                return False
+            self.digitalIODevice = digitalIODevice
+        return True
+
+    def addAnalogInputDevice(self, analogInputDevice : pglAnalogInputDevice = None):
+        ''''
+        add a analogInputDevice
+        
+        Args:
+            analogInputDevice: pglAnalogInputDevice for analog input
+        '''
+        self.analogInputDevice= None
+        
+        # check analogInputDevice device
+        if analogInputDevice is not None:
+            if not isinstance(analogInputDevice, pglAnalogInputDevice):
+                pglMessages.warning("analogInputDevice must be of type analogInputDevice.", level=2)
+                return False
+            self.analogInputDevice = analogInputDevice
+
+        return True
 
     @property
     def calibrationMode(self):
@@ -248,23 +273,31 @@ class pglDisplayCalibration():
         '''
         pass
 
-    def calibrateTemporal(self, settingsName):
+    def calibrateTemporal(self, settingsName=None, settings=None, displayName=None, displaySettings=None):
         '''
         User faceing function which runs the temporal calibration process. 
         
         You need to make sure that you have initialized with a digitalIODevice or run addDigitalIODevice
         
         Args:
-            settingsName (Str): Name of the screen settings to calibrate
+            settingsName (str): The name of the settings to use. If not set (and settings not set), will use default settings
+            settings (pglSettings): An instance of the pglSettings class. If set, will supersede settingsName.
+            displayName (str): The name of the display to use. If set, will be incorporated into settings (and supersede any
+                conflicting settings). If there is no settings/settingsName will use default settings
+            displaySettings (pglDisplaySettings): The settings of the dispaly to use, will supersed the displayName if set and
+                behave in a similar fashion
         '''
         if self.digitalIODevice is None:
-            print("(pglDisplayCalibration) No digitalIO device specified. Please specify on initialization of pglDisplayCalibration or use addDigitalIODevice")
+            pglMessages.warning("No digitalIO device specified. Please specify on initialization of pglDisplayCalibration or use addDigitalIODevice", level=2)
+            return None
+        if self.analogInputDevice is None:
+            pglMessages.warning("No analog input device specified. Please specify on initialization of pglDisplayCalibration or use addAnalogDevice", level=2)
             return None
 
         self.temporalCalibrationData = None
         
         # open the display with specified settings
-        e = pglExperiment(self.pgl, settingsName)
+        e = pglExperiment(self.pgl, settingsName, settings, displayName, displaySettings)
         e.settings.closeScreenOnEnd = True
         e.settings.backgroundColor = (0, 0, 0)
         e.initScreen()
@@ -278,7 +311,8 @@ class pglDisplayCalibration():
         # set information
         self.temporalCalibrationData.settingsName = settingsName
         self.temporalCalibrationData.settings = e.getSettings(settingsName)
-        self.temporalCalibrationData.deviceDescription = self.digitalIODevice.deviceDescription
+        self.temporalCalibrationData.digitalIOdeviceDescription = self.digitalIODevice.deviceDescription
+        self.temporalCalibrationData.analogInputDescription = self.analogInputDevice.deviceDescription
         
         # get calibration date and time
         self.temporalCalibrationData.creationDateTime = datetime.now()
@@ -293,7 +327,7 @@ class pglDisplayCalibration():
             self.temporalCalibrationData.metalInfo = self.pgl.info()
             
         except Exception as ex:
-            print(f"(pglDisplayCalibration:_calibrateTIming) Warning: Could not get display info: {ex}")
+            pglMessages.warning(f"Warning: Could not get display info: {ex}")
 
         # run internal function to calibrate the temporal
         self.temporalCalibrationData.analogTraceData = self._calibrateTemporal()
@@ -342,13 +376,13 @@ class pglDisplayCalibration():
         self.pgl.waitSecs(0.25)
 
         # setup digital output for sync pulse 
-        self.digitalIODevice.setupDigitalOutput(channel=0)
-        self.digitalIODevice.digitalOutput(0)
+        digitalIOChannel = 0
+        self.digitalIODevice.setupDigitalOutput(channel=digitalIOChannel)
 
         # read analog input for a little bit beyond stimulus duration
         startTime = self.pgl.getSecs()
         analogReadDurationSecs = totalDurationSecs + 0.5
-        self.digitalIODevice.startAnalogRead(duration=analogReadDurationSecs, channels=['AIN0','AIN1'], range=1.0)
+        self.analogInputDevice.startAnalogRead(duration=analogReadDurationSecs, channels=['AIN0','AIN1'], range=1.0)
 
         # display
         print(f"Total read time: {analogReadDurationSecs:.2f} seconds, (n={numRepeats}, trialLen={trialDurationSecs:.2f} s, totalDuration={totalDurationSecs:.2f} s)")
@@ -372,7 +406,7 @@ class pglDisplayCalibration():
                 stimulusPhase = np.searchsorted(np.cumsum(stimulusDurationFrames), iFrame, side='right')
 
                 if trialStart and stimulusPhase == 1:
-                    self.digitalIODevice.digitalOutput(1,pulseLen=pulseLenMilliseconds)
+                    self.digitalIODevice.digitalOutputPulse(digitalIOChannel)
                     trialStart = False
 
                 # set what color to draw the screen
@@ -385,7 +419,7 @@ class pglDisplayCalibration():
                 flushTime.append(self.pgl.flush())
 
         # get analog data
-        analogTraceData = self.digitalIODevice.stopAnalogRead(waitToFinish=True)
+        analogTraceData = self.analogInputDevice.stopAnalogRead(waitToFinish=True)
         print(f"Analog read complete (duration={self.pgl.getSecs() - startTime:.2f} s). Read {analogTraceData.nSamples} samples.")
 
         frameTime = np.median(np.diff(flushTime))*1000
@@ -1052,7 +1086,8 @@ class pglDisplayTemporalCalibrationData(HasTraits, pglSerialize):
     displayInfo = Dict(help="Display information at time of calibration")
     metalInfo = Dict(help="PGL info including display info such as UUID, serial number, and other information at time of calibration")   
     creationDateTime = Instance(datetime, default_value=datetime.now(), help="Date and time of calibration creation")
-    deviceDescription = Unicode("Unknown", help="Desciption of measurement device")
+    digitalIOdeviceDescription = Unicode("Unknown", help="Desciption of digitalIO measurement device")
+    analogInputDescription = Unicode("Unknown", help="Desciption of analog input measurement device")
     analogTraceData = Instance(pglAnalogTraceData, allow_none=True, default_value=None, help="analong measurement from photodiode")
     syncChannel = Int(1, help="Channel with sync pulse on it")     
     syncChannelThreshold = Float(0.2, help="Threshold for considering sync to be active")

@@ -19,7 +19,7 @@ from .pglTasks import pglFixationTaskLeftRight, pglBarTask
 from ._pglComm import pglSerial
 from .pglCalibration import pglDisplayCalibration, pglLuminanceCalibrationDeviceMinolta, pglDisplayLuminanceCalibrationData, pglLuminanceCalibrationDeviceDebug
 from .pglGammaTable import pglGammaTable 
-from .pglSettings import pglSettingsEditable, pglSettingsManager, pglDisplaySettings, pglDisplaySettingsList, pglDisplayModeSettings, pglSettings
+from .pglSettings import pglSettingsManager, pglDisplaySettings, pglDisplaySettingsList, pglDisplayModeSettings, pglSettings
 from .pglEventListener import pglEventListener
 from .pglEyeTracker import pglEyeTracker
 from .pglDialog import pglDialogs
