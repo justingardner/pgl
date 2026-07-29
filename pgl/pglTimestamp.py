@@ -18,7 +18,8 @@ class pglTimestamp:
     '''
     A class to handle timestamps for precise system time retrieval.
     '''
-    def getSecs(self):
+    @staticmethod
+    def getSecs():
         '''
         Get the current system time in seconds.
         
@@ -27,7 +28,8 @@ class pglTimestamp:
         '''
         return _pglTimestamp.getSecs()
     
-    def waitSecs(self, secs):
+    @staticmethod
+    def waitSecs(secs):
         '''
         Wait for a specified number of seconds.
         
@@ -39,7 +41,8 @@ class pglTimestamp:
         '''
         time.sleep(secs)
 
-    def getDateAndTime(self):
+    @staticmethod
+    def getDateAndTime():
         '''
         Get the current system date and time.
         
@@ -48,7 +51,8 @@ class pglTimestamp:
         '''
         return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
     
-    def formatDuration(self, seconds):
+    @staticmethod
+    def formatDuration(seconds):
         """
         Convert a number of seconds into a human-readable string.
         """
