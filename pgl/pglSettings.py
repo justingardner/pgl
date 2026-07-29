@@ -785,7 +785,7 @@ class pglSettings(pglTraitSettings):
         super().save(filename=filename)
         
     def saveDir(self):
-        return pglSettingsManager.getSettingsDir() / "settings.json"
+        return pglSettingsManager.getSettingsDir() / f"{pglBase.makeValidFilename(self.name)}.json"
 
 
     def reloadDisplays(self, selected=None):
