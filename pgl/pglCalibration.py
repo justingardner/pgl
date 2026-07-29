@@ -12,7 +12,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from ._pglComm import pglSerial
 from .pglBase import printHeader
-from .pglSettings import filename, pglSettings, pglSettingsManager
+from .pglSettings import pglSettings, pglSettingsManager
 from traitlets import Unicode, Int, Instance, Dict, Tuple, Float
 from datetime import datetime
 from .pglExperiment import pglExperiment
@@ -310,7 +310,7 @@ class pglDisplayCalibration():
 
         # set information
         self.temporalCalibrationData.settingsName = settingsName
-        self.temporalCalibrationData.settings = e.getSettings(settingsName)
+        self.temporalCalibrationData.settings = e.settings
         self.temporalCalibrationData.digitalIOdeviceDescription = self.digitalIODevice.deviceDescription
         self.temporalCalibrationData.analogInputDescription = self.analogInputDevice.deviceDescription
         
@@ -1560,7 +1560,7 @@ class pglDisplayLuminanceCalibrationData(HasTraits, pglSerialize):
                 return None
             return self.calibrationValues[-1]
         
-    def calculateInverseGamma(self, gamma = 1.0):
+    def calculateInverseGamma(self, gamma = 1.0, gammaTableSize=None):
         '''
         Calculate inverse gamma table from calibration measurements.
         
@@ -1594,7 +1594,7 @@ class pglDisplayLuminanceCalibrationData(HasTraits, pglSerialize):
                             fill_value='extrapolate')
         
         # Create inverse gamma table
-        gammaTableSize = self.gammaTableSize
+        if gammaTableSize is None: gammaTableSize = self.gammaTableSize
         linearOutput = np.linspace(0, 1, gammaTableSize)
         gammaOutput = np.power(linearOutput, gamma)
         inverseGamma = interpFunc(gammaOutput)
@@ -1605,3 +1605,30 @@ class pglDisplayLuminanceCalibrationData(HasTraits, pglSerialize):
         # For RGB, use the same correction for all channels (can be modified for per-channel)
         return (inverseGamma, inverseGamma.copy(), inverseGamma.copy())
     
+    def setDisplayToGamma(self, pgl, display, gamma = 1.0):
+        '''
+        Uses the saved gamma calibration data to set the display to the requested gamma
+        
+        Args:
+            display (pglDisplaySettings): The display that the gamma is being set on
+            gamma (Float): The gamma to achieve: 1.0 = linear (default), 2.2 = industry standard for natural iamges, 0 = do nothing
+        '''
+        if gamma == 0.0: return
+        
+        # set the gamma table size
+        self.gammaTableSize = display.gammaTableSize
+
+        inverseGammaTable = self.calculateInverseGamma(gamma, self.gammaTableSize)
+        if inverseGammaTable == None:
+            pglMessages.warning("Not able to compute gamma table for display {display.displayName}")
+            return
+        
+        # check display Num
+        if display.currentDisplayNum == -1:
+            pglMessages.warning("Display {display.displayName} is not currently connected, cannot set gamma table")
+            return
+
+        # set the gamma table
+        pgl.setGammaTable(display.currentDisplayNum, inverseGammaTable[0], inverseGammaTable[1], inverseGammaTable[2])
+        
+        

@@ -20,6 +20,10 @@ from dataclasses import dataclass
 from .pglSerialize import pglSerialize
 import matplotlib.pyplot as plt
 import numpy as np
+from .pglMessages import pglMessages
+from .pglTimestamp import pglTimestamp
+import time
+
 
 #################################################################
 # Parent class for devices
@@ -46,8 +50,7 @@ class pglDevice:
         else:
             self.deviceDescription = deviceDescription
         # set the initialization time
-        self.pglTimestamp = pglTimestamp()
-        self.startTime = self.pglTimestamp.getDateAndTime()
+        self.startTime = pglTimestamp.getDateAndTime()
         # set the device status
         self.currentStatus = 0
         # some fields about the device that will be set by subclasses
@@ -534,9 +537,6 @@ class pglPynputKeyboard(pglDevice):
         self.listenerThread = threading.Thread(target=self.listener.run, daemon=True)
         self.listenerThread.start()
         
-        # for getting time of events
-        self.pglTimestamp = pglTimestamp()
-
         # initialize the modifier keys
         self.shift = False
         self.ctrl = False
@@ -617,7 +617,7 @@ class pglPynputKeyboard(pglDevice):
             self.cmd = True
         else:
             # if not, then put the key into the queue
-            self.keyQueue.put((key,self.pglTimestamp.getSecs(),self.shift,self.ctrl,self.alt,self.cmd))
+            self.keyQueue.put((key,pglTimestamp.getSecs(),self.shift,self.ctrl,self.alt,self.cmd))
 
     # Callback function for key releases (optional)
     def onRelease(self, key):
@@ -747,6 +747,7 @@ class pglDigitalIODevice(pglDevice):
     def __init__(self, deviceType="DigitalIODevice"):
         # whether a digital output channel has been configured
         self.digitalOutputConfigured = False
+        self.digitalChannels={}
         super().__init__(deviceType=deviceType)
 
     def __repr__(self):
@@ -755,7 +756,7 @@ class pglDigitalIODevice(pglDevice):
     ################################################################
     # Digital output interface
     ################################################################
-    def setupDigitalOutput(self, channel=0):
+    def setupDigitalOutput(self, channel=0, pulseLen = 1):
         '''
         Configure a digital output channel.
 
@@ -766,9 +767,25 @@ class pglDigitalIODevice(pglDevice):
 
         Args:
             channel (int or str): Digital channel number or name
+            pulseLen (int): Time in ms for digital pulse to last (for digitalOutputPulse)
         '''
-        raise NotImplementedError("(pglDigitalIODevice:setupDigitalOutput) Subclass must implement setupDigitalOutput().")
+        # store pulseLen for this channel, which is used by digitalOutputPulse and digitalOutputPulseAtTime
+        self.digitalChannels[channel]= {"pulseLen": pulseLen}
 
+    def digitalOutputPulse(self, channel=0):
+        '''
+        Send a digital output pulse on channel
+
+        Implementations should check self.digitalOutputConfigured first.
+
+        Args:
+            channel (int or str): Digitial channel number or name, needs to be configured
+
+        Returns:
+            timestamp (float or None): Timestamp when output was set,
+                                       or None on error.
+        '''
+    
     def digitalOutput(self, state, pulseLen=None):
         '''
         Set the digital output state immediately.
@@ -787,26 +804,112 @@ class pglDigitalIODevice(pglDevice):
         '''
         raise NotImplementedError("(pglDigitalIODevice:digitalOutput) Subclass must implement digitalOutput().")
 
-    def digitalOutputAtTime(self, targetTime, state, pulseLen=None):
+    def digitalOutputPulse(self, channel):
         '''
-        Set the digital output state at a specified future time.
-
-        Implementations should check self.digitalOutputConfigured first
-        and validate that targetTime is in the future.
+        Send a digital output pulse. Call setupDigitalOutput() first to configure the channel.
 
         Args:
-            targetTime (float): Timestamp (in seconds) when the pulse
-                                should be delivered.
-            state (bool): True for HIGH, False for LOW
-            pulseLen (float or None): Pulse length in milliseconds
+            channel: channel to place the digital output pulse on to
+        Returns:
+            timestamp (float): Timestamp of when the digital output was set,
+                               or None if there was an error.
+        '''
+        # create a function to end pulse
+        def restoreState():
+            try:
+                # wait for pluseLen (in ms)
+                time.sleep(self.digitalChannels[channel]["pulseLen"] / 1000.0)
+                # reset the state
+                self.digitalOutput(channel, 0)
+            except Exception as e:
+                print(f"(pglLabJack:setDigitalOutput) Error restoring {self.digitalChannel[channel]["name"]}: {e}")
+
+        # set high
+        timestamp = self.digitalOutput(channel, 1)
+        if timestamp is None: return
+        
+        # start thread to reset state
+        thread = threading.Thread(target=restoreState, daemon=True)
+        thread.start()
+        
+        return timestamp
+
+    def digitalOutputPulseAtTime(self, targetTime, channel):
+        '''
+        Set the digital output state at a specified future time. Call setupDigitalOutput() first to configure the channel.
+
+        WARNING: If calling mulitple times, ensure pulses don't overlap in time as this code
+            does not currently handle multiple overlapping pulses and may produce unexpected results if pulses overlap.
+
+        Args:
+            targetTime (float): Timestamp (in seconds) when the pulse should be delivered.
+                                Must be in the future relative to pglTimestamp.getSecs().
+            channel: channel to put the pulse on
 
         Returns:
             bool: True if the pulse was successfully scheduled, False otherwise
         '''
-        raise NotImplementedError("(pglDigitalIODevice:digitalOutputAtTime) Subclass must implement digitalOutputAtTime().")
+
+        if not self.digitalOutputConfigured:
+            pglMessages.warning("Digital output channel not configured. Call setupDigitalOutput() first.")
+            return False
+
+        # Validate that targetTime is in the future
+        currentTime = pglTimestamp.getSecs()
+        if targetTime <= currentTime:
+            pglMessages.warning(f"Target time {targetTime:.6f} is not in the future (current time: {currentTime:.6f}).")
+            return False
+
+        def waitAndPulse():
+            try:
+                # Busy wait until target time
+                while pglTimestamp.getSecs() < targetTime:
+                    pass  # Busy wait for precise timing
+                
+                # send a pulse
+                self.digitalOutputPulse(channel)
+                    
+            except Exception as e:
+                pglMessages.warning(f"Error in scheduled pulse: {e}")
+
+        # Start thread to wait and deliver pulse
+        thread = threading.Thread(target=waitAndPulse, daemon=True)
+        thread.start()
+
+        return True
+    
+################################################################
+#  Abstract base class defining the interface for
+#  digital IO devices. Concrete devices (e.g.,
+#  pglLabJack) should inherit from this and implement
+#  the stubbed methods.
+################################################################
+class pglAnalogInputDevice(pglDevice):
+    '''
+    Abstract base class for analog input device.
+
+    Any concrete ADC device (e.g., a LabJack, an Arduino)
+    should inherit from this class and implement the
+    stubbed methods below. This defines the common interface
+    that the rest of pgl can rely on regardless of the
+    underlying hardware.
+
+    Subclasses are expected to:
+        - Establish/close the hardware connection (in __init__ / stop)
+        - Set self.analogInputConfigured appropriately
+        - Implement all methods marked as NotImplementedError below
+    '''
+
+    def __init__(self, deviceType="analogIputDevice"):
+        # whether a digital output channel has been configured
+        self.analogInputConfigured = False
+        super().__init__(deviceType=deviceType)
+
+    def __repr__(self):
+        return f"<pglAnalogInputDevice deviceType={getattr(self, 'deviceType', 'Unknown')}>"
 
     ################################################################
-    # Analog input interface
+    # start analog input
     ################################################################
     def startAnalogRead(self, duration=2, channels=[0], scanRate=1000, scansPerRead=1000, range=10.0):
         '''
@@ -821,6 +924,9 @@ class pglDigitalIODevice(pglDevice):
         '''
         raise NotImplementedError("(pglDigitalIODevice:startAnalogRead) Subclass must implement startAnalogRead().")
 
+    ################################################################
+    # stop analog input, should return data
+    ################################################################
     def stopAnalogRead(self, waitToFinish=False, doNotTruncate=False):
         '''
         Stop the analog reading and return time and data arrays.
@@ -834,20 +940,6 @@ class pglDigitalIODevice(pglDevice):
         '''
         raise NotImplementedError("(pglDigitalIODevice:stopAnalogRead) Subclass must implement stopAnalogRead().")
 
-    ################################################################
-    # Lifecycle interface
-    ################################################################
-    def start(self):
-        '''
-        Start the device.
-        '''
-        raise NotImplementedError("(pglDigitalIODevice:start) Subclass must implement start().")
-
-    def stop(self):
-        '''
-        Stop the device.
-        '''
-        raise NotImplementedError("(pglDigitalIODevice:stop) Subclass must implement stop().")
     
 class pglAnalogTraceData(pglSerialize):
     # Stores short trains of analog data created by pglDigitalIODevice

@@ -37,6 +37,7 @@ from . import pglTimestamp
 from .pglEyeTracker import pglEyeTracker
 from .pglEyelink import pglEyelink, pglEyelinkData
 from .pglSettings import pglSettingsManager
+from .pglMessages import pglMessages
 
 #######################
 # for returning stats
@@ -83,7 +84,7 @@ class pglExperimentBase():
         # get settings
         self.settings = settings
         if self.settings is None:
-            self.settings = pglSettingsManager.getSettings(settingsName)
+            self.settings = self.pgl.getSettings(settingsName)
         
         # if there was some error, then display it
         if self.settings is None:
@@ -360,9 +361,6 @@ class pglExperiment(pglExperimentBase):
         # init super
         super().__init__()
 
-        # load settings
-        self.loadSettings(settingsName=settingsName, settings=settings)
-
         if pgl is None:
             # If pgl is none, then this is a load
             if experimentName == "":
@@ -374,6 +372,9 @@ class pglExperiment(pglExperimentBase):
         else:
             # save pgl
             self.pgl = pgl
+
+        # load settings
+        self.loadSettings(settingsName=settingsName, settings=settings)
 
         # initialize experiment state and data
         self.state = pglExperimentState()
@@ -411,6 +412,9 @@ class pglExperiment(pglExperimentBase):
         if display.currentDisplayNum == -1:
             pglMessage.warning("Could not open display {display.name} because it is not connected")
             return
+        
+        # close all other screens
+        self.pgl.cleanUp()
         
         # open the screen
         self.pgl.open(whichScreen=display.currentDisplayNum-1, backgroundColor=backgroundColor)        
@@ -510,12 +514,14 @@ class pglExperiment(pglExperimentBase):
             return
         
         # No calibration
-        if display.calibration[0] == "None":
+        if display.luminanceCalibration[0] == "None":
             pglMessages.warning("Settings are set to calibrte for gamma {settings.calibrateForGamma} but no calibration found for display {display.name}")
             return
         
-        # set the gamma
-        display.setGamma(self.pgl, settings.calibrateForGamma)
+        # set the gamma to whatever is at the top of the calibrateForGamma list
+        gamma = settings.calibrateForGamma[0]
+        display.setGamma(self.pgl, gamma=gamma)
+        
      
         
     def endScreen(self):

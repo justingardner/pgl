@@ -13,18 +13,23 @@ import io
 import threading
 import time
 import numpy as np
-from pgl import pglTimestamp
-from .pglDevice import pglDigitalIODevice, pglAnalogTraceData
+from .pglTimestamp import pglTimestamp
+from .pglDevice import pglDigitalIODevice, pglAnalogInputDevice, pglAnalogTraceData
 import matplotlib.pyplot as plt
+from .pglMessages import pglMessages
+import time
 
-class pglLabJack(pglDigitalIODevice):
+class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
     def __init__(self):
         self.digitalOutputConfigured = False
+        self.analogInputConfigured = False
         super().__init__(deviceType="LabJack")
         
         # import library, checking for errors
         try:
             from labjack import ljm
+            # keep ljm reference
+            self.ljm = ljm
         except ImportError: 
             print("(pglLabJack) labjack library is not installed. Please install it to use LabJack.")
             return
@@ -65,12 +70,6 @@ class pglLabJack(pglDigitalIODevice):
     
             # set description
             self.deviceDescription = f"{self.type} LabJack via {self.connectionType}"
-            
-            # ljm library reference
-            self.ljm = ljm
-            
-            # timestamp utility
-            self.pglTimestamp = pglTimestamp()
                         
     def __repr__(self):
         if self.h is None:
@@ -78,131 +77,67 @@ class pglLabJack(pglDigitalIODevice):
         else:
             return f"<pglLabJack deviceType={self.type} connectionType={self.connectionType} serialNumber={self.serialNumber}>"
     
-    def setupDigitalOutput(self, channel=0):
+    def setupDigitalOutput(self, channel=0, pulseLen=1):
         '''
         Setup a digital output channel.
     
         Args:
-            channel (int or str): Digital channel number (e.g., 0 for FIO0) or name (e.g., 'FIO0')
+            channel (int): Digital channel number (e.g., 0 for FIO0)
+            pulseLen (int): Time in ms for digital pulse to last (for digitalOutputPulse)
         '''
         if self.h is None:
             print("(pglLabJack:setupDigitalOutput) LabJack device not connected.")
             self.digitalOutputConfigured = False
             return
+        
+        # call super to store pulseLen for this chanel
+        super().setupDigitalOutput(channel, pulseLen)
     
         # Convert to FIO name if needed
         if isinstance(channel, int):
-            self.channel = f"FIO{channel}"
+            self.digitalChannels[channel]["name"] = f"FIO{channel}"
         else:
-            self.channel = channel
-    
+            pglMessages.warning("channel must be an integer", level=2)
+            return
+            
         try:    
             # Set as digital output (direction = 1 for output)
-            self.ljm.eWriteName(self.h, f"{self.channel}", 1)
+            self.ljm.eWriteName(self.h, f"{self.digitalChannels[channel](0)}", 1)
             # Set initial state to LOW
-            self.ljm.eWriteName(self.h, self.channel, 0)
-            print(f"(pglLabJack:setupDigitalOutput) {self.channel} configured as output, set to LOW")
+            self.ljm.eWriteName(self.h, self.digitalChannels[-1], 0)
+            print(f"(pglLabJack:setupDigitalOutput) {self.digitalChannels[channel]["name"]} configured as output, set to LOW")
         except Exception as e:
-            print(f"(pglLabJack:setupDigitalOutput) Error setting up {self.channel}: {e}")
+            print(f"(pglLabJack:setupDigitalOutput) Error setting up {self.digitalChannels[channel]["name"]}: {e}")
             self.digitalOutputConfigured = False
         
         # configured
         self.digitalOutputConfigured = True
 
 
-    def digitalOutput(self, state, pulseLen=None):
+    def digitalOutput(self, channel, state):
         '''
         Set the digital output state. Call setupDigitalOutput() first to configure the channel.
 
         Args:
             state (bool): True for HIGH, False for LOW
-            pulseLen (float or None): Pulse length in milliseconds. If set, the output
-                                      will return back to the opposite state after this time
-
         Returns:
             timestamp (float): Timestamp of when the digital output was set,
                                or None if there was an error.
         '''
 
         if not self.digitalOutputConfigured:
-            print("(pglLabJack:setDigitalOutput) Digital output channel not configured. Call setupDigitalOutput() first.")
+            pglMessages.warning("(pglLabJack:setDigitalOutput) Digital output channel not configured. Call setupDigitalOutput() first.")
             return None
 
         # set state
         try:
-            self.ljm.eWriteName(self.h, self.channel, 1 if state else 0)
+            self.ljm.eWriteName(self.h, self.digitalChannels[channel]["name"], 1 if state else 0)
         except Exception as e:
-            print(f"(pglLabJack:setDigitalOutput) Error reading {self.channel}: {e}")
+            pglMessages.warning(f"(pglLabJack:setDigitalOutput) Error reading {self.digitalChannels[channel]["name"]}: {e}")
             return None
-
-        if pulseLen is not None:
-
-            def restoreState():
-                try:
-                    # wait for pluseLen (in ms)
-                    time.sleep(pulseLen / 1000.0)
-                    # reset the state
-                    self.ljm.eWriteName(self.h, self.channel, 0 if state else 1)
-                except Exception as e:
-                    print(f"(pglLabJack:setDigitalOutput) Error restoring {self.channel}: {e}")
-
-            # start thread to reset state
-            thread = threading.Thread(target=restoreState, daemon=True)
-            thread.start()
-
-        return self.pglTimestamp.getSecs()
-
-    def digitalOutputAtTime(self, targetTime, state, pulseLen=None):
-        '''
-        Set the digital output state at a specified future time. Call setupDigitalOutput() first to configure the channel.
-
-        WARNING: If calling mulitple times, ensure pulses don't overlap in time as this code
-            does not currently handle multiple overlapping pulses and may produce unexpected results if pulses overlap.
-
-        Args:
-            targetTime (float): Timestamp (in seconds) when the pulse should be delivered.
-                                Must be in the future relative to pglTimestamp.getSecs().
-            state (bool): True for HIGH, False for LOW
-            pulseLen (float or None): Pulse length in milliseconds. If set, the output
-                                      will return back to the opposite state after this time
-
-        Returns:
-            bool: True if the pulse was successfully scheduled, False otherwise
-        '''
-
-        if not self.digitalOutputConfigured:
-            print("(pglLabJack:digitalOutputAtTime) Digital output channel not configured. Call setupDigitalOutput() first.")
-            return False
-
-        # Validate that targetTime is in the future
-        currentTime = self.pglTimestamp.getSecs()
-        if targetTime <= currentTime:
-            print(f"(pglLabJack:digitalOutputAtTime) Target time {targetTime:.6f} is not in the future (current time: {currentTime:.6f}).")
-            return False
-
-        def waitAndPulse():
-            try:
-                # Busy wait until target time
-                while self.pglTimestamp.getSecs() < targetTime:
-                    pass  # Busy wait for precise timing
-                
-                # Set the digital output state
-                self.ljm.eWriteName(self.h, self.channel, 1 if state else 0)
-                
-                # If pulseLen is specified, restore state after delay
-                if pulseLen is not None:
-                    time.sleep(pulseLen / 1000.0)
-                    self.ljm.eWriteName(self.h, self.channel, 0 if state else 1)
-                    
-            except Exception as e:
-                print(f"(pglLabJack:digitalOutputAtTime) Error in scheduled pulse: {e}")
-
-        # Start thread to wait and deliver pulse
-        thread = threading.Thread(target=waitAndPulse, daemon=True)
-        thread.start()
-
-        return True
-            
+        
+        return pglTimestamp.getSecs()
+          
     def startAnalogRead(self, duration=2, channels=[0], scanRate=1000, scansPerRead=1000, range=10.0):
         '''
         Start analog input reading from specified channels.
@@ -265,18 +200,18 @@ class pglLabJack(pglDigitalIODevice):
 
         # start acquisition thread
         self.acquisitionThread = threading.Thread(
-            target=self.analogReadThread,
+            target=self._analogReadThread,
             daemon=True
         )
         self.acquisitionThread.start()
            
-    def analogReadThread(self):
+    def _analogReadThread(self):
         """
         Thread function to read analog data from LabJack
         """
         
         # record the start time of the stream
-        self.analogStartTimestamp = self.pglTimestamp.getSecs()
+        self.analogStartTimestamp = pglTimestamp.getSecs()
         
         # Convert channel names to addresses
         try:
@@ -303,7 +238,7 @@ class pglLabJack(pglDigitalIODevice):
         # keep getting data until duration is reached or stop event is set
         try:
             while not self.stopEvent.is_set():
-                if (self.pglTimestamp.getSecs() - self.analogStartTimestamp) >= self.analogStreamDuration:
+                if (pglTimestamp.getSecs() - self.analogStartTimestamp) >= self.analogStreamDuration:
                     break
 
                 # read the data from labJack stream
@@ -370,19 +305,5 @@ class pglLabJack(pglDigitalIODevice):
 
         return pglAnalogTraceData(time=time, data=data, channelNames=self.channels)
               
-    def start(self):
-        '''
-        Start the LabJack device
-        '''
-        if self.isRunning(): return
-        print(f"(pglLabJack:start) Starting LabJack device.")
-        
-    
-    def stop(self):
-        '''
-        Stop the LabJack Device
-        '''
-        if self.isRunning(): self.stopListener()
-        print(f"(pglLabJack:stop) Stopping LabJack device.")
 
  

@@ -106,7 +106,7 @@ class pglSettingsManager:
                         # save the modified display
                         modifiedSettings.save()
     
-    @classmethod            
+    @classmethod
     def getDisplaySettings(cls, displayName=None):
         '''
         Get all of the displaySettings
@@ -192,6 +192,7 @@ class pglSettingsManager:
             displaySettings.serialNumber  = Quartz.CGDisplaySerialNumber(display)
             displaySettings.isMain        = Quartz.CGDisplayIsMain(display)
             displaySettings.isBuiltin     = Quartz.CGDisplayIsBuiltin(display)
+            displaySettings.gammaTableSize = Quartz.CGDisplayGammaTableCapacity(display)
             
             # get display human readable name
             displaySettings.name = cls.getMatchingDisplayName(display)                    
@@ -212,6 +213,8 @@ class pglSettingsManager:
                 matchingDisplay.isBuiltin = displaySettings.isBuiltin
                 # and set its current display num
                 matchingDisplay.currentDisplayNum = display
+                # and gamma table size
+                matchingDisplay.gammaTableSize = displaySettings.gammaTableSize
             else:
                 # append to our list of all displays
                 displays.append(displaySettings)
@@ -622,6 +625,7 @@ class pglDisplaySettings(pglTraitSettings):
     flipLeftRight = Bool(False, help="Whether to flip the display left-right")
     flipUpDown = Bool(False, help="Whether to flip the display up-down")
     currentDisplayNum = Int(-1, help="Which display number this corresponds to. If not currently connected will be -1", enabled=False)
+    gammaTableSize = Int(-1, help="Size of gamma table", enabled=False)
     displayDistance = Float(57, min=0.0, help="Distance from subject eyes to display in cm, used to calculate degress of visual angle")
     displaySize = Tuple(Float, Float, labels=("width","height"), default_value=(30, 20), help="Width and height of display in cm, used to calculate degrees of visual angle")
     displayModes = List(Instance(pglDisplayModeSettings), settingsListKey="modeName", hideKey=True, highlightSelector=False, traitDisplayName="pixelDims", help="All supported display modes")
@@ -787,7 +791,7 @@ class pglSettings(pglTraitSettings):
     def saveDir(self):
         return pglSettingsManager.getSettingsDir() / f"{pglBase.makeValidFilename(self.name)}.json"
 
-
+    
     def reloadDisplays(self, selected=None):
         '''
         reload the displays so we have the most up-to-date display settings to choose from
