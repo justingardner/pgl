@@ -9,6 +9,10 @@
 # Import
 #############
 import inspect
+from IPython.display import display, HTML
+import time
+import threading
+
 
 #################################################################
 # warnings
@@ -22,14 +26,17 @@ class pglMessages:
         print(f"({cls.getCallerName(callerNameDepth)}) {msg}")
 
     @classmethod
-    def warning(cls, msg, level=1, callerNameDepth=2):
-        if level==1:
-            print(f"({cls.getCallerName(callerNameDepth)}) ❌ {msg} ❌")
-        elif level > 1:
-            print("❌"*80)
-            print(f"({cls.getCallerName(callerNameDepth)}) {msg}")
-            print("❌"*80)   
-            
+    def warning(cls, msg, level=2, callerNameDepth=2):
+        print(cls._formatMessage(msg,level,callerNameDepth))
+    
+    @classmethod
+    def _formatMessage(cls, msg, level=2, callerNameDepth=3):
+        if level == 1:
+            msg = f"({cls.getCallerName(callerNameDepth)}) ❌ {msg} ❌"
+        elif level == 2:
+            msg = "❌"*80 + "\n" + f"({cls.getCallerName(callerNameDepth+1)}) {msg}\n" + "❌"*80
+        return(msg)
+        
     @classmethod
     def oneTimeWarning(cls, msg, level=2):
         """
@@ -49,6 +56,40 @@ class pglMessages:
         # print the warning
         cls.warning(msg=msg, level=level, callerNameDepth=3)
        
+    @classmethod
+    def transientWarning(cls, msg, duration=5, level=2):
+        """
+        Display an HTML message that disappears after a specified duration.
+        Only clears this specific message, not the whole cell.
+            
+        Args:
+            message: The message to display
+            duration: Time in seconds before the message disappears (default: None))
+        """
+        # if duration is set, then must use html
+        if duration is not None:
+            useHTML=True
+            
+        # Generate a unique display_id
+        import uuid
+        displayId = str(uuid.uuid4())
+        
+        # Display with the ID
+        display(HTML(cls._formatMessage(msg,callerNameDepth=3,level=level)), display_id=displayId)
+        
+        # If no duration specified, we're done
+        if duration is None:
+            return
+        
+        def clearAfterDelay():
+            time.sleep(duration)
+            # Update using the display_id directly
+            display(HTML(""), display_id=displayId, update=True)
+        
+        thread = threading.Thread(target=clearAfterDelay)
+        thread.daemon = True
+        thread.start()
+        
     @staticmethod
     def getCallerName(depth=2):
         """
