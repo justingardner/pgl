@@ -22,7 +22,6 @@ from datetime import datetime
 import numpy as np
 import subprocess
 import platform
-from .pglBase import pglDisplayMessage
 from .pglParameter import pglParameter, pglParameterBlock
 from .pglSerialize import pglSerialize
 from .pglDialog import pglDialogs
@@ -33,6 +32,7 @@ from .pglBase import pglBase
 import re
 from collections import OrderedDict
 from .pglMessages import pglMessages
+import uuid
 
 displayDuration = 5  # seconds
 #######################################
@@ -45,13 +45,12 @@ class pglSettingsManager:
     def __init__(self):   
         pass
     
-    @classmethod
-    def settings(cls):
+    def settings(self):
         """
         Edit pgl settings. Brings up widget interface to edit settings
         """
         # get settings dir
-        settingsDir = cls.getSettingsDir()
+        settingsDir = self.getSettingsDir()
         
         # load all the seettings in there
         settingsList = []
@@ -62,41 +61,50 @@ class pglSettingsManager:
         
         # bring up dialog
         modified = pglDialogs.traitsDialog(original)
-        if modified is not None:
-            print("save")        
-    
+        
+        # and save
+        self._saveModifiedSettings(modified, original)
+                
     def displaySettings(self):
         """
         Edit pgl display settings. Brings up widget interface to edit display settings
         """
         # get the display infos
         original = pglDisplaySettingsList(self.getDisplaySettings())
+        print(original.settingsList[0].name)
         
         # display the settings
         modified = pglDialogs.traitsDialog(original)
+        
+        # and save
+        self._saveModifiedSettings(modified, original)
 
+    def _saveModifiedSettings(self, modifiedSettingsList, originalSettingsList):
+        '''
+        Save only modified settings from a settings list (could be either  pglDispalySettingsList or pglSettingsLIst)
+        '''
         # save the settings if user clicked OK
-        if modified is not None:
+        if modifiedSettingsList is not None:
             # for each display in modified list
-            for modifiedDisplay in modified.settingsList:
+            for modifiedSettings in modifiedSettingsList.settingsList:
                 # compare to original
-                matchingOriginalDisplay = next((originalDisplay for originalDisplay in original.settingsList if originalDisplay == modifiedDisplay), None)
-                if matchingOriginalDisplay is not None:
+                matchingOriginalSettings = next((originalSettings for originalSettings in originalSettingsList.settingsList if originalSettings == modifiedSettings), None)
+                if matchingOriginalSettings is not None:
                     # and if it is not equal (field by field) then save it
-                    if not matchingOriginalDisplay.equals(modifiedDisplay):
-                        # if the displayName changed, we need to change the name of the directory
-                        if modifiedDisplay.displayName != matchingOriginalDisplay.displayName:
-                            oldPath = self.getDisplayDir(matchingOriginalDisplay)
-                            newPath = self.getDisplayDir(modifiedDisplay)
+                    if not matchingOriginalSettings.equals(modifiedSettings):
+                        # if the name changed, we need to change the name of the directory
+                        if modifiedSettings.name != matchingOriginalSettings.name:
+                            oldPath = matchingOriginalSettings.saveDir().parent
+                            newPath = modifiedSettings.saveDir().parent
                             try:
                                 # rename to the new path
                                 if oldPath.exists(): oldPath.rename(newPath)
                             except OSError as e:
                                 # if it did not work, provide an error
                                 pglMessages.warning("Could not change directory name from {oldPath.name} to {newPath.name}, keeping {oldPath.name}")
-                                modifiedDisplay.displayName = matchingOriginalDisplay.displayName
+                                modifiedSettings.name = matchingOriginalSettings.name
                         # save the modified display
-                        modifiedDisplay.save()
+                        modifiedSettings.save()
     
     @classmethod            
     def getDisplaySettings(cls, displayName=None):
@@ -121,10 +129,12 @@ class pglSettingsManager:
             # load json settings
             displaySettings = pglDisplaySettings().load(p)
             # make sure displayName matches diectory
-            if pglBase.makeValidFilename(displaySettings.displayName) != str(p.parent.name):
-                displaySettings.displayName= str(p.parent.name)
+            if pglBase.makeValidFilename(displaySettings.name) != str(p.parent.name):
+                displaySettings.name = str(p.parent.name)
             # get the calibrations
             displaySettings.getCalibrations()
+            # set the displayNum to -1, so that the next piece of code can find it
+            displaySettings.currentDisplayNum = -1
             # and add to display list
             displays.append(displaySettings)
                 
@@ -184,7 +194,7 @@ class pglSettingsManager:
             displaySettings.isBuiltin     = Quartz.CGDisplayIsBuiltin(display)
             
             # get display human readable name
-            displaySettings.displayName = cls.getMatchingDisplayName(display)                    
+            displaySettings.name = cls.getMatchingDisplayName(display)                    
             
             # get the luminance calibrations
             displaySettings.getCalibrations()
@@ -200,6 +210,8 @@ class pglSettingsManager:
                 # if so, update a few fields to the settings found above
                 matchingDisplay.isMain = displaySettings.isMain
                 matchingDisplay.isBuiltin = displaySettings.isBuiltin
+                # and set its current display num
+                matchingDisplay.currentDisplayNum = display
             else:
                 # append to our list of all displays
                 displays.append(displaySettings)
@@ -207,7 +219,7 @@ class pglSettingsManager:
         if displayName is not None:
             # find the display with the matching displayName (compare using makeValidFilename to make case insenstive)
             return next(
-                (d for d in displays if pglBase.makeValidFilename(d.displayName) == pglBase.makeValidFilename(displayName)),
+                (d for d in displays if pglBase.makeValidFilename(d.name) == pglBase.makeValidFilename(displayName)),
                 None
             )                
         return(displays)
@@ -426,7 +438,7 @@ class pglSettingsManager:
         # append display specific directory if displaySettings is passed in
         if displaySettings is not None:
             # get a valid filename for displayName
-            displayName = pglBase.makeValidFilename(displaySettings.displayName)
+            displayName = pglBase.makeValidFilename(displaySettings.name)
             # and append that if it is not empty
             if displayName != "":
                 displayDir = displayDir / displayName
@@ -528,6 +540,26 @@ class pglSettingsManager:
 ##################################################
 class pglTraitSettings(HasTraits, pglSerialize):
     
+    # all trait setttings should have a name field and a uuid
+    name = Unicode("default", help="", visible=False, enabled=False)
+    uuid = Unicode("", help="Universal unique identifier for this setting", visible=False, enabled=False)
+
+    # default uuid
+    @default("uuid")
+    def _default_uuid(self):
+        return str(uuid.uuid4())
+    
+        
+    def __eq__(self, other):
+        '''
+        Define equality as when the two traitlet settings share the same uuid
+        '''
+        
+        if not isinstance(other, pglTraitSettings):
+            return NotImplemented
+
+        return self.uuid == other.uuid
+    
     def _getOrderedTraits(self):
         """Return traits in class definition order."""
         ordered = OrderedDict()
@@ -580,7 +612,7 @@ class pglDisplayModeSettings(pglTraitSettings):
     refreshRate = List(Float(), help="Refresh rates supported for this pixel dimension")
 
 class pglDisplaySettings(pglTraitSettings):
-    displayName = Unicode("default", help="Names of screen")
+    name = Unicode("default", help="Names of screen")
     uuid = Unicode("", help="UUID of display", enabled=False)
     vendor = Int(0, help="Vendor number", enabled=False)
     model = Int(0, help="Model number", enabled=False)
@@ -589,6 +621,7 @@ class pglDisplaySettings(pglTraitSettings):
     isBuiltin = Bool(False, help="Whether the display is the built-in display of e.g. a laptop", enabled=False)
     flipLeftRight = Bool(False, help="Whether to flip the display left-right")
     flipUpDown = Bool(False, help="Whether to flip the display up-down")
+    currentDisplayNum = Int(-1, help="Which display number this corresponds to. If not currently connected will be -1", enabled=False)
     displayDistance = Float(57, min=0.0, help="Distance from subject eyes to display in cm, used to calculate degress of visual angle")
     displaySize = Tuple(Float, Float, labels=("width","height"), default_value=(30, 20), help="Width and height of display in cm, used to calculate degrees of visual angle")
     displayModes = List(Instance(pglDisplayModeSettings), settingsListKey="modeName", hideKey=True, highlightSelector=False, traitDisplayName="pixelDims", help="All supported display modes")
@@ -602,10 +635,13 @@ class pglDisplaySettings(pglTraitSettings):
         Args:
             filename: Filename to save to, if ommitted, will generate path and filename using pglSettingsManager.getDisplayDir
         '''
-        if filename is None:
-            filename = pglSettingsManager.getDisplayDir(self) / "display.json"
+        # get the filename
+        if not filename: filename = self.saveDir()
         super().save(filename=filename)
         
+    def saveDir(self):
+        return pglSettingsManager.getDisplayDir(self) / "display.json"
+    
     def getCalibrations(self):
         '''
         Looks into calibrations direcotry of display to find luminance and temporal calibrations
@@ -634,9 +670,38 @@ class pglDisplaySettings(pglTraitSettings):
         
         # load the calibrtion
         from .pglCalibration import pglDisplayLuminanceCalibrationData
-        calibration = pglDisplayLuminanceCalibrationData.load(displayName=self.displayName, filepath=luminanceCalibrationDir)
+        calibration = pglDisplayLuminanceCalibrationData.load(displayName=self.name, filepath=luminanceCalibrationDir)
         calibration.display(fig=fig)
         return True
+    
+    def getLuminanceCalibration(self):
+       '''
+       get the luminance calibration
+       '''
+       if not self.luminanceCalibration or self.luminanceCalibration[0] == 'None':
+           pglMessages.warning("No luminance calibration found for {self.name}")
+           return
+       
+       # load the calibration
+       from .pglCalibration import pglDisplayLuminanceCalibrationData
+       luminanceCalibrationDir = pglSettingsManager.getDisplayLuminanceCalibrationDir(self) / self.luminanceCalibration[0]
+       calibration = pglDisplayLuminanceCalibrationData.load(displayName=self.name, filepath=luminanceCalibrationDir)
+       if calibration is None:
+           pglMessages.warning("Could not load luminance calibration from {luminanceCalibrationDir}") 
+           return
+       
+       return calibration
+    
+    def setGamma(self, pgl, gamma):
+        '''
+        Set the gamma using the calibration
+        '''
+        
+        # get the current luminance calibration
+        calibration = self.getLuminanceCalibration()
+        
+        # and set the gamma
+        calibration.setDisplayToGamma(pgl, self, gamma)
         
     def plotTemporalCalibration(self, fig, selected):
         '''
@@ -650,28 +715,18 @@ class pglDisplaySettings(pglTraitSettings):
 
         # load the calibrtion
         from .pglCalibration import pglDisplayTemporalCalibrationData
-        calibration = pglDisplayTemporalCalibrationData.load(displayName=self.displayName, filepath=temporalCalibrationDir)
+        calibration = pglDisplayTemporalCalibrationData.load(displayName=self.name, filepath=temporalCalibrationDir)
         calibration.display(fig=fig)
         
         return True
-    
-    def __eq__(self, other):
-        '''
-        Define equality as when the two displays share the same uuid
-        '''
-        
-        if not isinstance(other, pglDisplaySettings):
-            return NotImplemented
-
-        return self.uuid == other.uuid
 
 class pglDisplaySettingsList(pglTraitSettings):
 
-    settingsList = List(Instance(pglDisplaySettings), settingsListKey="displayName", traitDisplayName="Choose display", help="List of display settings")
+    settingsList = List(Instance(pglDisplaySettings), settingsListKey="name", traitDisplayName="Choose display", help="List of display settings")
     buttons = [("Test", "testDisplay")]
 
     def testDisplay(self):
-        print(f"Testing: {self.settingsList[0].displayName}")
+        print(f"Testing: {self.settingsList[0].name}")
         print(self.settingsList[0].print())
         print(self.settingsList[0].displayModes[0].print())
         
@@ -687,8 +742,8 @@ class pglDisplaySettingsList(pglTraitSettings):
 ##################################################
 class pglSettings(pglTraitSettings):
     
-    settingsName = Unicode("default", help="Display name for these settings")
-    displays = List(Instance(pglDisplaySettings), settingsListKey="displayName", highlightSelector=False, traitDisplayName="choose display", hideAll=True, help="Display - to edit display settings run pgl.displaySettings")
+    name = Unicode("default", help="Display name for these settings")
+    displays = List(Instance(pglDisplaySettings), settingsListKey="name", highlightSelector=False, traitDisplayName="choose display", hideAll=True, help="Display - to edit display settings run pgl.displaySettings")
     calibrateForGamma = List(Float, default_value=[2.2, 1.0, 0], help="What gamma to target calibration for 0.0 = No calibration, 1.0=linear, 2.2 typical for images/movies")
     dataPath = Unicode("~/data",help="Path to data directory").tag(isPath=True)
     startKey = Unicode("space", allow_none=True, help="Key to start experiment")
@@ -717,6 +772,21 @@ class pglSettings(pglTraitSettings):
         cls.reloadDisplays()
         
         return cls
+    
+    def save(self, filename=None):
+        '''
+        save
+        
+        Args:
+            filename: Filename to save to, if ommitted, will generate path and filename using pglSettingsManager.getSettingsDir
+        '''
+        # get the filename
+        if not filename: filename = self.saveDir()
+        super().save(filename=filename)
+        
+    def saveDir(self):
+        return pglSettingsManager.getSettingsDir() / "settings.json"
+
 
     def reloadDisplays(self, selected=None):
         '''
@@ -751,7 +821,7 @@ class pglSettings(pglTraitSettings):
         
 class pglSettingsList(pglTraitSettings):
 
-    settingsList = List(Instance(pglSettings), settingsListKey="settingsName", traitDisplayName="Choose settings", help="List of settings")
+    settingsList = List(Instance(pglSettings), settingsListKey="name", traitDisplayName="Choose settings", help="List of settings")
     buttons = [("Test", "testDisplay")]
 
     def testDisplay(self):
