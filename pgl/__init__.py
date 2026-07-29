@@ -19,10 +19,10 @@ from .pglTasks import pglFixationTaskLeftRight, pglBarTask
 from ._pglComm import pglSerial
 from .pglCalibration import pglDisplayCalibration, pglLuminanceCalibrationDeviceMinolta, pglDisplayLuminanceCalibrationData, pglLuminanceCalibrationDeviceDebug
 from .pglGammaTable import pglGammaTable 
-from .pglSettings import pglSettingsEditable, pglSettingsManager, pglDisplaySettings, pglDisplaySettingsList, pglDisplayModeSettings
+from .pglSettings import pglSettingsEditable, pglSettingsManager, pglDisplaySettings, pglDisplaySettingsList, pglDisplayModeSettings, pglSettings
 from .pglEventListener import pglEventListener
 from .pglEyeTracker import pglEyeTracker
-from .pglDialog import pglTraitsDialog
+from .pglDialog import pglDialogs
 from .pglMessages import pglMessages
 
 # Device specific imports (eye trackers, etc.)
@@ -38,7 +38,7 @@ try:
 except ImportError:
     print("(pgl) Warning: pylink not found, pglEyelink class will not be available. Download with: pip install sr-research-pylink")
 
-class pgl(pglBase, pglResolution, pglDraw, pglTransform, pglProfile, pglBatch, pglImage, pglStimuli, pglTimestamp, pglDevices, pglEvents, pglCommandReplayer, pglFrameGrab, pglGammaTable, pglSettingsManager, pglMessages):
+class pgl(pglBase, pglResolution, pglDraw, pglTransform, pglProfile, pglBatch, pglImage, pglStimuli, pglTimestamp, pglDevices, pglEvents, pglCommandReplayer, pglFrameGrab, pglGammaTable, pglSettingsManager, pglMessages, pglDialogs):
     """
     purpose: psychophysics and experiment library for Python.
     License: MIT License — see LICENSE file for details.
@@ -62,5 +62,6 @@ class pgl(pglBase, pglResolution, pglDraw, pglTransform, pglProfile, pglBatch, p
       pglCommandReplayer.__init__(self, *args, **kwargs)
       pglFrameGrab.__init__(self, *args, **kwargs)
       pglSettingsManager.__init__(self, *args, **kwargs)
+      pglDialogs.__init__(self, *args, **kwargs)
 __version__ = "1.0.0"
 __author__ = "JLG"

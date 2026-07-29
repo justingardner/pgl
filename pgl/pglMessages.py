@@ -18,6 +18,10 @@ class pglMessages:
     _oneTimeWarnings = set()
     
     @classmethod
+    def message(cls, msg, callerNameDepth=2):
+        print(f"({cls.getCallerName(callerNameDepth)}) {msg}")
+
+    @classmethod
     def warning(cls, msg, level=1, callerNameDepth=2):
         if level==1:
             print(f"({cls.getCallerName(callerNameDepth)}) ❌ {msg} ❌")
@@ -36,11 +40,11 @@ class pglMessages:
             level (int, default=2): Severity of warning 
         """
         # check to see if we have already printed this warning
-        if msg in self._oneTimeWarnings:
+        if msg in cls._oneTimeWarnings:
             return
     
         # add the warning to the set of printed warnings
-        self._oneTimeWarnings.add(msg)
+        cls._oneTimeWarnings.add(msg)
         
         # print the warning
         cls.warning(msg=msg, level=level, callerNameDepth=3)

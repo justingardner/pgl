@@ -319,6 +319,9 @@ class _pglTraitsDialog(QDialog):
 
                 if hideKey and name == keyTraitName:
                     continue
+                
+                if hideAll:
+                    continue
 
                 self._addTraitWidget(name, childTrait, proxy, layout)
                 childNames.append(name)
@@ -422,6 +425,7 @@ class _pglTraitsDialog(QDialog):
         # get metadata settings
         keyTraitName = trait.metadata["settingsListKey"]
         hideKey = trait.metadata.get("hideKey", False)
+        hideAll = trait.metadata.get("hideAll", False)
 
         # keep the state, with a key which is used by updateFields to
         # find settings list object which need to be recursed on
@@ -1221,28 +1225,30 @@ class ScrollableFigureCanvas(FigureCanvasQTAgg):
 # pglTraitsDialogStandalone which runs outside the jupyter notebook
 # to avoid crashy-conflicty behavior.
 #####################################################################
-def pglTraitsDialog(settings):
-    """
-    Pops up a PySide6 dialog in a separate process, blocks until closed,
-    and returns edited settings (OK) or None (Cancel).
-    """
-    tmpDir  = Path(tempfile.mkdtemp())
-    inFile  = tmpDir / "in.json"
-    outFile = tmpDir / "out.json"
+class pglDialogs:
+    @staticmethod
+    def traitsDialog(settings):
+        """
+        Pops up a PySide6 dialog in a separate process, blocks until closed,
+        and returns edited settings (OK) or None (Cancel).
+        """
+        tmpDir  = Path(tempfile.mkdtemp())
+        inFile  = tmpDir / "in.json"
+        outFile = tmpDir / "out.json"
 
-    settings.save(inFile)
+        settings.save(inFile)
 
-    scriptPath = Path(__file__).parent / "pglTraitsDialogStandalone.py"  # adjust path
-    result = subprocess.run(
-        [sys.executable, str(scriptPath), str(inFile), str(outFile)]
-    )
+        scriptPath = Path(__file__).parent / "pglTraitsDialogStandalone.py"  # adjust path
+        result = subprocess.run(
+            [sys.executable, str(scriptPath), str(inFile), str(outFile)]
+        )
 
-    if result.returncode == 0 and outFile.exists():
-        # OK
-        return pglSerialize.load(outFile)
-    else:
-        # Cancel
-        return None                               
+        if result.returncode == 0 and outFile.exists():
+            # OK
+            return pglSerialize.load(outFile)
+        else:
+            # Cancel
+            return None                               
 
 #############
 # Main class which should be subclassed for specific settings,

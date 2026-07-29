@@ -25,7 +25,7 @@ import platform
 from .pglBase import pglDisplayMessage
 from .pglParameter import pglParameter, pglParameterBlock
 from .pglSerialize import pglSerialize
-from .pglDialog import pglSettingsEditable, pglTraitsDialog
+from .pglDialog import pglSettingsEditable, pglDialogs
 import Quartz
 import CoreFoundation
 from AppKit import NSScreen
@@ -50,15 +50,22 @@ class pglSettingsManager:
         """
         Edit pgl settings. Brings up widget interface to edit settings
         """
-        # initialize settings select class
-        settingsSelect = pglSettingsSelect(self)
-        settingsSelect.load()
+        # get settings dir
+        settingsDir = cls.getSettingsDir()
         
-        # display the settings
-        settingsSelect.edit() 
+        # load all the seettings in there
+        settingsList = []
+        for filename in Path(settingsDir).glob("*.json"):
+            settings = pglSettings.load(filename=filename)
+            settingsList.append(settings)
+        settingsList = pglSettingsList(settingsList)    
         
-        # display the selected settings
-        settingsSelect.settings[0].edit() 
+        # bring up dialog
+        oldSettingsList = settingsList
+        settingsList = pglDialogs.traitsDialog(settingsList)
+        if settingsList is not None:
+            print("save")
+        
     
     def displaySettings(self):
         """
@@ -68,7 +75,7 @@ class pglSettingsManager:
         original = pglDisplaySettingsList(self.getDisplaySettings())
         
         # display the settings
-        modified = pglTraitsDialog(original)
+        modified = pglDialogs.traitsDialog(original)
 
         # save the settings if user clicked OK
         if modified is not None:
@@ -92,43 +99,14 @@ class pglSettingsManager:
                                 modifiedDisplay.displayName = matchingOriginalDisplay.displayName
                         # save the modified display
                         modifiedDisplay.save()
-            
-    def getDisplayNames(self, displayIndex=None):
-        '''
-        Get display names
-        '''
-
-        displayNames = ['Windowed']
-
-        # get names from gpuInfo
-        if not self.gpuInfo:
-            print(self.gpuInfo)
-            return displayNames
-
-        for gpuData in self.gpuInfo.values():
-            displays = gpuData.get("Displays", [])
-            for display in displays:
-                displayType = display.get('Display Type', None)
-                displayName = display.get('DisplayName', 'Unknown')
-                if displayType is not None:
-                    name = f"{displayName}: {displayType}"
-                else:
-                    name = f"{displayName}"
-                if name:
-                    displayNames.append(name)
-
-        if displayIndex is not None:
-            if displayIndex <= len(displayNames) and displayIndex > 0:
-                # move the selected display to the top
-                displayNames.insert(0, displayNames.pop(displayIndex))
-            else:
-                displayNames.insert(0, "Unknown Display")
-        
-        return displayNames
     
-    def getDisplaySettings(self):
+    @classmethod            
+    def getDisplaySettings(cls, displayName=None):
         '''
-        Get info on displays
+        Get all of the displaySettings
+        
+        Args:
+            displayName (str): If not (default=None) will return the matching setting or None if not found
         '''
         displays = []
         
@@ -140,7 +118,7 @@ class pglSettingsManager:
             from Quartz import CGDisplayCreateUUIDFromDisplayID
             
         # first check saved displays
-        displayDir = self.getDisplayDir()
+        displayDir = cls.getDisplayDir()
         for p in displayDir.rglob('display.json'):
             # load json settings
             displaySettings = pglDisplaySettings().load(p)
@@ -208,7 +186,7 @@ class pglSettingsManager:
             displaySettings.isBuiltin     = Quartz.CGDisplayIsBuiltin(display)
             
             # get display human readable name
-            displaySettings.displayName = self.getMatchingDisplayName(display)                    
+            displaySettings.displayName = cls.getMatchingDisplayName(display)                    
             
             # get the luminance calibrations
             displaySettings.getCalibrations()
@@ -227,9 +205,17 @@ class pglSettingsManager:
             else:
                 # append to our list of all displays
                 displays.append(displaySettings)
+                
+        if displayName is not None:
+            # find the display with the matching displayName (compare using makeValidFilename to make case insenstive)
+            return next(
+                (d for d in displays if pglBase.makeValidFilename(d.displayName) == pglBase.makeValidFilename(displayName)),
+                None
+            )                
         return(displays)
 
-    def getMatchingDisplayName(self, display):
+    @classmethod
+    def getMatchingDisplayName(cls, display):
         
         displayName = None
         # get the display name from Appkit
@@ -243,12 +229,47 @@ class pglSettingsManager:
             return displayName
         
         # if Appkit fails, then get through the system profiler info we have
-        displayNames = self.getDisplayNames(displayIndex=display)
+        displayNames = cls.getDisplayNames(displayIndex=display)
 
         if len(displayNames) >= 1:
             return displayNames[0]
         else:
             return "Unknown display name"
+    
+    @classmethod
+    def getDisplayNames(cls, displayIndex=None):
+        '''
+        Get display names
+        '''
+
+        displayNames = ['Windowed']
+
+        # get names from gpuInfo
+        if not cls.gpuInfo:
+            print(cls.gpuInfo)
+            return displayNames
+
+        for gpuData in cls.gpuInfo.values():
+            displays = gpuData.get("Displays", [])
+            for display in displays:
+                displayType = display.get('Display Type', None)
+                displayName = display.get('DisplayName', 'Unknown')
+                if displayType is not None:
+                    name = f"{displayName}: {displayType}"
+                else:
+                    name = f"{displayName}"
+                if name:
+                    displayNames.append(name)
+
+        if displayIndex is not None:
+            if displayIndex <= len(displayNames) and displayIndex > 0:
+                # move the selected display to the top
+                displayNames.insert(0, displayNames.pop(displayIndex))
+            else:
+                displayNames.insert(0, "Unknown Display")
+        
+        return displayNames    
+    
     @staticmethod       
     def getPGLDir():
         """
@@ -448,35 +469,61 @@ class pglSettingsManager:
         return calibrationsDir
     
     @classmethod
-    def getSettings(cls, settingsName=None):
+    def getSettings(cls, settingsName=None, settings=None, displayName=None, displaySettings=None):
         """
-        Load settings from a JSON file and return an instance of the settings class.
-        This will look in the directory returned by getSettingsDir().
+        Load settings form directory returned by getSettingsDir()
+        
         If you pass a settingsName, it will look for a file named {name}.json in that directory. 
-        If you do not pass a name, it will search through all files to see which one has the field default set
-        to true
-
+        Note that the name will be converted by pglBase.makeValidFilename so will be lowercase with spaces replaced by _ etc
+        
+        If settings is set, it will return that settings structure, supersceding settingsName
+        
+        If displayName is set, will look for that display in the directory returned by getDisplayDir() and will set 
+        the display field of the settings from above to that display. If there is no settings from above, it will
+        create a default settings and add the display to that.
+    
         Args:
-            settingsName (type): The name of the file to load
+            settingsName (str): The name of the settings to use. If not set (and settings not set), will use default settings
+            settings (pglSettings): An instance of the pglSettings class. If set, will supersede settingsName.
+            displayName (str): The name of the display to use. If set, will be incorporated into settings (and supersede any
+                conflicting settings). If there is no settings/settingsName will use default settings
+            displaySettings (pglDisplaySettings): The settings of the dispaly to use, will supersed the displayName if set and
+                behave in a similar fashion
 
         Returns:
-            An instance of the pglSettings with values loaded from the specified JSON file.
+            An instance of pglSettings
         """
-        if settingsName is None:
-            settingsName = "Default"
-            
-        # get the settings directory and create the full path to the settings file
-        settingsDir = cls.getSettingsDir()
-        settingsPath = Path(settingsDir) / settingsName
-        settingsPath = settingsPath.with_suffix(".json")
+        if settings is not None:
+            if not isinstance(settings, pglSettings):
+                pglMessages.warning("Settings must be pglSettings", level=2)
+                return
+        elif settingsName is not None:
+            # get the settings directory and create the full path to the settings file
+            settingsDir = cls.getSettingsDir()
+            settingsPath = Path(settingsDir) / pglBase.makeValidFilename(settingsName)
+            settingsPath = settingsPath.with_suffix(".json")
         
-        # see if the file exists
-        if not settingsPath.exists():
-            print(f"(pglSettingsManager:loadSettings) Settings file '{settingsPath}' not found.")
-            return None
+            # see if the file exists
+            if not settingsPath.exists():
+                pglMessages.warning(f"Settings file '{settingsPath}' not found.", level=2)
+                return None
+            else:
+                pglMessages.message(f"Loading settings from '{settingsPath}'.")
+                settings = pglSettings.load(filename=settingsPath)
         else:
-            print(f"(pglSettingsManager:loadSettings) Loading settings from '{settingsPath}'.")
-            return pglSettings(filename=settingsPath)
+            settings = pglSettings()
+            
+        if displaySettings is not None:
+            if not isinstance(settings, pglSettings):
+                pglMessages.warning("Display settings must be pgDisplaylSettings", level=2)
+                return
+        elif displayName is not None:
+            displaySettings = cls.getDisplaySettings(displayName)
+        
+        if displaySettings is not None:
+            settings.reloadDisplays(selected=displaySettings)
+            
+        return(settings)
 
 ##################################################
 # used for inheritence
@@ -535,13 +582,15 @@ class pglDisplayModeSettings(pglTraitSettings):
     refreshRate = List(Float(), help="Refresh rates supported for this pixel dimension")
 
 class pglDisplaySettings(pglTraitSettings):
-    displayName = Unicode("", help="Names of screen")
+    displayName = Unicode("default", help="Names of screen")
     uuid = Unicode("", help="UUID of display", enabled=False)
     vendor = Int(0, help="Vendor number", enabled=False)
     model = Int(0, help="Model number", enabled=False)
     serialNumber = Int(0, help="Serial number", enabled=False)
     isMain = Bool(False, help="Whether the display is the main display", enabled=False)
     isBuiltin = Bool(False, help="Whether the display is the built-in display of e.g. a laptop", enabled=False)
+    flipLeftRight = Bool(False, help="Whether to flip the display left-right")
+    flipUpDown = Bool(False, help="Whether to flip the display up-down")
     displayDistance = Float(57, min=0.0, help="Distance from subject eyes to display in cm, used to calculate degress of visual angle")
     displaySize = Tuple(Float, Float, labels=("width","height"), default_value=(30, 20), help="Width and height of display in cm, used to calculate degrees of visual angle")
     displayModes = List(Instance(pglDisplayModeSettings), settingsListKey="modeName", hideKey=True, highlightSelector=False, traitDisplayName="pixelDims", help="All supported display modes")
@@ -635,123 +684,13 @@ class pglDisplaySettingsList(pglTraitSettings):
 
 
  
-
-# Screen settings select
-class pglSettingsSelect(pglSettingsEditable):
+##################################################
+# Settings 
+##################################################
+class pglSettings(pglTraitSettings):
     
-    # traits that can be edited
-    settingsNames = List(Unicode(), help="Settings names")
-    #default = Bool(False, help="Whether this is the default settings")
-    
-    # Variable containing all the settings, this is set by calling class
-    settings = []
-
-    def __init__(self, pgl=None):
-        self.pgl = pgl
-        super().__init__()
-        
-    def load(self, settingsName=None):
-        # initialize experiment so that we can get settings from it
-        from .pglExperiment import pglExperiment
-        e = pglExperiment(self)
-        
-        # get the screen settings directory
-        settingsDir = e.getSettingsDir()
-        
-        # cycle through all files in settingsDir with .json extension
-        # and load as a pglScreenSettings instance
-        settings = []
-        for jsonFile in Path(settingsDir).glob("*.json"):
-            # load settings from file
-            s = pglSettings(jsonFile)
-            # put in displayNames, putting the matching number on top
-            s.displayName = self.pgl.getDisplayNames(s.displayNumber)
-            # add a link to this settingsSelect
-            s.settingsSelect = self
-            # append to list
-            settings.append(s)
-            
-        # if settings is empty, then create a default settings
-        if len(settings) == 0:
-            # create default settings
-            settings.append(pglSettings())
-            # and save
-            settings[0].onSave(None)
-            
-        if settingsName is not None:
-            # find the settings with this name and put it on top
-            for i, s in enumerate(settings):
-                if s.settingsName == settingsName:
-                    # move to top
-                    settings.insert(0, settings.pop(i))
-                    break
-                
-        # Now set our settingsNames trait and settings
-        self.settingsNames = [s.settingsName for s in settings]
-        self.settings = settings
-        
-    # ----- Callbacks for list change ---- #
-    # when the displayName is selected, edit those settings
-    def onListSelect(self, traitName, change):
-        # call parent method
-        super().onListSelect(traitName, change)
-        # load the selected settings
-        selectedName = change['new']
-        # go through settings, to see which one it matches to
-        for s in self.settings:
-            if s.settingsName == selectedName:
-                # display the settings
-                s.edit()
-            else:
-                s.hide()
-    
-    def remove(self, settingsInstance):
-        # remove the settingsInstance from our list
-        self.settings = [s for s in self.settings if s != settingsInstance]
-        # update settingsNames
-        self.settingsNames = [s.settingsName for s in self.settings]
-
-    def update(self, settingsInstance):
-        """
-        Update or add a settings instance to the list.
-        If the settingsName already exists, replace it.
-        If it's new, add it to the list.
-        """
-        # Check if this settings name already exists
-        existingIndex = None
-        for i, s in enumerate(self.settings):
-            if s.settingsName == settingsInstance.settingsName:
-                existingIndex = i
-                break
-    
-        if existingIndex is not None:
-            # Replace existing - hide the old one first
-            self.settings[existingIndex].hide()
-            if hasattr(self.settings[existingIndex], 'wrapper'):
-                self.settings[existingIndex].wrapper.close()
-            self.settings[existingIndex] = settingsInstance
-        else:
-            # Add new to the list
-            self.settings.append(settingsInstance)
-    
-        # Update settingsNames and move this one to top
-        allNames = [s.settingsName for s in self.settings]
-        self.settingsNames = [settingsInstance.settingsName] + [n for n in allNames if n != settingsInstance.settingsName]
-
-# Settings
-class pglSettings(pglSettingsEditable):
-    
-    settingsName = Unicode(help="Display name for these settings")
-    displayName = List(Unicode(), help="Names of available screens")
-    displayNumber = Int(0, min=0, step=1, help="Screen number, 0 for window, 1 for main, 2 for secondary etc")
-    windowWidth = Int(800, min=100, step=10, help="Window width in pixels")
-    windowHeight = Int(600, min=100, step=10, help="Window height in pixels")
-    displayDistance = Float(57.0, min = 0.0, step=0.1, max=None, help="Distance in cm from subject to screen")
-    displayWidth = Float(32.0, min = 0.0, step=0.1, max=None, help="Display width in cm")
-    displayHeight = Float(18.0, min = 0.0, step=0.1, max=None, help="Display height in cm")
-    flipLeftRight = Bool(False, help="Whether to flip the display left-right")
-    flipUpDown = Bool(False, help="Whether to flip the display up-down")
-    calibration = List(Unicode(), default_value=['Latest','None'], help="Which calibration to use")
+    settingsName = Unicode("default", help="Display name for these settings")
+    displays = List(Instance(pglDisplaySettings), settingsListKey="displayName", highlightSelector=False, traitDisplayName="choose display", hideAll=True, help="Display - to edit display settings run pgl.displaySettings")
     calibrateForGamma = List(Float, default_value=[2.2, 1.0, 0], help="What gamma to target calibration for 0.0 = No calibration, 1.0=linear, 2.2 typical for images/movies")
     dataPath = Unicode("~/data",help="Path to data directory").tag(isPath=True)
     startKey = Unicode("space", allow_none=True, help="Key to start experiment")
@@ -766,9 +705,72 @@ class pglSettings(pglSettingsEditable):
     backgroundColor = List(trait=Float(min=0.0, max=1.0), default_value=[0.5, 0.5, 0.5],minlen=3,maxlen=3,help="Background color as a list of RGB values").tag(isRGB=True)
     eyetracker =  List(Unicode(), default_value=['None', 'Eyelink'], help="Eyetracker")
     
+    @classmethod
+    def load(cls, filename):
+        '''
+        Load pglSettings. 
+    
+        Also loads displays list so that it has up to date display settings
+        '''
+        # call super function to load all fields
+        cls = super().load(filename)
+        
+        # reload the displays
+        cls.reloadDisplays()
+        
+        return cls
+
+    def reloadDisplays(self, selected=None):
+        '''
+        reload the displays so we have the most up-to-date display settings to choose from
+        '''
+
+        # load all the display settings
+        displays = pglSettingsManager.getDisplaySettings()
+        
+        if selected is None:
+            if self.displays is None or len(self.displays) == 0:
+                # no selection, no existing displays, just use default list
+                self.displays = displays
+                return
+            else:
+                # get selected from top of existing list
+                selected = self.displays[0]
+                
+        # if displays is not empty, then see if the selected display (the one on top)
+        # matches one of the newly loaded displays
+        if displays:
+            if selected in displays:
+                displays.insert(0, displays.pop(displays.index(selected)))
+            else:
+                displays.insert(0, selected)
+            self.displays = displays
+        else:
+            if selected in self.displays:
+                self.displays.insert(0, self.displays.pop(self.displays.index(selected)))
+            else:
+                self.displays.insert(0, selected)
+        
+class pglSettingsList(pglTraitSettings):
+
+    settingsList = List(Instance(pglSettings), settingsListKey="settingsName", traitDisplayName="Choose settings", help="List of settings")
+    buttons = [("Test", "testDisplay")]
+
+    def testDisplay(self):
+        print(self.settingsList[0].print())
+        
+    def __init__(self, settingsList=None):
+        super().__init__()
+        if settingsList is not None:
+            self.settingsList = settingsList
+
+    
+    
+##### DELETE EVERYTHING BELOW THIS LINE WHEN DONE FIXING pglSettings
+class pglOLDSettings(pglSettingsEditable):
     # link back to settings select class
     settingsSelect = None 
-    
+
     # ----- Put up edit dialog ---- #
     def edit(self):
         # call parent method
@@ -900,3 +902,108 @@ class pglSettings(pglSettingsEditable):
                 widget = self.widgetMap.get(trait)
                 if widget:
                     widget.disabled = displayNumber!=0
+                    
+
+
+
+# Screen settings select
+class pglSettingsSelect(pglSettingsEditable):
+    
+    # traits that can be edited
+    settingsNames = List(Unicode(), help="Settings names")
+    #default = Bool(False, help="Whether this is the default settings")
+    
+    # Variable containing all the settings, this is set by calling class
+    settings = []
+
+    def __init__(self, pgl=None):
+        self.pgl = pgl
+        super().__init__()
+        
+    def load(self, settingsName=None):
+        # initialize experiment so that we can get settings from it
+        from .pglExperiment import pglExperiment
+        e = pglExperiment(self)
+        
+        # get the screen settings directory
+        settingsDir = e.getSettingsDir()
+        
+        # cycle through all files in settingsDir with .json extension
+        # and load as a pglScreenSettings instance
+        settings = []
+        for jsonFile in Path(settingsDir).glob("*.json"):
+            # load settings from file
+            s = pglSettings(jsonFile)
+            # put in displayNames, putting the matching number on top
+            s.displayName = self.pgl.getDisplayNames(s.displayNumber)
+            # add a link to this settingsSelect
+            s.settingsSelect = self
+            # append to list
+            settings.append(s)
+            
+        # if settings is empty, then create a default settings
+        if len(settings) == 0:
+            # create default settings
+            settings.append(pglSettings())
+            # and save
+            settings[0].onSave(None)
+            
+        if settingsName is not None:
+            # find the settings with this name and put it on top
+            for i, s in enumerate(settings):
+                if s.settingsName == settingsName:
+                    # move to top
+                    settings.insert(0, settings.pop(i))
+                    break
+                
+        # Now set our settingsNames trait and settings
+        self.settingsNames = [s.settingsName for s in settings]
+        self.settings = settings
+        
+    # ----- Callbacks for list change ---- #
+    # when the displayName is selected, edit those settings
+    def onListSelect(self, traitName, change):
+        # call parent method
+        super().onListSelect(traitName, change)
+        # load the selected settings
+        selectedName = change['new']
+        # go through settings, to see which one it matches to
+        for s in self.settings:
+            if s.settingsName == selectedName:
+                # display the settings
+                s.edit()
+            else:
+                s.hide()
+    
+    def remove(self, settingsInstance):
+        # remove the settingsInstance from our list
+        self.settings = [s for s in self.settings if s != settingsInstance]
+        # update settingsNames
+        self.settingsNames = [s.settingsName for s in self.settings]
+
+    def update(self, settingsInstance):
+        """
+        Update or add a settings instance to the list.
+        If the settingsName already exists, replace it.
+        If it's new, add it to the list.
+        """
+        # Check if this settings name already exists
+        existingIndex = None
+        for i, s in enumerate(self.settings):
+            if s.settingsName == settingsInstance.settingsName:
+                existingIndex = i
+                break
+    
+        if existingIndex is not None:
+            # Replace existing - hide the old one first
+            self.settings[existingIndex].hide()
+            if hasattr(self.settings[existingIndex], 'wrapper'):
+                self.settings[existingIndex].wrapper.close()
+            self.settings[existingIndex] = settingsInstance
+        else:
+            # Add new to the list
+            self.settings.append(settingsInstance)
+    
+        # Update settingsNames and move this one to top
+        allNames = [s.settingsName for s in self.settings]
+        self.settingsNames = [settingsInstance.settingsName] + [n for n in allNames if n != settingsInstance.settingsName]

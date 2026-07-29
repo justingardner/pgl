@@ -628,25 +628,6 @@ class pglBase:
             else:
                 print(f"{prefix} {field}: {value}")
 
-    def oneTimeWarning(self, warningStr):
-        """
-        Print a one-time warning message.
-
-        Args:
-            warningStr (str): The warning message to print.
-        """
-        # check to see if we have already printed this warning
-        if not hasattr(self, '_oneTimeWarnings'):
-            self._oneTimeWarnings = set()
-        if warningStr in self._oneTimeWarnings:
-            return
-        # add the warning to the set of printed warnings
-        self._oneTimeWarnings.add(warningStr)
-        
-        # print the warning
-        print("❌"*80)
-        print(f"(pgl:oneTimeWarning) {warningStr}")
-        print("❌"*80)
 
     ################################################################
     # Check OS compatibility
@@ -779,7 +760,8 @@ class pglBase:
     ################################################################
     # Shutdown all mglMetal processes
     ################################################################
-    def shutdownAll(self):
+    @staticmethod
+    def shutdownAll():
         '''
         Shutdown all mglMetal processes
         '''
@@ -865,7 +847,8 @@ class pglBase:
     #################################################################
     # Print a header
     #################################################################
-    def printHeader(self, str="", len=80, fillChar="="):
+    @staticmethod
+    def printHeader(str="", len=80, fillChar="="):
         '''
         Print a header with a given string centered
         '''
@@ -890,7 +873,7 @@ class pglBase:
         cleanStr = cleanStr.strip('_.')
         
         # guard against an empty result
-        return cleanStr or 'unnamed'
+        return cleanStr.lower() or 'unnamed'
 
     ###################################
     # get the name of the mglMetalApp
