@@ -405,7 +405,7 @@ class pglExperiment(pglExperimentBase):
             
         # get screen parameters
         if len(self.settings.displays) < 1:
-            pglMessages.warning("Settings {self.settings.settingsName} is not associated with a display")
+            pglMessages.warning("Settings {self.settings.name} is not associated with a display")
             return
         display = self.settings.displays[0]
         if display.currentDisplayNum == -1:
@@ -419,7 +419,7 @@ class pglExperiment(pglExperimentBase):
             return
         
         # set visual angle coordinates
-        self.pgl.visualAngle(display.displayDistance,display.displaySize(0),display.displaySize(1))
+        self.pgl.visualAngle(display.displayDistance,display.displaySize[0],display.displaySize[1])
         
         # flip left-right and/or up-down if specified in settings
         if display.flipLeftRight: self.pgl.flipLeftRight()
