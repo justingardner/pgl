@@ -71,7 +71,6 @@ class pglSettingsManager:
         """
         # get the display infos
         original = pglDisplaySettingsList(self.getDisplaySettings())
-        print(original.settingsList[0].name)
         
         # display the settings
         modified = pglDialogs.traitsDialog(original)
@@ -601,11 +600,41 @@ class pglTraitSettings(HasTraits, pglSerialize):
             return False
 
         for name in self._getOrderedTraits():
-            if getattr(self, name) != getattr(other, name):
+            if not self._valueEquals(getattr(self, name), getattr(other, name)):
                 return False
 
         return True
 
+
+    def _valueEquals(self, a, b):
+        # same object or simple equality
+        if a is b:
+            return True
+
+        # nested settings objects
+        if hasattr(a, "equals") and hasattr(b, "equals"):
+            return a.equals(b)
+
+        # lists / tuples
+        if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+            if len(a) != len(b):
+                return False
+
+            return all(self._valueEquals(x, y) for x, y in zip(a, b))
+
+        # dictionaries if you use them
+        if isinstance(a, dict) and isinstance(b, dict):
+            if a.keys() != b.keys():
+                return False
+
+            return all(self._valueEquals(a[k], b[k]) for k in a)
+
+        # numpy arrays
+        if isinstance(a, np.ndarray) and isinstance(b, np.ndarray):
+            return np.array_equal(a, b)
+
+        # fallback
+        return a == b
 ##################################################
 # display Settings 
 ##################################################

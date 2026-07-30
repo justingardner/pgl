@@ -245,7 +245,7 @@ class _pglTraitsDialog(QDialog):
     #########################################
     # Widget factory per trait type
     #########################################
-    def _addTraitWidget(self, traitName, trait, settingsObject=None, layout=None):
+    def _addTraitWidget(self, traitName, trait, settingsObject=None, layout=None, settingsKey=None):
         
         # settingsObject is the object that owns this trait.
         # Defaults to the root dialog settings object.
@@ -259,56 +259,56 @@ class _pglTraitsDialog(QDialog):
             return
         
         if isinstance(trait, Tuple):
-            self._addTuple(traitName, trait, current, helpText, settingsObject, layout)
+            self._addTuple(traitName, trait, current, helpText, settingsObject, layout, settingsKey)
         
         # a settings list
         elif isinstance(trait, List) and "settingsListKey" in trait.metadata:
-            self._addSettingsList(traitName, trait, current, helpText, settingsObject, layout)
+            self._addSettingsList(traitName, trait, current, helpText, settingsObject, layout, settingsKey)
         
         # Float with min and max -> slider + spinbox
         elif isinstance(trait, Float) and trait.min is not None and not math.isinf(trait.max) and not math.isinf(trait.min):
-            self._addFloatRange(traitName, trait, current, helpText, settingsObject, layout)
+            self._addFloatRange(traitName, trait, current, helpText, settingsObject, layout, settingsKey)
 
         # Float (min only or unbounded)
         elif isinstance(trait, Float):
-            self._addFloat(traitName, trait, current, helpText, settingsObject, layout)
+            self._addFloat(traitName, trait, current, helpText, settingsObject, layout, settingsKey)
 
         # Int
         elif isinstance(trait, Int):
-            self._addInt(traitName, trait, current, helpText, settingsObject, layout)
+            self._addInt(traitName, trait, current, helpText, settingsObject, layout, settingsKey)
 
         # Bool
         elif isinstance(trait, Bool):
-            self._addBool(traitName, trait, current, helpText, settingsObject, layout)
+            self._addBool(traitName, trait, current, helpText, settingsObject, layout, settingsKey)
 
         # RGB list
         elif isinstance(trait, List) and trait.metadata.get("isRGB", False):
-            self._addRGB(traitName, trait, current, helpText, settingsObject, layout)
+            self._addRGB(traitName, trait, current, helpText, settingsObject, layout, settingsKey)
             
         # Path
         elif isinstance(trait, Unicode) and trait.metadata.get("isPath", False):
-            self._addText(traitName, trait, current, helpText, settingsObject, layout)
+            self._addText(traitName, trait, current, helpText, settingsObject, layout, settingsKey)
 
         # Unicode with button
         elif isinstance(trait, Unicode) and trait.metadata.get("hasSetButton", False):
-            self._addTextWithSetButton(traitName, trait, current, helpText, settingsObject, layout)
+            self._addTextWithSetButton(traitName, trait, current, helpText, settingsObject, layout, settingsKey)
 
         # Unicode
         elif isinstance(trait, Unicode):
-            self._addText(traitName, trait, current, helpText, settingsObject, layout)
+            self._addText(traitName, trait, current, helpText, settingsObject, layout, settingsKey)
 
         # List with a plot button
         elif isinstance(trait, List) and trait.metadata.get("hasPlotButton", False):
-            self._addListWithPlotButton(traitName, trait, current, helpText, settingsObject, layout)
+            self._addListWithPlotButton(traitName, trait, current, helpText, settingsObject, layout, settingsKey)
 
         # List -> dropdown
         elif isinstance(trait, List):
-            self._addList(traitName, trait, current, helpText, settingsObject, layout)
+            self._addList(traitName, trait, current, helpText, settingsObject, layout, settingsKey)
 
     # ----- Setting list -----
     _selectedSettings = {}
     def _addSettingsList(self, traitName, trait, current, helpText,
-                        settingsObject, layout=None):
+                        settingsObject, layout=None, settingsKey=None):
 
         # Build widgets once
         #--------------------
@@ -323,7 +323,7 @@ class _pglTraitsDialog(QDialog):
                 if hideAll:
                     continue
 
-                self._addTraitWidget(name, childTrait, proxy, layout)
+                self._addTraitWidget(name, childTrait, proxy, layout, settingsKey)
                 childNames.append(name)
 
         # Commit current selection
@@ -386,7 +386,7 @@ class _pglTraitsDialog(QDialog):
             try:
                 for name in childNames:
                     value = getattr(obj, name)
-                    entry = self.traitWidgets.get(name)
+                    entry = self.traitWidgets[state["key"]].get(name)
 
                     # ordinary widget
                     if entry is not None and "setter" in entry:
@@ -446,6 +446,7 @@ class _pglTraitsDialog(QDialog):
         # if there is a parent change.
         objectName = settingsObject.__class__.__name__ if not isinstance(settingsObject, _RetargetableProxy) else settingsObject.getClassName()
         settingsKey = (objectName, traitName)
+        self.traitWidgets.setdefault(settingsKey, {})
         state = {"list": current, "object": current[0], "key":settingsKey}
         self._selectedSettings[settingsKey] = state
 
@@ -481,7 +482,7 @@ class _pglTraitsDialog(QDialog):
         showObject(0)
         
     # ----- Float with min/max -----
-    def _addFloatRange(self, traitName, trait, current, helpText, settingsObject, layout=None):
+    def _addFloatRange(self, traitName, trait, current, helpText, settingsObject, layout=None, settingsKey=None):
         step = getattr(trait, 'step', (trait.max - trait.min) / 100.0)
 
         spin = QDoubleSpinBox()
@@ -536,10 +537,10 @@ class _pglTraitsDialog(QDialog):
             spin.setValue(float(value))
             slider.setValue(toSlider(float(value)))
 
-        self._register(traitName, trait, row, setter, layout)
+        self._register(traitName, trait, row, setter, layout, settingsKey)
 
     # ----- Float -----
-    def _addFloat(self, traitName, trait, current, helpText, settingsObject, layout=None):
+    def _addFloat(self, traitName, trait, current, helpText, settingsObject, layout=None, settingsKey=None):
         spin = QDoubleSpinBox()
         spin.setAlignment(Qt.AlignCenter) 
         spin.setButtonSymbols(QAbstractSpinBox.PlusMinus)
@@ -561,10 +562,10 @@ class _pglTraitsDialog(QDialog):
         
         # wrap with - and + buttons
         row = self._wrapSpinDoubleStep(spin, bigStep = 1.0)
-        self._register(traitName, trait, row, lambda v: spin.setValue(float(v)), layout)
+        self._register(traitName, trait, row, lambda v: spin.setValue(float(v)), layout, settingsKey)
 
     # ----- Int -----
-    def _addInt(self, traitName, trait, current, helpText, settingsObject, layout=None):
+    def _addInt(self, traitName, trait, current, helpText, settingsObject, layout=None, settingsKey=None):
         spin = QDoubleSpinBox()
         spin.setAlignment(Qt.AlignCenter) 
         spin.setDecimals(0)
@@ -583,10 +584,10 @@ class _pglTraitsDialog(QDialog):
         
         # wrap with - and + buttons
         row = self._wrapSpinSingleStep(spin)
-        self._register(traitName, trait, row, lambda v: spin.setValue(int(v)), layout)
+        self._register(traitName, trait, row, lambda v: spin.setValue(int(v)), layout, settingsKey)
 
     # ----- Tuple -----
-    def _addTuple(self, traitName, trait, current, helpText, settingsObject, layout=None):
+    def _addTuple(self, traitName, trait, current, helpText, settingsObject, layout=None, settingsKey=None):
         row = QWidget()
         h = QHBoxLayout(row)
         h.setContentsMargins(0, 0, 0, 0)
@@ -660,9 +661,9 @@ class _pglTraitsDialog(QDialog):
             finally:
                 self._updatingWidget = False
 
-        self._register(traitName, trait, row, setValue, layout)
+        self._register(traitName, trait, row, setValue, layout, settingsKey)
     # ----- Bool -----
-    def _addBool(self, traitName, trait, current, helpText, settingsObject, layout=None):
+    def _addBool(self, traitName, trait, current, helpText, settingsObject, layout=None, settingsKey=None):
         check = QCheckBox()
         check.setChecked(bool(current))
         check.setToolTip(helpText)
@@ -672,10 +673,10 @@ class _pglTraitsDialog(QDialog):
                 self._commit(settingsObject, traitName, check.isChecked())
 
         check.stateChanged.connect(onChange)
-        self._register(traitName, trait, check, lambda v: check.setChecked(bool(v)), layout)
+        self._register(traitName, trait, check, lambda v: check.setChecked(bool(v)), layout, settingsKey)
 
     # ----- Text / Path -----
-    def _addText(self, traitName, trait, current, helpText, settingsObject, layout=None):
+    def _addText(self, traitName, trait, current, helpText, settingsObject, layout=None, settingsKey=None):
         edit = QLineEdit(str(current) if current is not None else "")
         edit.setAlignment(Qt.AlignCenter) 
         edit.setToolTip(helpText)
@@ -685,10 +686,10 @@ class _pglTraitsDialog(QDialog):
                 self._commit(settingsObject, traitName, text)
 
         edit.textChanged.connect(onChange)
-        self._register(traitName, trait, edit, lambda v: edit.setText(str(v) if v is not None else ""), layout)
+        self._register(traitName, trait, edit, lambda v: edit.setText(str(v) if v is not None else ""), layout, settingsKey)
 
     # ----- List -> dropdown -----
-    def _addList(self, traitName, trait, current, helpText, settingsObject, layout=None):
+    def _addList(self, traitName, trait, current, helpText, settingsObject, layout=None, settingsKey=None):
         combo = CenteredComboBox()
 
         options = list(current) if current else []
@@ -737,12 +738,12 @@ class _pglTraitsDialog(QDialog):
 
             combo.blockSignals(False)
 
-        self._register(traitName, trait, combo, setter, layout)
+        self._register(traitName, trait, combo, setter, layout, settingsKey)
         
     # ----- List with toggle plot button -----
     plotButtonState = False
     _activePlotButton = None
-    def _addListWithPlotButton(self, traitName, trait, current, helpText, settingsObject, layout=None):
+    def _addListWithPlotButton(self, traitName, trait, current, helpText, settingsObject, layout=None, settingsKey=None):
         plotFunc = trait.metadata.get("buttonFunction", None)
 
         combo = CenteredComboBox()
@@ -820,10 +821,10 @@ class _pglTraitsDialog(QDialog):
             combo.addItems([str(item) for item in value])
             combo.blockSignals(False)
 
-        self._register(traitName, trait, row, setter, layout)
+        self._register(traitName, trait, row, setter, layout, settingsKey)
 
     # ----- Text with a set button -----
-    def _addTextWithSetButton(self, traitName, trait, current, helpText, settingsObject, layout=None):
+    def _addTextWithSetButton(self, traitName, trait, current, helpText, settingsObject, layout=None, settingsKey=None):
 
         buttonFunc = trait.metadata.get("buttonFunction", None)
 
@@ -857,11 +858,11 @@ class _pglTraitsDialog(QDialog):
         h.addWidget(edit, 1)
         h.addWidget(button)
 
-        self._register(traitName, trait, row, lambda v: edit.setText(str(v) if v is not None else ""), layout)
+        self._register(traitName, trait, row, lambda v: edit.setText(str(v) if v is not None else ""), layout, settingsKey)
 
 
     # ----- RGB -----
-    def _addRGB(self, traitName, trait, current, helpText, settingsObject, layout=None):
+    def _addRGB(self, traitName, trait, current, helpText, settingsObject, layout=None, settingsKey=None):
         rgb = list(current) if current else [0.0, 0.0, 0.0]
         boxes = []
         row = QWidget()
@@ -891,12 +892,12 @@ class _pglTraitsDialog(QDialog):
                 if i < len(value):
                     b.setValue(float(value[i]))
 
-        self._register(traitName, trait, row, setter, layout)
+        self._register(traitName, trait, row, setter, layout, settingsKey)
             
-   #########################################
+    #########################################
     # Helpers
     #########################################
-    def _register(self, traitName, trait, widget, setter, layout = None):
+    def _register(self, traitName, trait, widget, setter, layout = None, settingsKey = None):
         if layout is None:
             layout = self.formLayout
 
@@ -910,15 +911,21 @@ class _pglTraitsDialog(QDialog):
         from PySide6.QtWidgets import QSizePolicy
         widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         widget.setMinimumHeight(30)
+        
+        if settingsKey is None:
+            settingsKey = ("root",)
 
-        layout.addRow(label, widget)
-        self.traitWidgets[traitName] = {
+        self.traitWidgets.setdefault(settingsKey, {})
+
+        self.traitWidgets[settingsKey][traitName] = {
             'widget': widget,
             'row': widget,
             'label': label,
             'setter': setter,
         }
-        
+
+        layout.addRow(label, widget)
+                
         # honor default-enabled metadata
         if trait is not None:
             isEnabled = trait.metadata.get('enabled', True)
