@@ -142,12 +142,13 @@ class pglSettingsManager:
                 
         maxDisplays = 16        
         (err, active, count) = Quartz.CGGetActiveDisplayList(maxDisplays, None, None)
-        for display in active:
+
+        for iDisplay, displayID in enumerate(active):
             # initialize the displaySettings
             displaySettings = pglDisplaySettings()
             
             # get all supported modes
-            modes = Quartz.CGDisplayCopyAllDisplayModes(display, None)
+            modes = Quartz.CGDisplayCopyAllDisplayModes(displayID, None)
             displayModes = []
 
             for mode in modes:
@@ -185,25 +186,26 @@ class pglSettingsManager:
             #displaySettings.refreshRate = Quartz.CGDisplayModeGetRefreshRate(mode)
 
             # get UUID
-            uuidRef = CGDisplayCreateUUIDFromDisplayID(display)
+            uuidRef = CGDisplayCreateUUIDFromDisplayID(displayID)
             displaySettings.uuid = str(CoreFoundation.CFUUIDCreateString(None, uuidRef))
             
             # get other infor from quartz
-            displaySettings.vendor        = Quartz.CGDisplayVendorNumber(display)
-            displaySettings.model         = Quartz.CGDisplayModelNumber(display)
-            displaySettings.serialNumber  = Quartz.CGDisplaySerialNumber(display)
-            displaySettings.isMain        = Quartz.CGDisplayIsMain(display)
-            displaySettings.isBuiltin     = Quartz.CGDisplayIsBuiltin(display)
-            displaySettings.gammaTableSize = Quartz.CGDisplayGammaTableCapacity(display)
+            displaySettings.vendor        = Quartz.CGDisplayVendorNumber(displayID)
+            displaySettings.model         = Quartz.CGDisplayModelNumber(displayID)
+            displaySettings.serialNumber  = Quartz.CGDisplaySerialNumber(displayID)
+            displaySettings.isMain        = Quartz.CGDisplayIsMain(displayID)
+            displaySettings.isBuiltin     = Quartz.CGDisplayIsBuiltin(displayID)
+            displaySettings.gammaTableSize = Quartz.CGDisplayGammaTableCapacity(displayID)
             
             # get display human readable name
-            displaySettings.name = cls.getMatchingDisplayName(display)                    
+            displaySettings.name = cls.getMatchingDisplayName(displayID)                    
             
             # get the luminance calibrations
             displaySettings.getCalibrations()
             
             # check if we already have it in our list
             matchingDisplays = [d for d in displays if displaySettings == d]
+
             if len(matchingDisplays) > 1:
                 raise RuntimeError(
                     f"Found multiple displays with UUID {displaySettings.uuid}"
@@ -214,10 +216,11 @@ class pglSettingsManager:
                 matchingDisplay.isMain = displaySettings.isMain
                 matchingDisplay.isBuiltin = displaySettings.isBuiltin
                 # and set its current display num
-                matchingDisplay.currentDisplayNum = display
+                matchingDisplay.currentDisplayNum = iDisplay
                 # and gamma table size
                 matchingDisplay.gammaTableSize = displaySettings.gammaTableSize
             else:
+                displaySettings.currentDisplayNum = iDisplay
                 # append to our list of all displays
                 displays.append(displaySettings)
                 

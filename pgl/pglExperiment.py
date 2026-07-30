@@ -393,14 +393,14 @@ class pglExperiment(pglExperimentBase):
                 return
             self.state.display = self.settings.displays[0]
             if self.state.display.currentDisplayNum == -1:
-                pglMessages.warning("Could not open display {display.name} because it is not connected")
+                pglMessages.warning(f"Could not open display {self.state.display.name} because it is not connected")
                 return
             
             # close all other screens
             self.pgl.cleanUp()
             
             # set screen resolution if necessary
-            self.state.originalScreenResolution = self.pgl.getResolution(self.state.display.currentDisplayNum-1)
+            self.state.originalScreenResolution = self.pgl.getResolution(self.state.display.currentDisplayNum)
             
             # compare to what is desired
             displayMode = None
@@ -409,16 +409,16 @@ class pglExperiment(pglExperimentBase):
                 if displayMode == self.state.originalScreenResolution:
                     pglMessages.message("Match")
                 else:
-                    self.pgl.setResolutionUsingDisplayModeSettings(self.state.display.currentDisplayNum-1, displayMode)      
+                    self.pgl.setResolutionUsingDisplayModeSettings(self.state.display.currentDisplayNum, displayMode)      
                     self.state.screenResolution = self.pgl.getResolution()
                     pglMessages.message(f"Changing screen resolution to: {self.state.screenResolution[0]} x {self.state.screenResolution[1]} {self.state.screenResolution[2]}Hz {self.state.screenResolution[3]}bits " +
                                         f"from: {self.state.originalScreenResolution[0]} x {self.state.originalScreenResolution[1]} {self.state.originalScreenResolution[2]}Hz {self.state.originalScreenResolution[3]}bits")
 
             
             # open the screen
-            self.pgl.open(whichScreen=self.state.display.currentDisplayNum-1, backgroundColor=backgroundColor)        
+            self.pgl.open(whichScreen=self.state.display.currentDisplayNum, backgroundColor=backgroundColor)        
             if not self.pgl.isOpen():   
-                pglMessages.warning("Failed to open screen.", duration=5)
+                pglMessages.warning("Failed to open screen.")
                 return
             
             # set visual angle coordinates
@@ -523,14 +523,14 @@ class pglExperiment(pglExperimentBase):
             return
         
         # save the original gamma table
-        self.state.originalGammaTable = self.pgl.getGammaTable(display.currentDisplayNum-1)
+        self.state.originalGammaTable = self.pgl.getGammaTable(display.currentDisplayNum)
 
         # set the gamma to whatever is at the top of the calibrateForGamma list
         gamma = settings.calibrateForGamma[0]
         display.setGamma(self.pgl, gamma=gamma)
         
         # save the gamma table
-        self.state.gammaTable = self.pgl.getGammaTable(display.currentDisplayNum-1)
+        self.state.gammaTable = self.pgl.getGammaTable(display.currentDisplayNum)
         
     def endScreen(self):
         '''
@@ -553,13 +553,13 @@ class pglExperiment(pglExperimentBase):
                 # reset gamma
                 if self.state.originalGammaTable:
                     self.pgl.message("Restoring gamma table")
-                    self.pgl.setGammaTable(self.state.display.currentDisplayNum-1, rgbGammaTable=self.state.originalGammaTable)
+                    self.pgl.setGammaTable(self.state.display.currentDisplayNum, rgbGammaTable=self.state.originalGammaTable)
                     pglMessages.message("Restoring original gamma table")
                     
                 # reset screen dimensions
                 if self.state.screenResolution:
                     if self.state.screenResolution != self.state.originalScreenResolution:
-                        self.pgl.setResolution(self.state.display.currentDisplayNum-1, screenResolution=self.state.originalScreenResolution)
+                        self.pgl.setResolution(self.state.display.currentDisplayNum, screenResolution=self.state.originalScreenResolution)
                         pglMessages.message(f"Restoring resolution back to: {self.state.originalScreenResolution[0]} x {self.state.originalScreenResolution[1]} {self.state.originalScreenResolution[2]}Hz {self.state.originalScreenResolution[3]}bits")
                 
                 # close screen
