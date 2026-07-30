@@ -73,26 +73,6 @@ class pglExperimentBase():
         self.eyeTracker = None
         self.tasks = []
                 
-    def loadSettings(self, settingsName=None, settings=None):
-        
-        if (settings is None) and (settingsName is None):
-            # if no settings provided, then just use default settings
-            self.settings = pglSettings()
-            print("(pglExperiment) No settings provided, using default settings.")
-            return
-
-        # get settings
-        self.settings = settings
-        if self.settings is None:
-            self.settings = self.pgl.getSettings(settingsName)
-        
-        # if there was some error, then display it
-        if self.settings is None:
-            # display error in HTML
-            pglMessages.warning("Could not find settings, using default settings.")
-            # create default settings
-            self.settings = pglSettings()
-
     def load(self, experimentName="", subjectID="", date = None):
         '''
         Load the experiment settings, state and data.         
@@ -374,7 +354,7 @@ class pglExperiment(pglExperimentBase):
             self.pgl = pgl
 
         # load settings
-        self.loadSettings(settingsName=settingsName, settings=settings)
+        self.settings = pgl.getSettings(settingsName=settingsName, settings=settings, displaySettings=displaySettings, displayName=displayName)
 
         # initialize experiment state and data
         self.state = pglExperimentState()
@@ -406,7 +386,7 @@ class pglExperiment(pglExperimentBase):
             
         # get screen parameters
         if len(self.settings.displays) < 1:
-            pglMessages.warning("Settings {self.settings.name} is not associated with a display")
+            pglMessages.warning(f"Settings {self.settings.name} is not associated with a display")
             return
         display = self.settings.displays[0]
         if display.currentDisplayNum == -1:
@@ -521,8 +501,6 @@ class pglExperiment(pglExperimentBase):
         # set the gamma to whatever is at the top of the calibrateForGamma list
         gamma = settings.calibrateForGamma[0]
         display.setGamma(self.pgl, gamma=gamma)
-        
-     
         
     def endScreen(self):
         '''
@@ -841,7 +819,7 @@ class pglExperimentAnalysis(pglExperimentBase):
         super().__init__()
 
         # load settings - this is primarily to get the data dir
-        self.loadSettings(settingsName=settingsName, settings=settings)
+        self.settings = pglSettingsManager.getSettings(settingsName=settingsName, settings=settings)
 
         # load the experimentName
         self.load(experimentName=experimentName, subjectID=subjectID, date=date)

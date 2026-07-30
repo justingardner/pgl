@@ -535,7 +535,7 @@ class pglSettingsManager:
         
         if displaySettings is not None:
             settings.reloadDisplays(selected=displaySettings)
-            
+         
         return(settings)
 
 ##################################################
@@ -729,10 +729,24 @@ class pglDisplaySettingsList(pglTraitSettings):
     settingsList = List(Instance(pglDisplaySettings), settingsListKey="name", traitDisplayName="Choose display", help="List of display settings")
     buttons = [("Test", "testDisplay")]
 
+    ##########################
+    # test display settings
+    ##########################
     def testDisplay(self):
-        print(f"Testing: {self.settingsList[0].name}")
-        print(self.settingsList[0].print())
-        print(self.settingsList[0].displayModes[0].print())
+        from pgl import pgl
+        pgl = pgl()
+        from .pglExperiment import pglExperiment, pglTestTask
+        e = pglExperiment(pgl, displaySettings=self.settingsList[0])
+                
+        # initialize task
+        t = pglTestTask(pgl)
+        e.addTask(t)
+        
+        # open screen
+        e.initScreen()
+        
+        # and run
+        e.run()
         
     def __init__(self, settingsList=None):
         super().__init__()
