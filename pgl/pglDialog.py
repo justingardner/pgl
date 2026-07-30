@@ -1238,9 +1238,11 @@ class pglDialogs:
 
         settings.save(inFile)
 
-        scriptPath = Path(__file__).parent / "pglTraitsDialogStandalone.py"  # adjust path
+        # run, redirecting stderr because it produces meaningless messages from text handling
+        scriptPath = Path(__file__).parent / "pglTraitsDialogStandalone.py"
         result = subprocess.run(
-            [sys.executable, str(scriptPath), str(inFile), str(outFile)]
+            [sys.executable, str(scriptPath), str(inFile), str(outFile)],
+            stderr=subprocess.DEVNULL
         )
 
         if result.returncode == 0 and outFile.exists():
