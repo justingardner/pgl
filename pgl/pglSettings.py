@@ -57,6 +57,9 @@ class pglSettingsManager:
         for filename in Path(settingsDir).glob("*.json"):
             settings = pglSettings.load(filename=filename)
             settingsList.append(settings)
+        # if no saved settings, make a default one
+        if not settingsList:
+            settingsList.append(pglSettings())
         original = pglSettingsList(settingsList)    
         
         # bring up dialog
@@ -660,7 +663,7 @@ class pglDisplaySettings(pglTraitSettings):
     displayModes = List(Instance(pglDisplayModeSettings), settingsListKey="modeName", hideKey=True, highlightSelector=False, traitDisplayName="pixelDims", help="All supported display modes")
     luminanceCalibration = List(Unicode(), hasPlotButton=True, buttonFunction="plotLuminanceCalibration", default_value=['None'], help="Which luminance calibration to use")
     temporalCalibration = List(Unicode(), hasPlotButton=True, buttonFunction="plotTemporalCalibration", default_value=['None'], help="Which temporal calibration to use")
-            
+    
     def save(self, filename=None):
         '''
         save
@@ -805,6 +808,10 @@ class pglSettings(pglTraitSettings):
     backgroundColor = List(trait=Float(min=0.0, max=1.0), default_value=[0.5, 0.5, 0.5],minlen=3,maxlen=3,help="Background color as a list of RGB values").tag(isRGB=True)
     eyetracker =  List(Unicode(), default_value=['None', 'Eyelink'], help="Eyetracker")
     
+    def __init__(self):
+        super().__init__()
+        self.reloadDisplays()
+
     @classmethod
     def load(cls, filename):
         '''
