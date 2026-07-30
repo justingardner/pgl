@@ -10,6 +10,8 @@
 # Import modules
 #############
 from . import _resolution
+from .pglMessages import pglMessages
+from .pglSettings import pglDisplayModeSettings
 
 #############
 # Main class
@@ -72,7 +74,21 @@ class pglResolution:
     ################################################################
     # Set the display resolution
     ################################################################
-    def setResolution(self, whichScreen, screenWidth, screenHeight, screenRefreshRate, screenColorDepth):
+    def setResolutionUsingDisplayModeSettings(self, whichScreen, mode):
+        '''
+        Function which uses a pglDisplayModeSettings structure
+        '''
+        if not isinstance(mode,pglDisplayModeSettings):
+            pglMessages.warning("mode must be a pglDisplayModeSettings object")
+            return
+        
+        # call set resolution
+        self.setResolution(whichScreen, mode.pixelDims[0], mode.pixelDims[1], int(mode.refreshRate[0]))
+    
+    ################################################################
+    # Set the display resolution
+    ################################################################
+    def setResolution(self, whichScreen, screenWidth=None, screenHeight=None, screenRefreshRate=None, screenColorDepth=32, screenResolution=None):
         """
         Set the resolution and display settings for a given screen.
 
@@ -86,6 +102,7 @@ class pglResolution:
             screenHeight (int): Desired screen height in pixels.
             screenRefreshRate (int): Desired refresh rate in Hz.
             screenColorDepth (int): Desired color depth in bits per pixel (e.g., 32 for 32-bit color).
+            screenResolution (tuple): A tuple containing values returned by getResolution. If set, superscedes screenWidth, screenHeight, screenRefreshRate, screenColorDepth
 
         Returns:
             None: The function does not return a value, but it will print the new resolution if successful.
@@ -101,6 +118,16 @@ class pglResolution:
         whichScreen = self.validateWhichScreen(whichScreen)
         if (whichScreen is None): return
 
+        if screenResolution:
+            if isinstance(screenResolution, tuple) and len(screenResolution) == 4:
+                screenWidth = int(screenResolution[0])
+                screenHeight = int(screenResolution[1])
+                screenRefreshRate = int(screenResolution[2])
+                screenColorDepth= int(screenResolution[3])
+            else:
+                pglMessages.warning("screenResolution must be a tuple of length 4 returned by getResolution")
+                return
+                
         # Print what we are doing
         if self.verbose > 1: print(f"(pgl:setResolution) Setting resolution for screen {whichScreen} to {screenWidth}x{screenHeight}, refresh rate {screenRefreshRate}Hz, color depth {screenColorDepth}-bit")
 

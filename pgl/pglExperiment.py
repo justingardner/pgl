@@ -37,9 +37,9 @@ from enum import Enum
 from . import pglTimestamp
 from .pglEyeTracker import pglEyeTracker
 from .pglEyelink import pglEyelink, pglEyelinkData
-from .pglSettings import pglSettingsManager
+from .pglSettings import pglSettingsManager, pglDisplaySettings, pglDisplayModeSettings
 from .pglMessages import pglMessages
-from .pglSettings import pglDisplaySettings
+
 
 #######################
 # for returning stats
@@ -385,104 +385,125 @@ class pglExperiment(pglExperimentBase):
         # get background color
         if backgroundColor == -1:
             backgroundColor = self.settings.backgroundColor
-            
-        # get screen parameters
-        if len(self.settings.displays) < 1:
-            pglMessages.warning(f"Settings {self.settings.name} is not associated with a display")
-            return
-        self.state.display = self.settings.displays[0]
-        if self.state.display.currentDisplayNum == -1:
-            pglMessage.warning("Could not open display {display.name} because it is not connected")
-            return
         
-        # close all other screens
-        self.pgl.cleanUp()
-        
-        # open the screen
-        self.pgl.open(whichScreen=self.state.display.currentDisplayNum-1, backgroundColor=backgroundColor)        
-        if not self.pgl.isOpen():   
-            pglMessages.transientWarning("Failed to open screen.", duration=5)
-            return
-        
-        # set visual angle coordinates
-        self.pgl.visualAngle(self.state.display.displayDistance, self.state.display.displaySize[0], self.state.display.displaySize[1])
-        
-        # flip left-right and/or up-down if specified in settings
-        if self.state.display.flipLeftRight: self.pgl.flipLeftRight()
-        if self.state.display.flipUpDown: self.pgl.flipUpDown()
-        
-        # set the gamma table
-        self.setGamma(self.settings, self.state.display)
-        
-        # add keyboard device if not already loaded
-        keyboardDevices = self.pgl.devicesGet(pglKeyboardMouse)
-        if not keyboardDevices:
-            # nothing loaded, so create it
-            keyboardMouse = pglKeyboardMouse(eatKeys=None)
-            self.pgl.devicesAdd(keyboardMouse)
-            # check if listener is running
-            if not keyboardMouse.isRunning():
-                pglMessages.warning("Accessibility permission not granted for keyboard/mouse access.\n" +
-                                    "On macOS, go to System Preferences -> Security & Privacy -> Privacy -> Accessibility\n" +
-                                    "and add your terminal application (e.g. Terminal, iTerm, etc) to the list of apps allowed to control your computer.\n" +
-                                    "If you are running VS Code and it already has permissions granted, try running directly from a terminal with:\n"+
-                                    "    /Applications/Visual\\ Studio\\ Code.app/Contents/MacOS/Electron")
-                self.endScreen()
+        try:
+            # get screen parameters
+            if len(self.settings.displays) < 1:
+                pglMessages.warning(f"Settings {self.settings.name} is not associated with a display")
                 return
-        else:
-            # if already loaded, just grab it
-            keyboardMouse = keyboardDevices[0]
-            # and if it is not running, start it
-            if not keyboardMouse.isRunning():
-                keyboardMouse.start()
-        
-        # clear the mouse and keyboard queues of any pending events
-        keyboardMouse.clear()
-
-        # keep a pointer to keyboardMouse
-        self.keyboardMouse = keyboardMouse
-        
-        # If response keys is a comma-separated list, split it into a list (this is so you can do "1,space,F1,2"
-        if ',' in self.settings.responseKeys:
-            self.responseKeysList = [k.strip() for k in self.settings.responseKeys.split(',')]
-        else:
-            # if no commas, then just make a list of characters
-            self.responseKeysList = list(self.settings.responseKeys)
+            self.state.display = self.settings.displays[0]
+            if self.state.display.currentDisplayNum == -1:
+                pglMessages.warning("Could not open display {display.name} because it is not connected")
+                return
             
-        # get keyCodes
-        self.state.responseKeyCodesList = [keyboardMouse.charToKeyCode(k) for k in self.responseKeysList]
-        self.state.startKeyCode = keyboardMouse.charToKeyCode(self.settings.startKey)
-        self.state.endKeyCode = keyboardMouse.charToKeyCode(self.settings.endKey)
-        self.state.volumeTriggerKeyCode = keyboardMouse.charToKeyCode(self.settings.volumeTriggerKey)
-        
-        # if eatKeys is set, then compose a list of all keys as keyCodes
-        if self.settings.eatKeys:
-            # Collect all individual keys
-            eatKeyCodes = self.state.responseKeyCodesList.copy()  # Start with response keys list
-    
-            # Add single keys if they exist
-            if self.settings.startKey:
-                eatKeyCodes.append(self.state.startKeyCode)
-            if self.settings.endKey:
-                eatKeyCodes.append(self.state.endKeyCode)
-            if self.settings.volumeTriggerKey:
-                eatKeyCodes.append(self.state.volumeTriggerKeyCode)
-    
-            # Register these as keys to be eaten
-            keyboardMouse.setEatKeys(eatKeyCodes)
+            # close all other screens
+            self.pgl.cleanUp()
             
-        # wait half a second for metal app to initialize
-        self.pgl.waitSecs(0.5)
-        
-        # flush screen to get rid of any transients
-        self.pgl.flush()
-        self.pgl.flush()
-        
-        # mark that we have opened the screen
-        self.state.openScreen = True
+            # set screen resolution if necessary
+            self.state.originalScreenResolution = self.pgl.getResolution(self.state.display.currentDisplayNum-1)
+            
+            # compare to what is desired
+            displayMode = None
+            if self.state.display.displayModes:
+                displayMode = self.state.display.displayModes[0]
+                if displayMode == self.state.originalScreenResolution:
+                    pglMessages.message("Match")
+                else:
+                    self.pgl.setResolutionUsingDisplayModeSettings(self.state.display.currentDisplayNum-1, displayMode)      
+                    self.state.screenResolution = self.pgl.getResolution()
+                    pglMessages.message(f"Changing screen resolution to: {self.state.screenResolution[0]} x {self.state.screenResolution[1]} {self.state.screenResolution[2]}Hz {self.state.screenResolution[3]}bits " +
+                                        f"from: {self.state.originalScreenResolution[0]} x {self.state.originalScreenResolution[1]} {self.state.originalScreenResolution[2]}Hz {self.state.originalScreenResolution[3]}bits")
 
-        # initialize eye tracker
-        self.initEyeTracker()        
+            
+            # open the screen
+            self.pgl.open(whichScreen=self.state.display.currentDisplayNum-1, backgroundColor=backgroundColor)        
+            if not self.pgl.isOpen():   
+                pglMessages.warning("Failed to open screen.", duration=5)
+                return
+            
+            # set visual angle coordinates
+            self.pgl.visualAngle(self.state.display.displayDistance, self.state.display.displaySize[0], self.state.display.displaySize[1])
+            
+            # flip left-right and/or up-down if specified in settings
+            if self.state.display.flipLeftRight: self.pgl.flipLeftRight()
+            if self.state.display.flipUpDown: self.pgl.flipUpDown()
+            
+            # set the gamma table
+            self.setGamma(self.settings, self.state.display)
+            
+            # add keyboard device if not already loaded
+            keyboardDevices = self.pgl.devicesGet(pglKeyboardMouse)
+            if not keyboardDevices:
+                # nothing loaded, so create it
+                keyboardMouse = pglKeyboardMouse(eatKeys=None)
+                self.pgl.devicesAdd(keyboardMouse)
+                # check if listener is running
+                if not keyboardMouse.isRunning():
+                    pglMessages.warning("Accessibility permission not granted for keyboard/mouse access.\n" +
+                                        "On macOS, go to System Preferences -> Security & Privacy -> Privacy -> Accessibility\n" +
+                                        "and add your terminal application (e.g. Terminal, iTerm, etc) to the list of apps allowed to control your computer.\n" +
+                                        "If you are running VS Code and it already has permissions granted, try running directly from a terminal with:\n"+
+                                        "    /Applications/Visual\\ Studio\\ Code.app/Contents/MacOS/Electron")
+                    self.endScreen()
+                    return
+            else:
+                # if already loaded, just grab it
+                keyboardMouse = keyboardDevices[0]
+                # and if it is not running, start it
+                if not keyboardMouse.isRunning():
+                    keyboardMouse.start()
+            
+            # clear the mouse and keyboard queues of any pending events
+            keyboardMouse.clear()
+
+            # keep a pointer to keyboardMouse
+            self.keyboardMouse = keyboardMouse
+            
+            # If response keys is a comma-separated list, split it into a list (this is so you can do "1,space,F1,2"
+            if ',' in self.settings.responseKeys:
+                self.responseKeysList = [k.strip() for k in self.settings.responseKeys.split(',')]
+            else:
+                # if no commas, then just make a list of characters
+                self.responseKeysList = list(self.settings.responseKeys)
+                
+            # get keyCodes
+            self.state.responseKeyCodesList = [keyboardMouse.charToKeyCode(k) for k in self.responseKeysList]
+            self.state.startKeyCode = keyboardMouse.charToKeyCode(self.settings.startKey)
+            self.state.endKeyCode = keyboardMouse.charToKeyCode(self.settings.endKey)
+            self.state.volumeTriggerKeyCode = keyboardMouse.charToKeyCode(self.settings.volumeTriggerKey)
+            
+            # if eatKeys is set, then compose a list of all keys as keyCodes
+            if self.settings.eatKeys:
+                # Collect all individual keys
+                eatKeyCodes = self.state.responseKeyCodesList.copy()  # Start with response keys list
+        
+                # Add single keys if they exist
+                if self.settings.startKey:
+                    eatKeyCodes.append(self.state.startKeyCode)
+                if self.settings.endKey:
+                    eatKeyCodes.append(self.state.endKeyCode)
+                if self.settings.volumeTriggerKey:
+                    eatKeyCodes.append(self.state.volumeTriggerKeyCode)
+        
+                # Register these as keys to be eaten
+                keyboardMouse.setEatKeys(eatKeyCodes)
+                
+            # wait half a second for metal app to initialize
+            self.pgl.waitSecs(0.5)
+            
+            # flush screen to get rid of any transients
+            self.pgl.flush()
+            self.pgl.flush()
+            
+            # mark that we have opened the screen
+            self.state.openScreen = True
+
+            # initialize eye tracker
+            self.initEyeTracker()    
+        except Exception as e:
+            pglMessages.warning(f"Could not open screen. Error {type(e).__name__}: {e}")    
+            self.state.openScreen = False
+            return
 
     def setGamma(self, settings, display):
         '''
@@ -515,25 +536,39 @@ class pglExperiment(pglExperimentBase):
         '''
         Close the screen
         '''
-        # stop the keyboard listener
-        keyboardDevices = self.pgl.devicesGet(pglKeyboardMouse)
-        if keyboardDevices is not []:
-            for keyboardDevice in keyboardDevices:
-                print("(pglExperiment:endScreen) Stopping keyboard/mouse device.")
-                print(keyboardDevice)
-                keyboardDevice.stop()
+        try:
+            # stop the keyboard listener
+            keyboardDevices = self.pgl.devicesGet(pglKeyboardMouse)
+            if keyboardDevices is not []:
+                for keyboardDevice in keyboardDevices:
+                    print("(pglExperiment:endScreen) Stopping keyboard/mouse device.")
+                    print(keyboardDevice)
+                    keyboardDevice.stop()
 
-        if self.settings.closeScreenOnEnd:
-            self.pgl.clearScreen(self.settings.backgroundColor)
-            self.pgl.flush()
-            # reset gamma
-            if self.state.originalGammaTable:
-                self.pgl.message("Restoring gamma table")
-                self.pgl.setGammaTable(self.state.display.currentDisplayNum-1, rgbGammaTable=self.state.originalGammaTable)
-            
-            # close screen
-            self.pgl.close()
-            self.state.openScreen = False
+            if self.settings.closeScreenOnEnd:
+                # clear screen
+                self.pgl.clearScreen(self.settings.backgroundColor)
+                self.pgl.flush()
+                
+                # reset gamma
+                if self.state.originalGammaTable:
+                    self.pgl.message("Restoring gamma table")
+                    self.pgl.setGammaTable(self.state.display.currentDisplayNum-1, rgbGammaTable=self.state.originalGammaTable)
+                    pglMessages.message("Restoring original gamma table")
+                    
+                # reset screen dimensions
+                if self.state.screenResolution:
+                    if self.state.screenResolution != self.state.originalScreenResolution:
+                        self.pgl.setResolution(self.state.display.currentDisplayNum-1, screenResolution=self.state.originalScreenResolution)
+                        pglMessages.message(f"Restoring resolution back to: {self.state.originalScreenResolution[0]} x {self.state.originalScreenResolution[1]} {self.state.originalScreenResolution[2]}Hz {self.state.originalScreenResolution[3]}bits")
+                
+                # close screen
+                self.pgl.close()
+                self.state.openScreen = False
+        except Exception as e:
+            pglMessages.warning(f"Could not close screen. Error {type(e).__name__}: {e}")    
+            return
+                
 
     def eatAllKeys(self, eat=False):
         '''
@@ -1423,6 +1458,8 @@ class pglExperimentState(pglSerialize):
     originalGammaTable: Optional[Tuple[npt.NDArray[np.int_], npt.NDArray[np.int_], npt.NDArray[np.int_]]] = None
     gammaTable: Optional[Tuple[npt.NDArray[np.int_], npt.NDArray[np.int_], npt.NDArray[np.int_]]] = None
     display: Optional[pglDisplaySettings] = None
+    originalScreenResolution: Optional[Tuple[int, int, int, int]] = None
+    screenResolution: Optional[Tuple[int, int, int, int]] = None
 
 ##############################################
 # Settings for pglTask
@@ -1577,7 +1614,7 @@ class pglTaskData(pglSerialize):
         '''
         # get trial timestamps
         trialTimestamps = np.array([e.timestamp for e in self.events if isinstance(e, pglEventTrial)])
-        if len(trialTimestamps) < 2:
+        if len(trialTimestamps) <= 2:
             print("(pglTaskData:display) Insufficient trial events found to display.")
             return
         

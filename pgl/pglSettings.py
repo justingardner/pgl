@@ -646,6 +646,23 @@ class pglDisplayModeSettings(pglTraitSettings):
     pixelDims = Tuple(Int(), Int(), default_value=(0,0), visible=False, help="Pixel dimensions of screen")
     refreshRate = List(Float(), help="Refresh rates supported for this pixel dimension")
 
+    def __eq__(self, other):
+        '''
+        compare to other displayMode or to a tuple which has (pixelWidth, pixelHeight, refreshRate, ...)
+        '''
+        
+        if isinstance(other, pglDisplayModeSettings):
+            return (self.screenWidth, self.screenHeight, self.refresh) == \
+                   (other.screenWidth, other.screenHeight, other.refresh)
+        elif isinstance(other, tuple):
+            if len(other) < 3:
+                return False
+            else:
+                return (self.pixelDims[0], self.pixelDims[1], self.refreshRate) == other[0:3]
+        return NotImplemented
+
+
+
 class pglDisplaySettings(pglTraitSettings):
     name = Unicode("default", help="Names of screen")
     uuid = Unicode("", help="UUID of display", enabled=False)
@@ -755,6 +772,7 @@ class pglDisplaySettings(pglTraitSettings):
         calibration.display(fig=fig)
         
         return True
+    
 
 class pglDisplaySettingsList(pglTraitSettings):
 
