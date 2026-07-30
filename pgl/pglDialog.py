@@ -426,6 +426,7 @@ class _pglTraitsDialog(QDialog):
         keyTraitName = trait.metadata["settingsListKey"]
         hideKey = trait.metadata.get("hideKey", False)
         hideAll = trait.metadata.get("hideAll", False)
+        highlightSelector = trait.metadata.get("highlightSelector", True)
 
         # keep the state, with a key which is used by updateFields to
         # find settings list object which need to be recursed on
@@ -444,6 +445,7 @@ class _pglTraitsDialog(QDialog):
         
         # make the combo box which selects the list
         combo = CenteredComboBox()
+        if highlightSelector: combo.setObjectName("settingsSelector")
         combo.addItems([str(getattr(x, keyTraitName)) for x in current])
 
         # register the combo
