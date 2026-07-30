@@ -418,7 +418,17 @@ class _pglTraitsDialog(QDialog):
             if hasattr(self, "plotCanvas"):
                 self.plotCanvas.setVisible(False)
                 self.plotCanvas.draw()
-                
+        
+        # Updates the selection combo when th keyTrait changes
+        #------------------------------
+        def keyChanged(change):
+            if self._updatingWidget:
+                return
+
+            combo.setItemText(
+                state["list"].index(change["owner"]),
+                str(change["new"])
+            )
         if layout is None:
             layout = self.formLayout
 
@@ -459,6 +469,10 @@ class _pglTraitsDialog(QDialog):
 
         # build the widgets
         if not childNames: buildRows()
+        
+        # observe any changes to keyTraitName, so that we can update the combo
+        for obj in current:
+            obj.observe(keyChanged, names=keyTraitName)
 
         # connect showObject to changes in the index
         combo.currentIndexChanged.connect(showObject)
