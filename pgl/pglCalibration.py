@@ -352,7 +352,7 @@ class pglDisplayCalibration():
         # second number is the actual stimulus duration
         # third number is post-stimulus black
         # fourth number is inter-trial interval 
-        stimulusDurationFrames = [2, 3, 5, 0]
+        stimulusDurationFrames = [2, 3, 8, 0]
 
         # size of patch to draw in the center of the screen (in degrees)
         patchWidth = self.pgl.screenWidth.deg
