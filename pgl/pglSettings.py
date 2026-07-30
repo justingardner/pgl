@@ -828,8 +828,24 @@ class pglSettingsList(pglTraitSettings):
     settingsList = List(Instance(pglSettings), settingsListKey="name", traitDisplayName="Choose settings", help="List of settings")
     buttons = [("Test", "testDisplay")]
 
+    ##########################
+    # test display settings
+    ##########################
     def testDisplay(self):
-        print(self.settingsList[0].print())
+        from pgl import pgl
+        pgl = pgl()
+        from .pglExperiment import pglExperiment, pglTestTask
+        e = pglExperiment(pgl, settings=self.settingsList[0])
+                
+        # initialize task
+        t = pglTestTask(pgl)
+        e.addTask(t)
+        
+        # open screen
+        e.initScreen()
+        
+        # and run
+        e.run()
         
     def __init__(self, settingsList=None):
         super().__init__()
