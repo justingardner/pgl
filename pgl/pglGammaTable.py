@@ -45,7 +45,7 @@ class pglGammaTable:
         else:
             return self._pglGammaTable.getGammaTable(whichScreen)
 
-    def setGammaTable(self, whichScreen, red, green, blue):
+    def setGammaTable(self, whichScreen, redTable=None, greenTable=None, blueTable=None, rgbGammaTable=None, ):
         '''
         Set the gamma table for a given screen.
 
@@ -53,18 +53,28 @@ class pglGammaTable:
             whichScreen (int): Index of the display to query (0 = primary). Must be >= 0 and less
                 than the number of active displays. If set to None, defaults to the screen on which
                 pgl is open and running or, if not running, the primary display.
-            red (numpy.ndarray): Array containing the red gamma values.
-            green (numpy.ndarray): Array containing the green gamma values.
-            blue (numpy.ndarray): Array containing the blue gamma values.
+            rgbGammaTable (Tuple of 3 numpy.ndarray): Sets r, g, b of gamma table, uses same structure
+                as returned from getGammaTable. 
+            redTable (numpy.ndarray): Array containing the red gamma values. If provided, sets red table separately
+                but needs to have greenTable and blueTable also set.
+            greenTable (numpy.ndarray): Same as redTable but for green channel
+            blueTable (numpy.ndarray): Same as redTable but for blue channel
         '''
         whichScreen = self.validateWhichScreen(whichScreen)
         if (whichScreen is None): return
+        
+        if redTable and greenTable and blueTable:
+            rgbGammaTable = (redTable, greenTable, blueTable)
+        else:
+            if not rgbGammaTable:
+                pglMessages.warning("Gamma table should either be rgbGammaTable or redTable/greenTable/blueTable")
+                return
 
         if self._pglGammaTable is None:
             print("(pglGammaTable) ❌ _pglGammaTable not available, cannot setGammaTable.")
             return False
         else:
-            return self._pglGammaTable.setGammaTable(whichScreen, red, green, blue)
+            return self._pglGammaTable.setGammaTable(whichScreen, rgbGammaTable[0], rgbGammaTable[1], rgbGammaTable[2])
 
     def setGammaTableLinear(self, whichScreen):
         '''

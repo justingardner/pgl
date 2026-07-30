@@ -24,7 +24,6 @@ from .pglMessages import pglMessages
 from .pglTimestamp import pglTimestamp
 import time
 
-
 #################################################################
 # Parent class for devices
 #################################################################
@@ -190,10 +189,10 @@ class pglKeyboardMouse(pglDevice):
         super().__init__(deviceType="pglKeyboard")
 
         if not self.checkAccessibilityPermission():
-            print("(pglKeyboardMouse) ❌ This app is not authorized for Accessibility input monitoring. No keyboard events will be detected!!")
-            print("  Go to System Settings → Privacy & Security → Accessibility and add this app.")
-            print("  If you are running VS Code and it already has permissions granted, try running directly from a terminal with:")
-            print("  /Applications/Visual\\ Studio\\ Code.app/Contents/MacOS/Electron")
+            pglMessages.warning("This app is not authorized for Accessibility input monitoring. No keyboard events will be detected!!" +
+                    "  Go to System Settings → Privacy & Security → Accessibility and add this app." +
+                    "  If you are running VS Code and it already has permissions granted, try running directly from a terminal with:" +
+                    "  /Applications/Visual\\ Studio\\ Code.app/Contents/MacOS/Electron")
             return
 
         self.start(eatKeys)
@@ -508,10 +507,10 @@ class pglPynputKeyboard(pglDevice):
         super().__init__(deviceType="pglKeyboard")
 
         if not self.checkAccessibilityPermission():
-            print("(pglKeyboard) ❌ This app is not authorized for Accessibility input monitoring. No keyboard events will be detected!!")
-            print("              Go to System Settings → Privacy & Security → Accessibility and add this app.")
-            print("              If you are running VS Code and it already has permissions granted, try running directly from a terminal with:")
-            print("              /Applications/Visual\\ Studio\\ Code.app/Contents/MacOS/Electron")
+            pglMessages.warning("This app is not authorized for Accessibility input monitoring. No keyboard events will be detected!!" +
+                "              Go to System Settings → Privacy & Security → Accessibility and add this app." +  
+                "              If you are running VS Code and it already has permissions granted, try running directly from a terminal with:" +
+                "              /Applications/Visual\\ Studio\\ Code.app/Contents/MacOS/Electron")
             return
 
         self.start(eatKeys)

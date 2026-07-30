@@ -26,18 +26,20 @@ from traitlets import Float, TraitError, TraitError, observe, Instance, Int, Uni
 from .pglParameter import pglParameter, pglParameterBlock
 from .pglEvent import pglEvent
 from .pglSerialize import pglSerialize
-from typing import List as ListType, Optional
+from typing import List as ListType, Optional, Tuple
 from traitlets import List
 from matplotlib import pyplot as plt
 import matplotlib.patches as patches
 from matplotlib.lines import Line2D
 import numpy as np
+import numpy.typing as npt
 from enum import Enum
 from . import pglTimestamp
 from .pglEyeTracker import pglEyeTracker
 from .pglEyelink import pglEyelink, pglEyelinkData
 from .pglSettings import pglSettingsManager
 from .pglMessages import pglMessages
+from .pglSettings import pglDisplaySettings
 
 #######################
 # for returning stats
@@ -388,8 +390,8 @@ class pglExperiment(pglExperimentBase):
         if len(self.settings.displays) < 1:
             pglMessages.warning(f"Settings {self.settings.name} is not associated with a display")
             return
-        display = self.settings.displays[0]
-        if display.currentDisplayNum == -1:
+        self.state.display = self.settings.displays[0]
+        if self.state.display.currentDisplayNum == -1:
             pglMessage.warning("Could not open display {display.name} because it is not connected")
             return
         
@@ -397,20 +399,20 @@ class pglExperiment(pglExperimentBase):
         self.pgl.cleanUp()
         
         # open the screen
-        self.pgl.open(whichScreen=display.currentDisplayNum-1, backgroundColor=backgroundColor)        
+        self.pgl.open(whichScreen=self.state.display.currentDisplayNum-1, backgroundColor=backgroundColor)        
         if not self.pgl.isOpen():   
             pglMessages.transientWarning("Failed to open screen.", duration=5)
             return
         
         # set visual angle coordinates
-        self.pgl.visualAngle(display.displayDistance,display.displaySize[0],display.displaySize[1])
+        self.pgl.visualAngle(self.state.display.displayDistance, self.state.display.displaySize[0], self.state.display.displaySize[1])
         
         # flip left-right and/or up-down if specified in settings
-        if display.flipLeftRight: self.pgl.flipLeftRight()
-        if display.flipUpDown: self.pgl.flipUpDown()
+        if self.state.display.flipLeftRight: self.pgl.flipLeftRight()
+        if self.state.display.flipUpDown: self.pgl.flipUpDown()
         
         # set the gamma table
-        self.setGamma(self.settings, display)
+        self.setGamma(self.settings, self.state.display)
         
         # add keyboard device if not already loaded
         keyboardDevices = self.pgl.devicesGet(pglKeyboardMouse)
@@ -420,10 +422,11 @@ class pglExperiment(pglExperimentBase):
             self.pgl.devicesAdd(keyboardMouse)
             # check if listener is running
             if not keyboardMouse.isRunning():
-                pglDisplayMessage("<b>(pglExperiment:initScreen)</b> ❌ Accessibility permission not granted for keyboard/mouse access.", useHTML=True)
-                pglDisplayMessage("On macOS, go to System Preferences -> Security & Privacy -> Privacy -> Accessibility, and add your terminal application (e.g. Terminal, iTerm, etc) to the list of apps allowed to control your computer.", useHTML=True)
-                pglDisplayMessage("If you are running VS Code and it already has permissions granted, try running directly from a terminal with:", useHTML=True)
-                pglDisplayMessage("              /Applications/Visual\\ Studio\\ Code.app/Contents/MacOS/Electron", useHTML=True)
+                pglMessages.warning("Accessibility permission not granted for keyboard/mouse access.\n" +
+                                    "On macOS, go to System Preferences -> Security & Privacy -> Privacy -> Accessibility\n" +
+                                    "and add your terminal application (e.g. Terminal, iTerm, etc) to the list of apps allowed to control your computer.\n" +
+                                    "If you are running VS Code and it already has permissions granted, try running directly from a terminal with:\n"+
+                                    "    /Applications/Visual\\ Studio\\ Code.app/Contents/MacOS/Electron")
                 self.endScreen()
                 return
         else:
@@ -498,9 +501,15 @@ class pglExperiment(pglExperimentBase):
             pglMessages.warning("Settings are set to calibrte for gamma {settings.calibrateForGamma} but no calibration found for display {display.name}")
             return
         
+        # save the original gamma table
+        self.state.originalGammaTable = self.pgl.getGammaTable(display.currentDisplayNum-1)
+
         # set the gamma to whatever is at the top of the calibrateForGamma list
         gamma = settings.calibrateForGamma[0]
         display.setGamma(self.pgl, gamma=gamma)
+        
+        # save the gamma table
+        self.state.gammaTable = self.pgl.getGammaTable(display.currentDisplayNum-1)
         
     def endScreen(self):
         '''
@@ -515,6 +524,13 @@ class pglExperiment(pglExperimentBase):
                 keyboardDevice.stop()
 
         if self.settings.closeScreenOnEnd:
+            self.pgl.clearScreen(self.settings.backgroundColor)
+            self.pgl.flush()
+            # reset gamma
+            if self.state.originalGammaTable:
+                self.pgl.message("Restoring gamma table")
+                self.pgl.setGammaTable(self.state.display.currentDisplayNum-1, rgbGammaTable=self.state.originalGammaTable)
+            
             # close screen
             self.pgl.close()
             self.state.openScreen = False
@@ -1404,6 +1420,9 @@ class pglExperimentState(pglSerialize):
     startKeyCode: int = 0
     endKeyCode: int = 0
     volumeTriggerKeyCode: int = 0
+    originalGammaTable: Optional[Tuple[npt.NDArray[np.int_], npt.NDArray[np.int_], npt.NDArray[np.int_]]] = None
+    gammaTable: Optional[Tuple[npt.NDArray[np.int_], npt.NDArray[np.int_], npt.NDArray[np.int_]]] = None
+    display: Optional[pglDisplaySettings] = None
 
 ##############################################
 # Settings for pglTask

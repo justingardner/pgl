@@ -1670,6 +1670,6 @@ class pglDisplayLuminanceCalibrationData(HasTraits, pglSerialize):
             return
 
         # set the gamma table
-        pgl.setGammaTable(display.currentDisplayNum, inverseGammaTable[0], inverseGammaTable[1], inverseGammaTable[2])
+        pgl.setGammaTable(display.currentDisplayNum-1, rgbGammaTable=inverseGammaTable)
         
         
