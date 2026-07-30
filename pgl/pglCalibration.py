@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 from ._pglComm import pglSerial
 from .pglBase import printHeader
 from .pglSettings import pglSettings, pglDisplaySettings, pglSettingsManager
-from traitlets import Unicode, Int, Instance, Dict, Tuple, Float
+from traitlets import Unicode, Int, Instance, Dict, Tuple, Float, List
 from datetime import datetime
 from .pglExperiment import pglExperiment
 from tqdm.notebook import tqdm
@@ -331,11 +331,14 @@ class pglDisplayCalibration():
             pglMessages.warning(f"Warning: Could not get display info: {ex}")
 
         # run internal function to calibrate the temporal
-        self.temporalCalibrationData.analogTraceData = self._calibrateTemporal()
+        self._calibrateTemporal()
         
         # and save
         self.temporalCalibrationData.save()
         
+        # fit onset
+        self.temporalCalibrationData.computeFrameOnsetDelay()
+
         # plot data
         self.temporalCalibrationData.display()
 
@@ -428,71 +431,12 @@ class pglDisplayCalibration():
         # close full screen
         #pgl.fullScreen(False)
 
-        # return data
-        return(analogTraceData)
-    
-    def computeFrameOnsetDelay(self):
-        # try to compute onset time
-        cycleData = f['cycleData']
-        # calculate standard deviation around 0 for end of data
-        baseline = np.mean(data[1,-2500:])
-        baselineSTD = np.std(data[1,-2500:])
-        # now see when the median trace goes 2 std above the baseline
-        onset = np.argmax(cycleData['median']>baseline+baselineSTD*2)
-
-        # let's refine the search for the onset, by fitting a linear
-        # finction and finding the intersection with baseline
-
-        # let's refine the search for the onset, by fitting a linear
-        # finction and finding the intersection with baseline
-        print(f"baseline: {baseline} baselineSTD: {baselineSTD}")
-        cycle = cycleData['median'][0]
-
-        # set the thresholds for where we will do the linear fit.
-        leftThreshold = baseline + baselineSTD * 1.5
-        rightThreshold = baseline + baselineSTD * 20
-
-        # Search backwards from onset
-        leftIndex = onset
-        while leftIndex > 0 and cycle[leftIndex] > leftThreshold:
-            leftIndex -= 1
-
-        # Find right point
-        rightIndex = onset
-        while rightIndex < len(cycle) - 1 and cycle[rightIndex] < rightThreshold:
-            rightIndex += 1
-
-        leftIndex = onset-2
-        rightIndex = onset+2
-        # Make sure we have enough points to fit
-        if rightIndex - leftIndex < 3:
-            print("Warning: fitting window too small, using fallback")
-        else:
-            # Fit linear function over this adaptive window
-            xFit = np.arange(leftIndex, rightIndex + 1)
-            yFit = cycle[leftIndex:rightIndex + 1]
+        # save data
+        self.temporalCalibrationData.frameRate = frameRate
+        self.temporalCalibrationData.numRepeats = numRepeats
+        self.temporalCalibrationData.stimulusDurationFrames = stimulusDurationFrames
+        self.temporalCalibrationData.analogTraceData = analogTraceData
             
-            coeffs = np.polyfit(xFit, yFit, 1)
-            m, c = coeffs
-            
-            # Find intercept with baseline
-            if m != 0:
-                onset = (baseline - c) / m
-            
-        print(onset)
-        times = [onset + 1000*i/frameRate for i in range(stimulusDurationFrames[1]+1)]
-        [plt.axvline(x=t, color='red', linestyle='--') for t in times]
-
-        plt.ion()
-        plt.figure(figsize=(14,7))
-        plt.plot(cycle, 'k-', label='Median trace', linewidth=1.5)
-        plt.axvline(x=58, color='r', linestyle='--', linewidth=2)
-        plt.axvline(x=onset, color='g', linestyle='--', linewidth=2)
-        xLineExtended = np.array([onset, rightIndex])
-        yLineExtended = m * xLineExtended + c
-        plt.plot(xLineExtended, yLineExtended, 'b-', linewidth=2.5, label='Fitted line', alpha=0.8)
-        plt.xlim(45, 275)
-        
     def calibrateLuminance(self, settingsName, nRepeats=4, nSteps=256, runValidation=True, runGammaValidation=True):
         '''
         User faceing function which runs the luminance calibration process. It will get a luminance calibration
@@ -1093,6 +1037,10 @@ class pglDisplayTemporalCalibrationData(HasTraits, pglSerialize):
     analogTraceData = Instance(pglAnalogTraceData, allow_none=True, default_value=None, help="analong measurement from photodiode")
     syncChannel = Int(1, help="Channel with sync pulse on it")     
     syncChannelThreshold = Float(0.2, help="Threshold for considering sync to be active")
+    stimulusDurationFrames = List(Int, help="Frames used for each part of stimulus: first number is pre-stimulus black, second number is the actual stimulus duration, third number is post-stimulus black, fourth number is inter-trial interval ")    
+    numRepeats = Int(help="Number of repeats of stimulus")
+    frameRate = Float(help="Frame rate of display")
+    onsetDelay = Float(allow_none=True, default_value=None, help="delay to frame onset, computed from calibration data")
     
     def display(self, fig=None):
         '''
@@ -1107,7 +1055,8 @@ class pglDisplayTemporalCalibrationData(HasTraits, pglSerialize):
         
         # display the analog traces        
         self.analogTraceData.display(fig=fig, digitalSyncChannel=self.syncChannel, digitalSyncThreshold=self.syncChannelThreshold, ignoreInitial=0)
-
+        self.displayOnset()
+        
     def save(self, filename=None, filepath=None):
         '''
         save
@@ -1154,13 +1103,103 @@ class pglDisplayTemporalCalibrationData(HasTraits, pglSerialize):
         '''
         Get the display name associated with this data
         '''
-        return self.displayInfo.get("DisplayName",self.settingsName)
+        return self.displaySettings.name
     
     def getUUID(self):
         '''
         Get the UUID associated with this data
         '''
-        return self.metalInfo.get("display.uuid","Unknown")
+        return self.displaySettings.uuid
+    
+    def displayOnset(self):
+        # draw vertical lines for onset and offset of video frames
+        if self.onsetDelay is not None:
+            times = [self.onsetDelay + 1000*i/self.frameRate for i in range(self.stimulusDurationFrames[1]+1)]
+            [plt.axvline(x=t, color='red', linestyle='--') for t in times]
+
+    def computeFrameOnsetDelay(self):
+        '''
+        Use saved analogTraceData to estimate frame onset time
+        
+        '''
+        if self.analogTraceData is None:
+            pglMessages.message("No analog data recorded to computeFrameOnsetDelay from. Run temporal calibration first")
+            return
+        
+        # chanel which has data on it
+        dataChannel = 0 if self.syncChannel == 1 else 1
+        # get the cycleData
+        cycleData = self.analogTraceData.getCycles(digitalSyncChannel=self.syncChannel, digitalSyncThreshold=self.syncChannelThreshold, ignoreInitial=0)
+        
+        # get mask for last 250 ms of data
+        maxTime = np.max(self.analogTraceData.time)
+        mask = self.analogTraceData.time >= (maxTime-0.25)
+        #print(self.analogTraceData.data[dataChannel].size)
+        #print(mask.size)
+        baseline = np.mean(self.analogTraceData.data[mask][dataChannel])
+        baselineSTD = np.std(self.analogTraceData.data[mask][dataChannel])
+        
+        # calculate standard deviation around 0 for beginning of cycleData
+        #baseline = np.mean(cycleData['median'][dataChannel][mask])
+        #baselineSTD = np.std(cycleData['median'][dataChannel][mask])
+        
+        # now see when the median trace goes 2 std above the baseline
+        onset = np.argmax(cycleData['median'][dataChannel]>(baseline+baselineSTD*6))
+        print(f"baseline: {baseline} baselineSTD: {baselineSTD}")
+        print(f"onset: {onset}")
+        
+        # let's refine the search for the onset, by fitting a linear
+        # finction and finding the intersection with baseline
+
+        # let's refine the search for the onset, by fitting a linear
+        # finction and finding the intersection with baseline
+        cycle = cycleData['median'][dataChannel]
+        minCycle = np.min(cycle)
+        maxCycle = np.max(cycle)
+
+        # set the thresholds for where we will do the linear fit.
+        leftThreshold = baseline + baselineSTD * 1.5
+        rightThreshold = baseline + baselineSTD * 20
+
+        # Search backwards from onset
+        leftIndex = onset
+        while leftIndex > 0 and cycle[leftIndex] > leftThreshold:
+            leftIndex -= 1
+
+        # Find right point
+        rightIndex = onset
+        while rightIndex < len(cycle) - 1 and cycle[rightIndex] < rightThreshold:
+            rightIndex += 1
+
+        leftIndex = onset-2
+        rightIndex = onset+2
+        # Make sure we have enough points to fit
+        if rightIndex - leftIndex < 3:
+            print("Warning: fitting window too small, using fallback")
+        else:
+            # Fit linear function over this adaptive window
+            xFit = np.arange(leftIndex, rightIndex + 1)
+            yFit = cycle[leftIndex:rightIndex + 1]
+            print(f"xFit: {xFit}")
+            print(f"yFit: {yFit}")
+            coeffs = np.polyfit(xFit, yFit, 1)
+            m, c = coeffs
+            
+            # Find intercept with 20% to max from baseline
+            target = baseline + 0.20 * (maxCycle-minCycle)
+            if m != 0:
+                onset = (target - c) / m
+        plt.ion()
+        plt.figure(figsize=(14,7))
+        plt.plot(cycle, 'k-', label='Median trace', linewidth=1.5)
+        plt.axvline(x=58, color='r', linestyle='--', linewidth=2)
+        plt.axvline(x=onset, color='g', linestyle='--', linewidth=2)
+        xLineExtended = np.array([onset, rightIndex])
+        yLineExtended = m * xLineExtended + c
+        plt.plot(xLineExtended, yLineExtended, 'b-', linewidth=2.5, label='Fitted line', alpha=0.8)
+        plt.xlim(onset-10,onset+10)
+    
+        self.onsetDelay = onset
 
         
 # Calibration settings, subclass of pglSettings to inherit load/save functionality
