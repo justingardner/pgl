@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
     QSlider, QPushButton, QWidget, QScrollArea, QDialogButtonBox, QAbstractSpinBox,
     QStylePainter, QStyleOptionComboBox, QStyle
 )
-from PySide6.QtCore import Qt, QCoreApplication
+from PySide6.QtCore import Qt, QCoreApplication, QTimer
 from traitlets import (
     HasTraits, Float, Int, List, Unicode, Bool, Tuple, TraitType
 )
@@ -186,8 +186,13 @@ class _pglTraitsDialog(QDialog):
         for label, callbackName in getattr(self.settings, "buttons", []):
             button = QPushButton(label)
             callback = getattr(self.settings, callbackName)
+            def makeWrappedCallback(callback):
+                def wrapped():
+                    callback()
+                    QTimer.singleShot(750, self.raiseAndActivate)
+                return wrapped
 
-            button.clicked.connect(callback)
+            button.clicked.connect(makeWrappedCallback(callback))
             customButtonBox.addButton(button, QDialogButtonBox.ActionRole)
             
         mainLayout = QVBoxLayout(self)
@@ -226,6 +231,8 @@ class _pglTraitsDialog(QDialog):
         desiredHeight = formHeight + buttonHeight + extra
 
         self.resize(680, min(desiredHeight, maxDialogHeight))
+        self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
+        self.show()
     def _getOrderedTraits(self, obj=None):
         """Return traits in class definition order (like getOrderedTraits)."""
         if obj is None:
@@ -1193,6 +1200,11 @@ class _pglTraitsDialog(QDialog):
         h.addWidget(plusBig)
 
         return row
+
+    def raiseAndActivate(self):
+        self.show()
+        self.raise_()
+        self.activateWindow()
 
 #####################################################################
 # Helper class uses by settingsList which retargets fields
