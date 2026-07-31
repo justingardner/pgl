@@ -3,7 +3,7 @@
 ## Setup
 
 ```bash
-git clone http://github.com/justingardner.git/pgl pgl
+git clone https://github.com/justingardner/pgl.git pgl
 cd pgl
 pip install -e .
 ```
