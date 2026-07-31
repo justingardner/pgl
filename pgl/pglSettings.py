@@ -541,7 +541,7 @@ class pglSettingsManager:
         
         # update displays
         if displaySettings is not None:
-            settings.reloadDisplays(selected=displaySettings)
+            settings.reloadDisplays(selected=displaySettings, overwrite=True)
 
         return(settings)
 
@@ -803,6 +803,11 @@ class pglDisplaySettingsList(pglTraitSettings):
             
             # and run
             e.run()
+            
+            # print settings
+            self.settingsList[0].print()
+            self.settingsList[0].displayModes[0].print()
+
         except Exception as e:
             pglMessages.warning(f"Could not run test. Error {type(e).__name__}: {e}")    
             return
@@ -870,9 +875,14 @@ class pglSettings(pglTraitSettings):
         return pglSettingsManager.getSettingsDir() / f"{pglBase.makeValidFilename(self.name)}.json"
 
     
-    def reloadDisplays(self, selected=None):
+    def reloadDisplays(self, selected=None, overwrite=False):
         '''
         reload the displays so we have the most up-to-date display settings to choose from
+        
+        Args:
+            Selected (pglDisplaySettings): If set, puts the selected display on top of the dispaly list
+            overwrite (Bool): If True, uses the selected and updates only the currentDispalyNum from loaded
+                used for pgl.displaySettings button callback (which doesn't update from saved)
         '''
 
         # load all the display settings
@@ -893,7 +903,14 @@ class pglSettings(pglTraitSettings):
             if selected in displays:
                 # get the currentDisplayNum
                 selectedMatch = displays.pop(displays.index(selected))
-                selected.currentDisplayNum = selectedMatch.currentDisplayNum
+                # if overwrite then just copy currentDisplayNum
+                if overwrite:
+                    selected.currentDisplayNum = selectedMatch.currentDisplayNum
+                else:
+                    # if not overwrite, then get the latest version of the display
+                    # which loads from disk and updates selectf ields like currentDisplayNum
+                    # from current settings
+                    selected = selectedMatch
                 displays.insert(0, selected)
             else:
                 displays.insert(0, selected)
@@ -930,6 +947,11 @@ class pglSettingsList(pglTraitSettings):
             
             # and run
             e.run()
+            
+            # print settings
+            self.settingsList[0].print()
+            self.settingsList[0].displays[0].print()
+            self.settingsList[0].displays[0].displayModes[0].print()
         except Exception as e:
             pglMessages.warning(f"Could not run test. Error {type(e).__name__}: {e}")    
             return

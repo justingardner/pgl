@@ -946,7 +946,6 @@ class _pglTraitsDialog(QDialog):
         """Push a widget change into the settings copy."""
         try:
             setattr(settingsObject, traitName, value)
-            print(f"_commit: {traitName} -> {value} on {getattr(settingsObject, '_target', settingsObject)}")
         except Exception as e:
             # keep the dialog alive on a bad value
             print(f"(pglTraitsDialog:_commit) Could not set {traitName}: {e}")
