@@ -2,11 +2,18 @@
 
 ## Setup
 
+git clone http://github.com/justingardner.git/pgl pgl
+cd pgl
+pip install -e .
+
 ### Install Conda Environment
 
 ```bash
 conda env create -f pgl.yml
 ```
+
+
+
 
 ### Keyboard and mouse events
 
