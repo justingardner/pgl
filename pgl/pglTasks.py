@@ -254,6 +254,11 @@ class pglTestTask(pglTask):
             self.pgl.text(f"{minutes:02d}:{seconds:02d}",xAlign=1)
             if self.responseText != "":
                 self.pgl.text(self.responseText,xAlign=1)
+            # add some more info about experiemnt
+            if self.e.state.display.luminanceCalibration:
+                self.pgl.text(f"gamma: {self.e.settings.calibrateForGamma[0]}", line=-1, xAlign=-1)
+            else:
+                self.pgl.text(f"No luminance calibration", line=-1, xAlign=-1)
     
     def handleSubjectResponse(self, response, updateTime):
         self.responseText = f"Subject response received: {response} at {updateTime - self.e.data.startTime:.2f} seconds"

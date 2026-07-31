@@ -12,10 +12,10 @@ from .pglKeyboardMouse import pglKeyboardMouse, pglEventKeyboard, pglKeyBuffer
 from .pglEvent import pglEvent, pglEvents
 from .pglCommandReplayer import pglCommandReplayer
 from .pglFrameGrab import pglFrameGrab
-from .pglExperiment import pglExperiment, pglTask, pglTestTask, pglExperimentAnalysis
+from .pglExperiment import pglExperiment, pglTask, pglExperimentAnalysis
 from .pglParameter import pglParameter, pglParameterBlock, pglParameterNestedBlock, pglParameterBatch
 from .pglStaircase import pglStaircase, pglStaircaseUpDown
-from .pglTasks import pglFixationTaskLeftRight, pglBarTask
+from .pglTasks import pglFixationTaskLeftRight, pglBarTask, pglTestTask
 from ._pglComm import pglSerial
 from .pglCalibration import pglDisplayCalibration, pglLuminanceCalibrationDeviceMinolta, pglDisplayLuminanceCalibrationData, pglLuminanceCalibrationDeviceDebug
 from .pglGammaTable import pglGammaTable 

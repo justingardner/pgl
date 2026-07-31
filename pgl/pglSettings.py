@@ -530,17 +530,19 @@ class pglSettingsManager:
                 settings = pglSettings.load(filename=settingsPath)
         else:
             settings = pglSettings()
-            
+
+        # validate displaySettings / displayName
         if displaySettings is not None:
-            if not isinstance(settings, pglSettings):
+            if not isinstance(displaySettings, pglDisplaySettings):
                 pglMessages.warning("Display settings must be pgDisplaylSettings")
                 return
         elif displayName is not None:
             displaySettings = cls.getDisplaySettings(displayName)
         
+        # update displays
         if displaySettings is not None:
             settings.reloadDisplays(selected=displaySettings)
-         
+
         return(settings)
 
 ##################################################
@@ -664,8 +666,6 @@ class pglDisplayModeSettings(pglTraitSettings):
                 return (self.pixelDims[0], self.pixelDims[1], self.refreshRate) == other[0:3]
         return NotImplemented
 
-
-
 class pglDisplaySettings(pglTraitSettings):
     name = Unicode("default", help="Names of screen")
     uuid = Unicode("", help="UUID of display", enabled=False)
@@ -786,20 +786,27 @@ class pglDisplaySettingsList(pglTraitSettings):
     # test display settings
     ##########################
     def testDisplay(self):
-        from pgl import pgl
-        pgl = pgl()
-        from .pglExperiment import pglExperiment, pglTestTask
-        e = pglExperiment(pgl, displaySettings=self.settingsList[0])
-                
-        # initialize task
-        t = pglTestTask(pgl)
-        e.addTask(t)
-        
-        # open screen
-        e.initScreen()
-        
-        # and run
-        e.run()
+        try:
+            from pgl import pgl
+            pgl = pgl()
+            from .pglExperiment import pglExperiment
+            from .pglTasks import pglTestTask
+
+            e = pglExperiment(pgl, displaySettings=self.settingsList[0])
+
+            # initialize task
+            t = pglTestTask(pgl)
+            e.addTask(t)
+            
+            # open screen
+            e.initScreen()
+            
+            # and run
+            e.run()
+        except Exception as e:
+            pglMessages.warning(f"Could not run test. Error {type(e).__name__}: {e}")    
+            return
+
         
     def __init__(self, settingsList=None):
         super().__init__()
@@ -884,7 +891,9 @@ class pglSettings(pglTraitSettings):
         # matches one of the newly loaded displays
         if displays:
             if selected in displays:
-                displays.pop(displays.index(selected))
+                # get the currentDisplayNum
+                selectedMatch = displays.pop(displays.index(selected))
+                selected.currentDisplayNum = selectedMatch.currentDisplayNum
                 displays.insert(0, selected)
             else:
                 displays.insert(0, selected)
@@ -905,20 +914,25 @@ class pglSettingsList(pglTraitSettings):
     # test display settings
     ##########################
     def testDisplay(self):
-        from pgl import pgl
-        pgl = pgl()
-        from .pglExperiment import pglExperiment, pglTestTask
-        e = pglExperiment(pgl, settings=self.settingsList[0])
-                
-        # initialize task
-        t = pglTestTask(pgl)
-        e.addTask(t)
-        
-        # open screen
-        e.initScreen()
-        
-        # and run
-        e.run()
+        try:
+            from pgl import pgl
+            pgl = pgl()
+            from .pglExperiment import pglExperiment
+            from .pglTasks import pglTestTask
+            e = pglExperiment(pgl, settings=self.settingsList[0])
+                    
+            # initialize task
+            t = pglTestTask(pgl)
+            e.addTask(t)
+            
+            # open screen
+            e.initScreen()
+            
+            # and run
+            e.run()
+        except Exception as e:
+            pglMessages.warning(f"Could not run test. Error {type(e).__name__}: {e}")    
+            return
         
     def __init__(self, settingsList=None):
         super().__init__()

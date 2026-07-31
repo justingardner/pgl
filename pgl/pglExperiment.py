@@ -420,6 +420,7 @@ class pglExperiment(pglExperimentBase):
                     pglMessages.message(f"Changing screen resolution to: {self.state.screenResolution[0]} x {self.state.screenResolution[1]} {self.state.screenResolution[2]}Hz {self.state.screenResolution[3]}bits " +
                                         f"from: {self.state.originalScreenResolution[0]} x {self.state.originalScreenResolution[1]} {self.state.originalScreenResolution[2]}Hz {self.state.originalScreenResolution[3]}bits")
             
+
             # open the screen
             self.pgl.open(whichScreen=self.state.display.currentDisplayNum, backgroundColor=backgroundColor)        
             if not self.pgl.isOpen():   
@@ -428,7 +429,7 @@ class pglExperiment(pglExperimentBase):
             
             # set visual angle coordinates
             self.pgl.visualAngle(self.state.display.displayDistance, self.state.display.displaySize[0], self.state.display.displaySize[1])
-            
+
             # flip left-right and/or up-down if specified in settings
             if self.state.display.flipLeftRight: self.pgl.flipLeftRight()
             if self.state.display.flipUpDown: self.pgl.flipUpDown()
@@ -1291,32 +1292,6 @@ class pglTask:
                 print(f"Trial {iTrial+1} at {trialStart:.2f}s: " + ', '.join(f"{key}={value}" for key, value in params.items()))
             else:
                 print(f"Trial {iTrial+1} at {trialStart:.2f}s (vol={trialVolume}): " + ', '.join(f"{key}={value}" for key, value in params.items()))
-
-##############################################
-# test task for testing settings
-##############################################
-class pglTestTask(pglTask):
-    responseText = ""
-    def updateScreen(self):
-        # put upt the bulls eye
-        self.pgl.bullseye()
-        # display how to end
-        self.pgl.text("Press 'ESC' to quit",xAlign=1)
-        # and text for what trial we are on 
-        # This will just update every trial
-        self.pgl.text(f"Trial {self.state.currentTrial+1}",xAlign=1)
-        if self.e is not None:
-            self.pgl.text(f"Volume {self.e.state.volumeNumber}",xAlign=1)
-            elapsed = self.pgl.getSecs() - self.e.data.startTime
-            minutes = int(elapsed // 60)
-            seconds = int(elapsed % 60)
-            self.pgl.text(f"{minutes:02d}:{seconds:02d}",xAlign=1)
-            if self.responseText != "":
-                self.pgl.text(self.responseText,xAlign=1)
-    
-    def handleSubjectResponse(self, response, updateTime):
-        self.responseText = f"Subject response received: {response} at {updateTime - self.e.data.startTime:.2f} seconds"
-
 
 ##############################################
 # Settings for pglExperiment

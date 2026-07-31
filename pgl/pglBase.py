@@ -26,6 +26,7 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from .pglSerialize import pglSerialize
 import re
+from .pglMessages import pglMessages
 
 #############
 # Main class
@@ -935,7 +936,7 @@ class pglBase:
         # Validate whichScreen
         numDisplays, _ = self.getNumDisplaysAndDefault()
         if whichScreen < 0 or whichScreen >= numDisplays:
-            print(f"(pgl:validateWhichScreen) Error: Invalid screen number {whichScreen}. Must be between 0 and {numDisplays-1}.")
+            pglMessages.warning(f"Error: Invalid screen number {whichScreen}. Must be between 0 and {numDisplays-1}.")
             return None
         
         return whichScreen
