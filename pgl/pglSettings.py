@@ -513,7 +513,7 @@ class pglSettingsManager:
         """
         if settings is not None:
             if not isinstance(settings, pglSettings):
-                pglMessages.warning("Settings must be pglSettings", level=2)
+                pglMessages.warning("Settings must be pglSettings")
                 return
         elif settingsName is not None:
             # get the settings directory and create the full path to the settings file
@@ -523,7 +523,7 @@ class pglSettingsManager:
         
             # see if the file exists
             if not settingsPath.exists():
-                pglMessages.warning(f"Settings file '{settingsPath}' not found.", level=2)
+                pglMessages.warning(f"Settings file '{settingsPath}' not found.")
                 return None
             else:
                 pglMessages.message(f"Loading settings from '{settingsPath}'.")
@@ -533,7 +533,7 @@ class pglSettingsManager:
             
         if displaySettings is not None:
             if not isinstance(settings, pglSettings):
-                pglMessages.warning("Display settings must be pgDisplaylSettings", level=2)
+                pglMessages.warning("Display settings must be pgDisplaylSettings")
                 return
         elif displayName is not None:
             displaySettings = cls.getDisplaySettings(displayName)
@@ -884,13 +884,15 @@ class pglSettings(pglTraitSettings):
         # matches one of the newly loaded displays
         if displays:
             if selected in displays:
-                displays.insert(0, displays.pop(displays.index(selected)))
+                displays.pop(displays.index(selected))
+                displays.insert(0, selected)
             else:
                 displays.insert(0, selected)
             self.displays = displays
         else:
             if selected in self.displays:
-                self.displays.insert(0, self.displays.pop(self.displays.index(selected)))
+                self.displays.pop(self.displays.index(selected))
+                self.displays.insert(0, selected)
             else:
                 self.displays.insert(0, selected)
         

@@ -189,6 +189,7 @@ class _pglTraitsDialog(QDialog):
             def makeWrappedCallback(callback):
                 def wrapped():
                     callback()
+                    # raise the gui back up after we have run the callback
                     QTimer.singleShot(750, self.raiseAndActivate)
                 return wrapped
 
@@ -231,8 +232,11 @@ class _pglTraitsDialog(QDialog):
         desiredHeight = formHeight + buttonHeight + extra
 
         self.resize(680, min(desiredHeight, maxDialogHeight))
+        
+        # give hint for window to stay on top
         self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
         self.show()
+        
     def _getOrderedTraits(self, obj=None):
         """Return traits in class definition order (like getOrderedTraits)."""
         if obj is None:
@@ -942,6 +946,7 @@ class _pglTraitsDialog(QDialog):
         """Push a widget change into the settings copy."""
         try:
             setattr(settingsObject, traitName, value)
+            print(f"_commit: {traitName} -> {value} on {getattr(settingsObject, '_target', settingsObject)}")
         except Exception as e:
             # keep the dialog alive on a bad value
             print(f"(pglTraitsDialog:_commit) Could not set {traitName}: {e}")

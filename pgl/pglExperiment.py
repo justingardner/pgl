@@ -340,33 +340,39 @@ class pglExperiment(pglExperimentBase):
                 behave in a similar fashion
             subjectID (str): The identifier for the subject participating in the experiment.
         '''
-        # init super
-        super().__init__()
+        try:
+            # init super
+            super().__init__()
 
-        if pgl is None:
-            # If pgl is none, then this is a load
-            if experimentName == "":
-                print(f"(pglExperiment) No exerimentName provided for loading experiment data")
+            if pgl is None:
+                # If pgl is none, then this is a load
+                if experimentName == "":
+                    print(f"(pglExperiment) No exerimentName provided for loading experiment data")
+                    return
+                # load the experimentName
+                self.load(experimentName=experimentName, subjectID=subjectID)
                 return
-            # load the experimentName
-            self.load(experimentName=experimentName, subjectID=subjectID)
+            else:
+                # save pgl
+                self.pgl = pgl
+
+            # load settings
+            self.settings = pgl.getSettings(settingsName=settingsName, settings=settings, displaySettings=displaySettings, displayName=displayName)
+
+            # initialize experiment state and data
+            self.state = pglExperimentState()
+            self.data = pglExperimentData()
+            
+            # get experiment settings
+            self.experimentSettings = pglExperimentSettings()
+            if experimentName != "":
+                self.experimentSettings.experimentName = experimentName
+            self.experimentSettings.subjectID = subjectID
+
+        except Exception as e:
+            pglMessages.warning(f"Could not initialize experiment. Error {type(e).__name__}: {e}")    
             return
-        else:
-            # save pgl
-            self.pgl = pgl
 
-        # load settings
-        self.settings = pgl.getSettings(settingsName=settingsName, settings=settings, displaySettings=displaySettings, displayName=displayName)
-
-        # initialize experiment state and data
-        self.state = pglExperimentState()
-        self.data = pglExperimentData()
-        
-        # get experiment settings
-        self.experimentSettings = pglExperimentSettings()
-        if experimentName != "":
-            self.experimentSettings.experimentName = experimentName
-        self.experimentSettings.subjectID = subjectID
         
     def __repr__(self):
         return f"<pglExperiment: {len(self.task)} phases>"
@@ -378,7 +384,7 @@ class pglExperiment(pglExperimentBase):
         
         Args:
             backgroundColor: The background color as a list of RGB values, each between 0 and 1. If omitted, will use the color from settings.
-        '''        
+        '''    
         if self.settings is None:
             print("(pglExperiment:initScreen) No settings found to open screen.")
             return
@@ -395,13 +401,13 @@ class pglExperiment(pglExperimentBase):
             if self.state.display.currentDisplayNum == -1:
                 pglMessages.warning(f"Could not open display {self.state.display.name} because it is not connected")
                 return
-            
+        
             # close all other screens
             self.pgl.cleanUp()
             
             # set screen resolution if necessary
             self.state.originalScreenResolution = self.pgl.getResolution(self.state.display.currentDisplayNum)
-            
+
             # compare to what is desired
             displayMode = None
             if self.state.display.displayModes:
@@ -413,7 +419,6 @@ class pglExperiment(pglExperimentBase):
                     self.state.screenResolution = self.pgl.getResolution()
                     pglMessages.message(f"Changing screen resolution to: {self.state.screenResolution[0]} x {self.state.screenResolution[1]} {self.state.screenResolution[2]}Hz {self.state.screenResolution[3]}bits " +
                                         f"from: {self.state.originalScreenResolution[0]} x {self.state.originalScreenResolution[1]} {self.state.originalScreenResolution[2]}Hz {self.state.originalScreenResolution[3]}bits")
-
             
             # open the screen
             self.pgl.open(whichScreen=self.state.display.currentDisplayNum, backgroundColor=backgroundColor)        
