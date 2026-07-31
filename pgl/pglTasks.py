@@ -233,3 +233,29 @@ class pglBarTask(pglTask):
         # return frames
         return frames, xDeg, yDeg, timeStamps
     
+##############################################
+# test task for testing settings
+##############################################
+class pglTestTask(pglTask):
+    responseText = ""
+    def updateScreen(self):
+        # put upt the bulls eye
+        self.pgl.bullseye()
+        # display how to end
+        self.pgl.text("Press 'ESC' to quit",xAlign=1)
+        # and text for what trial we are on 
+        # This will just update every trial
+        self.pgl.text(f"Trial {self.state.currentTrial+1}",xAlign=1)
+        if self.e is not None:
+            self.pgl.text(f"Volume {self.e.state.volumeNumber}",xAlign=1)
+            elapsed = self.pgl.getSecs() - self.e.data.startTime
+            minutes = int(elapsed // 60)
+            seconds = int(elapsed % 60)
+            self.pgl.text(f"{minutes:02d}:{seconds:02d}",xAlign=1)
+            if self.responseText != "":
+                self.pgl.text(self.responseText,xAlign=1)
+    
+    def handleSubjectResponse(self, response, updateTime):
+        self.responseText = f"Subject response received: {response} at {updateTime - self.e.data.startTime:.2f} seconds"
+
+
