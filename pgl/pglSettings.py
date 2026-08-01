@@ -618,12 +618,22 @@ class pglSettingsManager:
                     settings.save()
                     settingsList = [settings]
                 else:
+                    # count the number of settings that have isDefault set
+                    nDefaultSettings = sum(1 for s in settingsList if s.isDefault)
                     # find the default settings
                     defaultSettings = next((s for s in settingsList if s.isDefault), None)
                     if defaultSettings is not None:
                         settings = defaultSettings
                         # put it on top of list
                         settingsList.insert(0, settingsList.pop(settingsList.index(defaultSettings)))
+                        # if there is more than one, then warn user and reset them
+                        if nDefaultSettings > 1:
+                            pglMessages.warning(f"Found {nDefaultSettings} set to default, keeping only first one")
+                            for s in settingsList[1:]:
+                                if s.isDefault:
+                                    s.isDefault = False
+                                    # save changes
+                                    s.save()
                     else:
                         # no default, set to first vailable
                         settings = settingsList[0]
