@@ -114,6 +114,10 @@ class pglSettingsManager:
                                 modifiedSettings.name = matchingOriginalSettings.name
                         # save the modified display
                         modifiedSettings.save()
+                else:
+                    # if it is not in the original list, then save it
+                    pglMessages.message(f"Saving new settings {modifiedSettings.name}")
+                    modifiedSettings.save()
             # for each display that was in original, but not in modified, delete it
             for originalSettings in originalSettingsList.settingsList:
                 if not any(modifiedSettings == originalSettings for modifiedSettings in modifiedSettingsList.settingsList):
