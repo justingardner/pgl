@@ -596,6 +596,8 @@ class _pglTraitsDialog(QDialog):
                 newObjName = getattr(newObj, keyTraitName)
                 newObjName += " copy"
                 setattr(newObj, keyTraitName, newObjName)
+                # Only one can be isDefault, so fix that if it is set
+                if newObj.isDefault: newObj.isDefault = False
                 # link it to changes in the combo
                 newObj.observe(keyChanged, names=keyTraitName)
                 # add it to the list
@@ -623,14 +625,16 @@ class _pglTraitsDialog(QDialog):
                     QMessageBox.Yes | QMessageBox.No,
                     QMessageBox.No  # default button
                 )
-
                 if reply != QMessageBox.Yes:
                     return
-
+                # if this is the default display, we will need to reassign
+                wasDefault = getattr(current[combo.currentIndex()], "isDefault")
                 # pop off the current item and retarget the list
                 current.pop(combo.currentIndex())
                 if current:
                     state["object"] = current[0]
+                    # set the top object to default if we just deleted the last default
+                    if wasDefault: current[0].isDefault = True
                 retargetList(current)
                 showSelection(0)
                 updateDeleteButtonState()
