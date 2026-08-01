@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
     QApplication, QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLabel, QLineEdit, QSpinBox, QDoubleSpinBox, QCheckBox, QComboBox,
     QSlider, QPushButton, QWidget, QScrollArea, QDialogButtonBox, QAbstractSpinBox,
-    QStylePainter, QStyleOptionComboBox, QStyle
+    QStylePainter, QStyleOptionComboBox, QStyle, QMessageBox
 )
 from PySide6.QtCore import Qt, QCoreApplication, QTimer
 from traitlets import (
@@ -502,7 +502,7 @@ class _pglTraitsDialog(QDialog):
                 newObj.uuid = str(uuid.uuid4())
                 # rename it
                 newObjName = getattr(newObj, keyTraitName)
-                newObjName += "_copy"
+                newObjName += " copy"
                 setattr(newObj, keyTraitName, newObjName)
                 # link it to changes in the combo
                 newObj.observe(keyChanged, names=keyTraitName)
@@ -522,6 +522,19 @@ class _pglTraitsDialog(QDialog):
             def onDelete():
                 # do not allow deleting the last item in the list
                 if len(current) <= 1: return
+                # confirm delete
+                itemName = getattr(current[combo.currentIndex()], keyTraitName)
+                reply = QMessageBox.question(
+                    self,
+                    "Confirm Delete",
+                    f"Are you sure you want to delete '{itemName}'?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No  # default button
+                )
+
+                if reply != QMessageBox.Yes:
+                    return
+
                 # pop off the current item and retarget the list
                 current.pop(combo.currentIndex())
                 if current:

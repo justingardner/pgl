@@ -106,6 +106,11 @@ class pglSettingsManager:
                                 modifiedSettings.name = matchingOriginalSettings.name
                         # save the modified display
                         modifiedSettings.save()
+            # for each display that was in original, but not in modified, delete it
+            for originalSettings in originalSettingsList.settingsList:
+                if not any(modifiedSettings == originalSettings for modifiedSettings in modifiedSettingsList.settingsList):
+                    pglMessages.message(f"Deleting settings {originalSettings.name}")
+                    self.moveToTrash(originalSettings.saveDir())
     
     @classmethod
     def getDisplaySettings(cls, displayName=None):
@@ -287,6 +292,29 @@ class pglSettingsManager:
         
         return displayNames    
     
+    @classmethod
+    def moveToTrash(cls, filepath):
+        '''
+        Move a file to the trash.
+        '''
+        try:
+            # get trash directory
+            trashDir = cls.getPGLDir() / "trash"
+            if not trashDir.exists():
+                trashDir.mkdir(parents=True, exist_ok=True)
+            # create path to move to trash
+            trashPath = trashDir / filepath.name
+            # check if it exists, if so, add a timestamp to the name
+            if trashPath.exists():
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                trashPath = trashDir / f"{filepath.stem}_{timestamp}{filepath.suffix}"  
+            # move to trash
+            filepath.rename(trashPath)
+            pglMessages.message(f"Moved {filepath} to trash: {trashPath}")
+        except Exception as e:
+            pglMessages.warning(f"Error moving {filepath} to trash: {e}")
+            return None
+        
     @staticmethod       
     def getPGLDir():
         """
