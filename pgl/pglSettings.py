@@ -41,26 +41,8 @@ class pglSettingsManager:
         """
         Edit pgl settings. Brings up widget interface to edit settings
         """
-        # get settings dir
-        settingsDir = self.getSettingsDir()
-        
-        # load all the seettings in there
-        settingsList = []
-        for filename in Path(settingsDir).glob("*.json"):
-            settings = pglSettings.load(filename=filename)
-            settingsList.append(settings)
-        
-        # if no saved settings, make a default one
-        if not settingsList:
-            settingsList.append(pglSettings())
-            settingsList[0].isDefault = True
-            
-        # find the default settings
-        defaultSettings = next((s for s in settingsList if s.isDefault), None)
-
-        # and put it at the top of list
-        if defaultSettings:
-            settingsList.insert(0, settingsList.pop(settingsList.index(defaultSettings)))
+        # get settings list
+        settingsList = self.getSettings(returnSettingsList=True)
 
         # keep original
         original = pglSettingsList(settingsList)    
@@ -567,7 +549,7 @@ class pglSettingsManager:
         return calibrationsDir
     
     @classmethod
-    def getSettings(cls, settingsName=None, settings=None, displayName=None, displaySettings=None):
+    def getSettings(cls, settingsName=None, settings=None, displayName=None, displaySettings=None, returnSettingsList=False):
         """
         Load settings form directory returned by getSettingsDir()
         
@@ -587,10 +569,17 @@ class pglSettingsManager:
                 conflicting settings). If there is no settings/settingsName will use default settings
             displaySettings (pglDisplaySettings): The settings of the dispaly to use, will supersed the displayName if set and
                 behave in a similar fashion
+            returnSettingsList (bool): If true, ignores other arguments and returns a list of all settings
 
         Returns:
             An instance of pglSettings
         """
+        if returnSettingsList:
+            settings=None
+            settingsName=None
+            displaySettings=None
+            displayName=None
+            
         if settings is not None:
             if not isinstance(settings, pglSettings):
                 pglMessages.warning("Settings must be pglSettings")
@@ -627,18 +616,23 @@ class pglSettingsManager:
                     settings = pglSettings()
                     settings.isDefault = True
                     settings.save()
+                    settingsList = [settings]
                 else:
                     # find the default settings
                     defaultSettings = next((s for s in settingsList if s.isDefault), None)
                     if defaultSettings is not None:
                         settings = defaultSettings
-                        pglMessages.message(f"Using default settings: {settings.name}")
+                        # put it on top of list
+                        settingsList.insert(0, settingsList.pop(settingsList.index(defaultSettings)))
                     else:
+                        # no default, set to first vailable
                         settings = settingsList[0]
                         settings.isDefault = True
                         settings.save()
                         pglMessages.message(f"No default settings found, using first available settings: {settings.name}.")
+                if returnSettingsList: return settingsList
 
+                            
         # validate displaySettings / displayName
         if displaySettings is not None:
             if not isinstance(displaySettings, pglDisplaySettings):
@@ -811,6 +805,7 @@ class pglDisplaySettings(pglTraitSettings):
         filename.parent.mkdir(parents=True, exist_ok=True)
  
         super().save(filename=filename)
+        pglMessages.message(f"Saved display settings to {filename}")
         
     def saveDir(self):
         return pglSettingsManager.getDisplayDir(self) / "display.json"
@@ -1039,6 +1034,8 @@ class pglSettings(pglTraitSettings):
         filename.parent.mkdir(parents=True, exist_ok=True)
 
         super().save(filename=filename)
+        pglMessages.message(f"Saved display settings to {filename}")
+
         
     def saveDir(self):
         return pglSettingsManager.getSettingsDir() / f"{pglBase.makeValidFilename(self.name)}.json"

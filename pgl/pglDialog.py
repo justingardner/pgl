@@ -1471,25 +1471,26 @@ class pglDialogs:
         and returns edited settings (OK) or None (Cancel).
         """
         try:
-            tmpDir  = Path(tempfile.mkdtemp())
-            inFile  = tmpDir / "in.json"
-            outFile = tmpDir / "out.json"
+            with tempfile.TemporaryDirectory() as tmpDirStr:
+                tmpDir  = Path(tmpDirStr)
+                inFile  = tmpDir / "in.json"
+                outFile = tmpDir / "out.json"
 
-            settings.save(inFile)
+                settings.save(inFile)
 
-            # run, redirecting stderr because it produces meaningless messages from text handling
-            scriptPath = Path(__file__).parent / "pglTraitsDialogStandalone.py"
-            result = subprocess.run(
-                [sys.executable, str(scriptPath), str(inFile), str(outFile)],
-                stderr=subprocess.DEVNULL
-            )
+                # run, redirecting stderr because it produces meaningless messages from text handling
+                scriptPath = Path(__file__).parent / "pglTraitsDialogStandalone.py"
+                result = subprocess.run(
+                    [sys.executable, str(scriptPath), str(inFile), str(outFile)],
+                    stderr=subprocess.DEVNULL
+                )
 
-            if result.returncode == 0 and outFile.exists():
-                # OK
-                return pglSerialize.load(outFile)
-            else:
-                # Cancel
-                return None                               
+                if result.returncode == 0 and outFile.exists():
+                    # OK
+                    return pglSerialize.load(outFile)
+                else:
+                    # Cancel
+                    return None                               
         except Exception as e:
             pglMessages.warning(f"Error running traitsDialog: {e}")
             return None
