@@ -32,6 +32,7 @@ from functools import partial
 import math
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
+from .pglMessages import pglMessages
 
 #######################################
 # _pglTraitsDialog
@@ -321,6 +322,14 @@ class _pglTraitsDialog(QDialog):
     def _addSettingsList(self, traitName, trait, current, helpText,
                         settingsObject, layout=None, settingsKey=None):
 
+        # get metadata settings
+        keyTraitName = trait.metadata["settingsListKey"]
+        hideKey = trait.metadata.get("hideKey", False)
+        hideAll = trait.metadata.get("hideAll", False)
+        highlightSelector = trait.metadata.get("highlightSelector", True)
+        buttons = trait.metadata.get("buttons", False)
+        setDefault = trait.metadata.get("setDefault", False)
+
         # Build widgets once
         #--------------------
         def buildRows():
@@ -450,7 +459,7 @@ class _pglTraitsDialog(QDialog):
 
         # User changed combo selection
         #------------------------------
-        def showObject(index):
+        def showSelection(index):
 
             # first commit selection order
             state["object"] = state["list"][index]
@@ -464,8 +473,14 @@ class _pglTraitsDialog(QDialog):
             if hasattr(self, "plotCanvas"):
                 self.plotCanvas.setVisible(False)
                 self.plotCanvas.draw()
-        
-        # Updates the selection combo when th keyTrait changes
+                
+            if setDefault:                
+                # update the default checkbox state
+                check.blockSignals(True)
+                check.setChecked(obj.isDefault)
+                check.blockSignals(False)
+                     
+        # Updates the selection combo when the keyTrait changes
         #------------------------------
         def keyChanged(change):
             if self._updatingWidget:
@@ -478,13 +493,6 @@ class _pglTraitsDialog(QDialog):
         if layout is None:
             layout = self.formLayout
 
-        # get metadata settings
-        keyTraitName = trait.metadata["settingsListKey"]
-        hideKey = trait.metadata.get("hideKey", False)
-        hideAll = trait.metadata.get("hideAll", False)
-        highlightSelector = trait.metadata.get("highlightSelector", True)
-        buttons = trait.metadata.get("buttons", False)
-        
         # keep the state, with a key which is used by updateFields to
         # find settings list object which need to be recursed on
         # key is the class name and the traitname. Note that
@@ -508,8 +516,56 @@ class _pglTraitsDialog(QDialog):
         if highlightSelector: combo.setObjectName("settingsSelector")
         combo.addItems([str(getattr(x, keyTraitName)) for x in current])
 
-        # register the combo
-        self._register(traitName, trait, combo, lambda v: None, layout)
+        # add defaults checkbox if requested
+        if setDefault:
+            # add a checkbox for setting defaults
+            row = QWidget()
+            h = QHBoxLayout(row)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.addWidget(combo, 1)
+            
+            label = QLabel("default:")
+            label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            label.setObjectName("tupleLabel")
+            h.addWidget(label)
+            
+            check = QCheckBox()
+            check.setChecked(True) # fix, temp
+            h.addWidget(check)
+
+            def onSelectDefault(checked):
+                check.blockSignals(True)
+                if checked:
+                    # set the current object as the default
+                    for obj in current:
+                        if obj is state["object"]:
+                            obj.isDefault = True
+                        else:
+                            obj.isDefault = False
+                else:
+                    # if the unser unchecks the default, we will revert it back to checked, because there must always be a default
+                    check.setChecked(True)
+                check.blockSignals(False)
+                
+            # check whether there is only one default, and if so, check the box
+            nSelected = sum(1 for obj in current if getattr(obj, "isDefault", False))
+            if nSelected == 0:
+                pglMessages.message("No default selected in settings list. Setting the first item as default.")
+                # no selections, so set the current one to be selected
+                state["object"].isDefault = True
+            elif nSelected > 1:
+                pglMessages.message("Multiple defaults selected in settings list. Setting the first item as default.")
+                for obj in current:
+                    if obj is state["object"]:
+                        obj.isDefault = True
+                    else:
+                        obj.isDefault = False
+            check.stateChanged.connect(onSelectDefault)             
+
+            self._register(traitName, trait, row, lambda v: None, layout)
+        else:
+            # register the combo
+            self._register(traitName, trait, combo, lambda v: None, layout)
         
         # if we have buttons add them here
         if buttons:
@@ -525,7 +581,7 @@ class _pglTraitsDialog(QDialog):
                 newObj.observe(keyChanged, names=keyTraitName)
                 retargetList(current)
                 # show the new object in the list
-                showObject(current.index(newObj))
+                showSelection(current.index(newObj))
                 updateDeleteButtonState()
             newButton.clicked.connect(onNew)
             
@@ -546,7 +602,7 @@ class _pglTraitsDialog(QDialog):
                 current.append(newObj)
                 retargetList(current)
                 # show the new object in the list
-                showObject(current.index(newObj))
+                showSelection(current.index(newObj))
                 updateDeleteButtonState()
             copyButton.clicked.connect(onCopy)
             
@@ -576,7 +632,7 @@ class _pglTraitsDialog(QDialog):
                 if current:
                     state["object"] = current[0]
                 retargetList(current)
-                showObject(0)
+                showSelection(0)
                 updateDeleteButtonState()
 
             deleteButton.clicked.connect(onDelete)
@@ -599,10 +655,10 @@ class _pglTraitsDialog(QDialog):
             obj.observe(keyChanged, names=keyTraitName)
 
         # connect showObject to changes in the index
-        combo.currentIndexChanged.connect(showObject)
+        combo.currentIndexChanged.connect(showSelection)
 
         # and show the first item in the list
-        showObject(0)
+        showSelection(0)
         
     # ----- Float with min/max -----
     def _addFloatRange(self, traitName, trait, current, helpText, settingsObject, layout=None, settingsKey=None):
@@ -915,20 +971,30 @@ class _pglTraitsDialog(QDialog):
                     self.plotCanvas.draw()
 
         def onSelectionChanged(index):
-            # display plot
-            if self._activePlotButton is not None:
-                self._activePlotButton.setChecked(False)
+            if self._activePlotButton is not None and self._activePlotButton is not button:
+                prev = self._activePlotButton
+                prev.blockSignals(True)
+                prev.setChecked(False)
+                prev.blockSignals(False)
+
+            button.blockSignals(True)
+            button.setChecked(True)
+            button.blockSignals(False)
+
             self._activePlotButton = button
             self.plotButtonState = True
-            button.setChecked(True)
-            updatePlot()
-            
-            # move selected to top, like onListSelect did
+
+            # move selected to top
             selected = combo.itemText(index)
             opts = [combo.itemText(i) for i in range(combo.count())]
             newList = [selected] + [x for x in opts if x != selected]
-            self._commit(settingsObject, traitName, newList)
 
+            combo.blockSignals(True)
+            self._commit(settingsObject, traitName, newList)
+            combo.blockSignals(False)
+
+            updatePlot()            
+        
         button.toggled.connect(onButtonToggled)
         combo.currentIndexChanged.connect(onSelectionChanged)
 
@@ -1404,22 +1470,26 @@ class pglDialogs:
         Pops up a PySide6 dialog in a separate process, blocks until closed,
         and returns edited settings (OK) or None (Cancel).
         """
-        tmpDir  = Path(tempfile.mkdtemp())
-        inFile  = tmpDir / "in.json"
-        outFile = tmpDir / "out.json"
+        try:
+            tmpDir  = Path(tempfile.mkdtemp())
+            inFile  = tmpDir / "in.json"
+            outFile = tmpDir / "out.json"
 
-        settings.save(inFile)
+            settings.save(inFile)
 
-        # run, redirecting stderr because it produces meaningless messages from text handling
-        scriptPath = Path(__file__).parent / "pglTraitsDialogStandalone.py"
-        result = subprocess.run(
-            [sys.executable, str(scriptPath), str(inFile), str(outFile)],
-            stderr=subprocess.DEVNULL
-        )
+            # run, redirecting stderr because it produces meaningless messages from text handling
+            scriptPath = Path(__file__).parent / "pglTraitsDialogStandalone.py"
+            result = subprocess.run(
+                [sys.executable, str(scriptPath), str(inFile), str(outFile)],
+                stderr=subprocess.DEVNULL
+            )
 
-        if result.returncode == 0 and outFile.exists():
-            # OK
-            return pglSerialize.load(outFile)
-        else:
-            # Cancel
-            return None                               
+            if result.returncode == 0 and outFile.exists():
+                # OK
+                return pglSerialize.load(outFile)
+            else:
+                # Cancel
+                return None                               
+        except Exception as e:
+            pglMessages.warning(f"Error running traitsDialog: {e}")
+            return None

@@ -16,6 +16,7 @@ import numpy as np
 from pathlib import Path
 from datetime import datetime
 from traitlets import HasTraits, TraitError
+from .pglMessages import pglMessages
 
 ##########################
 # Recursively collect all subclasses
@@ -46,18 +47,18 @@ class pglSerialize:
         """Save object to JSON file"""
         try:
             filename = Path(filename).with_suffix(".json")
-            print(f"(pglSerialize) Saving {self.__class__.__name__} to '{filename}'")
+            pglMessages.message(f"(pglSerialize) Saving {self.__class__.__name__} to '{filename}'")
             with open(filename, 'w') as f:
                 f.write(self.toJSON())
         except PermissionError:
-            print(f"(pglSerialize) No permission to write to '{filename}'")
+            pglMessages.warning(f"(pglSerialize) No permission to write to '{filename}'")
         except IsADirectoryError:
-            print(f"(pglSerialize) '{filename}' is a directory, cannot write file")
+            pglMessages.warning(f"(pglSerialize) '{filename}' is a directory, cannot write file")
         except OSError as e:
-            print(f"(pglSerialize) OS error while saving '{filename}': {e}")
+            pglMessages.warning(f"(pglSerialize) OS error while saving '{filename}': {e}")
         except Exception as e:
-            print(f"(pglSerialize) Unknown error ({type(e).__name__}) while saving '{filename}': {e}")
-    
+            pglMessages.warning(f"(pglSerialize) Unknown error ({type(e).__name__}) while saving '{filename}': {e}")
+
     ##########################
     # Load from JSON file
     ##########################
@@ -67,25 +68,25 @@ class pglSerialize:
         filename = Path(filename).with_suffix(".json")
 
         if not filename.exists():
-            print(f"(pglSerialize) File '{filename}' not found.")
+            pglMessages.warning(f"(pglSerialize) File '{filename}' not found.", level=1)
             return None
 
         if not filename.is_file():
-            print(f"(pglSerialize) '{filename}' is not a file.")
+            pglMessages.warning(f"(pglSerialize) '{filename}' is not a file.", level=1)
             return None
 
         try:
             jsonString = filename.read_text()
-            obj = cls.fromJSON(jsonString)  # uses your existing fromJSON
+            obj = cls.fromJSON(jsonString, filename=filename)  # uses your existing fromJSON
             return obj
         except PermissionError:
-            print(f"(pglSerialize) No permission to read '{filename}'.")
+            pglMessages.warning(f"(pglSerialize) No permission to read '{filename}'.", level=1)
         except OSError as e:
-            print(f"(pglSerialize) OS error reading '{filename}': {e}")
+            pglMessages.warning(f"(pglSerialize) OS error reading '{filename}': {e}", level=1)
         except json.JSONDecodeError as e:
-            print(f"(pglSerialize) JSON decode error in '{filename}': {e}")
+            pglMessages.warning(f"(pglSerialize) JSON decode error in '{filename}': {e}", level=1)
         except Exception as e:
-            print(f"(pglSerialize) Unknown error loading '{filename}': {type(e).__name__}: {e}")
+            pglMessages.warning(f"(pglSerialize) Unknown error loading '{filename}': {type(e).__name__}: {e}", level=1)
 
         return None
     ##########################
@@ -192,7 +193,7 @@ class pglSerialize:
     # fromJSON
     ##########################
     @classmethod
-    def fromJSON(cls, jsonString):
+    def fromJSON(cls, jsonString, filename=None):
                 
         # Build registry of all known pglSerialize subclasses
         CLASS_REGISTRY = pglGetAllSubclasses(pglSerialize)
@@ -227,7 +228,7 @@ class pglSerialize:
                         setattr(obj, key, value)
                     return obj
                 except (ImportError, AttributeError) as e:
-                    print(f"(pglSerialize) Could not restore HasTraits object {class_name}: {e}")
+                    pglMessages.warning(f"(pglSerialize) Could not restore HasTraits object {class_name}: {e}", level=1)
                     return dct
             
             # Restore pglSerialize objects
@@ -235,7 +236,7 @@ class pglSerialize:
                 className = dct.pop('__class__')
                 if className in CLASS_REGISTRY:
                     objectClass = CLASS_REGISTRY[className]
-                    obj = objectClass.fromJSONdict(dct)
+                    obj = objectClass.fromJSONdict(dct, filename=filename)
                     return obj
             
             return dct
@@ -246,14 +247,14 @@ class pglSerialize:
     # fromJSONdict
     ##########################
     @classmethod
-    def fromJSONdict(cls, data, type="all"):
+    def fromJSONdict(cls, data, type="all", filename=None):
         """Create instance from dict. Override for custom initialization/validation"""
         obj = cls.__new__(cls)
         
         # If this is a HasTraits class, use updateTraitsFromDict
         if issubclass(cls, HasTraits):
             obj.__init__()  # Initialize HasTraits properly
-            obj.updateTraitsFromDict(data)
+            obj.updateTraitsFromDict(data, filename=filename)
             # If this is a dataclass, use __init__ to get defaults and validation
         elif is_dataclass(cls):
             # Get all field names
@@ -270,7 +271,7 @@ class pglSerialize:
     ##########################
     # updateTraitsFromDict - For HasTraits objects
     ##########################
-    def updateTraitsFromDict(self, data, filename="<dict>", typeConverter=None):
+    def updateTraitsFromDict(self, data, filename=None, typeConverter=None):
         """
         Update traits from a dictionary with validation and error handling.
         
@@ -348,13 +349,12 @@ class pglSerialize:
                     traceback.print_exc()
                     print(f"{'='*80}\n")
             else:
-                print(f"(pglSerialize) '{key}' not found in '{filename}', "
-                    f"using default {getattr(self, key)}")
+                pglMessages.message(f"'{key}' not found in {filename} using default {getattr(self, key)}")
         
         # Warn about unknown keys
         extraKeys = set(data.keys()) - set(self.trait_names())
         if extraKeys:
-            print(f"(pglSerialize) Unknown keys in '{filename}' (ignored): {list(extraKeys)}")
+            pglMessages.message(f"(pglSerialize) Unknown keys in {filename} (ignored): {list(extraKeys)}")
 
 
     def _getDetailedTypeInfo(self, obj):

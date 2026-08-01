@@ -11,9 +11,8 @@
 # Import modules
 #############
 from datetime import date as Date, datetime
-import json
+from IPython.display import clear_output
 import numpy as np
-import itertools
 import random
 import math
 from dataclasses import dataclass, field
@@ -343,6 +342,10 @@ class pglExperiment(pglExperimentBase):
         try:
             # init super
             super().__init__()
+
+            # clear the text screen
+            clear_output(wait=True)
+        
             self.isInitialized=False
             if pgl is None:
                 # If pgl is none, then this is a load
@@ -533,8 +536,9 @@ class pglExperiment(pglExperimentBase):
         
         # No calibration
         if display.luminanceCalibration[0] == "None":
-            pglMessages.warning(f"Settings are set to calibrte for gamma {settings.calibrateForGamma} but no calibration found for display {display.name}")
-            return
+            if settings.calibrateForGamma is not None and settings.calibrateForGamma[0] != 0.0:
+                pglMessages.warning(f"Gamma is set to {settings.calibrateForGamma[0]} but no calibration found for display {display.name}")
+                return
         
         # save the original gamma table
         self.state.originalGammaTable = self.pgl.getGammaTable(display.currentDisplayNum)

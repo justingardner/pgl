@@ -8,19 +8,14 @@
 #############
 # Import
 #############
-from asyncio import subprocess
 from curses import wrapper
 from pathlib import Path
-from urllib import response
 from IPython.display import display, HTML, clear_output
 from fileinput import filename
 from ipywidgets.widgets import widget
 from traitlets import HasTraits, Float, Int, List, Tuple, TraitError, Unicode, Dict, default, link, Bool, TraitType, Instance
 from datetime import datetime   
 import numpy as np
-import subprocess
-import platform
-from .pglParameter import pglParameter, pglParameterBlock
 from .pglSerialize import pglSerialize
 from .pglDialog import pglDialogs
 import Quartz
@@ -158,7 +153,8 @@ class pglSettingsManager:
                 
         maxDisplays = 16        
         (err, active, count) = Quartz.CGGetActiveDisplayList(maxDisplays, None, None)
-
+        currentRefreshRate = 0.0
+        
         for iDisplay, displayID in enumerate(active):
             # initialize the displaySettings
             displaySettings = pglDisplaySettings()
@@ -266,7 +262,11 @@ class pglSettingsManager:
             displaySettingsWindowed.currentDisplayMode = (800, 600, 60.0)
             displaySettingsWindowed.displayModes = [pglDisplayModeSettings(modeName="800 x 600", pixelDims=(800, 600), refreshRate=[60.0])]
             displays.append(displaySettingsWindowed)
-                
+        displaySettingsWindowed.currentDisplayNum = 0
+        displaySettingsWindowed.currentDisplayMode = (displaySettingsWindowed.windowSize[0], displaySettingsWindowed.windowSize[1], currentRefreshRate)
+        displaySettingsWindowed.luminanceCalibration = ['None']
+        displaySettingsWindowed.temporalCalibration = ['None']
+               
         if displayName is not None:
             # find the display with the matching displayName (compare using makeValidFilename to make case insenstive)
             return next(
@@ -599,7 +599,35 @@ class pglSettingsManager:
                 pglMessages.message(f"Loading settings from '{settingsPath}'.")
                 settings = pglSettings.load(filename=settingsPath)
         else:
-            settings = pglSettings()
+            # use a default settings if we are trying to just open a display
+            if displaySettings is not None or displayName is not None:
+                settings = pglSettings()
+            else:
+                # get settings dir
+                settingsDir = cls.getSettingsDir()
+                
+                # load all the seettings in there
+                settingsList = []
+                for filename in Path(settingsDir).glob("*.json"):
+                    settings = pglSettings.load(filename=filename)
+                    settingsList.append(settings)
+                # if no saved settings, make a default one
+                if not settingsList:
+                    pglMessages.message("No saved settings found, creating default settings.")
+                    settings = pglSettings()
+                    settings.isDefault = True
+                    settings.save()
+                else:
+                    # find the default settings
+                    defaultSettings = next((s for s in settingsList if s.isDefault), None)
+                    if defaultSettings is not None:
+                        settings = defaultSettings
+                        pglMessages.message(f"Using default settings: {settings.name}")
+                    else:
+                        settings = settingsList[0]
+                        settings.isDefault = True
+                        settings.save()
+                        pglMessages.message(f"No default settings found, using first available settings: {settings.name}.")
 
         # validate displaySettings / displayName
         if displaySettings is not None:
@@ -623,7 +651,8 @@ class pglTraitSettings(HasTraits, pglSerialize):
     # all trait setttings should have a name field and a uuid
     name = Unicode("default", help="", visible=False, enabled=False)
     uuid = Unicode("", help="Universal unique identifier for this setting", visible=False, enabled=False)
-
+    isDefault = Bool(False, help="Whether this is the default settings", visible=False, enabled=False)
+    
     # default uuid
     @default("uuid")
     def _default_uuid(self):
@@ -713,6 +742,7 @@ class pglTraitSettings(HasTraits, pglSerialize):
 
         # fallback
         return a == b
+        
 ##################################################
 # display Settings 
 ##################################################
@@ -798,32 +828,44 @@ class pglDisplaySettings(pglTraitSettings):
         if selected == "None":
             return False
         
-        # load the calibration
-        luminanceCalibrationDir = pglSettingsManager.getDisplayLuminanceCalibrationDir(self) / selected 
+        if self.luminanceCalibration == 'None':
+            pglMessages.message(f"LuminanceCalibration set to None: No luminance calibrations found for {self.name}")
+            return False
+        else:
+            calibration = self.getLuminanceCalibration()
+            calibration.display(fig=fig)
         
-        # load the calibrtion
-        from .pglCalibration import pglDisplayLuminanceCalibrationData
-        calibration = pglDisplayLuminanceCalibrationData.load(displayName=self.name, filepath=luminanceCalibrationDir)
-        calibration.display(fig=fig)
         return True
     
     def getLuminanceCalibration(self):
-       '''
-       get the luminance calibration
-       '''
-       if not self.luminanceCalibration or self.luminanceCalibration[0] == 'None':
-           pglMessages.warning("No luminance calibration found for {self.name}")
-           return
+        '''
+        get the luminance calibration
+        '''
+        if not self.luminanceCalibration or self.luminanceCalibration[0] == 'None':
+            return
+        elif self.luminanceCalibration[0] == 'Latest':
+            # get the latest calibration
+            luminanceCalibrationDir = pglSettingsManager.getDisplayLuminanceCalibrationDir(self)
+            pattern = re.compile(r'^\d{8}(_.*)?$')
+            matches = [p for p in luminanceCalibrationDir.rglob('*') if p.is_dir() and pattern.match(p.name)]
+            if not matches:
+                pglMessages.warning(f"Luminance calibration set to Latest: No luminance calibrations found for {self.name}")
+                return
+            latestCalibrationDir = max(matches, key=lambda p: p.name)
+            calibrationName = latestCalibrationDir.name
+            pglMessages.message(f"Luminance calibration set to Latest: Using {calibrationName} for {self.name}")
+        else:
+            calibrationName = self.luminanceCalibration[0]
+           
+        # load the calibration
+        from .pglCalibration import pglDisplayLuminanceCalibrationData
+        luminanceCalibrationDir = pglSettingsManager.getDisplayLuminanceCalibrationDir(self) / calibrationName
+        calibration = pglDisplayLuminanceCalibrationData.load(displayName=self.name, filepath=luminanceCalibrationDir)
+        if calibration is None:
+            pglMessages.warning(f"Could not load luminance calibration from {luminanceCalibrationDir}") 
+            return
        
-       # load the calibration
-       from .pglCalibration import pglDisplayLuminanceCalibrationData
-       luminanceCalibrationDir = pglSettingsManager.getDisplayLuminanceCalibrationDir(self) / self.luminanceCalibration[0]
-       calibration = pglDisplayLuminanceCalibrationData.load(displayName=self.name, filepath=luminanceCalibrationDir)
-       if calibration is None:
-           pglMessages.warning("Could not load luminance calibration from {luminanceCalibrationDir}") 
-           return
-       
-       return calibration
+        return calibration
     
     def setGamma(self, pgl, gamma):
         '''
@@ -834,7 +876,8 @@ class pglDisplaySettings(pglTraitSettings):
         calibration = self.getLuminanceCalibration()
         
         # and set the gamma
-        calibration.setDisplayToGamma(pgl, self, gamma)
+        if calibration:
+            calibration.setDisplayToGamma(pgl, self, gamma)
         
     def plotTemporalCalibration(self, fig, selected):
         '''
@@ -844,14 +887,46 @@ class pglDisplaySettings(pglTraitSettings):
             return False
 
         # load the calibration
-        temporalCalibrationDir = pglSettingsManager.getDisplayTemporalCalibrationDir(self) / selected 
+        calibration = self.getTemporalCalibration()
+        if calibration is None:
+            pglMessages.warning(f"Could not load temporal calibration for {self.name}") 
+            return False
 
-        # load the calibrtion
-        from .pglCalibration import pglDisplayTemporalCalibrationData
-        calibration = pglDisplayTemporalCalibrationData.load(displayName=self.name, filepath=temporalCalibrationDir)
+        # display
         calibration.display(fig=fig)
         
         return True
+    
+    def getTemporalCalibration(self):
+        '''
+        get the temporal calibration
+        '''
+        if not self.temporalCalibration or self.temporalCalibration[0] == 'None':
+            return
+        elif self.temporalCalibration[0] == 'Latest':
+            # get the latest calibration
+            temporalCalibrationDir = pglSettingsManager.getDisplayTemporalCalibrationDir(self)
+            pattern = re.compile(r'^\d{8}(_.*)?$')
+            matches = [p for p in temporalCalibrationDir.rglob('*') if p.is_dir() and pattern.match(p.name)]
+            if not matches:
+                pglMessages.warning(f"Temporal calibration set to Latest: No temporal calibrations found for {self.name}")
+                return
+            latestCalibrationDir = max(matches, key=lambda p: p.name)
+            calibrationName = latestCalibrationDir.name
+            pglMessages.message(f"Temporal calibration set to Latest: Using {calibrationName} for {self.name}")
+        else:
+            calibrationName = self.temporalCalibration[0]
+            print(f"Using temporal calibration: {calibrationName}")
+           
+        # load the calibration
+        from .pglCalibration import pglDisplayTemporalCalibrationData
+        filepath = pglSettingsManager.getDisplayTemporalCalibrationDir(self) / calibrationName
+        calibration = pglDisplayTemporalCalibrationData.load(displayName=self.name, filepath=filepath)
+        if calibration is None:
+            pglMessages.warning(f"Could not load temporal calibration {filepath} from {temporalCalibrationDir}") 
+            return
+       
+        return calibration
     
 
 class pglDisplaySettingsList(pglTraitSettings):
@@ -1008,8 +1083,7 @@ class pglSettings(pglTraitSettings):
         
 class pglSettingsList(pglTraitSettings):
 
-    settingsList = List(Instance(pglSettings), buttons = True, settingsListKey="name", traitDisplayName="Choose settings", help="List of settings")
-    
+    settingsList = List(Instance(pglSettings), buttons=True, setDefault=True, settingsListKey="name", traitDisplayName="Choose settings", help="List of settings")
     buttons = [("Test", "testDisplay")]
 
     ##########################
@@ -1017,15 +1091,19 @@ class pglSettingsList(pglTraitSettings):
     ##########################
     def testDisplay(self):
         try:
-            from pgl import pgl
-            pgl = pgl()
+            # imports (inside function to avoid circular imports)
             from .pglExperiment import pglExperiment
             from .pglTasks import pglTestTask
+            from pgl import pgl
+            
+            # init pgl
+            pgl = pgl()
+
+            # init experiment
             e = pglExperiment(pgl, settings=self.settingsList[0])
                     
             # initialize task
-            t = pglTestTask(pgl)
-            e.addTask(t)
+            e.addTask(pglTestTask(pgl))
             
             # open screen
             e.initScreen()

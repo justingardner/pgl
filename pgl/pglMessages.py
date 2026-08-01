@@ -31,7 +31,9 @@ class pglMessages:
     
     @classmethod
     def _formatMessage(cls, msg, level=2, callerNameDepth=3):
-        if level == 1:
+        if level == 0:
+            msg = f"({cls.getCallerName(callerNameDepth)}) ⚠️ {msg} ⚠️"
+        elif level == 1:
             msg = f"({cls.getCallerName(callerNameDepth)}) ❌ {msg} ❌"
         elif level == 2:
             msg = "❌"*80 + "\n" + f"({cls.getCallerName(callerNameDepth+1)}) {msg}\n" + "❌"*80
