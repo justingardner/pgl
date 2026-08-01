@@ -400,9 +400,6 @@ class pglExperiment(pglExperimentBase):
                 pglMessages.warning(f"Settings {self.settings.name} is not associated with a display")
                 return
             self.state.display = self.settings.displays[0]
-            if self.state.display.currentDisplayNum == -1:
-                pglMessages.warning(f"Could not open display {self.state.display.name} because it is not connected")
-                return
         
             # close all other screens
             self.pgl.cleanUp()
@@ -410,21 +407,30 @@ class pglExperiment(pglExperimentBase):
             # set screen resolution if necessary
             self.state.originalScreenResolution = self.pgl.getResolution(self.state.display.currentDisplayNum)
 
-            # compare to what is desired
-            displayMode = None
-            if self.state.display.displayModes:
-                displayMode = self.state.display.displayModes[0]
-                if displayMode == self.state.originalScreenResolution:
-                    pglMessages.message("Match")
-                else:
-                    self.pgl.setResolutionUsingDisplayModeSettings(self.state.display.currentDisplayNum, displayMode)      
-                    self.state.screenResolution = self.pgl.getResolution()
-                    pglMessages.message(f"Changing screen resolution to: {self.state.screenResolution[0]} x {self.state.screenResolution[1]} {self.state.screenResolution[2]}Hz {self.state.screenResolution[3]}bits " +
-                                        f"from: {self.state.originalScreenResolution[0]} x {self.state.originalScreenResolution[1]} {self.state.originalScreenResolution[2]}Hz {self.state.originalScreenResolution[3]}bits")
+            if self.state.display.uuid == "windowed":
+                # open the screen
+                self.pgl.open(0, screenWidth=self.state.display.windowSize[0], screenHeight=self.state.display.windowSize[1], backgroundColor=backgroundColor)                        
+                self.pgl.setWindowFrameInDisplay(0, screenX=self.state.display.windowPosition[0], screenY=self.state.display.windowPosition[1], screenWidth=self.state.display.windowSize[0], screenHeight=self.state.display.windowSize[1])
+            else:
+                if self.state.display.currentDisplayNum == -1:
+                    pglMessages.warning(f"Could not open display {self.state.display.name} because it is not connected")
+                    return
+                # compare to what is desired
+                displayMode = None
+                if self.state.display.displayModes:
+                    displayMode = self.state.display.displayModes[0]
+                    if displayMode == self.state.originalScreenResolution:
+                        pglMessages.message("Match")
+                    else:
+                        self.pgl.setResolutionUsingDisplayModeSettings(self.state.display.currentDisplayNum, displayMode)      
+                        self.state.screenResolution = self.pgl.getResolution()
+                        pglMessages.message(f"Changing screen resolution to: {self.state.screenResolution[0]} x {self.state.screenResolution[1]} {self.state.screenResolution[2]}Hz {self.state.screenResolution[3]}bits " +
+                                            f"from: {self.state.originalScreenResolution[0]} x {self.state.originalScreenResolution[1]} {self.state.originalScreenResolution[2]}Hz {self.state.originalScreenResolution[3]}bits")
+                
+                # open the screen
+                self.pgl.open(whichScreen=self.state.display.currentDisplayNum, backgroundColor=backgroundColor)        
             
-
-            # open the screen
-            self.pgl.open(whichScreen=self.state.display.currentDisplayNum, backgroundColor=backgroundColor)        
+            # check whether it was opened
             if not self.pgl.isOpen():   
                 pglMessages.warning("Failed to open screen.")
                 return

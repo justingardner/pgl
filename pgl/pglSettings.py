@@ -262,7 +262,7 @@ class pglSettingsManager:
             #displaySettingsWindowed = pglDisplaySettings()
             displaySettingsWindowed.name = "Windowed"
             displaySettingsWindowed.uuid = "windowed"
-            displaySettingsWindowed.currentDisplayNum = -1
+            displaySettingsWindowed.currentDisplayNum = 0
             displaySettingsWindowed.currentDisplayMode = (800, 600, 60.0)
             displaySettingsWindowed.displayModes = [pglDisplayModeSettings(modeName="800 x 600", pixelDims=(800, 600), refreshRate=[60.0])]
             displays.append(displaySettingsWindowed)
@@ -751,7 +751,7 @@ class pglDisplaySettings(pglTraitSettings):
     flipUpDown = Bool(False, help="Whether to flip the display up-down")
     displayDistance = Float(57, min=0.0, help="Distance from subject eyes to display in cm, used to calculate degress of visual angle")
     displaySize = Tuple(Float, Float, labels=("width","height"), default_value=(30, 20), help="Width and height of display in cm, used to calculate degrees of visual angle")
-    windowPosition = Tuple(Int(), Int(), labels=("x","y"), default_value=(0, 0), help="Position of window in pixels", visible=False)
+    windowPosition = Tuple(Int(), Int(), labels=("x","y"), default_value=(100, 100), help="Position of window in pixels", visible=False)
     windowSize = Tuple(Int(), Int(), labels=("width","height"), default_value=(800, 600), help="Size of window in pixels", visible=False)
     displayModes = List(Instance(pglDisplayModeSettings), settingsListKey="modeName", hideKey=True, highlightSelector=False, traitDisplayName="pixelDims", help="All supported display modes")
     luminanceCalibration = List(Unicode(), hasPlotButton=True, buttonFunction="plotLuminanceCalibration", default_value=['None'], help="Which luminance calibration to use")
