@@ -170,12 +170,12 @@ class pglBase:
 
         # start up mglMetal application
         if not os.path.exists(self.metalAppName):
-            print(f"(pglBase:open) ❌ Error: mglMetal application not found at {self.metalAppName}")
+            pglMessages.warning(f"Error: mglMetal application not found at {self.metalAppName}")
             return False
         else:
             if self.verbose > 0: 
-                print(f"(pglBase:open) Starting mglMetal application: {self.metalAppName}")
-                print(f"(pglBase:open) Using socket with address: {socketName}")
+                pglMessages.message(f"Starting mglMetal application: {self.metalAppName}")
+                pglMessages.message(f"Using socket with address: {socketName}")
             try:
                 # start the mglMetal application
                 result = subprocess.run([
@@ -183,14 +183,14 @@ class pglBase:
                     "--args", "-mglConnectionAddress", socketName
                     ], check=True)
             except Exception as e:
-                print(f"(pglBase:open) ❌ Error starting mglMetal application: {e}")
+                pglMessages.warning(f"Error starting mglMetal application: {e}")
                 return False
         
         # now try to connect to the socket
         self.s = pglComm._pglComm(socketName,self)
 
         if not self.s.isOpen():
-            print("(pglBase:open) ❌ Error: Could not connect to mglMetal application.")
+            pglMessages.warning(f"Error: Could not connect to mglMetal application.")
             self.s = None
             return False
 
@@ -198,7 +198,7 @@ class pglBase:
         commandTypesFilename = os.path.join(self.pglDir, "metal/mglCommandTypes.h")
         self.s.parseCommandValues(commandTypesFilename)
         if not self.s.isOpen():
-            print("(pglBase:open) ❌ Error: Could not parse command types.")
+            pglMessages.warning(f"Error: Could not parse command types.")
             self.s = None
             return False
 
@@ -249,22 +249,22 @@ class pglBase:
 
         # Check if the socket is connected
         if not self.s:
-            print("(pglBase:close) ❌ Not connected to socket")
+            pglMessages.warning(f"Not connected to socket")
             return False
         
         # get the PID of the mglMetal application
         pid = self.s.getPID()
         if pid is None:
-            print("(pglBase:close) ❌ Could not find PID of mglMetal application")
+            pglMessages.warning(f"Could not find PID of mglMetal application")
             return False
         
         # close the application
-        if self.verbose > 0: print(f"(pglBase:close) Closing mglMetal application with PID {pid}")
+        if self.verbose > 0: pglMessages.message(f"Closing mglMetal application with PID {pid}")
         try:
             subprocess.run(["kill", "-9", str(pid)], check=True)
-            if self.verbose > 0: print(f"(pglBase:close) mglMetal application with PID: {pid} was killed successfully.")
+            if self.verbose > 0: pglMessages.message(f"mglMetal application with PID: {pid} was killed successfully.")
         except subprocess.CalledProcessError as e:
-            print(f"(pglBase:close) ❌ Error killing mglMetal application with PID: {pid} : {e}")
+            pglMessages.warning(f"Error killing mglMetal application with PID: {pid} : {e}")
 
         # Close the socket
         self.s.close()
