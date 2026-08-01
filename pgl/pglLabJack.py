@@ -31,7 +31,7 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
             # keep ljm reference
             self.ljm = ljm
         except ImportError: 
-            print("(pglLabJack) labjack library is not installed. Please install it to use LabJack.")
+            pglMessages.warning("Labjack library is not installed. Please install LJM Library to use LabJack.\n Installation is available from: https://support.labjack.com/docs/ljm-software-installer-macos-x64\nAfter downloading, install into pgl pip environment: python -m pip install labjack-ljm")
             return
         
         try:
@@ -39,9 +39,9 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
             self.h = ljm.openS("ANY", "USB", "ANY")
         except Exception as e:
             if e.errorCode == 1227:
-                print(f"(pglLabJack) No LabJack device found: {e}")
+                pglMessages.warning(f"(pglLabJack) No LabJack device found: {e}")
             else:
-                print(f"(pglLabJack) Error opening LabJack device: {e}")
+                pglMessages.warning(f"(pglLabJack) Error opening LabJack device: {e}")
             self.h = None
             return
         
@@ -269,21 +269,23 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
         Returns:
             data: pglAnalogTraceData which holds time and data
         """
-        if self.h is None or not self.isReading:
-            return None, None
+        if self.h is None:
+            return None
 
-        # waitToFinish
-        if not waitToFinish:
-            # stop thread
+        # If acquisition is active, request stop when not waiting
+        if not waitToFinish and self.isReading:
             self.stopEvent.set()
 
-        # wait for acquisition thread
-        if self.acquisitionThread.is_alive():
+        # If acquisition thread exists, wait for it to finish
+        if self.acquisitionThread is not None and self.acquisitionThread.is_alive():
             self.acquisitionThread.join()
 
         # copy data safely
         with self.bufferLock:
             data = np.array(self.analogBuffer)
+
+        if data.size == 0:
+            return None
 
         # Reshape data to separate channels
         # data shape will be (numSamples, numChannels)

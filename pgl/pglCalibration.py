@@ -273,7 +273,7 @@ class pglDisplayCalibration():
         '''
         pass
 
-    def calibrateTemporal(self, settingsName=None, settings=None, displayName=None, displaySettings=None):
+    def calibrateTemporal(self, settingsName=None, settings=None, displayName=None, displaySettings=None, waitToStart=None):
         '''
         User faceing function which runs the temporal calibration process. 
         
@@ -286,6 +286,7 @@ class pglDisplayCalibration():
                 conflicting settings). If there is no settings/settingsName will use default settings
             displaySettings (pglDisplaySettings): The settings of the dispaly to use, will supersed the displayName if set and
                 behave in a similar fashion
+            waitToStart (int): Seconds to wait before starting, defaults to None
         '''
         if self.digitalIODevice is None:
             pglMessages.warning("No digitalIO device specified. Please specify on initialization of pglDisplayCalibration or use addDigitalIODevice", level=2)
@@ -298,6 +299,10 @@ class pglDisplayCalibration():
         
         # open the display with specified settings
         e = pglExperiment(self.pgl, settingsName, settings, displayName, displaySettings)
+        if e.isInitialized is False:
+            pglMessages.warning(f"(pglDisplayLuminanceCalibrationData:attachSettings) Could not initialize experiment with settings: {settingsName}")
+            return None
+
         e.settings.closeScreenOnEnd = True
         e.settings.backgroundColor = (0, 0, 0)
         e.initScreen()
@@ -322,13 +327,17 @@ class pglDisplayCalibration():
             # get display info if available
             gpu = next(iter(self.pgl.gpuInfo.values()))
             displays = gpu.get('Displays', [])
-            self.temporalCalibrationData.displayInfo = displays[self.temporalCalibrationData.displaySettings.currentDisplayNum-1]
+            self.temporalCalibrationData.displayInfo = displays[self.temporalCalibrationData.displaySettings.currentDisplayNum]
             
             # get info from pgl
             self.temporalCalibrationData.metalInfo = self.pgl.info()
             
         except Exception as ex:
             pglMessages.warning(f"Warning: Could not get display info: {ex}")
+
+        if waitToStart:
+            pglMessages.message(f"Waiting for {waitToStart}s")
+            self.pgl.waitSecs(waitToStart)
 
         # run internal function to calibrate the temporal
         self._calibrateTemporal()
@@ -385,14 +394,12 @@ class pglDisplayCalibration():
 
         # read analog input for a little bit beyond stimulus duration
         startTime = self.pgl.getSecs()
-        analogReadDurationSecs = totalDurationSecs + 0.5
+        analogReadDurationSecs = totalDurationSecs + 1.0
         self.analogInputDevice.startAnalogRead(duration=analogReadDurationSecs, channels=['AIN0','AIN1'], range=1.0)
+        self.pgl.waitSecs(0.1)
 
         # display
         print(f"Total read time: {analogReadDurationSecs:.2f} seconds, (n={numRepeats}, trialLen={trialDurationSecs:.2f} s, totalDuration={totalDurationSecs:.2f} s)")
-
-        # length of digital output pulse in ms
-        pulseLenMilliseconds = 2 
 
         # initialize arrays of timestamps
         flushTime = []
@@ -437,7 +444,7 @@ class pglDisplayCalibration():
         self.temporalCalibrationData.stimulusDurationFrames = stimulusDurationFrames
         self.temporalCalibrationData.analogTraceData = analogTraceData
             
-    def calibrateLuminance(self, settingsName, nRepeats=4, nSteps=256, runValidation=True, runGammaValidation=True):
+    def calibrateLuminance(self, settingsName, nRepeats=4, nSteps=256, runValidation=True, nStepsValidation=None, nRepeatsValidation=None, runGammaValidation=True):
         '''
         User faceing function which runs the luminance calibration process. It will get a luminance calibration
         and then validate that you get a linear gamma (gamma=1.0) if runValidation is set and a 2.2 gamma
@@ -450,6 +457,8 @@ class pglDisplayCalibration():
             nRepeats (int): Number of times to repeat each measurement.
             nSteps (int): Number of steps in the calibration.
             runValidation (bool): If True, run validation after calibration.
+            nStepsValidation (int): Number of steps in the validation. If None, will use 1
+            nRepeatsValidation (int): Number of times to repeat each measurement in the validation. If None, will use 32
             runGammaValidation (bool): If True, run gamma validation after calibration. This can validate
                 for making a gamma of 2.2 for videos
         '''
@@ -464,6 +473,10 @@ class pglDisplayCalibration():
         
         # open the display with specified settings
         e = pglExperiment(self.pgl, settingsName)
+        if e.isInitialized is False:
+            pglMessages.warning(f"(pglDisplayLuminanceCalibrationData:attachSettings) Could not initialize experiment with settings: {settingsName}")
+            return None
+
         e.settings.closeScreenOnEnd = True
         e.initScreen()
         if self.pgl.isOpen() is False:
@@ -473,14 +486,19 @@ class pglDisplayCalibration():
         # run calibraiton
         self.luminanceCalibrationData = self._calibrateLuminance(e, settingsName, nRepeats, nSteps, validate=False)
         self.luminanceCalibrationData.display()
-        
+
+        if nStepsValidation is None:
+            nStepsValidation = min(8, nSteps)
+        if nRepeatsValidation is None:
+            nRepeatsValidation = min(1, nRepeats)
+
         # run validation
         if runValidation:
-            self.luminanceValidationData = self.validateLuminance(e, gamma=1.0)
+            self.luminanceValidationData = self.validateLuminance(e, nRepeats=nRepeatsValidation, nSteps=nStepsValidation, gamma=1.0)
             self.luminanceValidationData.display(gamma=1.0)
     
         if runGammaValidation:
-            self.luminanceGammaValidationData = self.validateLuminance(e, gamma=2.2)
+            self.luminanceGammaValidationData = self.validateLuminance(e, nRepeats=nRepeatsValidation, nSteps=nStepsValidation, gamma=2.2)
             self.luminanceGammaValidationData.display(gamma=2.2)
 
         # and save
@@ -512,6 +530,10 @@ class pglDisplayCalibration():
         if e is None:
             # open the display with specified settings
             e = pglExperiment(self.pgl, self.luminanceCalibrationData.settingsName)
+            if e.isInitialized is False:
+                pglMessages.warning(f"(pglDisplayLuminanceCalibrationData:attachSettings) Could not initialize experiment with settings: {settingsName}")
+                return None
+
             e.initScreen()
             closeScreenOnEnd = True
             if self.pgl.isOpen() is False:
@@ -578,11 +600,10 @@ class pglDisplayCalibration():
 
         # save settings name
         self.currentLuminanceCalibrationData.settingsName = settingsName
-        self.currentLuminanceCalibrationData.settings = e.getSettings(settingsName)
+        self.currentLuminanceCalibrationData.settings = pglSettingsManager.getSettings(settingsName)
         
         # save the current gamma table so we can replace it
-        displayNumber = self.currentLuminanceCalibrationData.settings.displayNumber
-        if displayNumber > 0: displayNumber -= 1
+        displayNumber = self.currentLuminanceCalibrationData.settings.displays[0].currentDisplayNum
         self.currentGammaTable = self.pgl.getGammaTable(displayNumber)
         
         # Set gamma table - either linear or inverse for validation
@@ -893,16 +914,12 @@ class pglDisplayCalibration():
             print("(pglCalibration) Calibration data is not valid. Cannot save.")
             return None
         
-        # get the filepath
-        displayName = self.luminanceCalibrationData.getDisplayName()
-        filepath = self.getCalibrationFilepath(displayName, makePath=True)
-        
         # save the calibration data
-        self.luminanceCalibrationData.save(filename="calibration", filepath=filepath)    
+        self.luminanceCalibrationData.save()    
         if self.checkLuminanceCalibrationData(self.luminanceValidationData):
-            self.luminanceValidationData.save(filename="validation", filepath=filepath)
+            self.luminanceValidationData.save()
         if self.checkLuminanceCalibrationData(self.luminanceGammaValidationData):
-            self.luminanceGammaValidationData.save(filename="gammaValidation", filepath=filepath)
+            self.luminanceGammaValidationData.save()
         
     @staticmethod
     def chooseCalibrationFilepath(displayName, calibrationType=None, date=None):
@@ -1067,7 +1084,7 @@ class pglDisplayTemporalCalibrationData(HasTraits, pglSerialize):
         '''
         # get a filepath
         if filepath is None:
-            filepath = pglDisplayCalibration.getCalibrationFilepath(self.getDisplayName(), makePath=True, calibrationType="temporal")
+            filepath = pglSettingsManager.getDisplayTemporalCalibrationDir(displaySettings=self.displaySettings, newCalibration=True)
         
         # get the filename
         if filename is None:
@@ -1171,8 +1188,9 @@ class pglDisplayTemporalCalibrationData(HasTraits, pglSerialize):
         while rightIndex < len(cycle) - 1 and cycle[rightIndex] < rightThreshold:
             rightIndex += 1
 
-        leftIndex = onset-2
-        rightIndex = onset+2
+        leftIndex = max(0, onset - 2)
+        rightIndex = min(len(cycle) - 1, onset + 2)
+
         # Make sure we have enough points to fit
         if rightIndex - leftIndex < 3:
             print("Warning: fitting window too small, using fallback")
@@ -1247,7 +1265,7 @@ class pglDisplayLuminanceCalibrationData(HasTraits, pglSerialize):
         '''
         # get a filepath
         if filepath is None:
-            filepath = pglDisplayCalibration.getCalibrationFilepath(self.getDisplayName(), makePath=True, calibrationType="luminance")
+            filepath = pglSettingsManager.getDisplayLuminanceCalibrationDir(displaySettings=self.settings.displays[0], newCalibration=True)
         
         # get the filename
         if filename is None:
@@ -1317,7 +1335,7 @@ class pglDisplayLuminanceCalibrationData(HasTraits, pglSerialize):
             c.calibrationMeasurements = np.array(calib.uncorrected.luminance).T
             c.nSteps = len(c.calibrationValues)
         except (AttributeError, ValueError) as e:
-            print(f"(pglDisplayLuminanceCalibrationData:loadMatlab) ❌❌❌ Could not parse calibration❌❌❌: {e}")
+            pglMessages.warning(f"Could not parse calibration: {e}")
             return None
         
         # get min and max luminance
@@ -1328,7 +1346,7 @@ class pglDisplayLuminanceCalibrationData(HasTraits, pglSerialize):
         try:
             c.displayInfo["DisplayName"] = calib.monitor.ID
         except (AttributeError, ValueError) as e:
-            print(f"(pglDisplayLuminanceCalibrationData:loadMatlab) Could not parse monitor ID: {e}")
+            pglMessages.warning(f"Could not parse monitor ID: {e}")
             
         c.deviceDescription = "Import from matlab"
         return(c,calib) 
@@ -1343,6 +1361,9 @@ class pglDisplayLuminanceCalibrationData(HasTraits, pglSerialize):
         '''
         
         e = pglExperiment(pgl, settingsName)
+        if e.isInitialized is False:
+            pglMessages.warning(f"(pglDisplayLuminanceCalibrationData:attachSettings) Could not initialize experiment with settings: {settingsName}")
+            return None
         e.settings.closeScreenOnEnd = True
         e.settings.backgroundColor = (0, 0, 0)
         e.initScreen()

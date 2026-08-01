@@ -2,6 +2,12 @@
 
 ## Setup
 
+```bash
+git clone https://github.com/justingardner/pgl.git pgl
+cd pgl
+pip install -e .
+```
+
 ### Install Conda Environment
 
 ```bash
