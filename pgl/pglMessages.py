@@ -89,6 +89,14 @@ class pglMessages:
         thread = threading.Thread(target=clearAfterDelay)
         thread.daemon = True
         thread.start()
+
+    @classmethod
+    def accessibilityWarning(cls):
+        accessibilityWarningMessage = ("This app is not authorized for Accessibility input monitoring. No keyboard events will be detected!!" +
+                    "  Go to System Settings → Privacy & Security → Accessibility and add this app." +
+                    "  If you are running VS Code and it already has permissions granted, try running directly from a terminal with:" +
+                    "  /Applications/Visual\\ Studio\\ Code.app/Contents/MacOS/Electron")
+        cls.warning(accessibilityWarningMessage)
         
     @staticmethod
     def getCallerName(depth=2):

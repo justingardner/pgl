@@ -63,7 +63,7 @@ class pglGammaTable:
         whichScreen = self.validateWhichScreen(whichScreen)
         if (whichScreen is None): return
         
-        if redTable and greenTable and blueTable:
+        if redTable is not None and greenTable is not None and blueTable is not None:
             rgbGammaTable = (redTable, greenTable, blueTable)
         else:
             if not rgbGammaTable:

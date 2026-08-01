@@ -34,7 +34,6 @@ from collections import OrderedDict
 from .pglMessages import pglMessages
 import uuid
 
-displayDuration = 5  # seconds
 #######################################
 # Mixin class for pgl to provide settings management
 #######################################
@@ -377,7 +376,7 @@ class pglSettingsManager:
     
     
     @classmethod
-    def getDisplayTemporalCalibrationDir(cls, displaySettings=None, makeDir=False):
+    def getDisplayTemporalCalibrationDir(cls, displaySettings=None, newCalibration=False):
         '''
         Get the directory where temporal calibrations live
         
@@ -389,41 +388,45 @@ class pglSettingsManager:
         Returns:
             Path: The directory path where display luminance calibrations are stored        
         '''
-        temporalCalibrationDir = cls.getDisplayDir(displaySettings, makeDir) / "temporal"
-        
+        temporalCalibrationDir = cls.getDisplayDir(displaySettings) / "temporal"
+        if newCalibration:
+            temporalCalibrationDir = temporalCalibrationDir / datetime.now().strftime("%Y%m%d_%H%M%S")
+       
         # check if it exists, create if not
-        if makeDir and not temporalCalibrationDir.exists():
+        if newCalibration and not temporalCalibrationDir.exists():
             try:
                 temporalCalibrationDir.mkdir(parents=True, exist_ok=True)
-                display(HTML(f"<b>(pglScreenSettings:getDisplayDir)</b> Created directory: {temporalCalibrationDir}"))
+                pglMessages.message(f"Created directory: {temporalCalibrationDir}")
             except Exception as e:
-                display(HTML(f"<b>(pglScreenSettings:getDisplayDir)</b> Error creating directory {temporalCalibrationDir}: {e}"))
+                pglMessages.message(f"Error creating directory {temporalCalibrationDir}: {e}")
                 return None
         return temporalCalibrationDir
 
 
     @classmethod
-    def getDisplayLuminanceCalibrationDir(cls, displaySettings=None, makeDir=False):
+    def getDisplayLuminanceCalibrationDir(cls, displaySettings=None, newCalibration=False):
         '''
         Get the directory where luminance calibrations live
         
         Args:
             displaySettings (default=None): pglDisplaySettings from which displayName and uuid will be used
                 to find the matching directory. If not specified, will just return the top level displayDir
-            makeDir (default=False): Set to True to create the directory if it does not already exist
+            newCalibration (default=False): Set to True to also make a directory underneath with the data and time
+
         
         Returns:
             Path: The directory path where display luminance calibrations are stored        
         '''
-        luminanceCalibrationDir = cls.getDisplayDir(displaySettings, makeDir) / "luminance"
-        
+        luminanceCalibrationDir = cls.getDisplayDir(displaySettings) / "luminance"
+        if newCalibration:
+            luminanceCalibrationDir = luminanceCalibrationDir / datetime.now().strftime("%Y%m%d_%H%M%S")
         # check if it exists, create if not
-        if makeDir and not luminanceCalibrationDir.exists():
+        if newCalibration and not luminanceCalibrationDir.exists():
             try:
                 luminanceCalibrationDir.mkdir(parents=True, exist_ok=True)
-                display(HTML(f"<b>(pglScreenSettings:getDisplayDir)</b> Created directory: {luminanceCalibrationDir}"))
+                pglMessages.message(f"Created directory: {luminanceCalibrationDir}")
             except Exception as e:
-                display(HTML(f"<b>(pglScreenSettings:getDisplayDir)</b> Error creating directory {luminanceCalibrationDir}: {e}"))
+                pglMessages.message(f"Error creating directory {luminanceCalibrationDir}: {e}")
                 return None
         return luminanceCalibrationDir
 
@@ -693,6 +696,10 @@ class pglDisplaySettings(pglTraitSettings):
         '''
         # get the filename
         if not filename: filename = self.saveDir()
+
+        # Ensure directory exists
+        filename.parent.mkdir(parents=True, exist_ok=True)
+ 
         super().save(filename=filename)
         
     def saveDir(self):
@@ -869,6 +876,10 @@ class pglSettings(pglTraitSettings):
         '''
         # get the filename
         if not filename: filename = self.saveDir()
+
+        # Ensure directory exists
+        filename.parent.mkdir(parents=True, exist_ok=True)
+
         super().save(filename=filename)
         
     def saveDir(self):

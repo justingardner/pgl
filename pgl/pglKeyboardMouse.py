@@ -15,6 +15,7 @@ from typing import Optional
 from .pglEvent import pglEvent
 from .pglEventListener import pglEventListener, keyCodeToChar, charToKeyCode
 from .pglDevice import pglDevice
+from .pglMessages import pglMessages
 
 #############################
 # keyboard and mouse device 
@@ -29,10 +30,7 @@ class pglKeyboardMouse(pglDevice):
         super().__init__(deviceType="pglKeyboard")
 
         if not self.checkAccessibilityPermission():
-            print("(pglKeyboardMouse) ❌ This app is not authorized for Accessibility input monitoring. No keyboard events will be detected!!")
-            print("  Go to System Settings → Privacy & Security → Accessibility and add this app.")
-            print("  If you are running VS Code and it already has permissions granted, try running directly from a terminal with:")
-            print("  /Applications/Visual\\ Studio\\ Code.app/Contents/MacOS/Electron")
+            pglMessages.warning(pglMessages.accessibilityWarningMessage)
             return
 
         self.start(eatKeys)

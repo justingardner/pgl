@@ -343,7 +343,7 @@ class pglExperiment(pglExperimentBase):
         try:
             # init super
             super().__init__()
-
+            self.isInitialized=False
             if pgl is None:
                 # If pgl is none, then this is a load
                 if experimentName == "":
@@ -358,6 +358,7 @@ class pglExperiment(pglExperimentBase):
 
             # load settings
             self.settings = pgl.getSettings(settingsName=settingsName, settings=settings, displaySettings=displaySettings, displayName=displayName)
+            if self.settings is None: return
 
             # initialize experiment state and data
             self.state = pglExperimentState()
@@ -368,6 +369,7 @@ class pglExperiment(pglExperimentBase):
             if experimentName != "":
                 self.experimentSettings.experimentName = experimentName
             self.experimentSettings.subjectID = subjectID
+            self.isInitialized=True
 
         except Exception as e:
             pglMessages.warning(f"Could not initialize experiment. Error {type(e).__name__}: {e}")    
@@ -525,7 +527,7 @@ class pglExperiment(pglExperimentBase):
         
         # No calibration
         if display.luminanceCalibration[0] == "None":
-            pglMessages.warning("Settings are set to calibrte for gamma {settings.calibrateForGamma} but no calibration found for display {display.name}")
+            pglMessages.warning(f"Settings are set to calibrte for gamma {settings.calibrateForGamma} but no calibration found for display {display.name}")
             return
         
         # save the original gamma table
