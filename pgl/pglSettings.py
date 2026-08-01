@@ -10,8 +10,6 @@
 #############
 from asyncio import subprocess
 from curses import wrapper
-from http.client import responses
-from http.client import responses
 from pathlib import Path
 from urllib import response
 from IPython.display import display, HTML, clear_output
@@ -151,6 +149,13 @@ class pglSettingsManager:
             # initialize the displaySettings
             displaySettings = pglDisplaySettings()
             
+            # get the current mode settings
+            currentMode = Quartz.CGDisplayCopyDisplayMode(displayID)
+            currentWidth = Quartz.CGDisplayModeGetWidth(currentMode)
+            currentHeight = Quartz.CGDisplayModeGetHeight(currentMode)
+            currentRefreshRate = Quartz.CGDisplayModeGetRefreshRate(currentMode)
+            displaySettings.currentDisplayMode = (currentWidth, currentHeight, currentRefreshRate)
+
             # get all supported modes
             modes = Quartz.CGDisplayCopyAllDisplayModes(displayID, None)
             displayModes = []
@@ -160,6 +165,7 @@ class pglSettingsManager:
                 w = Quartz.CGDisplayModeGetWidth(mode)
                 h = Quartz.CGDisplayModeGetHeight(mode)
                 refreshRate = Quartz.CGDisplayModeGetRefreshRate(mode)
+                
 
                 # make into a tuple
                 pixelDims = (w, h)
@@ -179,16 +185,21 @@ class pglSettingsManager:
                     displayModeSettings.modeName = f"{w} x {h}"
                     displayModeSettings.pixelDims = pixelDims
                     displayModeSettings.refreshRate = [refreshRate]
-                    displayModes.append(displayModeSettings)
+                    
+                    # see if this mode matches current
+                    if (w, h) == (currentWidth, currentHeight):
+                        # put the current refresh rate at the top of the list
+                        # making sure not to dupliacte it if it is already there
+                        if currentRefreshRate in displayModeSettings.refreshRate:
+                            displayModeSettings.refreshRate.remove(currentRefreshRate)
+                        displayModeSettings.refreshRate.insert(0, currentRefreshRate)
+                        # insert this mode at the top of the displayModes list
+                        displayModes.insert(0, displayModeSettings)
+                    else:
+                        displayModes.append(displayModeSettings)
 
             displaySettings.displayModes = displayModes     
                    
-            # get the current mode settings
-            #mode = Quartz.CGDisplayCopyDisplayMode(display)
-            #displaySettings.displayWidth = Quartz.CGDisplayModeGetWidth(mode)  
-            #displaySettings.displayHeight = Quartz.CGDisplayModeGetHeight(mode)
-            #displaySettings.refreshRate = Quartz.CGDisplayModeGetRefreshRate(mode)
-
             # get UUID
             uuidRef = CGDisplayCreateUUIDFromDisplayID(displayID)
             displaySettings.uuid = str(CoreFoundation.CFUUIDCreateString(None, uuidRef))
@@ -221,6 +232,8 @@ class pglSettingsManager:
                 matchingDisplay.isBuiltin = displaySettings.isBuiltin
                 # and set its current display num
                 matchingDisplay.currentDisplayNum = iDisplay
+                # and display mode
+                matchingDisplay.currentDisplayMode = displaySettings.currentDisplayMode
                 # and gamma table size
                 matchingDisplay.gammaTableSize = displaySettings.gammaTableSize
             else:
@@ -709,6 +722,7 @@ class pglDisplaySettings(pglTraitSettings):
     flipUpDown = Bool(False, help="Whether to flip the display up-down")
     currentDisplayNum = Int(-1, help="Which display number this corresponds to. If not currently connected will be -1", enabled=False)
     gammaTableSize = Int(-1, help="Size of gamma table", enabled=False)
+    currentDisplayMode = Tuple(Int(), Int(), Float(), labels=("width","height", "refreshRate"), default_value=(0,0,0), help="Current display mode (width, height, refreshRate)", enabled=False)
     displayDistance = Float(57, min=0.0, help="Distance from subject eyes to display in cm, used to calculate degress of visual angle")
     displaySize = Tuple(Float, Float, labels=("width","height"), default_value=(30, 20), help="Width and height of display in cm, used to calculate degrees of visual angle")
     displayModes = List(Instance(pglDisplayModeSettings), settingsListKey="modeName", hideKey=True, highlightSelector=False, traitDisplayName="pixelDims", help="All supported display modes")
