@@ -595,7 +595,7 @@ class pglExperiment(pglExperimentBase):
         Run the experiment.
         '''
         if self.state.openScreen == False:
-            pglDisplayMessage("(pglExperiment:run) ❌ Screen is not open. Call initScreen() before running the experiment.",useHTML=True, duration=5)
+            pglMessages.warning("Screen is not open. Call initScreen() before running the experiment.")
             return
         
 
