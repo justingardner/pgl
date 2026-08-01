@@ -9,6 +9,7 @@
 # Import
 #############
 import copy
+import uuid
 from PySide6.QtWidgets import (
     QApplication, QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLabel, QLineEdit, QSpinBox, QDoubleSpinBox, QCheckBox, QComboBox,
@@ -448,7 +449,8 @@ class _pglTraitsDialog(QDialog):
         hideKey = trait.metadata.get("hideKey", False)
         hideAll = trait.metadata.get("hideAll", False)
         highlightSelector = trait.metadata.get("highlightSelector", True)
-
+        buttons = trait.metadata.get("buttons", False)
+        
         # keep the state, with a key which is used by updateFields to
         # find settings list object which need to be recursed on
         # key is the class name and the traitname. Note that
@@ -472,6 +474,61 @@ class _pglTraitsDialog(QDialog):
 
         # register the combo
         self._register(traitName, trait, combo, lambda v: None, layout)
+        
+        # if we have buttons add them here
+        if buttons:
+            # create the buttons
+            # make a new settings
+            newButton = QPushButton("new")
+            def onNew():
+                # make a new object of the same type as the first in the list
+                newObj = current[0].__class__()
+                # create a new UUID for it
+                newObj.uuid = str(uuid.uuid4())
+                current.append(newObj)
+                retargetList(current)
+                # show the new object in the list
+                showObject(current.index(newObj))
+                updateDeleteButtonState()
+            newButton.clicked.connect(onNew)
+            
+            # make a copy of current settings
+            copyButton = QPushButton("copy")
+            def onCopy():
+                # make a copy of the current settings
+                newObj = copy.deepcopy(current[combo.currentIndex()])
+                # create a new UUID for it
+                newObj.uuid = str(uuid.uuid4())
+                # rename it
+                newObjName = getattr(newObj, keyTraitName)
+                newObjName += "_copy"
+                setattr(newObj, keyTraitName, newObjName)
+                # add it to the list
+                current.append(newObj)
+                retargetList(current)
+                # show the new object in the list
+                showObject(current.index(newObj))
+                updateDeleteButtonState()
+            copyButton.clicked.connect(onCopy)
+            
+            # delete the current settings
+            def updateDeleteButtonState():
+                # delete button is only enabled if there is more than one item in the list
+                deleteButton.setEnabled(len(current) > 1)
+            deleteButton = QPushButton("delete")
+            def onDelete():
+                # do not allow deleting the last item in the list
+                if len(current) <= 1: return
+                # pop off the current item and retarget the list
+                current.pop(combo.currentIndex())
+                if current:
+                    state["object"] = current[0]
+                retargetList(current)
+                showObject(0)
+                updateDeleteButtonState()
+
+            deleteButton.clicked.connect(onDelete)
+            self.addButtonRow(None, [newButton, copyButton, deleteButton], displayName="")
         
         # set what the widget is updating
         proxy = _RetargetableProxy(current[0])
@@ -912,7 +969,9 @@ class _pglTraitsDialog(QDialog):
         if layout is None:
             layout = self.formLayout
 
-        traitLabel = trait.metadata["traitDisplayName"] if "traitDisplayName" in trait.metadata else traitName
+        traitLabel = traitName
+        if trait is not None and "traitDisplayName" in trait.metadata:
+            traitLabel = trait.metadata["traitDisplayName"]
         label = QLabel(traitLabel)
         label.setObjectName("traitLabel")
         #label.setMinimumWidth(180)          # consistent label column
@@ -941,7 +1000,16 @@ class _pglTraitsDialog(QDialog):
         if trait is not None:
             isEnabled = trait.metadata.get('enabled', True)
             widget.setEnabled(bool(isEnabled))
+    def addButtonRow(self, name, buttons, displayName=None, layout=None, settingsKey=None):
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        for b in buttons:
+            h.addWidget(b)
 
+        # fake a trait just to carry a display label, or pass None and rely on `name`
+        self._register(displayName or name, None, row, lambda v: None, layout, settingsKey)
+        
     def _commit(self, settingsObject, traitName, value):
         """Push a widget change into the settings copy."""
         try:
@@ -1137,6 +1205,11 @@ class _pglTraitsDialog(QDialog):
         QPushButton#halfSizeButton {
             min-width: 36px;
             padding: 7px 20px;
+        }
+        QPushButton:disabled {
+            background-color: #2a2c30;
+            color: #6b6e73;
+            border: 1px solid #2f3136;
         }
         """
     def _wrapSpinSingleStep(self, spin):

@@ -935,7 +935,8 @@ class pglSettings(pglTraitSettings):
         
 class pglSettingsList(pglTraitSettings):
 
-    settingsList = List(Instance(pglSettings), settingsListKey="name", traitDisplayName="Choose settings", help="List of settings")
+    settingsList = List(Instance(pglSettings), buttons = True, settingsListKey="name", traitDisplayName="Choose settings", help="List of settings")
+    
     buttons = [("Test", "testDisplay")]
 
     ##########################
