@@ -9,6 +9,7 @@
 # Import
 #############
 import copy
+from unicodedata import name
 import uuid
 from PySide6.QtWidgets import (
     QApplication, QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
@@ -267,9 +268,6 @@ class _pglTraitsDialog(QDialog):
         current = getattr(settingsObject, traitName)
 
         # a tuple
-        if not trait.metadata.get('visible',True):
-            return
-        
         if isinstance(trait, Tuple):
             self._addTuple(traitName, trait, current, helpText, settingsObject, layout, settingsKey)
         
@@ -315,7 +313,8 @@ class _pglTraitsDialog(QDialog):
 
         # List -> dropdown
         elif isinstance(trait, List):
-            self._addList(traitName, trait, current, helpText, settingsObject, layout, settingsKey)
+            self._addList(traitName, trait, current, helpText, settingsObject, layout, settingsKey)        
+
 
     # ----- Setting list -----
     _selectedSettings = {}
@@ -404,15 +403,50 @@ class _pglTraitsDialog(QDialog):
                     if entry is not None and "setter" in entry:
                         entry["setter"](value)
 
+                    # dynamic visibility based on obj's trait metadata
+                    if entry is not None:
+                        visible = obj.trait_metadata(name, "visible", True)
+                        entry["layout"].setRowVisible(entry["widget"], bool(visible))
+                    
                     # nested settings list
-                    nestedKey = (obj.__class__.__name__,name)
+                    nestedKey = (builtClassName,name)
                     nested = self._selectedSettings.get(nestedKey)
 
                     if nested is not None:
                         nested["retargetList"](value)
+                        visible = obj.trait_metadata(name, "visible", True)
+                        nested["setVisible"](bool(visible))
+            except Exception as e:
+                print(f"Error updating fields for {obj}: {e}")
 
             finally:
                 self._updatingWidget = False
+
+        # set visible turns on off the settings list and all its children and buttons
+        #------------------------------
+        def setVisible(visible):
+            # hide/show the combo row itself
+            layout.setRowVisible(combo, visible)
+
+            # hide/show the button row
+            if buttons:
+                newButton.setVisible(visible)
+                copyButton.setVisible(visible)
+                deleteButton.setVisible(visible)
+
+            # hide/show all currently-built child rows, respecting their own metadata too
+            obj = state["object"]
+            for name in childNames:
+                childEntry = self.traitWidgets[settingsKey].get(name)
+                if childEntry is not None:
+                    ownVisible = obj.trait_metadata(name, "visible", True)
+                    childEntry["layout"].setRowVisible(childEntry["widget"], visible and bool(ownVisible))
+
+                # recurse into any further-nested settings lists
+                nestedKey = (builtClassName, name)
+                nested = self._selectedSettings.get(nestedKey)
+                if nested is not None:
+                    nested["setVisible"](visible)
 
         # User changed combo selection
         #------------------------------
@@ -462,6 +496,8 @@ class _pglTraitsDialog(QDialog):
         self.traitWidgets.setdefault(settingsKey, {})
         state = {"list": current, "object": current[0], "key":settingsKey}
         self._selectedSettings[settingsKey] = state
+
+        state["setVisible"] = setVisible
 
         # make sure the order of the list is selected on top
         # and the rest alphabetical
@@ -552,6 +588,9 @@ class _pglTraitsDialog(QDialog):
         
         state["retargetList"] = retargetList
 
+        # get the build class
+        builtClassName = current[0].__class__.__name__
+        
         # build the widgets
         if not childNames: buildRows()
         
@@ -1008,10 +1047,15 @@ class _pglTraitsDialog(QDialog):
             'row': widget,
             'label': label,
             'setter': setter,
+            'layout': layout,
         }
 
         layout.addRow(label, widget)
-                
+        
+        # honor default-visible metadata (row stays built, just hidden)
+        if trait is not None and not trait.metadata.get('visible', True):
+            layout.setRowVisible(widget, False)
+            
         # honor default-enabled metadata
         if trait is not None:
             isEnabled = trait.metadata.get('enabled', True)

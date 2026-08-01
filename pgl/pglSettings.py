@@ -241,6 +241,18 @@ class pglSettingsManager:
                 # append to our list of all displays
                 displays.append(displaySettings)
                 
+        # see if we have a windowed display
+        displaySettingsWindowed = next((d for d in displays if d.uuid == "windowed"), None)
+        if displaySettingsWindowed is None:
+            displaySettingsWindowed = pglDisplaySettingsWindowed()
+            #displaySettingsWindowed = pglDisplaySettings()
+            displaySettingsWindowed.name = "Windowed"
+            displaySettingsWindowed.uuid = "windowed"
+            displaySettingsWindowed.currentDisplayNum = -1
+            displaySettingsWindowed.currentDisplayMode = (800, 600, 60.0)
+            displaySettingsWindowed.displayModes = [pglDisplayModeSettings(modeName="800 x 600", pixelDims=(800, 600), refreshRate=[60.0])]
+            displays.append(displaySettingsWindowed)
+                
         if displayName is not None:
             # find the display with the matching displayName (compare using makeValidFilename to make case insenstive)
             return next(
@@ -716,15 +728,17 @@ class pglDisplaySettings(pglTraitSettings):
     vendor = Int(0, help="Vendor number", enabled=False)
     model = Int(0, help="Model number", enabled=False)
     serialNumber = Int(0, help="Serial number", enabled=False)
+    currentDisplayNum = Int(-1, help="Which display number this corresponds to. If not currently connected will be -1", enabled=False)
+    currentDisplayMode = Tuple(Int(), Int(), Float(), labels=("width","height", "refreshRate"), default_value=(0,0,0), help="Current display mode (width, height, refreshRate)", enabled=False)
     isMain = Bool(False, help="Whether the display is the main display", enabled=False)
     isBuiltin = Bool(False, help="Whether the display is the built-in display of e.g. a laptop", enabled=False)
+    gammaTableSize = Int(-1, help="Size of gamma table", enabled=False)
     flipLeftRight = Bool(False, help="Whether to flip the display left-right")
     flipUpDown = Bool(False, help="Whether to flip the display up-down")
-    currentDisplayNum = Int(-1, help="Which display number this corresponds to. If not currently connected will be -1", enabled=False)
-    gammaTableSize = Int(-1, help="Size of gamma table", enabled=False)
-    currentDisplayMode = Tuple(Int(), Int(), Float(), labels=("width","height", "refreshRate"), default_value=(0,0,0), help="Current display mode (width, height, refreshRate)", enabled=False)
     displayDistance = Float(57, min=0.0, help="Distance from subject eyes to display in cm, used to calculate degress of visual angle")
     displaySize = Tuple(Float, Float, labels=("width","height"), default_value=(30, 20), help="Width and height of display in cm, used to calculate degrees of visual angle")
+    windowPosition = Tuple(Int(), Int(), labels=("x","y"), default_value=(0, 0), help="Position of window in pixels", visible=False)
+    windowSize = Tuple(Int(), Int(), labels=("width","height"), default_value=(800, 600), help="Size of window in pixels", visible=False)
     displayModes = List(Instance(pglDisplayModeSettings), settingsListKey="modeName", hideKey=True, highlightSelector=False, traitDisplayName="pixelDims", help="All supported display modes")
     luminanceCalibration = List(Unicode(), hasPlotButton=True, buttonFunction="plotLuminanceCalibration", default_value=['None'], help="Which luminance calibration to use")
     temporalCalibration = List(Unicode(), hasPlotButton=True, buttonFunction="plotTemporalCalibration", default_value=['None'], help="Which temporal calibration to use")
@@ -867,7 +881,10 @@ class pglDisplaySettingsList(pglTraitSettings):
         if settingsList is not None:
             self.settingsList = settingsList
 
-
+class pglDisplaySettingsWindowed(pglDisplaySettings):
+    windowPosition = Tuple(Int(), Int(), labels=("x","y"), default_value=(0, 0), help="Position of window in pixels", visible=True)
+    windowSize = Tuple(Int(), Int(), labels=("width","height"), default_value=(800, 600), help="Size of window in pixels", visible=True)
+    displayModes = List(Instance(pglDisplayModeSettings), settingsListKey="modeName", hideKey=True, highlightSelector=False, traitDisplayName="pixelDims", help="All supported display modes", visible=False)
  
 ##################################################
 # Settings 
