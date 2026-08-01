@@ -486,6 +486,7 @@ class _pglTraitsDialog(QDialog):
                 # create a new UUID for it
                 newObj.uuid = str(uuid.uuid4())
                 current.append(newObj)
+                newObj.observe(keyChanged, names=keyTraitName)
                 retargetList(current)
                 # show the new object in the list
                 showObject(current.index(newObj))
@@ -503,6 +504,8 @@ class _pglTraitsDialog(QDialog):
                 newObjName = getattr(newObj, keyTraitName)
                 newObjName += "_copy"
                 setattr(newObj, keyTraitName, newObjName)
+                # link it to changes in the combo
+                newObj.observe(keyChanged, names=keyTraitName)
                 # add it to the list
                 current.append(newObj)
                 retargetList(current)
