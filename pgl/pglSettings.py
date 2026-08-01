@@ -78,10 +78,20 @@ class pglSettingsManager:
         # and save
         self._saveModifiedSettings(modified, original)
 
+    def isShiftPressed(self):
+        flags = Quartz.CGEventSourceFlagsState(Quartz.kCGEventSourceStateHIDSystemState)
+        return bool(flags & Quartz.kCGEventFlagMaskShift) 
     def _saveModifiedSettings(self, modifiedSettingsList, originalSettingsList):
         '''
         Save only modified settings from a settings list (could be either  pglDispalySettingsList or pglSettingsLIst)
         '''
+
+        # save all settings if shift is pressed
+        saveAll = False
+        if self.isShiftPressed():
+            saveAll = True
+            pglMessages.message("Shift key pressed, saving all settings")
+            
         # save the settings if user clicked OK
         if modifiedSettingsList is not None:
             # for each display in modified list
@@ -90,7 +100,7 @@ class pglSettingsManager:
                 matchingOriginalSettings = next((originalSettings for originalSettings in originalSettingsList.settingsList if originalSettings == modifiedSettings), None)
                 if matchingOriginalSettings is not None:
                     # and if it is not equal (field by field) then save it
-                    if not matchingOriginalSettings.equals(modifiedSettings):
+                    if saveAll or not matchingOriginalSettings.equals(modifiedSettings):
                         # if the name changed, we need to change the name of the directory
                         if modifiedSettings.name != matchingOriginalSettings.name:
                             oldPath = matchingOriginalSettings.saveDir().parent
