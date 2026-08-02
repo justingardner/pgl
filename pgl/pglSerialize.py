@@ -68,11 +68,11 @@ class pglSerialize:
         filename = Path(filename).with_suffix(".json")
 
         if not filename.exists():
-            pglMessages.warning(f"(pglSerialize) File '{filename}' not found.", level=1)
+            pglMessages.warning(f"File {filename} not found.", level=1)
             return None
 
         if not filename.is_file():
-            pglMessages.warning(f"(pglSerialize) '{filename}' is not a file.", level=1)
+            pglMessages.warning(f"{filename} is not a file.", level=1)
             return None
 
         try:
