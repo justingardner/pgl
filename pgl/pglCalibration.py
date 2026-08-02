@@ -12,7 +12,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from ._pglComm import pglSerial
 from .pglBase import printHeader
-from .pglSettings import pglSettings, pglDisplaySettings, pglSettingsManager
+from .pglSettings import pglSettings, pglDisplaySettings, pglSettingsManager, pglTraitSettings
 from traitlets import Unicode, Int, Instance, Dict, Tuple, Float, List
 from datetime import datetime
 from .pglExperiment import pglExperiment
@@ -23,6 +23,7 @@ from scipy.interpolate import interp1d
 from .pglDevice import pglDigitalIODevice, pglAnalogInputDevice, pglAnalogTraceData
 from scipy.io import loadmat
 from .pglMessages import pglMessages
+
 
 ##########################
 # Calibration device class
@@ -917,9 +918,9 @@ class pglDisplayCalibration():
         # save the calibration data
         self.luminanceCalibrationData.save()    
         if self.checkLuminanceCalibrationData(self.luminanceValidationData):
-            self.luminanceValidationData.save()
+            self.luminanceValidationData.save(filename="validation")
         if self.checkLuminanceCalibrationData(self.luminanceGammaValidationData):
-            self.luminanceGammaValidationData.save()
+            self.luminanceGammaValidationData.save(filename="gammaValidation")
         
     @staticmethod
     def chooseCalibrationFilepath(displayName, calibrationType=None, date=None):
@@ -1041,7 +1042,7 @@ class pglDisplayCalibration():
         return(filepath)
 
 # Calibration settings, subclass of pglSettings to inherit load/save functionality
-class pglDisplayTemporalCalibrationData(HasTraits, pglSerialize):
+class pglDisplayTemporalCalibrationData(pglTraitSettings):
     
     settingsName = Unicode("Default", help="Settings name used to open display")
     settings = Instance(pglSettings, allow_none=True, help="Settings used during calibration") 
@@ -1221,7 +1222,7 @@ class pglDisplayTemporalCalibrationData(HasTraits, pglSerialize):
 
         
 # Calibration settings, subclass of pglSettings to inherit load/save functionality
-class pglDisplayLuminanceCalibrationData(HasTraits, pglSerialize):
+class pglDisplayLuminanceCalibrationData(pglTraitSettings):
     
     settingsName = Unicode("Default", help="Settings name used to open display")
     displayInfo = Dict(help="Display information at time of calibration")
@@ -1409,6 +1410,9 @@ class pglDisplayLuminanceCalibrationData(HasTraits, pglSerialize):
             # compute max difference between max and min in percentage
             maxDiff = np.max(np.abs(maxMeasurements - minMeasurements)/measurements * 100)
             print(f"Maximum difference between max and min measurements: {maxDiff:.3f}%")
+        if verbose > 1:
+            super().print()
+            
         
     def display(self, gamma=None, fig=None):
         '''
