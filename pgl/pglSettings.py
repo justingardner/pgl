@@ -69,6 +69,7 @@ class pglSettingsManager:
     def isShiftPressed(self):
         flags = Quartz.CGEventSourceFlagsState(Quartz.kCGEventSourceStateHIDSystemState)
         return bool(flags & Quartz.kCGEventFlagMaskShift) 
+    
     def _saveModifiedSettings(self, modifiedSettingsList, originalSettingsList):
         '''
         Save only modified settings from a settings list (could be either  pglDispalySettingsList or pglSettingsLIst)
@@ -672,7 +673,6 @@ class pglTraitSettings(HasTraits, pglSerialize):
     def _default_uuid(self):
         return str(uuid.uuid4())
     
-        
     def __eq__(self, other):
         '''
         Define equality as when the two traitlet settings share the same uuid
@@ -801,6 +801,25 @@ class pglDisplaySettings(pglTraitSettings):
     luminanceCalibration = List(Unicode(), hasPlotButton=True, buttonFunction="plotLuminanceCalibration", default_value=['None'], help="Which luminance calibration to use")
     temporalCalibration = List(Unicode(), hasPlotButton=True, buttonFunction="plotTemporalCalibration", default_value=['None'], help="Which temporal calibration to use")
     
+    @classmethod
+    def load(cls, filename):
+        '''
+        Load pglDisplaySettings. 
+    
+        Also loads displays list so that it has up to date display settings
+        '''
+        # check if filename exists
+        if not Path(filename).exists():
+            # look for it in the display directory
+            filename = pglSettingsManager.getDisplayDir() / pglBase.makeValidFilename(filename) / "display.json"
+            if not Path(filename).exists():
+                pglMessages.warning(f"File {filename} does not exist")
+                return None
+            
+        # call super function to load all fields
+        cls = super().load(filename)
+        
+        return cls
     def save(self, filename=None):
         '''
         save
@@ -816,7 +835,7 @@ class pglDisplaySettings(pglTraitSettings):
  
         super().save(filename=filename)
         pglMessages.message(f"Saved display settings to {filename}")
-        
+                
     def saveDir(self):
         return pglSettingsManager.getDisplayDir(self) / "display.json"
     
@@ -852,26 +871,27 @@ class pglDisplaySettings(pglTraitSettings):
         
         return True
     
-    def getLuminanceCalibration(self):
+    def getLuminanceCalibration(self, calibrationName=None):
         '''
         get the luminance calibration
         '''
-        if not self.luminanceCalibration or self.luminanceCalibration[0] == 'None':
-            return
-        elif self.luminanceCalibration[0] == 'Latest':
-            # get the latest calibration
-            luminanceCalibrationDir = pglSettingsManager.getDisplayLuminanceCalibrationDir(self)
-            pattern = re.compile(r'^\d{8}(_.*)?$')
-            matches = [p for p in luminanceCalibrationDir.rglob('*') if p.is_dir() and pattern.match(p.name)]
-            if not matches:
-                pglMessages.warning(f"Luminance calibration set to Latest: No luminance calibrations found for {self.name}")
+        if not calibrationName:
+            if not self.luminanceCalibration or self.luminanceCalibration[0] == 'None':
                 return
-            latestCalibrationDir = max(matches, key=lambda p: p.name)
-            calibrationName = latestCalibrationDir.name
-            pglMessages.message(f"Luminance calibration set to Latest: Using {calibrationName} for {self.name}")
-        else:
-            calibrationName = self.luminanceCalibration[0]
-           
+            elif self.luminanceCalibration[0] == 'Latest':
+                # get the latest calibration
+                luminanceCalibrationDir = pglSettingsManager.getDisplayLuminanceCalibrationDir(self)
+                pattern = re.compile(r'^\d{8}(_.*)?$')
+                matches = [p for p in luminanceCalibrationDir.rglob('*') if p.is_dir() and pattern.match(p.name)]
+                if not matches:
+                    pglMessages.warning(f"Luminance calibration set to Latest: No luminance calibrations found for {self.name}")
+                    return
+                latestCalibrationDir = max(matches, key=lambda p: p.name)
+                calibrationName = latestCalibrationDir.name
+                pglMessages.message(f"Luminance calibration set to Latest: Using {calibrationName} for {self.name}")
+            else:
+                calibrationName = self.luminanceCalibration[0]
+        
         # load the calibration
         from .pglCalibration import pglDisplayLuminanceCalibrationData
         luminanceCalibrationDir = pglSettingsManager.getDisplayLuminanceCalibrationDir(self) / calibrationName
@@ -912,26 +932,27 @@ class pglDisplaySettings(pglTraitSettings):
         
         return True
     
-    def getTemporalCalibration(self):
+    def getTemporalCalibration(self, calibrationName=None):
         '''
         get the temporal calibration
         '''
-        if not self.temporalCalibration or self.temporalCalibration[0] == 'None':
-            return
-        elif self.temporalCalibration[0] == 'Latest':
-            # get the latest calibration
-            temporalCalibrationDir = pglSettingsManager.getDisplayTemporalCalibrationDir(self)
-            pattern = re.compile(r'^\d{8}(_.*)?$')
-            matches = [p for p in temporalCalibrationDir.rglob('*') if p.is_dir() and pattern.match(p.name)]
-            if not matches:
-                pglMessages.warning(f"Temporal calibration set to Latest: No temporal calibrations found for {self.name}")
+        if not calibrationName:
+            if not self.temporalCalibration or self.temporalCalibration[0] == 'None':
                 return
-            latestCalibrationDir = max(matches, key=lambda p: p.name)
-            calibrationName = latestCalibrationDir.name
-            pglMessages.message(f"Temporal calibration set to Latest: Using {calibrationName} for {self.name}")
-        else:
-            calibrationName = self.temporalCalibration[0]
-            print(f"Using temporal calibration: {calibrationName}")
+            elif self.temporalCalibration[0] == 'Latest':
+                # get the latest calibration
+                temporalCalibrationDir = pglSettingsManager.getDisplayTemporalCalibrationDir(self)
+                pattern = re.compile(r'^\d{8}(_.*)?$')
+                matches = [p for p in temporalCalibrationDir.rglob('*') if p.is_dir() and pattern.match(p.name)]
+                if not matches:
+                    pglMessages.warning(f"Temporal calibration set to Latest: No temporal calibrations found for {self.name}")
+                    return
+                latestCalibrationDir = max(matches, key=lambda p: p.name)
+                calibrationName = latestCalibrationDir.name
+                pglMessages.message(f"Temporal calibration set to Latest: Using {calibrationName} for {self.name}")
+            else:
+                calibrationName = self.temporalCalibration[0]
+                print(f"Using temporal calibration: {calibrationName}")
            
         # load the calibration
         from .pglCalibration import pglDisplayTemporalCalibrationData
