@@ -331,7 +331,7 @@ class pglSettingsManager:
         '''
         try:
             # get trash directory
-            trashDir = cls.getPGLDir() / "trash"
+            trashDir = cls.getPGLSettingsDir() / "trash"
             if not trashDir.exists():
                 trashDir.mkdir(parents=True, exist_ok=True)
             # create path to move to trash
@@ -348,7 +348,7 @@ class pglSettingsManager:
             return None
         
     @staticmethod       
-    def getPGLDir():
+    def getPGLSettingsDir():
         """
         Get the directory where settings are stored.
 
@@ -378,7 +378,7 @@ class pglSettingsManager:
             str: The directory path where settings are stored.
         """
         # get the settingsDir
-        settingsDir = cls.getPGLDir() / "settings"
+        settingsDir = cls.getPGLSettingsDir() / "settings"
         
         # check if it exists, create if not
         if not settingsDir.exists():
@@ -504,7 +504,7 @@ class pglSettingsManager:
             Path: The directory path where display settings are stored
         """
         # get the main directory for displays
-        displayDir = cls.getPGLDir() / "displays"
+        displayDir = cls.getPGLSettingsDir() / "displays"
         
         # append display specific directory if displaySettings is passed in
         if displaySettings is not None:
@@ -536,7 +536,7 @@ class pglSettingsManager:
             str: The directory path where calibrations are stored
         """
         # get the screenSetttingsDir
-        calibrationsDir = cls.getPGLDir() / "calibrations"
+        calibrationsDir = cls.getPGLSettingsDir() / "calibrations"
         
         # check if it exists, create if not
         if not calibrationsDir.exists():
@@ -667,11 +667,23 @@ class pglTraitSettings(HasTraits, pglSerialize):
     name = Unicode("default", help="", visible=False, enabled=False)
     uuid = Unicode("", help="Universal unique identifier for this setting", visible=False, enabled=False)
     isDefault = Bool(False, help="Whether this is the default settings", visible=False, enabled=False)
+    pglVersion = Unicode("", help="version number of pgl", visible=False, enabled=False)
+    github = Unicode("", help="github revision number", visible=False, enabled=False)
+    version = Unicode("1.0", help="version number of this tratilet", visible=False, enabled=False)
     
     # default uuid
     @default("uuid")
     def _default_uuid(self):
         return str(uuid.uuid4())
+
+    @default("pglVersion")
+    def _default_pglVersion(self):
+        return pglBase.version()
+    
+    @default("github")
+    def _default_github(self):
+        return pglBase.getRepoRevision()
+    
     
     def __eq__(self, other):
         '''

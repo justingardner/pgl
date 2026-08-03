@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from .pglSerialize import pglSerialize
 import re
 from .pglMessages import pglMessages
+from importlib.metadata import version as _pkg_version, PackageNotFoundError
 
 #############
 # Main class
@@ -47,6 +48,7 @@ class pglBase:
     screenHeight = SimpleNamespace(pix = 0, cm = 0.0, deg = 0.0)
     distanceToScreen = SimpleNamespace(cm = 0.0)
     clearScreenColor = [0.0, 0.0, 0.0]
+    frameRate = 0
 
     ################################################################
     # Init Function
@@ -66,8 +68,10 @@ class pglBase:
                 
         # get some directories
         self.homeDir = os.path.expanduser("~")
-        pglDir = inspect.getfile(self.__class__)
-        self.pglDir = os.path.dirname(os.path.dirname(pglDir))
+        self.pglDir = self.getPGLDir()
+        print(self.pglDir)
+        
+        # github status
         
         # get socket path
         self.metalSocketPath = os.path.join(self.homeDir, "Library/Containers/gru.mglMetal/Data")
@@ -109,6 +113,16 @@ class pglBase:
 
         # Print the new verbosity level
         if self._verbose > 0: print(f"(pglBase) Verbosity level set to {self._verbose}")
+
+    ################################################################
+    # getPGLDir
+    ################################################################
+    @classmethod
+    def getPGLDir(cls):
+        pglDir = inspect.getfile(cls)
+        pglDir = os.path.dirname(os.path.dirname(pglDir))
+        return(Path(pglDir))
+
 
     ################################################################
     # Open a screen
@@ -731,12 +745,13 @@ class pglBase:
             self.state = pglState()
             
             # set some fields
+            self.state.pgldir = self.getPGLDir()
+            self.state.version = self.versionDict()
             self.state.screenWidthPixels = self.screenWidth.pix
             self.state.screenHeightPixels = self.screenHeight.pix
             self.state.screenWidthDegrees = self.screenWidth.deg
             self.state.screenHeightDegrees = self.screenHeight.deg
             self.state.frameRate = self.frameRate   
-            self.state.repoRevision = self.getRepoRevision()
             
             # save
             self.state.save(filepath)
@@ -943,16 +958,74 @@ class pglBase:
     #################################################################
     # get the github revision
     #################################################################
-    def getRepoRevision(self):
+    @classmethod
+    def getRepoRevision(cls):
         '''
         Get the github revision        
         '''
         try:
-            result = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True, cwd=self.pglDir)
+            result = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True, cwd=cls.getPGLDir())
             return result.stdout.strip()
-        except subprocess.CalledProcessError:
+        except (subprocess.CalledProcessError, FileNotFoundError, OSError):
             return "Unknown"
-   
+
+    #################################################################
+    # get repo dirty files
+    #################################################################
+    @classmethod
+    def getRepoDirtyFiles(cls):
+        '''
+        Get the list of files with uncommitted changes
+        '''
+        try:
+            result = subprocess.run(
+                ["git", "status", "--porcelain"],
+                capture_output=True, text=True, check=True, cwd=cls.getPGLDir()
+            )
+            # each line looks like " M pgl/pglDraw.py" or "?? newfile.py"
+            return [line[3:] for line in result.stdout.splitlines()]
+        except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+            return []
+    
+    #################################################################
+    # get repo branch
+    #################################################################
+    @classmethod
+    def getRepoBranch(cls):
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                capture_output=True, text=True, check=True, cwd=cls.getPGLDir()
+            )
+            return result.stdout.strip()
+        except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+            return "unknown"
+        
+    #################################################################
+    # get PGL version
+    #################################################################
+    @classmethod
+    def version(cls):
+        try:
+            v = _pkg_version("pgl")
+        except PackageNotFoundError:
+            v = "unknown"
+        return v
+
+    #################################################################
+    # get PGL version dict
+    #################################################################
+    @classmethod
+    def versionDict(cls):
+        return {
+            "version": cls.version(),
+            "github": cls.getRepoRevision(),
+            "dirtyFiles": cls.getRepoDirtyFiles(),
+            "branch": cls.getRepoBranch(),
+            "python": sys.version.split()[0],
+            "platform": platform.platform(),
+            "numpy": np.__version__
+        }
 
 ################
 # getCPUInfo   #
@@ -1080,9 +1153,10 @@ def printHeader(str="", len=80, fillChar="="):
 ##############################################
 @dataclass
 class pglState(pglSerialize):
+    version: dict = field(default_factory=dict)
     screenWidthPixels: int = 0
     screenHeightPixels: int = 0
     screenWidthDegrees: int = 0
     screenHeightDegrees: int = 0
     frameRate: int = 0
-    repoRevision: str = ""
+    
