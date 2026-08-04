@@ -94,7 +94,7 @@ class pglBatch:
         commands have been executed and the display is updated accordingly.
 
         Returns:
-            None
+            flushTimes: array of flushTimes as reported by commandResults
         '''
         if self._batchState != 2:
             print("(pglBatch:batchEnd) ❌ Batch not run. Please run a batch before ending it.")
@@ -110,7 +110,6 @@ class pglBatch:
         # end the profiling
         self._profileModeEnd()
 
-        
         # read command results
         commandResults = self.s.readCommandResults(0, nCommands)
         
@@ -128,3 +127,5 @@ class pglBatch:
 
          # Save the profile information to the profileList
         self.profileList.append(self.profileInfo)
+        
+        return self.profileInfo['flushTimes']

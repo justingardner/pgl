@@ -407,6 +407,7 @@ class pglDisplayCalibration():
         
         # initialize arrays of timestamps
         flushTime = []
+        batchFlushTimes = np.zeros((numRepeats,sum(stimulusDurationFrames)))
         
         # two versions here, one that uses batch to try to display more consistent frames, and the other that just
         # uses regular frame-by-frame updating. Leaving in the latter for debugging / checking
@@ -438,13 +439,13 @@ class pglDisplayCalibration():
                     else:
                         self.pgl.rect(0,0,patchWidth,patchHeight,0);
                     
-                    # flush the screen, recording the time of each flush for later analysis
+                    # flush the screen
                     self.pgl.flush()
             
                 #now that the batch is done, set the digital output and play it
                 self.digitalIODevice.digitalOutputPulse(digitalIOChannel)
                 self.pgl.batchRun()
-                self.pgl.batchEnd()
+                batchFlushTimes[iRepeat,:] = self.pgl.batchEnd()
             
         else:
             flushTime = []
@@ -489,7 +490,13 @@ class pglDisplayCalibration():
         # close full screen
         #pgl.fullScreen(False)
 
+        # process batchFlushTimes to get the frameRate and any dropped frames
+        #for iRepeat in range(numRepeats):
+        #    frameTimes = np.diff(batchFlushTimes[iRepeat])
+        #    print(f"{iRepeat}: {frameTimes}")
+        
         # save data
+        self.temporalCalibrationData.flushTimes = batchFlushTimes
         self.temporalCalibrationData.analogScanRate = scanRate
         self.temporalCalibrationData.frameRate = frameRate
         self.temporalCalibrationData.numRepeats = numRepeats
@@ -1110,6 +1117,7 @@ class pglDisplayTemporalCalibrationData(pglTraitSettings):
     stimulusDurationFrames = List(Int, help="Frames used for each part of stimulus: first number is pre-stimulus black, second number is the actual stimulus duration, third number is post-stimulus black, fourth number is inter-trial interval ")    
     numRepeats = Int(help="Number of repeats of stimulus")
     frameRate = Float(help="Frame rate of display")
+    flushTimes = Instance(np.ndarray, "Matrix of repeats x frames which reports the flush times")
     onsetDelay = Float(allow_none=True, default_value=None, help="delay to frame onset, computed from calibration data")
     
     def display(self, fig=None):
