@@ -301,14 +301,14 @@ class pglDisplayCalibration():
         # open the display with specified settings
         e = pglExperiment(self.pgl, settingsName, settings, displayName, displaySettings)
         if e.isInitialized is False:
-            pglMessages.warning(f"(pglDisplayLuminanceCalibrationData:attachSettings) Could not initialize experiment with settings: {settingsName}")
+            pglMessages.warning(f"Could not initialize experiment with settings: {settingsName}")
             return None
 
         e.settings.closeScreenOnEnd = True
         e.settings.backgroundColor = (0, 0, 0)
         e.initScreen()
         if self.pgl.isOpen() is False:
-            print(f"(pglCalibration:calibrate) Display {settingsName} did not open, cannot calibrate.")
+            pglMessages.warning(f"Display {settingsName} did not open, cannot calibrate.")
             return None
         
         # initialize the data structure for saving data
@@ -392,12 +392,21 @@ class pglDisplayCalibration():
         # setup digital output for sync pulse 
         digitalIOChannel = 0
         self.digitalIODevice.setupDigitalOutput(channel=digitalIOChannel)
+        
+        sendAuxDigitalIO = False
+        if sendAuxDigitalIO:
+            auxDigitalIOChannel = 1
+            self.digitalIODevice.setupDigitalOutput(channel=auxDigitalIOChannel)
 
         # read analog input for a little bit beyond stimulus duration
         startTime = self.pgl.getSecs()
         analogReadDurationSecs = totalDurationSecs + 1.0
-        scanRate = 5000
-        self.analogInputDevice.startAnalogRead(duration=analogReadDurationSecs, channels=['AIN0','AIN1'], range=1.0, scanRate=scanRate, scansPerRead=scanRate)
+        if sendAuxDigitalIO:
+            scanRate = 2000
+            self.analogInputDevice.startAnalogRead(duration=analogReadDurationSecs, channels=['AIN0','AIN1','AIN2'], range=1.0, scanRate=scanRate, scansPerRead=scanRate)
+        else:
+            scanRate = 5000
+            self.analogInputDevice.startAnalogRead(duration=analogReadDurationSecs, channels=['AIN0','AIN1'], range=1.0, scanRate=scanRate, scansPerRead=scanRate)
         self.pgl.waitSecs(0.1)
 
         # display
@@ -444,6 +453,7 @@ class pglDisplayCalibration():
             
                 #now that the batch is done, set the digital output and play it
                 self.digitalIODevice.digitalOutputPulse(digitalIOChannel)
+                if sendAuxDigitalIO: self.digitalIODevice.digitalOutputPulse(auxDigitalIOChannel)
                 self.pgl.batchRun()
                 batchFlushTimes[iRepeat,:] = self.pgl.batchEnd()
             
@@ -481,7 +491,8 @@ class pglDisplayCalibration():
         if analogTraceData:
             print(f"Analog read complete (duration={self.pgl.getSecs() - startTime:.2f} s). Read {analogTraceData.nSamples} samples.")
         else:
-            pglMessages.warning("Calibration failed")
+            pglMessages.warning(f"Calibration failed. This may be because the scanRate: {scanRate} was set to high")
+            
             return
 
         # fix, fix, fix, commenting out to deal with batch
