@@ -396,50 +396,101 @@ class pglDisplayCalibration():
         # read analog input for a little bit beyond stimulus duration
         startTime = self.pgl.getSecs()
         analogReadDurationSecs = totalDurationSecs + 1.0
-        self.analogInputDevice.startAnalogRead(duration=analogReadDurationSecs, channels=['AIN0','AIN1'], range=1.0)
+        scanRate = 5000
+        self.analogInputDevice.startAnalogRead(duration=analogReadDurationSecs, channels=['AIN0','AIN1'], range=1.0, scanRate=scanRate, scansPerRead=scanRate)
         self.pgl.waitSecs(0.1)
 
         # display
         print(f"Total read time: {analogReadDurationSecs:.2f} seconds, (n={numRepeats}, trialLen={trialDurationSecs:.2f} s, totalDuration={totalDurationSecs:.2f} s)")
 
+        useBatch = True
+        
         # initialize arrays of timestamps
         flushTime = []
-        for iRepeat in range(numRepeats):
-            trialStart = True
-            currentFrame = 0
-            self.pgl.rect(0,0,patchWidth,patchHeight,0);
-            
-            # set the digital pulse to be timelocked to the start of stimuls presentation
-            #startFrameTime = pgl.getTargetPresentationTimestamp()
-            #pglLabJack.digitalOutputAtTime(startFrameTime+((1/frameRate)*stimulusDurationFrames[0])/1000, 1, pulseLen=pulseLenMilliseconds)
-            
-            for iFrame in range(sum(stimulusDurationFrames)):
-                # compute which stimulus phase we are in based on the current frame number and the stimulusDurationFrames
-                stimulusPhase = np.searchsorted(np.cumsum(stimulusDurationFrames), iFrame, side='right')
+        
+        # two versions here, one that uses batch to try to display more consistent frames, and the other that just
+        # uses regular frame-by-frame updating. Leaving in the latter for debugging / checking
+        if useBatch:
+            # loop over repeats
+            for iRepeat in range(numRepeats):
+                trialStart = True
 
-                if trialStart and stimulusPhase == 1:
-                    self.digitalIODevice.digitalOutputPulse(digitalIOChannel)
-                    trialStart = False
-
-                # set what color to draw the screen
-                if stimulusPhase == 1:
-                    self.pgl.rect(0,0,patchWidth,patchHeight,1);
-                else:
-                    self.pgl.rect(0,0,patchWidth,patchHeight,0);
+                self.pgl.clearScreen(0)      
+                self.pgl.rect(0,0,patchWidth,patchHeight,0);
+                self.pgl.flush()
                 
-                # flush the screen, recording the time of each flush for later analysis
-                flushTime.append(self.pgl.flush())
+                # set the digital pulse to be timelocked to the start of stimuls presentation
+                #startFrameTime = pgl.getTargetPresentationTimestamp()
+                #pglLabJack.digitalOutputAtTime(startFrameTime+((1/frameRate)*stimulusDurationFrames[0])/1000, 1, pulseLen=pulseLenMilliseconds)
+                
+                # loop over frames in stimulus, creating the batch
+                self.pgl.batchStart()
+                for iFrame in range(sum(stimulusDurationFrames)):
+                    # compute which stimulus phase we are in based on the current frame number and the stimulusDurationFrames
+                    stimulusPhase = np.searchsorted(np.cumsum(stimulusDurationFrames), iFrame, side='right')
+
+                    if trialStart and stimulusPhase == 1:
+                        trialStart = False
+
+                    # set what color to draw the screen
+                    if stimulusPhase == 1:
+                        self.pgl.rect(0,0,patchWidth,patchHeight,1);
+                    else:
+                        self.pgl.rect(0,0,patchWidth,patchHeight,0);
+                    
+                    # flush the screen, recording the time of each flush for later analysis
+                    self.pgl.flush()
+            
+                #now that the batch is done, set the digital output and play it
+                self.digitalIODevice.digitalOutputPulse(digitalIOChannel)
+                self.pgl.batchRun()
+                self.pgl.batchEnd()
+            
+        else:
+            flushTime = []
+            for iRepeat in range(numRepeats):
+                trialStart = True
+                currentFrame = 0
+                
+                self.pgl.rect(0,0,patchWidth,patchHeight,0);
+                
+                # set the digital pulse to be timelocked to the start of stimuls presentation
+                #startFrameTime = pgl.getTargetPresentationTimestamp()
+                #pglLabJack.digitalOutputAtTime(startFrameTime+((1/frameRate)*stimulusDurationFrames[0])/1000, 1, pulseLen=pulseLenMilliseconds)
+                
+                for iFrame in range(sum(stimulusDurationFrames)):
+                    # compute which stimulus phase we are in based on the current frame number and the stimulusDurationFrames
+                    stimulusPhase = np.searchsorted(np.cumsum(stimulusDurationFrames), iFrame, side='right')
+
+                    if trialStart and stimulusPhase == 1:
+                        self.digitalIODevice.digitalOutputPulse(digitalIOChannel)
+                        trialStart = False
+
+                    # set what color to draw the screen
+                    if stimulusPhase == 1:
+                        self.pgl.rect(0,0,patchWidth,patchHeight,1);
+                    else:
+                        self.pgl.rect(0,0,patchWidth,patchHeight,0);
+                    
+                    # flush the screen, recording the time of each flush for later analysis
+                    flushTime.append(self.pgl.flush())
 
         # get analog data
         analogTraceData = self.analogInputDevice.stopAnalogRead(waitToFinish=True)
-        print(f"Analog read complete (duration={self.pgl.getSecs() - startTime:.2f} s). Read {analogTraceData.nSamples} samples.")
+        if analogTraceData:
+            print(f"Analog read complete (duration={self.pgl.getSecs() - startTime:.2f} s). Read {analogTraceData.nSamples} samples.")
+        else:
+            pglMessages.warning("Calibration failed")
+            return
 
-        frameTime = np.median(np.diff(flushTime))*1000
-        print(f"Median frame time: {frameTime:.4f} ms (frame rate: {1000/frameTime:.2f} Hz)")
+        # fix, fix, fix, commenting out to deal with batch
+        #frameTime = np.median(np.diff(flushTime))*1000
+        #print(f"Median frame time: {frameTime:.4f} ms (frame rate: {1000/frameTime:.2f} Hz)")
         # close full screen
         #pgl.fullScreen(False)
 
         # save data
+        self.temporalCalibrationData.analogScanRate = scanRate
         self.temporalCalibrationData.frameRate = frameRate
         self.temporalCalibrationData.numRepeats = numRepeats
         self.temporalCalibrationData.stimulusDurationFrames = stimulusDurationFrames
@@ -1053,6 +1104,7 @@ class pglDisplayTemporalCalibrationData(pglTraitSettings):
     digitalIOdeviceDescription = Unicode("Unknown", help="Desciption of digitalIO measurement device")
     analogInputDescription = Unicode("Unknown", help="Desciption of analog input measurement device")
     analogTraceData = Instance(pglAnalogTraceData, allow_none=True, default_value=None, help="analong measurement from photodiode")
+    analogScanRate = Int(1000, help="The scanRate that the analog data was collected at")
     syncChannel = Int(1, help="Channel with sync pulse on it")     
     syncChannelThreshold = Float(0.2, help="Threshold for considering sync to be active")
     stimulusDurationFrames = List(Int, help="Frames used for each part of stimulus: first number is pre-stimulus black, second number is the actual stimulus duration, third number is post-stimulus black, fourth number is inter-trial interval ")    
@@ -1133,6 +1185,7 @@ class pglDisplayTemporalCalibrationData(pglTraitSettings):
         # draw vertical lines for onset and offset of video frames
         if self.onsetDelay is not None:
             times = [self.onsetDelay + 1000*i/self.frameRate for i in range(self.stimulusDurationFrames[1]+1)]
+            print(f"times: {times}")
             [plt.axvline(x=t, color='red', linestyle='--') for t in times]
 
     def computeFrameOnsetDelay(self):
@@ -1163,8 +1216,8 @@ class pglDisplayTemporalCalibrationData(pglTraitSettings):
         
         # now see when the median trace goes 2 std above the baseline
         onset = np.argmax(cycleData['median'][dataChannel]>(baseline+baselineSTD*6))
-        print(f"baseline: {baseline} baselineSTD: {baselineSTD}")
-        print(f"onset: {onset}")
+        #print(f"baseline: {baseline} baselineSTD: {baselineSTD}")
+        #print(f"onset: {onset}")
         
         # let's refine the search for the onset, by fitting a linear
         # finction and finding the intersection with baseline
@@ -1193,6 +1246,7 @@ class pglDisplayTemporalCalibrationData(pglTraitSettings):
         rightIndex = min(len(cycle) - 1, onset + 2)
 
         # Make sure we have enough points to fit
+        linearFit = False
         if rightIndex - leftIndex < 3:
             print("Warning: fitting window too small, using fallback")
         else:
@@ -1208,17 +1262,21 @@ class pglDisplayTemporalCalibrationData(pglTraitSettings):
             target = baseline + 0.20 * (maxCycle-minCycle)
             if m != 0:
                 onset = (target - c) / m
+                linearFit = True
+
         plt.ion()
         plt.figure(figsize=(14,7))
         plt.plot(cycle, 'k-', label='Median trace', linewidth=1.5)
-        plt.axvline(x=58, color='r', linestyle='--', linewidth=2)
+            #plt.axvline(x=58, color='r', linestyle='--', linewidth=2)
         plt.axvline(x=onset, color='g', linestyle='--', linewidth=2)
-        xLineExtended = np.array([onset, rightIndex])
-        yLineExtended = m * xLineExtended + c
-        plt.plot(xLineExtended, yLineExtended, 'b-', linewidth=2.5, label='Fitted line', alpha=0.8)
-        plt.xlim(onset-10,onset+10)
-    
-        self.onsetDelay = onset
+        if linearFit:
+            xLineExtended = np.array([onset, rightIndex])
+            yLineExtended = m * xLineExtended + c
+            plt.plot(xLineExtended, yLineExtended, 'b-', linewidth=2.5, label='Fitted line', alpha=0.8)
+            plt.xlim(onset-10,onset+10)
+            
+        # return onset in ms (not the scanRate of the analog device)
+        self.onsetDelay = float(onset*1000/self.analogScanRate)
 
         
 # Calibration settings, subclass of pglSettings to inherit load/save functionality

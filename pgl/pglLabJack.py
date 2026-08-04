@@ -270,6 +270,7 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
             data: pglAnalogTraceData which holds time and data
         """
         if self.h is None:
+            pglMessages.warning("Device not initialized")
             return None
 
         # If acquisition is active, request stop when not waiting
@@ -278,6 +279,7 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
 
         # If acquisition thread exists, wait for it to finish
         if self.acquisitionThread is not None and self.acquisitionThread.is_alive():
+            pglMessages.message("waiting for analog acquisition to end")
             self.acquisitionThread.join()
 
         # copy data safely
@@ -285,6 +287,7 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
             data = np.array(self.analogBuffer)
 
         if data.size == 0:
+            pglMessages.warning("No data read")
             return None
 
         # Reshape data to separate channels
