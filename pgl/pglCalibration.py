@@ -1117,7 +1117,7 @@ class pglDisplayTemporalCalibrationData(pglTraitSettings):
     stimulusDurationFrames = List(Int, help="Frames used for each part of stimulus: first number is pre-stimulus black, second number is the actual stimulus duration, third number is post-stimulus black, fourth number is inter-trial interval ")    
     numRepeats = Int(help="Number of repeats of stimulus")
     frameRate = Float(help="Frame rate of display")
-    flushTimes = Instance(np.ndarray, "Matrix of repeats x frames which reports the flush times")
+    flushTimes = Instance(np.ndarray, allow_none=True, default_value=None, help="Matrix of repeats x frames which reports the flush times")
     onsetDelay = Float(allow_none=True, default_value=None, help="delay to frame onset, computed from calibration data")
     
     def display(self, fig=None):
