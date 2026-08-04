@@ -756,7 +756,6 @@ class _pglTraitsDialog(QDialog):
 
     # ----- Int -----
     def _addInt(self, traitName, trait, current, helpText, settingsObject, layout=None, settingsKey=None):
-        print("INT")
         spin = QDoubleSpinBox()
         spin.setAlignment(Qt.AlignCenter) 
         spin.setDecimals(0)
