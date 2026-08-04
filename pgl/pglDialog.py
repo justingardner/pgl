@@ -64,28 +64,32 @@ class _pglTraitsDialog(QDialog):
     def __init__(self, settings, parent=None, title="Settings"):
         super().__init__(parent)
 
-        # copy the settings so the original is untouched until OK
-        self.settings = copy.deepcopy(settings)
+        try:
+            # copy the settings so the original is untouched until OK
+            self.settings = copy.deepcopy(settings)
 
-        # give the copy a back-reference to this dialog
-        self.settings._dialog = self
+            # give the copy a back-reference to this dialog
+            self.settings._dialog = self
 
-        # maps traitName -> {'widget', 'row', 'label'} for the trait API
-        self.traitWidgets = {}
+            # maps traitName -> {'widget', 'row', 'label'} for the trait API
+            self.traitWidgets = {}
 
-        # keep track of whether we are pushing values into widgets so that
-        # we do not create feedback loops when the trait observer fires
-        self._updatingWidget = False
+            # keep track of whether we are pushing values into widgets so that
+            # we do not create feedback loops when the trait observer fires
+            self._updatingWidget = False
 
-        # dialog result flag
-        self.accepted_ = False
+            # dialog result flag
+            self.accepted_ = False
 
-        # window setup
-        self.setWindowTitle(title)
-        self.setStyleSheet(self._darkStyle())
+            # window setup
+            self.setWindowTitle(title)
+            self.setStyleSheet(self._darkStyle())
 
-        # build the interface
-        self._buildUI()
+            # build the interface
+            self._buildUI()
+        except Exception as e:
+            print(f"Error creating traitsDialog: {e}")
+
 
     #########################################
     # Public entry point
@@ -274,7 +278,11 @@ class _pglTraitsDialog(QDialog):
         
         # a settings list
         elif isinstance(trait, List) and "settingsListKey" in trait.metadata:
-            self._addSettingsList(traitName, trait, current, helpText, settingsObject, layout, settingsKey)
+            if not current:
+                # if empty list just move on
+                return
+            else:
+                self._addSettingsList(traitName, trait, current, helpText, settingsObject, layout, settingsKey)
         
         # Float with min and max -> slider + spinbox
         elif isinstance(trait, Float) and trait.min is not None and not math.isinf(trait.max) and not math.isinf(trait.min):
@@ -321,7 +329,6 @@ class _pglTraitsDialog(QDialog):
     _selectedSettings = {}
     def _addSettingsList(self, traitName, trait, current, helpText,
                         settingsObject, layout=None, settingsKey=None):
-
         # get metadata settings
         keyTraitName = trait.metadata["settingsListKey"]
         hideKey = trait.metadata.get("hideKey", False)
@@ -749,6 +756,7 @@ class _pglTraitsDialog(QDialog):
 
     # ----- Int -----
     def _addInt(self, traitName, trait, current, helpText, settingsObject, layout=None, settingsKey=None):
+        print("INT")
         spin = QDoubleSpinBox()
         spin.setAlignment(Qt.AlignCenter) 
         spin.setDecimals(0)
