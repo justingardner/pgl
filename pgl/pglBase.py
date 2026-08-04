@@ -69,7 +69,6 @@ class pglBase:
         # get some directories
         self.homeDir = os.path.expanduser("~")
         self.pglDir = self.getPGLDir()
-        print(self.pglDir)
         
         # github status
         
