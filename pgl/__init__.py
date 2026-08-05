@@ -27,7 +27,7 @@ from .pglMessages import pglMessages
 from .pglPipeline import pglChooseSession
 
 # Device specific imports (eye trackers, etc.)
-from .pglVPixx import pglProPixx, pglDataPixx
+from .pglVPixx import pglProPixx, pglDataPixx, pglDataPixxDigitalIODevice
 from .pglTrackPixx import pglTrackPixx3
 from .pglLabJack import pglLabJack
 from .pglEyelink import pglEyelinkData

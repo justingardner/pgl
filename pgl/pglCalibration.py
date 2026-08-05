@@ -393,7 +393,7 @@ class pglDisplayCalibration():
         digitalIOChannel = 0
         self.digitalIODevice.setupDigitalOutput(channel=digitalIOChannel)
         
-        sendAuxDigitalIO = False
+        sendAuxDigitalIO = True
         if sendAuxDigitalIO:
             auxDigitalIOChannel = 1
             self.digitalIODevice.setupDigitalOutput(channel=auxDigitalIOChannel)

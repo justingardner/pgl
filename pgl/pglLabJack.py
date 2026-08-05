@@ -102,9 +102,9 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
             
         try:    
             # Set as digital output (direction = 1 for output)
-            self.ljm.eWriteName(self.h, f"{self.digitalChannels[channel](0)}", 1)
+            self.ljm.eWriteName(self.h, f"{self.digitalChannels[channel]["name"]}", 1)
             # Set initial state to LOW
-            self.ljm.eWriteName(self.h, self.digitalChannels[-1], 0)
+            self.ljm.eWriteName(self.h, self.digitalChannels[channel]["name"], 0)
             print(f"(pglLabJack:setupDigitalOutput) {self.digitalChannels[channel]["name"]} configured as output, set to LOW")
         except Exception as e:
             print(f"(pglLabJack:setupDigitalOutput) Error setting up {self.digitalChannels[channel]["name"]}: {e}")

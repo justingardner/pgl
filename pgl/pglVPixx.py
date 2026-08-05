@@ -621,7 +621,10 @@ class pglDataPixxDigitalIODevice(pglDigitalIODevice):
         except ImportError: 
             pglMessages.warning("pypixxlib is not installed. Please install it to use DataPixx.")            
             return        
-        
+
+        # no configured triggers
+        self.triggers = None
+
         # open as DPx
         self.openDPx()
         
@@ -709,16 +712,16 @@ class pglDataPixxDigitalIODevice(pglDigitalIODevice):
         """
         try:
             # get error
-            errorNum = dp.DPxGetError()
+            errorNum = self.dp.DPxGetError()
             if errorNum != 0:
-                errorStr = dp.DPxGetErrorString()
+                errorStr = self.dp.DPxGetErrorString()
                 pglMessages.warning(f"DataPixx error {errorNum}: {errorStr}")
 
             # clear error
-            dp.DPxClearError()
+            self.dp.DPxClearError()
             pglMessages.message("(pglDataPixx:getError) Error state cleared.")
             
-            if dp.DPxIs5VFault(): pglMessages.warning("5V fault detected.")
+            if self.dp.DPxIs5VFault(): pglMessages.warning("5V fault detected.")
             
             
         except Exception as e:
@@ -825,11 +828,34 @@ class pglDataPixxDigitalIODevice(pglDigitalIODevice):
         # register the triggers, note the hardcoded address here - this is in the sample code - eeks
         self.triggers = self._configureDigitalOutputs(triggers, currentAddress=int(8e6))        
 
- 
+
+    def setupDigitalOutput(self, channel=0, pulseLen = 1):
+        self.configureDigitalOutputs()
+
+    def digitalOutputPulse(self, channel=0):
+        '''
+        Send a digital output pulse on channel
+
+        Implementations should check self.digitalOutputConfigured first.
+
+        Args:
+            channel (int or str): Digitial channel number or name, needs to be configured
+
+        Returns:
+            timestamp (float or None): Timestamp when output was set,
+                                       or None on error.
+        '''
+        if not self.triggers:
+            pglMessages.warning("Triggers are not configured, run setupDigitalOutput")
+            return
+
+        # send the specified trigger
+        self._sendTrigger("stimulusOn")
+    
     ################################################################
     # send a digital trigger, 
     ################################################################
-    def sendTrigger(self, eventName, delay=0.0, samplingRate=1000):
+    def _sendTrigger(self, eventName, delay=0.0, samplingRate=1000):
         """
         Sends a digital trigger signal based on the provided dictionary entry.
         
@@ -845,7 +871,7 @@ class pglDataPixxDigitalIODevice(pglDigitalIODevice):
         # get the entry
         entry = self.triggers.get(eventName, None)
         if entry is None:
-            print(f"(pglDataPixx: sendTrigger) Could not find {eventName} in configured triggers.")
+            pglMessages.warning(f"Could not find {eventName} in configured triggers.")
             return
         
         # Determine the length of the signal (number of bits) for scheduling purposes
@@ -866,4 +892,4 @@ class pglDataPixxDigitalIODevice(pglDigitalIODevice):
 
         # Start the digital output schedule to send the trigger signal
         self.dp.DPxStartDoutSched()
-  
+        self.dp.DPxWriteRegCache()
