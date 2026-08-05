@@ -402,11 +402,11 @@ class pglDisplayCalibration():
         startTime = self.pgl.getSecs()
         analogReadDurationSecs = totalDurationSecs + 1.0
         if sendAuxDigitalIO:
-            scanRate = 2000
-            self.analogInputDevice.startAnalogRead(duration=analogReadDurationSecs, channels=['AIN0','AIN1','AIN2'], range=1.0, scanRate=scanRate, scansPerRead=scanRate)
+            scanRate = 1500
+            self.analogInputDevice.startAnalogRead(duration=analogReadDurationSecs, channels=['AIN0','AIN1','AIN2'], voltageRange=10.0, scanRate=scanRate, scansPerRead=scanRate)
         else:
-            scanRate = 5000
-            self.analogInputDevice.startAnalogRead(duration=analogReadDurationSecs, channels=['AIN0','AIN1'], range=1.0, scanRate=scanRate, scansPerRead=scanRate)
+            scanRate = 3000
+            self.analogInputDevice.startAnalogRead(duration=analogReadDurationSecs, channels=['AIN0','AIN1'], voltageRange=10.0, scanRate=scanRate, scansPerRead=scanRate)
         self.pgl.waitSecs(0.1)
 
         # display

@@ -138,7 +138,7 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
         
         return pglTimestamp.getSecs()
           
-    def startAnalogRead(self, duration=2, channels=[0], scanRate=1000, scansPerRead=1000, range=10.0):
+    def startAnalogRead(self, duration=2, channels=[0], scanRate=1000, scansPerRead=1000, voltageRange=10.0):
         '''
         Start analog input reading from specified channels.
         
@@ -147,7 +147,7 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
             channels (list): List of channel numbers or names
             scanRate (int): Sampling rate in Hz
             scansPerRead (int): Number of scans per read operation
-            range (float): Voltage range for analog inputs. Options: 10.0V, 1.0V, 0.1V, 0.01V
+            voltageRange (float): Voltage range for analog inputs. Options: 10.0V, 1.0V, 0.1V, 0.01V
 
         '''
         if self.h is None:
@@ -164,13 +164,13 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
         
         # validate range 
         validRanges = [10.0, 1.0, 0.1, 0.01]
-        if range not in validRanges:
-            print(f"(pglLabJack:startAnalogRead) Invalid range {range}V. Valid options: {validRanges}")
+        if voltageRange not in validRanges:
+            print(f"(pglLabJack:startAnalogRead) Invalid range {voltageRange}V. Valid options: {validRanges}")
             return
         try:
             # set each channel to the specified range
             for channel in channelAddresses:
-                self.ljm.eWriteName(self.h, f"{channel}_RANGE", range)
+                self.ljm.eWriteName(self.h, f"{channel}_RANGE", voltageRange)
         except Exception as e:
             print(f"(pglLabJack:startAnalogRead) Error setting range: {e}")
             return
@@ -179,7 +179,7 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
         self.channels = channelAddresses
         self.scanRate = scanRate
         self.scansPerRead = scansPerRead
-        self.range = range
+        self.range = voltageRange
         self.analogStreamDuration = duration
 
         # derived parameters
