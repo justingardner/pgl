@@ -28,6 +28,7 @@ from .pglSerialize import pglSerialize
 import re
 from .pglMessages import pglMessages
 from importlib.metadata import version as _pkg_version, PackageNotFoundError
+import functools
 
 #############
 # Main class
@@ -958,6 +959,7 @@ class pglBase:
     # get the github revision
     #################################################################
     @classmethod
+    @functools.lru_cache(maxsize=1)
     def getRepoRevision(cls):
         '''
         Get the github revision        
@@ -990,6 +992,7 @@ class pglBase:
     # get repo branch
     #################################################################
     @classmethod
+    @functools.lru_cache(maxsize=1)
     def getRepoBranch(cls):
         try:
             result = subprocess.run(
