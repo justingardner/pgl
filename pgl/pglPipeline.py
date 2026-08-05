@@ -15,6 +15,9 @@ from datetime import datetime
 from traitlets import HasTraits, Float, Int, List, Tuple, TraitError, Unicode, Dict, default, link, Bool, TraitType, Instance
 from enum import Enum, auto
 import fsspec
+from pathlib import Path
+import re
+from .pglExperiment import pglExperimentData
 
 ##########################
 # pglDataPort
@@ -189,43 +192,135 @@ class pglChooseLevel(pglTraitSettings):
     subject, run, ...). Subclasses just declare which class their
     children are; discovery logic itself lives here
     '''
-    name = Unicode("", help="Name of this level (experiment name, subjectID, etc.)")
+    name = Unicode("", help="Name of this level (experiment name, subjectID, etc.)", visible=False)
     childList = List(Instance(pglTraitSettings), settingsListKey="name", help="List of child levels found under this one")
-    
     # subclasses override this with the class to instantiate for each
     # child directory found; None means this is a leaf level (no
     # further recursion into subdirectories)
     childClass = None
 
-    def __init__(self, name="", dataDir="", filesystem=None):
+    def __init__(self, name="", dataDir="", filesystem=None, entries=None):
         super().__init__()
 
         self.name = name
         self.dataDir = dataDir
         self.filesystem = filesystem if filesystem is not None else fsspec.filesystem("file")
+        self.childList = self._getChildren(entries) if self.childClass is not None else []
 
-        self.childList = self._getChildren() if self.childClass is not None else []
+    @classmethod
+    def create(cls, name="", dataDir="", filesystem=None):
+        '''
+        Factory method: validates that dataDir qualifies as this
+        level (via _isValid), then builds the instance and, for
+        non-leaf levels, checks that it actually ended up with at
+        least one valid child. A level with no valid children isn't
+        considered valid itself (e.g. a subject directory with no
+        valid runs isn't really a subject). Returns None if either
+        check fails, otherwise returns the fully-built instance.
+        '''
+        filesystem = filesystem if filesystem is not None else fsspec.filesystem("file")
+        try:
+            entries = filesystem.ls(dataDir, detail=True)
+        except (FileNotFoundError, OSError):
+            return None
+        
+        if not cls._isValid(name=name, dataDir=dataDir, entries=entries):
+            return None
 
-    def _getChildren(self):
+        instance = cls(name=name, dataDir=dataDir, filesystem=filesystem, entries=entries)
+
+        # leaf levels have no children to check; only enforce the
+        # "must have at least one valid child" rule on levels that
+        # actually recurse
+        if cls.childClass is not None and len(instance.childList) == 0:
+            return None
+
+        return instance
+
+    @classmethod
+    def _isValid(cls, name=None, dataDir=None, filesystem=None, entries=None):
+        '''
+        Subclass-overrideable check for whether dataDir qualifies as
+        this level based on its own properties (name pattern, presence
+        of a specific file, etc). Default: always valid.
+        '''
+        return True
+
+    def _getChildren(self, entries):
         '''
         Find all directories directly under dataDir and instantiate
-        one childClass instance per directory found.
+        one childClass instance per directory that passes validation
+        (including the "has valid children" check, if applicable).
         '''
+    
+        if entries is None:
+            entries = self.filesystem.ls(self.dataDir, detail=True)
+
         children = []
-        for entry in self.filesystem.ls(self.dataDir, detail=True):
+        for entry in entries:
             if entry["type"] != "directory":
                 continue
             childName = entry["name"].rstrip("/").split("/")[-1]
-            
-            children.append(
-                self.childClass(name=childName, dataDir=entry["name"], filesystem=self.filesystem)
-            )
+            child = self.childClass.create(name=childName, dataDir=entry["name"], filesystem=self.filesystem)
+            if child is not None:
+                children.append(child)
         return children
+        
+#    luminanceCalibration = List(Unicode(), hasPlotButton=True, buttonFunction="plotLuminanceCalibration", default_value=['None'], help="Which luminance calibration to use")
 
+from .pglExperiment import pglExperimentBase
+class pglRun(pglExperimentBase):
+    def __init__(self, dataDir):
+        '''
+        Initialize the pglExperimentAnalysis class.
+        
+        Args:
+            subjectID (str): The identifier for the subject participating in the experiment.
+            ExperimentName (str): The name of the experiment to load.
+        '''
+        # init super
+        super().__init__()
+
+        # load the experimentName
+        self.load(dataDir=dataDir)
+ 
 class pglChooseRun(pglChooseLevel):
+    # this is the root, so no more recursion beyond this point
     childClass = None
+
+    date = Unicode("", help="Date the run was collected")
+    experimenter = Unicode("", help="Who ran the session")
+    stimulusType = Unicode("", help="Stimulus type used for this run")
+
+    requiredFiles = ["settings.json", "data.json", "state.json", "pgl.json", "experimentSettings.json"]
+
+    @classmethod
+    def _isValid(cls, name=None, dataDir=None, filesystem=None, entries=None):
+        foundNames = {Path(entry["name"]).name for entry in entries}
+        return all(requiredFile in foundNames for requiredFile in cls.requiredFiles)
+    
+    def __init__(self, name="", dataDir="", filesystem=None, entries=None):
+        super().__init__(name=name, dataDir=dataDir, filesystem=filesystem, entries=entries)
+        self._load(dataDir)
+
+    def _load(self,dataDir):
+        '''
+        '''
+        # load data
+        self.run= pglRun(dataDir)
+        self.run.print()
+        
+        
+        
 class pglChooseSubject(pglChooseLevel):
     childClass = pglChooseRun
+    
+    @classmethod
+    def _isValid(cls, name=None, dataDir=None, filesystem=None, entries=None):
+        # check whether it is a directory of form sXXXXX
+        lastDir = Path(dataDir).name
+        return bool(re.match(r"^s\d+$", lastDir))
+    
 class pglChooseExperiment(pglChooseLevel):
     childClass = pglChooseSubject
 class pglChooseSession(pglChooseLevel):
