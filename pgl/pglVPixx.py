@@ -9,9 +9,11 @@
 # Import modules
 #############
 #from pgl import pglEvent
-from .pglDevice import pglDevice
+from .pglDevice import pglDevice, pglDigitalIODevice
 from .pglEvent import pglEvent
+from .pglMessages import pglMessages
 import numpy as np
+
 
 ###################################
 # DataPixx device
@@ -41,7 +43,7 @@ class pglDataPixx(pglDevice):
             from pypixxlib.datapixx import DATAPixx3
             from pypixxlib import _libdpx as dp
         except ImportError: 
-            print("(pglDataPixx) pypixxlib is not installed. Please install it to use DataPixx.")
+            pglMessages.warning("pypixxlib is not installed. Please install it to use DataPixx.")
             return
 
         # keep reference to library
@@ -72,9 +74,6 @@ class pglDataPixx(pglDevice):
         # start logging
         self.device.din.startDinLog()
         self.device.updateRegisterCache()
-
-        # open as DPx
-        self.openDPx()
 
     
     def __del__(self):
@@ -169,54 +168,7 @@ class pglDataPixx(pglDevice):
             # return all the events
             return(events)
 
-    ################################################################
-    # open device for low0level DPx ibrary
-    ################################################################
-    def openDPx(self):
-        '''
-        Open datapixx device using DPx
-        '''
-        self.dp.DPxOpen()
-        if not self.dp.DPxIsReady():
-            self.getError()
-            return
-
-        # print status
-        print(f"(pglDataPixx): Opened DataPixx with firmware version: {self.dp.DPxGetFirmwareRev()}")
-        print(f"(pglDataPixx): Current pixel mode: {self.dp.DPxIsDoutPixelMode()}")
-        print(f"(pglDataPixx): DAC scheudle: {self.dp.DPxIsDacSchedRunning()}")
-        
-    ################################################################
-    # close device for low-level DPX library
-    ################################################################
-    def closeDPx(self):
-        '''
-        Close datapixx device using DPx
-        '''
-        try:
-            # close
-            self.dp.DPxClose()
-
-            print("(pglDataPixx) Closed DataPixx DPx")
-        except Exception as e:
-            self.getError()
-
-    ################################################################
-    # clear schedules
-    ################################################################
-    def stopDPxSchedules(self):
-        # close schedules
-        self.dp.DPxDisableDoutPixelMode()
-        self.dp.DPxDisableDoutPixelModeB()
-        self.dp.DPxDisableDoutPixelModeGB()
-        
-        # stop all schedules
-        self.dp.DPxStopAllScheds()
-        
-        # write changes 
-        self.dp.DPxWriteRegCache()
-
-    ################################################################
+   ################################################################
     # setup digital output
     ################################################################
     def setupDigitalOutput(self):
@@ -238,36 +190,13 @@ class pglDataPixx(pglDevice):
         self.enableButtonSchedules()
 
         # enable pixel mode
-        self.enablePixelMode()
+        #self.enablePixelMode()
 
         #self.closeDPx()
 
         print("(pglDataPixx:enableButtonSchedules) DataPixx digital output setup complete.")
 
-    ################################################################
-    # enablePixelMode: Modified from VPIxx example code
-    ################################################################
-    def enablePixelMode(self):
-        """
-        Enable pixel mode for the DataPixx device.
-        
-        This method enables the pixel mode for the DataPixx device, allowing it to control pixel-level output.
-        """
-        # Check that we have a device
-        if self.device is None or self.currentStatus==-1:
-            print("(pglDataPixx:enablePixelMode) DataPixx device is not initialized.")
-            return
-        
 
-        # Enable pixel mode
-        self.dp.DPxEnableDoutPixelModeB()
-        #self.dp.DPxEnableDoutPixelModeGB()
-        #self.dp.DPxEnableDoutPixelMode()
-        self.dp.DPxWriteRegCache()
-
-        print("(pglDataPixx:enablePixelMode) Pixel mode enabled.")
-
- 
     ################################################################
     # getError: Modified from VPIxx example code
     ################################################################
@@ -488,155 +417,7 @@ class pglDataPixx(pglDevice):
         self.dp.DPxSetDoutButtonSchedulesMode(2)
         self.dp.DPxWriteRegCache()
 
-    ################################################################
-    # enableVsyncTrigger: Modified from VPIxx example code
-    ################################################################
-    def enableVsyncTrigger(self):
-        """
-        Enable vsync trigger for ProPixx
-        
-        This method enables the vsync trigger for the ProPixx device
-        """
-        print("(pglDataPixx:enableVsyncTrigger) vsync trigger enabled.")
-
-        # Initialize the device
-        #self.openDPx()
-
-        # stop currently running schedules
-        self.stopDPxSchedules()
-
-        # setup schedule
-        base_address = self.dp.DPxGetDoutBuffBaseAddr()
-        buffer_dout = [0xFFFF, 0]
-        self.dp.DPxSetDoutBuff(base_address, 4)
-        self.dp.DPxWriteRam(base_address, buffer_dout)
-        self.dp.DPxSetDoutSched(0, 2, 'video', 0) 
-
-        # updae cache
-        self.dp.DPxUpdateRegCache()
-
-        # start schedule
-        self.dp.DPxStartDoutSched()
-        self.dp.DPxUpdateRegCache()
-
-        # Close 
-        #self.closeDPx()
-
-    ################################################################
-    # configureDigitialOuptut, adapted form vpixx documentation
-    ################################################################
-    def _configureDigitalOutputs(self, configDict, currentAddress):
-        """
-        Configures digital outputs based on the provided trigger dictionary and
-        assigns a memory address. Each signal's bits are shifted according to the
-        specified output channel, and then written to the VPixx hardware memory.
-        
-        Parameters:
-            configDict (dict): Dictionary with entries in the format:
-                {
-                    'eventName': {'signal': [0, 1, 0, ...], 'channel': int
-                    }
-                }
-                Where the eventName is an aribtrary string to use to trigger the event
-                the signal is the shape of the digitial pulse (e.g. 0, 1, 0 starts at 0
-                rises to 1 and falls back to 0 when triggered)
-                channel is the digitial channel that will be written
-            currentAddress (int): The starting memory address for storing signal
-                                data.
-        
-        Returns:
-            configDict (dict): The updated dictionary with assigned memory addresses
-                                for each event.
-        """
-        # Loop through each event in the configuration dictionary
-        for event, details in configDict.items():
-            
-            # Ensure the currentAddress is even; if it's odd, increment by 1
-            if currentAddress % 2 != 0:
-                currentAddress += 1
-                
-            details['address'] = currentAddress
-            channel = details.get('channel')
-            signal = details.get('signal', [])
-            signalLength = len(signal)
-            
-            # Shift each bit in the signal to the left by the value of the channel.
-            # This positions the bit correctly for the digital output channel.
-            toggledSignal = [(bit << channel) for bit in signal]
-            
-            # Write the modified signal (toggledSignal) into the VPixx hardware memory
-            # at the specified address.
-            self.dp.DPxWriteRam(currentAddress, toggledSignal)
-            
-            print(f"Configured: {event} is {signal} on DOut channel {channel}")
-            
-            # Update the current memory address by adding the length of the signal.
-            # Important to multiply by 2 to reserve enough space.
-            currentAddress += signalLength * 2
-        
-        # After configuring all events, commit changes to the register cache of the
-        # hardware
-        self.dp.DPxWriteRegCache()
-        
-        return configDict
-
-    ################################################################
-    # configure the digital outputs, calls internal function
-    ################################################################
-    def configureDigitalOutputs(self):
-        '''
-        Configures some triggerst that can be sent using sendTrigger
-        '''
-        # set up triggers
-        triggers = {
-            "stimulusOn": {"signal": [1, 0], "channel": 8},
-            "stimulusOff": {"signal": [1, 0], "channel": 1},
-        }
-
-        # register the triggers, note the hardcoded address here - this is in the sample code - eeks
-        self.triggers = self._configureDigitalOutputs(triggers, currentAddress=int(8e6))        
-
-    ################################################################
-    # send a digital trigger, 
-    ################################################################
-    def sendTrigger(self, eventName, delay=0.0, samplingRate=1000):
-        """
-        Sends a digital trigger signal based on the provided dictionary entry.
-        
-        Parameters:
-            entry (dict): A dictionary entry containing keys 'signal', 'channel',
-                        and 'address'.
-            delay (float): Delay (in seconds) before the trigger signal starts
-                        (default is 0.0).
-            samplingRate (int): Sampling rate in Hz for the digital output (default
-                                is 10).
-        """
-
-        # get the entry
-        entry = self.triggers.get(eventName, None)
-        if entry is None:
-            print(f"(pglDataPixx: sendTrigger) Could not find {eventName} in configured triggers.")
-            return
-        
-        # Determine the length of the signal (number of bits) for scheduling purposes
-        signalLength = len(entry.get('signal', []))
-        
-        # Retrieve the memory address for this signal from the entry
-        address = entry.get('address')
-        
-        # Schedule the digital output signal on the hardware:
-        # - delay: when to start the signal,
-        # - samplingRate: how often to sample the signal,
-        # - signal_length: the duration of the signal,
-        # - address: the location in memory where the signal is stored.
-        self.dp.DPxSetDoutSchedule(delay, samplingRate, signalLength, address)
-
-        #self.dp.DPxSetDoutSchedRate(1,'video')
-        self.dp.DPxSetDoutSchedRate(1000,'hz')
-
-        # Start the digital output schedule to send the trigger signal
-        self.dp.DPxStartDoutSched()
-    ################################################################
+   ################################################################
     # test function, can be removed once working
     ################################################################
     def test(self):
@@ -824,3 +605,265 @@ class pglEventResponsePixx(pglEvent):
             str: String representation of the instance.
         '''
         return f"(pglEventResponsePixx) Code: {self.code}, ID: {self.id}, Device Time: {self.deviceTime}"
+
+###################################
+# Use datapixx as Digital IO
+###################################
+class pglDataPixxDigitalIODevice(pglDigitalIODevice):
+    '''
+    send digital pulses with DataPixx
+    '''
+    def __init__(self):
+        # get library
+        try:
+            from pypixxlib import _libdpx as dp
+            self.dp = dp
+        except ImportError: 
+            pglMessages.warning("pypixxlib is not installed. Please install it to use DataPixx.")            
+            return        
+        
+        # open as DPx
+        self.openDPx()
+        
+    ################################################################
+    # open device for low0level DPx ibrary
+    ################################################################
+    def openDPx(self):
+        '''
+        Open datapixx device using DPx
+        '''
+        self.dp.DPxOpen()
+        if not self.dp.DPxIsReady():
+            self.getError()
+            return
+
+        # print status
+        pglMessages.message(f"Opened DataPixx with firmware version: {self.dp.DPxGetFirmwareRev()}")
+        pglMessages.message(f"Current pixel mode: {self.dp.DPxIsDoutPixelMode()}")
+        pglMessages.message(f"DAC schedule: {self.dp.DPxIsDacSchedRunning()}")
+        
+    
+    ################################################################
+    # close device for low-level DPX library
+    ################################################################
+    def closeDPx(self):
+        '''
+        Close datapixx device using DPx
+        '''
+        try:
+            # close
+            self.dp.DPxClose()
+
+            pglMessages.message("Closed DataPixx DPx")
+        except Exception as e:
+            self.getError()
+
+    ################################################################
+    # clear schedules
+    ################################################################
+    def stopDPxSchedules(self):
+        # close schedules
+        self.dp.DPxDisableDoutPixelMode()
+        self.dp.DPxDisableDoutPixelModeB()
+        self.dp.DPxDisableDoutPixelModeGB()
+        
+        # stop all schedules
+        self.dp.DPxStopAllScheds()
+        
+        # write changes 
+        self.dp.DPxWriteRegCache()
+
+    ################################################################
+    # enablePixelMode: Modified from VPIxx example code
+    ################################################################
+    def enablePixelMode(self):
+        """
+        Enable pixel mode for the DataPixx device.
+        
+        This method enables the pixel mode for the DataPixx device, allowing it to control pixel-level output.
+        """
+        # Check that we have a device
+        if self.device is None or self.currentStatus==-1:
+            pglMessages.warning("DataPixx device is not initialized.",level=1)
+            return
+        
+
+        # Enable pixel mode
+        self.dp.DPxEnableDoutPixelModeB()
+        #self.dp.DPxEnableDoutPixelModeGB()
+        #self.dp.DPxEnableDoutPixelMode()
+        self.dp.DPxWriteRegCache()
+
+        pglMessages.message("Pixel mode enabled.")
+
+ 
+    ################################################################
+    # getError: Modified from VPIxx example code
+    ################################################################
+    def getError(self):
+        """
+        Gets any error from the DataPixx device and prints out the message
+        
+        Will return 0 if no error or the error number if there is an error
+
+        """
+        try:
+            # get error
+            errorNum = dp.DPxGetError()
+            if errorNum != 0:
+                errorStr = dp.DPxGetErrorString()
+                pglMessages.warning(f"DataPixx error {errorNum}: {errorStr}")
+
+            # clear error
+            dp.DPxClearError()
+            pglMessages.message("(pglDataPixx:getError) Error state cleared.")
+            
+            if dp.DPxIs5VFault(): pglMessages.warning("5V fault detected.")
+            
+            
+        except Exception as e:
+            pglMessages.warning(f"Could not get error state: {e}")
+     ################################################################
+    # enableVsyncTrigger: Modified from VPIxx example code
+    ################################################################
+    def enableVsyncTrigger(self):
+        """
+        Enable vsync trigger for ProPixx
+        
+        This method enables the vsync trigger for the ProPixx device
+        """
+        pglMessages.message("(pglDataPixx:enableVsyncTrigger) vsync trigger enabled.")
+
+        # stop currently running schedules
+        self.stopDPxSchedules()
+
+        # setup schedule
+        base_address = self.dp.DPxGetDoutBuffBaseAddr()
+        buffer_dout = [0xFFFF, 0]
+        self.dp.DPxSetDoutBuff(base_address, 4)
+        self.dp.DPxWriteRam(base_address, buffer_dout)
+        self.dp.DPxSetDoutSched(0, 2, 'video', 0) 
+
+        # updae cache
+        self.dp.DPxUpdateRegCache()
+
+        # start schedule
+        self.dp.DPxStartDoutSched()
+        self.dp.DPxUpdateRegCache()
+
+    ################################################################
+    # configureDigitialOuptut, adapted form vpixx documentation
+    ################################################################
+    def _configureDigitalOutputs(self, configDict, currentAddress):
+        """
+        Configures digital outputs based on the provided trigger dictionary and
+        assigns a memory address. Each signal's bits are shifted according to the
+        specified output channel, and then written to the VPixx hardware memory.
+        
+        Parameters:
+            configDict (dict): Dictionary with entries in the format:
+                {
+                    'eventName': {'signal': [0, 1, 0, ...], 'channel': int
+                    }
+                }
+                Where the eventName is an aribtrary string to use to trigger the event
+                the signal is the shape of the digitial pulse (e.g. 0, 1, 0 starts at 0
+                rises to 1 and falls back to 0 when triggered)
+                channel is the digitial channel that will be written
+            currentAddress (int): The starting memory address for storing signal
+                                data.
+        
+        Returns:
+            configDict (dict): The updated dictionary with assigned memory addresses
+                                for each event.
+        """
+        # Loop through each event in the configuration dictionary
+        for event, details in configDict.items():
+            
+            # Ensure the currentAddress is even; if it's odd, increment by 1
+            if currentAddress % 2 != 0:
+                currentAddress += 1
+                
+            details['address'] = currentAddress
+            channel = details.get('channel')
+            signal = details.get('signal', [])
+            signalLength = len(signal)
+            
+            # Shift each bit in the signal to the left by the value of the channel.
+            # This positions the bit correctly for the digital output channel.
+            toggledSignal = [(bit << channel) for bit in signal]
+            
+            # Write the modified signal (toggledSignal) into the VPixx hardware memory
+            # at the specified address.
+            self.dp.DPxWriteRam(currentAddress, toggledSignal)
+            
+            print(f"Configured: {event} is {signal} on DOut channel {channel}")
+            
+            # Update the current memory address by adding the length of the signal.
+            # Important to multiply by 2 to reserve enough space.
+            currentAddress += signalLength * 2
+        
+        # After configuring all events, commit changes to the register cache of the
+        # hardware
+        self.dp.DPxWriteRegCache()
+        
+        return configDict
+
+    ################################################################
+    # configure the digital outputs, calls internal function
+    ################################################################
+    def configureDigitalOutputs(self):
+        '''
+        Configures some triggers that can be sent using sendTrigger
+        '''
+        # set up triggers
+        triggers = {
+            "stimulusOn": {"signal": [1, 0], "channel": 8},
+            "stimulusOff": {"signal": [1, 0], "channel": 1},
+        }
+
+        # register the triggers, note the hardcoded address here - this is in the sample code - eeks
+        self.triggers = self._configureDigitalOutputs(triggers, currentAddress=int(8e6))        
+
+ 
+    ################################################################
+    # send a digital trigger, 
+    ################################################################
+    def sendTrigger(self, eventName, delay=0.0, samplingRate=1000):
+        """
+        Sends a digital trigger signal based on the provided dictionary entry.
+        
+        Parameters:
+            entry (dict): A dictionary entry containing keys 'signal', 'channel',
+                        and 'address'.
+            delay (float): Delay (in seconds) before the trigger signal starts
+                        (default is 0.0).
+            samplingRate (int): Sampling rate in Hz for the digital output (default
+                                is 10).
+        """
+
+        # get the entry
+        entry = self.triggers.get(eventName, None)
+        if entry is None:
+            print(f"(pglDataPixx: sendTrigger) Could not find {eventName} in configured triggers.")
+            return
+        
+        # Determine the length of the signal (number of bits) for scheduling purposes
+        signalLength = len(entry.get('signal', []))
+        
+        # Retrieve the memory address for this signal from the entry
+        address = entry.get('address')
+        
+        # Schedule the digital output signal on the hardware:
+        # - delay: when to start the signal,
+        # - samplingRate: how often to sample the signal,
+        # - signal_length: the duration of the signal,
+        # - address: the location in memory where the signal is stored.
+        self.dp.DPxSetDoutSchedule(delay, samplingRate, signalLength, address)
+
+        #self.dp.DPxSetDoutSchedRate(1,'video')
+        self.dp.DPxSetDoutSchedRate(1000,'hz')
+
+        # Start the digital output schedule to send the trigger signal
+        self.dp.DPxStartDoutSched()
+  

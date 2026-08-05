@@ -74,7 +74,7 @@ class pglExperimentBase():
         self.eyeTracker = None
         self.tasks = []
                 
-    def load(self, experimentName="", subjectID="", date = None):
+    def load(self, experimentName="", subjectID="", date = None, dataDir=None):
         '''
         Load the experiment settings, state and data.         
         '''
@@ -83,78 +83,84 @@ class pglExperimentBase():
         self.task = []
 
         self.pglTimestamp = pglTimestamp()
-        dataDir = Path(self.settings.dataPath).expanduser() / experimentName / subjectID 
-        # check that data path exists
-        if not dataDir.exists() or not dataDir.is_dir():
-            print(f"(pglExperiment:load) ❌ Could not find data directory: {dataDir}")
-            return
         
-        # Get all directories in the dataPath
-        dirList = [d for d in dataDir.iterdir() if d.is_dir()]
+        # Fix, Fix, Fix, this is a bit clunky for loading an experiment.
+        # this should be replaced with the stuff in pglPipeline, but
+        if dataDir is None:
+            dataDir = Path(self.settings.dataPath).expanduser() / experimentName / subjectID 
+            # check that data path exists
+            if not dataDir.exists() or not dataDir.is_dir():
+                print(f"(pglExperiment:load) ❌ Could not find data directory: {dataDir}")
+                return
+            
+            # Get all directories in the dataPath
+            dirList = [d for d in dataDir.iterdir() if d.is_dir()]
 
-        # check date setting, so that we can filter out experiments by date        
-        if date is not None:
-            # Convert to YYYYMMDD string
-            if isinstance(date, str):
-                dateStr = date
-            elif isinstance(date, datetime):
-                dateStr = date.strftime("%Y%m%d")
-            elif isinstance(date, Date):
-                dateStr = date.strftime("%Y%m%d")
-            else:
-                raise TypeError("date must be a string, datetime.date, datetime.datetime, or None")
+            # check date setting, so that we can filter out experiments by date        
+            if date is not None:
+                # Convert to YYYYMMDD string
+                if isinstance(date, str):
+                    dateStr = date
+                elif isinstance(date, datetime):
+                    dateStr = date.strftime("%Y%m%d")
+                elif isinstance(date, Date):
+                    dateStr = date.strftime("%Y%m%d")
+                else:
+                    raise TypeError("date must be a string, datetime.date, datetime.datetime, or None")
 
-            # Keep only directories whose names start with the date
-            dirList = [d for d in dirList if d.name.startswith(dateStr)]
+                # Keep only directories whose names start with the date
+                dirList = [d for d in dirList if d.name.startswith(dateStr)]
 
-        # sort directory list
-        dirList = sorted(dirList, key=lambda d: d.name)
-        
-        # print the experiment name and subjetID
-        print(f"(pglExperiment:load) Data directory: {dataDir}")
-        print(f"Experiment name: {experimentName} | Subject ID: {subjectID}")
-        
-        # Print all the directories
-        for i, d in enumerate(dirList, start=1):
-            try:
-                # for typical data files, parse into a datatime
-                dt = datetime.strptime(d.name, "%Y%m%d_%H%M%S")
-                # and print a more user-friendly name
-                dataPrintname = dt.strftime("%A %B %-d, %Y %-I:%M%p")
-                # try to read the data.json file
-                dataFilename = dataDir / d.name / "data.json"
-                if dataFilename.exists():
-                    try:
-                        # load the data so that we can print information about the experiment
-                        experimentData = pglSerialize.load(dataDir / d.name / "data.json")
-                        experimentSettings = pglSerialize.load(dataDir / d.name / "experimentSettings.json")
-                        # print number of volumes
-                        numVols = experimentData.getNumEvents(type="volumeTrigger")
-                        if numVols==0:
-                            numVols = experimentData.getNumEvents(type="keyboard", eventType="keydown", keyChar="5")
-                        dataPrintname += f" | nVols: {numVols}"
-                        # print duration
-                        dataPrintname += f" | {self.pglTimestamp.formatDuration(self.experimentDuration(experimentData))}"
-                        # print experiment name
-                        dataPrintname += f" | {experimentSettings.experimentName}"
-                    except:
-                        pass
-                # Add the filename
-                dataPrintname = f"{dataPrintname} ({d.name})"
-            except:
-                # not a typical name, just display
-                dataPrintname = d.name
-            print(f"{i}. {dataPrintname}", flush=True)
+            # sort directory list
+            dirList = sorted(dirList, key=lambda d: d.name)
+            
+            # print the experiment name and subjetID
+            print(f"(pglExperiment:load) Data directory: {dataDir}")
+            print(f"Experiment name: {experimentName} | Subject ID: {subjectID}")
+            
+            # Print all the directories
+            for i, d in enumerate(dirList, start=1):
+                try:
+                    # for typical data files, parse into a datatime
+                    dt = datetime.strptime(d.name, "%Y%m%d_%H%M%S")
+                    # and print a more user-friendly name
+                    dataPrintname = dt.strftime("%A %B %-d, %Y %-I:%M%p")
+                    # try to read the data.json file
+                    dataFilename = dataDir / d.name / "data.json"
+                    if dataFilename.exists():
+                        try:
+                            # load the data so that we can print information about the experiment
+                            experimentData = pglSerialize.load(dataDir / d.name / "data.json")
+                            experimentSettings = pglSerialize.load(dataDir / d.name / "experimentSettings.json")
+                            # print number of volumes
+                            numVols = experimentData.getNumEvents(type="volumeTrigger")
+                            if numVols==0:
+                                numVols = experimentData.getNumEvents(type="keyboard", eventType="keydown", keyChar="5")
+                            dataPrintname += f" | nVols: {numVols}"
+                            # print duration
+                            dataPrintname += f" | {self.pglTimestamp.formatDuration(self.experimentDuration(experimentData))}"
+                            # print experiment name
+                            dataPrintname += f" | {experimentSettings.experimentName}"
+                        except:
+                            pass
+                    # Add the filename
+                    dataPrintname = f"{dataPrintname} ({d.name})"
+                except:
+                    # not a typical name, just display
+                    dataPrintname = d.name
+                print(f"{i}. {dataPrintname}", flush=True)
 
-        # Ask the user to choose
-        print("\nSelect a directory number: ", flush=True)
-        choice = int(input())
-        if choice < 1 or choice > len(dirList):
-            print(f"(pglExperiment:load) ❌ Invalid choice: {choice}")
-            return
+            # Ask the user to choose
+            print("\nSelect a directory number: ", flush=True)
+            choice = int(input())
+            if choice < 1 or choice > len(dirList):
+                print(f"(pglExperiment:load) ❌ Invalid choice: {choice}")
+                return
 
-        # Get the selected directory
-        selectedDir = dataDir / dirList[choice - 1]
+            # Get the selected directory
+            selectedDir = dataDir / dirList[choice - 1]
+        else:
+            selectedDir = Path(dataDir)
 
         # load the experiment data, settings, and state
         print(f"(pglExperiment:load) Loading experimentdata from: {selectedDir}")
@@ -206,7 +212,8 @@ class pglExperimentBase():
         self.tasks.append(task)
         
         # save in experimentSettings
-        self.experimentSettings.tasks.append(task.settings.taskSaveName)
+        if task.settings is not None:
+            self.experimentSettings.tasks.append(task.settings.taskSaveName)
 
     def display(self):
         '''
@@ -1343,7 +1350,7 @@ class pglExperimentSettings(pglTraitSettings):
 # Data for pglExperiment
 ##############################################
 @dataclass
-class pglExperimentData(pglSerialize):
+class pglExperimentData(pglTraitSettings):
     startTime: float = 0.0
     endTime: float = 0.0
     events: ListType[pglEvent] = field(default_factory=list) 
