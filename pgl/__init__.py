@@ -24,7 +24,7 @@ from .pglEventListener import pglEventListener
 from .pglEyeTracker import pglEyeTracker
 from .pglDialog import pglDialogs
 from .pglMessages import pglMessages
-from .pglPipeline import pglChooseSession
+from .pglPipeline import pglChoose
 
 # Device specific imports (eye trackers, etc.)
 from .pglVPixx import pglProPixx, pglDataPixx, pglDataPixxDigitalIODevice

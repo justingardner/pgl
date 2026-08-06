@@ -38,7 +38,7 @@ from .pglEyeTracker import pglEyeTracker
 from .pglEyelink import pglEyelink, pglEyelinkData
 from .pglSettings import pglSettingsManager, pglDisplaySettings, pglDisplayModeSettings
 from .pglMessages import pglMessages
-
+import fsspec
 
 #######################
 # for returning stats
@@ -73,7 +73,126 @@ class pglExperimentBase():
         self.pgl = None
         self.eyeTracker = None
         self.tasks = []
+    
+    @classmethod
+    def isValidExperimentDir(cls, verbose=True, settings=None, dataPath=None, experimentName=None, subjectID=None, sessionName=None, runName=None, fullDataPath=None, filesystem=None):
+        '''
+        Check whether the experiment dir has all the correct files
+        '''
+        experimentDir = cls.getExperimentDir(settings=settings, dataPath=dataPath, experimentName=experimentName, subjectID=subjectID, sessionName=sessionName, runName=runName, fullDataPath=fullDataPath, filesystem=filesystem)
+        
+        # Top-level required JSON files
+        requiredExperimentFiles = ["data.json","experimentSettings.json","settings.json","pgl.json","state.json"]
+        requiredFiles = ["data.json","settings.json","state.json"]
+        
+        # Check top-level JSON files
+        for fileName in requiredExperimentFiles:
+            filePath = experimentDir / fileName
+            if not filePath.is_file():
+                if verbose:
+                    pglMessages.message(f"Missing file: {filePath}")
+                return False
+
+        # Check non-json entries
+        for item in experimentDir.iterdir():
+            if item.suffix != ".json":
+
+                # Everything non-json should be a directory
+                if not item.is_dir():
+                    if verbose:
+                        pglMessages.message(f"Expected directory, found: {item}")
+                    return False
+
+                # Check task files only if any task file exists
+                taskFilesFound = [fileName for fileName in requiredFiles 
+                                if (item / fileName).is_file()]
+
+                if len(taskFilesFound) > 0:
+                    # If one exists, all must exist
+                    for fileName in requiredFiles:
+                        filePath = item / fileName
+                        if not filePath.is_file():
+                            if verbose:
+                                pglMessages.message(f"Missing file in task directory {item}: {fileName}")
+                            return False
+
+                    # parameters must be a directory (may be empty)
+                    parametersPath = item / "parameters"
+                    if not parametersPath.is_dir():
+                        if verbose:
+                            pglMessages.message(f"No parameters directory in {item}")
+                        return False
+                    else:
+                        # Any directories inside parameters must contain required task files
+                        for subItem in parametersPath.iterdir():
+
+                            # Ignore non-directories
+                            if not subItem.is_dir():
+                                continue
+
+                            # Check required parameter files
+                            for fileName in requiredFiles:
+                                filePath = subItem / fileName
+                                if not filePath.is_file():
+                                    if verbose:
+                                        pglMessages.message(f"Missing file in parameter directory {subItem}: {fileName}")
+                                    return False
+        return True    
+    
+    @classmethod
+    def getExperimentDir(cls, settings=None, dataPath=None, experimentName=None, subjectID=None, sessionName=None, runName=None, fullDataPath=None, filesystem=None):
+        '''
+        get the directory of the experiment
+        
+        '''
+        # set filesystem
+        filesystem = filesystem if filesystem is not None else fsspec.filesystem("file")
+        
+        # if not fullDatadir passed in, construct it from arguments
+        if not fullDataPath:
+            if not dataPath: 
+                if not settings:
+                    # get the default settings
+                    settings = pglSettingsManager.getSettings()
+                if settings:
+                    # set dataDir to where settings tells us it is
+                    dataPath= settings.dataPath
+            fullDataPath = Path(dataPath).expanduser()
+            
+            # add on experiment name
+            if experimentName:
+                fullDataPath = fullDataPath / experimentName
+                # check that experimentName exists
+                if not filesystem.exists(fullDataPath):
+                    pglMessages.warning(f"Experiment directory {fullDataPath} does not exist")
+                    return fullDataPath
+            
+            # add a subjectID
+            if subjectID:
+                fullDataPath = fullDataPath / subjectID
+                # check the subjectID 
+                if not filesystem.exists(fullDataPath):
+                    pglMessages.warning(f"Subject directory {fullDataPath} does not exist")
+                    return fullDataPath
                 
+            # add a sessionName
+            if sessionName:
+                fullDataPath = fullDataPath / sessionName
+                # check the sessionName 
+                if not filesystem.exists(fullDataPath):
+                    pglMessages.warning(f"Session directory {fullDataPath} does not exist")
+                    return fullDataPath
+                
+            # add a sessionName
+            if runName:
+                fullDataPath = fullDataPath / runName
+                # check the runName
+                if not filesystem.exists(fullDataPath):
+                    pglMessages.warning(f"Run directory {fullDataPath} does not exist")
+                    return fullDataPath
+                
+        return Path(fullDataPath)
+
     def load(self, experimentName="", subjectID="", date = None, dataDir=None):
         '''
         Load the experiment settings, state and data.         
@@ -332,7 +451,7 @@ class pglExperiment(pglExperimentBase):
     Experiment class which handles timing, parameter randomization,
     subject response, synchronizing with measurement hardware etc
     '''
-    def __init__(self, pgl=None, settingsName=None, settings=None, displayName=None, displaySettings=None, subjectID="s0000", experimentName=""):
+    def __init__(self, pgl=None, settingsName=None, settings=None, displayName=None, displaySettings=None, subjectID="s0000", experimentName=None, sessionName=None, runName=None):
         '''
         Initialize the pglExperiment class.
         
@@ -376,8 +495,19 @@ class pglExperiment(pglExperimentBase):
             
             # get experiment settings
             self.experimentSettings = pglExperimentSettings()
-            if experimentName != "":
+            if experimentName:
                 self.experimentSettings.experimentName = experimentName
+            if sessionName:
+                self.experimentSettings.sessionName = sessionName
+            else:
+                # default session name is YYYYMMDD
+                self.experimentSettings.sessionName = datetime.now().strftime("%Y%m%d") 
+            if runName:
+                self.experimentSettings.runName = runName
+            else:
+                # default run name is run_HHMMDD
+                self.experimentSettings.runName = f"run_{datetime.now().strftime("%H%M%S")}"
+                
             self.experimentSettings.subjectID = subjectID
             self.isInitialized=True
 
@@ -843,7 +973,7 @@ class pglExperiment(pglExperimentBase):
         '''
         # Create the directory to save data into (dataDir/experimentSaveName/subjectID/YYYYMMDD_HHMMSS)
         try:
-            dataDir = Path(self.settings.dataPath).expanduser() / self.experimentSettings.experimentSaveName / self.experimentSettings.subjectID / datetime.now().strftime("%Y%m%d_%H%M%S")
+            dataDir = Path(self.settings.dataPath).expanduser() / self.experimentSettings.experimentSaveName / self.experimentSettings.subjectID / self.experimentSettings.sessionName / self.experimentSettings.runName
             dataDir.mkdir(parents=True, exist_ok=True)    
         except Exception as e:
             print(f"(pglExperiment:save) ❌ Could not create data directory {dataDir}: {e}")

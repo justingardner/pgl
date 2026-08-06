@@ -550,6 +550,20 @@ class pglSettingsManager:
         return calibrationsDir
     
     @classmethod
+    def getDefaultSettings(cls):
+        '''
+        get the default settings
+        '''
+        settingsList = cls.getSettings()
+        if not settingsList:
+            pglMessages.warning("No settings found!!")
+        setting = next((s for s in settingsList if s.isDefault), None)
+        if not setting:
+            pglMessages.warning("No default setting found, using first in list", level=1)
+            setting = settings[0]
+        return setting
+
+    @classmethod
     def getSettings(cls, settingsName=None, settings=None, displayName=None, displaySettings=None, returnSettingsList=False):
         """
         Load settings form directory returned by getSettingsDir()
@@ -671,6 +685,9 @@ class pglTraitSettings(HasTraits, pglSerialize):
     github = Unicode("", help="github revision number", visible=False, enabled=False)
     version = Unicode("1.0", help="version number of this tratilet", visible=False, enabled=False)
     
+    # old class names that are no longer being used, which if they were serialized
+    # will now load back into this type
+    _oldSerializationNames = ["pglSettingsEditable"]
     # default uuid
     @default("uuid")
     def _default_uuid(self):
