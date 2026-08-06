@@ -23,11 +23,30 @@ from .pglMessages import pglMessages
 ##########################
 def pglGetAllSubclasses(baseClass):
     allSubclasses = {}
-    for subclass in baseClass.__subclasses__():
-        allSubclasses[subclass.__name__] = subclass
-        allSubclasses.update(pglGetAllSubclasses(subclass))
-    return allSubclasses
 
+    def addName(name, cls):
+        if name in allSubclasses:
+            pglMessages.warning(
+                f"Duplicate serialization name '{name}' "
+                f"for {cls.__name__} and {allSubclasses[name].__name__}"
+            )
+        allSubclasses[name] = cls
+
+    def collect(cls):
+        for subclass in cls.__subclasses__():
+
+            # Canonical name
+            addName(subclass.__name__, subclass)
+
+            # Aliases for backwards compatibility.
+            for alias in subclass.__dict__.get("_oldSerializationNames", []):
+                addName(alias, subclass)
+
+            # Recurse
+            collect(subclass)
+
+    collect(baseClass)
+    return allSubclasses
 ##########################
 # pglSerialize class
 ##########################
@@ -238,8 +257,11 @@ class pglSerialize:
                     objectClass = CLASS_REGISTRY[className]
                     obj = objectClass.fromJSONdict(dct, filename=filename)
                     return obj
-            
-            return dct
+                else:
+                    availableClasses = sorted(CLASS_REGISTRY.keys())
+                    pglMessages.warning(f"(pglSerialize) Could not restore object of class '{className}' from '{filename}'.\nKnown classes: {availableClasses}")
+                    dct["__class__"] = className
+                    return dct
         
         return json.loads(jsonString, object_hook=decodeObject)
 
