@@ -268,7 +268,7 @@ class pglChooseLevel(pglTraitSettings):
         
 #    luminanceCalibration = List(Unicode(), hasPlotButton=True, buttonFunction="plotLuminanceCalibration", default_value=['None'], help="Which luminance calibration to use")
 
-from .pglExperiment import pglExperimentBase
+from .pglExperiment import pglExperimentBase, pglExperiment
 class pglRun(pglExperimentBase):
     def __init__(self, dataDir):
         '''
@@ -282,7 +282,7 @@ class pglRun(pglExperimentBase):
         super().__init__()
 
         # load the experimentName
-        self.load(dataDir=dataDir)
+        #self.load(dataDir=dataDir)
  
 class pglChooseRun(pglChooseLevel):
     # this is the root, so no more recursion beyond this point
@@ -296,8 +296,8 @@ class pglChooseRun(pglChooseLevel):
 
     @classmethod
     def _isValid(cls, name=None, dataDir=None, filesystem=None, entries=None):
-        foundNames = {Path(entry["name"]).name for entry in entries}
-        return all(requiredFile in foundNames for requiredFile in cls.requiredFiles)
+        # check if we have a valid experiment name
+        return pglExperiment.isValidExperimentDir(fullDataPath=dataDir)
     
     def __init__(self, name="", dataDir="", filesystem=None, entries=None):
         super().__init__(name=name, dataDir=dataDir, filesystem=filesystem, entries=entries)
@@ -307,13 +307,15 @@ class pglChooseRun(pglChooseLevel):
         '''
         '''
         # load data
-        self.run= pglRun(dataDir)
-        self.run.print()
+        #self.run = pglRun(dataDir)
+        #self.run.print()
         
         
+class pglChooseSession(pglChooseLevel):
+    childClass = pglChooseRun
         
 class pglChooseSubject(pglChooseLevel):
-    childClass = pglChooseRun
+    childClass = pglChooseSession
     
     @classmethod
     def _isValid(cls, name=None, dataDir=None, filesystem=None, entries=None):
@@ -323,7 +325,7 @@ class pglChooseSubject(pglChooseLevel):
     
 class pglChooseExperiment(pglChooseLevel):
     childClass = pglChooseSubject
-class pglChooseSession(pglChooseLevel):
+class pglChoose(pglChooseLevel):
     childClass = pglChooseExperiment
     
 #################################
