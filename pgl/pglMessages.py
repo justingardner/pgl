@@ -22,8 +22,9 @@ class pglMessages:
     _oneTimeWarnings = set()
     
     @classmethod
-    def message(cls, msg, callerNameDepth=2):
-        print(f"({cls.getCallerName(callerNameDepth)}) {msg}")
+    def message(cls, msg, callerNameDepth=2, verbose=True):
+        if verbose:
+            print(f"({cls.getCallerName(callerNameDepth)}) {msg}")
 
     @classmethod
     def warning(cls, msg, level=2, callerNameDepth=2):

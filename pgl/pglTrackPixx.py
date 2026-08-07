@@ -284,7 +284,7 @@ class pglTrackPixx3(pglEyeTracker):
                 #print(events)
                 for event in events:
                     # handle the events
-                    if event.id == "white left":
+                    if (event.type == "ResponsePixx" and event.id == "white left") or (event.type == "keyboard" and event.keyChar == "escape")  or (event.type == "keyboard" and event.keyChar == "space"):
                         # exit the calibration loop
                         print("(pglTrackPixx3:calibrateEyeImage) Exiting calibrate eye image loop")
                         self.pgl.clearScreen((0,0,0))
@@ -292,7 +292,7 @@ class pglTrackPixx3(pglEyeTracker):
                         self.pgl.clearScreen((0,0,0))
                         self.pgl.flush()
                         loopCalibration = False
-                    elif event.id == "yellow left":
+                    elif (event.type == "ResponsePixx" and event.id == "yellow left") or (event.type == "keyboard" and event.eventType == "keydown" and event.keyChar == "left"):
                         # decrease LED intensity
                         self.ledIntensity = max(0, self.ledIntensity - 1)
                         self.dp.TPxSetLEDIntensity(self.ledIntensity)
@@ -300,19 +300,19 @@ class pglTrackPixx3(pglEyeTracker):
 
                         print(f"(pglTrackPixx3:calibrateEyeImage) Decreased LED intensity to {self.ledIntensity} {self.dp.TPxGetLEDIntensity()}.")
 
-                    elif event.id == "red left":
+                    elif (event.type == "ResponsePixx" and event.id == "red left") or (event.type == "keyboard" and event.eventType == "keydown" and event.keyChar == "right"):
                         # increase LED intensity
                         self.ledIntensity = min(8, self.ledIntensity + 1)
                         self.dp.TPxSetLEDIntensity(self.ledIntensity)
                         self.dp.DPxUpdateRegCache()
                         print(f"(pglTrackPixx3:calibrateEyeImage) Increased LED intensity to {self.ledIntensity}.")
-                    elif event.id == "green left":
+                    elif (event.type == "ResponsePixx" and vent.id == "green left"):
                         # increase lens
                         self.lens = min(2, self.lens + 1)
                         self.dp.TPxSetLens(self.lens)
                         self.dp.DPxUpdateRegCache()
                         print(f"(pglTrackPixx3:calibrateEyeImage) Increased lens focal length to {self.lens*25+25} mm.")
-                    elif event.id == "blue left":
+                    elif (event.type == "ResponsePixx" and event.id == "blue left"):
                         # decrease lens
                         self.lens = max(0, self.lens - 1)
                         self.dp.DPxUpdateRegCache()
@@ -320,6 +320,8 @@ class pglTrackPixx3(pglEyeTracker):
                         print(f"(pglTrackPixx3:calibrateEyeImage) Decreased lens focal length to {self.lens*25+25} mm.")
                     else:
                         print(f"(pglTrackPixx3:calibrateEyeImage) Unknown event: {event}")
+   
+
     #################################################
     # calibrateEyePosition
     ################################################

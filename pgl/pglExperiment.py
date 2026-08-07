@@ -62,9 +62,6 @@ class pglExperimentBase():
     and saving settings, state and data.
     '''
     def __init__(self):
-        # init super
-        super().__init__()
-        
         # initialize variables
         self.settings = None
         self.state = None
@@ -473,21 +470,18 @@ class pglExperiment(pglExperimentBase):
             clear_output(wait=True)
         
             self.isInitialized=False
-            if pgl is None:
-                # If pgl is none, then this is a load
-                if experimentName == "":
-                    print(f"(pglExperiment) No exerimentName provided for loading experiment data")
-                    return
-                # load the experimentName
-                self.load(experimentName=experimentName, subjectID=subjectID)
+
+            if not pgl:
+                pglMessages.warning("Need to pass in valid pgl")
                 return
-            else:
-                # save pgl
-                self.pgl = pgl
+            
+            # save pgl
+            self.pgl = pgl
 
             # load settings
             self.settings = pgl.getSettings(settingsName=settingsName, settings=settings, displaySettings=displaySettings, displayName=displayName)
             if self.settings is None: return
+            self.settings.print()
 
             # initialize experiment state and data
             self.state = pglExperimentState()

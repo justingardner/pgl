@@ -18,6 +18,9 @@ from datetime import datetime
 from traitlets import HasTraits, TraitError
 from .pglMessages import pglMessages
 
+# FIx, FIX, FIX, temporarily trying to shutdown pglSerialize from
+# printing all the missing and added fields
+verbose = 1
 ##########################
 # Recursively collect all subclasses
 ##########################
@@ -371,12 +374,12 @@ class pglSerialize:
                     traceback.print_exc()
                     print(f"{'='*80}\n")
             else:
-                pglMessages.message(f"'{key}' not found in {filename} using default {getattr(self, key)}")
+                pglMessages.message(f"'{key}' not found in {filename} using default {getattr(self, key)}", verbose=verbose)
         
         # Warn about unknown keys
         extraKeys = set(data.keys()) - set(self.trait_names())
         if extraKeys:
-            pglMessages.message(f"(pglSerialize) Unknown keys in {filename} (ignored): {list(extraKeys)}")
+            pglMessages.message(f"(pglSerialize) Unknown keys in {filename} (ignored): {list(extraKeys)}", verbose=verbose)
 
 
     def _getDetailedTypeInfo(self, obj):
