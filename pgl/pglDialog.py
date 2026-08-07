@@ -88,7 +88,7 @@ class _pglTraitsDialog(QDialog):
             # build the interface
             self._buildUI()
         except Exception as e:
-            print(f"Error creating traitsDialog: {e}")
+            pglMessages.warning(f"Error creating traitsDialog: {e}")
 
 
     #########################################
