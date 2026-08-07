@@ -550,20 +550,6 @@ class pglSettingsManager:
         return calibrationsDir
     
     @classmethod
-    def getDefaultSettings(cls):
-        '''
-        get the default settings
-        '''
-        settingsList = cls.getSettings()
-        if not settingsList:
-            pglMessages.warning("No settings found!!")
-        setting = next((s for s in settingsList if s.isDefault), None)
-        if not setting:
-            pglMessages.warning("No default setting found, using first in list", level=1)
-            setting = settings[0]
-        return setting
-
-    @classmethod
     def getSettings(cls, settingsName=None, settings=None, displayName=None, displaySettings=None, returnSettingsList=False):
         """
         Load settings form directory returned by getSettingsDir()

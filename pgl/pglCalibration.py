@@ -24,6 +24,7 @@ from .pglDevice import pglDigitalIODevice, pglAnalogInputDevice, pglAnalogTraceD
 from scipy.io import loadmat
 from .pglMessages import pglMessages
 from scipy.interpolate import PchipInterpolator
+from .pglSettings import pglSettingsManager
 
 ##########################
 # Calibration device class
@@ -1116,8 +1117,8 @@ class pglDisplayTemporalCalibrationData(pglTraitSettings):
     settingsName = Unicode("Default", help="Settings name used to open display")
     settings = Instance(pglSettings, allow_none=True, help="Settings used during calibration") 
     displaySettings = Instance(pglDisplaySettings, allow_none=True, help="Display settings used during calibration")
-    displayInfo = Dict(help="Display information at time of calibration")
-    metalInfo = Dict(help="PGL info including display info such as UUID, serial number, and other information at time of calibration")   
+    displayInfo = Dict(allow_none=True, default_value=None, help="Display information at time of calibration")
+    metalInfo = Dict(allow_none=True, default_value=None, help="PGL info including display info such as UUID, serial number, and other information at time of calibration")   
     creationDateTime = Instance(datetime, default_value=datetime.now(), help="Date and time of calibration creation")
     digitalIOdeviceDescription = Unicode("Unknown", help="Desciption of digitalIO measurement device")
     analogInputDescription = Unicode("Unknown", help="Desciption of analog input measurement device")
@@ -1429,7 +1430,7 @@ class pglDisplayLuminanceCalibrationData(pglTraitSettings):
         c.deviceDescription = "Import from matlab"
         return(c,calib) 
     
-    def attachSettings(self, pgl, settingsName):
+    def attachSettings(self, settingsName):
         '''
         attach settings to the data (useful for import from matlab)
         
@@ -1437,36 +1438,12 @@ class pglDisplayLuminanceCalibrationData(pglTraitSettings):
             pgl: pgl instance
             settingsName: name of settings to attach to these data
         '''
-        
-        e = pglExperiment(pgl, settingsName)
-        if e.isInitialized is False:
-            pglMessages.warning(f"(pglDisplayLuminanceCalibrationData:attachSettings) Could not initialize experiment with settings: {settingsName}")
-            return None
-        e.settings.closeScreenOnEnd = True
-        e.settings.backgroundColor = (0, 0, 0)
-        e.initScreen()
-        if pgl.isOpen() is False:
-            print(f"(pglDisplayLuminanceCalibrationData:attachSettings) Display {settingsName} did not open, cannot attach settings.")
-            return None
-        
+           
         # set information
         self.settingsName = settingsName
-        self.settings = e.getSettings(settingsName)
+        self.settings = pglSettingsManager.getSettings(settingsName)
         
-        try:
-            # get display info if available
-            gpu = next(iter(pgl.gpuInfo.values()))
-            displays = gpu.get('Displays', [])
-            self.displayInfo = displays[self.settings.displayNumber-1]
-            
-            # get info from pgl
-            self.metalInfo = pgl.info()
-            
-        except Exception as ex:
-            print(f"(pglDisplayLuminanceCalibrationData:attachSettings) Warning: Could not get display info: {ex}")    
-    
-        e.endScreen()
-        
+         
     def print(self, verbose=False):
         '''
         print the calibration data in a readable format.

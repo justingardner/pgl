@@ -350,12 +350,12 @@ class pglSerialize:
                     print(f"-" * 80)
                     print(f"Original error: {e}")
                     print(f"-" * 80)
-                    print("Call stack:")
+                    #print("Call stack:")
                     # Print abbreviated stack trace (skip first 2 frames - this function)
-                    for frame_info in traceback.extract_stack()[:-2]:
-                        print(f"  File '{frame_info.filename}', line {frame_info.lineno}, in {frame_info.name}")
-                        if frame_info.line:
-                            print(f"    {frame_info.line}")
+                    #for frame_info in traceback.extract_stack()[:-2]:
+                    #    print(f"  File '{frame_info.filename}', line {frame_info.lineno}, in {frame_info.name}")
+                    #    if frame_info.line:
+                    #        print(f"    {frame_info.line}")
                     print(f"{'='*80}\n")
                     
                 except Exception as e:
