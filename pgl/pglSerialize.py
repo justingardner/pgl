@@ -265,7 +265,8 @@ class pglSerialize:
                     pglMessages.warning(f"(pglSerialize) Could not restore object of class '{className}' from '{filename}'.\nKnown classes: {availableClasses}")
                     dct["__class__"] = className
                     return dct
-        
+            # if we fall through just return the dct
+            return dct
         return json.loads(jsonString, object_hook=decodeObject)
 
     ##########################
