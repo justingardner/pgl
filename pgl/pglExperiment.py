@@ -494,13 +494,13 @@ class pglExperiment(pglExperimentBase):
             if sessionName:
                 self.experimentSettings.sessionName = sessionName
             else:
-                # default session name is YYYYMMDD
-                self.experimentSettings.sessionName = datetime.now().strftime("%Y%m%d") 
+                # default session name is session_YYYY-MM-DD
+                self.experimentSettings.sessionName = f"session_{datetime.now().strftime("%Y-%m-%d")}"
             if runName:
                 self.experimentSettings.runName = runName
             else:
-                # default run name is run_HHMMDD
-                self.experimentSettings.runName = f"run_{datetime.now().strftime("%H%M%S")}"
+                # default run name is run_HH-MM-DD
+                self.experimentSettings.runName = f"run_{datetime.now().strftime("%H-%M-%S")}"
                 
             self.experimentSettings.subjectID = subjectID
             self.isInitialized=True
