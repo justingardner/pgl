@@ -13,6 +13,7 @@ from .pglDevice import pglDevice, pglDigitalIODevice
 from .pglEvent import pglEvent
 from .pglMessages import pglMessages
 import numpy as np
+from .pglTimestamp import pglTimestamp
 
 
 ###################################
@@ -123,7 +124,7 @@ class pglDataPixx(pglDevice):
                 self.deviceAttributes[attributeName] = getattr(self.device, method)()
 
             # get cpu time
-            self.deviceAttributes['cpuTime'] = self.pglTimestamp.getSecs()
+            self.deviceAttributes['cpuTime'] = pglTimestamp.getSecs()
 
             # print current status
             if self.verbose > 0:
@@ -535,7 +536,7 @@ class pglProPixx(pglDevice):
                 self.deviceAttributes[attributeName] = getattr(self.device, method)()
 
             # Get CPU time
-            self.deviceAttributes['cpuTime'] = self.pglTimestamp.getSecs()
+            self.deviceAttributes['cpuTime'] = pglTimestamp.getSecs()
 
             # Print current status
             if self.verbose > 0:
