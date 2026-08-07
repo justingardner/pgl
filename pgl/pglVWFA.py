@@ -11,7 +11,7 @@
 from .pglExperiment import pglTask
 from .pglStaircase import pglStaircaseUpDown
 import numpy as np
-from .pglParameter import pglParameter, pglParameterBlock
+from .pglParameter import pglParameter, pglParameterNestedBlock
 import os
 from PIL import Image as PILImage
 import scipy.io as sio
