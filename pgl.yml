@@ -380,7 +380,6 @@ dependencies:
       - pyobjc-framework-virtualization==12.2.1
       - pyobjc-framework-vision==12.2.1
       - pyobjc-framework-webkit==12.2.1
-      - pypixxlib==1.10.3
       - pypng==0.20220715.0
       - pyside6==6.11.1
       - pyside6-addons==6.11.1
