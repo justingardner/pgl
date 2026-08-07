@@ -16,6 +16,8 @@ import os
 from PIL import Image as PILImage
 import scipy.io as sio
 import h5py
+from .pglMessages import pglMessages
+from pathlib import Path
 
 #############
 # Helper Functions
@@ -109,6 +111,9 @@ class pglVWFATask(pglTask):
 
         # Preload file paths (textures are loaded per-trial for memory)
         self.stimulusFolder = stimulusFolder
+        if not Path(stimulusFolder).exists():
+            pglMessages.warning(f"Could not find stimulus folder: {stimulusFolder}")
+            raise FileNotFoundError(f"Stimulus folder does not exist: {stimulusFolder}")
         self.filePaths = self._build_file_paths()
  
         # Per-trial state (populated in startTrial / startSegment)
