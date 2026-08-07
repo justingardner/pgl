@@ -59,7 +59,7 @@ class pglSettingsManager:
         """
         # get the display infos
         original = pglDisplaySettingsList(self.getDisplaySettings())
-        
+
         # display the settings
         modified = pglDialogs.traitsDialog(original)
         
@@ -300,7 +300,6 @@ class pglSettingsManager:
 
         # get names from gpuInfo
         if not cls.gpuInfo:
-            print(cls.gpuInfo)
             return displayNames
 
         for gpuData in cls.gpuInfo.values():
@@ -674,6 +673,7 @@ class pglTraitSettings(HasTraits, pglSerialize):
     # old class names that are no longer being used, which if they were serialized
     # will now load back into this type
     _oldSerializationNames = ["pglSettingsEditable"]
+    
     # default uuid
     @default("uuid")
     def _default_uuid(self):
