@@ -17,9 +17,89 @@ from .pglTimestamp import pglTimestamp
 
 
 ###################################
+# Base DataPixx device
+###################################
+class pglDataPixxBase(pglDevice):
+    '''
+    Base class for dataPixx clases which has helper functions to open close and stop schedules
+    as well as initialize the library    
+    '''
+    def __init__(self, deviceName=None):
+        '''
+        init function
+
+        Args:
+            deviceName (str): String descriptive name of device
+        '''
+        if not deviceName: deviceName = "DataPixx"
+
+       # call parent constructor
+        super().__init__(deviceType=deviceName, deviceDescription="VPixx dataPixx")
+        
+        # get library
+        try:
+            from pypixxlib.datapixx import DATAPixx3 as DATAPixx3
+            from pypixxlib import _libdpx as dp
+
+            # keep reference to libraries
+            self.dp = dp        
+            self.DATAPixx3 = DATAPixx3
+        except ImportError: 
+            pglMessages.warning("pypixxlib is not installed. Please install it to use DataPixx.")
+            return
+
+    ################################################################
+    # open device for low0level DPx ibrary
+    ################################################################
+    def openDPx(self):
+        '''
+        Open datapixx device using DPx
+        '''
+        self.dp.DPxOpen()
+        if not self.dp.DPxIsReady():
+            self.getError()
+            return
+
+        # print status
+        pglMessages.message(f"Opened DataPixx with firmware version: {self.dp.DPxGetFirmwareRev()}")
+        pglMessages.message(f"Current pixel mode: {self.dp.DPxIsDoutPixelMode()}")
+        pglMessages.message(f"DAC schedule: {self.dp.DPxIsDacSchedRunning()}")
+        
+    
+    ################################################################
+    # close device for low-level DPX library
+    ################################################################
+    def closeDPx(self):
+        '''
+        Close datapixx device using DPx
+        '''
+        try:
+            # close
+            self.dp.DPxClose()
+
+            pglMessages.message("Closed DataPixx DPx")
+        except Exception as e:
+            self.getError()
+
+    ################################################################
+    # clear schedules
+    ################################################################
+    def stopDPxSchedules(self):
+        # close schedules
+        self.dp.DPxDisableDoutPixelMode()
+        self.dp.DPxDisableDoutPixelModeB()
+        self.dp.DPxDisableDoutPixelModeGB()
+        
+        # stop all schedules
+        self.dp.DPxStopAllScheds()
+        
+        # write changes 
+        self.dp.DPxWriteRegCache()
+
+###################################
 # DataPixx device
 ###################################
-class pglDataPixx(pglDevice):
+class pglDataPixx(pglDataPixxBase):
     """
     Represents a DataPixx device.
     """    
@@ -37,22 +117,11 @@ class pglDataPixx(pglDevice):
         self.currentStatus = -1
 
         # call parent constructor
-        super().__init__("DataPixx")
-        
-        # get library
-        try:
-            from pypixxlib.datapixx import DATAPixx3
-            from pypixxlib import _libdpx as dp
-        except ImportError: 
-            pglMessages.warning("pypixxlib is not installed. Please install it to use DataPixx.")
-            return
-
-        # keep reference to library
-        self.dp = dp        
+        super().__init__()
         
         # Initialize the DATAPixx3 instance
         try:
-            self.device = DATAPixx3()
+            self.device = self.DATAPixx3()
         except Exception as e:
             print(f"(pglDataPixx) Failed to initialize DataPixx: {e}")
             self.device = None
@@ -76,6 +145,8 @@ class pglDataPixx(pglDevice):
         self.device.din.startDinLog()
         self.device.updateRegisterCache()
 
+        # open the device
+        self.openDPx()
     
     def __del__(self):
         """
@@ -92,8 +163,8 @@ class pglDataPixx(pglDevice):
         self.device = None
         self.currentStatus = -1
 
-        # Call the superclass's destructor (FIX, why can't we call this?)
-        #super().__del__()
+        # close the device
+        self.closeDPx()
 
     ################################################################
     # Get the status of the DataPixx device
@@ -455,7 +526,7 @@ class pglDataPixx(pglDevice):
 ###################################
 # ProPixx device
 ###################################
-class pglProPixx(pglDevice):
+class pglProPixx(pglDataPixxBase):
     """
     Represents a ProPixx device.
     """    
@@ -615,67 +686,17 @@ class pglDataPixxDigitalIODevice(pglDigitalIODevice):
     send digital pulses with DataPixx
     '''
     def __init__(self):
-        # get library
-        try:
-            from pypixxlib import _libdpx as dp
-            self.dp = dp
-        except ImportError: 
-            pglMessages.warning("pypixxlib is not installed. Please install it to use DataPixx.")            
-            return        
+        '''
+        Init
+        '''
+        # initialize super
+        super().__init__()
 
         # no configured triggers
         self.triggers = None
 
         # open as DPx
         self.openDPx()
-        
-    ################################################################
-    # open device for low0level DPx ibrary
-    ################################################################
-    def openDPx(self):
-        '''
-        Open datapixx device using DPx
-        '''
-        self.dp.DPxOpen()
-        if not self.dp.DPxIsReady():
-            self.getError()
-            return
-
-        # print status
-        pglMessages.message(f"Opened DataPixx with firmware version: {self.dp.DPxGetFirmwareRev()}")
-        pglMessages.message(f"Current pixel mode: {self.dp.DPxIsDoutPixelMode()}")
-        pglMessages.message(f"DAC schedule: {self.dp.DPxIsDacSchedRunning()}")
-        
-    
-    ################################################################
-    # close device for low-level DPX library
-    ################################################################
-    def closeDPx(self):
-        '''
-        Close datapixx device using DPx
-        '''
-        try:
-            # close
-            self.dp.DPxClose()
-
-            pglMessages.message("Closed DataPixx DPx")
-        except Exception as e:
-            self.getError()
-
-    ################################################################
-    # clear schedules
-    ################################################################
-    def stopDPxSchedules(self):
-        # close schedules
-        self.dp.DPxDisableDoutPixelMode()
-        self.dp.DPxDisableDoutPixelModeB()
-        self.dp.DPxDisableDoutPixelModeGB()
-        
-        # stop all schedules
-        self.dp.DPxStopAllScheds()
-        
-        # write changes 
-        self.dp.DPxWriteRegCache()
 
     ################################################################
     # enablePixelMode: Modified from VPIxx example code

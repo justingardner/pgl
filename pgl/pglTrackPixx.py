@@ -306,7 +306,7 @@ class pglTrackPixx3(pglEyeTracker):
                         self.dp.TPxSetLEDIntensity(self.ledIntensity)
                         self.dp.DPxUpdateRegCache()
                         print(f"(pglTrackPixx3:calibrateEyeImage) Increased LED intensity to {self.ledIntensity}.")
-                    elif (event.type == "ResponsePixx" and vent.id == "green left"):
+                    elif (event.type == "ResponsePixx" and event.id == "green left"):
                         # increase lens
                         self.lens = min(2, self.lens + 1)
                         self.dp.TPxSetLens(self.lens)
