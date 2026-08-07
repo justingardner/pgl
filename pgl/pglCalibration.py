@@ -23,7 +23,7 @@ from scipy.interpolate import interp1d
 from .pglDevice import pglDigitalIODevice, pglAnalogInputDevice, pglAnalogTraceData
 from scipy.io import loadmat
 from .pglMessages import pglMessages
-
+from scipy.interpolate import PchipInterpolator
 
 ##########################
 # Calibration device class
@@ -1319,7 +1319,7 @@ class pglDisplayLuminanceCalibrationData(pglTraitSettings):
     gamma = Float(0.0, help="If not 0 then this is a validation run trying to achieve this gamma - i.e. 1.0 = linear")
     units = Unicode("cd/m2", help="Units that were used for measurement")
     deviceDescription = Unicode("Unknown", help="Desciption of measurement device")
-    
+    trimThreshold = Float(allow_none=True, default_value=None, help="Threshold to trim flat portions of curves when computing inverse, value of 1 means trim at either end of curve if the values are not increasing by more than 1/nSteps. Defaults to None, try values of less than one and see them with display")
     def getDisplayName(self):
         '''
         Get the display name associated with this data
@@ -1490,13 +1490,44 @@ class pglDisplayLuminanceCalibrationData(pglTraitSettings):
         if verbose > 1:
             super().print()
             
+    def displayInverse(self, gamma=1.0, fig=None):
+        '''
+        display a graph of the inverse table
         
-    def display(self, gamma=None, fig=None):
+        Args:
+            gamma (float): Gamma to achieve (default 1.0)
+            fig (matplotlib.fig, optional): If provided, plots into this figure
+        '''
+        # use the passed-in axis, or create a new figure/axis if none given
+        if fig is None:
+            fig, ax = plt.subplots(figsize=(10, 6))
+        else:
+            ax = fig.add_subplot(111)
+
+        inverseTable = self.calculateInverseGamma(gamma=gamma, gammaTableSize=1024, trimThreshold=self.trimThreshold)
+        values = np.linspace(0, 1, 1024)
+        ax.plot(values, inverseTable[0], 'o--', label='Median', color='green', markeredgecolor='green', markersize=2)
+
+        ax.legend()
+        ax.set_xlabel("Display Value (normalized 0-1)")
+        ax.set_ylabel(f"Table value (normalized 0-1)")
+        
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        
+        ax.set_title(f"{self.getDisplayName()} UUID: {self.getUUID()}\n{self.deviceDescription}: {self.creationDateTime}\nnRepeats: {self.nRepeats} nSteps: {self.nSteps} min = {self.minLuminance:.2f}, max = {self.maxLuminance:.2f}\nInverse table for gamma: {gamma if gamma is not None else 'N/A'}")
+
+        ax.grid(True)
+
+        plt.show()        
+        
+    def display(self, gamma=None, fig=None,):
         '''
         display graph of calibration data
         Args:
             gamma (float, optional): If provided, display the ideal gamma curve (1.0 or 2.2 or whatever) for comparison.
             fig (matplotlib.fig, optional): If provided, plot into this figure instead of creating a new figure.
+            inverseGamma (float): If not None, will plot the inverse table to achieve the input value
         '''
         if self.calibrationValues is None or self.calibrationMeasurements is None:
             print("(pglDisplayLuminanceCalibrationData) No calibration data to display.")
@@ -1525,7 +1556,14 @@ class pglDisplayLuminanceCalibrationData(pglTraitSettings):
             ax.plot(values, idealMeasurements, 'r--', label=f'Ideal Gamma {gamma}')
         else:
             ax.plot(values, measurements, 'o-', label='Median', color='black', markeredgecolor='white', markersize=8)
-
+            
+        if self.trimThreshold:
+            (trimX, trimY) = self.trimFlatRegions(x=values,y=measurements,trimThreshold=self.trimThreshold)
+            # plot vertical lines at trimThreshold values
+            ax.axvline(x=trimX[0], color='red', linestyle='--', label='trim border for inverese')
+            ax.axvline(x=trimX[-1], color='red', linestyle='--', label='trim border for inverese')
+            
+            
         ax.legend()
         ax.set_xlabel("Display Value (normalized 0-1)")
         ax.set_ylabel(f"Measured Luminance ({self.units})")
@@ -1703,12 +1741,15 @@ class pglDisplayLuminanceCalibrationData(pglTraitSettings):
                 return None
             return self.calibrationValues[-1]
         
-    def calculateInverseGamma(self, gamma = 1.0, gammaTableSize=None):
+    def calculateInverseGamma(self, gamma = 1.0, gammaTableSize=None, trimThreshold=None):
         '''
         Calculate inverse gamma table from calibration measurements.
         
         Args:
             gamma: The target gamma value for inverse (default is 1.0 = linear table).
+            trimThreshold: If not None, then will trim flat ends of curve, set to 1 to
+              use a threshold in which each step has to increase the luminance by 1/nSteps
+              
         
         Returns:
             Tuple of three numpy arrays (R, G, B) for the inverse gamma table.
@@ -1723,6 +1764,9 @@ class pglDisplayLuminanceCalibrationData(pglTraitSettings):
         
         medianValues = np.median(calValues, axis=1)
         medianMeasurements = np.median(calMeasurements, axis=1)
+
+        if trimThreshold:
+            (medianValues, medianMeasurements) = self.trimFlatRegions(medianValues, medianMeasurements, trimThreshold)
         
         # Normalize measurements to 0-1 range
         minLum = np.min(medianMeasurements)
@@ -1731,10 +1775,23 @@ class pglDisplayLuminanceCalibrationData(pglTraitSettings):
         
         # Create interpolation function: maps desired linear output to required input
         # We want: given a desired output level, what input do we need?
-        interpFunc = interp1d(normalizedMeasurements, medianValues, 
-                            kind='cubic', 
-                            bounds_error=False, 
-                            fill_value='extrapolate')
+        #interpFunc = interp1d(normalizedMeasurements, medianValues, 
+        #                    kind='cubic', 
+        #                    bounds_error=False, 
+        #                    fill_value='extrapolate')
+        
+        
+        # ensure strictly increasing x values before interpolation
+        sortIdx = np.argsort(normalizedMeasurements)
+        normalizedMeasurements = normalizedMeasurements[sortIdx]
+        medianValues = medianValues[sortIdx]
+
+        # drop points that aren't strictly increasing (duplicates / flattened top)
+        mask = np.concatenate(([True], np.diff(normalizedMeasurements) > 1e-6))
+        normalizedMeasurements = normalizedMeasurements[mask]
+        medianValues = medianValues[mask]
+        
+        interpFunc = PchipInterpolator(normalizedMeasurements, medianValues, extrapolate=True)
         
         # Create inverse gamma table
         if gammaTableSize is None: gammaTableSize = self.gammaTableSize
@@ -1748,6 +1805,42 @@ class pglDisplayLuminanceCalibrationData(pglTraitSettings):
         # For RGB, use the same correction for all channels (can be modified for per-channel)
         return (inverseGamma, inverseGamma.copy(), inverseGamma.copy())
     
+    def trimFlatRegions(self, x, y, trimThreshold=0.5):
+        """
+        Trim flat regions from the start and end of a monotonic curve.
+        
+        Args:
+            x: input values
+            y: measured luminance values
+            trimThreshold: minimum fraction of the x-range that must be covered
+                            per step to not be considered "flat"
+        
+        Returns:
+            trimmed x, y arrays
+        """
+        yRange = y.max() - y.min()
+        xSteps = len(x)
+        minStep = trimThreshold * (yRange / xSteps)
+        #print(f"yRange: {yRange} xSteps: {xSteps} minStep: {minStep}")
+
+        # find where the curve starts rising meaningfully from the bottom
+        dy = np.diff(y)
+        startIdx = 0
+        for i in range(len(dy)):
+            if dy[i] > minStep:
+                startIdx = i
+                break
+
+        # find where the curve stops rising meaningfully at the top
+        endIdx = len(y) - 1
+        for i in range(len(dy) - 1, -1, -1):
+            #print(f"i={i} dy[i]={dy[i]}")
+            if dy[i] > minStep:
+                endIdx = i + 1
+                break
+        
+        #print(f"{x[startIdx]}:{x[endIdx]}")
+        return x[startIdx:endIdx+1], y[startIdx:endIdx+1]
     def setDisplayToGamma(self, pgl, display, gamma = 1.0):
         '''
         Uses the saved gamma calibration data to set the display to the requested gamma
