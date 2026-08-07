@@ -12,6 +12,7 @@ from pgl import pglEyeTracker
 from pgl import pglDevice
 import numpy as np
 import matplotlib.pyplot as plt
+from .pglMessages import pglMessages
 
 ###################################
 # TrackPixx3 device
@@ -32,7 +33,7 @@ class pglTrackPixx3(pglEyeTracker):
         try:
             import pypixxlib._libdpx as dp
         except ImportError: 
-            pgl.oneTimeWarning("(pglTrackPixx3) pypixxlib is not installed. Please install it to use TrackPixx3.")
+            pglMessages.warning("pypixxlib is not installed. Please install it to use TrackPixx3.")
             return
         self.dp = dp
         
@@ -98,12 +99,13 @@ class pglTrackPixx3(pglEyeTracker):
         self.ledIntensity = self.dp.TPxGetLEDIntensity()
         self.lens = self.dp.TPxGetLens()
         print(f"(pglTrackPixx3) TrackPixx3 initialized with LED intensity {self.ledIntensity} and lens {self.lens*25+25} mm.")
-    
+
+        self.eyeTrackerStatus = None
     @property
     def isCalibrated(self):
         # this runs every time you access eyetracker.isCalibrated
-        if self.device is not None:
-            return self.device.isDeviceCalibrated()
+        if self.tracker is not None:
+            return self.tracker.isDeviceCalibrated()
         else:
             return self._calibrated
     @isCalibrated.setter
@@ -115,31 +117,61 @@ class pglTrackPixx3(pglEyeTracker):
         start eye tracking and save to filename
         '''
         if self.tracker is None:
-            try: 
-                from pypixxlib.tracker import TRACKPixx3
-            except:
-                print(f"(pglTrackPixx3:start) ❌ Could not import tracker library")
+            # initialize tracker            
             self.tracker = TRACKPixx3()
             self.tracker.open()
+            # show overlay on 2nd monitor
+            self.tracker.showOverlay()
             
         # check calibration
         if not self.isCalibrated:
-            print(f"(pglTrackPixx3) ❌ Eye tracker must be calibrated before running")
+            pglMessages.warning(f"Eye tracker must be calibrated before running")
             return
         
-        # start recording
-        self.tracker.setUpDataRecording(filename)
+        # start recording, this api call is apparently bs - not yet implemented by ViewPixx
+        #self.tracker.setUpDataRecording(filename)
+        
+        # start recording based on: https://docs.vpixx.com/python/collect-data-from-the-trackpixx3
+        self.eyeTrackerStatus = self.dp.TPxSetupSchedule()
+        self.dp.TPxStartSchedule()
+        self.dp.DPxUpdateRegCache()
+        
+        # save filename 
+        self.eyeTrackerDataFilename = Path(filename).with_suffix('.csv')
 
     def stop(self):
         '''
         stop eye tracking
         '''
         if self.tracker is None:
-            print(f"(pglTrackPixx3) ❌ Not currently saving data - run start first")
+            pglMessages.warning(f"Eye tracker is not initialized")            
             return
+        
+        if self.eyeTrackerStatus is None:
+            pglMessages.warning(f"Eye tracker is not collecting data - run start first")            
+            return
+            
     
-        # save buffered data
-        self.tracker.saveBufferedData()
+        # save buffered data, bs call, not implemented yet
+        #self.tracker.saveBufferedData()
+        
+        # stop recording based on: https://docs.vpixx.com/python/collect-data-from-the-trackpixx3
+        self.dp.TPxStopSchedule()
+        self.dp.DPxUpdateRegCache()
+        self.dp.TPxGetStatus(self.eyeTrackerStatus)
+        eyeTrackerData = self.dp.TPxReadData(self.eyeTrackerStatus, self.eyeTrackerStatus['newBufferFrames'])
+
+        # Hard coded column labels (reallly, this is how VPixx does it in their example)
+        columnHeaders = ['TimeTag','LeftEyeX','LeftEyeY','LeftPupilDiameter','RightEyeX','RightEyeY',
+                  'RightPupilDiameter','DigitalIn','LeftBlink', 'RightBlink', 'DigitalOut',
+                  'LeftEyeFixationFlag','RightEyeFixationFlag','LeftEyeSaccadeFlag','RightEyeSaccadeFlag',
+                  'MessageCode','LeftEyeRawX','LeftEyeRawY','RightEyeRawX','RightEyeRawY']
+
+        # Create a DataFrame using pandas
+        eyeTrackerDataFrame = pd.DataFrame(eyeTrackerData, columns=columnHeaders)
+
+        # Save the DataFrame to a CSV file
+        eyeTrackerDataFrame.to_csv(self.eyeTrackerDataFilename, index=False)
         
         # close tracker
         self.tracker.close()
@@ -149,13 +181,13 @@ class pglTrackPixx3(pglEyeTracker):
         '''
         print status
         '''
-        # First get the TPxDict from TPxSetupSchedule()
-        TPxDict = self.dp.TPxSetupSchedule()
+        if self.eyeTrackerStatus is None:
+            pglMessages.message("No active recording to report status on.")
+            return
 
-        # Update it with current status
-        self.dp.TPxGetStatus(TPxDict)
-
-        for key, value in TPxDict.items():
+        # get and print status
+        self.dp.TPxGetStatus(self.eyeTrackerStatus)
+        for key, value in self.eyeTrackerStatus.items():
             print(f"{key}: {value}")
         
     #################################################
