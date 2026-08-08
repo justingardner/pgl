@@ -970,7 +970,7 @@ class pglExperimentAnalysis(pglExperimentBase):
                 parameterValues (list): List of all parameter values
                 trialNum: 
                 volumeNum:
-                tiralTime:
+                trialTime:
         '''
         # figure out what task we are working on
         if taskName is None:
