@@ -268,31 +268,54 @@ class pglChooseLevel(pglTraitSettings):
         
 #    luminanceCalibration = List(Unicode(), hasPlotButton=True, buttonFunction="plotLuminanceCalibration", default_value=['None'], help="Which luminance calibration to use")
 
-from .pglExperiment import pglExperimentBase, pglExperiment
+from .pglExperiment import pglExperimentBase, pglExperiment, pglExperimentSettings
+
 class pglRun(pglExperimentBase):
-    def __init__(self, dataDir):
+    #experimentSettings = Instance(pglExperimentSettings, allow_none=True, default_value=None, help="settings of the experiemnt")
+    
+    def __init__(self, fullDataPath):
         '''
-        Initialize the pglExperimentAnalysis class.
+        Initialize the pglRun class
         
         Args:
-            subjectID (str): The identifier for the subject participating in the experiment.
-            ExperimentName (str): The name of the experiment to load.
+            dataDir: The directory where the run is saved
         '''
         # init super
         super().__init__()
 
-        # load the experimentName
-        self.load(fullDataPath=dataDir)
+        # keep path
+        self.fullDataPath = Path(fullDataPath)
+        
+    def getTaskNames(self):
+        taskString = ""
+        if not self.experimentSettings:
+            self.experimentSettings = pglExperimentSettings.load(self.fullDataPath / "experimentSettings")
+        if self.experimentSettings:
+            taskString = ", ".join(self.experimentSettings.tasks)
+        return taskString
+        
  
 class pglChooseRun(pglChooseLevel):
     # this is the root, so no more recursion beyond this point
     childClass = None
 
+    run = Instance(pglRun, allow_none=True, default_value=None, help="Class representing run data", visible=False)
     date = Unicode("yowsa", help="Date the run was collected")
     experimenter = Unicode("doggoneit", help="Who ran the session")
-    stimulusType = Unicode("my gosh", help="Stimulus type used for this run")
+    tasks = Unicode(allow_none=True, help="Stimulus type used for this run")
+    
+    @default('tasks')
+    def _defaultTasks(self):
+        self._initRun()
+        # should only run once, on access to the field
+        if self.run:
+            return self.run.getTaskNames()
+        else:
+            return ""
 
-    requiredFiles = ["settings.json", "data.json", "state.json", "pgl.json", "experimentSettings.json"]
+    def _initRun(self):
+        if not self.run:
+            self.run = pglRun(self.dataDir)        
 
     @classmethod
     def _isValid(cls, name=None, dataDir=None, filesystem=None, entries=None):
@@ -300,23 +323,22 @@ class pglChooseRun(pglChooseLevel):
         validExperimentDir = pglExperiment.isValidExperimentDir(fullDataPath=dataDir)
         return validExperimentDir
     
-    def __init__(self, name="", dataDir="", filesystem=None, entries=None):
-        super().__init__(name=name, dataDir=dataDir, filesystem=filesystem, entries=entries)
-        #print(f"dataDir: {dataDir} isValid: {self._isValid(name=name,dataDir=dataDir,filesystem=filesystem,entries=entries)}")
-        
-        #if dataDir: self._load(dataDir)
-    def _load(self,dataDir):
-        '''
-        load the run
-        '''
-        # load data
-        self.run = pglRun(dataDir)
-        #self.run.print()
-        
+               
         
 class pglChooseSession(pglChooseLevel):
     childList = List(Instance(pglTraitSettings), settingsListKey="name", traitDisplayName="Select run(s)", multiSelect=True, maxRowsVisible=6, help="Runs in session dir")
     childClass = pglChooseRun
+    
+    def __init__(self, name="", dataDir="", filesystem=None, entries=None):
+        # initialize class
+        super().__init__(name=name, dataDir=dataDir, filesystem=filesystem, entries=entries)
+        
+        # now go through each of the children (which are runs, and get them cued up)        
+        #for iRun in range(len(self.childList)):
+            # 
+        #    print(f"dataDir: {self.childList[iRun].dataDir}")
+        #print(f"dataDir: {dataDir} isValid: {self._isValid(name=name,dataDir=dataDir,filesystem=filesystem,entries=entries)}")
+ 
         
 class pglChooseSubject(pglChooseLevel):
     # re-declare childList, so we can give it a proper name
