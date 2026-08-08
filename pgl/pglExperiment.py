@@ -481,7 +481,6 @@ class pglExperiment(pglExperimentBase):
             # load settings
             self.settings = pgl.getSettings(settingsName=settingsName, settings=settings, displaySettings=displaySettings, displayName=displayName)
             if self.settings is None: return
-            self.settings.print()
 
             # initialize experiment state and data
             self.state = pglExperimentState()
@@ -587,11 +586,21 @@ class pglExperiment(pglExperimentBase):
                 self.pgl.devicesAdd(keyboardMouse)
                 # check if listener is running
                 if not keyboardMouse.isRunning():
-                    pglMessages.warning("Accessibility permission not granted for keyboard/mouse access.\n" +
-                                        "On macOS, go to System Preferences -> Security & Privacy -> Privacy -> Accessibility\n" +
-                                        "and add your terminal application (e.g. Terminal, iTerm, etc) to the list of apps allowed to control your computer.\n" +
-                                        "If you are running VS Code and it already has permissions granted, try running directly from a terminal with:\n"+
-                                        "    /Applications/Visual\\ Studio\\ Code.app/Contents/MacOS/Electron")
+                    warningMessage = "Accessibility permission not granted for keyboard/mouse access.\n" + \
+                        "On macOS, go to System Preferences -> Security & Privacy -> Privacy -> Accessibility\n" + \
+                        "and add your terminal application (e.g. Terminal, iTerm, etc) to the list of apps allowed to control your computer.\n" + \
+                        "If you are running VS Code and it already has permissions granted, try running directly from a terminal with:\n" + \
+                        "    /Applications/Visual\\ Studio\\ Code.app/Contents/MacOS/Code"
+                    pglMessages.warning(warningMessage)
+                    startTime = pglTimestamp.getSecs()     
+                    displayMessageTime = 15  
+                    while((pglTimestamp.getSecs()-startTime) < displayMessageTime):      
+                        self.pgl.text("Accessibility permission error")
+                        self.pgl.text("Need to grant for keyboard and mouse")
+                        self.pgl.text("See instructions printed to console")
+                        self.pgl.text(f"Screen will close in {int(displayMessageTime-(pglTimestamp.getSecs()-startTime))} s")
+                        self.pgl.flush()
+                    
                     self.endScreen()
                     return
             else:
