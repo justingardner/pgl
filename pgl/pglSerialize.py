@@ -43,6 +43,7 @@ def pglGetAllSubclasses(baseClass):
 
             # Aliases for backwards compatibility.
             for alias in subclass.__dict__.get("_oldSerializationNames", []):
+                #print(f"alias: {alias} subclass: {subclass}")
                 addName(alias, subclass)
 
             # Recurse

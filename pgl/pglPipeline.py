@@ -282,7 +282,7 @@ class pglRun(pglExperimentBase):
         super().__init__()
 
         # load the experimentName
-        #self.load(dataDir=dataDir)
+        self.load(fullDataPath=dataDir)
  
 class pglChooseRun(pglChooseLevel):
     # this is the root, so no more recursion beyond this point
@@ -297,17 +297,20 @@ class pglChooseRun(pglChooseLevel):
     @classmethod
     def _isValid(cls, name=None, dataDir=None, filesystem=None, entries=None):
         # check if we have a valid experiment name
-        return pglExperiment.isValidExperimentDir(fullDataPath=dataDir)
+        validExperimentDir = pglExperiment.isValidExperimentDir(fullDataPath=dataDir)
+        return validExperimentDir
     
     def __init__(self, name="", dataDir="", filesystem=None, entries=None):
         super().__init__(name=name, dataDir=dataDir, filesystem=filesystem, entries=entries)
-        self._load(dataDir)
-
+        print(f"dataDir: {dataDir} isValid: {self._isValid(name=name,dataDir=dataDir,filesystem=filesystem,entries=entries)}")
+        
+        if dataDir: self._load(dataDir)
     def _load(self,dataDir):
         '''
+        load the run
         '''
         # load data
-        #self.run = pglRun(dataDir)
+        self.run = pglRun(dataDir)
         #self.run.print()
         
         
