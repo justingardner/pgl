@@ -518,6 +518,26 @@ class _pglTraitsDialog(QDialog):
         containerLayout = QVBoxLayout(container)
         containerLayout.setContentsMargins(10, 10, 10, 10)
 
+        buttonRow = QWidget()
+        buttonLayout = QHBoxLayout(buttonRow)
+        buttonLayout.setContentsMargins(0, 0, 0, 0)
+
+        selectAllButton = QPushButton("select all")
+        def onSelectAll():
+            for obj in state["list"]:
+                obj.isSelected = True
+        selectAllButton.clicked.connect(onSelectAll)
+
+        selectNoneButton = QPushButton("select none")
+        def onSelectNone():
+            for obj in state["list"]:
+                obj.isSelected = False
+        selectNoneButton.clicked.connect(onSelectNone)
+
+        buttonLayout.addWidget(selectNoneButton)
+        buttonLayout.addWidget(selectAllButton)
+        containerLayout.addWidget(buttonRow)
+
         scrollArea = QScrollArea()
         scrollArea.setObjectName("multiSelect")
         scrollArea.setWidgetResizable(True)
@@ -556,26 +576,6 @@ class _pglTraitsDialog(QDialog):
 
         scrollArea.setWidget(rowsContainer)
         containerLayout.addWidget(scrollArea)
-
-        buttonRow = QWidget()
-        buttonLayout = QHBoxLayout(buttonRow)
-        buttonLayout.setContentsMargins(0, 0, 0, 0)
-
-        selectAllButton = QPushButton("select all")
-        def onSelectAll():
-            for obj in state["list"]:
-                obj.isSelected = True
-        selectAllButton.clicked.connect(onSelectAll)
-
-        selectNoneButton = QPushButton("select none")
-        def onSelectNone():
-            for obj in state["list"]:
-                obj.isSelected = False
-        selectNoneButton.clicked.connect(onSelectNone)
-
-        buttonLayout.addWidget(selectNoneButton)
-        buttonLayout.addWidget(selectAllButton)
-        containerLayout.addWidget(buttonRow)
 
         self._register(traitName, trait, container, lambda v: None, layout)
 
