@@ -302,9 +302,9 @@ class pglChooseRun(pglChooseLevel):
     
     def __init__(self, name="", dataDir="", filesystem=None, entries=None):
         super().__init__(name=name, dataDir=dataDir, filesystem=filesystem, entries=entries)
-        print(f"dataDir: {dataDir} isValid: {self._isValid(name=name,dataDir=dataDir,filesystem=filesystem,entries=entries)}")
+        #print(f"dataDir: {dataDir} isValid: {self._isValid(name=name,dataDir=dataDir,filesystem=filesystem,entries=entries)}")
         
-        if dataDir: self._load(dataDir)
+        #if dataDir: self._load(dataDir)
     def _load(self,dataDir):
         '''
         load the run
@@ -315,9 +315,12 @@ class pglChooseRun(pglChooseLevel):
         
         
 class pglChooseSession(pglChooseLevel):
+    childList = List(Instance(pglTraitSettings), settingsListKey="name", traitDisplayName="Choose run", help="Runs in session dir")
     childClass = pglChooseRun
         
 class pglChooseSubject(pglChooseLevel):
+    # re-declare childList, so we can give it a proper name
+    childList = List(Instance(pglTraitSettings), settingsListKey="name", traitDisplayName="Choose session", help="Sessions in subject dir")
     childClass = pglChooseSession
     
     @classmethod
@@ -327,8 +330,13 @@ class pglChooseSubject(pglChooseLevel):
         return bool(re.match(r"^s\d+$", lastDir))
     
 class pglChooseExperiment(pglChooseLevel):
+    # re-declare childList, so we can give it a proper name
+    childList = List(Instance(pglTraitSettings), settingsListKey="name", traitDisplayName="Choose subject", help="Subjects in experiment dir")
     childClass = pglChooseSubject
+    
 class pglChoose(pglChooseLevel):
+    # re-declare childList, so we can give it a proper name
+    childList = List(Instance(pglTraitSettings), settingsListKey="name", traitDisplayName="Choose experiment", help="Experiments in datadir")
     childClass = pglChooseExperiment
     
 #################################
