@@ -835,6 +835,7 @@ class pglDisplaySettings(pglTraitSettings):
         cls = super().load(filename)
         
         return cls
+    
     def save(self, filename=None):
         '''
         save
@@ -1008,8 +1009,8 @@ class pglDisplaySettingsList(pglTraitSettings):
             e.run()
             
             # print settings
-            self.settingsList[0].print()
-            self.settingsList[0].displayModes[0].print()
+            #self.settingsList[0].print()
+            #self.settingsList[0].displayModes[0].print()
 
         except Exception as e:
             pglMessages.warning(f"Could not run test. Error {type(e).__name__}: {e}")    
@@ -1033,7 +1034,7 @@ class pglSettings(pglTraitSettings):
     
     name = Unicode("default", help="Display name for these settings")
     displays = List(Instance(pglDisplaySettings), settingsListKey="name", highlightSelector=False, traitDisplayName="choose display", hideAll=True, help="Display - to edit display settings run pgl.displaySettings")
-    calibrateForGamma = List(Float, default_value=[2.2, 1.0, 0], help="What gamma to target calibration for 0.0 = No calibration, 1.0=linear, 2.2 typical for images/movies")
+    calibrateForGamma = List(Float, default_value=[0, 1.0, 2.2], help="What gamma to target calibration for 0.0 = No calibration, 1.0=linear, 2.2 typical for images/movies")
     dataPath = Unicode("~/data",help="Path to data directory").tag(isPath=True)
     startKey = Unicode("space", allow_none=True, help="Key to start experiment")
     endKey = Unicode("escape", allow_none=True, help="Key to end experiment")
