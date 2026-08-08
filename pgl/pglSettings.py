@@ -666,6 +666,7 @@ class pglTraitSettings(HasTraits, pglSerialize):
     name = Unicode("default", help="", visible=False, enabled=False)
     uuid = Unicode("", help="Universal unique identifier for this setting", visible=False, enabled=False)
     isDefault = Bool(False, help="Whether this is the default settings", visible=False, enabled=False)
+    isSelected = Bool(False, help="Whether this settings is selected when used for multi-selection", visible=False, enabled=False)
     pglVersion = Unicode("", help="version number of pgl", visible=False, enabled=False)
     github = Unicode("", help="github revision number", visible=False, enabled=False)
     version = Unicode("1.0", help="version number of this tratilet", visible=False, enabled=False)

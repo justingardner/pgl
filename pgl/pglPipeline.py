@@ -288,9 +288,9 @@ class pglChooseRun(pglChooseLevel):
     # this is the root, so no more recursion beyond this point
     childClass = None
 
-    date = Unicode("", help="Date the run was collected")
-    experimenter = Unicode("", help="Who ran the session")
-    stimulusType = Unicode("", help="Stimulus type used for this run")
+    date = Unicode("yowsa", help="Date the run was collected")
+    experimenter = Unicode("doggoneit", help="Who ran the session")
+    stimulusType = Unicode("my gosh", help="Stimulus type used for this run")
 
     requiredFiles = ["settings.json", "data.json", "state.json", "pgl.json", "experimentSettings.json"]
 
@@ -315,7 +315,7 @@ class pglChooseRun(pglChooseLevel):
         
         
 class pglChooseSession(pglChooseLevel):
-    childList = List(Instance(pglTraitSettings), settingsListKey="name", traitDisplayName="Choose run", help="Runs in session dir")
+    childList = List(Instance(pglTraitSettings), settingsListKey="name", traitDisplayName="Select run(s)", multiSelect=True, maxRowsVisible=6, help="Runs in session dir")
     childClass = pglChooseRun
         
 class pglChooseSubject(pglChooseLevel):

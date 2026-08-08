@@ -15,9 +15,11 @@ from PySide6.QtWidgets import (
     QApplication, QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLabel, QLineEdit, QSpinBox, QDoubleSpinBox, QCheckBox, QComboBox,
     QSlider, QPushButton, QWidget, QScrollArea, QDialogButtonBox, QAbstractSpinBox,
-    QStylePainter, QStyleOptionComboBox, QStyle, QMessageBox
+    QStylePainter, QStyleOptionComboBox, QStyle, QMessageBox, QSizePolicy,
+    QGraphicsDropShadowEffect
 )
-from PySide6.QtCore import Qt, QCoreApplication, QTimer
+from PySide6.QtCore import Qt, QCoreApplication, QTimer, Signal
+from PySide6.QtGui import QColor
 from traitlets import (
     HasTraits, Float, Int, List, Unicode, Bool, Tuple, TraitType
 )
@@ -84,6 +86,8 @@ class _pglTraitsDialog(QDialog):
             # window setup
             self.setWindowTitle(title)
             self.setStyleSheet(self._darkStyle())
+
+            self._selectedSettings = {}
 
             # build the interface
             self._buildUI()
@@ -275,14 +279,22 @@ class _pglTraitsDialog(QDialog):
         # a tuple
         if isinstance(trait, Tuple):
             self._addTuple(traitName, trait, current, helpText, settingsObject, layout, settingsKey)
-        
+
+        # a multi-select list (checkbox rows)
+        elif isinstance(trait, List) and "settingsListKey" in trait.metadata and trait.metadata.get("multiSelect", False):
+            if not current:
+                # if empty list just move on
+                return
+            else:
+                self._addMultiSelectList(traitName, trait, current, helpText, settingsObject, layout, settingsKey)
+
         # a settings list
         elif isinstance(trait, List) and "settingsListKey" in trait.metadata:
             if not current:
                 # if empty list just move on
                 return
             else:
-                self._addSettingsList(traitName, trait, current, helpText, settingsObject, layout, settingsKey)
+                self._addSettingsList(traitName, trait, current, helpText, settingsObject, layout, settingsKey)        
         
         # Float with min and max -> slider + spinbox
         elif isinstance(trait, Float) and trait.min is not None and not math.isinf(trait.max) and not math.isinf(trait.min):
@@ -324,9 +336,274 @@ class _pglTraitsDialog(QDialog):
         elif isinstance(trait, List):
             self._addList(traitName, trait, current, helpText, settingsObject, layout, settingsKey)        
 
+    #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
+    # ----- Multi-select list -----
+    #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
+    def _addMultiSelectList(self, traitName, trait, current, helpText,
+                             settingsObject, layout=None, settingsKey=None):
+        # get metadata settings
+        keyTraitName = trait.metadata["settingsListKey"]
+        hideKey = trait.metadata.get("hideKey", False)
+        hideAll = trait.metadata.get("hideAll", False)
+        maxRowsVisible = trait.metadata.get("maxRowsVisible", 5)
+        
+        if layout is None:
+            layout = self.formLayout
 
+        objectName = settingsObject.__class__.__name__ if not isinstance(settingsObject, _RetargetableProxy) else settingsObject.getClassName()
+        settingsKey = (objectName, traitName)
+        self.traitWidgets.setdefault(settingsKey, {})
+
+        state = {"list": current, "focused": current[0], "key": settingsKey, "rows": {}}
+        self._selectedSettings[settingsKey] = state
+
+        # Build the detail rows for whichever object currently has focus
+        #--------------------
+        def buildRows():
+            for name, childTrait in self._getOrderedTraits(current[0]).items():
+                if name.startswith("_"):
+                    continue
+                if hideKey and name == keyTraitName:
+                    continue
+                if hideAll:
+                    continue
+                self._addTraitWidget(name, childTrait, proxy, layout, settingsKey)
+                childNames.append(name)
+
+        # Update the detail widgets from one object
+        #------------------------------
+        def updateFields(obj):
+            self._updatingWidget = True
+            try:
+                for name in childNames:
+                    value = getattr(obj, name)
+                    entry = self.traitWidgets[state["key"]].get(name)
+
+                    if entry is not None and "setter" in entry:
+                        entry["setter"](value)
+
+                    if entry is not None:
+                        visible = obj.trait_metadata(name, "visible", True)
+                        entry["layout"].setRowVisible(entry["widget"], bool(visible))
+
+                    nestedKey = (builtClassName, name)
+                    nested = self._selectedSettings.get(nestedKey)
+                    if nested is not None:
+                        nested["retargetList"](value)
+                        visible = obj.trait_metadata(name, "visible", True)
+                        nested["setVisible"](bool(visible))
+            except Exception as e:
+                print(f"Error updating fields for {obj}: {e}")
+            finally:
+                self._updatingWidget = False
+
+        # Give a row the highlighted / non-highlighted look
+        #------------------------------
+        def styleRow(row, focused):
+            row.setProperty("focused", focused)
+            row.style().unpolish(row)
+            row.style().polish(row)
+            row.update()
+
+        # Set which object's details are shown below the scroll area
+        #------------------------------
+        def setFocus(obj):
+            prev = state["focused"]
+            prevEntry = state["rows"].get(id(prev))
+            if prevEntry is not None:
+                styleRow(prevEntry["row"], False)
+
+            state["focused"] = obj
+            entry = state["rows"].get(id(obj))
+            if entry is not None:
+                styleRow(entry["row"], True)
+
+            proxy.retarget(obj)
+            updateFields(obj)
+            if hasattr(self, "plotCanvas"):
+                self.plotCanvas.setVisible(False)
+                self.plotCanvas.draw()
+                
+        # Keep a checkbox synced if isSelected changes from elsewhere
+        # (e.g. select all / select none, or programmatic changes)
+        #------------------------------
+        def makeSelectedObserver(obj, checkbox):
+            def onSelectedChanged(change):
+                if self._updatingWidget:
+                    return
+                checkbox.blockSignals(True)
+                checkbox.setChecked(change["new"])
+                checkbox.blockSignals(False)
+            return onSelectedChanged
+
+        # Build one row widget for an object
+        #------------------------------
+        def buildRow(obj):
+            row = _ClickableRow()
+            row.setObjectName("multiSelectRow")
+            row.setProperty("focused", False)
+
+            h = QHBoxLayout(row)
+            h.setContentsMargins(6, 4, 6, 4)
+
+            label = QLabel(str(getattr(obj, keyTraitName)))
+            #label.setObjectName("rowInternalLabel")
+            label.setAttribute(Qt.WA_TransparentForMouseEvents)
+            h.addWidget(label, 1)
+
+            checkbox = QCheckBox()
+            checkbox.setChecked(bool(getattr(obj, "isSelected", False)))
+            h.addWidget(checkbox)
+
+            def onCheckboxToggled(checked, obj=obj):
+                self._updatingWidget = True
+                try:
+                    obj.isSelected = checked
+                finally:
+                    self._updatingWidget = False
+            checkbox.toggled.connect(onCheckboxToggled)
+
+            observer = makeSelectedObserver(obj, checkbox)
+            obj.observe(observer, names="isSelected")
+
+            row.clicked.connect(lambda obj=obj: setFocus(obj))
+
+            state["rows"][id(obj)] = {"row": row, "checkbox": checkbox,
+                                       "label": label, "observer": observer,
+                                       "object": obj}
+            return row
+
+        # (Re)build the full stack of rows for the given list
+        #------------------------------
+        def rebuildRows(objList):
+            for key, entry in list(state["rows"].items()):
+                entry["object"].unobserve(entry["observer"], names="isSelected")
+                entry["row"].setParent(None)
+                entry["row"].deleteLater()
+            state["rows"] = {}
+
+            for obj in objList:
+                addRowToLayout(buildRow(obj))
+            applyScrollHeight()
+        # Retarget this multi-select list to another backing list
+        # (used when nested inside a settings list that changes)
+        #----------------------------
+        def retargetList(newList):
+            state["list"] = newList
+            rebuildRows(newList)
+            setFocus(newList[0])
+
+        # Show/hide everything, respecting nested visibility too
+        #------------------------------
+        def setVisible(visible):
+            layout.setRowVisible(container, visible)
+
+            obj = state["focused"]
+            for name in childNames:
+                childEntry = self.traitWidgets[settingsKey].get(name)
+                if childEntry is not None:
+                    ownVisible = obj.trait_metadata(name, "visible", True)
+                    childEntry["layout"].setRowVisible(childEntry["widget"], visible and bool(ownVisible))
+
+                nestedKey = (builtClassName, name)
+                nested = self._selectedSettings.get(nestedKey)
+                if nested is not None:
+                    nested["setVisible"](visible)
+
+        state["setVisible"] = setVisible
+        state["retargetList"] = retargetList
+
+        # --- build the widget tree ---
+        container = QWidget()
+        containerLayout = QVBoxLayout(container)
+        containerLayout.setContentsMargins(10, 10, 10, 10)
+
+        scrollArea = QScrollArea()
+        scrollArea.setObjectName("multiSelect")
+        scrollArea.setWidgetResizable(True)
+
+        rowsContainer = QWidget()
+        rowsLayout = QVBoxLayout(rowsContainer)
+        rowsLayout.setContentsMargins(0, 0, 0, 0)
+        rowsLayout.setSpacing(2)
+        rowsLayout.addStretch()  # keep rows packed at top as list grows/shrinks
+
+        def addRowToLayout(row):
+            rowsLayout.insertWidget(rowsLayout.count() - 1, row)
+
+        # Size the scroll area to show ~maxRowsVisible rows, measured
+        # from an actual built row rather than a guessed constant
+        #------------------------------
+        def applyScrollHeight():
+            if not state["rows"]:
+                return
+
+            sampleRow = next(iter(state["rows"].values()))["row"]
+
+            rowHeight = sampleRow.sizeHint().height()
+            spacing = rowsLayout.spacing()
+
+            margins = rowsLayout.contentsMargins()
+            marginHeight = margins.top() + margins.bottom()
+
+            total = (
+                maxRowsVisible * rowHeight
+                + (maxRowsVisible - 1) * spacing
+                + marginHeight
+            )
+
+            scrollArea.setFixedHeight(total + 8)
+
+        scrollArea.setWidget(rowsContainer)
+        containerLayout.addWidget(scrollArea)
+
+        buttonRow = QWidget()
+        buttonLayout = QHBoxLayout(buttonRow)
+        buttonLayout.setContentsMargins(0, 0, 0, 0)
+
+        selectAllButton = QPushButton("select all")
+        def onSelectAll():
+            for obj in state["list"]:
+                obj.isSelected = True
+        selectAllButton.clicked.connect(onSelectAll)
+
+        selectNoneButton = QPushButton("select none")
+        def onSelectNone():
+            for obj in state["list"]:
+                obj.isSelected = False
+        selectNoneButton.clicked.connect(onSelectNone)
+
+        buttonLayout.addWidget(selectNoneButton)
+        buttonLayout.addWidget(selectAllButton)
+        containerLayout.addWidget(buttonRow)
+
+        self._register(traitName, trait, container, lambda v: None, layout)
+
+        # _register() assumes single-row widgets (combo boxes, spin boxes) and
+        # pins vertical size policy to Fixed with a 30px minimum. This container
+        # is a multi-row scroll area + button row, so give it room to size to
+        # its real content instead of being squeezed to the registration-time
+        # sizeHint (which was computed before any rows existed).
+        container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        container.setMinimumHeight(0)
+
+        # set what the detail widgets are updating
+        proxy = _RetargetableProxy(current[0])
+        childNames = []
+        builtClassName = current[0].__class__.__name__
+
+        if not childNames:
+            buildRows()
+
+        for obj in current:
+            addRowToLayout(buildRow(obj))
+        applyScrollHeight()
+
+        setFocus(current[0])
+
+    #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
     # ----- Setting list -----
-    _selectedSettings = {}
+    #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
     def _addSettingsList(self, traitName, trait, current, helpText,
                         settingsObject, layout=None, settingsKey=None):
         # get metadata settings
@@ -533,7 +810,7 @@ class _pglTraitsDialog(QDialog):
             
             label = QLabel("default:")
             label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            label.setObjectName("tupleLabel")
+            label.setObjectName("rowInternalLabel")
             h.addWidget(label)
             
             check = QCheckBox()
@@ -671,7 +948,9 @@ class _pglTraitsDialog(QDialog):
         # and show the first item in the list
         showSelection(0)
         
+    #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
     # ----- Float with min/max -----
+    #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
     def _addFloatRange(self, traitName, trait, current, helpText, settingsObject, layout=None, settingsKey=None):
         step = getattr(trait, 'step', (trait.max - trait.min) / 100.0)
 
@@ -729,7 +1008,9 @@ class _pglTraitsDialog(QDialog):
 
         self._register(traitName, trait, row, setter, layout, settingsKey)
 
+    #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
     # ----- Float -----
+    #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
     def _addFloat(self, traitName, trait, current, helpText, settingsObject, layout=None, settingsKey=None):
         spin = QDoubleSpinBox()
         spin.setAlignment(Qt.AlignCenter) 
@@ -754,7 +1035,9 @@ class _pglTraitsDialog(QDialog):
         row = self._wrapSpinDoubleStep(spin, bigStep = 1.0)
         self._register(traitName, trait, row, lambda v: spin.setValue(float(v)), layout, settingsKey)
 
+    #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
     # ----- Int -----
+    #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
     def _addInt(self, traitName, trait, current, helpText, settingsObject, layout=None, settingsKey=None):
         spin = QDoubleSpinBox()
         spin.setAlignment(Qt.AlignCenter) 
@@ -776,7 +1059,9 @@ class _pglTraitsDialog(QDialog):
         row = self._wrapSpinSingleStep(spin)
         self._register(traitName, trait, row, lambda v: spin.setValue(int(v)), layout, settingsKey)
 
+    #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
     # ----- Tuple -----
+    #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
     def _addTuple(self, traitName, trait, current, helpText, settingsObject, layout=None, settingsKey=None):
         row = QWidget()
         h = QHBoxLayout(row)
@@ -795,7 +1080,7 @@ class _pglTraitsDialog(QDialog):
             if tupleLabels is not None:
                 label = QLabel(f"{tupleLabels[i]}:")
                 label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                label.setObjectName("tupleLabel")
+                label.setObjectName("rowInternalLabel")
                 h.addWidget(label)
             
             # Get the trait for this tuple element
@@ -852,7 +1137,9 @@ class _pglTraitsDialog(QDialog):
                 self._updatingWidget = False
 
         self._register(traitName, trait, row, setValue, layout, settingsKey)
+    #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
     # ----- Bool -----
+    #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
     def _addBool(self, traitName, trait, current, helpText, settingsObject, layout=None, settingsKey=None):
         check = QCheckBox()
         check.setChecked(bool(current))
@@ -865,7 +1152,9 @@ class _pglTraitsDialog(QDialog):
         check.stateChanged.connect(onChange)
         self._register(traitName, trait, check, lambda v: check.setChecked(bool(v)), layout, settingsKey)
 
+    #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
     # ----- Text / Path -----
+    #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
     def _addText(self, traitName, trait, current, helpText, settingsObject, layout=None, settingsKey=None):
         edit = QLineEdit(str(current) if current is not None else "")
         edit.setAlignment(Qt.AlignCenter) 
@@ -878,7 +1167,9 @@ class _pglTraitsDialog(QDialog):
         edit.textChanged.connect(onChange)
         self._register(traitName, trait, edit, lambda v: edit.setText(str(v) if v is not None else ""), layout, settingsKey)
 
+    #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
     # ----- List -> dropdown -----
+    #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
     def _addList(self, traitName, trait, current, helpText, settingsObject, layout=None, settingsKey=None):
         combo = CenteredComboBox()
 
@@ -930,7 +1221,9 @@ class _pglTraitsDialog(QDialog):
 
         self._register(traitName, trait, combo, setter, layout, settingsKey)
         
+    #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
     # ----- List with toggle plot button -----
+    #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
     plotButtonState = False
     _activePlotButton = None
     def _addListWithPlotButton(self, traitName, trait, current, helpText, settingsObject, layout=None, settingsKey=None):
@@ -1023,7 +1316,9 @@ class _pglTraitsDialog(QDialog):
 
         self._register(traitName, trait, row, setter, layout, settingsKey)
 
+    #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
     # ----- Text with a set button -----
+    #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
     def _addTextWithSetButton(self, traitName, trait, current, helpText, settingsObject, layout=None, settingsKey=None):
 
         buttonFunc = trait.metadata.get("buttonFunction", None)
@@ -1061,7 +1356,9 @@ class _pglTraitsDialog(QDialog):
         self._register(traitName, trait, row, lambda v: edit.setText(str(v) if v is not None else ""), layout, settingsKey)
 
 
+    #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
     # ----- RGB -----
+    #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
     def _addRGB(self, traitName, trait, current, helpText, settingsObject, layout=None, settingsKey=None):
         rgb = list(current) if current else [0.0, 0.0, 0.0]
         boxes = []
@@ -1181,7 +1478,7 @@ class _pglTraitsDialog(QDialog):
             color: #d6d9de;
             font-size: 13px;
         }
-        #traitLabel, #tupleLabel {
+        #traitLabel, #rowInternalLabel {
             color: #000000;
             font-weight: 600;
         }
@@ -1348,7 +1645,27 @@ class _pglTraitsDialog(QDialog):
             color: #6b6e73;
             border: 1px solid #2f3136;
         }
-        """
+        
+        /* Multi Select Rows */
+        QScrollArea#multiSelect {
+            border: 1px solid #d0d0d0;
+            border-radius: 8px;
+            background: white;            
+        }
+
+        QWidget#multiSelectRow {
+            border-radius: 4px;
+            background-color: #1e1f22;
+        }
+        QWidget#multiSelectRow:hover {
+           background-color: #292b2f;
+        }
+        QWidget#multiSelectRow[focused="true"] {
+            background-color: #3a5f8f;
+        }
+        QWidget#multiSelectRow[focused="true"]:hover {
+            background-color: #4a6fa0;
+        }        """
     def _wrapSpinSingleStep(self, spin):
         """Wrap a spinbox with a large - on the left and + on the right."""
         spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
@@ -1469,6 +1786,20 @@ class ScrollableFigureCanvas(FigureCanvasQTAgg):
             QCoreApplication.sendEvent(p.verticalScrollBar(), event)
         else:
             super().wheelEvent(event)
+            
+class _ClickableRow(QWidget):
+    clicked = Signal()
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setAttribute(Qt.WA_StyledBackground, True)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+
 #####################################################################
 # pglTraitsDialog: what gets called by the user. This rund
 # pglTraitsDialogStandalone which runs outside the jupyter notebook
