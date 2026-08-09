@@ -57,6 +57,10 @@ def pglGetAllSubclasses(baseClass):
 # force an unfired dynamic default (e.g. a lazy/network-backed field)?
 ##########################
 def pglShouldReadTraitForSerialize(obj, traitName):
+    
+    # do not serialize private variables
+    if traitName.startswith('_'): return False
+    
     hasDynamicDefault = traitName in type(obj)._trait_default_generators
     if hasDynamicDefault and not obj.trait_has_value(traitName):
         # never been computed - reading now would fire the generator
@@ -180,7 +184,7 @@ class pglSerialize:
                     '__class__': o.__class__.__name__,
                     '__module__': o.__class__.__module__,
                     **{key: encodeObject(getattr(o, key)) 
-                       for key in o.trait_names() if not key.startswith('_') and pglShouldReadTraitForSerialize(o, key)}
+                       for key in o.trait_names() if pglShouldReadTraitForSerialize(o, key)}
                 }
             
             # Recursively handle lists
@@ -208,8 +212,7 @@ class pglSerialize:
         if isinstance(self, HasTraits):
             return {key: getattr(self, key) 
                     for key in self.trait_names() 
-                    if not key.startswith('_')
-                    and pglShouldReadTraitForSerialize(self, key)}
+                    if pglShouldReadTraitForSerialize(self, key)}
         
         # If this is a dataclass, manually build dict (preserves nested objects)
         if is_dataclass(self):
