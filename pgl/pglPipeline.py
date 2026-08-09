@@ -271,8 +271,9 @@ class pglChooseLevel(pglTraitSettings):
 from .pglExperiment import pglExperimentBase, pglExperiment, pglExperimentSettings
 
 class pglRun(pglExperimentBase):
+    fullDataPath = Unicode(allow_none=True, default_value="", help="Full path to data", visible=False)
     #experimentSettings = Instance(pglExperimentSettings, allow_none=True, default_value=None, help="settings of the experiemnt")
-    
+
     def __init__(self, fullDataPath):
         '''
         Initialize the pglRun class
@@ -284,12 +285,13 @@ class pglRun(pglExperimentBase):
         super().__init__()
 
         # keep path
-        self.fullDataPath = Path(fullDataPath)
+        self.fullDataPath = fullDataPath
         
     def getTaskNames(self):
+        print(f"path: {self.fullDataPath}")
         taskString = ""
         if not self.experimentSettings:
-            self.experimentSettings = pglExperimentSettings.load(self.fullDataPath / "experimentSettings")
+            self.experimentSettings = pglExperimentSettings.load(Path(self.fullDataPath) / "experimentSettings")
         if self.experimentSettings:
             taskString = ", ".join(self.experimentSettings.tasks)
         return taskString
@@ -299,23 +301,24 @@ class pglChooseRun(pglChooseLevel):
     # this is the root, so no more recursion beyond this point
     childClass = None
 
-    run = Instance(pglRun, allow_none=True, default_value=None, help="Class representing run data", visible=False)
-    date = Unicode("yowsa", help="Date the run was collected")
-    experimenter = Unicode("doggoneit", help="Who ran the session")
-    tasks = Unicode(allow_none=True, help="Stimulus type used for this run")
+    _run = Instance(pglRun, allow_none=True, default_value=None, help="Class representing run data", visible=False)
+    dataDir = Unicode(allow_none=True, default_value=None, help="Where the data for this run lives", enable=False)
+    #date = Unicode("yowsa", help="Date the run was collected")
+    #experimenter = Unicode("doggoneit", help="Who ran the session")
+    tasks = Unicode(allow_none=True, help="Stimulus type used for this run", enable=False)
     
     @default('tasks')
     def _defaultTasks(self):
         self._initRun()
         # should only run once, on access to the field
-        if self.run:
-            return self.run.getTaskNames()
+        if self._run:
+            return self._run.getTaskNames()
         else:
             return ""
 
     def _initRun(self):
-        if not self.run:
-            self.run = pglRun(self.dataDir)        
+        if not self._run:
+            self._run = pglRun(self.dataDir)        
 
     @classmethod
     def _isValid(cls, name=None, dataDir=None, filesystem=None, entries=None):

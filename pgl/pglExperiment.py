@@ -54,7 +54,7 @@ class Stats:
 ##############################################s
 # Experiment base class
 ##############################################
-class pglExperimentBase():
+class pglExperimentBase(pglTraitSettings):
     '''
     Base class for pglExperiment which runs experiments
     and pglExperimentAnalysis which is used for loading and
@@ -1373,6 +1373,9 @@ class pglTask:
 ##############################################
 class pglExperimentSettings(pglTraitSettings):
     experimentName = Unicode("Default experiment", help="Name of the experiment")
+    sessionName = Unicode("", help="Session name of experiment")
+    runName = Unicode("", help="Name of run of experiment")
+    experimenterName = Unicode("", help="Name of experimenter who ran in experiment")
     experimentSaveName = Unicode("defaultExperiment", help="Name to use when saving experiment data (defaults to camelCase version of experimentName)")
     subjectID = Unicode("s0000", help="Identifier for the subject participating in the experiment.")
     tasks = List(trait=Unicode(), default_value=[], help="Task names")

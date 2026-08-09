@@ -51,6 +51,18 @@ def pglGetAllSubclasses(baseClass):
 
     collect(baseClass)
     return allSubclasses
+
+##########################
+# Should we read this trait's value right now, or would doing so
+# force an unfired dynamic default (e.g. a lazy/network-backed field)?
+##########################
+def pglShouldReadTraitForSerialize(obj, traitName):
+    hasDynamicDefault = traitName in type(obj)._trait_default_generators
+    if hasDynamicDefault and not obj.trait_has_value(traitName):
+        # never been computed - reading now would fire the generator
+        return False
+    return True
+
 ##########################
 # pglSerialize class
 ##########################
@@ -168,7 +180,7 @@ class pglSerialize:
                     '__class__': o.__class__.__name__,
                     '__module__': o.__class__.__module__,
                     **{key: encodeObject(getattr(o, key)) 
-                       for key in o.trait_names() if not key.startswith('_')}
+                       for key in o.trait_names() if not key.startswith('_') and pglShouldReadTraitForSerialize(o, key)}
                 }
             
             # Recursively handle lists
@@ -196,7 +208,8 @@ class pglSerialize:
         if isinstance(self, HasTraits):
             return {key: getattr(self, key) 
                     for key in self.trait_names() 
-                    if not key.startswith('_')}
+                    if not key.startswith('_')
+                    and pglShouldReadTraitForSerialize(self, key)}
         
         # If this is a dataclass, manually build dict (preserves nested objects)
         if is_dataclass(self):
@@ -376,7 +389,9 @@ class pglSerialize:
                     traceback.print_exc()
                     print(f"{'='*80}\n")
             else:
-                pglMessages.message(f"'{key}' not found in {filename} using default {getattr(self, key)}", verbose=verbose)
+                if pglShouldReadTraitForSerialize(self, key):
+                    pglMessages.message(f"'{key}' not found in {filename} using default {getattr(self, key)}", verbose=verbose)
+
         
         # Warn about unknown keys
         extraKeys = set(data.keys()) - set(self.trait_names())
