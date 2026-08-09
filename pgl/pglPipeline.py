@@ -272,7 +272,7 @@ from .pglExperiment import pglExperimentBase, pglExperiment, pglExperimentSettin
 
 class pglRun(pglExperimentBase):
     fullDataPath = Unicode(allow_none=True, default_value="", help="Full path to data", visible=False)
-    #experimentSettings = Instance(pglExperimentSettings, allow_none=True, default_value=None, help="settings of the experiemnt")
+    experimentSettings = Instance(pglExperimentSettings, allow_none=True, default_value=None, help="settings of the experiemnt")
 
     def __init__(self, fullDataPath):
         '''
@@ -302,10 +302,10 @@ class pglChooseRun(pglChooseLevel):
     childClass = None
 
     _run = Instance(pglRun, allow_none=True, default_value=None, help="Class representing run data", visible=False)
-    dataDir = Unicode(allow_none=True, default_value=None, help="Where the data for this run lives", enable=False)
+    dataDir = Unicode(allow_none=True, default_value=None, help="Where the data for this run lives", enabled=False)
     #date = Unicode("yowsa", help="Date the run was collected")
     #experimenter = Unicode("doggoneit", help="Who ran the session")
-    tasks = Unicode(allow_none=True, help="Stimulus type used for this run", enable=False)
+    tasks = Unicode(allow_none=True, help="Stimulus type used for this run", enabled=False)
     
     @default('tasks')
     def _defaultTasks(self):
