@@ -1409,7 +1409,7 @@ class pglExperimentSettings(pglTraitSettings):
 # Data for pglExperiment
 ##############################################
 @dataclass
-class pglExperimentData(pglTraitSettings):
+class pglExperimentData(pglSerialize):
     startTime: float = 0.0
     endTime: float = 0.0
     events: ListType[pglEvent] = field(default_factory=list) 
@@ -1430,19 +1430,21 @@ class pglExperimentData(pglTraitSettings):
             filteredEvents = [event for event in filteredEvents if getattr(event, "keyChar", None) == keyChar]
         return len(filteredEvents)
     
-    def display(self, e=None):
+    def display(self, e=None, fig=None):
         '''
         Display the experiment data.
         '''
         if len(self.events) == 0:
             print("(pglExperimentData) No events to display.")
             return
-
+        
         # get info from experiment if provided
         if e is not None:
             self.volumeTriggerKey = e.settings.volumeTriggerKey
         else:
-            self.volumeTriggerKey = ""
+            #settings = pglSettingsManager.getSettings()
+            #self.volumeTriggerKey = settings.volumeTriggerKey 
+            self.volumeTriggerKey = "`"
         
         # Get the time at which start the timeline, if there is a keyboard
         # event that happens before the start of the experiment (like when the experimenter
@@ -1459,7 +1461,7 @@ class pglExperimentData(pglTraitSettings):
         nKeys = 0
         
         # init timeline
-        timeline = timelinePlot(startTime=startTime, endTime=max(self.endTime-self.startTime,10))
+        timeline = timelinePlot(fig=fig, startTime=startTime, endTime=max(self.endTime-self.startTime,10))
         # for each event, add to timeline
         for event in self.events:
             if event.type == "keyboard":
@@ -1737,7 +1739,7 @@ class timelinePlot:
         timeline.show()
     """
     
-    def __init__(self, startTime=0, endTime=100, figsize=(12, 4)):
+    def __init__(self, startTime=0, endTime=100, figsize=(12, 4), fig=None):
         """
         Initialize the timeline plot.
         
@@ -1750,7 +1752,11 @@ class timelinePlot:
         self.endTime = endTime
         
         # Create figure and axis
-        self.fig, self.ax = plt.subplots(figsize=figsize)
+        if fig:
+            self.fig = fig
+            self.ax = self.fig.add_subplot(111)
+        else:
+            self.fig, self.ax = plt.subplots(figsize=figsize)
         
         # Setup the timeline axis
         self.ax.set_xlim(startTime, endTime)

@@ -346,6 +346,8 @@ class _pglTraitsDialog(QDialog):
         hideKey = trait.metadata.get("hideKey", False)
         hideAll = trait.metadata.get("hideAll", False)
         maxRowsVisible = trait.metadata.get("maxRowsVisible", 5)
+        plotButtonFunction = trait.metadata.get("buttonFunction", None)
+        hasPlotButton = trait.metadata.get("hasPlotButton", None)
         
         if layout is None:
             layout = self.formLayout
@@ -521,7 +523,7 @@ class _pglTraitsDialog(QDialog):
         buttonRow = QWidget()
         buttonLayout = QHBoxLayout(buttonRow)
         buttonLayout.setContentsMargins(0, 0, 0, 0)
-
+        
         selectAllButton = QPushButton("select all")
         def onSelectAll():
             for obj in state["list"]:
@@ -533,6 +535,22 @@ class _pglTraitsDialog(QDialog):
             for obj in state["list"]:
                 obj.isSelected = False
         selectNoneButton.clicked.connect(onSelectNone)
+        
+        if hasPlotButton:
+            plotButton = QPushButton("display")
+            def onPlotButton():
+                # get which list item has focus
+                obj = state["focused"]
+                # and call its plot function
+                buttonFunction = getattr(obj,plotButtonFunction,None)
+                if buttonFunction:
+                    self.plotCanvas.setVisible(True)
+                    buttonFunction(self.figure)
+                    #self.plotButtonState = True
+                else:
+                    print(f"{obj.name} does not have function: {plotButtonFunction}")
+            buttonLayout.addWidget(plotButton)
+            plotButton.clicked.connect(onPlotButton)
 
         buttonLayout.addWidget(selectNoneButton)
         buttonLayout.addWidget(selectAllButton)
