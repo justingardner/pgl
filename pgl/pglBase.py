@@ -760,6 +760,78 @@ class pglBase:
             print(f"(pglBase:save) Failed to save to {filepath}: {e}")
 
     ################################################################
+    # # validate filesystem: used for fsspec 
+    ################################################################
+    @staticmethod
+    def validateFilesystem(filesystem=None, dataPath=None):
+        '''
+        Return a valid fsspec filesystem and (possibly rewritten) data path.
+
+        This normalises the two ways a filesystem can be specified:
+
+        1. Explicitly, by passing an fsspec AbstractFileSystem instance as
+            `filesystem`. In that case it is validated and returned unchanged,
+            along with `dataPath` untouched.
+
+        2. Implicitly, by encoding a protocol in `dataPath` itself (e.g.
+            'ssh://host/path' or 'https://host/file'). When `filesystem` is
+            None and `dataPath` carries such a qualifier, the protocol/location
+            is extracted, a matching filesystem is constructed, and the bare
+            path (with the protocol part stripped) is returned.
+
+        If neither a filesystem nor a protocol qualifier is supplied, a plain
+        local ("file") filesystem is returned and `dataPath` is left as-is.
+
+        Args:
+            filesystem (fsspec.AbstractFileSystem, optional): An existing
+                fsspec filesystem instance. If provided, it is validated and
+                returned unchanged. Defaults to None.
+            dataPath (str or Path, optional): The path to the data. May include
+                a protocol qualifier (e.g. 'ssh://', 'https://') which, when
+                `filesystem` is None, is used to infer the filesystem. Defaults
+                to None.
+
+        Returns:
+            tuple: (filesystem, dataPath) where `filesystem` is a valid fsspec
+            AbstractFileSystem and `dataPath` is the corresponding path with any
+            protocol qualifier removed. Returns (None, dataPath) on error.
+        '''
+        import fsspec
+        from fsspec.core import url_to_fs
+        from fsspec import AbstractFileSystem
+
+        # Case 1: a filesystem was explicitly provided -> validate and return
+        if filesystem is not None:
+            if not isinstance(filesystem, AbstractFileSystem):
+                pglMessages.warning(
+                    f"(validateFilesystem) Expected an fsspec AbstractFileSystem, "
+                    f"got {type(filesystem).__name__}.")
+                return None, dataPath
+            return filesystem, dataPath
+
+        # Case 2: no filesystem given -> infer from dataPath if possible.
+        # No path at all: fall back to a plain local filesystem.
+        if dataPath is None:
+            return fsspec.filesystem("file"), dataPath
+
+        dataPathString = str(dataPath)
+
+        # Detect a protocol qualifier such as 'ssh://', 'https://', 's3://'.
+        # A bare local path (or Windows drive like 'C:\...') has no '://'.
+        if "://" not in dataPathString:
+            return fsspec.filesystem("file"), dataPath
+
+        # url_to_fs builds the filesystem and returns the protocol-stripped path.
+        try:
+            fileSystem, strippedPath = url_to_fs(dataPathString)
+        except Exception as e:
+            pglMessages.warning(
+                f"(validateFilesystem) Could not resolve filesystem for "
+                f"'{dataPathString}': {type(e).__name__}: {e}")
+            return None, dataPath
+
+        return fileSystem, strippedPath        
+    ################################################################
     # Clean up open windows (which may be orphaned) and their socket connections
     ################################################################
     def cleanUp(self):
