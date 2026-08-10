@@ -15,9 +15,13 @@ from datetime import datetime
 from traitlets import HasTraits, Float, Int, List, Tuple, TraitError, Unicode, Dict, default, link, Bool, TraitType, Instance
 from enum import Enum, auto
 import fsspec
+from fsspec import AbstractFileSystem
 from pathlib import Path
 import re
-from .pglExperiment import pglExperimentData
+from .pglExperiment import pglExperimentData, pglExperimentBase, pglExperimentSettings
+from .pglBase import pglBase
+from .pglSettings import pglSettings
+
 
 ##########################
 # pglDataPort
@@ -188,7 +192,7 @@ class pglDatasetData(pglDataMatrix):
 #################################
 class pglChooseLevel(pglTraitSettings):
     '''
-    Base class for one level of the dataDir hierarchy (experiment,
+    Base class for one level of the dataPath hierarchy (experiment,
     subject, run, ...). Subclasses just declare which class their
     children are; discovery logic itself lives here
     '''
@@ -199,18 +203,17 @@ class pglChooseLevel(pglTraitSettings):
     # further recursion into subdirectories)
     childClass = None
 
-    def __init__(self, name="", dataDir="", filesystem=None, entries=None):
+    def __init__(self, name="", dataPath="", filesystem=None, entries=None):
         super().__init__()
 
         self.name = name
-        self.dataDir = dataDir
-        self.filesystem = filesystem if filesystem is not None else fsspec.filesystem("file")
+        self.filesystem, self.dataPath = pglBase.validateFilesystem(filesystem=filesystem, dataPath=dataPath)
         self.childList = self._getChildren(entries) if self.childClass is not None else []
 
     @classmethod
-    def create(cls, name="", dataDir="", filesystem=None):
+    def create(cls, name="", dataPath="", filesystem=None):
         '''
-        Factory method: validates that dataDir qualifies as this
+        Factory method: validates that dataPath qualifies as this
         level (via _isValid), then builds the instance and, for
         non-leaf levels, checks that it actually ended up with at
         least one valid child. A level with no valid children isn't
@@ -218,29 +221,36 @@ class pglChooseLevel(pglTraitSettings):
         valid runs isn't really a subject). Returns None if either
         check fails, otherwise returns the fully-built instance.
         '''
-        filesystem = filesystem if filesystem is not None else fsspec.filesystem("file")
+        filesystem, dataPath = pglBase.validateFilesystem(filesystem=filesystem, dataPath=dataPath)
+
+
+        # load all the entries in the directory
         try:
-            entries = filesystem.ls(dataDir, detail=True)
+            entries = filesystem.ls(dataPath, detail=True)
         except (FileNotFoundError, OSError):
             return None
         
-        if not cls._isValid(name=name, dataDir=dataDir, entries=entries):
+        # check if the disrecotry is valid (this is an overwriteable function for specific
+        # checks like if the directory contains all the files necessary for a run)
+        if not cls._isValid(name=name, dataPath=dataPath, filesystem=filesystem, entries=entries):
             return None
 
-        instance = cls(name=name, dataDir=dataDir, filesystem=filesystem, entries=entries)
+        # there are some children create the instance
+        instance = cls(name=name, dataPath=dataPath, filesystem=filesystem, entries=entries)
 
-        # leaf levels have no children to check; only enforce the
-        # "must have at least one valid child" rule on levels that
-        # actually recurse
+        # There should be a list of children now (this is what selection is over).
+        # So, drop out here if the list is empty. Alternatively, if this is a leaf
+        # (i.e. has no childClass) then no check necessary
         if cls.childClass is not None and len(instance.childList) == 0:
             return None
 
+        # return the initialized instance
         return instance
 
     @classmethod
-    def _isValid(cls, name=None, dataDir=None, filesystem=None, entries=None):
+    def _isValid(cls, name=None, dataPath=None, filesystem=None, entries=None):
         '''
-        Subclass-overrideable check for whether dataDir qualifies as
+        Subclass-overrideable check for whether dataPath qualifies as
         this level based on its own properties (name pattern, presence
         of a specific file, etc). Default: always valid.
         '''
@@ -248,63 +258,98 @@ class pglChooseLevel(pglTraitSettings):
 
     def _getChildren(self, entries):
         '''
-        Find all directories directly under dataDir and instantiate
+        Find all directories directly under dataPath and instantiate
         one childClass instance per directory that passes validation
         (including the "has valid children" check, if applicable).
         '''
     
         if entries is None:
-            entries = self.filesystem.ls(self.dataDir, detail=True)
+            entries = self.filesystem.ls(self.dataPath, detail=True)
 
         children = []
         for entry in entries:
             if entry["type"] != "directory":
                 continue
             childName = entry["name"].rstrip("/").split("/")[-1]
-            child = self.childClass.create(name=childName, dataDir=entry["name"], filesystem=self.filesystem)
+            child = self.childClass.create(name=childName, dataPath=entry["name"], filesystem=self.filesystem)
             if child is not None:
                 children.append(child)
         return children
         
 #    luminanceCalibration = List(Unicode(), hasPlotButton=True, buttonFunction="plotLuminanceCalibration", default_value=['None'], help="Which luminance calibration to use")
 
-from .pglExperiment import pglExperimentBase, pglExperiment, pglExperimentSettings
-from .pglSettings import pglSettings
 
+
+##################################
+# pglRun
+##################################
 class pglRun(pglExperimentBase):
+    
+    filesystem = Instance(AbstractFileSystem, allow_none=True, serialize=False, help="filesystem for serialization")
     fullDataPath = Unicode(allow_none=True, default_value="", help="Full path to data", visible=False)
-    experimentSettings = Instance(pglExperimentSettings, allow_none=True, default_value=None, help="settings of the experiemnt")
-    settings = Instance(pglSettings, allow_none=True, default_value=None, help="settings that this experiment was run with")
-    data = Instance(pglExperimentData, allow_none=True, default_value=None, help="data from experiemnt")
+    
+    # These will be lazy-loaded as needed
+    _experimentSettings = Instance(pglExperimentSettings, allow_none=True, default_value=None, help="settings of the experiemnt")
+    _settings = Instance(pglSettings, allow_none=True, default_value=None, help="settings that this experiment was run with")
+    _data = Instance(pglExperimentData, allow_none=True, default_value=None, help="data from experiemnt")
     
     
-    def __init__(self, fullDataPath):
+    ##########################
+    # Lazy-loaded properties
+    ##########################
+    @property
+    def experimentSettings(self):
+        '''Experiment settings, loaded from disk on first access.'''
+        if self._experimentSettings is None:
+            self._experimentSettings = pglExperimentSettings.load(filename=Path(self.fullDataPath) / "experimentSettings", filesystem=self.filesystem)
+        return self._experimentSettings
+
+    @experimentSettings.setter
+    def experimentSettings(self, value):
+        self._experimentSettings = value
+
+    @property
+    def settings(self):
+        '''Settings the experiment was run with, loaded on first access.'''
+        if self._settings is None:
+            self._settings = pglSettings.load(filename=Path(self.fullDataPath) / "settings", filesystem=self.filesystem)
+        return self._settings
+
+    @settings.setter
+    def settings(self, value):
+        self._settings = value
+
+    @property
+    def data(self):
+        '''Experiment data, loaded from disk on first access.'''
+        if self._data is None:
+            self._data = pglExperimentData.load(filename=Path(self.fullDataPath) / "data", filesystem=self.filesystem)
+        return self._data
+
+    @data.setter
+    def data(self, value):
+        self._data = value
+
+    
+    def __init__(self, fullDataPath, filesystem):
         '''
         Initialize the pglRun class
         
         Args:
-            dataDir: The directory where the run is saved
+            dataPath: The directory where the run is saved
         '''
         # init super
         super().__init__()
 
-        # keep path
-        self.fullDataPath = fullDataPath
+        # keep the path and filesystem
+        self.filesystem, self.fullDataPath = pglBase.validateFilesystem(filesystem, fullDataPath)
         
     def getTaskNames(self):
         '''
         Extracts task names from experimentSettings
         '''
         
-        taskString = ""
-        
-        # load experimentSettings if not already loaded
-        if not self.experimentSettings:
-            self.experimentSettings = pglExperimentSettings.load(Path(self.fullDataPath) / "experimentSettings")
-
-        # get task names form experimentSettings
-        if self.experimentSettings:
-            taskString = ", ".join(self.experimentSettings.tasks)
+        taskString = ", ".join(self.experimentSettings.tasks)
         
         # return taskString
         return taskString
@@ -313,59 +358,54 @@ class pglRun(pglExperimentBase):
         '''
         display plot of the run
         '''
-        # load data, if not already loaded
-        if not self.data:
-            self.data = pglExperimentData.load(Path(self.fullDataPath) / "data.json")
-            
         # display
-        if self.data:
-            try:
-                self.data.display(fig=fig)
-                fig.suptitle(f"{self.fullDataPath}")
-            except Exception as e:
-                print(f"error: {e}")
+        try:
+            self.data.display(fig=fig)
+            fig.suptitle(f"{self.fullDataPath}")
+        except Exception as e:
+            print(f"error: {e}")
              
 class pglChooseRun(pglChooseLevel):
     # this is the root, so no more recursion beyond this point
     childClass = None
 
-    _run = Instance(pglRun, allow_none=True, default_value=None, help="Class representing run data", visible=False)
-    dataDir = Unicode(allow_none=True, default_value=None, help="Where the data for this run lives", enabled=False)
+    dataPath = Unicode(allow_none=True, default_value=None, help="Where the data for this run lives", enabled=False)
     #date = Unicode("yowsa", help="Date the run was collected")
     #experimenter = Unicode("doggoneit", help="Who ran the session")
-    tasks = Unicode(allow_none=True, help="Stimulus type used for this run", enabled=False)
+    _tasks = Unicode(allow_none=True, default_value="", help="Stimulus type used for this run", enabled=False)
+    _run = Instance(pglRun, allow_none=True, default_value=None, serialize=False, help="Class representing run data", visible=False)
     
-    @default('tasks')
-    def _defaultTasks(self):
-        self._initRun()
-        return self._run.getTaskNames()
+    @property
+    def tasks(self):
+        '''String representing tasks, lazy-loaded.'''
+        if not self._tasks:
+            self._tasks = self.run.getTaskNames()
+        return self._tasks
 
-    def _initRun(self):
-        if not self._run: self._run = pglRun(self.dataDir)        
+    @property
+    def run(self):
+        '''String representing tasks, lazy-loaded.'''
+        if not self._run:
+            self.run = pglRun(self.dataPath, self.filesystem)   
+        return self._run
+    
+    @run.setter
+    def run(self, value):
+        self._run = value
 
-    @classmethod
-    def _isValid(cls, name=None, dataDir=None, filesystem=None, entries=None):
-        # check if we have a valid experiment name
-        validExperimentDir = pglExperiment.isValidExperimentDir(fullDataPath=dataDir)
-        return validExperimentDir
-
+    # display
     def display(self, fig=None):
         '''
         display the run
         '''
-        self._initRun()
-        self._run.display(fig=fig)
-        
-    
-               
-        
+        self.run.display(fig=fig)
+
+################################################################################
+# # Each one of these classes sits at one level of the file structure hierarchy
+################################################################################        
 class pglChooseSession(pglChooseLevel):
     childList = List(Instance(pglTraitSettings), settingsListKey="name", traitDisplayName="Select run(s)", multiSelect=True, maxRowsVisible=6, hasPlotButton=True, buttonFunction="display", help="Runs in session dir")
     childClass = pglChooseRun
-    
-    def __init__(self, name="", dataDir="", filesystem=None, entries=None):
-        # initialize class
-        super().__init__(name=name, dataDir=dataDir, filesystem=filesystem, entries=entries) 
                 
 class pglChooseSubject(pglChooseLevel):
     # re-declare childList, so we can give it a proper name
@@ -373,9 +413,10 @@ class pglChooseSubject(pglChooseLevel):
     childClass = pglChooseSession
     
     @classmethod
-    def _isValid(cls, name=None, dataDir=None, filesystem=None, entries=None):
+    def _isValid(cls, name=None, dataPath=None, filesystem=None, entries=None):
+        
         # check whether it is a directory of form sXXXXX
-        lastDir = Path(dataDir).name
+        lastDir = Path(dataPath).name
         return bool(re.match(r"^s\d+$", lastDir))
     
 class pglChooseExperiment(pglChooseLevel):
@@ -385,7 +426,7 @@ class pglChooseExperiment(pglChooseLevel):
     
 class pglChoose(pglChooseLevel):
     # re-declare childList, so we can give it a proper name
-    childList = List(Instance(pglTraitSettings), settingsListKey="name", traitDisplayName="Choose experiment", help="Experiments in datadir")
+    childList = List(Instance(pglTraitSettings), settingsListKey="name", traitDisplayName="Choose experiment", help="Experiments in data path")
     childClass = pglChooseExperiment
     
 #################################
