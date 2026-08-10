@@ -321,6 +321,7 @@ class pglRun(pglExperimentBase):
         if self.data:
             try:
                 self.data.display(fig=fig)
+                fig.suptitle(f"{self.fullDataPath}")
             except Exception as e:
                 print(f"error: {e}")
              

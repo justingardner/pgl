@@ -348,7 +348,7 @@ class _pglTraitsDialog(QDialog):
         maxRowsVisible = trait.metadata.get("maxRowsVisible", 5)
         plotButtonFunction = trait.metadata.get("buttonFunction", None)
         hasPlotButton = trait.metadata.get("hasPlotButton", None)
-        
+        self.multiSelectPlotButtonState = False
         if layout is None:
             layout = self.formLayout
 
@@ -376,6 +376,17 @@ class _pglTraitsDialog(QDialog):
         #------------------------------
         def updateFields(obj):
             self._updatingWidget = True
+            # update plot if visible
+            #if self.multiSelectPlotButtonState:
+            #    try:
+            #        buttonFunction = getattr(obj,plotButtonFunction,None)
+            #        if buttonFunction:
+            #            buttonFunction(self.figure)
+            #        else:
+            #            pglMessages.warning(f"Button function {buttonFunction} not found for {obj}")
+            #    except Exception as e:
+            #        pglMessages.warning(f"Could not run {buttonFunction}: {e}")
+            # update fields
             try:
                 for name in childNames:
                     value = getattr(obj, name)
@@ -539,16 +550,24 @@ class _pglTraitsDialog(QDialog):
         if hasPlotButton:
             plotButton = QPushButton("display")
             def onPlotButton():
-                # get which list item has focus
-                obj = state["focused"]
-                # and call its plot function
-                buttonFunction = getattr(obj,plotButtonFunction,None)
-                if buttonFunction:
-                    self.plotCanvas.setVisible(True)
-                    buttonFunction(self.figure)
-                    #self.plotButtonState = True
-                else:
-                    print(f"{obj.name} does not have function: {plotButtonFunction}")
+                try:
+                    # get which list item has focus
+                    obj = state["focused"]
+                    # and call its plot function
+                    buttonFunction = getattr(obj,plotButtonFunction,None)
+                    if buttonFunction:
+                        if not self.multiSelectPlotButtonState:
+                            self.plotCanvas.setVisible(True)
+                            buttonFunction(self.figure)
+                            self.multiSelectPlotButtonState = True
+                        else:
+                            self.plotCanvas.setVisible(False)
+                            self.multiSelectPlotButtonState = False
+                    else:
+                        print(f"{obj.name} does not have function: {plotButtonFunction}")
+                except Exception as e:
+                    pglMessages.warning("Error calling plotButton function {plotButtonFunction}: {e}")
+                    
             buttonLayout.addWidget(plotButton)
             plotButton.clicked.connect(onPlotButton)
 
