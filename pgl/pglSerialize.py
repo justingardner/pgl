@@ -17,6 +17,8 @@ from pathlib import Path
 from datetime import datetime
 from traitlets import HasTraits, TraitError
 from .pglMessages import pglMessages
+import fsspec
+from fsspec.core import url_to_fs
 
 # FIx, FIX, FIX, temporarily trying to shutdown pglSerialize from
 # printing all the missing and added fields
@@ -57,10 +59,19 @@ def pglGetAllSubclasses(baseClass):
 # force an unfired dynamic default (e.g. a lazy/network-backed field)?
 ##########################
 def pglShouldReadTraitForSerialize(obj, traitName):
-    
-    # do not serialize private variables
-    if traitName.startswith('_'): return False
-    
+    '''Decide whether a trait should be serialized.
+
+    Default: serialize all declared traits. A trait can explicitly opt out
+    by setting serialize=False in its metadata. 
+    '''
+    trait = obj.traits().get(traitName)
+    if trait is None:
+        return False
+
+    # Explicit opt-out wins
+    if trait.metadata.get("serialize", True) is False:
+        return False
+        
     hasDynamicDefault = traitName in type(obj)._trait_default_generators
     if hasDynamicDefault and not obj.trait_has_value(traitName):
         # never been computed - reading now would fire the generator
@@ -82,12 +93,26 @@ class pglSerialize:
     ##########################
     # Save to JSON file
     ##########################
-    def save(self, filename):
+    def save(self, filename, filesystem=None):
         """Save object to JSON file"""
         try:
-            filename = Path(filename).with_suffix(".json")
+            # Validate/resolve filesystem and normalise the path
+            from .pglBase import pglBase
+            filesystem, filename = pglBase.validateFilesystem(filesystem, filename)
+            if filesystem is None:
+                pglMessages.warning(
+                    f"(pglSerialize) Could not resolve a filesystem for '{filename}'.")
+                return
+
+            # Ensure the filename has a .json suffix (string-based to stay
+            # OS-agnostic for remote, always POSIX-style, paths)
+            filename = str(filename)
+            if not filename.endswith(".json"):
+                base, dot, _ = filename.rpartition(".")
+                filename = (base if dot else filename) + ".json"
+
             #pglMessages.message(f"Saving {self.__class__.__name__} to '{filename}'")
-            with open(filename, 'w') as f:
+            with filesystem.open(filename, 'w') as f:
                 f.write(self.toJSON())
         except PermissionError:
             pglMessages.warning(f"(pglSerialize) No permission to write to '{filename}'")
@@ -97,25 +122,48 @@ class pglSerialize:
             pglMessages.warning(f"(pglSerialize) OS error while saving '{filename}': {e}")
         except Exception as e:
             pglMessages.warning(f"(pglSerialize) Unknown error ({type(e).__name__}) while saving '{filename}': {e}")
-
     ##########################
     # Load from JSON file
     ##########################
     @classmethod
-    def load(cls, filename):
-        """Load a pglSerialize (or subclass) object from a JSON file and return it"""
-        filename = Path(filename).with_suffix(".json")
+    def load(cls, filename, filesystem=None):
+        """Load a pglSerialize (or subclass) object from a JSON file and return it.
 
-        if not filename.exists():
+        Args:
+            filename (str or Path): Path to the JSON file. May include a protocol
+                qualifier (e.g. 'ssh://...') when `filesystem` is None.
+            filesystem (fsspec.AbstractFileSystem, optional): Filesystem to read
+                through. If None, it is inferred from `filename` (falling back to
+                a local filesystem). Defaults to None.
+
+        Returns:
+            The loaded object, or None if it could not be loaded.
+        """
+
+        # Validate/resolve filesystem and normalise the path
+        from .pglBase import pglBase
+        filesystem, filename = pglBase.validateFilesystem(filesystem, filename)
+        if filesystem is None:
+            pglMessages.warning(f"(pglSerialize) Could not resolve a filesystem for '{filename}'.")
+            return None
+
+        # Ensure the filename has a .json suffix
+        filename = str(filename)
+        if not filename.endswith(".json"):
+            base, dot, _ = filename.rpartition(".")
+            filename = (base if dot else filename) + ".json"
+
+        if not filesystem.exists(filename):
             pglMessages.warning(f"File {filename} not found.", level=1)
             return None
 
-        if not filename.is_file():
+        if not filesystem.isfile(filename):
             pglMessages.warning(f"{filename} is not a file.", level=1)
             return None
 
         try:
-            jsonString = filename.read_text()
+            with filesystem.open(filename, "r") as fileHandle:
+                jsonString = fileHandle.read()
             obj = cls.fromJSON(jsonString, filename=filename)  # uses your existing fromJSON
             return obj
         except PermissionError:
@@ -132,12 +180,10 @@ class pglSerialize:
     # update instance function - updates this instance in place from a JSON file
     # (useful for updating an existing object rather than creating a new one)
     ##########################
-    def updateFromFile(self, filename):
-        """Update this object in place from a JSON file"""
-        obj = self.__class__.load(filename)  # call the class method
+    def updateFromFile(self, filename, filesystem=None):
+        obj = self.__class__.load(filename, filesystem=filesystem)
         if obj is not None:
-            self.copyTraitsFrom(obj)  # reuse existing copy logic
-    
+            self.copyTraitsFrom(obj)    
     ##########################
     # toJSON
     ##########################
