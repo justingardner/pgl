@@ -98,7 +98,7 @@ class pglSerialize:
         try:
             # Validate/resolve filesystem and normalise the path
             from .pglBase import pglBase
-            filesystem, filename = pglBase.validateFilesystem(filesystem, filename)
+            filesystem, filename, _ = pglBase.validateFilesystem(filesystem, filename)
             if filesystem is None:
                 pglMessages.warning(
                     f"(pglSerialize) Could not resolve a filesystem for '{filename}'.")
@@ -142,7 +142,7 @@ class pglSerialize:
 
         # Validate/resolve filesystem and normalise the path
         from .pglBase import pglBase
-        filesystem, filename = pglBase.validateFilesystem(filesystem, filename)
+        filesystem, filename, _ = pglBase.validateFilesystem(filesystem, filename)
         if filesystem is None:
             pglMessages.warning(f"(pglSerialize) Could not resolve a filesystem for '{filename}'.")
             return None

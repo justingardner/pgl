@@ -202,16 +202,21 @@ class pglChooseLevel(pglTraitSettings):
     # child directory found; None means this is a leaf level (no
     # further recursion into subdirectories)
     childClass = None
+    
+    filesystem = Instance(AbstractFileSystem, allow_none=True, serialize=False, help="filesystem for serialization",visible=False)
+    fullDataPath = Unicode(allow_none=True, default_value="", help="Full path to data", visible=False)
+    filesystemPrefix = Unicode(allow_none=True, default_value="", help="Prefix like ssh:// used for accessing filesystem", visible=False)
 
-    def __init__(self, name="", dataPath="", filesystem=None, entries=None):
+
+    def __init__(self, name="", dataPath="", filesystem=None, filesystemPrefix=None, entries=None):
         super().__init__()
 
         self.name = name
-        self.filesystem, self.dataPath = pglBase.validateFilesystem(filesystem=filesystem, dataPath=dataPath)
+        self.filesystem, self.dataPath, self.filesystemPrefix = pglBase.validateFilesystem(filesystem=filesystem, dataPath=dataPath, filesystemPrefix=filesystemPrefix)
         self.childList = self._getChildren(entries) if self.childClass is not None else []
 
     @classmethod
-    def create(cls, name="", dataPath="", filesystem=None):
+    def create(cls, name="", dataPath="", filesystem=None, filesystemPrefix=None):
         '''
         Factory method: validates that dataPath qualifies as this
         level (via _isValid), then builds the instance and, for
@@ -221,8 +226,7 @@ class pglChooseLevel(pglTraitSettings):
         valid runs isn't really a subject). Returns None if either
         check fails, otherwise returns the fully-built instance.
         '''
-        filesystem, dataPath = pglBase.validateFilesystem(filesystem=filesystem, dataPath=dataPath)
-
+        filesystem, dataPath, filesystemPrefix = pglBase.validateFilesystem(filesystem=filesystem, dataPath=dataPath, filesystemPrefix=filesystemPrefix)
 
         # load all the entries in the directory
         try:
@@ -235,8 +239,9 @@ class pglChooseLevel(pglTraitSettings):
         if not cls._isValid(name=name, dataPath=dataPath, filesystem=filesystem, entries=entries):
             return None
 
-        # there are some children create the instance
-        instance = cls(name=name, dataPath=dataPath, filesystem=filesystem, entries=entries)
+        # there are some children create the instance, note that we use the original filesystem
+        # and dataPath so that the dataPath can be stored with its filesystem prefix if it has one
+        instance = cls(name=name, dataPath=dataPath, filesystem=filesystem, filesystemPrefix=filesystemPrefix, entries=entries)
 
         # There should be a list of children now (this is what selection is over).
         # So, drop out here if the list is empty. Alternatively, if this is a leaf
@@ -271,14 +276,10 @@ class pglChooseLevel(pglTraitSettings):
             if entry["type"] != "directory":
                 continue
             childName = entry["name"].rstrip("/").split("/")[-1]
-            child = self.childClass.create(name=childName, dataPath=entry["name"], filesystem=self.filesystem)
+            child = self.childClass.create(name=childName, dataPath=entry["name"], filesystem=self.filesystem, filesystemPrefix=self.filesystemPrefix)
             if child is not None:
                 children.append(child)
         return children
-        
-#    luminanceCalibration = List(Unicode(), hasPlotButton=True, buttonFunction="plotLuminanceCalibration", default_value=['None'], help="Which luminance calibration to use")
-
-
 
 ##################################
 # pglRun
@@ -287,12 +288,12 @@ class pglRun(pglExperimentBase):
     
     filesystem = Instance(AbstractFileSystem, allow_none=True, serialize=False, help="filesystem for serialization")
     fullDataPath = Unicode(allow_none=True, default_value="", help="Full path to data", visible=False)
+    filesystemPrefix = Unicode(allow_none=True, default_value="", help="Prefix like ssh:// used for accessing filesystem", visible=False)
     
     # These will be lazy-loaded as needed
     _experimentSettings = Instance(pglExperimentSettings, allow_none=True, default_value=None, help="settings of the experiemnt")
     _settings = Instance(pglSettings, allow_none=True, default_value=None, help="settings that this experiment was run with")
     _data = Instance(pglExperimentData, allow_none=True, default_value=None, help="data from experiemnt")
-    
     
     ##########################
     # Lazy-loaded properties
@@ -301,7 +302,8 @@ class pglRun(pglExperimentBase):
     def experimentSettings(self):
         '''Experiment settings, loaded from disk on first access.'''
         if self._experimentSettings is None:
-            self._experimentSettings = pglExperimentSettings.load(filename=Path(self.fullDataPath) / "experimentSettings", filesystem=self.filesystem)
+            filesystem, fullDataPath = pglBase.validateFilesystem(filesystem=self.filesystem, dataPath=self.fullDataPath, filesystemPrefix=self.filesystemPrefix)
+            self._experimentSettings = pglExperimentSettings.load(filename=Path(fullDataPath) / "experimentSettings", filesystem=filesystem)
         return self._experimentSettings
 
     @experimentSettings.setter
@@ -312,7 +314,8 @@ class pglRun(pglExperimentBase):
     def settings(self):
         '''Settings the experiment was run with, loaded on first access.'''
         if self._settings is None:
-            self._settings = pglSettings.load(filename=Path(self.fullDataPath) / "settings", filesystem=self.filesystem)
+            filesystem, fullDataPath, _ = pglBase.validateFilesystem(filesystem=self.filesystem, dataPath=self.fullDataPath, filesystemPrefix=self.filesystemPrefix)
+            self._settings = pglSettings.load(filename=Path(fullDataPath) / "settings", filesystem=filesystem)
         return self._settings
 
     @settings.setter
@@ -323,7 +326,9 @@ class pglRun(pglExperimentBase):
     def data(self):
         '''Experiment data, loaded from disk on first access.'''
         if self._data is None:
-            self._data = pglExperimentData.load(filename=Path(self.fullDataPath) / "data", filesystem=self.filesystem)
+            pglMessages.message(f"Loading {self.filesystemPrefix}/{self.fullDataPath}")
+            filesystem, fullDataPath, _ = pglBase.validateFilesystem(filesystem=self.filesystem, dataPath=self.fullDataPath, filesystemPrefix=self.filesystemPrefix)
+            self._data = pglExperimentData.load(filename=Path(fullDataPath) / "data", filesystem=filesystem)
         return self._data
 
     @data.setter
@@ -331,7 +336,7 @@ class pglRun(pglExperimentBase):
         self._data = value
 
     
-    def __init__(self, fullDataPath, filesystem):
+    def __init__(self, fullDataPath, filesystem, filesystemPrefix):
         '''
         Initialize the pglRun class
         
@@ -342,7 +347,7 @@ class pglRun(pglExperimentBase):
         super().__init__()
 
         # keep the path and filesystem
-        self.filesystem, self.fullDataPath = pglBase.validateFilesystem(filesystem, fullDataPath)
+        self.filesystem, self.fullDataPath, self.filesystemPrefix = pglBase.validateFilesystem(filesystem=filesystem,dataPath=fullDataPath,filesystemPrefix=filesystemPrefix)
         
     def getTaskNames(self):
         '''
@@ -370,8 +375,7 @@ class pglChooseRun(pglChooseLevel):
     childClass = None
 
     dataPath = Unicode(allow_none=True, default_value=None, help="Where the data for this run lives", enabled=False)
-    #date = Unicode("yowsa", help="Date the run was collected")
-    #experimenter = Unicode("doggoneit", help="Who ran the session")
+
     _tasks = Unicode(allow_none=True, default_value="", help="Stimulus type used for this run", enabled=False)
     _run = Instance(pglRun, allow_none=True, default_value=None, serialize=False, help="Class representing run data", visible=False)
     
@@ -386,7 +390,7 @@ class pglChooseRun(pglChooseLevel):
     def run(self):
         '''String representing tasks, lazy-loaded.'''
         if not self._run:
-            self.run = pglRun(self.dataPath, self.filesystem)   
+            self.run = pglRun(fullDataPath=self.dataPath, filesystem=self.filesystem, filesystemPrefix=self.filesystemPrefix)   
         return self._run
     
     @run.setter

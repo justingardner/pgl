@@ -566,7 +566,7 @@ class _pglTraitsDialog(QDialog):
                     else:
                         print(f"{obj.name} does not have function: {plotButtonFunction}")
                 except Exception as e:
-                    pglMessages.warning("Error calling plotButton function {plotButtonFunction}: {e}")
+                    pglMessages.warning(f"Error calling plotButton function {plotButtonFunction}: {e}")
                     
             buttonLayout.addWidget(plotButton)
             plotButton.clicked.connect(onPlotButton)
