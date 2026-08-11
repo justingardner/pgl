@@ -1205,7 +1205,7 @@ class pglTaskData(pglSerialize):
     events: ListType[pglEvent] = field(default_factory=list) 
     params: ListType[dict] = field(default_factory=list)
     
-    def display(self, taskName="task", responseMapping={True:('Correct','green'), False:('Incorrect','red')}):
+    def display(self, taskName="task", responseMapping={True:('Correct','green'), False:('Incorrect','red')}, ax=None):
         '''
         Display the experiment data.
         '''
@@ -1219,7 +1219,7 @@ class pglTaskData(pglSerialize):
         maxTrialLength = np.diff(trialTimestamps[:-1]).max()
         
         # init timeline
-        timeline = timelinePlot(startTime=0, endTime=maxTrialLength)
+        timeline = timelinePlot(ax=ax, startTime=0, endTime=maxTrialLength)
         
         # init a dict for counting the number of different responseTypes found in the events
         responseCounts = {respType: 0 for respType in responseMapping}
@@ -1259,7 +1259,7 @@ class pglTaskData(pglSerialize):
                 percent = (count / sum(responseCounts.values()) * 100) if nTrials > 0 else 0
                 legend.append({'label': f'{label} (n={count}: {percent:.1f}%)', 'color': color})
         timeline.addLegend(legend)
-        timeline.show()
+        if not ax: timeline.show()
 
 ##############################################
 # Task base 
@@ -1336,11 +1336,11 @@ class pglTaskBase(pglTraitSettings):
         obj.parameters = parameters
         return obj
 
-    def display(self):
+    def display(self, ax=None):
         '''
         Display the task data
         '''
-        self.data.display(self.settings.taskName)
+        self.data.display(taskName=self.settings.taskName, ax=ax)
     
     def print(self):
         '''
@@ -1674,7 +1674,7 @@ class pglExperimentData(pglTraitSettings):
             filteredEvents = [event for event in filteredEvents if getattr(event, "keyChar", None) == keyChar]
         return len(filteredEvents)
     
-    def display(self, e=None, fig=None):
+    def display(self, e=None, ax=None):
         '''
         Display the experiment data.
         '''
@@ -1705,7 +1705,7 @@ class pglExperimentData(pglTraitSettings):
         nKeys = 0
         
         # init timeline
-        timeline = timelinePlot(fig=fig, startTime=startTime, endTime=max(self.endTime-self.startTime,10))
+        timeline = timelinePlot(ax=ax, startTime=startTime, endTime=max(self.endTime-self.startTime,10))
         # for each event, add to timeline
         for event in self.events:
             if event.type == "keyboard":
@@ -1722,7 +1722,7 @@ class pglExperimentData(pglTraitSettings):
                 
         timeline.setTitle("Experiment Events")
         timeline.addLegend([{'label': f'Keypress (n={nKeys})', 'color': 'green'},{'label': f'Volumes (n={nVols})', 'color': 'blue'}])
-        timeline.show()
+        if not ax: timeline.show()
     def getTriggerStats(self):
         '''
         Get the median time between volume triggers.
@@ -1780,7 +1780,7 @@ class timelinePlot:
         timeline.show()
     """
     
-    def __init__(self, startTime=0, endTime=100, figsize=(12, 4), fig=None):
+    def __init__(self, startTime=0, endTime=100, figsize=(12, 4), ax=None):
         """
         Initialize the timeline plot.
         
@@ -1793,9 +1793,9 @@ class timelinePlot:
         self.endTime = endTime
         
         # Create figure and axis
-        if fig:
-            self.fig = fig
-            self.ax = self.fig.add_subplot(111)
+        if ax:
+            self.fig = ax.figure
+            self.ax = ax
         else:
             self.fig, self.ax = plt.subplots(figsize=figsize)
         
@@ -1956,6 +1956,7 @@ class timelinePlot:
         # Make text bold (optional)
         for text in legend.get_texts():
             text.set_weight('bold') 
+    
     def show(self):
         """Display the plot."""
         plt.tight_layout()

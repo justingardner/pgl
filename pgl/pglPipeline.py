@@ -25,6 +25,7 @@ from .pglSettings import pglSettings
 from .pglDialog import pglDialogs
 from typing import Annotated
 import numpy as np
+import matplotlib.pyplot as plt
 
 ########################
 # action status
@@ -190,16 +191,25 @@ class pglRun(pglExperimentBase):
         '''
         return(", ".join(self.experimentSettings.tasks))
     
-        
-    
-    def display(self, fig=None):
+    def display(self, ax=None):
         '''
         display plot of the run
         '''
         # display
         try:
-            self.data.display(fig=fig)
-            fig.suptitle(f"{self.fullDataPath}")
+            # compute how many axes we need
+            nTasks = len(self.tasks)
+            fig, _ = plt.subplots(nTasks+1,1,figsize=(12,4*(nTasks+1)), constrained_layout=True)
+            
+            # display experiment
+            self.data.display(ax=fig.axes[0])
+            
+            # display tasks
+            for iTask, task in enumerate(self.tasks):
+                task.display(ax=fig.axes[iTask+1])
+            
+            plt.show()
+            
         except Exception as e:
             print(f"error: {e}")
            
