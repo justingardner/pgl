@@ -22,7 +22,7 @@ from fsspec.core import url_to_fs
 
 # FIx, FIX, FIX, temporarily trying to shutdown pglSerialize from
 # printing all the missing and added fields
-verbose = 1
+verbose = 0
 ##########################
 # Recursively collect all subclasses
 ##########################

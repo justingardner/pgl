@@ -1261,7 +1261,6 @@ class pglTaskData(pglSerialize):
         timeline.addLegend(legend)
         timeline.show()
 
-                  
 ##############################################
 # Task base 
 ##############################################
@@ -1353,11 +1352,16 @@ class pglTaskBase(pglTraitSettings):
         # print task name and number of trials
         print(f"Task: {self.settings.taskName} | Trials: {self.state.currentTrial+1}")
         print(f"Duration={timestamp.formatDuration(self.data.endTime - self.data.startTime)} | startTime={self.data.startTime} | endTime={self.data.endTime}")
-        
+
+        # print seglen and waitFor
+        print(f"seglen={self.settings.seglen}")
+        print(f"waitUntilVolumeTrigger={self.settings.waitUntilVolumeTrigger}")
+                
         # print fixedParameters
         print('\n'.join(f"{key}={value}" for key, value in self.settings.fixedParameters.items()))
         print('-' * 40)
         
+
         # print parameters
         for p in self.parameters:
             print(f"{p.settings.name}")
@@ -1649,11 +1653,10 @@ class pglExperimentSettings(pglTraitSettings):
 ##############################################
 # Data for pglExperiment
 ##############################################
-@dataclass
-class pglExperimentData(pglSerialize):
-    startTime: float = 0.0
-    endTime: float = 0.0
-    events: ListType[pglEvent] = field(default_factory=list) 
+class pglExperimentData(pglTraitSettings):
+    startTime = Float(0.0, help="Time in secs of start of experiment")
+    endTime = Float(0.0, help="Time in secs of end of experiment")
+    events = List(Instance(pglEvent), default_value=[], help="List of events from experiment")
     
     def __repr__(self):
         return f"pglExperimentData(startTime={self.startTime}, endTime={self.endTime}, {len(self.events)} events)"
@@ -2020,7 +2023,7 @@ class pglEventSegment(pglEvent):
         self.timestamp = timestamp
 
     def print(self):
-        print(f"(pglEventSegment) Segment {self.eventType} at: {self.timestamp}")
+        print(f"(pglEventSegment) Segment {self.segmentNum} {self.eventType} at: {self.timestamp}")
         
 
 #################################################################

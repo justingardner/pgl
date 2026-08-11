@@ -24,6 +24,7 @@ from .pglBase import pglBase
 from .pglSettings import pglSettings
 from .pglDialog import pglDialogs
 from typing import Annotated
+import numpy as np
 
 ########################
 # action status
@@ -166,7 +167,7 @@ class pglRun(pglExperimentBase):
         get a named task
         '''
         for task in self.tasks:
-            if task.settings.taskName == taskName:
+            if task.settings.taskSaveName == taskName:
                 return task
         return None
 
@@ -444,6 +445,7 @@ class pglActionLoadSession(pglAction):
 ##################################################################
 # class pglActionRecreateExperimentDataFromTasks
 ##################################################################
+from .pglExperiment import pglEventSegment, pglEventVolumeTrigger
 class pglActionRecreateExperimentDataFromTasksChooseTaskName(pglTraitSettings):
     taskName = List(Unicode(), default_value=[], help="Tasks in run", visible=False)
 
@@ -453,7 +455,9 @@ class pglActionRecreateExperimentDataFromTasksChooseRun(pglTraitSettings):
     
 class pglActionRecreateExperimentDataFromTasksSettings(pglTraitSettings):
     TR = Float(1.0, help="The TR that was used for frame acuqistiion")
+    nVols = Int(0, help="Number of volumes in acquisition, if set to 0, will create out till end of task")
     runList = List(Instance(pglActionRecreateExperimentDataFromTasksChooseRun), default_value=[], settingsListKey="runName", traitDisplayName="Run", help="run list")
+    taskNameList = List(Unicode(), help="List of task names fore each run",visible=False)
 
 class pglActionRecreateExperimentDataFromTasks(pglAction):
     '''
@@ -494,6 +498,11 @@ class pglActionRecreateExperimentDataFromTasks(pglAction):
                 self.settings.runList[-1].taskNames.append(chooseTaskNames)
             
         self.settings = pglDialogs.traitsDialog(self.settings)
+        if self.settings:
+            for iRun, run in enumerate(self.session.runs):
+                for taskNames in self.settings.runList[iRun].taskNames:
+                    if taskNames.isSelected:
+                        self.settings.taskNameList.append(taskNames.taskName[0])
     
     #----------------------------------------
     #########################################
@@ -503,14 +512,106 @@ class pglActionRecreateExperimentDataFromTasks(pglAction):
         '''
         # for each run
         for iRun, run in enumerate(self.session.runs):
-            #print(self.settings.runList[iRun].taskNames)
-            #taskName = self.settings.runList[iRun].taskNames
+            # get selected task name
+            taskName = self.settings.taskNameList[iRun]
+            
             # get the selected task
-            #tasks = run.getTask
-            for task in run.tasks:
-                task.print()
-            #    pass
-        
+            task = run.getTask(taskName)
+            
+            if task:
+                # check to make sure the experiment started on volume trigger
+                if not run.settings.startOnVolumeTrigger:
+                    pglMessagaes.warning("Run did not start on volume trigger - alignment of volumes to task is not guaranteed")
+                
+                # get the start and end time and use that for the experiment settings
+                run.data.startTime = task.data.startTime
+                run.data.endTime = task.data.endTime
+                
+                # start making volume trigger events
+                volumeTriggerEvents = []
+                startTime = task.data.startTime
+
+                # find the next segment that is marked as waitUntilVolumeTrigger
+                waitUntilVolumeTriggerSegments = [i for i, value in enumerate(task.settings.waitUntilVolumeTrigger) if value]
+
+                # iterate over segments to find next one which marks a volume trigger
+                eventsIterator = iter(task.data.events)
+                
+                def makeVolumeEvents(startTime, stopTime, TR, currentVolumeNum):
+                    # make equaly spaced triggers from triggerStartTime to this time
+                    duration = stopTime - startTime
+
+                    nTRs = round(duration / TR)
+                    actualTR = duration / nTRs
+
+                    slop = actualTR - TR
+                    if abs(slop) > 0.1 * TR:
+                        pglMessages.warning(f"Warning for {nTRs} volumes beginning at {currentVolumeNum}: spacing requires {slop:.3f}s of slop ({100 * abs(slop) / TR:.1f}% of TR)", level=1)
+
+
+                    times = [
+                        startTime + i * actualTR
+                        for i in range(nTRs + 1)
+                    ]
+
+                    # Explicitly pin the endpoints
+                    times[0] = startTime
+                    times[-1] = stopTime
+                    
+                    return times
+                
+                # get the next segment that has waitUntilVolumeTrigger set
+                segment = next((e for e in eventsIterator if isinstance(e, pglEventSegment) and (e.segmentNum in waitUntilVolumeTriggerSegments)), None)
+                
+                # while we find such segments
+                volumeTriggers = []
+                while segment:
+                    # make volume triggers between them
+                    volumeTriggers += makeVolumeEvents(startTime, segment.timestamp, self.settings.TR, len(set(volumeTriggers)))
+                    # start a new cycle by using this segments timestamp as the next start time                    
+                    startTime = segment.timestamp
+                    segment = next((e for e in eventsIterator if isinstance(e, pglEventSegment) and (e.segmentNum in waitUntilVolumeTriggerSegments)), None)
+                
+                if self.settings.nVols > 0:
+                    endTime = run.data.startTime + self.settings.nVols * self.settings.TR
+                else:
+                    endTime = run.data.endTime
+                # make the remaining volume triggers to end of experiment
+                if endTime - startTime > self.settings.TR:
+                    # round to nearest TR
+                    endTime = startTime + round((endTime - startTime) / self.settings.TR) * self.settings.TR
+                    # create volume triggers
+                    volumeTriggers += makeVolumeEvents(startTime, endTime, self.settings.TR, len(set(volumeTriggers)))
+                
+                # sort and remove duplicates
+                volumeTriggers = sorted(set(volumeTriggers))
+                
+                # clip to desired length
+                if self.settings.nVols > 0:
+                    volumeTriggers = volumeTriggers[:self.settings.nVols]
+                
+                # compute some statistics and display
+                diff = np.diff(volumeTriggers)
+                pglMessages.message(f"nTriggers: {len(volumeTriggers)} Mean: {np.mean(diff):.3f}, SD: {np.std(diff, ddof=1):.3f}")
+                
+                # clear old events
+                run.data.events = [e for e in run.data.events if not isinstance(e, pglEventVolumeTrigger)]
+                
+                # generate events
+                for triggerTime in volumeTriggers:
+                    # create the volume trigger event
+                    t = pglEventVolumeTrigger()
+                    t.timestamp = triggerTime
+                    
+                    # add it to the event list
+                    run.data.events.append(t)    
+                
+                # sort events
+                run.data.events.sort(key=lambda e: e.timestamp)            
+            else:
+                pglMessages.warning(f"Could not find task {taskName}")
+            
+            #run.data.print()
         # return session
         return self.session
         
