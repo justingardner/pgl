@@ -21,6 +21,7 @@ import re
 from .pglExperiment import pglExperimentData, pglExperimentBase, pglExperimentSettings
 from .pglBase import pglBase
 from .pglSettings import pglSettings
+from .pglDialog import pglDialogs
 
 
 ##########################
@@ -29,7 +30,7 @@ from .pglSettings import pglSettings
 class pglDataPort():
 
     def __init__(self, name, dataType, optional=False):
-        if not (isinstance(dataType, type) and issubclass(dataType, pglDataMatrix)):
+        if not (isinstance(dataType, type) and (issubclass(dataType, pglDataMatrix) or issubclass(dataType, pglTraitSettings))):
             raise TypeError(f"dataType must be a subclass of pglDataMtrix, got {dataType!r}")
         
         self.name = name
@@ -124,7 +125,7 @@ class pglAction(pglTraitSettings):
         self.status = pglActionStatus.INITIALIZED
         self.error: Exception | None = None
 
-        self.version = 0.0
+        self.version = "0.0"
         
         self.inputData = {}
         self.outputData = {}
@@ -151,45 +152,131 @@ class pglPipeline(pglAction):
         super().__init__()
         pass
     
-#################################
-# runs
-#################################
-class pglRunInfo(pglTraitSettings):
-    name = Unicode("", help="Name in the form of: experimentName subjectID startTime")
-    experimentName = Unicode("", help="Name of experiment")
-    subjectID = Unicode("", "SubjectID should be of form S0000")
-    date = Instance(datetime, help="Date and time of run")
-    taskNames = List(Unicode, help="Names of the tasks run")    
-class pglRunData(pglDataMatrix):
-    pass
 
-#################################
-# Sessions
-#################################
-class pglSessionInfo(pglTraitSettings):
-    name = Unicode("", help="Name in the form of: experimentName subjectID startTime")
-    experimentName = Unicode("", help="Name of experiment")
-    subjectID = Unicode("", "SubjectID should be of form S0000")
-    date = Instance(datetime, help="Date of experiment")
-    runs = List(Instance(pglRunInfo), help="Runs in session")
+##################################
+# pglRun
+##################################
+class pglRun(pglExperimentBase):
+    
+    # filesystem, name and prefix for where the session is loaded from
+    filesystem = Instance(AbstractFileSystem, allow_none=True, serialize=False, help="filesystem for serialization")
+    fullDataPath = Unicode(allow_none=True, default_value="", help="Full path to data", visible=False)
+    filesystemPrefix = Unicode(allow_none=True, default_value="", help="Prefix like ssh:// used for accessing filesystem", visible=False)
+    
+    # These will be lazy-loaded as needed
+    _experimentSettings = Instance(pglExperimentSettings, allow_none=True, default_value=None, help="settings of the experiemnt")
+    _settings = Instance(pglSettings, allow_none=True, default_value=None, help="settings that this experiment was run with")
+    _data = Instance(pglExperimentData, allow_none=True, default_value=None, help="data from experiemnt")
+    
+    ##########################
+    # Lazy-loaded properties
+    ##########################
+    @property
+    def experimentSettings(self):
+        '''Experiment settings, loaded from disk on first access.'''
+        if self._experimentSettings is None:
+            filesystem, fullDataPath = pglBase.validateFilesystem(filesystem=self.filesystem, dataPath=self.fullDataPath, filesystemPrefix=self.filesystemPrefix)
+            self._experimentSettings = pglExperimentSettings.load(filename=Path(fullDataPath) / "experimentSettings", filesystem=filesystem)
+        return self._experimentSettings
 
-class pglSessionData(pglDataMatrix):
-    pass
+    @experimentSettings.setter
+    def experimentSettings(self, value):
+        self._experimentSettings = value
 
-#################################
-# Datasets
-#################################
-class pglDatasetInfo(pglTraitSettings):
-    name = Unicode("", help="Name in the form of: experimentName subjectID startTime")
-    experimentName = Unicode("", help="Name of experiment")
-    subjectIDs = List(Unicode, help="List of all subjectIDs")
-    sessions = List(Instance(pglSessionInfo), help="List of sessions in the dataset")
-class pglDatasetData(pglDataMatrix):
-    pass
+    @property
+    def settings(self):
+        '''Settings the experiment was run with, loaded on first access.'''
+        if self._settings is None:
+            filesystem, fullDataPath, _ = pglBase.validateFilesystem(filesystem=self.filesystem, dataPath=self.fullDataPath, filesystemPrefix=self.filesystemPrefix)
+            self._settings = pglSettings.load(filename=Path(fullDataPath) / "settings", filesystem=filesystem)
+        return self._settings
 
-#################################
-# pglChooseSession
-#################################
+    @settings.setter
+    def settings(self, value):
+        self._settings = value
+
+    @property
+    def data(self):
+        '''Experiment data, loaded from disk on first access.'''
+        if self._data is None:
+            pglMessages.message(f"Loading {self.filesystemPrefix}/{self.fullDataPath}")
+            filesystem, fullDataPath, _ = pglBase.validateFilesystem(filesystem=self.filesystem, dataPath=self.fullDataPath, filesystemPrefix=self.filesystemPrefix)
+            self._data = pglExperimentData.load(filename=Path(fullDataPath) / "data", filesystem=filesystem)
+        return self._data
+
+    @data.setter
+    def data(self, value):
+        self._data = value
+
+    
+    def __init__(self, fullDataPath, filesystem, filesystemPrefix):
+        '''
+        Initialize the pglRun class
+        
+        Args:
+            dataPath: The directory where the run is saved
+        '''
+        # init super
+        super().__init__()
+
+        # keep the path and filesystem
+        self.filesystem, self.fullDataPath, self.filesystemPrefix = pglBase.validateFilesystem(filesystem=filesystem,dataPath=fullDataPath,filesystemPrefix=filesystemPrefix)
+        
+    def getTaskNames(self):
+        '''
+        Extracts task names from experimentSettings
+        '''
+        
+        taskString = ", ".join(self.experimentSettings.tasks)
+        
+        # return taskString
+        return taskString
+    
+    def display(self, fig=None):
+        '''
+        display plot of the run
+        '''
+        # display
+        try:
+            self.data.display(fig=fig)
+            fig.suptitle(f"{self.fullDataPath}")
+        except Exception as e:
+            print(f"error: {e}")
+           
+##################################
+# pglSession
+##################################
+class pglSession(pglTraitSettings):
+
+    # filesystem, name and prefix for where the session is loaded from
+    filesystem = Instance(AbstractFileSystem, allow_none=True, serialize=False, help="filesystem for serialization")
+    filesystemPrefix = Unicode(allow_none=True, default_value="", help="Prefix like ssh:// used for accessing filesystem", visible=False)
+    
+    # List of all runs
+    runs = List(Instance(pglRun), allow_none=True, help="List of all runs")
+
+    def __init__(self, filesystem=None, filesystemPrefix='', runList=[]):
+        '''
+        Init
+        
+        Args:
+            fullDataPath (str): path to data for session
+            filesystem: filesystem where path exists (None for local)
+            filesystemPrefix: Prefix like ssh://
+            runList: List of paths to runs
+        '''
+        
+        self.filesystem = filesystem                
+        self.filesystemPrefix = filesystemPrefix
+        
+        for runPath in runList:
+            self.runs.append(pglRun(fullDataPath=runPath, filesystem=filesystem, filesystemPrefix=filesystemPrefix))
+        
+##################################################################
+# pglChooseSession. Base class for walking directory structures.
+# implements reading of child directories and putting them in a list
+# creating a class around those directories, see pglChoose classes below
+##################################################################
 class pglChooseLevel(pglTraitSettings):
     '''
     Base class for one level of the dataPath hierarchy (experiment,
@@ -279,97 +366,12 @@ class pglChooseLevel(pglTraitSettings):
             child = self.childClass.create(name=childName, dataPath=entry["name"], filesystem=self.filesystem, filesystemPrefix=self.filesystemPrefix)
             if child is not None:
                 children.append(child)
-        return children
-
-##################################
-# pglRun
-##################################
-class pglRun(pglExperimentBase):
-    
-    filesystem = Instance(AbstractFileSystem, allow_none=True, serialize=False, help="filesystem for serialization")
-    fullDataPath = Unicode(allow_none=True, default_value="", help="Full path to data", visible=False)
-    filesystemPrefix = Unicode(allow_none=True, default_value="", help="Prefix like ssh:// used for accessing filesystem", visible=False)
-    
-    # These will be lazy-loaded as needed
-    _experimentSettings = Instance(pglExperimentSettings, allow_none=True, default_value=None, help="settings of the experiemnt")
-    _settings = Instance(pglSettings, allow_none=True, default_value=None, help="settings that this experiment was run with")
-    _data = Instance(pglExperimentData, allow_none=True, default_value=None, help="data from experiemnt")
-    
-    ##########################
-    # Lazy-loaded properties
-    ##########################
-    @property
-    def experimentSettings(self):
-        '''Experiment settings, loaded from disk on first access.'''
-        if self._experimentSettings is None:
-            filesystem, fullDataPath = pglBase.validateFilesystem(filesystem=self.filesystem, dataPath=self.fullDataPath, filesystemPrefix=self.filesystemPrefix)
-            self._experimentSettings = pglExperimentSettings.load(filename=Path(fullDataPath) / "experimentSettings", filesystem=filesystem)
-        return self._experimentSettings
-
-    @experimentSettings.setter
-    def experimentSettings(self, value):
-        self._experimentSettings = value
-
-    @property
-    def settings(self):
-        '''Settings the experiment was run with, loaded on first access.'''
-        if self._settings is None:
-            filesystem, fullDataPath, _ = pglBase.validateFilesystem(filesystem=self.filesystem, dataPath=self.fullDataPath, filesystemPrefix=self.filesystemPrefix)
-            self._settings = pglSettings.load(filename=Path(fullDataPath) / "settings", filesystem=filesystem)
-        return self._settings
-
-    @settings.setter
-    def settings(self, value):
-        self._settings = value
-
-    @property
-    def data(self):
-        '''Experiment data, loaded from disk on first access.'''
-        if self._data is None:
-            pglMessages.message(f"Loading {self.filesystemPrefix}/{self.fullDataPath}")
-            filesystem, fullDataPath, _ = pglBase.validateFilesystem(filesystem=self.filesystem, dataPath=self.fullDataPath, filesystemPrefix=self.filesystemPrefix)
-            self._data = pglExperimentData.load(filename=Path(fullDataPath) / "data", filesystem=filesystem)
-        return self._data
-
-    @data.setter
-    def data(self, value):
-        self._data = value
-
-    
-    def __init__(self, fullDataPath, filesystem, filesystemPrefix):
-        '''
-        Initialize the pglRun class
-        
-        Args:
-            dataPath: The directory where the run is saved
-        '''
-        # init super
-        super().__init__()
-
-        # keep the path and filesystem
-        self.filesystem, self.fullDataPath, self.filesystemPrefix = pglBase.validateFilesystem(filesystem=filesystem,dataPath=fullDataPath,filesystemPrefix=filesystemPrefix)
-        
-    def getTaskNames(self):
-        '''
-        Extracts task names from experimentSettings
-        '''
-        
-        taskString = ", ".join(self.experimentSettings.tasks)
-        
-        # return taskString
-        return taskString
-    
-    def display(self, fig=None):
-        '''
-        display plot of the run
-        '''
-        # display
-        try:
-            self.data.display(fig=fig)
-            fig.suptitle(f"{self.fullDataPath}")
-        except Exception as e:
-            print(f"error: {e}")
+        return children        
              
+################################################################################
+# Each one of these classes sits at one level of the file structure hierarchy
+# So they can be used to walk the experiment directory and load runs
+################################################################################        
 class pglChooseRun(pglChooseLevel):
     # this is the root, so no more recursion beyond this point
     childClass = None
@@ -404,9 +406,6 @@ class pglChooseRun(pglChooseLevel):
         '''
         self.run.display(fig=fig)
 
-################################################################################
-# # Each one of these classes sits at one level of the file structure hierarchy
-################################################################################        
 class pglChooseSession(pglChooseLevel):
     childList = List(Instance(pglTraitSettings), settingsListKey="name", traitDisplayName="Select run(s)", multiSelect=True, maxRowsVisible=6, hasPlotButton=True, buttonFunction="display", help="Runs in session dir")
     childClass = pglChooseRun
@@ -436,22 +435,58 @@ class pglChoose(pglChooseLevel):
 #################################
 # class pglActionLoadSession
 #################################
+class pglActionLoadSessionSettings(pglTraitSettings):
+    selectedPaths = List(Unicode(), help="Paths of runs selected for loading")
+    filesystemPrefix = Unicode("", help="Filesystem prefix like ssh:// which can be set if the files are not local")
+
 class pglActionLoadSession(pglAction):
     
     # data input / output contract
     inputPorts = pglPortList()
     outputPorts = pglPortList([
-        pglDataPort("session", pglSessionData, optional=False)
+        pglDataPort("session", pglSession, optional=False)
     ])
+    settings = Instance(pglActionLoadSessionSettings, help="settings")
     
-    def __init__(self):
-        super().__init__()
-    
-    def configure(self):
+    def configure(self, dataPath):
         # have the user choose the session info
-        pass
+        # Fix, fix, fix, How do we get dataPath in here?
+        # What do we do if the pass is not valid?
+        # how do we make a default plan
+        
+        # put up traits dialog to have user select the experiments
+        s = pglChooseExperiment(dataPath=dataPath)
+        s = pglDialogs.traitsDialog(s)
+
+        # walk the structure to get to the leaves (which have runs)        
+        def walkInstances(node, depth=0):
+            selectedPaths = []
+            childClass = getattr(type(node), "childClass", None)
+            if childClass is None:
+                # Leaf instance — get the dataPath if it was selected
+                if node.isSelected: selectedPaths.append(node.dataPath)
+                return selectedPaths
+
+            # childList holds the child instances
+            for child in node.childList:
+                selectedPaths.extend(walkInstances(child, depth + 1))
+                
+            return(selectedPaths)
+
+        self.settings = pglActionLoadSessionSettings()
+        self.settings.selectedPaths = walkInstances(s)
+        self.settings.filesystemPrefix = s.filesystemPrefix
     
     def run(self):
-        self.outputData = {'session': pglSessionData()}
+        # just create the session variable
+        session = pglSession(
+            filesystemPrefix=self.settings.filesystemPrefix,
+            runList = self.settings.selectedPaths
+        )
+        
+        # and return
+        self.outputData = {'session': session}
+        return self.outputData
         
     
+
