@@ -39,6 +39,8 @@ from .pglEyelink import pglEyelink, pglEyelinkData
 from .pglSettings import pglSettingsManager, pglDisplaySettings, pglDisplayModeSettings
 from .pglMessages import pglMessages
 import fsspec
+import posixpath
+from .pglBase import pglBase
 
 #######################
 # for returning stats
@@ -69,7 +71,7 @@ class pglExperimentBase(pglTraitSettings):
         self.experimentSettings = None
         self.pgl = None
         self.eyeTracker = None
-        self.tasks = []
+        #self.tasks = []
     
     @classmethod
     def isValidExperimentDir(cls, verbose=False, settings=None, dataPath=None, experimentName=None, subjectID=None, sessionName=None, runName=None, fullDataPath=None, filesystem=None):
@@ -292,7 +294,11 @@ class pglExperimentBase(pglTraitSettings):
             triggerStats = self.data.getTriggerStats()
             print(f"Median time between triggers: {triggerStats.median:.3f}s")
             print(f"Mean ± std time between triggers: {triggerStats.mean:.3f} ± {triggerStats.std:.6f}s")
-        
+
+        # print task names
+        for taskName in self.experimentSettings.tasks:
+            print(f"taskName: {taskName}")
+
         # print task data
         if hasattr(self, "tasks"):
             for task in self.tasks:
@@ -363,6 +369,7 @@ class pglExperimentBase(pglTraitSettings):
             volumeNumber, nearestTimestamp = min(volumeTriggers, key=lambda x: abs(x[1] - event.timestamp))
         
         return volumeNumber
+    
 ##############################################s
 # Experiment class
 ##############################################
@@ -1050,11 +1057,329 @@ class pglExperimentAnalysis(pglExperimentBase):
             'trialNums': trialNums,
             'nTrials': nTrials
         }
-                            
+    
+##############################################
+# Settings for pglTask
+##############################################
+class pglTaskSettings(pglTraitSettings):
+    taskName = Unicode("Default task", help="Name of the task")
+    taskSaveName = Unicode("defaultTask", help="Name to use when saving task data (defaults to camelCase version of taskName)")    
+    phaseNum = Int(default_value=None, allow_none=True, help="Phase number for the task. Set to None if this should run in all phases")
+    seglen = List(Float(), help="List of segment lengths in seconds.")
+    segmin = List(Float(), help="Minimum length of a segment.")
+    segmax = List(Float(), help="Maximum length of a segment.")
+    waitUntilVolumeTrigger = List(Bool(), help="List of nSegments where if set to true will run through the segment length and then wait for a volume trigger to continue.")
+    nSegments = Int(help="Number of segments in the task.")
+    nTrials = Float(np.inf, help="Number of trials to run for.")
+    fixedParameters = Dict(default_value={}, help="Dictionary of fixed parameters for the task.")
+    saveEyeTracker = Bool(False, help="Whether to save eye tracker events this task (if we have an eye tracker).")    
+    taskID = Int(0, help="Numeric identifier for the task, used for pglExperiment to keep track of tasks.")
+
+    # observe changes to taskName and if taskSaveName is not set
+    # set taskSaveName to a camelCase version of taskName
+    @observe("taskName")
+    def toCamelCase(self, change) -> None:
+        if self.taskSaveName == "" or self.taskSaveName == "defaultTask":
+            # split taskName into words
+            words = change['new'].strip().split()
+            if not words:
+                return
+            # convert to camelCase and save as taskSaveName
+            firstWord = words[0][0].lower() + words[0][1:] if words[0] else ""
+            restWords = "".join(word[0].upper() + word[1:] if word else "" for word in words[1:])
+            self.taskSaveName = firstWord + restWords
+        
+    # observe changes in seglen, segmin, segmax to keep them in sync
+    @observe("seglen", "segmin", "segmax")
+    def _updateSegments(self, change):
+
+        # hold off on trait notifications while we update
+        with self.hold_trait_notifications():
+
+            # if seglen change, then just make seming and segmax the same as seglen
+            if change["name"] == "seglen":
+                self.segmin = list(self.seglen)
+                self.segmax = list(self.seglen)
+
+            elif change["name"] == "segmin":
+                # if segmax is longer than semin, truncate it
+                if len(self.segmax) > len(self.segmin):
+                    self.segmax = self.segmax[:len(self.segmin)]
+                
+                # if segmax is shorter than segmin, extend it
+                if len(self.segmax) < len(self.segmin):
+                    self.segmax += self.segmin[len(self.segmax):]
+                
+                # ensure segmax is not less than segmin
+                for i, (minVal, maxVal) in enumerate(zip(change['new'], self.segmax)):
+                    self.segmax[i] = max(minVal, maxVal)
+                    
+                # set seglen to average of segmin/segmax
+                self.seglen = [(minVal + maxVal) / 2.0 for minVal, maxVal in zip(self.segmin, self.segmax)]
+
+            elif change["name"] == "segmax":
+                # if segmin is longer than semax, truncate it
+                if len(self.segmin) > len(self.segmax):
+                    self.segmin = self.segmin[:len(self.segmax)]
+                
+                # if segmin is shorter than segmax, extend it
+                if len(self.segmin) < len(self.segmax):
+                    self.segmin += self.segmax[len(self.segmin):]
+                
+                # ensure segmax is not less than segmin
+                for i, (minVal, maxVal) in enumerate(zip(change['new'], self.segmin)):
+                    self.segmin[i] = min(minVal, maxVal)
+
+                # set seglen to average of segmin/segmax
+                self.seglen = [(minVal + maxVal) / 2.0 for minVal, maxVal in zip(self.segmin, self.segmax)]
+        
+        self.nSegments = len(self.seglen)
+        
+        # make length of waitUntilVolumeTrigger same as nSegments
+        self.waitUntilVolumeTrigger = (self.waitUntilVolumeTrigger + [False] * self.nSegments)[:self.nSegments]
+    
+    @observe("waitUntilVolumeTrigger")
+    def _updateWaitUntilVolumeTrigger(self, change):
+        # make same length as seglen
+        self.waitUntilVolumeTrigger = (self.waitUntilVolumeTrigger + [False] * self.nSegments)[:self.nSegments]
+    '''
+    Settings for pglTask
+    '''
+    def __init__(self):
+        super().__init__()
+        
+    def updateTraitsFromDict(self, data, filename="<dict>", typeConverter=None):
+        """
+        Override to convert parameter dicts to pglParameter instances.
+        Only converts items in the 'parameters' list, not other dict values.
+        """
+        # Make a copy to avoid modifying the original
+        data = data.copy()
+        
+        # ONLY convert the 'parameters' key specifically
+        if 'parameters' in data and isinstance(data['parameters'], list):
+            converted_params = []
+            for item in data['parameters']:
+                if isinstance(item, dict):
+                    # Extract the two required positional arguments
+                    name = item.get('name', 'unnamed')
+                    validValues = item.get('validValues', [])
+                    
+                    # Create pglParameter with those two args
+                    param = pglParameter(name, validValues)
+                    
+                    # Update any other attributes that might be stored
+                    # (like blockNum, currentTrial, etc. from your serialized data)
+                    for key, value in item.items():
+                        if key not in ['name', 'validValues'] and hasattr(param, key):
+                            setattr(param, key, value)
+                    
+                    converted_params.append(param)
+                elif isinstance(item, pglParameter):
+                    # Already correct type
+                    converted_params.append(item)
+                else:
+                    print(f"Warning: Unexpected type in parameters: {type(item)}")
+                    converted_params.append(item)
+            data['parameters'] = converted_params
+        
+        # Call parent implementation to handle ALL other traits normally
+        pglTraitSettings.updateTraitsFromDict(self, data, filename, typeConverter)
+##############################################
+# State for pglTask
+##############################################
+@dataclass
+class pglTaskState(pglSerialize):
+    phaseNum: Optional[int] = None
+    currentTrial: int = 0
+    currentSegment: int = 0
+    subjectResponses: ListType[int] = field(default_factory=list)
+
+##############################################
+# State for pglTask
+##############################################
+@dataclass
+class pglTaskData(pglSerialize):
+    startTime: Optional[float] = None
+    endTime: Optional[float] = None
+    events: ListType[pglEvent] = field(default_factory=list) 
+    params: ListType[dict] = field(default_factory=list)
+    
+    def display(self, taskName="task", responseMapping={True:('Correct','green'), False:('Incorrect','red')}):
+        '''
+        Display the experiment data.
+        '''
+        # get trial timestamps
+        trialTimestamps = np.array([e.timestamp for e in self.events if isinstance(e, pglEventTrial)])
+        if len(trialTimestamps) <= 2:
+            print("(pglTaskData:display) Insufficient trial events found to display.")
+            return
+        
+        # get the max trial length
+        maxTrialLength = np.diff(trialTimestamps[:-1]).max()
+        
+        # init timeline
+        timeline = timelinePlot(startTime=0, endTime=maxTrialLength)
+        
+        # init a dict for counting the number of different responseTypes found in the events
+        responseCounts = {respType: 0 for respType in responseMapping}
+        
+        # for each event, add to timeline
+        trialStart = None
+        gotResponse = False
+        nTrials = 0
+        for event in self.events:
+            # if we find a new trial event, reset the beginning time
+            if isinstance(event, pglEventTrial):
+                trialStart = event.timestamp
+                if event.eventType == "start":
+                    nTrials += 1
+            elif trialStart is not None:
+                # display segment events
+                if isinstance(event, pglEventSegment) and event.eventType == pglEventSegment.boundaryType.START.value:
+                    timeline.addTriangleMarker(time=event.timestamp - trialStart, color='blue', label=f'{event.segmentNum}', direction='up')
+                # display subject response events
+                elif isinstance(event, pglEventSubjectResponse):
+                    gotResponse = True
+                    label, color = responseMapping.get(event.responseType, ('?', 'gray'))
+                    timeline.addTriangleMarker(time=event.timestamp - trialStart, color=color, label=label[0], direction='down')   
+                    # update response counts
+                    if event.responseType in responseCounts:
+                        responseCounts[event.responseType] += 1
+                        
+        timeline.setTitle(f"{taskName}: {nTrials} trials")
+        
+        # display legend
+        legend = [{'label': 'Segment', 'color': 'blue'}]
+        # add the response values
+        if gotResponse:
+            for respType, (label, color) in responseMapping.items():
+                # get statistics for this response type
+                count = responseCounts.get(respType, 0)
+                percent = (count / sum(responseCounts.values()) * 100) if nTrials > 0 else 0
+                legend.append({'label': f'{label} (n={count}: {percent:.1f}%)', 'color': color})
+        timeline.addLegend(legend)
+        timeline.show()
+
+                  
+##############################################
+# Task base 
+##############################################
+class pglTaskBase(pglTraitSettings):
+    settings = Instance(pglTaskSettings, allow_none=True, help="Settings for the task")
+    state = Instance(pglTaskState, allow_none=True, help="State of task")
+    data = Instance(pglTaskData, allow_none=True, help="Data of task")
+    parameters = List(Instance(pglParameter), default_value=[], help="parameters of task")
+  
+    def save(self, dataDir):
+        '''
+        Save the task settings, state and data.
+        '''
+        try:
+            dataDir = dataDir / self.settings.taskSaveName
+            dataDir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            print(f"(pglTask:save) ❌ Could not create task data directory {dataDir}: {e}")
+            return
+        
+        # save settings, state and data
+        self.settings.save(dataDir / "settings.json")
+        self.state.save(dataDir / "state.json")
+        self.data.save(dataDir / "data.json")
+        
+        # save parameters
+        try:
+            paramDir = dataDir / "parameters"
+            paramDir.mkdir(parents=True, exist_ok=True)
+            for param in self.parameters:
+                param.save(paramDir)
+        except Exception as e:
+            print(f"(pglTask:save) ❌ Could not save task parameters to {dataDir}: {e}")
+
+    @classmethod
+    def load(cls, taskDir, filesystem=None):
+        '''
+        Load the task data.
+        '''
+        print(f"(pglTask:load) Loading task data from: {taskDir}")
+
+        # validate filesystem
+        filesystem, taskDir, _ = pglBase.validateFilesystem(filesystem, taskDir)
+
+        # load settings, state and data
+        try:
+            settings = pglSerialize.load(filename=posixpath.join(str(taskDir), "settings.json"), filesystem=filesystem)
+            state = pglSerialize.load(filename=posixpath.join(str(taskDir), "state.json"), filesystem=filesystem)
+            data = pglSerialize.load(filename=posixpath.join(str(taskDir), "data.json"), filesystem=filesystem)
+        except Exception as e:
+            pglMessages.warning(f"Could not load task data from {taskDir}: {e}")
+            return None
+
+        # load parameters
+        parameters = []
+        parametersDir = posixpath.join(str(taskDir), "parameters")
+        try:
+            for paramDir in filesystem.ls(parametersDir, detail=False):
+                param = pglParameter.from_file(paramDir, filesystem=filesystem)
+                if param is None:
+                    pglMessages.warning(f"Skipping parameter that failed to load: {paramDir}")
+                    continue
+                parameters.append(param)
+        except Exception as e:
+            pglMessages.warning(f"Could not load task parameters from {parametersDir}: {e}")
+            return None
+
+        # instantiate class
+        obj = cls()
+        obj.settings = settings
+        obj.state = state
+        obj.data = data
+        obj.parameters = parameters
+        return obj
+
+    def display(self):
+        '''
+        Display the task data
+        '''
+        self.data.display(self.settings.taskName)
+    
+    def print(self):
+        '''
+        Print a summary of the task data
+        '''
+        from pgl import pglTimestamp
+        timestamp = pglTimestamp()
+        
+        # print task name and number of trials
+        print(f"Task: {self.settings.taskName} | Trials: {self.state.currentTrial+1}")
+        print(f"Duration={timestamp.formatDuration(self.data.endTime - self.data.startTime)} | startTime={self.data.startTime} | endTime={self.data.endTime}")
+        
+        # print fixedParameters
+        print('\n'.join(f"{key}={value}" for key, value in self.settings.fixedParameters.items()))
+        print('-' * 40)
+        
+        # print parameters
+        for p in self.parameters:
+            print(f"{p.settings.name}")
+        
+        # print trial by trial information
+        for iTrial, params in enumerate(self.data.params):
+            # find matching trial event
+            trialEvent = next((event for event in self.data.events if isinstance(event, pglEventTrial) and event.trialNum == iTrial), None)
+            trialStart = trialEvent.timestamp-self.data.startTime if trialEvent else "No trial event found"
+            if hasattr(self,'e'):
+                trialVolume = self.e.getNearestVolumeTrigger(trialEvent)
+            else:
+                trialVolume = None
+            if trialVolume is None:
+                print(f"Trial {iTrial+1} at {trialStart:.2f}s: " + ', '.join(f"{key}={value}" for key, value in params.items()))
+            else:
+                print(f"Trial {iTrial+1} at {trialStart:.2f}s (vol={trialVolume}): " + ', '.join(f"{key}={value}" for key, value in params.items()))
+                          
 ##############################################
 # Task class
 ##############################################
-class pglTask:
+class pglTask(pglTaskBase):
     # this are set every trial, which allows us to
     # randomize the length of each segment (based on segmin/segmax)
     # or jump segment, by dynamically changing from Inf to current time
@@ -1283,90 +1608,6 @@ class pglTask:
         '''
         # set current segment length to 0 to force jump
         self._thisTrialSeglen[self.state.currentSegment] = 0
-    
-    def save(self, dataDir):
-        '''
-        Save the task settings, state and data.
-        '''
-        try:
-            dataDir = dataDir / self.settings.taskSaveName
-            dataDir.mkdir(parents=True, exist_ok=True)
-        except Exception as e:
-            print(f"(pglTask:save) ❌ Could not create task data directory {dataDir}: {e}")
-            return
-        
-        # save settings, state and data
-        self.settings.save(dataDir / "settings.json")
-        self.state.save(dataDir / "state.json")
-        self.data.save(dataDir / "data.json")
-        
-        # save parameters
-        try:
-            paramDir = dataDir / "parameters"
-            paramDir.mkdir(parents=True, exist_ok=True)
-            for param in self.parameters:
-                param.save(paramDir)
-        except Exception as e:
-            print(f"(pglTask:save) ❌ Could not save task parameters to {dataDir}: {e}")
-
-    def load(self, taskDir):
-        '''
-        Load the task data.
-        '''
-        print(f"(pglTask:load) Loading task data from: {taskDir}")
-        
-        # load settings, state and data
-        try:
-            self.settings = pglSerialize.load(taskDir / "settings.json")
-            self.state = pglSerialize.load(taskDir / "state.json")
-            self.data = pglSerialize.load(taskDir / "data.json")
-        except Exception as e:
-            print(f"(pglTask:load) ❌ Could not load task data from {taskDir}: {e}")    
-        
-        try:
-            # load parameters
-            self.parameters = []
-            for paramDir in (taskDir / "parameters").iterdir():
-                param = pglParameter.from_file(paramDir)
-                self.parameters.append(param)
-        except Exception as e:
-            print(f"(pglTask:load) ❌ Could not load task parameters from {taskDir / 'parameters'}: {e}")
-
-    def display(self):
-        '''
-        Display the task data
-        '''
-        self.data.display(self.settings.taskName)
-    
-    def print(self):
-        '''
-        Print a summary of the task data
-        '''
-        from pgl import pglTimestamp
-        timestamp = pglTimestamp()
-        
-        # print task name and number of trials
-        print(f"Task: {self.settings.taskName} | Trials: {self.state.currentTrial+1}")
-        print(f"Duration={timestamp.formatDuration(self.data.endTime - self.data.startTime)} | startTime={self.data.startTime} | endTime={self.data.endTime}")
-        
-        # print fixedParameters
-        print('\n'.join(f"{key}={value}" for key, value in self.settings.fixedParameters.items()))
-        print('-' * 40)
-        
-        # print parameters
-        for p in self.parameters:
-            print(f"{p.settings.name}")
-        
-        # print trial by trial information
-        for iTrial, params in enumerate(self.data.params):
-            # find matching trial event
-            trialEvent = next((event for event in self.data.events if isinstance(event, pglEventTrial) and event.trialNum == iTrial), None)
-            trialStart = trialEvent.timestamp-self.data.startTime if trialEvent else "No trial event found"
-            trialVolume = self.e.getNearestVolumeTrigger(trialEvent)
-            if trialVolume is None:
-                print(f"Trial {iTrial+1} at {trialStart:.2f}s: " + ', '.join(f"{key}={value}" for key, value in params.items()))
-            else:
-                print(f"Trial {iTrial+1} at {trialStart:.2f}s (vol={trialVolume}): " + ', '.join(f"{key}={value}" for key, value in params.items()))
 
 ##############################################
 # Settings for pglExperiment
@@ -1378,7 +1619,7 @@ class pglExperimentSettings(pglTraitSettings):
     experimenterName = Unicode("", help="Name of experimenter who ran in experiment")
     experimentSaveName = Unicode("defaultExperiment", help="Name to use when saving experiment data (defaults to camelCase version of experimentName)")
     subjectID = Unicode("s0000", help="Identifier for the subject participating in the experiment.")
-    tasks = List(trait=Unicode(), default_value=[], help="Task names")
+    tasks = List(Unicode(), default_value=[], help="Task names")
     
     # observe changes to experimentName and if experimentSaveName is not set
     # set experimentSaveName to a camelCase version of experimentName
@@ -1520,209 +1761,6 @@ class pglExperimentState(pglSerialize):
     display: Optional[pglDisplaySettings] = None
     originalScreenResolution: Optional[Tuple[int, int, int, int]] = None
     screenResolution: Optional[Tuple[int, int, int, int]] = None
-
-##############################################
-# Settings for pglTask
-##############################################
-class pglTaskSettings(pglTraitSettings):
-    taskName = Unicode("Default task", help="Name of the task")
-    taskSaveName = Unicode("defaultTask", help="Name to use when saving task data (defaults to camelCase version of taskName)")    
-    phaseNum = Int(default_value=None, allow_none=True, help="Phase number for the task. Set to None if this should run in all phases")
-    seglen = List(Float(), help="List of segment lengths in seconds.")
-    segmin = List(Float(), help="Minimum length of a segment.")
-    segmax = List(Float(), help="Maximum length of a segment.")
-    waitUntilVolumeTrigger = List(Bool(), help="List of nSegments where if set to true will run through the segment length and then wait for a volume trigger to continue.")
-    nSegments = Int(help="Number of segments in the task.")
-    nTrials = Float(np.inf, help="Number of trials to run for.")
-    fixedParameters = Dict(default_value={}, help="Dictionary of fixed parameters for the task.")
-    saveEyeTracker = Bool(False, help="Whether to save eye tracker events this task (if we have an eye tracker).")    
-    taskID = Int(0, help="Numeric identifier for the task, used for pglExperiment to keep track of tasks.")
-
-    # observe changes to taskName and if taskSaveName is not set
-    # set taskSaveName to a camelCase version of taskName
-    @observe("taskName")
-    def toCamelCase(self, change) -> None:
-        if self.taskSaveName == "" or self.taskSaveName == "defaultTask":
-            # split taskName into words
-            words = change['new'].strip().split()
-            if not words:
-                return
-            # convert to camelCase and save as taskSaveName
-            firstWord = words[0][0].lower() + words[0][1:] if words[0] else ""
-            restWords = "".join(word[0].upper() + word[1:] if word else "" for word in words[1:])
-            self.taskSaveName = firstWord + restWords
-        
-    # observe changes in seglen, segmin, segmax to keep them in sync
-    @observe("seglen", "segmin", "segmax")
-    def _updateSegments(self, change):
-
-        # hold off on trait notifications while we update
-        with self.hold_trait_notifications():
-
-            # if seglen change, then just make seming and segmax the same as seglen
-            if change["name"] == "seglen":
-                self.segmin = list(self.seglen)
-                self.segmax = list(self.seglen)
-
-            elif change["name"] == "segmin":
-                # if segmax is longer than semin, truncate it
-                if len(self.segmax) > len(self.segmin):
-                    self.segmax = self.segmax[:len(self.segmin)]
-                
-                # if segmax is shorter than segmin, extend it
-                if len(self.segmax) < len(self.segmin):
-                    self.segmax += self.segmin[len(self.segmax):]
-                
-                # ensure segmax is not less than segmin
-                for i, (minVal, maxVal) in enumerate(zip(change['new'], self.segmax)):
-                    self.segmax[i] = max(minVal, maxVal)
-                    
-                # set seglen to average of segmin/segmax
-                self.seglen = [(minVal + maxVal) / 2.0 for minVal, maxVal in zip(self.segmin, self.segmax)]
-
-            elif change["name"] == "segmax":
-                # if segmin is longer than semax, truncate it
-                if len(self.segmin) > len(self.segmax):
-                    self.segmin = self.segmin[:len(self.segmax)]
-                
-                # if segmin is shorter than segmax, extend it
-                if len(self.segmin) < len(self.segmax):
-                    self.segmin += self.segmax[len(self.segmin):]
-                
-                # ensure segmax is not less than segmin
-                for i, (minVal, maxVal) in enumerate(zip(change['new'], self.segmin)):
-                    self.segmin[i] = min(minVal, maxVal)
-
-                # set seglen to average of segmin/segmax
-                self.seglen = [(minVal + maxVal) / 2.0 for minVal, maxVal in zip(self.segmin, self.segmax)]
-        
-        self.nSegments = len(self.seglen)
-        
-        # make length of waitUntilVolumeTrigger same as nSegments
-        self.waitUntilVolumeTrigger = (self.waitUntilVolumeTrigger + [False] * self.nSegments)[:self.nSegments]
-    
-    @observe("waitUntilVolumeTrigger")
-    def _updateWaitUntilVolumeTrigger(self, change):
-        # make same length as seglen
-        self.waitUntilVolumeTrigger = (self.waitUntilVolumeTrigger + [False] * self.nSegments)[:self.nSegments]
-    '''
-    Settings for pglTask
-    '''
-    def __init__(self):
-        super().__init__()
-        
-    def updateTraitsFromDict(self, data, filename="<dict>", typeConverter=None):
-        """
-        Override to convert parameter dicts to pglParameter instances.
-        Only converts items in the 'parameters' list, not other dict values.
-        """
-        # Make a copy to avoid modifying the original
-        data = data.copy()
-        
-        # ONLY convert the 'parameters' key specifically
-        if 'parameters' in data and isinstance(data['parameters'], list):
-            converted_params = []
-            for item in data['parameters']:
-                if isinstance(item, dict):
-                    # Extract the two required positional arguments
-                    name = item.get('name', 'unnamed')
-                    validValues = item.get('validValues', [])
-                    
-                    # Create pglParameter with those two args
-                    param = pglParameter(name, validValues)
-                    
-                    # Update any other attributes that might be stored
-                    # (like blockNum, currentTrial, etc. from your serialized data)
-                    for key, value in item.items():
-                        if key not in ['name', 'validValues'] and hasattr(param, key):
-                            setattr(param, key, value)
-                    
-                    converted_params.append(param)
-                elif isinstance(item, pglParameter):
-                    # Already correct type
-                    converted_params.append(item)
-                else:
-                    print(f"Warning: Unexpected type in parameters: {type(item)}")
-                    converted_params.append(item)
-            data['parameters'] = converted_params
-        
-        # Call parent implementation to handle ALL other traits normally
-        pglTraitSettings.updateTraitsFromDict(self, data, filename, typeConverter)
-##############################################
-# State for pglTask
-##############################################
-@dataclass
-class pglTaskState(pglSerialize):
-    phaseNum: Optional[int] = None
-    currentTrial: int = 0
-    currentSegment: int = 0
-    subjectResponses: ListType[int] = field(default_factory=list)
-
-##############################################
-# State for pglTask
-##############################################
-@dataclass
-class pglTaskData(pglSerialize):
-    startTime: Optional[float] = None
-    endTime: Optional[float] = None
-    events: ListType[pglEvent] = field(default_factory=list) 
-    params: ListType[dict] = field(default_factory=list)
-    
-    def display(self, taskName="task", responseMapping={True:('Correct','green'), False:('Incorrect','red')}):
-        '''
-        Display the experiment data.
-        '''
-        # get trial timestamps
-        trialTimestamps = np.array([e.timestamp for e in self.events if isinstance(e, pglEventTrial)])
-        if len(trialTimestamps) <= 2:
-            print("(pglTaskData:display) Insufficient trial events found to display.")
-            return
-        
-        # get the max trial length
-        maxTrialLength = np.diff(trialTimestamps[:-1]).max()
-        
-        # init timeline
-        timeline = timelinePlot(startTime=0, endTime=maxTrialLength)
-        
-        # init a dict for counting the number of different responseTypes found in the events
-        responseCounts = {respType: 0 for respType in responseMapping}
-        
-        # for each event, add to timeline
-        trialStart = None
-        gotResponse = False
-        nTrials = 0
-        for event in self.events:
-            # if we find a new trial event, reset the beginning time
-            if isinstance(event, pglEventTrial):
-                trialStart = event.timestamp
-                if event.eventType == "start":
-                    nTrials += 1
-            elif trialStart is not None:
-                # display segment events
-                if isinstance(event, pglEventSegment) and event.eventType == pglEventSegment.boundaryType.START.value:
-                    timeline.addTriangleMarker(time=event.timestamp - trialStart, color='blue', label=f'{event.segmentNum}', direction='up')
-                # display subject response events
-                elif isinstance(event, pglEventSubjectResponse):
-                    gotResponse = True
-                    label, color = responseMapping.get(event.responseType, ('?', 'gray'))
-                    timeline.addTriangleMarker(time=event.timestamp - trialStart, color=color, label=label[0], direction='down')   
-                    # update response counts
-                    if event.responseType in responseCounts:
-                        responseCounts[event.responseType] += 1
-                        
-        timeline.setTitle(f"{taskName}: {nTrials} trials")
-        
-        # display legend
-        legend = [{'label': 'Segment', 'color': 'blue'}]
-        # add the response values
-        if gotResponse:
-            for respType, (label, color) in responseMapping.items():
-                # get statistics for this response type
-                count = responseCounts.get(respType, 0)
-                percent = (count / sum(responseCounts.values()) * 100) if nTrials > 0 else 0
-                legend.append({'label': f'{label} (n={count}: {percent:.1f}%)', 'color': color})
-        timeline.addLegend(legend)
-        timeline.show()
 
 
 ##############################################

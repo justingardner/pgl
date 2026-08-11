@@ -15,6 +15,9 @@ from pathlib import Path
 from .pglSerialize import pglSerialize, pglGetAllSubclasses
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Any
+import posixpath
+from .pglMessages import pglMessages
+from .pglBase import pglBase
 
 import numpy as np
 import itertools
@@ -160,20 +163,22 @@ class pglParameter:
         for blockNum, (paramNames, parameterBlock) in enumerate(zip(self.data.parameterNames, self.data.parameterBlocks)):
             print(f"Block {blockNum+1}: {len(parameterBlock)} trials randomized over: {paramNames}")
      
-    def save(self, parameterDir='.'):
+    def save(self, parameterDir='.', filesystem=None):
         '''
         Save the parameter settings, state and data.         
         '''
         import traceback
+        # validate filesystem
+        filesystem, parameterDir, _ = pglBase.validateFilesystem(filesystem, parameterDir)
+
         # Create the directory to save data into
-        
         try:
-            dataDir = Path(parameterDir) / f"{self.settings.name}"
-            dataDir.mkdir(parents=True, exist_ok=True)    
+            dataDir = posixpath.join(str(parameterDir), self.settings.name)
+            filesystem.makedirs(dataDir, exist_ok=True)
         except Exception as e:
             traceback.print_exc()  # Show full traceback
             print(f"(pglParameter:save) ❌ Could not create data directory {parameterDir}: {e}")
-            return
+            return        
 
         # give user feedback where things are being saved
         print(f"(pglParameter:save) Saving parameter {self.settings.name} to: {dataDir}")
@@ -182,12 +187,12 @@ class pglParameter:
         self.state.randomNumberGeneratorState = self._rng.bit_generator.state
         
         # save settings, state and data
-        self.settings.save(dataDir / "settings.json")
-        self.state.save(dataDir / "state.json")
-        self.data.save(dataDir / "data.json")
+        self.settings.save(dataDir / "settings.json", filesystem=filesystem)
+        self.state.save(dataDir / "state.json", filesystem=filesystem)
+        self.data.save(dataDir / "data.json", filesystem=filesystem)
     
     @classmethod
-    def from_file(cls, parameterDir):
+    def from_file(cls, parameterDir, filesystem=None):
         '''
         Instatiates a pglParameter class by loading from parameterDir
         used for loading saved parameters.
@@ -197,10 +202,15 @@ class pglParameter:
         has to be updated whenever a new subclass is created that needs
         to be serialized
         '''
-        
+
+        # validate filesystem
+        filesystem, parameterDir, _ = pglBase.validateFilesystem(filesystem, parameterDir)
+
+        import posixpath
+
         # check parameterDir
         try:
-            if not parameterDir.exists():
+            if not filesystem.exists(str(parameterDir)):
                 raise FileNotFoundError(f"Data directory {parameterDir} does not exist.")
         except Exception as e:
             print(f"(pglParameter:from_file) ❌ Could not access data directory {parameterDir}: {e}")
@@ -208,25 +218,27 @@ class pglParameter:
 
         try:
             # peek at settings to see what class to instantiate
-            settingsPath = Path(parameterDir) / "settings.json"
-            data = json.loads(settingsPath.read_text())
+            settingsPath = posixpath.join(str(parameterDir), "settings.json")
+            with filesystem.open(settingsPath, "r") as f:
+                data = json.loads(f.read())
         except Exception as e:
             print(f"(pglParameter) Could not load settings.json from {parameterDir}: {e}")
-            return
+            return        
         
         # get the className
         className = data.get('className', 'pglParameter')
         
         # create the instance
-        obj = cls.createClassInstance(cls, className)
+        obj = cls.createClassInstance(className)
         
         # call load to load from the directory
-        obj.load(Path(parameterDir))
+        obj.load(parameterDir, filesystem=filesystem)
         
         # return the created object
         return obj
 
-    def createClassInstance(self, className):
+    @staticmethod
+    def createClassInstance(className):
         '''
             create an instance of pglParameter with the correct class give in className
         '''
@@ -241,22 +253,25 @@ class pglParameter:
         obj = targetClass.__new__(targetClass)
         return obj
 
-    def load(self, parameterDir):
+    def load(self, parameterDir, filesystem=None):
         '''
         Load the parameter settings, state and data.         
         '''
+        
+        # validate filesystem
+        filesystem, parameterDir, _ = pglBase.validateFilesystem(filesystem, parameterDir)
+
         # Create the directory to load data from
         try:
-            if not parameterDir.exists():
+            if not filesystem.exists(str(parameterDir)):
                 raise FileNotFoundError(f"Data directory {parameterDir} does not exist.")
         except Exception as e:
-            print(f"(pglParameter:load) ❌ Could not access data directory {parameterDir}: {e}")
+            pglMessages.warning(f"Could not access data directory {parameterDir}: {e}")
             return
-
-        # load settings, state and data
-        self.settings = pglParameterSettings.load(parameterDir / "settings.json")
-        self.state = pglParameterState.load(parameterDir / "state.json")
-        self.data = pglParameterData.load(parameterDir / "data.json")        
+        
+        self.settings = pglParameterSettings.load(posixpath.join(str(parameterDir), "settings.json"), filesystem=filesystem)
+        self.state = pglParameterState.load(posixpath.join(str(parameterDir), "state.json"), filesystem=filesystem)
+        self.data = pglParameterData.load(posixpath.join(str(parameterDir), "data.json"), filesystem=filesystem)
         
         # update random number generator state
         self._rng = np.random.default_rng()
@@ -270,7 +285,7 @@ class pglParameter:
         '''
         Instatiates a pglParameter class given settings state and data.
         '''
-        obj = cls.createClassInstance(cls, settings.__class__)
+        obj = cls.createClassInstance(settings.className)
         
         # set data classes
         obj.settings = settings
@@ -393,14 +408,14 @@ class pglParameterBlock(pglParameter):
         # and return
         return (self.settings.parameterNames, block)
     
-    def load(self, parameterDir):
+    def load(self, parameterDir,filesystem=None):
         '''
         Load function handles recreation of self.settings.parameters list
         As these will just get saved out as a dicts because they are not
         derived from pglSerialize.
         '''
         # call super
-        super().load(parameterDir)
+        super().load(parameterDir, filesystem=filesystem)
 
         # now for each parameter recreate the structure
         parameters = []

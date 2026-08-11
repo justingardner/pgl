@@ -16,81 +16,22 @@ from traitlets import HasTraits, Float, Int, List, Tuple, TraitError, Unicode, D
 from enum import Enum, auto
 import fsspec
 from fsspec import AbstractFileSystem
+import posixpath
 from pathlib import Path
 import re
-from .pglExperiment import pglExperimentData, pglExperimentBase, pglExperimentSettings
+from .pglExperiment import pglExperimentData, pglExperimentBase, pglExperimentSettings, pglTaskBase
 from .pglBase import pglBase
 from .pglSettings import pglSettings
 from .pglDialog import pglDialogs
+from typing import Annotated
 
-
-##########################
-# pglDataPort
-##########################
-class pglDataPort():
-
-    def __init__(self, name, dataType, optional=False):
-        if not (isinstance(dataType, type) and (issubclass(dataType, pglDataMatrix) or issubclass(dataType, pglTraitSettings))):
-            raise TypeError(f"dataType must be a subclass of pglDataMtrix, got {dataType!r}")
-        
-        self.name = name
-        self.dataType = dataType
-        self.optional = optional
-        
-##########################
-# pglPortList
-##########################
-class pglPortList:
-    '''
-    Ordered collection of pglDataPort, addressable both positionally
-    (like a list) and by name (like a dict), where the name comes
-    from the port itself rather than an external key.
-    '''
-    def __init__(self, ports=None):
-        self._ports: list[pglDataPort] = []
-        if ports:
-            for p in ports:
-                self.append(p)
-
-    def append(self, port: 'pglDataPort'):
-        if not port.name:
-            raise ValueError("pglDataPort must have a name before being added")
-        if port.name in self:
-            raise ValueError(f"Duplicate port name: {port.name!r}")
-        self._ports.append(port)
-
-    def __getitem__(self, key):
-        if isinstance(key, int):
-            return self._ports[key]
-        for p in self._ports:
-            if p.name == key:
-                return p
-        raise KeyError(key)
-
-    def __contains__(self, key):
-        if isinstance(key, str):
-            return any(p.name == key for p in self._ports)
-        return key in self._ports
-
-    def __iter__(self):
-        return iter(self._ports)
-
-    def __len__(self):
-        return len(self._ports)
-
-    def keys(self):
-        return [p.name for p in self._ports]
-
-    def items(self):
-        return [(p.name, p) for p in self._ports]
- 
 ########################
 # action status
 ########################
 class pglActionStatus(Enum):
     INITIALIZED = auto()
-    CONFIGURED = auto()
     VALIDATED = auto()
+    CONFIGURED = auto()
     RUNNING = auto()
     SUCCESS = auto()
     FAILED = auto()
@@ -103,14 +44,6 @@ class pglAction(pglTraitSettings):
     name = Unicode("", help="Name of action")
     status = Instance(pglActionStatus, help="action status")
     error = Instance(Exception, allow_none=True, default_value=None, help="error")
-    
-    # Dict of inputs to the action, where each entry is a string name key and a pglDataPort value
-    # Subclasses should override with specific pglData subclases for specificity.
-    inputPorts: pglPortList = None
-
-    # Dict of inputs to the action, where each entry is a string name key and a pglDataPort value
-    # Subclasses should override with specific pglData subclases for specificity.
-    outputPorts: pglPortList = None
     
     # settings for the action, required to be a pglTraitSettings. Subclass sould override this
     settings = Instance(pglTraitSettings, help='Settings for this action')
@@ -130,8 +63,9 @@ class pglAction(pglTraitSettings):
         self.inputData = {}
         self.outputData = {}
 
-    def configure(self):
-        pass
+    def configure(self) -> None:
+        # set status
+        self.status.pglActionStatus.CONFIGURED
         
     def run(self):
         pass
@@ -152,7 +86,6 @@ class pglPipeline(pglAction):
         super().__init__()
         pass
     
-
 ##################################
 # pglRun
 ##################################
@@ -167,6 +100,7 @@ class pglRun(pglExperimentBase):
     _experimentSettings = Instance(pglExperimentSettings, allow_none=True, default_value=None, help="settings of the experiemnt")
     _settings = Instance(pglSettings, allow_none=True, default_value=None, help="settings that this experiment was run with")
     _data = Instance(pglExperimentData, allow_none=True, default_value=None, help="data from experiemnt")
+    _tasks = List(Instance(pglTaskBase), allow_none=True, default_value=None, help="tasks from experiment")
     
     ##########################
     # Lazy-loaded properties
@@ -175,7 +109,8 @@ class pglRun(pglExperimentBase):
     def experimentSettings(self):
         '''Experiment settings, loaded from disk on first access.'''
         if self._experimentSettings is None:
-            filesystem, fullDataPath = pglBase.validateFilesystem(filesystem=self.filesystem, dataPath=self.fullDataPath, filesystemPrefix=self.filesystemPrefix)
+            pglMessages.message(f"Loading experiment settings for: {self.filesystemPrefix}/{self.fullDataPath}")
+            filesystem, fullDataPath, _ = pglBase.validateFilesystem(filesystem=self.filesystem, dataPath=self.fullDataPath, filesystemPrefix=self.filesystemPrefix)
             self._experimentSettings = pglExperimentSettings.load(filename=Path(fullDataPath) / "experimentSettings", filesystem=filesystem)
         return self._experimentSettings
 
@@ -187,6 +122,7 @@ class pglRun(pglExperimentBase):
     def settings(self):
         '''Settings the experiment was run with, loaded on first access.'''
         if self._settings is None:
+            pglMessages.message(f"Loading settings for: {self.filesystemPrefix}/{self.fullDataPath}")
             filesystem, fullDataPath, _ = pglBase.validateFilesystem(filesystem=self.filesystem, dataPath=self.fullDataPath, filesystemPrefix=self.filesystemPrefix)
             self._settings = pglSettings.load(filename=Path(fullDataPath) / "settings", filesystem=filesystem)
         return self._settings
@@ -199,7 +135,7 @@ class pglRun(pglExperimentBase):
     def data(self):
         '''Experiment data, loaded from disk on first access.'''
         if self._data is None:
-            pglMessages.message(f"Loading {self.filesystemPrefix}/{self.fullDataPath}")
+            pglMessages.message(f"Loading data for: {self.filesystemPrefix}/{self.fullDataPath}")
             filesystem, fullDataPath, _ = pglBase.validateFilesystem(filesystem=self.filesystem, dataPath=self.fullDataPath, filesystemPrefix=self.filesystemPrefix)
             self._data = pglExperimentData.load(filename=Path(fullDataPath) / "data", filesystem=filesystem)
         return self._data
@@ -208,7 +144,32 @@ class pglRun(pglExperimentBase):
     def data(self, value):
         self._data = value
 
-    
+    @property
+    def tasks(self):
+        '''Experiment tasks'''
+        if self._tasks is None:
+            pglMessages.message(f"Loading tasks for: {self.filesystemPrefix}/{self.fullDataPath}")
+            filesystem, fullDataPath, _ = pglBase.validateFilesystem(filesystem=self.filesystem, dataPath=self.fullDataPath, filesystemPrefix=self.filesystemPrefix)
+            taskNames = self.experimentSettings.tasks
+            self._tasks = []
+            for taskName in taskNames:
+                print(f"taskName: {taskName}")
+                self._tasks.append(pglTaskBase.load(taskDir=posixpath.join(str(fullDataPath), taskName), filesystem=filesystem))
+        return self._tasks
+
+    @tasks.setter
+    def tasks(self, value):
+        self._tasks = value
+        
+    def getTask(self, taskName):
+        '''
+        get a named task
+        '''
+        for task in self.tasks:
+            if task.settings.taskName == taskName:
+                return task
+        return None
+
     def __init__(self, fullDataPath, filesystem, filesystemPrefix):
         '''
         Initialize the pglRun class
@@ -226,11 +187,9 @@ class pglRun(pglExperimentBase):
         '''
         Extracts task names from experimentSettings
         '''
+        return(", ".join(self.experimentSettings.tasks))
+    
         
-        taskString = ", ".join(self.experimentSettings.tasks)
-        
-        # return taskString
-        return taskString
     
     def display(self, fig=None):
         '''
@@ -254,7 +213,6 @@ class pglSession(pglTraitSettings):
     
     # List of all runs
     runs = List(Instance(pglRun), allow_none=True, help="List of all runs")
-
     def __init__(self, filesystem=None, filesystemPrefix='', runList=[]):
         '''
         Init
@@ -441,14 +399,10 @@ class pglActionLoadSessionSettings(pglTraitSettings):
 
 class pglActionLoadSession(pglAction):
     
-    # data input / output contract
-    inputPorts = pglPortList()
-    outputPorts = pglPortList([
-        pglDataPort("session", pglSession, optional=False)
-    ])
+    # settings
     settings = Instance(pglActionLoadSessionSettings, help="settings")
     
-    def configure(self, dataPath):
+    def configure(self, dataPath: str) -> None:
         # have the user choose the session info
         # Fix, fix, fix, How do we get dataPath in here?
         # What do we do if the pass is not valid?
@@ -477,7 +431,7 @@ class pglActionLoadSession(pglAction):
         self.settings.selectedPaths = walkInstances(s)
         self.settings.filesystemPrefix = s.filesystemPrefix
     
-    def run(self):
+    def run(self) -> Annotated[pglSession, "session"]:
         # just create the session variable
         session = pglSession(
             filesystemPrefix=self.settings.filesystemPrefix,
@@ -485,8 +439,82 @@ class pglActionLoadSession(pglAction):
         )
         
         # and return
-        self.outputData = {'session': session}
-        return self.outputData
+        return session
         
+##################################################################
+# class pglActionRecreateExperimentDataFromTasks
+##################################################################
+class pglActionRecreateExperimentDataFromTasksChooseTaskName(pglTraitSettings):
+    taskName = List(Unicode(), default_value=[], help="Tasks in run", visible=False)
+
+class pglActionRecreateExperimentDataFromTasksChooseRun(pglTraitSettings):
+    runName = Unicode(help="Name of run", visible=False)
+    taskNames = List(Instance(pglActionRecreateExperimentDataFromTasksChooseTaskName), default_value=[], settingsListKey="taskName", traitDisplayName="Select run(s)", multiSelect=True, maxRowsVisible=2, help="Tasks in run")
+    
+class pglActionRecreateExperimentDataFromTasksSettings(pglTraitSettings):
+    TR = Float(1.0, help="The TR that was used for frame acuqistiion")
+    runList = List(Instance(pglActionRecreateExperimentDataFromTasksChooseRun), default_value=[], settingsListKey="runName", traitDisplayName="Run", help="run list")
+
+class pglActionRecreateExperimentDataFromTasks(pglAction):
+    '''
+    Fixer for sessions that were run when pglExperimentData was not being saved correctly
+    This will recreate startTime, endTime and volume events by examining
+    the task data
+    '''
+    
+    settings = Instance(pglActionRecreateExperimentDataFromTasksSettings, allow_none=True, help="settings")
+    
+    #----------------------------------------
+    #########################################
+    def configure(self, session: pglSession) -> None:
+        '''
+        Configure the action, by having the user select the TR and taskName
+        
+        Args:
+            session (pglSession): The session to run on
+        '''
+        # keep the session as we will need it in run
+        self.session = session
+        
+        # put up settings
+        self.settings = pglActionRecreateExperimentDataFromTasksSettings()
+        for run in session.runs:
+            # append to the list of runs
+            chooseRun = pglActionRecreateExperimentDataFromTasksChooseRun()
+            chooseRun.runName = Path(run.fullDataPath).name
+            self.settings.runList.append(chooseRun)
+            # get all the taskNames
+            taskNames = run.experimentSettings.tasks
+            for iTaskName, taskName in enumerate(taskNames):
+                chooseTaskNames = pglActionRecreateExperimentDataFromTasksChooseTaskName()
+                chooseTaskNames.taskName = taskName
+                if iTaskName == 0:
+                    chooseTaskNames.isSelected = True
+                # add add to the run list
+                self.settings.runList[-1].taskNames.append(chooseTaskNames)
+            
+        self.settings = pglDialogs.traitsDialog(self.settings)
+    
+    #----------------------------------------
+    #########################################
+    def run(self) -> Annotated[pglSession, "sessionWithFixedExperimentalData"]:
+        '''
+        run the fix
+        '''
+        # for each run
+        for iRun, run in enumerate(self.session.runs):
+            #print(self.settings.runList[iRun].taskNames)
+            #taskName = self.settings.runList[iRun].taskNames
+            # get the selected task
+            #tasks = run.getTask
+            for task in run.tasks:
+                task.print()
+            #    pass
+        
+        # return session
+        return self.session
+        
+    
+
     
 

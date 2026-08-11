@@ -818,26 +818,28 @@ class pglDisplaySettings(pglTraitSettings):
     temporalCalibration = List(Unicode(), hasPlotButton=True, buttonFunction="plotTemporalCalibration", default_value=['None'], help="Which temporal calibration to use")
     
     @classmethod
-    def load(cls, filename):
+    def load(cls, filename, filesystem=None):
         '''
         Load pglDisplaySettings. 
     
         Also loads displays list so that it has up to date display settings
         '''
+        filesystem, filename, _ = pglBase.validateFilesystem(filesystem, filename)
+        
         # check if filename exists
-        if not Path(filename).exists():
+        if not filesystem.exists(str(filename)):
             # look for it in the display directory
-            filename = pglSettingsManager.getDisplayDir() / pglBase.makeValidFilename(filename) / "display.json"
-            if not Path(filename).exists():
+            filename = str(Path(pglSettingsManager.getDisplayDir()) / pglBase.makeValidFilename(filename) / "display.json")
+            if not filesystem.exists(filename):
                 pglMessages.warning(f"File {filename} does not exist")
                 return None
             
         # call super function to load all fields
-        cls = super().load(filename)
+        cls = super().load(filename=filename, filesystem=filesystem)
         
         return cls
     
-    def save(self, filename=None):
+    def save(self, filename=None, filesystem=None):
         '''
         save
         
@@ -847,10 +849,13 @@ class pglDisplaySettings(pglTraitSettings):
         # get the filename
         if not filename: filename = self.saveDir()
 
+        # validate filesystem
+        filesystem, filename, _ = pglBase.validateFilesystem(filesystem, filename)
+
         # Ensure directory exists
-        filename.parent.mkdir(parents=True, exist_ok=True)
+        filesystem.makedirs(posixpath.dirname(filename), exist_ok=True)
  
-        super().save(filename=filename)
+        super().save(filename=filename, filesystem=filesystem)
         pglMessages.message(f"Saved display settings to {filename}")
                 
     def saveDir(self):
@@ -1054,21 +1059,21 @@ class pglSettings(pglTraitSettings):
         self.reloadDisplays()
 
     @classmethod
-    def load(cls, filename):
+    def load(cls, filename, filesystem=None):
         '''
         Load pglSettings. 
     
         Also loads displays list so that it has up to date display settings
         '''
         # call super function to load all fields
-        cls = super().load(filename)
+        cls = super().load(filename=filename, filesystem=filesystem)
         
         # reload the displays
         cls.reloadDisplays()
         
         return cls
     
-    def save(self, filename=None):
+    def save(self, filename=None, filesystem=None):
         '''
         save
         
@@ -1078,10 +1083,13 @@ class pglSettings(pglTraitSettings):
         # get the filename
         if not filename: filename = self.saveDir()
 
-        # Ensure directory exists
-        filename.parent.mkdir(parents=True, exist_ok=True)
+        # validate filesystem
+        filesystem, filename, _ = pglBase.validateFilesystem(filesystem, filename)
 
-        super().save(filename=filename)
+        # Ensure directory exists
+        filesystem.makedirs(posixpath.dirname(filename), exist_ok=True)
+
+        super().save(filename=filename, filesystem=filesystem)
         pglMessages.message(f"Saved display settings to {filename}")
 
         
