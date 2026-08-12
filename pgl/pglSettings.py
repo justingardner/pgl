@@ -26,6 +26,7 @@ import re
 from collections import OrderedDict
 from .pglMessages import pglMessages
 import uuid
+import posixpath
 
 #######################################
 # Mixin class for pgl to provide settings management

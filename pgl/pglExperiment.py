@@ -71,7 +71,6 @@ class pglExperimentBase(pglTraitSettings):
         self.experimentSettings = None
         self.pgl = None
         self.eyeTracker = None
-        #self.tasks = []
     
     @classmethod
     def isValidExperimentDir(cls, verbose=False, settings=None, dataPath=None, experimentName=None, subjectID=None, sessionName=None, runName=None, fullDataPath=None, filesystem=None):
@@ -395,6 +394,7 @@ class pglExperiment(pglExperimentBase):
         try:
             # init super
             super().__init__()
+            self.tasks = []
 
             # clear the text screen
             clear_output(wait=True)

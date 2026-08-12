@@ -19,10 +19,11 @@ from fsspec import AbstractFileSystem
 import posixpath
 from pathlib import Path
 import re
-from .pglExperiment import pglExperimentData, pglExperimentBase, pglExperimentSettings, pglTaskBase
+from .pglExperiment import pglExperimentData, pglExperimentBase, pglExperimentSettings, pglTaskBase, pglEventTrial, pglEventSegment
 from .pglBase import pglBase
 from .pglSettings import pglSettings
 from .pglDialog import pglDialogs
+from .pglParameter import pglParameter, pglParameterBlock
 from typing import Annotated
 import numpy as np
 import matplotlib.pyplot as plt
@@ -48,7 +49,7 @@ class pglAction(pglTraitSettings):
     error = Instance(Exception, allow_none=True, default_value=None, help="error")
     
     # settings for the action, required to be a pglTraitSettings. Subclass sould override this
-    settings = Instance(pglTraitSettings, help='Settings for this action')
+    settings = Instance(pglTraitSettings, allow_none=True, default_value=None, help='Settings for this action')
     
     # init action
     #-----------------
@@ -212,6 +213,116 @@ class pglRun(pglExperimentBase):
             
         except Exception as e:
             print(f"error: {e}")
+    
+    def getTrialsByParameter(self, parameterName: str, taskName: str = None):
+        '''
+        Extracts trial data grouped by parameterName
+        
+        Args:
+            parameterName (str): Name of parameter to group data by
+        
+        Returns:
+            dictionary with fields
+                parameterName (str): Name of parameter that the trials are sorted by
+                nParameterValues (int): Number of different parameter values
+                parameterValues (list): List of all parameter values
+                trialNum: 
+                volumeNum:
+                trialTime:
+        '''
+        # figure out what task we are working on
+        if taskName is None:
+            task = self.tasks[0]
+        else:
+            # search for the taskName (case insensitive)
+            task = next((t for t in self.tasks if t.settings.taskName.lower() == taskName.lower()), None)
+            # if not found, check if they meant the taskSaveName
+            if task is None:
+                task = next((t for t in self.tasks if t.settings.taskSaveName.lower() == taskName.lower()), None)
+        
+        if task is None:
+            print(f"(pglExperimentAnalysis:getTrialsByParameter) ❌ Could not find {taskName} in experiemnt.\nValid tasks are: {' '.join(t.settings.taskName for t in self.tasks)}")
+            return None
+                
+        # gather all the different parameter names
+        parameters = task.parameters
+        # get all the parameters recursively
+        # so that we get all parameters in blocks 
+        def collectParameters(parameterList):
+            parameters = []
+            for p in parameterList:
+                if isinstance(p, pglParameterBlock):
+                    parameters.extend(collectParameters(p.settings.parameters))
+                else:
+                    parameters.append(p)
+            return parameters
+        parameters = collectParameters(parameters)
+        
+        # get the matching parameter
+        parameter = next((p for p in parameters if p.settings.name == parameterName), None)
+        if parameter is None:
+            print(f"(pglExperimentAnalysis:getTrialsByParameter) ❌ Could not find '{parameterName}' in parameters {[p.settings.name for p in parameters]}")
+            return
+        
+        # initialize the list of lists for volumes by conditions        
+        validValues = parameter.settings.validValues
+        volumes = [[] for _ in range(len(validValues))]
+        startTimes = [[] for _ in range(len(validValues))]
+        trialNums = [[] for _ in range(len(validValues))]
+        nTrials = [0 for _ in range(len(validValues))]
+        nTrialsTotal = 0
+        
+        # loop over trials, collecting the params dictionary for each trial
+        for iTrial, params in enumerate(task.data.params):
+            # find matching trial event
+            trialEvent = next((event for event in task.data.events if isinstance(event, pglEventTrial) and event.trialNum == iTrial), None)
+            
+            # get the trials tart time and volume
+            trialStart = trialEvent.timestamp - task.data.startTime if trialEvent else "No trial event found"
+            trialVolume = self.getNearestVolumeTrigger(trialEvent)
+
+            # if we found a volume trigger
+            if trialVolume is not None:
+                # get the value that was set for this trial
+                trialValue = params.get(parameter.settings.name,None)
+                # if it matches the valid values
+                if trialValue in validValues:
+                    # get the index
+                    conditionIndex = validValues.index(trialValue)
+                    
+                    # and populate arrays with data
+                    volumes[conditionIndex].append(trialVolume)
+                    startTimes[conditionIndex].append(trialStart)
+                    trialNums[conditionIndex].append(iTrial+1)
+                    nTrials[conditionIndex] += 1
+                    nTrialsTotal += 1
+        
+        # pack everything up
+        return pglTrialsByParameter(
+            parameterName=parameter.settings.name,
+            parameterValues=validValues,
+            parameter=parameter,
+            nTrialsTotal=nTrialsTotal,
+            volumes=volumes,
+            startTimes=startTimes,
+            trialNums=trialNums,
+            nTrials=nTrials
+        )
+
+
+##################################
+# pglTrialsByParameter
+##################################
+class pglTrialsByParameter(pglTraitSettings):
+    parameterName = Unicode(help="Name of parameter that was used to sort trials by")
+    parameterValues = List(help="List of all values that the parameter can take")
+    parameter = Instance(pglParameter, help="The pglParameter instance of the parameter")
+    nTrialsTotal = Int(help="total number of trials")
+    volumes = List(List(Int()),help="A list of lists of volumes, one list for each value of the parameter")
+    startTimes = List(List(Float()),help="A list of lists of times, one list for each value of the parameter")
+    trialNums = List(List(Int()),help="A list of lists of trial volumes, one list for each value of the parameter")
+    nTrials = List(Int(),help="A list of number of trials, one list for each value of the parameter")
+    
            
 ##################################
 # pglSession
@@ -240,7 +351,7 @@ class pglSession(pglTraitSettings):
         
         for runPath in runList:
             self.runs.append(pglRun(fullDataPath=runPath, filesystem=filesystem, filesystemPrefix=filesystemPrefix))
-        
+    
 ##################################################################
 # pglChooseSession. Base class for walking directory structures.
 # implements reading of child directories and putting them in a list
@@ -626,6 +737,21 @@ class pglActionRecreateExperimentDataFromTasks(pglAction):
         return self.session
         
     
+##################################
+# saves data locally
+##################################
+class pglActionSave(pglAction):
+    '''
+    '''
+    #----------------------------------------
+    #########################################
+    def configure(self, session: pglSession | None = None) -> None:
+        self.session = session
 
+    #----------------------------------------
+    #########################################
+    def run(self) -> None:
+        if self.session:
+            self.session.save()
     
 
