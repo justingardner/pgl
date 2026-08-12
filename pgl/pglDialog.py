@@ -35,6 +35,7 @@ import math
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 from .pglMessages import pglMessages
+import traceback
 
 #######################################
 # _pglTraitsDialog
@@ -166,7 +167,7 @@ class _pglTraitsDialog(QDialog):
         self.formLayout.setRowWrapPolicy(QFormLayout.DontWrapRows)
 
         for traitName, trait in self._getOrderedTraits().items():
-            if traitName.startswith('_'):
+            if traitName.startswith('_') and not trait.metadata.get("property", None):
                 continue
             self._addTraitWidget(traitName, trait)
 
@@ -274,7 +275,11 @@ class _pglTraitsDialog(QDialog):
         if settingsObject is None:
             settingsObject = self.settings
         helpText = self._helpText(traitName, trait)
-        current = getattr(settingsObject, traitName)
+        
+        # get the property to read (usualy just the traitName, but if property)
+        # is set there is another property that is used for the trait (like for lazy-loaded properties)
+        readName = trait.metadata.get("property", traitName)
+        current = getattr(settingsObject, readName)
 
         # a tuple
         if isinstance(trait, Tuple):
@@ -363,7 +368,7 @@ class _pglTraitsDialog(QDialog):
         #--------------------
         def buildRows():
             for name, childTrait in self._getOrderedTraits(current[0]).items():
-                if name.startswith("_"):
+                if name.startswith("_") and not childTrait.metadata.get("property", None):
                     continue
                 if hideKey and name == keyTraitName:
                     continue
@@ -371,7 +376,7 @@ class _pglTraitsDialog(QDialog):
                     continue
                 self._addTraitWidget(name, childTrait, proxy, layout, settingsKey)
                 childNames.append(name)
-
+                childTraits[name] = childTrait
         # Update the detail widgets from one object
         #------------------------------
         def updateFields(obj):
@@ -389,7 +394,13 @@ class _pglTraitsDialog(QDialog):
             # update fields
             try:
                 for name in childNames:
-                    value = getattr(obj, name)
+                    # read what the underlying property is (usually the trait, but
+                    # could be a property for lazy-loading)
+                    childTrait = childTraits.get(name)
+                    readName = name
+                    if childTrait is not None: 
+                        readName = childTrait.metadata.get("property", name)
+                    value = getattr(obj, readName)
                     entry = self.traitWidgets[state["key"]].get(name)
 
                     if entry is not None and "setter" in entry:
@@ -407,6 +418,7 @@ class _pglTraitsDialog(QDialog):
                         nested["setVisible"](bool(visible))
             except Exception as e:
                 print(f"Error updating fields for {obj}: {e}")
+                
             finally:
                 self._updatingWidget = False
 
@@ -627,6 +639,7 @@ class _pglTraitsDialog(QDialog):
         # set what the detail widgets are updating
         proxy = _RetargetableProxy(current[0])
         childNames = []
+        childTraits = {}
         builtClassName = current[0].__class__.__name__
 
         if not childNames:
@@ -650,12 +663,15 @@ class _pglTraitsDialog(QDialog):
         highlightSelector = trait.metadata.get("highlightSelector", True)
         buttons = trait.metadata.get("buttons", False)
         setDefault = trait.metadata.get("setDefault", False)
+        hasPlotButton = trait.metadata.get("hasPlotButton", False)
+        plotButtonFunction = trait.metadata.get("buttonFunction", None)
+        self.settingsListPlotButtonState = False 
 
         # Build widgets once
         #--------------------
         def buildRows():
             for name, childTrait in self._getOrderedTraits(current[0]).items():
-                if name.startswith("_"):
+                if name.startswith("_") and not childTrait.metadata.get("property", None):
                     continue
 
                 if hideKey and name == keyTraitName:
@@ -666,6 +682,7 @@ class _pglTraitsDialog(QDialog):
 
                 self._addTraitWidget(name, childTrait, proxy, layout, settingsKey)
                 childNames.append(name)
+                childTraits[name]=childTrait
 
         # Commit current selection
         # this function will reorder the list so that the selection is at top
@@ -726,7 +743,13 @@ class _pglTraitsDialog(QDialog):
 
             try:
                 for name in childNames:
-                    value = getattr(obj, name)
+                    # read what the underlying property is (usually the trait, but
+                    # could be a property for lazy-loading)
+                    childTrait = childTraits.get(name)
+                    readName = name
+                    if childTrait is not None:
+                        readName = childTrait.metadata.get("property", name)
+                    value = getattr(obj, readName)
                     entry = self.traitWidgets[state["key"]].get(name)
 
                     # ordinary widget
@@ -791,7 +814,17 @@ class _pglTraitsDialog(QDialog):
             # retarget and update all the fields
             proxy.retarget(obj)
             updateFields(obj)
-            if hasattr(self, "plotCanvas"):
+            # refresh plot if it's currently shown 
+            if hasPlotButton and self.settingsListPlotButtonState:
+                try:
+                    buttonFunction = getattr(obj, plotButtonFunction, None)
+                    if buttonFunction is not None:
+                        self.figure.clear()
+                        buttonFunction(fig=self.figure)
+                        self.plotCanvas.draw()
+                except Exception as e:
+                    pglMessages.warning(f"Error refreshing plot: {e}")
+            elif hasattr(self, "plotCanvas"):
                 self.plotCanvas.setVisible(False)
                 self.plotCanvas.draw()
                 
@@ -837,8 +870,43 @@ class _pglTraitsDialog(QDialog):
         if highlightSelector: combo.setObjectName("settingsSelector")
         combo.addItems([str(getattr(x, keyTraitName)) for x in current])
 
+         # add plot button
+        if hasPlotButton:
+            plotButton = QPushButton(trait.metadata.get("buttonLabel", "display"))
+
+            def onPlotButton():
+                try:
+                    # act on the currently-selected object
+                    obj = state["object"]
+                    buttonFunction = getattr(obj, plotButtonFunction, None)
+                    if buttonFunction is None:
+                        print(f"{obj} does not have function: {plotButtonFunction}")
+                        return
+                    if not self.settingsListPlotButtonState:
+                        self.plotCanvas.setVisible(True)
+                        self.figure.clear()
+                        buttonFunction(self.figure)
+                        self.plotCanvas.draw()
+                        self.settingsListPlotButtonState = True
+                    else:
+                        self.figure.clear()
+                        self.plotCanvas.setVisible(False)
+                        self.plotCanvas.draw()
+                        self.settingsListPlotButtonState = False
+                except Exception as e:
+                    pglMessages.warning(f"Error calling plotButton function {plotButtonFunction}: {e}")
+
+            plotButton.clicked.connect(onPlotButton)
+            # combo + plot button in one row
+            row = QWidget()
+            h = QHBoxLayout(row)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.addWidget(combo, 1)
+            h.addWidget(plotButton)
+            self._register(traitName, trait, row, lambda v: None, layout)
+
         # add defaults checkbox if requested
-        if setDefault:
+        elif setDefault:
             # add a checkbox for setting defaults
             row = QWidget()
             h = QHBoxLayout(row)
@@ -881,8 +949,8 @@ class _pglTraitsDialog(QDialog):
                         obj.isDefault = True
                     else:
                         obj.isDefault = False
-            check.stateChanged.connect(onSelectDefault)             
-
+            check.stateChanged.connect(onSelectDefault)     
+                
             self._register(traitName, trait, row, lambda v: None, layout)
         else:
             # register the combo
@@ -962,10 +1030,12 @@ class _pglTraitsDialog(QDialog):
 
             deleteButton.clicked.connect(onDelete)
             self.addButtonRow(None, [newButton, copyButton, deleteButton], displayName="")
+                # if we have a plot button, add it
         
         # set what the widget is updating
         proxy = _RetargetableProxy(current[0])
         childNames = []
+        childTraits={}
         
         state["retargetList"] = retargetList
 
@@ -1484,7 +1554,14 @@ class _pglTraitsDialog(QDialog):
     def _commit(self, settingsObject, traitName, value):
         """Push a widget change into the settings copy."""
         try:
-            setattr(settingsObject, traitName, value)
+            writeName = traitName
+            # look up property= metadata if the object exposes traits
+            try:
+                trait = settingsObject.trait(traitName)
+                writeName = trait.metadata.get("property", traitName)
+            except Exception:
+                pass
+            setattr(settingsObject, writeName, value)
         except Exception as e:
             # keep the dialog alive on a bad value
             print(f"(pglTraitsDialog:_commit) Could not set {traitName}: {e}")
