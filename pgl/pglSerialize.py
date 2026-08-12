@@ -33,7 +33,7 @@ def pglGetAllSubclasses(baseClass):
         if name in allSubclasses:
             pglMessages.warning(
                 f"Duplicate serialization name '{name}' "
-                f"for {cls.__name__} and {allSubclasses[name].__name__}"
+                f"for {cls.__name__} and {allSubclasses[name].__name__}", level=0
             )
         allSubclasses[name] = cls
 
