@@ -10,6 +10,15 @@
 #############
 import numpy as np
 from types import SimpleNamespace
+from .pglMessages import pglMessages
+from .pglBase import pglBase
+from .pglSettings import pglTraitSettings
+from PIL import Image, UnidentifiedImageError
+from traitlets import HasTraits, Float, Int, List, Tuple, TraitError, Unicode, Dict, default, link, Bool, TraitType, Instance
+from fsspec import AbstractFileSystem
+import posixpath
+import os
+import matplotlib.pyplot as plt
 
 #############
 # Image class
@@ -307,3 +316,138 @@ class pglImageInstance:
             print(f"Image {self.imageNum} ({self.width.pix}x{self.height.pix}) displayed: left={self.displayLeft} right={self.displayRight} bottom={self.displayBottom} top={self.displayTop} time={self.displayTime}")
        else:
            print(f"Image: {self.imageNum} ({self.width.pix}x{self.height.pix})")
+
+class pglImageFile(pglTraitSettings):
+
+    # filesystem, name and prefix for where the images were loaded from
+    filesystem = Instance(AbstractFileSystem, allow_none=True, serialize=False, help="filesystem for serialization")
+    filename= Unicode(allow_none=True, default_value="", help="Full path to images", visible=False)
+    filesystemPrefix = Unicode(allow_none=True, default_value="", help="Prefix like ssh:// used for accessing filesystem", visible=False)
+    _size = Tuple(Int, Int, labels=("width","height"), property="size", enabled=False, allow_none=True, default_value=None, help="Image width x height")
+    _mode = Unicode(allow_none=True, default_value=None, property="mode", enabled=False, help="Image mode")
+    _format = Unicode(allow_none=True, default_value=None, property="format", enabled=False, help="Image format")
+    _img = Instance(Image.Image, allow_none=True, default_value=None, serialize=False, visible=False, help="The loaded PIL image")
+    
+    def _loadMetadata(self):
+        pglMessages.message(f"Loading image metadata: {self.filesystemPrefix}/{self.filename}")
+        filesystem, filename, _ = pglBase.validateFilesystem(filesystem=self.filesystem, dataPath=self.filename, filesystemPrefix=self.filesystemPrefix)
+        with filesystem.open(filename, "rb") as h:
+            img = Image.open(h)
+            self._size = img.size
+            self._mode = img.mode
+            self._format = img.format
+
+    def _loadImage(self):
+        pglMessages.message(f"Loading image: {self.filesystemPrefix}/{self.filename}")
+        filesystem, filename, _ = pglBase.validateFilesystem(filesystem=self.filesystem, dataPath=self.filename, filesystemPrefix=self.filesystemPrefix)
+        with filesystem.open(filename, "rb") as h:
+            img = Image.open(h)
+            img.load()
+            self._img = img
+            # also cache metadata if not already set
+            if self._size is None: self._size = img.size
+            if self._mode is None: self._mode = img.mode
+            if self._format is None: self._format = img.format
+
+    @property
+    def size(self):
+        '''imageSize.'''
+        if self._size is None: self._loadMetadata()
+        return self._size
+
+    @size.setter
+    def size(self, value):
+        self._size = value    
+
+    @property
+    def mode(self):
+        '''imageMode.'''
+        if self._mode is None: self._loadMetadata()
+        return self._mode
+
+    @mode.setter
+    def mode(self, value):
+        self._mode = value    
+
+    @property
+    def format(self):
+        '''imageFormat.'''
+        if self._format is None: self._loadMetadata()
+        return self._format
+
+    @format.setter
+    def format(self, value):
+        self._format = value    
+        
+    @property
+    def img(self):
+        '''image'''
+        if self._img is None: self._loadImage()
+        return self._img
+
+    @img.setter
+    def img(self, value):
+        self._img = value    
+
+    def __repr__(self):
+        return f"{os.path.basename(self.filename)} {self.size[0]}x{self.size[1]} {self.mode}"
+    
+    def print(self):
+        print(self.__repr__())
+        
+    def display(self, fig=None, ax=None):
+        if fig:
+            ax = fig.subplots()
+        if ax is None:
+            fig, ax = plt.subplots()
+        # self.img triggers _loadImage (full pixel decode) — only now
+        img = self.img
+        if self.mode in ("L", "I", "F", "I;16"):
+            ax.imshow(img, cmap="gray")
+        else:
+            ax.imshow(self.img)
+        ax.set_title(repr(self))
+        ax.axis("off")
+        return ax
+
+class pglImageDatabase(pglTraitSettings):
+    
+    # filesystem, name and prefix for where the images were loaded from
+    filesystem = Instance(AbstractFileSystem, allow_none=True, serialize=False, help="filesystem for serialization")
+    dataPath = Unicode(allow_none=True, default_value="", help="Full path to images", visible=False)
+    filesystemPrefix = Unicode(allow_none=True, default_value="", help="Prefix like ssh:// used for accessing filesystem", visible=False)
+    images = List(Instance(pglImageFile), default_value=[], settingsListKey="filename", traitDisplayName="Choose image", hasPlotButton=True, buttonFunction="display", help="List of images in database")
+    
+    def __init__(self, dataPath=None, filesystem=None):
+        '''
+        Initialize by pointing to a directory where images live
+        '''
+        
+        if dataPath:
+            # get known image extensions
+            Image.init()
+            imageExts = set(Image.registered_extensions().keys())
+            
+            # parse filesystem
+            self.filesystem, self.fullDataPath, self.filesystemPrefix = pglBase.validateFilesystem(filesystem, dataPath)
+            
+            # look for images in directory
+            for f in self.filesystem.ls(self.fullDataPath, detail=True):
+                # only open files
+                if f["type"] != "file": continue
+                if os.path.splitext(f["name"])[1].lower() in imageExts:
+                    self.images.append(pglImageFile(
+                        filename = f["name"],
+                        filesystem = self.filesystem,
+                        filesystemPrefix = self.filesystemPrefix
+                    ))
+            
+            pglMessages.message(f"Found {len(self.images)} image files")
+
+    def displayImage(self, ax=None):
+        images[0].display(ax=ax)
+    
+    def print(self):
+        for iImage, image in enumerate(self.images):
+            print(f"{iImage}: ",end="")        
+            image.print()
