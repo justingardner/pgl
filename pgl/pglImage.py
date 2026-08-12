@@ -417,7 +417,7 @@ class pglImageDatabase(pglTraitSettings):
     dataPath = Unicode(allow_none=True, default_value="", help="Full path to images", visible=False)
     filesystemPrefix = Unicode(allow_none=True, default_value="", help="Prefix like ssh:// used for accessing filesystem", visible=False)
     images = List(Instance(pglImageFile), default_value=[], settingsListKey="filename", traitDisplayName="Choose image", hasPlotButton=True, buttonFunction="display", help="List of images in database")
-    
+    nImages = Int(0, help="Number of images")
     def __init__(self, dataPath=None, filesystem=None):
         '''
         Initialize by pointing to a directory where images live
@@ -441,9 +441,17 @@ class pglImageDatabase(pglTraitSettings):
                         filesystem = self.filesystem,
                         filesystemPrefix = self.filesystemPrefix
                     ))
+            # store number of images                    
+            self.nImages = len(self.images)
             
+            # and let the world know
             pglMessages.message(f"Found {len(self.images)} image files")
-
+            
+    def getImage(self,imageNum):
+        if imageNum < 0 or imageNum >= self.nImages:
+            pglMessages.warning(f"Could not get image: imageNum={imageNum} out of range [0,{self.nImages})")
+        return(self.images[imageNum].img)
+    
     def displayImage(self, ax=None):
         images[0].display(ax=ax)
     
