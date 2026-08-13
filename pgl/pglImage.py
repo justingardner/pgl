@@ -19,6 +19,7 @@ from fsspec import AbstractFileSystem
 import posixpath
 import os
 import matplotlib.pyplot as plt
+import pandas as pd
 
 #############
 # Image class
@@ -320,6 +321,7 @@ class pglImageInstance:
 class pglImageFile(pglTraitSettings):
 
     # filesystem, name and prefix for where the images were loaded from
+    name = Unicode(help="name of image")
     filesystem = Instance(AbstractFileSystem, allow_none=True, serialize=False, help="filesystem for serialization")
     filename= Unicode(allow_none=True, default_value="", help="Full path to images", visible=False)
     filesystemPrefix = Unicode(allow_none=True, default_value="", help="Prefix like ssh:// used for accessing filesystem", visible=False)
@@ -327,6 +329,7 @@ class pglImageFile(pglTraitSettings):
     _mode = Unicode(allow_none=True, default_value=None, property="mode", enabled=False, help="Image mode")
     _format = Unicode(allow_none=True, default_value=None, property="format", enabled=False, help="Image format")
     _img = Instance(Image.Image, allow_none=True, default_value=None, serialize=False, visible=False, help="The loaded PIL image")
+    caption = Unicode(default_value="", help="Image caption")
     
     def _loadMetadata(self):
         pglMessages.message(f"Loading image metadata: {self.filesystemPrefix}/{self.filename}")
@@ -416,8 +419,9 @@ class pglImageDatabase(pglTraitSettings):
     filesystem = Instance(AbstractFileSystem, allow_none=True, serialize=False, help="filesystem for serialization")
     dataPath = Unicode(allow_none=True, default_value="", help="Full path to images", visible=False)
     filesystemPrefix = Unicode(allow_none=True, default_value="", help="Prefix like ssh:// used for accessing filesystem", visible=False)
-    images = List(Instance(pglImageFile), default_value=[], settingsListKey="filename", traitDisplayName="Choose image", hasPlotButton=True, buttonFunction="display", help="List of images in database")
+    images = List(Instance(pglImageFile), default_value=[], settingsListKey="name", traitDisplayName="Choose image", hasPlotButton=True, buttonFunction="display", help="List of images in database")
     nImages = Int(0, help="Number of images")
+    
     def __init__(self, dataPath=None, filesystem=None):
         '''
         Initialize by pointing to a directory where images live
@@ -437,6 +441,7 @@ class pglImageDatabase(pglTraitSettings):
                 if f["type"] != "file": continue
                 if os.path.splitext(f["name"])[1].lower() in imageExts:
                     self.images.append(pglImageFile(
+                        name = os.path.basename(f["name"]),
                         filename = f["name"],
                         filesystem = self.filesystem,
                         filesystemPrefix = self.filesystemPrefix
@@ -444,12 +449,31 @@ class pglImageDatabase(pglTraitSettings):
             # store number of images                    
             self.nImages = len(self.images)
             
+            # alphabetically sort the images by name
+            self.images.sort(key=lambda x: x.name.lower())
+            
             # and let the world know
             pglMessages.message(f"Found {len(self.images)} image files")
             
+    def preloadImage(self,imageNum):
+        '''
+        preloadImage from database. This will preload the image into memory
+        '''
+        if imageNum < 0 or imageNum >= self.nImages:
+            pglMessages.warning(f"Could not preload image: imageNum={imageNum} out of range [0,{self.nImages})")
+            return None
+        return self.images[imageNum].img
+        
     def getImage(self,imageNum):
+        '''
+        getImage from database
+        
+        Args:
+            imageNum (int): number of image to get
+        '''
         if imageNum < 0 or imageNum >= self.nImages:
             pglMessages.warning(f"Could not get image: imageNum={imageNum} out of range [0,{self.nImages})")
+            return None
         return(self.images[imageNum].img)
     
     def displayImage(self, ax=None):
@@ -457,5 +481,41 @@ class pglImageDatabase(pglTraitSettings):
     
     def print(self):
         for iImage, image in enumerate(self.images):
-            print(f"{iImage}: ",end="")        
-            image.print()
+            print(f"{iImage}: {image.name} ",end="")        
+            #image.print()
+            
+class pglImageDatabaseNSD(pglImageDatabase):
+    def __init__(self, dataPath=None, filesystem=None):
+        super().__init__(dataPath,filesystem)
+        if dataPath is None: return
+        # now make a set of the filenames that we loaded
+        filenames = [image.name for image in self.images]
+        # load the the csv manifest
+        self.manifest = None
+        for csvFilename in self.filesystem.glob(os.path.join(dataPath, "*.csv")):
+            try:
+                # dataFrame for csv file
+                dataFrame = pd.read_csv(self.filesystem.open(csvFilename))
+                # check for specific columns that we wish to use
+                manifestFilenames = dataFrame["filename"]
+                manifestIndex = dataFrame["index"]
+                manifestCaption = dataFrame["caption_1"]
+                # see if we have all images in the manifest
+                if set(manifestFilenames) == set(filenames):
+                    # good, let's keep the dataFrame
+                    self.manifest = dataFrame
+                    # and sort by the index value
+                    # first make a dict which matches each filename to the index in the index column
+                    indexByFilename = dict(zip(manifestFilenames, manifestIndex))
+                    # and sort our images
+                    self.images.sort(key=lambda x: indexByFilename[x.name])
+                    
+                    # set the captions of the images according to the manifest
+                    captionByFilename = dict(zip(manifestFilenames, manifestCaption))
+                    for image in self.images:
+                        image.caption = captionByFilename[image.name]
+                    
+                    pglMessages.message("Sorted and set captions from manifest")                    
+            except Exception as e:
+                pglMessages.warning(f"Error loading manifest {csvFilename}: {e}", level=1)
+     
