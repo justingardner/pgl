@@ -193,7 +193,7 @@ class pglBase:
             try:
                 # start the mglMetal application
                 result = subprocess.run([
-                    "open", "-g", "-n", self.metalAppName,
+                    "open", "-n", self.metalAppName,
                     "--args", "-mglConnectionAddress", socketName
                     ], check=True)
             except Exception as e:
