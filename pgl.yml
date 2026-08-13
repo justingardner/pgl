@@ -219,6 +219,13 @@ dependencies:
   - zlib=1.3.2=hb4cf58c_0
   - zstd=1.5.7=h817c040_0
   - pip:
+      - asyncssh==2.24.0
+      - bcrypt==5.0.0
+      - invoke==3.0.3
+      - labjack-ljm==1.23.0
+      - paramiko==5.0.0
+      - pgl==0.1.0
+      - pynacl==1.6.2
       - pyobjc==12.2.1
       - pyobjc-framework-accessibility==12.2.1
       - pyobjc-framework-accounts==12.2.1
@@ -380,9 +387,11 @@ dependencies:
       - pyobjc-framework-virtualization==12.2.1
       - pyobjc-framework-vision==12.2.1
       - pyobjc-framework-webkit==12.2.1
+      - pypixxlib==1.10.3
       - pypng==0.20220715.0
       - pyside6==6.11.1
       - pyside6-addons==6.11.1
       - pyside6-essentials==6.11.1
       - shiboken6==6.11.1
+      - sshfs==2026.8.0
 prefix: /Users/Shared/koret_software/miniforge3/envs/pgl
