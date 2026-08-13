@@ -60,11 +60,14 @@ class pglDataPixxBase(pglDevice):
             self.getError()
             return
 
-        # IMPORTANT: force an actual USB round-trip.
+    
         # DPxUpdateRegCache() writes to the device and reads the registers back.
         try:
             self.dp.DPxUpdateRegCache()
-            self.getError()
+            if self.getError():
+                pglMessages.warning("Is DataPixx3 connected and turned on (green power light)")
+                return
+
         except Exception as e:
             pglMessages.warning(f"DataPixx: device opened but hardware communication failed: {e}")
             return False
@@ -742,32 +745,6 @@ class pglDataPixxDigitalIODevice(pglDigitalIODevice, pglDataPixxBase):
 
  
     ################################################################
-    # getError: Modified from VPIxx example code
-    ################################################################
-    def getError(self):
-        """
-        Gets any error from the DataPixx device and prints out the message
-        
-        Will return 0 if no error or the error number if there is an error
-
-        """
-        try:
-            # get error
-            errorNum = self.dp.DPxGetError()
-            if errorNum != 0:
-                errorStr = self.dp.DPxGetErrorString()
-                pglMessages.warning(f"DataPixx error {errorNum}: {errorStr}")
-
-            # clear error
-            self.dp.DPxClearError()
-            pglMessages.message("(pglDataPixx:getError) Error state cleared.")
-            
-            if self.dp.DPxIs5VFault(): pglMessages.warning("5V fault detected.")
-            
-            
-        except Exception as e:
-            pglMessages.warning(f"Could not get error state: {e}")
-     ################################################################
     # enableVsyncTrigger: Modified from VPIxx example code
     ################################################################
     def enableVsyncTrigger(self):
@@ -908,6 +885,12 @@ class pglDataPixxDigitalIODevice(pglDigitalIODevice, pglDataPixxBase):
             samplingRate (int): Sampling rate in Hz for the digital output (default
                                 is 10).
         """
+        import cProfile
+        import pstats
+
+        profiler = cProfile.Profile()
+
+        profiler.enable()
 
         # get the entry
         entry = self.triggers.get(eventName, None)
@@ -934,3 +917,7 @@ class pglDataPixxDigitalIODevice(pglDigitalIODevice, pglDataPixxBase):
         # Start the digital output schedule to send the trigger signal
         self.dp.DPxStartDoutSched()
         self.dp.DPxWriteRegCache()
+
+        profiler.disable()
+
+        pstats.Stats(profiler).sort_stats("cumulative").print_stats(30)
