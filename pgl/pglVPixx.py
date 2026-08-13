@@ -24,17 +24,17 @@ class pglDataPixxBase(pglDevice):
     Base class for dataPixx clases which has helper functions to open close and stop schedules
     as well as initialize the library    
     '''
-    def __init__(self, deviceName=None):
+    def __init__(self, deviceType=None):
         '''
         init function
 
         Args:
-            deviceName (str): String descriptive name of device
+            deviceType (str): String descriptive name of device
         '''
-        if not deviceName: deviceName = "DataPixx"
+        if not deviceType: deviceType = "DataPixx"
 
        # call parent constructor
-        super().__init__(deviceType=deviceName, deviceDescription="VPixx dataPixx")
+        super().__init__(deviceType=deviceType, deviceDescription="VPixx dataPixx")
         
         # get library
         try:
@@ -60,10 +60,33 @@ class pglDataPixxBase(pglDevice):
             self.getError()
             return
 
+        # IMPORTANT: force an actual USB round-trip.
+        # DPxUpdateRegCache() writes to the device and reads the registers back.
+        try:
+            self.dp.DPxUpdateRegCache()
+            self.getError()
+        except Exception as e:
+            pglMessages.warning(f"DataPixx: device opened but hardware communication failed: {e}")
+            return False
+
         # print status
-        pglMessages.message(f"Opened DataPixx with firmware version: {self.dp.DPxGetFirmwareRev()}")
-        pglMessages.message(f"Current pixel mode: {self.dp.DPxIsDoutPixelMode()}")
-        pglMessages.message(f"DAC schedule: {self.dp.DPxIsDacSchedRunning()}")
+        try:
+            pglMessages.message(f"Opened DataPixx with firmware version: {self.dp.DPxGetFirmwareRev()}")
+            if self.getError(): 
+                pglMessages.warning("Is DataPixx3 connected and turned on (green power light)")
+                return
+            pglMessages.message(f"Current pixel mode: {self.dp.DPxIsDoutPixelMode()}")
+            if self.getError():
+                pglMessages.warning("Is DataPixx3 connected and turned on (green power light)")
+                return
+            pglMessages.message(f"DAC schedule: {self.dp.DPxIsDacSchedRunning()}")
+            if self.getError():
+                pglMessages.warning("Is DataPixx3 connected and turned on (green power light)")
+                return
+        except Exception as e:
+            pglMessages.warning(f"DataPixx: device opened but hardware communication failed: {e}")
+            return False
+        
         
     
     ################################################################
@@ -96,6 +119,39 @@ class pglDataPixxBase(pglDevice):
         # write changes 
         self.dp.DPxWriteRegCache()
 
+    ################################################################
+    # getError: Modified from VPIxx example code
+    ################################################################
+    def getError(self):
+        """
+        Gets any error from the DataPixx device and prints out the message
+        
+        Will return 0 if no error or the error number if there is an error
+
+        """
+        try:
+            hasError = False
+            # get error
+            error = self.dp.DPxGetError()
+            if error != "DPX_SUCCESS":
+                errorStr = self.dp.DPxGetErrorString()
+                pglMessages.warning(f"(pglDataPixx:getError) DataPixx error {error}: {errorStr}")
+                hasError = True
+            # clear error
+            self.dp.DPxClearError()
+
+            # detect 5V fault            
+            if self.dp.DPxIs5VFault():
+                pglMessages.message("5V fault detected.")
+                hasError = True
+            
+            
+        except Exception as e:
+            pglMessages.warning(f"(pglDataPixx:getError) Could not get error state: {e}")
+        
+        return hasError
+        
+    ################################################################
 ###################################
 # DataPixx device
 ###################################
@@ -268,43 +324,6 @@ class pglDataPixx(pglDataPixxBase):
 
         print("(pglDataPixx:enableButtonSchedules) DataPixx digital output setup complete.")
 
-
-    ################################################################
-    # getError: Modified from VPIxx example code
-    ################################################################
-    def getError(self):
-        """
-        Gets any error from the DataPixx device and prints out the message
-        
-        Will return 0 if no error or the error number if there is an error
-
-        """
-        if self.device is None or self.currentStatus == -1:
-            print("(pglDataPixx:getError) DataPixx device is not initialized.")
-            return
-        try:
-            from pypixxlib import _libdpx as dp
-        except ImportError:
-            print("(pglDataPixx:getError) pypixxlib is not installed. Please install it to use DataPixx error handling.")
-            return
-
-        try:
-            # get error
-            errorNum = dp.DPxGetError()
-            if errorNum != 0:
-                errorStr = dp.DPxGetErrorString()
-                print(f"(pglDataPixx:getError) DataPixx error {errorNum}: {errorStr}")
-
-            # clear error
-            dp.DPxClearError()
-            print("(pglDataPixx:getError) Error state cleared.")
-            
-            if dp.DPxIs5VFault(): print("(pglDataPixx:getError) 5V fault detected.")
-            
-            
-        except Exception as e:
-            print(f"(pglDataPixx:getError) Could not get error state: {e}")
-    ################################################################
     # enableButtonSchedules: Modified from VPIxx example code
     ################################################################
     def enableButtonSchedules(self, buttonMap = None, pulseWidth=50):
@@ -681,7 +700,7 @@ class pglEventResponsePixx(pglEvent):
 ###################################
 # Use datapixx as Digital IO
 ###################################
-class pglDataPixxDigitalIODevice(pglDigitalIODevice):
+class pglDataPixxDigitalIODevice(pglDigitalIODevice, pglDataPixxBase):
     '''
     send digital pulses with DataPixx
     '''
@@ -690,7 +709,7 @@ class pglDataPixxDigitalIODevice(pglDigitalIODevice):
         Init
         '''
         # initialize super
-        super().__init__()
+        super().__init__(deviceType="DataPixxDigitalIO")
 
         # no configured triggers
         self.triggers = None
