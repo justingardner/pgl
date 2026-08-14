@@ -434,6 +434,9 @@ class pglImageDatabase(pglTraitSettings):
             
             # parse filesystem
             self.filesystem, self.fullDataPath, self.filesystemPrefix = pglBase.validateFilesystem(filesystem, dataPath)
+            if not self.filesystem:
+                pglMessages.message("Could not resolve path to images")
+                return
             
             # look for images in directory
             for f in self.filesystem.ls(self.fullDataPath, detail=True):
@@ -487,6 +490,7 @@ class pglImageDatabase(pglTraitSettings):
 class pglImageDatabaseNSD(pglImageDatabase):
     def __init__(self, dataPath=None, filesystem=None):
         super().__init__(dataPath,filesystem)
+        if not self.filesystem: return
         if dataPath is None: return
         # now make a set of the filenames that we loaded
         filenames = [image.name for image in self.images]
