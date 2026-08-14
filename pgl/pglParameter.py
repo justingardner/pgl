@@ -30,13 +30,16 @@ class pglParameter:
     '''
     Class representing a parameter in the experiment.
     '''
-    def __init__(self, name: str, validValues: list|tuple|np.ndarray, description: str="", randomSeed=None):
+    def __init__(self, name: str, validValues: list|tuple|np.ndarray, description: str="", blankEvery=None, randomSeed=None):
         '''
         Initialize the parameter.
         
         Args:
             name (str): The name of the parameter.
             validValues (list, optional): A list of valid values for the parameter. 
+            blankEvery (int): Insert a blank every n trials. For example, if set to 5 then 
+                in every 5 trials (randomly) you will have one blank (value set to None)
+                defaults to None which inserts on blanks
             description (str, optional): Description string describing the parameter.
         '''
         # initialize state, data, and settings
@@ -73,6 +76,12 @@ class pglParameter:
         # initialize random number generation
         self.setRandomSeed(randomSeed)
 
+        # set blankEvery
+        if blankEvery:
+            self.settings.blankEvery = blankEvery
+            self.state.currentTrialInBlankBlock = -1
+            self.setCurrentBlankTrial()
+        
     def __repr__(self):
         return f"pglParameter(name={self.settings.name}, validValues={self.settings.validValues}, description={self.settings.description})"
 
@@ -85,6 +94,9 @@ class pglParameter:
 
         # display full string
         return f"{description}{self.settings.name}: {self.settings.validValues}"
+
+    def setCurrentBlankTrial(self):
+        self.state.currentBlankTrial = self._rng.integers(0, self.settings.blankEvery)
 
     def setRandomSeed(self, randomSeed=None):
         '''
@@ -105,10 +117,31 @@ class pglParameter:
         # increment trial number
         self.state.currentTrial += 1
         self.state.currentTrialInBlock += 1
-        
+
         # check if we need to start a new block
         if self.state.blockNum == -1 or self.state.currentTrialInBlock >= self.data.blockLengths[self.state.blockNum]:
             self.startBlock()
+        
+        # deal with blanks, which can happen every (blankEvery) trials
+        if self.settings.blankEvery:
+            # update what trial in the blank cycle we are in
+            self.state.currentTrialInBlankBlock += 1
+            
+            # if we are past the end of the block, then reset the block
+            if self.state.currentTrialInBlankBlock >= self.settings.blankEvery:
+                self.state.currentTrialInBlankBlock = 0
+                # and reset which trial is the blank one
+                self.setCurrentBlankTrial()
+            
+            # see if this is the blank trial
+            if self.state.currentBlankTrial == self.state.currentTrialInBlankBlock:
+                # save trial number in data
+                self.data.blankTrials.append(self.state.currentTrial)
+                # reset currentTrialInBlock, since we are not doing a blank and not advancing in block
+                self.state.currentTrialInBlock -= 1
+                # if so, set the parameters to None and return
+                paramNames = self.data.parameterNames[self.state.blockNum]
+                return dict.fromkeys(paramNames)     
 
         # get parameter values for this trial
         paramNames = self.data.parameterNames[self.state.blockNum]
@@ -162,6 +195,9 @@ class pglParameter:
         #print values for each block
         for blockNum, (paramNames, parameterBlock) in enumerate(zip(self.data.parameterNames, self.data.parameterBlocks)):
             print(f"Block {blockNum+1}: {len(parameterBlock)} trials randomized over: {paramNames}")
+            
+        if self.settings.blankEvery:
+            print(f"BlankTrials: {self.data.blankTrials}")
      
     def save(self, parameterDir='.', filesystem=None):
         '''
@@ -312,7 +348,7 @@ class pglParameterBatch(pglParameter):
     ...
     NOTE: This is designed to work with pglParameterNestedBlock, but not for pglParameterBlock
     '''
-    def __init__(self, name: str, validValues: list|tuple|np.ndarray, batchSize: int, description: str="", randomSeed=None):
+    def __init__(self, name: str, validValues: list|tuple|np.ndarray, batchSize: int, description: str="", blankEvery=None, randomSeed=None):
         '''
         Initialize the parameter.
         
@@ -327,12 +363,13 @@ class pglParameterBatch(pglParameter):
         self.settings = pglParameterSettingsBatch()
         
         # call super init
-        super().__init__(name=name, validValues=validValues, description=description, randomSeed=randomSeed)
+        super().__init__(name=name, validValues=validValues, description=description, blankEvery=blankEvery, randomSeed=randomSeed)
 
         # validate the batchSize
         self.settings.batchSize = batchSize
         if len(validValues) % batchSize != 0:
-            raise ValueError(f"(pglParameterBatch) ❌ Error: batchSize ({batchSize}) must evenly divide the number of validValues ({len(validValues)}).")
+            pglMessages.warning(f"batchSize ({batchSize}) must evenly divide the number of validValues ({len(validValues)})")
+            raise ValueError()
 
     def getParameterBlock(self):
         '''
@@ -364,7 +401,7 @@ class pglParameterBlock(pglParameter):
     This is a subclass of pglParameter which allows you to group
     multiple parameters together into a single block.
     '''
-    def __init__(self, parameters: list, name: str="", description: str="", randomSeed=None):
+    def __init__(self, parameters: list, name: str="", description: str="", blankEvery=None, randomSeed=None):
         '''
         Initialize the parameter block.
         
@@ -392,7 +429,7 @@ class pglParameterBlock(pglParameter):
             name = "_".join(self.settings.parameterNames)
             
         # call super init
-        super().__init__(name=name, validValues=allParameterValues,description=description,randomSeed=randomSeed)
+        super().__init__(name=name, validValues=allParameterValues,description=description,blankEvery=blankEvery, randomSeed=randomSeed)
         
     def getParameterBlock(self):
         '''
@@ -478,7 +515,7 @@ class pglParameterNestedBlock(pglParameterBlock):
     Note how every 3 trials param1 will go through all of its values. Every 6 trials
     each value of param1 will see each value of param2    
     '''
-    def __init__(self, parameters: list, name: str="", description: str="", randomSeed=None):
+    def __init__(self, parameters: list, name: str="", description: str="", blankEvery=None, randomSeed=None):
         # validate parameters, in particular the parameters can only include pglParameterBatch
         # if it is in the last place of the list 
         for i, p in enumerate(parameters):
@@ -486,7 +523,7 @@ class pglParameterNestedBlock(pglParameterBlock):
                 raise TypeError(f"(pglParameterNestedBlock) ❌ Error: pglParameterBatch can only be the last parameter in the list, but found one at position {i}.")
         
         # init using super
-        super().__init__(parameters=parameters, name=name, description=description, randomSeed=randomSeed)
+        super().__init__(parameters=parameters, name=name, description=description, blankEvery=blankEvery, randomSeed=randomSeed)
         
     def getParameterBlock(self):
         # recursive function used to build the nested blocks
@@ -532,6 +569,7 @@ class pglParameterSettings(pglSerialize):
     validValues: List = field(default_factory=list)
     description: str = ""
     randomSeed: int = 0
+    blankEvery: int | None = None
 
 @dataclass
 class pglParameterSettingsBatch(pglParameterSettings):
@@ -551,6 +589,7 @@ class pglParameterData(pglSerialize):
     parameterNames: List[List[str]] = field(default_factory=list)
     parameterBlocks: List[List[Tuple]] = field(default_factory=list)
     blockLengths: List[int] = field(default_factory=list)
+    blankTrials: List[int] = field(default_factory=list)
     
     def __repr__(self):
         return f"pglParameterData({len(self.parameterBlocks)} blocks, {sum(self.blockLengths)} total trials)"        
@@ -564,3 +603,5 @@ class pglParameterState(pglSerialize):
     currentTrialInBlock: int = -1
     blockNum: int = -1
     randomNumberGeneratorState: int = 0
+    currentTrialInBlankEvery = -1
+    currentBlankTrial = -1
