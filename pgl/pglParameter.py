@@ -30,16 +30,15 @@ class pglParameter:
     '''
     Class representing a parameter in the experiment.
     '''
-    def __init__(self, name: str, validValues: list|tuple|np.ndarray, description: str="", blankEvery=None, randomSeed=None):
+    def __init__(self, name: str, validValues: list|tuple|np.ndarray, description: str="", catchTrialEvery=None, randomSeed=None):
         '''
         Initialize the parameter.
         
         Args:
             name (str): The name of the parameter.
             validValues (list, optional): A list of valid values for the parameter. 
-            blankEvery (int): Insert a blank every n trials. For example, if set to 5 then 
-                in every 5 trials (randomly) you will have one blank (value set to None)
-                defaults to None which inserts on blanks
+            catchTrialEvery (int): Inserts a None every n trials if set to an int.
+                E.g. catchTrialEvery=5 will randomly return a None every 5 trials 
             description (str, optional): Description string describing the parameter.
         '''
         # initialize state, data, and settings
@@ -76,11 +75,11 @@ class pglParameter:
         # initialize random number generation
         self.setRandomSeed(randomSeed)
 
-        # set blankEvery
-        if blankEvery:
-            self.settings.blankEvery = blankEvery
-            self.state.currentTrialInBlankBlock = -1
-            self.setCurrentBlankTrial()
+        # set catchTrialEvery
+        if catchTrialEvery:
+            self.settings.catchTrialEvery = catchTrialEvery
+            self.state.currentTrialInCatchTrialBlock = -1
+            self.setCurrentCatchTrial()
         
     def __repr__(self):
         return f"pglParameter(name={self.settings.name}, validValues={self.settings.validValues}, description={self.settings.description})"
@@ -95,8 +94,8 @@ class pglParameter:
         # display full string
         return f"{description}{self.settings.name}: {self.settings.validValues}"
 
-    def setCurrentBlankTrial(self):
-        self.state.currentBlankTrial = self._rng.integers(0, self.settings.blankEvery)
+    def setCurrentCatchTrial(self):
+        self.state.currentCatchTrial = self._rng.integers(0, self.settings.catchTrialEvery)
 
     def setRandomSeed(self, randomSeed=None):
         '''
@@ -122,22 +121,23 @@ class pglParameter:
         if self.state.blockNum == -1 or self.state.currentTrialInBlock >= self.data.blockLengths[self.state.blockNum]:
             self.startBlock()
         
-        # deal with blanks, which can happen every (blankEvery) trials
-        if self.settings.blankEvery:
+        # deal with catchTrials, which can happen every (catchTrialEvery) trials
+        if self.settings.catchTrialEvery:
             # update what trial in the blank cycle we are in
-            self.state.currentTrialInBlankBlock += 1
+            self.state.currentTrialInCatchTrialBlock += 1
             
             # if we are past the end of the block, then reset the block
-            if self.state.currentTrialInBlankBlock >= self.settings.blankEvery:
-                self.state.currentTrialInBlankBlock = 0
+            if self.state.currentTrialInCatchTrialBlock >= self.settings.catchTrialEvery:
+                self.state.currentTrialInCatchTrialBlock = 0
                 # and reset which trial is the blank one
-                self.setCurrentBlankTrial()
+                self.setCurrentCatchTrial()
             
             # see if this is the blank trial
-            if self.state.currentBlankTrial == self.state.currentTrialInBlankBlock:
+            if self.state.currentCatchTrial == self.state.currentTrialInCatchTrialBlock:
                 # save trial number in data
-                self.data.blankTrials.append(self.state.currentTrial)
-                # reset currentTrialInBlock, since we are not doing a blank and not advancing in block
+                self.data.catchTrials.append(self.state.currentTrial)
+                # reset currentTrialInBlock, since we are adding a blank and so
+                # we should not advance in block
                 self.state.currentTrialInBlock -= 1
                 # if so, set the parameters to None and return
                 paramNames = self.data.parameterNames[self.state.blockNum]
@@ -196,8 +196,8 @@ class pglParameter:
         for blockNum, (paramNames, parameterBlock) in enumerate(zip(self.data.parameterNames, self.data.parameterBlocks)):
             print(f"Block {blockNum+1}: {len(parameterBlock)} trials randomized over: {paramNames}")
             
-        if self.settings.blankEvery:
-            print(f"BlankTrials: {self.data.blankTrials}")
+        if self.settings.catchTrialEvery:
+            print(f"Catch trials: {self.data.catchTrials}")
      
     def save(self, parameterDir='.', filesystem=None):
         '''
@@ -347,8 +347,16 @@ class pglParameterBatch(pglParameter):
     trial 3: [8,5,6]
     ...
     NOTE: This is designed to work with pglParameterNestedBlock, but not for pglParameterBlock
+    
+    catchTrialEvery:
+        Inserts a None at a random position every N parameter trials. 
+        For pglParameterBatch, this can result in a None within a batch.
+
+    catchBatchEvery:
+        Returns an entire None batch every N batches.
+        Does not consume any parameter values.
     '''
-    def __init__(self, name: str, validValues: list|tuple|np.ndarray, batchSize: int, description: str="", blankEvery=None, randomSeed=None):
+    def __init__(self, name: str, validValues: list|tuple|np.ndarray, batchSize: int, description: str="", catchTrialEvery=None, catchBatchEvery=None, randomSeed=None):
         '''
         Initialize the parameter.
         
@@ -363,34 +371,43 @@ class pglParameterBatch(pglParameter):
         self.settings = pglParameterSettingsBatch()
         
         # call super init
-        super().__init__(name=name, validValues=validValues, description=description, blankEvery=blankEvery, randomSeed=randomSeed)
+        super().__init__(name=name, validValues=validValues, description=description, catchTrialEvery=catchTrialEvery, randomSeed=randomSeed)
 
         # validate the batchSize
         self.settings.batchSize = batchSize
-        if len(validValues) % batchSize != 0:
-            pglMessages.warning(f"batchSize ({batchSize}) must evenly divide the number of validValues ({len(validValues)})")
-            raise ValueError()
+        self.settings.catchBatchEvery = catchBatchEvery
+        if catchBatchEvery:
+            self.state.currentBatchInCatchBlock = -1
+            self.setCurrentCatchBatch()
 
-    def getParameterBlock(self):
+    def setCurrentCatchBatch(self):
+        self.state.currentCatchBatch = self._rng.integers(0, self.settings.catchBatchEvery)
+
+    def get(self):
         '''
-        Get a set of parameters to run over, will
-        produce a random ordering of that parameter
-        in batches of batchSize values per trial.
+        get returns a batch of parameters
         '''
-        paramNames = [self.settings.name]
+        paramName = self.settings.name
+        batch = []
         
-        # shuffle the valid values
-        parameterBlock = list(self.settings.validValues)
-        self._rng.shuffle(parameterBlock)
-        
-        # split into batches of batchSize
-        batches = [tuple(parameterBlock[i:i+self.settings.batchSize]) 
-                for i in range(0, len(parameterBlock), self.settings.batchSize)]
-        
-        # wrap in list of tuples to be compatible with other parameter blocks
-        batches = [(b,) for b in batches]
-        
-        return (paramNames, batches)        
+        if self.settings.catchBatchEvery:
+            # update where we are in the catch block
+            self.state.currentBatchInCatchBlock += 1
+            if self.state.currentBatchInCatchBlock >= self.settings.catchBatchEvery:
+                self.state.currentBatchInCatchBlock = 0
+                # get a new random catch batch
+                self.setCurrentCatchBatch()
+
+            # if this is the catch batch
+            if self.state.currentBatchInCatchBlock == self.state.currentCatchBatch:
+                # this is a catch batch so return None
+                return {paramName: None}
+
+        for _ in range(self.settings.batchSize):
+            result = super().get()
+            batch.append(result[paramName])
+
+        return {paramName: tuple(batch)}
         
 ##########################
 # Parameter block class
@@ -569,7 +586,8 @@ class pglParameterSettings(pglSerialize):
     validValues: List = field(default_factory=list)
     description: str = ""
     randomSeed: int = 0
-    blankEvery: int | None = None
+    catchTrialEvery: int | None = None
+    catchBatchEvery: int | None = None
 
 @dataclass
 class pglParameterSettingsBatch(pglParameterSettings):
@@ -589,7 +607,7 @@ class pglParameterData(pglSerialize):
     parameterNames: List[List[str]] = field(default_factory=list)
     parameterBlocks: List[List[Tuple]] = field(default_factory=list)
     blockLengths: List[int] = field(default_factory=list)
-    blankTrials: List[int] = field(default_factory=list)
+    catchTrials: List[int] = field(default_factory=list)
     
     def __repr__(self):
         return f"pglParameterData({len(self.parameterBlocks)} blocks, {sum(self.blockLengths)} total trials)"        
@@ -603,5 +621,7 @@ class pglParameterState(pglSerialize):
     currentTrialInBlock: int = -1
     blockNum: int = -1
     randomNumberGeneratorState: int = 0
-    currentTrialInBlankEvery = -1
-    currentBlankTrial = -1
+    currentTrialInCatchTrialBlock = -1
+    currentCatchTrial = -1
+    currentBatchInCatchBlock  = -1
+    currentCatchBatch = -1
