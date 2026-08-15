@@ -30,7 +30,16 @@ def pglGetAllSubclasses(baseClass):
     allSubclasses = {}
 
     def addName(name, cls):
+        # check for duplicate class
         if name in allSubclasses:
+            # if it is in the same module, then its most likely just a stale jupyter class,
+            # so overwrite the old one and move on
+            existing = allSubclasses[name]
+            if cls.__module__ == existing.__module__:
+                allSubclasses[name] = cls
+                return
+
+            # different modules, more likely to be real name clash, so warn and ignore
             pglMessages.warning(
                 f"Duplicate serialization name '{name}' "
                 f"for {cls.__name__} and {allSubclasses[name].__name__}", level=0
