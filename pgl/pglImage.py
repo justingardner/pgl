@@ -435,9 +435,13 @@ class pglImageDatabase(pglTraitSettings):
             # parse filesystem
             self.filesystem, self.fullDataPath, self.filesystemPrefix = pglBase.validateFilesystem(filesystem, dataPath)
             if not self.filesystem:
-                pglMessages.message("Could not resolve path to images")
+                pglMessages.warning("Could not resolve path to images")
                 return
             
+            if not self.filesystem.exists(self.fullDataPath):
+                pglMessages.warning("Could not find path {self.fullDataPath}")
+                return
+                
             # look for images in directory
             for f in self.filesystem.ls(self.fullDataPath, detail=True):
                 # only open files
@@ -506,7 +510,7 @@ class pglImageDatabaseWithManifest(pglImageDatabase):
                     manifestFilenames = dataFrame[filenameColumn]
                     manifestIndex = dataFrame[indexColumn]
                 else:
-                    pglMessages.message("Could not find {filenameColumn} and {indexColumn} in {csvFilename}. Using alphabetical sort order")
+                    pglMessages.message(f"Could not find {filenameColumn} and {indexColumn} in {csvFilename}. Using alphabetical sort order")
                     return                
                 manifestCaption = dataFrame.get(captionColumn)
                 
