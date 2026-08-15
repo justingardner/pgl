@@ -487,8 +487,8 @@ class pglImageDatabase(pglTraitSettings):
             print(f"{iImage}: {image.name} ",end="")        
             #image.print()
             
-class pglImageDatabaseNSD(pglImageDatabase):
-    def __init__(self, dataPath=None, filesystem=None):
+class pglImageDatabaseWithManifest(pglImageDatabase):
+    def __init__(self, dataPath=None, filesystem=None, filenameColumn="filename", indexColumn="index", captionColumn="caption_1"):
         super().__init__(dataPath,filesystem)
         if not self.filesystem: return
         if dataPath is None: return
@@ -500,10 +500,16 @@ class pglImageDatabaseNSD(pglImageDatabase):
             try:
                 # dataFrame for csv file
                 dataFrame = pd.read_csv(self.filesystem.open(csvFilename))
+
                 # check for specific columns that we wish to use
-                manifestFilenames = dataFrame["filename"]
-                manifestIndex = dataFrame["index"]
-                manifestCaption = dataFrame["caption_1"]
+                if filenameColumn in dataFrame.columns and indexColumn in dataFrame.columns:
+                    manifestFilenames = dataFrame[filenameColumn]
+                    manifestIndex = dataFrame[indexColumn]
+                else:
+                    pglMessages.message("Could not find {filenameColumn} and {indexColumn} in {csvFilename}. Using alphabetical sort order")
+                    return                
+                manifestCaption = dataFrame.get(captionColumn)
+                
                 # see if we have all images in the manifest
                 if set(manifestFilenames) == set(filenames):
                     # good, let's keep the dataFrame
@@ -515,9 +521,10 @@ class pglImageDatabaseNSD(pglImageDatabase):
                     self.images.sort(key=lambda x: indexByFilename[x.name])
                     
                     # set the captions of the images according to the manifest
-                    captionByFilename = dict(zip(manifestFilenames, manifestCaption))
-                    for image in self.images:
-                        image.caption = captionByFilename[image.name]
+                    if manifestCaption is not None: 
+                        captionByFilename = dict(zip(manifestFilenames, manifestCaption))
+                        for image in self.images:
+                            image.caption = captionByFilename[image.name]
                     
                     pglMessages.message("Sorted and set captions from manifest")                    
             except Exception as e:
