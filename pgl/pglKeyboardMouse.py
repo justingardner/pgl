@@ -30,7 +30,12 @@ class pglKeyboardMouse(pglDevice):
         super().__init__(deviceType="pglKeyboard")
 
         if not self.checkAccessibilityPermission():
-            pglMessages.warning(pglMessages.accessibilityWarningMessage)
+            warningMessage = "Accessibility permission not granted for keyboard/mouse access.\n" + \
+                "On macOS, go to System Preferences -> Security & Privacy -> Privacy -> Accessibility\n" + \
+                "and add your terminal application (e.g. Terminal, iTerm, etc) to the list of apps allowed to control your computer.\n" + \
+                "If you are running VS Code and it already has permissions granted, try running directly from a terminal with:\n" + \
+                "    /Applications/Visual\\ Studio\\ Code.app/Contents/MacOS/Code"
+            pglMessages.warning(warningMessage)
             return
 
         self.start(eatKeys)
