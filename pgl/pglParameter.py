@@ -418,7 +418,7 @@ class pglParameterBlock(pglParameter):
     This is a subclass of pglParameter which allows you to group
     multiple parameters together into a single block.
     '''
-    def __init__(self, parameters: list, name: str="", description: str="", blankEvery=None, randomSeed=None):
+    def __init__(self, parameters: list, name: str="", description: str="", catchTrialEvery=None, randomSeed=None):
         '''
         Initialize the parameter block.
         
@@ -446,7 +446,7 @@ class pglParameterBlock(pglParameter):
             name = "_".join(self.settings.parameterNames)
             
         # call super init
-        super().__init__(name=name, validValues=allParameterValues,description=description,blankEvery=blankEvery, randomSeed=randomSeed)
+        super().__init__(name=name, validValues=allParameterValues,description=description,catchTrialEvery=catchTrialEvery, randomSeed=randomSeed)
         
     def getParameterBlock(self):
         '''
@@ -532,7 +532,7 @@ class pglParameterNestedBlock(pglParameterBlock):
     Note how every 3 trials param1 will go through all of its values. Every 6 trials
     each value of param1 will see each value of param2    
     '''
-    def __init__(self, parameters: list, name: str="", description: str="", blankEvery=None, randomSeed=None):
+    def __init__(self, parameters: list, name: str="", description: str="", cathcTrialEvery=None, randomSeed=None):
         # validate parameters, in particular the parameters can only include pglParameterBatch
         # if it is in the last place of the list 
         for i, p in enumerate(parameters):
@@ -540,7 +540,7 @@ class pglParameterNestedBlock(pglParameterBlock):
                 raise TypeError(f"(pglParameterNestedBlock) ❌ Error: pglParameterBatch can only be the last parameter in the list, but found one at position {i}.")
         
         # init using super
-        super().__init__(parameters=parameters, name=name, description=description, blankEvery=blankEvery, randomSeed=randomSeed)
+        super().__init__(parameters=parameters, name=name, description=description, catchTrialEvery=catchTrialEvery, randomSeed=randomSeed)
         
     def getParameterBlock(self):
         # recursive function used to build the nested blocks
