@@ -437,11 +437,7 @@ class pglImageDatabase(pglTraitSettings):
             if not self.filesystem:
                 pglMessages.warning("Could not resolve path to images")
                 return
-            
-            if not self.filesystem.exists(self.fullDataPath):
-                pglMessages.warning("Could not find path {self.fullDataPath}")
-                return
-                
+                            
             # look for images in directory
             for f in self.filesystem.ls(self.fullDataPath, detail=True):
                 # only open files
@@ -460,7 +456,7 @@ class pglImageDatabase(pglTraitSettings):
             self.images.sort(key=lambda x: x.name.lower())
             
             # and let the world know
-            pglMessages.message(f"Found {len(self.images)} image files")
+            pglMessages.message(f"Found {len(self.images)} image files in {os.path.basename(dataPath)}")
             
     def preloadImage(self,imageNum):
         '''
