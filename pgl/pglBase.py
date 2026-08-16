@@ -763,145 +763,87 @@ class pglBase:
     # # validate filesystem: used for fsspec 
     ################################################################
     @staticmethod
-    def validateFilesystem(filesystem=None, dataPath=None, filesystemPrefix=""):
+    def validateFilesystem(filesystem=None, dataPath=None, filesystemPrefix="", ensureExists=False):
         '''
-        Return a valid fsspec filesystem and (possibly rewritten) data path.
+        Return a valid fsspec filesystem and data path.
 
-        This normalises the ways a filesystem can be specified:
-
-        1. Explicitly, by passing an fsspec AbstractFileSystem instance as
-            `filesystem`. In that case it is validated and returned unchanged,
-            along with `dataPath` untouched.
-
-        2. Implicitly, by encoding a protocol in `dataPath` itself (e.g.
-            'ssh://host/path' or 'https://host/file'). When `filesystem` is
-            None and `dataPath` carries such a qualifier, the protocol/location
-            is extracted, a matching filesystem is constructed, and the bare
-            path (with the protocol part stripped) is returned.
-
-        3. Implicitly, by supplying `filesystemPrefix` (e.g.
-            'ssh://host'). When `dataPath` has no embedded prefix, the supplied
-            prefix is prepended before inference. If `dataPath` already carries
-            a prefix and it differs from `filesystemPrefix`, the passed-in
-            `filesystemPrefix` is preferred and a level-one warning is issued.
-
-        If neither a filesystem nor a protocol qualifier is supplied, a plain
-        local ("file") filesystem is returned and `dataPath` is left as-is.
-
-        Args:
-            filesystem (fsspec.AbstractFileSystem, optional): An existing
-                fsspec filesystem instance. If provided, it is validated and
-                returned unchanged. Defaults to None.
-            dataPath (str or Path, optional): The path to the data. May include
-                a protocol qualifier (e.g. 'ssh://', 'https://') which, when
-                `filesystem` is None, is used to infer the filesystem. Defaults
-                to None.
-            filesystemPrefix (str, optional): A protocol qualifier (e.g.
-                'ssh://host') to apply to `dataPath` when it does not already
-                carry one. If both are present and disagree, this value wins and
-                a level-one warning is logged. Defaults to None.
-
-        Returns:
-            tuple: (filesystem, dataPath, protocolPrefix) where
-                    filesystem     : a valid fsspec AbstractFileSystem (or None on error)
-                    dataPath       : the path with any protocol qualifier removed
-                    protocolPrefix : the protocol qualifier that was stripped, including
-                                     the '://' (e.g. 'ssh://cointreau.stanford.edu'), or
-                                     "" if there was none (plain local path). Reattaching
-                                     protocolPrefix + dataPath reproduces the original URL.
-        
+        Filesystem selection priority:
+            1. Explicitly supplied filesystem
+            2. Explicitly supplied filesystemPrefix
+            3. Prefix embedded in dataPath
+            4. Local filesystem ("file")
         '''
+
         import fsspec
         from fsspec.core import url_to_fs
         from fsspec import AbstractFileSystem
 
-        # Case 1: a filesystem was explicitly provided -> validate and return
-        if filesystem is not None:
-            if not isinstance(filesystem, AbstractFileSystem):
-                pglMessages.warning(
-                    f"(validateFilesystem) Expected an fsspec AbstractFileSystem, "
-                    f"got {type(filesystem).__name__}.")
-                return None, dataPath, filesystemPrefix
-            return filesystem, dataPath, filesystemPrefix
+        # ------------------------------------------------------------
+        # 1. Normalize dataPath and separate any embedded prefix
+        # ------------------------------------------------------------
 
-        # Case 2: no filesystem given -> infer from dataPath if possible.
-        # No path at all: fall back to a plain local filesystem.
-        if dataPath is None:
-            return fsspec.filesystem("file"), dataPath, filesystemPrefix
+        if dataPath is None or dataPath == "":
+            dataPath = ""
+            dataPathPrefix = ""
 
-        dataPathString = str(dataPath)
+        else:
+            dataPath = str(dataPath)
 
-        # Reconcile any passed-in filesystemPrefix with a prefix already
-        # embedded in dataPath.
-        if filesystemPrefix:
-            # Normalise the supplied prefix so it ends in '://' at least once.
-            suppliedPrefix = str(filesystemPrefix)
-
-            if "://" in dataPathString:
-                # dataPath already carries a prefix -> extract and compare.
-                embeddedProtocol, _, embeddedRest = dataPathString.partition("://")
-                embeddedAuthority = embeddedRest.split("/", 1)[0]
-                embeddedPrefix = f"{embeddedProtocol}://{embeddedAuthority}"
-
-                # Compare against the supplied prefix (strip a trailing '/').
-                if embeddedPrefix.rstrip("/") != suppliedPrefix.rstrip("/"):
-                    pglMessages.warning(
-                        f"(validateFilesystem) dataPath prefix '{embeddedPrefix}' "
-                        f"differs from supplied filesystemPrefix '{suppliedPrefix}'; "
-                        f"preferring the supplied filesystemPrefix.", level=1)
-                    # Rebuild dataPath using the supplied prefix, keeping the
-                    # bare path portion after the embedded authority.
-                    barePath = embeddedRest[len(embeddedAuthority):]
-                    dataPathString = f"{suppliedPrefix.rstrip('/')}{barePath}"
+            if "://" in dataPath:
+                protocol, _, rest = dataPath.partition("://")
+                authority = rest.split("/", 1)[0]
+                dataPathPrefix = f"{protocol}://{authority}"
+                dataPath = rest[len(authority):]
             else:
-                # dataPath has no embedded prefix -> tack the supplied one on.
-                separator = "" if suppliedPrefix.endswith("/") else "/"
-                if dataPathString.startswith("/"):
-                    separator = ""
-                dataPathString = f"{suppliedPrefix.rstrip('/')}/" \
-                                 f"{dataPathString.lstrip('/')}"
+                dataPathPrefix = ""
 
-        # Detect a protocol qualifier such as 'ssh://', 'https://', 's3://'.
-        # A bare local path (or Windows drive like 'C:\...') has no '://'.
-        if "://" not in dataPathString:
-            return fsspec.filesystem("file"), dataPath, filesystemPrefix
+        # ------------------------------------------------------------
+        # 2. Determine filesystem
+        # ------------------------------------------------------------
 
-        # url_to_fs builds the filesystem and returns the protocol-stripped path.
+        if filesystem is not None:
+
+            if not isinstance(filesystem, AbstractFileSystem):
+                pglMessages.warning(f"Expected an fsspec AbstractFileSystem, got {type(filesystem).__name__}.")
+                return None, dataPath, ""
+
+            filesystem = filesystem
+            filesystemPrefix = filesystemPrefix or dataPathPrefix
+
+        elif filesystemPrefix:
+
+            filesystemPrefix = str(filesystemPrefix)
+            try:
+                filesystem, _ = url_to_fs(f"{filesystemPrefix.rstrip('/')}/{dataPath.lstrip('/')}")
+            except Exception as e:
+                pglMessages.warning(f"Error accessing filesystem {filesystemPrefix}: {e}")
+
+        elif dataPathPrefix:
+
+            filesystemPrefix = dataPathPrefix
+            try:
+                filesystem, _ = url_to_fs(f"{filesystemPrefix.rstrip('/')}/{dataPath.lstrip('/')}")
+            except Exception as e:
+                pglMessages.warning(f"Error accessing filesystem {filesystemPrefix}: {e}")
+            
+        else:
+
+            filesystemPrefix = ""
+            filesystem = fsspec.filesystem("file")
+
+        # ------------------------------------------------------------
+        # 3. Validate filesystem and dataPath
+        # ------------------------------------------------------------
         try:
-            fileSystem, strippedPath = url_to_fs(dataPathString)
+            if not filesystem.exists(dataPath):
+                pglMessages.warning(f"{dataPath} does not exist")
+                filesystem = None
         except Exception as e:
-            pglMessages.warning(
-                f"(validateFilesystem) Could not resolve filesystem for "
-                f"'{dataPathString}': {type(e).__name__}: {e}")
-            return None, dataPath, filesystemPrefix
-
-        ##########################################
-        # # helper for validateFilesystem
-        ##########################################
-        def _extractPrefix(originalUrl, strippedPath):
-            '''
-            Given the original URL and the protocol-stripped path returned by
-            url_to_fs, return the leading prefix such that prefix + strippedPath
-            reconstructs (a normalised form of) the original URL.
-            '''
-            strippedPath = str(strippedPath)
-
-            # Common case: the stripped path is a suffix of the original URL.
-            idx = originalUrl.rfind(strippedPath)
-            if idx > 0:
-                return originalUrl[:idx]
-
-            # Fallback: split on '://' and keep protocol + authority up to the
-            # first '/' of the path.
-            protocol, sep, rest = originalUrl.partition("://")
-            if sep:
-                authority = rest.split("/", 1)[0]     # host[:port]
-                return f"{protocol}://{authority}"
-
-            return ""     
-        
-        return fileSystem, strippedPath, _extractPrefix(dataPathString, strippedPath)
-    ################################################################
+                pglMessages.warning(f"Error accessing {dataPath}: {e}")
+                filesystem = None
+            
+        return filesystem, dataPath, filesystemPrefix
+  ################################################################
     # Clean up open windows (which may be orphaned) and their socket connections
     ################################################################
     def cleanUp(self):
