@@ -18,7 +18,7 @@ from typing import List, Tuple, Dict, Any
 import posixpath
 from .pglMessages import pglMessages
 from .pglBase import pglBase
-
+from .pglSettings import pglStateDataSettings
 import numpy as np
 import itertools
 import random
@@ -26,7 +26,7 @@ import random
 #############
 # Parameter class
 #############
-class pglParameter:
+class pglParameter(pglStateDataSettings):
     '''
     Class representing a parameter in the experiment.
     '''
@@ -199,33 +199,15 @@ class pglParameter:
         if self.settings.catchTrialEvery:
             print(f"Catch trials: {self.data.catchTrials}")
      
-    def save(self, parameterDir='.', filesystem=None):
+    def save(self, dataPath='.', filesystem=None, filesystemPrefix=None):
         '''
         Save the parameter settings, state and data.         
         '''
-        import traceback
-        # validate filesystem
-        filesystem, parameterDir, _ = pglBase.validateFilesystem(filesystem, parameterDir)
-
-        # Create the directory to save data into
-        try:
-            dataDir = posixpath.join(str(parameterDir), self.settings.name)
-            filesystem.makedirs(dataDir, exist_ok=True)
-        except Exception as e:
-            traceback.print_exc()  # Show full traceback
-            print(f"(pglParameter:save) ❌ Could not create data directory {parameterDir}: {e}")
-            return        
-
-        # give user feedback where things are being saved
-        print(f"(pglParameter:save) Saving parameter {self.settings.name} to: {dataDir}")
-        
         # save random number generator state
         self.state.randomNumberGeneratorState = self._rng.bit_generator.state
         
-        # save settings, state and data
-        self.settings.save(dataDir / "settings.json", filesystem=filesystem)
-        self.state.save(dataDir / "state.json", filesystem=filesystem)
-        self.data.save(dataDir / "data.json", filesystem=filesystem)
+        # call parent to save
+        super().save(dataPath=dataPath, filesystem=filesystem, filesystemPrefix=filesystemPrefix)
     
     @classmethod
     def from_file(cls, parameterDir, filesystem=None):

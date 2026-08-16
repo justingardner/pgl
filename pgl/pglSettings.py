@@ -773,7 +773,100 @@ class pglTraitSettings(HasTraits, pglSerialize):
 
         # fallback
         return a == b
+
+class pglStateDataSettings(pglTraitSettings):
+    '''
+    Base class for classes like experiments, parameters, staircases etc which
+    have settings, state and data
+    '''
+    
+    @classmethod
+    def load(cls, dataPath, filesystem=None, filesystemPrefix=None):
+        """Load pglStateDataSettings
+
+        Args:
+            filename (str or Path): Path to the JSON file. May include a protocol
+                qualifier (e.g. 'ssh://...') when `filesystem` is None.
+            filesystem (fsspec.AbstractFileSystem, optional): Filesystem to read
+                through. If None, it is inferred from `filename` (falling back to
+                a local filesystem). Defaults to None.
+            filesystemPrefix (str): 'ssh://' like strings to qualify filename
+
+        Returns:
+            The loaded object, or None if it could not be loaded.
+        """
+        # Validate/resolve filesystem and normalise the path
+        from .pglBase import pglBase
+        filesystem, dataPath, _ = pglBase.validateFilesystem(filesystem=filesystem, dataPath=dataPath, filesystemPrefix=filesystemPrefix)
+        if filesystem is None:
+            pglMessages.warning(f"(pglSerialize) Could not resolve a filesystem for '{dataPath}'")
+            return None
         
+        # call parent class load (i.e. pglSerialize all the traits)
+        obj = super().load(filename=posixpath.join(dataPath, "traits.json"), filesystem=filesystem)
+        if obj is None:
+            pglMessages.warning(f"Could not load traits for: {posixpath.join(dataPath, 'traits.json')}")
+            return None
+        
+        # load settings
+        try:
+            obj.settings = pglTraitSettings.load(filename=posixpath.join(dataPath, "settings.json"), filesystem=filesystem)
+        except Exception as e:
+            pglMessages.warning(f"Could not load settings {posixpath.join(dataPath, 'settings.json')}: {e}")
+        try:
+            obj.state = pglTraitletSettings.load(filename=posixpath.join(dataPath, "state.json"), filesystem=filesystem)
+        except Exception as e:
+            pglMessages.warning(f"Could not load state {posixpath.join(dataPath, 'state.json')}: {e}")
+        try:    
+            obj.data = pglTraitletSettings.load(filename=posixpath.join(dataPath, "data.json"), filesystem=filesystem)
+        except Exception as e:
+            pglMessages.warning(f"Could not load data {posixpath.join(dataPath, 'data.json')}: {e}")
+        return obj
+
+    def save(self, dataPath, filesystem=None, filesystemPrefix=None):
+        '''
+        Save pglStateDataSettings
+
+        Args:
+            filename (str or Path): Path to the JSON file. May include a protocol
+                qualifier (e.g. 'ssh://...') when `filesystem` is None.
+            filesystem (fsspec.AbstractFileSystem, optional): Filesystem to read
+                through. If None, it is inferred from `filename` (falling back to
+                a local filesystem). Defaults to None.
+            filesystemPrefix (str): 'ssh://' like strings to qualify filename
+        '''
+        # Validate/resolve filesystem and normalise the path
+        from .pglBase import pglBase
+        filesystem, dataPath, _ = pglBase.validateFilesystem(filesystem=filesystem, dataPath=dataPath, filesystemPrefix=filesystemPrefix, create=True)
+        if filesystem is None:
+            pglMessages.warning(f"(pglSerialize) Could not resolve a filesystem for '{dataPath}'")
+            return None
+        
+        # call parent class save (i.e. pglSerialize all the traits)
+        super().save(filename=posixpath.join(dataPath, "traits.json"), filesystem=filesystem)
+        
+        # save settings
+        settings = getattr(self, 'settings', None)
+        if settings is None:
+            pglMessages.warning(f"Instance of {type(self).__name__} does not have settings, nothing to save",level=1)
+        else:
+            settings.save(filename=posixpath.join(dataPath, "settings.json"), filesystem=filesystem)
+            
+        # save state
+        state = getattr(self, 'state', None)
+        if state is None:
+            pglMessages.warning(f"Instance of {type(self).__name__} does not have state, nothing to save",level=1)
+        else:
+            state.save(filename=posixpath.join(dataPath, "state.json"), filesystem=filesystem)
+            
+        # save data
+        data = getattr(self, 'data', None)
+        if data is None:
+            pglMessages.warning(f"Instance of {type(self).__name__} does not have data, nothing to save",level=1)
+        else:
+            data.save(filename=posixpath.join(dataPath, "data.json"), filesystem=filesystem)
+            
+    
 ##################################################
 # display Settings 
 ##################################################
@@ -819,13 +912,13 @@ class pglDisplaySettings(pglTraitSettings):
     temporalCalibration = List(Unicode(), hasPlotButton=True, buttonFunction="plotTemporalCalibration", default_value=['None'], help="Which temporal calibration to use")
     
     @classmethod
-    def load(cls, filename, filesystem=None):
+    def load(cls, filename, filesystem=None, filesystemPrefix=None):
         '''
         Load pglDisplaySettings. 
     
         Also loads displays list so that it has up to date display settings
         '''
-        filesystem, filename, _ = pglBase.validateFilesystem(filesystem, filename)
+        filesystem, filename, _ = pglBase.validateFilesystem(filesystem=filesystem, dataPath=filename, filesystemPrefix=filesystemPrefix)
         
         # check if filename exists
         if not filesystem.exists(str(filename)):
@@ -840,7 +933,7 @@ class pglDisplaySettings(pglTraitSettings):
         
         return cls
     
-    def save(self, filename=None, filesystem=None):
+    def save(self, filename=None, filesystem=None, filesystemPrefix=None):
         '''
         save
         
@@ -850,13 +943,7 @@ class pglDisplaySettings(pglTraitSettings):
         # get the filename
         if not filename: filename = self.saveDir()
 
-        # validate filesystem
-        filesystem, filename, _ = pglBase.validateFilesystem(filesystem, filename)
-
-        # Ensure directory exists
-        filesystem.makedirs(posixpath.dirname(filename), exist_ok=True)
- 
-        super().save(filename=filename, filesystem=filesystem)
+        super().save(filename=filename, filesystem=filesystem, filesystemPrefix=filesystemPrefix)
         pglMessages.message(f"Saved display settings to {filename}")
                 
     def saveDir(self):
@@ -1074,7 +1161,7 @@ class pglSettings(pglTraitSettings):
         
         return cls
     
-    def save(self, filename=None, filesystem=None):
+    def save(self, filename=None, filesystem=None, filesystemPrefix=None):
         '''
         save
         
@@ -1084,15 +1171,8 @@ class pglSettings(pglTraitSettings):
         # get the filename
         if not filename: filename = self.saveDir()
 
-        # validate filesystem
-        filesystem, filename, _ = pglBase.validateFilesystem(filesystem, filename)
-
-        # Ensure directory exists
-        filesystem.makedirs(posixpath.dirname(filename), exist_ok=True)
-
-        super().save(filename=filename, filesystem=filesystem)
-        pglMessages.message(f"Saved display settings to {filename}")
-
+        super().save(filename=filename, filesystem=filesystem, filesystemPrefix=filesystemPrefix)
+        pglMessages.message(f"Saved settings to {filename}")
         
     def saveDir(self):
         return pglSettingsManager.getSettingsDir() / f"{pglBase.makeValidFilename(self.name)}.json"

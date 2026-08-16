@@ -18,7 +18,6 @@ import math
 from dataclasses import dataclass, field
 from .pglKeyboardMouse import pglKeyboardMouse
 from pathlib import Path
-from .pglSettings import pglSettings, pglTraitSettings
 from IPython.display import display, HTML
 import ipywidgets as widgets
 from traitlets import Float, TraitError, TraitError, observe, Instance, Int, Unicode, Dict, validate, Bool
@@ -36,7 +35,7 @@ from enum import Enum
 from . import pglTimestamp
 from .pglEyeTracker import pglEyeTracker
 from .pglEyelink import pglEyelink, pglEyelinkData
-from .pglSettings import pglSettingsManager, pglDisplaySettings, pglDisplayModeSettings
+from .pglSettings import pglSettingsManager, pglDisplaySettings, pglDisplayModeSettings, pglTraitSettings, pglStateDataSettings
 from .pglMessages import pglMessages
 import fsspec
 import posixpath
@@ -56,7 +55,7 @@ class Stats:
 ##############################################s
 # Experiment base class
 ##############################################
-class pglExperimentBase(pglTraitSettings):
+class pglExperimentBase(pglStateDataSettings):
     '''
     Base class for pglExperiment which runs experiments
     and pglExperimentAnalysis which is used for loading and
@@ -138,16 +137,19 @@ class pglExperimentBase(pglTraitSettings):
         return True    
     
     @classmethod
-    def getExperimentDir(cls, settings=None, dataPath=None, experimentName=None, subjectID=None, sessionName=None, runName=None, fullDataPath=None, filesystem=None):
+    def getExperimentDir(cls, settings=None, dataPath=None, experimentName=None, subjectID=None, sessionName=None, runName=None, fullDataPath=None, filesystem=None, filesystemPrefix=None):
         '''
         get the directory of the experiment
         
         '''
-        # set filesystem
-        filesystem = filesystem if filesystem is not None else fsspec.filesystem("file")
-        
+        from .pglBase import pglBase
+        if fullDataPath:
+            # validate and return
+            filesystem, fullDataPath, _ = pglBase.validateFilesystem(filesystem=filesystem, dataPath=fullDataPath, filesystemPrefix=filesystemPrefix)
+            return (filesystem, fullDataPath)
+            
         # if not fullDatadir passed in, construct it from arguments
-        if not fullDataPath:
+        elif fullDataPath:
             if not dataPath: 
                 if not settings:
                     # get the default settings
@@ -155,7 +157,12 @@ class pglExperimentBase(pglTraitSettings):
                 if settings:
                     # set dataDir to where settings tells us it is
                     dataPath= settings.dataPath
+            
+            # expand user
             fullDataPath = Path(dataPath).expanduser()
+            
+            # now that we have the start of a path, validate the filesystem
+            filesystem, fullDataPath, _ = pglBase.validateFilesystem(filesystem=filesystem, dataPath=fullDataPath, filesystemPrefix=filesystemPrefix)
             
             # add on experiment name
             if experimentName:
@@ -189,9 +196,10 @@ class pglExperimentBase(pglTraitSettings):
                     pglMessages.warning(f"Run directory {fullDataPath} does not exist")
                     return fullDataPath
                 
-        return Path(fullDataPath)
+        return Path(filesystem, fullDataPath)
 
-    def load(self, settings=None, dataPath=None, experimentName=None, subjectID=None, sessionName=None, runName=None, fullDataPath=None, filesystem=None):
+    @classmethod
+    def load(cls, settings=None, dataPath=None, experimentName=None, subjectID=None, sessionName=None, runName=None, fullDataPath=None, filesystem=None, filesystemPrefix=None):
         '''
         Load the experiment settings, state and data.         
         '''
@@ -200,41 +208,45 @@ class pglExperimentBase(pglTraitSettings):
         self.task = []
 
         # get the experiment directory
-        experimentDir = self.getExperimentDir(settings=settings, dataPath=dataPath, experimentName=experimentName, subjectID=subjectID, sessionName=sessionName, runName=runName, fullDataPath=fullDataPath, filesystem=filesystem)
+        filesystem, experimentPath, filesystemPrefix = self.getExperimentDir(settings=settings, dataPath=dataPath, experimentName=experimentName, subjectID=subjectID, sessionName=sessionName, runName=runName, fullDataPath=fullDataPath, filesystem=filesystem, filesystemPrefix=filesystemPrefix)
+        if filesystem is None:
+            pglMessages.message(f"Could not locate experiment directory")
+            return
         
-        # load the experiment data, settings, and state
-        print(f"(pglExperiment:load) Loading experimentdata from: {experimentDir}")
-        self.data = pglSerialize.load(experimentDir / "data.json")
-        self.settings = pglSerialize.load(experimentDir / "settings.json")
-        self.experimentSettings = pglSerialize.load(experimentDir / "experimentSettings.json")
-        self.state = pglSerialize.load(experimentDir / "state.json")
+        # call parent class to load the experiment data, settings, and state
+        print(f"(pglExperiment:load) Loading experimentdata from: {experimentPath}")
+        obj = super().load(dataPath=experimentPath, filesystem=filesystem,filesystemPrefix=filesystemPrefix)
+        if obj is None:
+            pglMessages.warning(f"Could not load {experimentPath}")
+            return None
+        
+        # load experiment settings
+        obj.experimentSettings = pglSerialize.load(experimentPath / "experimentSettings.json")
+        if obj.experimentSettings is None:
+            pglMessages.warning(f"Could not load experiment settings for {experimentPath}")
+            return None
         
         # load pgl state
-        self.pglState = pglSerialize.load(experimentDir / "pgl.json")
-        
-        # load all the tasks
-        dirList = [d for d in experimentDir.iterdir() if d.is_dir()]
-        dirList = sorted(dirList, key=lambda d: d.name)
-        for i, d in enumerate(dirList, start=1):
-            # get the task directory
-            taskDir = experimentDir / d.name
-            # load the task data
-            task = pglTask()
-            task.load(taskDir)
+        obj.pglState = pglSerialize.load(experimentPath / "pgl.json")
+        if obj.pglSate is None:
+            pglMessages.warning(f"Could not load pgl state for {experimentPath}")
+            return None
             
-            # add the task to the experiment
-            self.addTask(task)
-        
-        # load the eye tracker data
-        if self.settings.eyetracker[0] == "Eyelink":
-            eyeTrackerFilename = selectedDir / f"{self.settings.eyetracker[0].lower()}.asc"
-            self.eyeTrackerData = pglEyelinkData(str(eyeTrackerFilename))
-        elif self.settings.eyetracker[0] == "None":
-            self.eyeTracker = None
-        else:
-            print("(pglExperiment) ❌ Unknown eye tracker type {self.settings.eyetracker[0]}")
-            self.eyeTracker = None
-   
+        # load all the tasks
+        for iTask, taskName in enumerate(obj.experimentSettings.tasks):
+            # get the task directory
+            taskPath = experimentPath / taskName
+            # load the task data
+            task = pglTask.load(dataPath=taskPath)
+            if task is None:
+                pglMessages.warning("Could not load task {taskName}",level=1)
+            else:            
+                # add the task to the experiment
+                obj.addTask(task)
+    
+        # return the created object
+        return obj
+       
     def addTask(self, task):
         '''
         Add a task to the experiment.
@@ -906,35 +918,28 @@ class pglExperiment(pglExperimentBase):
         '''
         # Create the directory to save data into (dataDir/experimentSaveName/subjectID/YYYYMMDD_HHMMSS)
         try:
-            dataDir = Path(self.settings.dataPath).expanduser() / self.experimentSettings.experimentSaveName / self.experimentSettings.subjectID / self.experimentSettings.sessionName / self.experimentSettings.runName
-            dataDir.mkdir(parents=True, exist_ok=True)    
+            dataPath = Path(self.settings.dataPath).expanduser() / self.experimentSettings.experimentSaveName / self.experimentSettings.subjectID / self.experimentSettings.sessionName / self.experimentSettings.runName
+            dataPath.mkdir(parents=True, exist_ok=True)    
         except Exception as e:
-            print(f"(pglExperiment:save) ❌ Could not create data directory {dataDir}: {e}")
+            print(f"(pglExperiment:save) ❌ Could not create data directory {dataPath}: {e}")
             return
         
         # give user feedback where things are being saved
-        print(f"(pglExperiment:save) Saving experiment data to: {dataDir}")
+        print(f"(pglExperiment:save) Saving experiment data to: {dataPath}")
         
         # save eye tracker data if we have an eye tracker
         if self.eyeTracker is not None:
-            eyeTrackerFilename = dataDir / f"{self.settings.eyetracker[0].lower()}"
+            eyeTrackerFilename = dataPath / f"{self.settings.eyetracker[0].lower()}"
             self.eyeTracker.save(eyeTrackerFilename)
 
         # save pgl state
-        self.pgl.save(dataDir / "pgl.json")
+        self.pgl.save(dataPath / "pgl.json")
         
-        # save settings
-        self.settings.save(dataDir / "settings.json")
-        self.experimentSettings.save(dataDir / "experimentSettings.json")
-
-        # save state
-        self.state.save(dataDir / "state.json")
-        
-        # save data
-        self.data.save(dataDir / "data.json")
-
         # save each task
-        for task in self.tasks: task.save(dataDir)   
+        for task in self.tasks: task.save(dataPath)   
+        
+        # and call parent to save rest
+        super().save(dataPath=dataPath)
     
 ##############################################
 # Settings for pglTask
@@ -1148,30 +1153,31 @@ class pglTaskBase(pglTraitSettings):
     data = Instance(pglTaskData, allow_none=True, help="Data of task")
     parameters = List(Instance(pglParameter), default_value=[], help="parameters of task")
   
-    def save(self, dataDir):
+    def save(self, dataPath):
         '''
         Save the task settings, state and data.
         '''
         try:
-            dataDir = dataDir / self.settings.taskSaveName
-            dataDir.mkdir(parents=True, exist_ok=True)
+            dataPath = Path(dataPath) / self.settings.taskSaveName
+            dataPath.mkdir(parents=True, exist_ok=True)
         except Exception as e:
-            print(f"(pglTask:save) ❌ Could not create task data directory {dataDir}: {e}")
+            print(f"(pglTask:save) ❌ Could not create task data directory {dataPath}: {e}")
             return
         
         # save settings, state and data
-        self.settings.save(dataDir / "settings.json")
-        self.state.save(dataDir / "state.json")
-        self.data.save(dataDir / "data.json")
+        self.settings.save(dataPath / "settings.json")
+        self.state.save(dataPath / "state.json")
+        self.data.save(dataPath / "data.json")
         
         # save parameters
         try:
-            paramDir = dataDir / "parameters"
-            paramDir.mkdir(parents=True, exist_ok=True)
-            for param in self.parameters:
-                param.save(paramDir)
+            parameterPath = dataPath / "parameters"
+            parameterPath.mkdir(parents=True, exist_ok=True)
+            for parameter in self.parameters:
+                parameter.save(parameterPath)
         except Exception as e:
-            print(f"(pglTask:save) ❌ Could not save task parameters to {dataDir}: {e}")
+            print(f"(pglTask:save) ❌ Could not save task parameters to {dataPath}: {e}")
+        print(f"Saved task {self.settings.taskName} to {dataPath}")
 
     @classmethod
     def load(cls, taskDir, filesystem=None):

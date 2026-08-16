@@ -102,16 +102,17 @@ class pglSerialize:
     ##########################
     # Save to JSON file
     ##########################
-    def save(self, filename, filesystem=None):
+    def save(self, filename, filesystem=None, filesystemPrefix=None):
         """Save object to JSON file"""
         try:
             # Validate/resolve filesystem and normalise the path
             from .pglBase import pglBase
-            filesystem, filename, _ = pglBase.validateFilesystem(filesystem, filename)
+            dataPath = Path(filename).parent
+            filesystem, dataPath, _ = pglBase.validateFilesystem(filesystem=filesystem, dataPath=dataPath, filesystemPrefix=filesystemPrefix, create=True)
             if filesystem is None:
-                pglMessages.warning(
-                    f"(pglSerialize) Could not resolve a filesystem for '{filename}'.")
+                pglMessages.warning(f"(pglSerialize) Could not resolve a filesystem for '{filename}'.")
                 return
+            filename = Path(dataPath) / Path(filename).name
 
             # Ensure the filename has a .json suffix (string-based to stay
             # OS-agnostic for remote, always POSIX-style, paths)
@@ -131,11 +132,12 @@ class pglSerialize:
             pglMessages.warning(f"(pglSerialize) OS error while saving '{filename}': {e}")
         except Exception as e:
             pglMessages.warning(f"(pglSerialize) Unknown error ({type(e).__name__}) while saving '{filename}': {e}")
+    
     ##########################
     # Load from JSON file
     ##########################
     @classmethod
-    def load(cls, filename, filesystem=None):
+    def load(cls, filename, filesystem=None, filesystemPrefix=None):
         """Load a pglSerialize (or subclass) object from a JSON file and return it.
 
         Args:
@@ -151,7 +153,7 @@ class pglSerialize:
 
         # Validate/resolve filesystem and normalise the path
         from .pglBase import pglBase
-        filesystem, filename, _ = pglBase.validateFilesystem(filesystem, filename)
+        filesystem, filename, _ = pglBase.validateFilesystem(filesystem=filesystem, dataPath=filename, filesystemPrefix=filesystemPrefix)
         if filesystem is None:
             pglMessages.warning(f"(pglSerialize) Could not resolve a filesystem for '{filename}'.")
             return None

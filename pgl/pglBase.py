@@ -763,7 +763,7 @@ class pglBase:
     # # validate filesystem: used for fsspec 
     ################################################################
     @staticmethod
-    def validateFilesystem(filesystem=None, dataPath=None, filesystemPrefix="", ensureExists=False):
+    def validateFilesystem(filesystem=None, dataPath=None, filesystemPrefix="", create=False):
         '''
         Return a valid fsspec filesystem and data path.
 
@@ -836,8 +836,11 @@ class pglBase:
         # ------------------------------------------------------------
         try:
             if not filesystem.exists(dataPath):
-                pglMessages.warning(f"{dataPath} does not exist")
-                filesystem = None
+                if create:
+                    filesystem.makedirs(dataPath, exist_ok=True)
+                else:                    
+                    pglMessages.warning(f"{dataPath} does not exist")
+                    filesystem = None
         except Exception as e:
                 pglMessages.warning(f"Error accessing {dataPath}: {e}")
                 filesystem = None
