@@ -27,6 +27,7 @@ from .pglParameter import pglParameter, pglParameterBlock
 from typing import Annotated
 import numpy as np
 import matplotlib.pyplot as plt
+from .pglSettings import pglSettingsManager
 
 
 ########################
@@ -511,7 +512,197 @@ class pglChooseData(pglChooseLevel):
     # re-declare childList, so we can give it a proper name
     childList = List(Instance(pglTraitSettings), settingsListKey="name", traitDisplayName="Choose experiment", help="Experiments in data path")
     childClass = pglChooseExperiment
+    
+class pglChoose():
+    '''
+    Class which provides ways to choose experiment directories
+    '''
+    @classmethod
+    def getExperimentPath(cls, fullDataPath=None, settings=None, settingsName=None, experimentName=None, subjectID=None, sessionName=None, runName=None, filesystem=None, filesystemPrefix=None, dataPath=None):
+        '''
+        get the directory of the experiment. Many ways to call this to make it easy to get the correct experiemnt dir
         
+        If you want to browse the full experiments:
+        
+            # use default settings to find dataDir
+            pglChoose.getExperimentPath()
+            
+            # use settings name to find dataDir:
+            pglChoose.getExperimentPath(settingsName='windowed)
+
+            # or, call directly with the setting:
+            s = pglSettingsManager.getSettings(settingsName='windowed')
+            pglChoose.getExperimentPath(settings=s)
+            
+            # or, pass in an explicit path
+            pglChoose.getExperimentPath(dataPath='/path/to/experiments')
+
+        If you know the exact path:
+            pglChoose.getExperimentPath('/data/experimentDir/subjectDir/sessionDir/runDir')
+            
+        If you want to browse runs for a particular experiment:
+            pglChoose.getExperimentPath(experimentName='experimentName')
+            
+        
+        Returns:
+            A tuple consisting of:
+                (filesystem, fullDataPath, filesystemPrefix)
+            where:
+                filesystem: fsspec filesystem for the path
+                fullDataPath: path within in filesystem
+                filesystemPrefix: Any filesystem prefix (e.g. ssh://gru.stanford.edu/) this is NOT needed
+                    to access the path, it is returned in case the calling function wants to save it
+                    so that the same path can be accessed again
+        
+        '''
+        from .pglBase import pglBase
+        if fullDataPath:
+            # validate and return
+            filesystem, fullDataPath, filesystemPrefix = pglBase.validateFilesystem(filesystem=filesystem, dataPath=fullDataPath, filesystemPrefix=filesystemPrefix)
+            return (filesystem, fullDataPath, filesystemPrefix)
+            
+        # if not fullDatadir passed in, construct it from arguments
+        else:
+            if not dataPath: 
+                if not settings and not settingsName:
+                    # get the default settings
+                    settings = pglSettingsManager.getSettings(settingsName=settingsName)
+                if settings:
+                    # set dataPath to where settings tells us it is
+                    dataPath= settings.dataPath
+
+            # expand user
+            fullDataPath = Path(dataPath).expanduser()
+            
+            # now that we have the start of a path, validate the filesystem
+            filesystem, fullDataPath, filesystemPrefix = pglBase.validateFilesystem(filesystem=filesystem, dataPath=fullDataPath, filesystemPrefix=filesystemPrefix)
+            if filesystem is None:
+                pglMessages.warning("Could not find dataPath: {fullDataPath}")
+                return
+            
+            # add on experiment name
+            if experimentName:
+                fullDataPath = Path(fullDataPath) / experimentName
+                # check that experimentName exists
+                if not filesystem.exists(fullDataPath):
+                    pglMessages.warning(f"Experiment directory {fullDataPath} does not exist")
+                    return (None, fullDataPath, filesystemPrefix)
+            else:
+                # choose based on subject experiment namers
+                (filesystem, fullDataPath) = cls._chooseDialog(fullDataPath=fullDataPath, chooseLevel='experimentNames', filesystem=filesystem)
+                if filesystem is None: 
+                    return None 
+                else: 
+                    return (filesystem, fullDataPath, filesystemPrefix)
+           
+            # add a subjectID
+            if subjectID:
+                fullDataPath = fullDataPath / subjectID
+                # check the subjectID 
+                if not filesystem.exists(fullDataPath):
+                    pglMessages.warning(f"Subject directory {fullDataPath} does not exist")
+                    return (None, fullDataPath, filesystemPrefix)
+            else:
+                # choose based on subject IDs
+                (filesystem, fullDataPath) = cls._chooseDialog(fullDataPath=fullDataPath, chooseLevel='subjectIDs', filesystem=filesystem)
+                if filesystem is None: 
+                    return None 
+                else: 
+                    return (filesystem, fullDataPath, filesystemPrefix)
+                
+            # add a sessionName
+            if sessionName:
+                fullDataPath = fullDataPath / sessionName
+                # check the sessionName 
+                if not filesystem.exists(fullDataPath):
+                    pglMessages.warning(f"Session directory {fullDataPath} does not exist")
+                    return (None, fullDataPath, filesystemPrefix)
+            else:
+                # choose based on session names
+                (filesystem, fullDataPath) = cls._chooseDialog(fullDataPath=fullDataPath, chooseLevel='sessionNames', filesystem=filesystem)
+                if filesystem is None: 
+                    return None 
+                else: 
+                    return (filesystem, fullDataPath, filesystemPrefix)
+                
+            # add a runName
+            if runName:
+                fullDataPath = fullDataPath / runName
+                # check the runName
+                if not filesystem.exists(fullDataPath):
+                    pglMessages.warning(f"Run directory {fullDataPath} does not exist")
+                    return (None, fullDataPath, filesystemPrefix)
+                else:
+                    # choose based on run names
+                    (filesystem, fullDataPath) = cls._chooseDialog(fullDataPath=fullDataPath, chooseLevel='runNames', filesystem=filesystem)
+                    if filesystem is None: 
+                        return None 
+                    else: 
+                        return (filesystem, fullDataPath, filesystemPrefix)
+              
+        return (filesystem, fullDataPath, filesystemPrefix)
+    
+    @ classmethod
+    def _chooseDialog(cls, fullDataPath, filesystem=None, chooseLevel=None):
+        '''
+        Function that will put up a dialog to choose an experiment for loading
+        '''
+        # put up dialog
+        if chooseLevel == 'experimentNames':
+            s = pglChooseData(dataPath=fullDataPath, filesystem=filesystem)
+            s = pglDialogs.traitsDialog(s)
+            if s is None:
+                pglMessages.message("No runs selected")
+                return (None, None)
+        elif chooseLevel == 'subjectIDs':
+            s = pglChooseExperiment(dataPath=fullDataPath, filesystem=filesystem)
+            s = pglDialogs.traitsDialog(s)
+            if s is None:
+                pglMessages.message("No runs selected")
+                return (None, None)
+        elif chooseLevel == 'sessionNames':
+            s = pglChooseSubject(dataPath=fullDataPath, filesystem=filesystem)
+            s = pglDialogs.traitsDialog(s)
+            if s is None:
+                pglMessages.message("No runs selected")
+                return (None, None)
+        elif chooseLevel == 'runNames':
+            s = pglChooseSession(dataPath=fullDataPath, filesystem=filesystem)
+            s = pglDialogs.traitsDialog(s)
+            if s is None:
+                pglMessages.message("No runs selected")
+                return (None, None)
+        else:
+            pglMessages.warning(f"Unkown choose level: {chooseLevel}")
+            return (None, None)
+        
+        # walk structure to get runs that are selected
+        runNames = cls.walkInstances(s)
+        if not runNames:
+            pglMessages.message("No runs selected")
+            return (None, None)
+        elif len(runNames)>1:
+            pglMessages.message(f"Multiple runs selecting, using {runNames[0]}")
+
+        return (filesystem, runNames[0])
+
+    # walk the structure to get to the leaves (which have runs)        
+    @classmethod
+    def walkInstances(cls, node, depth=0):
+        selectedPaths = []
+        childClass = getattr(type(node), "childClass", None)
+        if childClass is None:
+            # Leaf instance — get the dataPath if it was selected
+            if node.isSelected: 
+                selectedPaths.append(node.dataPath)
+            return selectedPaths
+
+        # childList holds the child instances
+        for child in node.childList:
+            selectedPaths.extend(cls.walkInstances(child, depth + 1))
+
+        return(selectedPaths)
+    
 #################################
 # class pglActionLoadSession
 #################################
