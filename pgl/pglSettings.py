@@ -850,8 +850,9 @@ class pglStateDataSettings(pglTraitSettings):
             pglMessages.warning(f"(pglSerialize) Could not resolve a filesystem for '{dataPath}'")
             return None
         
-        # call parent class save (i.e. pglSerialize all the traits)
-        if self.traits():
+        # call parent class save (i.e. pglSerialize all the traits), but only if it has traits
+        # that are not just the default ones in pglTraitSettings 
+        if set(self.traits()) != set(pglTraitSettings().traits()):
             super().save(filename=posixpath.join(dataPath, "traits.json"), filesystem=filesystem)
         
         # save settings
