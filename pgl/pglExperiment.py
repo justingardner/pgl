@@ -40,6 +40,7 @@ from .pglMessages import pglMessages
 import fsspec
 import posixpath
 from .pglBase import pglBase
+from .pglDialog import pglDialogs
 
 #######################
 # for returning stats
@@ -145,11 +146,11 @@ class pglExperimentBase(pglStateDataSettings):
         from .pglBase import pglBase
         if fullDataPath:
             # validate and return
-            filesystem, fullDataPath, _ = pglBase.validateFilesystem(filesystem=filesystem, dataPath=fullDataPath, filesystemPrefix=filesystemPrefix)
-            return (filesystem, fullDataPath)
+            filesystem, fullDataPath, filesystemPrefix = pglBase.validateFilesystem(filesystem=filesystem, dataPath=fullDataPath, filesystemPrefix=filesystemPrefix)
+            return (filesystem, fullDataPath, filesystemPrefix)
             
         # if not fullDatadir passed in, construct it from arguments
-        elif fullDataPath:
+        else:
             if not dataPath: 
                 if not settings:
                     # get the default settings
@@ -157,12 +158,12 @@ class pglExperimentBase(pglStateDataSettings):
                 if settings:
                     # set dataDir to where settings tells us it is
                     dataPath= settings.dataPath
-            
+
             # expand user
             fullDataPath = Path(dataPath).expanduser()
             
             # now that we have the start of a path, validate the filesystem
-            filesystem, fullDataPath, _ = pglBase.validateFilesystem(filesystem=filesystem, dataPath=fullDataPath, filesystemPrefix=filesystemPrefix)
+            filesystem, fullDataPath, filesystemPrefix = pglBase.validateFilesystem(filesystem=filesystem, dataPath=fullDataPath, filesystemPrefix=filesystemPrefix)
             
             # add on experiment name
             if experimentName:
@@ -170,7 +171,30 @@ class pglExperimentBase(pglStateDataSettings):
                 # check that experimentName exists
                 if not filesystem.exists(fullDataPath):
                     pglMessages.warning(f"Experiment directory {fullDataPath} does not exist")
-                    return fullDataPath
+                    return (None, fullDataPath, filesystemPrefix)
+            else:
+                # DEBG - FIX< this should go somewhere else, also should handle Cancel
+                # should also force selection of on only one
+                # allow user to select
+                from .pglPipeline import pglChooseData
+                print(f"fullDataPath: {fullDataPath}")
+                s = pglChooseData(dataPath=fullDataPath)
+                s = pglDialogs.traitsDialog(s)
+                # walk the structure to get to the leaves (which have runs)        
+                def walkInstances(node, depth=0):
+                    selectedPaths = []
+                    childClass = getattr(type(node), "childClass", None)
+                    if childClass is None:
+                        # Leaf instance — get the dataPath if it was selected
+                        if node.isSelected: selectedPaths.append(node.dataPath)
+                        return selectedPaths
+
+                    # childList holds the child instances
+                    for child in node.childList:
+                        selectedPaths.extend(walkInstances(child, depth + 1))
+                        
+                    return(selectedPaths)
+                return (filesystem, walkInstances(s)[0], filesystemPrefix)
             
             # add a subjectID
             if subjectID:
@@ -178,7 +202,7 @@ class pglExperimentBase(pglStateDataSettings):
                 # check the subjectID 
                 if not filesystem.exists(fullDataPath):
                     pglMessages.warning(f"Subject directory {fullDataPath} does not exist")
-                    return fullDataPath
+                    return (None, fullDataPath, filesystemPrefix)
                 
             # add a sessionName
             if sessionName:
@@ -186,7 +210,7 @@ class pglExperimentBase(pglStateDataSettings):
                 # check the sessionName 
                 if not filesystem.exists(fullDataPath):
                     pglMessages.warning(f"Session directory {fullDataPath} does not exist")
-                    return fullDataPath
+                    return (None, fullDataPath, filesystemPrefix)
                 
             # add a sessionName
             if runName:
@@ -194,23 +218,19 @@ class pglExperimentBase(pglStateDataSettings):
                 # check the runName
                 if not filesystem.exists(fullDataPath):
                     pglMessages.warning(f"Run directory {fullDataPath} does not exist")
-                    return fullDataPath
+                    return (None, fullDataPath, filesystemPrefix)
                 
-        return Path(filesystem, fullDataPath)
+        return (filesystem, fullDataPath, filesystemPrefix)
 
     @classmethod
     def load(cls, settings=None, dataPath=None, experimentName=None, subjectID=None, sessionName=None, runName=None, fullDataPath=None, filesystem=None, filesystemPrefix=None):
         '''
         Load the experiment settings, state and data.         
         '''
-        # default values
-        self.pgl = None
-        self.task = []
-
         # get the experiment directory
-        filesystem, experimentPath, filesystemPrefix = self.getExperimentDir(settings=settings, dataPath=dataPath, experimentName=experimentName, subjectID=subjectID, sessionName=sessionName, runName=runName, fullDataPath=fullDataPath, filesystem=filesystem, filesystemPrefix=filesystemPrefix)
+        filesystem, experimentPath, filesystemPrefix = cls.getExperimentDir(settings=settings, dataPath=dataPath, experimentName=experimentName, subjectID=subjectID, sessionName=sessionName, runName=runName, fullDataPath=fullDataPath, filesystem=filesystem, filesystemPrefix=filesystemPrefix)
         if filesystem is None:
-            pglMessages.message(f"Could not locate experiment directory")
+            pglMessages.message(f"Could not locate experiment directory {dataPath}")
             return
         
         # call parent class to load the experiment data, settings, and state
@@ -221,13 +241,13 @@ class pglExperimentBase(pglStateDataSettings):
             return None
         
         # load experiment settings
-        obj.experimentSettings = pglSerialize.load(experimentPath / "experimentSettings.json")
+        obj.experimentSettings = pglSerialize.load(Path(experimentPath) / "experimentSettings.json")
         if obj.experimentSettings is None:
             pglMessages.warning(f"Could not load experiment settings for {experimentPath}")
             return None
         
         # load pgl state
-        obj.pglState = pglSerialize.load(experimentPath / "pgl.json")
+        obj.pglState = pglSerialize.load(Path(experimentPath) / "pgl.json")
         if obj.pglSate is None:
             pglMessages.warning(f"Could not load pgl state for {experimentPath}")
             return None
@@ -1176,8 +1196,8 @@ class pglTaskBase(pglTraitSettings):
             for parameter in self.parameters:
                 parameter.save(parameterPath)
         except Exception as e:
-            print(f"(pglTask:save) ❌ Could not save task parameters to {dataPath}: {e}")
-        print(f"Saved task {self.settings.taskName} to {dataPath}")
+            pglMessages.warning(f"Could not save task parameters to {dataPath}: {e}")
+        pglMessages.message(f"Saved task {self.settings.taskName} to {dataPath}")
 
     @classmethod
     def load(cls, taskDir, filesystem=None):

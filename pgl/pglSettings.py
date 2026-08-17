@@ -801,12 +801,20 @@ class pglStateDataSettings(pglTraitSettings):
         if filesystem is None:
             pglMessages.warning(f"(pglSerialize) Could not resolve a filesystem for '{dataPath}'")
             return None
-        
-        # call parent class load (i.e. pglSerialize all the traits)
-        obj = super().load(filename=posixpath.join(dataPath, "traits.json"), filesystem=filesystem)
-        if obj is None:
-            pglMessages.warning(f"Could not load traits for: {posixpath.join(dataPath, 'traits.json')}")
-            return None
+    
+        # if there is a traits file then    
+        if filesystem.exists(posixpath.join(dataPath, "traits.json")):
+            # call parent class load (i.e. pglSerialize all the traits)
+            obj = super().load(filename=posixpath.join(dataPath, "traits.json"), filesystem=filesystem)
+            if obj is None:
+                pglMessages.warning(f"Could not load traits for: {posixpath.join(dataPath, 'traits.json')}")
+                return None
+        else:
+            try:
+                obj = cls()
+            except Exception as e:
+                pglMessages.warning(f"Could not initialize {cls.__name__} using __init__ function")
+                return
         
         # load settings
         try:
@@ -814,11 +822,11 @@ class pglStateDataSettings(pglTraitSettings):
         except Exception as e:
             pglMessages.warning(f"Could not load settings {posixpath.join(dataPath, 'settings.json')}: {e}")
         try:
-            obj.state = pglTraitletSettings.load(filename=posixpath.join(dataPath, "state.json"), filesystem=filesystem)
+            obj.state = pglTraitSettings.load(filename=posixpath.join(dataPath, "state.json"), filesystem=filesystem)
         except Exception as e:
             pglMessages.warning(f"Could not load state {posixpath.join(dataPath, 'state.json')}: {e}")
         try:    
-            obj.data = pglTraitletSettings.load(filename=posixpath.join(dataPath, "data.json"), filesystem=filesystem)
+            obj.data = pglTraitSettings.load(filename=posixpath.join(dataPath, "data.json"), filesystem=filesystem)
         except Exception as e:
             pglMessages.warning(f"Could not load data {posixpath.join(dataPath, 'data.json')}: {e}")
         return obj
@@ -843,7 +851,8 @@ class pglStateDataSettings(pglTraitSettings):
             return None
         
         # call parent class save (i.e. pglSerialize all the traits)
-        super().save(filename=posixpath.join(dataPath, "traits.json"), filesystem=filesystem)
+        if self.traits():
+            super().save(filename=posixpath.join(dataPath, "traits.json"), filesystem=filesystem)
         
         # save settings
         settings = getattr(self, 'settings', None)

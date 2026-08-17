@@ -28,6 +28,7 @@ from typing import Annotated
 import numpy as np
 import matplotlib.pyplot as plt
 
+
 ########################
 # action status
 ########################
@@ -309,7 +310,6 @@ class pglRun(pglExperimentBase):
             nTrials=nTrials
         )
 
-
 ##################################
 # pglTrialsByParameter
 ##################################
@@ -507,11 +507,11 @@ class pglChooseExperiment(pglChooseLevel):
     childList = List(Instance(pglTraitSettings), settingsListKey="name", traitDisplayName="Choose subject", help="Subjects in experiment dir")
     childClass = pglChooseSubject
     
-class pglChoose(pglChooseLevel):
+class pglChooseData(pglChooseLevel):
     # re-declare childList, so we can give it a proper name
     childList = List(Instance(pglTraitSettings), settingsListKey="name", traitDisplayName="Choose experiment", help="Experiments in data path")
     childClass = pglChooseExperiment
-    
+        
 #################################
 # class pglActionLoadSession
 #################################
