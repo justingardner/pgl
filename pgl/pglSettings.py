@@ -781,7 +781,7 @@ class pglStateDataSettings(pglTraitSettings):
     '''
     
     @classmethod
-    def load(cls, dataPath, filesystem=None, filesystemPrefix=None):
+    def load(cls, dataPath, filesystem=None, filesystemPrefix=None, loadAsClass=None):
         """Load pglStateDataSettings
 
         Args:
@@ -805,7 +805,7 @@ class pglStateDataSettings(pglTraitSettings):
         # if there is a traits file then    
         if filesystem.exists(posixpath.join(dataPath, "traits.json")):
             # call parent class load (i.e. pglSerialize all the traits)
-            obj = super().load(filename=posixpath.join(dataPath, "traits.json"), filesystem=filesystem)
+            obj = super().load(filename=posixpath.join(dataPath, "traits.json"), filesystem=filesystem, loadAsClass=loadAsClass)
             if obj is None:
                 pglMessages.warning(f"Could not load traits for: {posixpath.join(dataPath, 'traits.json')}")
                 return None

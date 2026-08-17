@@ -137,7 +137,7 @@ class pglSerialize:
     # Load from JSON file
     ##########################
     @classmethod
-    def load(cls, filename, filesystem=None, filesystemPrefix=None):
+    def load(cls, filename, filesystem=None, filesystemPrefix=None, loadAsClass=None):
         """Load a pglSerialize (or subclass) object from a JSON file and return it.
 
         Args:
@@ -146,11 +146,11 @@ class pglSerialize:
             filesystem (fsspec.AbstractFileSystem, optional): Filesystem to read
                 through. If None, it is inferred from `filename` (falling back to
                 a local filesystem). Defaults to None.
+            loadAsClass: IF set will load the class as the set class name
 
         Returns:
             The loaded object, or None if it could not be loaded.
         """
-
         # Validate/resolve filesystem and normalise the path
         from .pglBase import pglBase
         filesystem, filename, _ = pglBase.validateFilesystem(filesystem=filesystem, dataPath=filename, filesystemPrefix=filesystemPrefix)
@@ -175,7 +175,8 @@ class pglSerialize:
         try:
             with filesystem.open(filename, "r") as fileHandle:
                 jsonString = fileHandle.read()
-            obj = cls.fromJSON(jsonString, filename=filename)  # uses your existing fromJSON
+            
+            obj = cls.fromJSON(jsonString, filename=filename, loadAsClass=loadAsClass)  # uses your existing fromJSON
             return obj
         except PermissionError:
             pglMessages.warning(f"(pglSerialize) No permission to read '{filename}'.", level=1)
@@ -289,7 +290,7 @@ class pglSerialize:
     # fromJSON
     ##########################
     @classmethod
-    def fromJSON(cls, jsonString, filename=None):
+    def fromJSON(cls, jsonString, filename=None, loadAsClass=None):
                 
         # Build registry of all known pglSerialize subclasses
         CLASS_REGISTRY = pglGetAllSubclasses(pglSerialize)
@@ -330,17 +331,18 @@ class pglSerialize:
             # Restore pglSerialize objects
             if '__class__' in dct:
                 className = dct.pop('__class__')
-                if className in CLASS_REGISTRY:
+                if loadAsClass is not None:
+                    # override setting in json
+                    objectClass = loadAsClass
+                elif className in CLASS_REGISTRY:
                     objectClass = CLASS_REGISTRY[className]
-                    obj = objectClass.fromJSONdict(dct, filename=filename)
-                    return obj
                 else:
                     availableClasses = sorted(CLASS_REGISTRY.keys())
                     pglMessages.warning(f"(pglSerialize) Could not restore object of class '{className}' from '{filename}'.\nKnown classes: {availableClasses}")
                     dct["__class__"] = className
                     return dct
-            # if we fall through just return the dct
-            return dct
+                obj = objectClass.fromJSONdict(dct, filename=filename)
+                return obj
         return json.loads(jsonString, object_hook=decodeObject)
 
     ##########################

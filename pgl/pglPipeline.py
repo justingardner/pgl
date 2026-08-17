@@ -175,7 +175,7 @@ class pglRun(pglExperimentBase):
                 return task
         return None
 
-    def __init__(self, fullDataPath, filesystem, filesystemPrefix):
+    def __init__(self, fullDataPath=None, filesystem=None, filesystemPrefix=None):
         '''
         Initialize the pglRun class
         
@@ -186,7 +186,8 @@ class pglRun(pglExperimentBase):
         super().__init__()
 
         # keep the path and filesystem
-        self.filesystem, self.fullDataPath, self.filesystemPrefix = pglBase.validateFilesystem(filesystem=filesystem,dataPath=fullDataPath,filesystemPrefix=filesystemPrefix)
+        if filesystem is not None and fullDataPath is not None:
+            self.filesystem, self.fullDataPath, self.filesystemPrefix = pglBase.validateFilesystem(filesystem=filesystem,dataPath=fullDataPath,filesystemPrefix=filesystemPrefix)
         
     def getTaskNames(self):
         '''

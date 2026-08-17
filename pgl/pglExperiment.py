@@ -73,154 +73,94 @@ class pglExperimentBase(pglStateDataSettings):
         self.eyeTracker = None
     
     @classmethod
-    def isValidExperimentDir(cls, verbose=False, settings=None, dataPath=None, experimentName=None, subjectID=None, sessionName=None, runName=None, fullDataPath=None, filesystem=None):
+    def isValidExperimentPath(cls, verbose=False, fullDataPath=None, settings=None,
+                            settingsName=None, experimentName=None, subjectID=None,
+                            sessionName=None, runName=None, filesystem=None,
+                            filesystemPrefix=None, dataPath=None):
         '''
         Check whether the experiment dir has all the correct files
         '''
-        experimentDir = cls.getExperimentDir(settings=settings, dataPath=dataPath, experimentName=experimentName, subjectID=subjectID, sessionName=sessionName, runName=runName, fullDataPath=fullDataPath, filesystem=filesystem)
-        
+        from .pglPipeline import pglChoose
+        filesystem, fullDataPath, _ = pglChoose.getExperimentPath(
+            fullDataPath=fullDataPath,
+            settings=settings,
+            settingsName=settingsName,
+            experimentName=experimentName,
+            subjectID=subjectID,
+            sessionName=sessionName,
+            runName=runName,
+            filesystem=filesystem,
+            filesystemPrefix=filesystemPrefix,
+            dataPath=dataPath)
+
+        sep = filesystem.sep
+
         # Top-level required JSON files
-        requiredExperimentFiles = ["data.json","experimentSettings.json","settings.json","pgl.json","state.json"]
-        requiredFiles = ["data.json","settings.json","state.json"]
-        
+        requiredExperimentFiles = [
+            "data.json", "experimentSettings.json", "settings.json",
+            "pgl.json", "state.json"
+        ]
+        requiredFiles = ["data.json", "settings.json", "state.json"]
+
         # Check top-level JSON files
         for fileName in requiredExperimentFiles:
-            filePath = experimentDir / fileName
-            if not filePath.is_file():
+            filePath = f"{fullDataPath}{sep}{fileName}"
+            if not filesystem.isfile(filePath):
                 if verbose:
                     pglMessages.message(f"Missing file: {filePath}")
                 return False
 
         # Check non-json entries
-        for item in experimentDir.iterdir():
-            if item.suffix != ".json":
+        for item in filesystem.ls(fullDataPath, detail=False):
+            fileName = item.rsplit(sep, 1)[-1]
+
+            if not fileName.endswith(".json"):
 
                 # Everything non-json should be a directory
-                if not item.is_dir():
+                if not filesystem.isdir(item):
                     if verbose:
                         pglMessages.message(f"Expected directory, found: {item}")
                     return False
 
                 # Check task files only if any task file exists
-                taskFilesFound = [fileName for fileName in requiredFiles 
-                                if (item / fileName).is_file()]
+                taskFilesFound = [
+                    fileName for fileName in requiredFiles
+                    if filesystem.isfile(f"{item}{sep}{fileName}")
+                ]
 
                 if len(taskFilesFound) > 0:
+
                     # If one exists, all must exist
                     for fileName in requiredFiles:
-                        filePath = item / fileName
-                        if not filePath.is_file():
+                        filePath = f"{item}{sep}{fileName}"
+                        if not filesystem.isfile(filePath):
                             if verbose:
-                                pglMessages.message(f"Missing file in task directory {item}: {fileName}")
+                                pglMessages.message(
+                                    f"Missing file in task directory {item}: {fileName}")
                             return False
 
                     # parameters must be a directory (may be empty)
-                    parametersPath = item / "parameters"
-                    if not parametersPath.is_dir():
+                    parametersPath = f"{item}{sep}parameters"
+                    if not filesystem.isdir(parametersPath):
                         if verbose:
-                            pglMessages.message(f"No parameters directory in {item}")
+                            pglMessages.message(
+                                f"No parameters directory in {item}")
                         return False
-                    else:
-                        # Any directories inside parameters must contain required task files
-                        for subItem in parametersPath.iterdir():
 
-                            # Ignore non-directories
-                            if not subItem.is_dir():
-                                continue
+                    # Any directories inside parameters must contain required task files
+                    for subItem in filesystem.ls(parametersPath, detail=False):
+                        if not filesystem.isdir(subItem):
+                            continue
 
-                            # Check required parameter files
-                            for fileName in requiredFiles:
-                                filePath = subItem / fileName
-                                if not filePath.is_file():
-                                    if verbose:
-                                        pglMessages.message(f"Missing file in parameter directory {subItem}: {fileName}")
-                                    return False
-        return True    
-    
-    @classmethod
-    def getExperimentDir(cls, settings=None, dataPath=None, experimentName=None, subjectID=None, sessionName=None, runName=None, fullDataPath=None, filesystem=None, filesystemPrefix=None):
-        '''
-        get the directory of the experiment
-        
-        '''
-        from .pglBase import pglBase
-        if fullDataPath:
-            # validate and return
-            filesystem, fullDataPath, filesystemPrefix = pglBase.validateFilesystem(filesystem=filesystem, dataPath=fullDataPath, filesystemPrefix=filesystemPrefix)
-            return (filesystem, fullDataPath, filesystemPrefix)
-            
-        # if not fullDatadir passed in, construct it from arguments
-        else:
-            if not dataPath: 
-                if not settings:
-                    # get the default settings
-                    settings = pglSettingsManager.getSettings()
-                if settings:
-                    # set dataDir to where settings tells us it is
-                    dataPath= settings.dataPath
+                        for fileName in requiredFiles:
+                            filePath = f"{subItem}{sep}{fileName}"
+                            if not filesystem.isfile(filePath):
+                                if verbose:
+                                    pglMessages.message(
+                                        f"Missing file in parameter directory {subItem}: {fileName}")
+                                return False
 
-            # expand user
-            fullDataPath = Path(dataPath).expanduser()
-            
-            # now that we have the start of a path, validate the filesystem
-            filesystem, fullDataPath, filesystemPrefix = pglBase.validateFilesystem(filesystem=filesystem, dataPath=fullDataPath, filesystemPrefix=filesystemPrefix)
-            
-            # add on experiment name
-            if experimentName:
-                fullDataPath = fullDataPath / experimentName
-                # check that experimentName exists
-                if not filesystem.exists(fullDataPath):
-                    pglMessages.warning(f"Experiment directory {fullDataPath} does not exist")
-                    return (None, fullDataPath, filesystemPrefix)
-            else:
-                # DEBG - FIX< this should go somewhere else, also should handle Cancel
-                # should also force selection of on only one
-                # allow user to select
-                from .pglPipeline import pglChooseData
-                print(f"fullDataPath: {fullDataPath}")
-                s = pglChooseData(dataPath=fullDataPath)
-                s = pglDialogs.traitsDialog(s)
-                # walk the structure to get to the leaves (which have runs)        
-                def walkInstances(node, depth=0):
-                    selectedPaths = []
-                    childClass = getattr(type(node), "childClass", None)
-                    if childClass is None:
-                        # Leaf instance — get the dataPath if it was selected
-                        if node.isSelected: selectedPaths.append(node.dataPath)
-                        return selectedPaths
-
-                    # childList holds the child instances
-                    for child in node.childList:
-                        selectedPaths.extend(walkInstances(child, depth + 1))
-                        
-                    return(selectedPaths)
-                return (filesystem, walkInstances(s)[0], filesystemPrefix)
-            
-            # add a subjectID
-            if subjectID:
-                fullDataPath = fullDataPath / subjectID
-                # check the subjectID 
-                if not filesystem.exists(fullDataPath):
-                    pglMessages.warning(f"Subject directory {fullDataPath} does not exist")
-                    return (None, fullDataPath, filesystemPrefix)
-                
-            # add a sessionName
-            if sessionName:
-                fullDataPath = fullDataPath / sessionName
-                # check the sessionName 
-                if not filesystem.exists(fullDataPath):
-                    pglMessages.warning(f"Session directory {fullDataPath} does not exist")
-                    return (None, fullDataPath, filesystemPrefix)
-                
-            # add a sessionName
-            if runName:
-                fullDataPath = fullDataPath / runName
-                # check the runName
-                if not filesystem.exists(fullDataPath):
-                    pglMessages.warning(f"Run directory {fullDataPath} does not exist")
-                    return (None, fullDataPath, filesystemPrefix)
-                
-        return (filesystem, fullDataPath, filesystemPrefix)
+        return True  
 
     @classmethod
     def load(cls, settings=None, dataPath=None, experimentName=None, subjectID=None, sessionName=None, runName=None, fullDataPath=None, filesystem=None, filesystemPrefix=None):
@@ -228,42 +168,57 @@ class pglExperimentBase(pglStateDataSettings):
         Load the experiment settings, state and data.         
         '''
         # get the experiment directory
-        filesystem, experimentPath, filesystemPrefix = cls.getExperimentDir(settings=settings, dataPath=dataPath, experimentName=experimentName, subjectID=subjectID, sessionName=sessionName, runName=runName, fullDataPath=fullDataPath, filesystem=filesystem, filesystemPrefix=filesystemPrefix)
+        from .pglPipeline import pglChoose
+        filesystem, experimentPath, filesystemPrefix = pglChoose.getExperimentPath(settings=settings, dataPath=dataPath, experimentName=experimentName, subjectID=subjectID, sessionName=sessionName, runName=runName, fullDataPath=fullDataPath, filesystem=filesystem, filesystemPrefix=filesystemPrefix)
         if filesystem is None:
             pglMessages.message(f"Could not locate experiment directory {dataPath}")
             return
-        
+ 
         # call parent class to load the experiment data, settings, and state
         print(f"(pglExperiment:load) Loading experimentdata from: {experimentPath}")
-        obj = super().load(dataPath=experimentPath, filesystem=filesystem,filesystemPrefix=filesystemPrefix)
+        obj = super().load(dataPath=experimentPath, filesystem=filesystem,filesystemPrefix=filesystemPrefix, loadAsClass=pglExperimentBase)
         if obj is None:
             pglMessages.warning(f"Could not load {experimentPath}")
             return None
         
         # load experiment settings
-        obj.experimentSettings = pglSerialize.load(Path(experimentPath) / "experimentSettings.json")
-        if obj.experimentSettings is None:
-            pglMessages.warning(f"Could not load experiment settings for {experimentPath}")
-            return None
+        experimentSettingsPath = f"{experimentPath}{filesystem.sep}experimentSettings.json"
+        if filesystem.exists(experimentSettingsPath):
+            obj.experimentSettings = pglSerialize.load(experimentSettingsPath, filesystem=filesystem)
+            if obj.experimentSettings is None:
+                pglMessages.warning(f"Could not load experiment settings for {experimentSettingsPath}")
+        else:
+            pglMessages.warning(f"No experimentSettings.json found for: {experimentSettingsPath}",level=1)
         
         # load pgl state
-        obj.pglState = pglSerialize.load(Path(experimentPath) / "pgl.json")
-        if obj.pglSate is None:
-            pglMessages.warning(f"Could not load pgl state for {experimentPath}")
-            return None
+        pglStatePath = f"{experimentPath}{filesystem.sep}pgl.json"
+        if filesystem.exists(pglStatePath):
+            obj.pglState = pglSerialize.load(pglStatePath, filesystem=filesystem)
+            if obj.pglState is None:
+                pglMessages.warning(f"Could not load pgl state for {pglStatePath}")
+                return None
+        else:
+            pglMessages.warning(f"No pgl.json found for: {pglStatePath}", level=1)            
             
         # load all the tasks
-        for iTask, taskName in enumerate(obj.experimentSettings.tasks):
-            # get the task directory
-            taskPath = experimentPath / taskName
-            # load the task data
-            task = pglTask.load(dataPath=taskPath)
-            if task is None:
-                pglMessages.warning("Could not load task {taskName}",level=1)
-            else:            
-                # add the task to the experiment
-                obj.addTask(task)
-    
+        if obj.experimentSettings:
+            for iTask, taskName in enumerate(obj.experimentSettings.tasks):
+                # get the task directory
+                taskPath = f"{experimentPath}{filesystem.sep}{taskName}"
+
+                # load the task data
+                if filesystem.isdir(taskPath):
+                    # load the task
+                    task = pglTask.load(dataPath=taskPath, filesystem=filesystem)
+                
+                    if task is None:
+                        pglMessages.warning(f"Could not load task {taskName}", level=1)
+                    else:
+                        # add the task to the experiment
+                        obj.addTask(task)
+                else:
+                    pglMessages.warning(f"Could not find task {taskName}: taskPath")
+        
         # return the created object
         return obj
        
@@ -429,7 +384,7 @@ class pglExperiment(pglExperimentBase):
             self.tasks = []
 
             # clear the text screen
-            clear_output(wait=True)
+            #clear_output(wait=True)
         
             self.isInitialized=False
 
@@ -952,6 +907,9 @@ class pglExperiment(pglExperimentBase):
             eyeTrackerFilename = dataPath / f"{self.settings.eyetracker[0].lower()}"
             self.eyeTracker.save(eyeTrackerFilename)
 
+        # save experiment settings
+        self.experimentSettings.save(dataPath / "experimentSettings.json")
+        
         # save pgl state
         self.pgl.save(dataPath / "pgl.json")
         
