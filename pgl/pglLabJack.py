@@ -87,7 +87,7 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
             channelGroup (str): String for the channel group, can be "FIO", "EIO", "CIO", "MIO" or "DIO" Defaults to FIO
         '''
         if self.h is None:
-            print("(pglLabJack:setupDigitalOutput) LabJack device not connected.")
+            pglMessages.warnig("(pglLabJack:setupDigitalOutput) LabJack device not connected.", level=1)
             self.digitalOutputConfigured = False
             return
         
@@ -103,7 +103,7 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
         if isinstance(channel, int):
             self.digitalChannels[channel]["name"] = f"{channelGroup}{channel}"
         else:
-            pglMessages.warning("channel must be an integer", level=2)
+            pglMessages.warning(f"channel must be an integer", level=2)
             return
             
         try:    
@@ -131,7 +131,7 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
         '''
 
         if not self.digitalOutputConfigured:
-            pglMessages.warning("(pglLabJack:setDigitalOutput) Digital output channel not configured. Call setupDigitalOutput() first.")
+            pglMessages.warning(f"(pglLabJack:setDigitalOutput) Digital output channel not configured. Call setupDigitalOutput() first.")
             return None
 
         # set state

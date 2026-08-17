@@ -23,6 +23,7 @@ import numpy as np
 from .pglMessages import pglMessages
 from .pglTimestamp import pglTimestamp
 import time
+import threading
 
 #################################################################
 # Parent class for devices
@@ -202,6 +203,12 @@ class pglDigitalIODevice(pglDevice):
         # whether a digital output channel has been configured
         self.digitalOutputConfigured = False
         self.digitalChannels={}
+        
+        # for outputing words
+        self.wordDigitalChanels = []
+        self.wordBits = 0
+        self.wordMaxValue = 0
+        
         super().__init__(deviceType=deviceType)
 
     def __repr__(self):
@@ -226,20 +233,6 @@ class pglDigitalIODevice(pglDevice):
         # store pulseLen for this channel, which is used by digitalOutputPulse and digitalOutputPulseAtTime
         self.digitalChannels[channel]= {"pulseLen": pulseLen}
 
-    def digitalOutputPulse(self, channel=0):
-        '''
-        Send a digital output pulse on channel
-
-        Implementations should check self.digitalOutputConfigured first.
-
-        Args:
-            channel (int or str): Digitial channel number or name, needs to be configured
-
-        Returns:
-            timestamp (float or None): Timestamp when output was set,
-                                       or None on error.
-        '''
-    
     def digitalOutput(self, state, pulseLen=None):
         '''
         Set the digital output state immediately.
@@ -258,6 +251,51 @@ class pglDigitalIODevice(pglDevice):
         '''
         raise NotImplementedError("(pglDigitalIODevice:digitalOutput) Subclass must implement digitalOutput().")
 
+    def setupDigitalOutputWord(self, channels=None):
+        '''
+        sets up the channels (list of channel numbers) for outputing words, where the list goes
+        from lowst order bit to highest order bit in order
+        
+        channels must first be initialized with setupDigitalOutput
+        
+        Args:
+            channels (list of int): channels to use in word
+        '''
+        if channels is None:
+            pglMessages.warning(f"digital output word has no channels")
+            return
+        
+        # make sure each channel is valid
+        channelsNotSetup = set(channels) - self.digitalChannels.keys()
+        if channelsNotSetup:
+            for channel in channelsNotSetup:
+                pglMessages.warning(f"Channel {channel} has not been setup",level=1)
+            return      
+        
+        # save the list
+        self.wordDigitalChanels = channels
+        self.wordBits = len(channels)
+        self.wordMaxValue = 2**self.wordBits-1
+              
+        
+    def digitalOutputWord(self, outputWord):
+        '''
+        Will put out a pulse on the digital channels setup with setupDigitalOutputWord
+        representing the outputWord        
+        
+        Args:
+            channels (list of int): channels to use in word
+        '''
+        if outputWord < 0 or outputWord > self.wordMaxValue:
+            pglMessages.warning(f"outputWord must be between 0 and {self.wordMaxValue}: {outputWord}",level=1)
+            return
+        
+        # write each bit out
+        for iBit in range(self.wordBits):
+            val = (outputWord >> iBit) & 0x1
+            # send pulses for all positive ones
+            if val:self.digitalOutputPulse(self.wordDigitalChanels[iBit])
+            
     def digitalOutputPulse(self, channel):
         '''
         Send a digital output pulse. Call setupDigitalOutput() first to configure the channel.
