@@ -77,13 +77,14 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
         else:
             return f"<pglLabJack deviceType={self.type} connectionType={self.connectionType} serialNumber={self.serialNumber}>"
     
-    def setupDigitalOutput(self, channel=0, pulseLen=1):
+    def setupDigitalOutput(self, channel=0, pulseLen=1, channelGroup="FIO"):
         '''
         Setup a digital output channel.
     
         Args:
             channel (int): Digital channel number (e.g., 0 for FIO0)
             pulseLen (int): Time in ms for digital pulse to last (for digitalOutputPulse)
+            channelGroup (str): String for the channel group, can be "FIO", "EIO", "CIO", "MIO" or "DIO" Defaults to FIO
         '''
         if self.h is None:
             print("(pglLabJack:setupDigitalOutput) LabJack device not connected.")
@@ -93,9 +94,14 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
         # call super to store pulseLen for this chanel
         super().setupDigitalOutput(channel, pulseLen)
     
+        validChannelGroups = set(["FIO", "EIO", "CIO", "MIO", "DIO"])
+        if channelGroup not in validChannelGroups:
+            pglMessages.warning(f"Input channel group: {channelGroup} is not in valid group: {validChannelGroups}")
+            return
+        
         # Convert to FIO name if needed
         if isinstance(channel, int):
-            self.digitalChannels[channel]["name"] = f"FIO{channel}"
+            self.digitalChannels[channel]["name"] = f"{channelGroup}{channel}"
         else:
             pglMessages.warning("channel must be an integer", level=2)
             return
@@ -112,7 +118,6 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
         
         # configured
         self.digitalOutputConfigured = True
-
 
     def digitalOutput(self, channel, state):
         '''
@@ -310,5 +315,11 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
 
         return pglAnalogTraceData(time=time, data=data, channelNames=self.channels)
               
-
- 
+    def __del__(self):
+        """
+        Clean up the labJack instance
+        """
+        # Perform any necessary cleanup here
+        if self.h is not None:
+            self.ljm.close(self.h)
+            self.h = None
