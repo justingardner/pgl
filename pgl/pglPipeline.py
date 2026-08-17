@@ -153,13 +153,14 @@ class pglRun(pglExperimentBase):
     def tasks(self):
         '''Experiment tasks'''
         if self._tasks is None:
+            print("GOT NONE HERE")
             pglMessages.message(f"Loading tasks for: {self.filesystemPrefix}/{self.fullDataPath}")
             filesystem, fullDataPath, _ = pglBase.validateFilesystem(filesystem=self.filesystem, dataPath=self.fullDataPath, filesystemPrefix=self.filesystemPrefix)
             taskNames = self.experimentSettings.tasks
             self._tasks = []
             for taskName in taskNames:
                 print(f"taskName: {taskName}")
-                self._tasks.append(pglTaskBase.load(taskDir=posixpath.join(str(fullDataPath), taskName), filesystem=filesystem))
+                self._tasks.append(pglTaskBase.load(dataPath=f"{fullDataPath}{filesystem.sep}{taskName}", filesystem=filesystem))
         return self._tasks
 
     @tasks.setter
@@ -184,11 +185,11 @@ class pglRun(pglExperimentBase):
         '''
         # init super
         super().__init__()
-
+            
         # keep the path and filesystem
         if filesystem is not None and fullDataPath is not None:
             self.filesystem, self.fullDataPath, self.filesystemPrefix = pglBase.validateFilesystem(filesystem=filesystem,dataPath=fullDataPath,filesystemPrefix=filesystemPrefix)
-        
+    
     def getTaskNames(self):
         '''
         Extracts task names from experimentSettings
@@ -579,7 +580,7 @@ class pglChoose():
             filesystem, fullDataPath, filesystemPrefix = pglBase.validateFilesystem(filesystem=filesystem, dataPath=fullDataPath, filesystemPrefix=filesystemPrefix)
             if filesystem is None:
                 pglMessages.warning("Could not find dataPath: {fullDataPath}")
-                return
+                return (None, None, None)
             
             # add on experiment name
             if experimentName:
@@ -592,7 +593,7 @@ class pglChoose():
                 # choose based on subject experiment namers
                 (filesystem, fullDataPath) = cls._chooseDialog(fullDataPath=fullDataPath, chooseLevel='experimentNames', filesystem=filesystem)
                 if filesystem is None: 
-                    return None 
+                    return (None, None, None)
                 else: 
                     return (filesystem, fullDataPath, filesystemPrefix)
            
@@ -607,7 +608,7 @@ class pglChoose():
                 # choose based on subject IDs
                 (filesystem, fullDataPath) = cls._chooseDialog(fullDataPath=fullDataPath, chooseLevel='subjectIDs', filesystem=filesystem)
                 if filesystem is None: 
-                    return None 
+                    return (None, None, None)
                 else: 
                     return (filesystem, fullDataPath, filesystemPrefix)
                 
@@ -622,7 +623,7 @@ class pglChoose():
                 # choose based on session names
                 (filesystem, fullDataPath) = cls._chooseDialog(fullDataPath=fullDataPath, chooseLevel='sessionNames', filesystem=filesystem)
                 if filesystem is None: 
-                    return None 
+                    return (None, None, None)
                 else: 
                     return (filesystem, fullDataPath, filesystemPrefix)
                 
@@ -637,7 +638,7 @@ class pglChoose():
                     # choose based on run names
                     (filesystem, fullDataPath) = cls._chooseDialog(fullDataPath=fullDataPath, chooseLevel='runNames', filesystem=filesystem)
                     if filesystem is None: 
-                        return None 
+                        return (None, None, None)
                     else: 
                         return (filesystem, fullDataPath, filesystemPrefix)
               

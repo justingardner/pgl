@@ -71,6 +71,7 @@ class pglExperimentBase(pglStateDataSettings):
         self.experimentSettings = None
         self.pgl = None
         self.eyeTracker = None
+        self.nTasks = 0
     
     @classmethod
     def isValidExperimentPath(cls, verbose=False, fullDataPath=None, settings=None,
@@ -171,16 +172,24 @@ class pglExperimentBase(pglStateDataSettings):
         from .pglPipeline import pglChoose
         filesystem, experimentPath, filesystemPrefix = pglChoose.getExperimentPath(settings=settings, dataPath=dataPath, experimentName=experimentName, subjectID=subjectID, sessionName=sessionName, runName=runName, fullDataPath=fullDataPath, filesystem=filesystem, filesystemPrefix=filesystemPrefix)
         if filesystem is None:
-            pglMessages.message(f"Could not locate experiment directory {dataPath}")
+            if dataPath is not None:
+                pglMessages.message(f"Could not locate experiment directory {dataPath}")
             return
  
         # call parent class to load the experiment data, settings, and state
         print(f"(pglExperiment:load) Loading experimentdata from: {experimentPath}")
-        obj = super().load(dataPath=experimentPath, filesystem=filesystem,filesystemPrefix=filesystemPrefix, loadAsClass=pglExperimentBase)
+        obj = super().load(dataPath=experimentPath, filesystem=filesystem,filesystemPrefix=filesystemPrefix, loadAsClass=cls)
         if obj is None:
-            pglMessages.warning(f"Could not load {experimentPath}")
+            if experimentPath is not None:
+                pglMessages.warning(f"Unable to load {experimentPath}")
             return None
+
+        # keep where we were loaded from
+        obj.filesystem = filesystem
+        obj.fullDataPath = experimentPath
+        obj.filesystemPrefix = filesystemPrefix
         
+        # if we have
         # load experiment settings
         experimentSettingsPath = f"{experimentPath}{filesystem.sep}experimentSettings.json"
         if filesystem.exists(experimentSettingsPath):
@@ -202,6 +211,11 @@ class pglExperimentBase(pglStateDataSettings):
             
         # load all the tasks
         if obj.experimentSettings:
+            # initialize tasks, this is only relevant for pglRun
+            # becuase it lazy-loads tasks, and this will prevent
+            # it from trying to do so
+            if hasattr(obj,'_tasks'): obj._tasks = []
+            
             for iTask, taskName in enumerate(obj.experimentSettings.tasks):
                 # get the task directory
                 taskPath = f"{experimentPath}{filesystem.sep}{taskName}"
@@ -215,21 +229,23 @@ class pglExperimentBase(pglStateDataSettings):
                         pglMessages.warning(f"Could not load task {taskName}", level=1)
                     else:
                         # add the task to the experiment
-                        obj.addTask(task)
+                        obj.addTask(task, addToTaskList=False)
+                        pass
                 else:
                     pglMessages.warning(f"Could not find task {taskName}: taskPath")
         
         # return the created object
         return obj
        
-    def addTask(self, task):
+    def addTask(self, task, addToTaskList=True):
         '''
         Add a task to the experiment.
         '''
         # give it a reference to pgl and experiment
         task.pgl = self.pgl
         task.e = self
-        task.taskID = len(self.tasks)
+        self.nTasks += 1
+        task.taskID = self.nTasks
 
         # set whether to save eye tracker info
         if self.eyeTracker is not None:
@@ -239,7 +255,7 @@ class pglExperimentBase(pglStateDataSettings):
         self.tasks.append(task)
         
         # save in experimentSettings
-        if task.settings is not None:
+        if addToTaskList and task.settings is not None:
             self.experimentSettings.tasks.append(task.settings.taskSaveName)
 
     def display(self):
@@ -1158,27 +1174,27 @@ class pglTaskBase(pglTraitSettings):
         pglMessages.message(f"Saved task {self.settings.taskName} to {dataPath}")
 
     @classmethod
-    def load(cls, taskDir, filesystem=None):
+    def load(cls, dataPath, filesystem=None):
         '''
         Load the task data.
         '''
-        print(f"(pglTask:load) Loading task data from: {taskDir}")
+        print(f"(pglTask:load) Loading task data from: {dataPath}")
 
         # validate filesystem
-        filesystem, taskDir, _ = pglBase.validateFilesystem(filesystem, taskDir)
+        filesystem, taskPath, _ = pglBase.validateFilesystem(filesystem, dataPath)
 
         # load settings, state and data
         try:
-            settings = pglSerialize.load(filename=posixpath.join(str(taskDir), "settings.json"), filesystem=filesystem)
-            state = pglSerialize.load(filename=posixpath.join(str(taskDir), "state.json"), filesystem=filesystem)
-            data = pglSerialize.load(filename=posixpath.join(str(taskDir), "data.json"), filesystem=filesystem)
+            settings = pglSerialize.load(filename=f"{taskPath}{filesystem.sep}settings.json", filesystem=filesystem)
+            state = pglSerialize.load(filename=f"{taskPath}{filesystem.sep}state.json", filesystem=filesystem)
+            data = pglSerialize.load(filename=f"{taskPath}{filesystem.sep}data.json", filesystem=filesystem)
         except Exception as e:
-            pglMessages.warning(f"Could not load task data from {taskDir}: {e}")
+            pglMessages.warning(f"Could not load task data from {taskPath}: {e}")
             return None
 
         # load parameters
         parameters = []
-        parametersDir = posixpath.join(str(taskDir), "parameters")
+        parametersDir = f"{taskPath}{filesystem.sep}parameters"
         try:
             for paramDir in filesystem.ls(parametersDir, detail=False):
                 param = pglParameter.from_file(paramDir, filesystem=filesystem)

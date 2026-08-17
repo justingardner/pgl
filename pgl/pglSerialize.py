@@ -343,6 +343,7 @@ class pglSerialize:
                     return dct
                 obj = objectClass.fromJSONdict(dct, filename=filename)
                 return obj
+            return dct
         return json.loads(jsonString, object_hook=decodeObject)
 
     ##########################
