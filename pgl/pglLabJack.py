@@ -70,7 +70,11 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
     
             # set description
             self.deviceDescription = f"{self.type} LabJack via {self.connectionType}"
-                        
+               
+    @property
+    def isActive(self):
+        return True if self.h is not None else False
+            
     def __repr__(self):
         if self.h is None:
             return "<pglLabJack device not connected>"

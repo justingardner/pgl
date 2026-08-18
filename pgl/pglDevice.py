@@ -86,6 +86,7 @@ class pglDevice:
         pass
     def stop(self):
         pass
+    
     def status(self):
         """
         Get the status of the device.
@@ -99,6 +100,15 @@ class pglDevice:
         # Implement status retrieval logic here
         return f"(pglDevice) Device {self.deviceType}: status not implemented"
 
+    @property
+    def isActive(self):
+        '''
+        True if initialized and running, False if not.
+        
+        Should be implemented in subclass, defaults to returning True
+        '''
+        return True
+        
 #################################################################
 # pglDevices is mixed into pgl and handles multiple pglDevice instances
 #################################################################
