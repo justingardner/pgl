@@ -113,7 +113,6 @@ class pglSerialize:
                 pglMessages.warning(f"(pglSerialize) Could not resolve a filesystem for '{filename}'.")
                 return
             filename = Path(dataPath) / Path(filename).name
-            print(filename)
 
             # Make it json
             filename = str(Path(filename).with_suffix(".json"))
