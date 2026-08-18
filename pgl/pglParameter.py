@@ -389,7 +389,7 @@ class pglParameterBatch(pglParameter):
             result = super().get()
             batch.append(result[paramName])
 
-        return {paramName: tuple(batch)}
+        return {paramName: batch}
         
 ##########################
 # Parameter block class
