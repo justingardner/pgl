@@ -87,7 +87,7 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
             channelGroup (str): String for the channel group, can be "FIO", "EIO", "CIO", "MIO" or "DIO" Defaults to FIO
         '''
         if self.h is None:
-            pglMessages.warnig("(pglLabJack:setupDigitalOutput) LabJack device not connected.", level=1)
+            pglMessages.warning("(pglLabJack:setupDigitalOutput) LabJack device not connected.", level=1)
             self.digitalOutputConfigured = False
             return
         
@@ -131,14 +131,14 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
         '''
 
         if not self.digitalOutputConfigured:
-            pglMessages.warning(f"(pglLabJack:setDigitalOutput) Digital output channel not configured. Call setupDigitalOutput() first.")
+            pglMessages.warning(f"Digital output channel not configured. Call setupDigitalOutput() first.")
             return None
 
         # set state
         try:
             self.ljm.eWriteName(self.h, self.digitalChannels[channel]["name"], 1 if state else 0)
         except Exception as e:
-            pglMessages.warning(f"(pglLabJack:setDigitalOutput) Error reading {self.digitalChannels[channel]["name"]}: {e}")
+            pglMessages.warning(f"Error writing {self.digitalChannels[channel]["name"]}: {e}")
             return None
         
         return pglTimestamp.getSecs()
