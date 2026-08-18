@@ -35,7 +35,8 @@ class pglDataPixxBase(pglDevice):
 
        # call parent constructor
         super().__init__(deviceType=deviceType, deviceDescription="VPixx dataPixx")
-        
+
+        self.dp = None        
         # get library
         try:
             from pypixxlib.datapixx import DATAPixx3 as DATAPixx3
@@ -195,11 +196,12 @@ class pglDataPixx(pglDataPixxBase):
         # run status to get status
         self.currentStatus = self.status()
 
-        # set the device start time
+        # get the device start time
         self.deviceStartTime = self.deviceAttributes.get('deviceTime', 0)
 
         # start device log
         self.deviceLog = self.device.din.setDinLog(12e6, 1000)
+
         # start logging
         self.device.din.startDinLog()
         self.device.updateRegisterCache()
@@ -267,10 +269,45 @@ class pglDataPixx(pglDataPixxBase):
             print(f"(pglDataPixx) Could not get current status: {e}")
             self.currentStatus = 0
             return self.currentStatus
+
     ################################################################
     # Poll for events
     ################################################################
     def poll(self):
+        """
+        Poll the DataPixx device for events.
+
+        This method polls the DataPixx device for digital input events.
+        """
+        # Update register cache to get latest hardware state
+        self.dp.DPxUpdateRegCache()
+        
+        # Get digital input log status
+        # Initialize status dict with required field
+        if not hasattr(self, 'dinStatus'):
+            self.dinStatus = {'currentReadFrame': 0}
+        
+        self.dp.DPxGetDinStatus(self.dinStatus)
+        newEvents = self.dinStatus.get('newLogFrames', 0)
+        
+        if newEvents > 0:
+            # Read the digital input log data
+            eventData = self.dp.DPxReadDinLog(self.dinStatus, newEvents)
+            
+            # Set up a list for holding events
+            events = []
+
+            for x in eventData:
+                # Get the time of the event
+                time = round(x[0] - self.deviceStartTime, 2)
+                code = x[1]  # Digital input value
+                id = self.buttonCodes.get(code, 'Unknown')
+                events.append(pglEventResponsePixx(code, id, time))
+            
+            return events
+        
+        return []  # No new events
+    def pollold(self):
         """
         Poll the DataPixx device for events.
 
@@ -722,6 +759,27 @@ class pglDataPixxDigitalIODevice(pglDigitalIODevice, pglDataPixxBase):
 
         # open as DPx
         self.openDPx()
+
+    @property
+    def isActive(self):
+        '''
+        Make sure that dataPixx is active and ready
+        '''
+        if self.dp is None: 
+            pglMessages.message("No DP library found")
+            return False
+
+        try:
+            # Check if device is ready
+            if not self.dp.DPxIsReady():
+                pglMessages.warning("Device not ready")
+                return False
+            
+            return True
+            
+        except Exception as e:
+            pglMessages.warning(f"Error checking device: {e}")
+            return False
 
     ################################################################
     # enablePixelMode: Modified from VPIxx example code
