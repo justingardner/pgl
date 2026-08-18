@@ -147,18 +147,15 @@ class pglSerialize:
         Returns:
             The loaded object, or None if it could not be loaded.
         """
+        # Ensure the filename has a .json suffix
+        filename = str(Path(filename).with_suffix(".json"))
+
         # Validate/resolve filesystem and normalise the path
         from .pglBase import pglBase
         filesystem, filename, _ = pglBase.validateFilesystem(filesystem=filesystem, dataPath=filename, filesystemPrefix=filesystemPrefix)
         if filesystem is None:
             pglMessages.warning(f"(pglSerialize) Could not resolve a filesystem for '{filename}'.")
             return None
-
-        # Ensure the filename has a .json suffix
-        filename = str(filename)
-        if not filename.endswith(".json"):
-            base, dot, _ = filename.rpartition(".")
-            filename = (base if dot else filename) + ".json"
 
         if not filesystem.exists(filename):
             pglMessages.warning(f"File {filename} not found.", level=1)

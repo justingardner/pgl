@@ -1370,7 +1370,7 @@ class pglDisplayLuminanceCalibrationData(pglTraitSettings):
             if filepath is None: return
         # get the filename
         if filename is None:
-            filename = "calibration"
+            filename = "calibration.json"
         
         print(f"(pglDisplayLuminanceCalibrationData:load) Loading {filepath / filename}")
         
