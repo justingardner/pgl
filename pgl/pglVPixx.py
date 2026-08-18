@@ -302,7 +302,7 @@ class pglDataPixx(pglDataPixxBase):
    ################################################################
     # setup digital output
     ################################################################
-    def setupDigitalOutput(self):
+    def setupDigitalOutput(self,):
         """
         Setup the digital output for the DataPixx device.
         """
@@ -717,6 +717,9 @@ class pglDataPixxDigitalIODevice(pglDigitalIODevice, pglDataPixxBase):
         # no configured triggers
         self.triggers = None
 
+        # note the hardcoded address here - this is in the sample code - eeks
+        self.currentAddress = int(8e6)
+
         # open as DPx
         self.openDPx()
 
@@ -775,37 +778,40 @@ class pglDataPixxDigitalIODevice(pglDigitalIODevice, pglDataPixxBase):
     ################################################################
     # configureDigitialOuptut, adapted form vpixx documentation
     ################################################################
-    def _configureDigitalOutputs(self, configDict, currentAddress):
+    def _configureDigitalOutputs(self, triggers):
         """
         Configures digital outputs based on the provided trigger dictionary and
         assigns a memory address. Each signal's bits are shifted according to the
         specified output channel, and then written to the VPixx hardware memory.
         
-        Parameters:
-            configDict (dict): Dictionary with entries in the format:
+        Args:
+            triggers (dict): Dictionary with entries in the format:
                 {
-                    'eventName': {'signal': [0, 1, 0, ...], 'channel': int
-                    }
+                    'eventName': {'signal': [0, 1, 0, ...], 'channel': int}
                 }
                 Where the eventName is an aribtrary string to use to trigger the event
                 the signal is the shape of the digitial pulse (e.g. 0, 1, 0 starts at 0
                 rises to 1 and falls back to 0 when triggered)
-                channel is the digitial channel that will be written
-            currentAddress (int): The starting memory address for storing signal
-                                data.
+                channel is the digitial channel that will be written. 
+
+        e.g.:
+            triggers = {
+                "stimulusOn": {"signal": [1, 0], "channel": 8},
+                "stimulusOff": {"signal": [1, 0], "channel": 1},
+            }
+
         
-        Returns:
-            configDict (dict): The updated dictionary with assigned memory addresses
-                                for each event.
+        this is called by setupDigitalOutput, which allows you to just set channels in a simpler interface
+        
         """
         # Loop through each event in the configuration dictionary
-        for event, details in configDict.items():
+        for event, details in triggers.items():
             
             # Ensure the currentAddress is even; if it's odd, increment by 1
-            if currentAddress % 2 != 0:
-                currentAddress += 1
+            if self.currentAddress % 2 != 0:
+                self.currentAddress += 1
                 
-            details['address'] = currentAddress
+            details['address'] = self.currentAddress
             channel = details.get('channel')
             signal = details.get('signal', [])
             signalLength = len(signal)
@@ -816,39 +822,31 @@ class pglDataPixxDigitalIODevice(pglDigitalIODevice, pglDataPixxBase):
             
             # Write the modified signal (toggledSignal) into the VPixx hardware memory
             # at the specified address.
-            self.dp.DPxWriteRam(currentAddress, toggledSignal)
+            self.dp.DPxWriteRam(self.currentAddress, toggledSignal)
             
             print(f"Configured: {event} is {signal} on DOut channel {channel}")
             
             # Update the current memory address by adding the length of the signal.
             # Important to multiply by 2 to reserve enough space.
-            currentAddress += signalLength * 2
+            self.currentAddress += signalLength * 2
         
         # After configuring all events, commit changes to the register cache of the
         # hardware
         self.dp.DPxWriteRegCache()
         
-        return configDict
-
-    ################################################################
-    # configure the digital outputs, calls internal function
-    ################################################################
-    def configureDigitalOutputs(self):
-        '''
-        Configures some triggers that can be sent using sendTrigger
-        '''
-        # set up triggers
-        triggers = {
-            "stimulusOn": {"signal": [1, 0], "channel": 8},
-            "stimulusOff": {"signal": [1, 0], "channel": 1},
-        }
-
-        # register the triggers, note the hardcoded address here - this is in the sample code - eeks
-        self.triggers = self._configureDigitalOutputs(triggers, currentAddress=int(8e6))        
-
+        self.triggers = triggers
 
     def setupDigitalOutput(self, channel=0, pulseLen = 1):
-        self.configureDigitalOutputs()
+        '''
+
+        Setus up digital output for a channel. Calls _cnofigure DigitalOutputs
+        
+        '''
+        if channel >= 0 and channel < 32:
+            trigger = {f"channel{channel:02d}": {"signal": [1, 0], "channel": channel}}
+            self._configureDigitalOutputs(triggers=trigger)
+        else:
+            pglMessages.warning("Channel must be between 0 and 32: {channel}")
 
     def digitalOutputPulse(self, channel=0):
         '''
@@ -868,7 +866,7 @@ class pglDataPixxDigitalIODevice(pglDigitalIODevice, pglDataPixxBase):
             return
 
         # send the specified trigger
-        self._sendTrigger("stimulusOn")
+        self._sendTrigger(f"channel{channel:02d}")
     
     ################################################################
     # send a digital trigger, 
@@ -888,9 +886,8 @@ class pglDataPixxDigitalIODevice(pglDigitalIODevice, pglDataPixxBase):
         import cProfile
         import pstats
 
-        profiler = cProfile.Profile()
-
-        profiler.enable()
+        #profiler = cProfile.Profile()
+        #profiler.enable()
 
         # get the entry
         entry = self.triggers.get(eventName, None)
@@ -918,6 +915,5 @@ class pglDataPixxDigitalIODevice(pglDigitalIODevice, pglDataPixxBase):
         self.dp.DPxStartDoutSched()
         self.dp.DPxWriteRegCache()
 
-        profiler.disable()
-
-        pstats.Stats(profiler).sort_stats("cumulative").print_stats(30)
+        #profiler.disable()
+        #pstats.Stats(profiler).sort_stats("cumulative").print_stats(30)
