@@ -714,8 +714,8 @@ class pglDataPixxDigitalIODevice(pglDigitalIODevice, pglDataPixxBase):
         # initialize super
         super().__init__(deviceType="DataPixxDigitalIO")
 
-        # no configured triggers
-        self.triggers = None
+        # no configured digital channels
+        self.digitalChannels = {}
 
         # note the hardcoded address here - this is in the sample code - eeks
         self.currentAddress = int(8e6)
@@ -811,10 +811,13 @@ class pglDataPixxDigitalIODevice(pglDigitalIODevice, pglDataPixxBase):
             if self.currentAddress % 2 != 0:
                 self.currentAddress += 1
                 
-            details['address'] = self.currentAddress
+            # get details of trigger
             channel = details.get('channel')
             signal = details.get('signal', [])
-            signalLength = len(signal)
+
+            # set some new details
+            details['address'] = self.currentAddress
+            details['signalLength'] = len(signal)
             
             # Shift each bit in the signal to the left by the value of the channel.
             # This positions the bit correctly for the digital output channel.
@@ -828,25 +831,26 @@ class pglDataPixxDigitalIODevice(pglDigitalIODevice, pglDataPixxBase):
             
             # Update the current memory address by adding the length of the signal.
             # Important to multiply by 2 to reserve enough space.
-            self.currentAddress += signalLength * 2
+            self.currentAddress += details['signalLength'] * 2
         
         # After configuring all events, commit changes to the register cache of the
         # hardware
         self.dp.DPxWriteRegCache()
-        
-        self.triggers = triggers
 
-    def setupDigitalOutput(self, channel=0, pulseLen = 1):
+        # and update our trigger dictionary
+        self.digitalChannels |= triggers
+
+    def setupDigitalOutput(self, channel=0, pulseLen = 1, **kwargs):
         '''
 
         Setus up digital output for a channel. Calls _cnofigure DigitalOutputs
         
         '''
-        if channel >= 0 and channel < 32:
-            trigger = {f"channel{channel:02d}": {"signal": [1, 0], "channel": channel}}
+        if channel >= 0 and channel < 16:
+            trigger = {channel: {"signal": [1, 0], "channel": channel}}
             self._configureDigitalOutputs(triggers=trigger)
         else:
-            pglMessages.warning("Channel must be between 0 and 32: {channel}")
+            pglMessages.warning("Channel must be between 0 and 16: {channel}")
 
     def digitalOutputPulse(self, channel=0):
         '''
@@ -861,42 +865,40 @@ class pglDataPixxDigitalIODevice(pglDigitalIODevice, pglDataPixxBase):
             timestamp (float or None): Timestamp when output was set,
                                        or None on error.
         '''
-        if not self.triggers:
+        if not self.digitalChannels:
             pglMessages.warning("Triggers are not configured, run setupDigitalOutput")
             return
 
         # send the specified trigger
-        self._sendTrigger(f"channel{channel:02d}")
+        self._sendTrigger(channel)
     
     ################################################################
     # send a digital trigger, 
     ################################################################
-    def _sendTrigger(self, eventName, delay=0.0, samplingRate=1000):
+    def _sendTrigger(self, channel, delay=0.0, samplingRate=1000):
         """
         Sends a digital trigger signal based on the provided dictionary entry.
         
         Parameters:
-            entry (dict): A dictionary entry containing keys 'signal', 'channel',
-                        and 'address'.
+            channel (int): The key for the digitalChannels entry 
             delay (float): Delay (in seconds) before the trigger signal starts
                         (default is 0.0).
             samplingRate (int): Sampling rate in Hz for the digital output (default
                                 is 10).
         """
-        import cProfile
-        import pstats
-
+        #import cProfile
+        #import pstats
         #profiler = cProfile.Profile()
         #profiler.enable()
 
         # get the entry
-        entry = self.triggers.get(eventName, None)
+        entry = self.digitalChannels.get(channel, None)
         if entry is None:
-            pglMessages.warning(f"Could not find {eventName} in configured triggers.")
+            pglMessages.warning(f"Could not find {channel} in configured triggers.")
             return
         
         # Determine the length of the signal (number of bits) for scheduling purposes
-        signalLength = len(entry.get('signal', []))
+        signalLength = entry.get('signalLength')
         
         # Retrieve the memory address for this signal from the entry
         address = entry.get('address')

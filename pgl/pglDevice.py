@@ -261,7 +261,7 @@ class pglDigitalIODevice(pglDevice):
         '''
         raise NotImplementedError("(pglDigitalIODevice:digitalOutput) Subclass must implement digitalOutput().")
 
-    def setupDigitalOutputWord(self, channels=None):
+    def setupDigitalOutputWord(self, channels=None, **kwargs):
         '''
         sets up the channels (list of channel numbers) for outputing words, where the list goes
         from lowst order bit to highest order bit in order
@@ -270,6 +270,7 @@ class pglDigitalIODevice(pglDevice):
         
         Args:
             channels (list of int): channels to use in word
+            kwargs: are ignored unless the subclass needs them
         '''
         if channels is None:
             pglMessages.warning(f"digital output word has no channels")
@@ -304,7 +305,7 @@ class pglDigitalIODevice(pglDevice):
         for iBit in range(self.wordBits):
             val = (outputWord >> iBit) & 0x1
             # send pulses for all positive ones
-            if val:self.digitalOutputPulse(self.wordDigitalChanels[iBit])
+            if val: self.digitalOutputPulse(self.wordDigitalChanels[iBit])
             
     def digitalOutputPulse(self, channel):
         '''

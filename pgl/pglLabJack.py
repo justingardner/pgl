@@ -81,7 +81,7 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
         else:
             return f"<pglLabJack deviceType={self.type} connectionType={self.connectionType} serialNumber={self.serialNumber}>"
     
-    def setupDigitalOutput(self, channel=0, pulseLen=1, channelGroup="FIO"):
+    def setupDigitalOutput(self, channel=0, pulseLen=1, channelGroup="FIO", **kwargs):
         '''
         Setup a digital output channel.
     
