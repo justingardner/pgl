@@ -1349,7 +1349,8 @@ class pglDisplayLuminanceCalibrationData(pglTraitSettings):
         # get the filename
         if filename is None:
             filename = "calibration"
-                           
+
+        print(filepath / filename)
         # call parent to save
         super().save(filepath / filename)
     

@@ -113,14 +113,11 @@ class pglSerialize:
                 pglMessages.warning(f"(pglSerialize) Could not resolve a filesystem for '{filename}'.")
                 return
             filename = Path(dataPath) / Path(filename).name
+            print(filename)
 
-            # Ensure the filename has a .json suffix (string-based to stay
-            # OS-agnostic for remote, always POSIX-style, paths)
-            filename = str(filename)
-            if not filename.endswith(".json"):
-                base, dot, _ = filename.rpartition(".")
-                filename = (base if dot else filename) + ".json"
-
+            # Make it json
+            filename = str(Path(filename).with_suffix(".json"))
+            
             #pglMessages.message(f"Saving {self.__class__.__name__} to '{filename}'")
             with filesystem.open(filename, 'w') as f:
                 f.write(self.toJSON())
