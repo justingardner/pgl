@@ -372,7 +372,7 @@ class pglPynputKeyboard(pglDevice):
                 keyChar = str(key) 
                 keyCode = None
             # put in event list
-            eventList.append(pglEventKeyboard(keyChar, keyCode, key, timestamp, shift, ctrl, alt, cmd, "keydown"))
+            eventList.append(pglEventKeyboard(keyChar=keyChar, keyCode=keyCode, key=key, timestamp=timestamp, shift=shift, ctrl=ctrl, alt=alt, cmd=cmd, eventType="keydown"))
         return eventList
     
     
@@ -386,32 +386,45 @@ class pglEventKeyboard(pglEvent):
 
     """
 
-    def __init__(self, keyChar, keyCode, key, timestamp, shift, ctrl, alt, cmd, eventType = None):
+    def __init__(self, keyChar=None, keyCode=None, timestamp=None, key=None, shift=False, ctrl=False, alt=False, cmd=False, eventType=None):
         '''
         Initialize the pglEventKeyboard instance.
         Args:
-            keyChar(str): The key that was pressed.
-            keyCode (int): The key code of the pressed key.
-            key (Key): The key object.
-            timestamp (double): The device time.
-            shift (bool): Whether the shift key was held down.
-            ctrl (bool): Whether the ctrl key was held down.
-            alt (bool): Whether the alt key was held down.
-            cmd (bool): Whether the cmd key was held down.
-            eventType (str): The type of event ('keydown' or 'keyup').
+            keyChar(str): The key that was pressed. If not passed in, but keyCode is then is derived from keyCode
+            keyCode (int): The key code of the pressed key. If not passed in, but keyChar is then is derived from keyChar
+            key (Key): The key object. Can be omitted
+            timestamp (double): The device time. 
+            shift (bool): Whether the shift key was held down. Default False
+            ctrl (bool): Whether the ctrl key was held down. Default False
+            alt (bool): Whether the alt key was held down. Default False
+            cmd (bool): Whether the cmd key was held down. Default False
+            eventType (str): The type of event ('keydown' or 'keyup'). Defaults to keydown
         Returns:
             None
         '''
         super().__init__("keyboard")
-        self.keyChar = keyChar
-        self.keyCode = keyCode
+
+        # if keyChar is not passed in but keyCode, is then dervie it from keyCode
+        if keyChar is None and keyCode is not None:
+            self.keyChar = keyCodeToChar(keyCode)
+        else:
+            self.keyChar = keyChar
+        # get keyCode (either derive from keyChar or passed in)
+        if keyCode is None and keyChar is not None:
+            self.keyCode = charToKeyCode(keyChar)
+        else:
+            self.keyCode = keyCode
         self.key = key
         self.timestamp = timestamp
         self.shift = shift
         self.ctrl = ctrl
         self.alt = alt
         self.cmd = cmd
-        self.eventType = eventType
+        # default to keydown events
+        if eventType is not None:
+            self.eventType = eventType
+        else:
+            self.eventType = 'keydown'
     def __repr__(self):
         '''
         Return a string representation of the pglEventKeyboard instance.

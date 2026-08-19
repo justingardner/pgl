@@ -14,7 +14,7 @@ from .pglEvent import pglEvent
 from .pglMessages import pglMessages
 import numpy as np
 from .pglTimestamp import pglTimestamp
-
+from .pglKeyboardMouse import pglEventKeyboard
 
 ###################################
 # Base DataPixx device
@@ -96,8 +96,6 @@ class pglDataPixxBase(pglDevice):
         except Exception as e:
             pglMessages.warning(f"DataPixx: device opened but hardware communication failed: {e}")
             return False
-        
-        
     
     ################################################################
     # close device for low-level DPX library
@@ -161,71 +159,13 @@ class pglDataPixxBase(pglDevice):
         
         return hasError
         
-################################################################
-###################################
-# DataPixx device
-###################################
-class pglDataPixx(pglDataPixxBase):
-    """
-    Represents a DataPixx device.
-    """    
-    def __init__(self):
-        '''
-        Initialize the pglDataPixx instance.
-        
-        Args:
-            pgl (object): The pgl instance.
-                
-        Returns:
-            None
-        '''
-        # set to not initialized
-        self.currentStatus = -1
-
-        # call parent constructor
-        super().__init__()
-        
-        # Initialize the DATAPixx3 instance
-        #try:
-        #    self.device = self.DATAPixx3()
-        #except Exception as e:
-        #    print(f"(pglDataPixx) Failed to initialize DataPixx: {e}")
-        #    self.device = None
-        #    return  
-    
-        
-        # run status to get status
-        #self.currentStatus = self.status()
-
-        # get the device start time
-        #self.deviceStartTime = self.deviceAttributes.get('deviceTime', 0)
-
-        # start device log
-        #self.deviceLog = self.device.din.setDinLog(12e6, 1000)
-
-        # start logging
-        #self.device.din.startDinLog()
-        #self.device.updateRegisterCache()
-
-        # open the device
-        self.openDPx()
-
-    
+    ################################################################
+    # destructor
+    ################################################################
     def __del__(self):
         """
         Destructor for the pglDataPixx class.
         """
-        if self.device is not None and self.currentStatus != -1:
-            try:
-                self.device.din.stopDinLog()
-                self.device.updateRegisterCache()
-            except Exception as e:
-                print(f"(pglDataPixx) Error during cleanup: {e}")
-
-        # set variables to initial state
-        self.device = None
-        self.currentStatus = -1
-
         # close the device
         self.closeDPx()
 
@@ -244,23 +184,23 @@ class pglDataPixx(pglDataPixxBase):
             return self.currentStatus
 
         try:
-            # Names of methods that are supported by the DataPixx device
-            methodNames = {
-                'getAssemblyRevision': 'assemblyRevision',
-                'getFirmwareRevision': 'firmwareRevision',
-                'getName': 'name',
-                'getSerialNumber': 'serialNumber',
-                'getTime': 'deviceTime'
-            }
-            # Get current status using the method names
-            for method, attributeName in methodNames.items():
-                # Use getattr to call the method dynamically on the device object
-                self.deviceAttributes[attributeName] = getattr(self.device, method)()
+            # Update register cache from device
+            self.dp.DPxSelectDevice(self.deviceType)
+            self.dp.DPxUpdateRegCache()
 
-            # get cpu time
+            productionInfo = self.dp.DPxReadProductionInfo()
+
+            # Get device attributes using dp calls
+            self.deviceAttributes['assemblyRevision'] = productionInfo['Assembly REV']
+            self.deviceAttributes['firmwareRevision'] = self.dp.DPxGetFirmwareRev()
+            self.deviceAttributes['name'] = self.dp.part_number_constants[self.dp.DPxGetPartNumber()]
+            self.deviceAttributes['serialNumber'] = productionInfo['S/N']
+            self.deviceAttributes['deviceTime'] = self.dp.DPxGetTime()
+            
+            # Get cpu time
             self.deviceAttributes['cpuTime'] = pglTimestamp.getSecs()
 
-            # print current status
+            # Print current status
             if self.verbose > 0:
                 print(f"(pglDataPixx) {self.deviceAttributes.get('name','Unknown DataPixx name')}")
                 print(f"              serial #: {self.deviceAttributes.get('serialNumber','Unknown')}, assembly revision: {self.deviceAttributes.get('assemblyRevision','Unknown')}, firmware revision: {self.deviceAttributes.get('firmwareRevision','Unknown')}")
@@ -268,7 +208,7 @@ class pglDataPixx(pglDataPixxBase):
 
             self.currentStatus = 1
         except Exception as e:
-            print(f"(pglDataPixx) Could not get current status: {e}")
+            pglMessages.warning(f"Could not get current status: {e}")
             self.currentStatus = 0
             return self.currentStatus
 
@@ -583,26 +523,32 @@ class pglProPixx(pglDataPixxBase):
 ###################################
 # ResponsePixx events (buttons)
 ###################################
-class pglEventResponsePixx(pglEvent):
+class pglEventResponsePixx(pglEventKeyboard):
     """
     Represents a response event for ResponsePixx
 
     """
     
-    def __init__(self, code, id, deviceTime):
+    def __init__(self, deviceCode=None, id=None, deviceTime=None, timestamp=None, keyChar=None):
         '''
         Initialize the pglEventResponsePixx instance.
         Args:
-            code (int): The event code.
+            deviceCode (int): The event code.
             id (str): The event ID.
             deviceTime (float): The device time.
+            timestamp: pgl time
+            keyChar: a character that will be used when event is read as a keyboard event
         Returns:
             None
         '''
-        super().__init__("ResponsePixx")
-        self.code = code
+        # set keyboard event fields
+        super().__init__(keyChar=keyChar, timestamp=timestamp)
+
+        # set individual fields
+        self.deviceCode = deviceCode
         self.id = id
         self.deviceTime = deviceTime
+
     
     def __repr__(self):
         '''
@@ -610,12 +556,12 @@ class pglEventResponsePixx(pglEvent):
         Returns:
             str: String representation of the instance.
         '''
-        return f"(pglEventResponsePixx) Code: {self.code}, ID: {self.id}, Device Time: {self.deviceTime}"
+        return f"(pglEventResponsePixx) deviceCode: {self.deviceCode}, ID: {self.id}, Device Time: {self.deviceTime}, keyChar: {self.keyChar}, timestamp: {self.timestamp}"
 
 ###################################
 # Use datapixx as Digital IO
 ###################################
-class pglDataPixxDigitalIODevice(pglDigitalIODevice, pglDataPixxBase):
+class pglDataPixx(pglDigitalIODevice, pglDataPixxBase):
     '''
     send digital pulses with DataPixx
     '''
@@ -638,6 +584,12 @@ class pglDataPixxDigitalIODevice(pglDigitalIODevice, pglDataPixxBase):
         # start logging button press activity
         self.startEventLogging()
 
+        # dispaly status
+        self.status()
+
+    ################################################################
+    # isActive
+    ################################################################
     @property
     def isActive(self):
         '''
@@ -658,49 +610,6 @@ class pglDataPixxDigitalIODevice(pglDigitalIODevice, pglDataPixxBase):
         except Exception as e:
             pglMessages.warning(f"Error checking device: {e}")
             return False
-
-    ################################################################
-    # Get the status of the DataPixx device
-    ################################################################
-    def status(self):
-        """
-        Get the status of the DataPixx device.
-
-        Returns:
-            int: Status code of the DataPixx device.
-        """
-        if self.currentStatus == -1:
-            print("(pglDataPixx) DataPixx not initialized properly.")
-            return self.currentStatus
-
-        try:
-            # Update register cache from device
-            self.dp.DPxSelectDevice(self.deviceType)
-            self.dp.DPxUpdateRegCache()
-
-            productionInfo = self.dp.DPxReadProductionInfo()
-
-            # Get device attributes using dp calls
-            self.deviceAttributes['assemblyRevision'] = productionInfo['Assembly REV']
-            self.deviceAttributes['firmwareRevision'] = self.dp.DPxGetFirmwareRev()
-            self.deviceAttributes['name'] = self.dp.part_number_constants[self.dp.DPxGetPartNumber()]
-            self.deviceAttributes['serialNumber'] = productionInfo['S/N']
-            self.deviceAttributes['deviceTime'] = self.dp.DPxGetTime()
-            
-            # Get cpu time
-            self.deviceAttributes['cpuTime'] = pglTimestamp.getSecs()
-
-            # Print current status
-            if self.verbose > 0:
-                print(f"(pglDataPixx) {self.deviceAttributes.get('name','Unknown DataPixx name')}")
-                print(f"              serial #: {self.deviceAttributes.get('serialNumber','Unknown')}, assembly revision: {self.deviceAttributes.get('assemblyRevision','Unknown')}, firmware revision: {self.deviceAttributes.get('firmwareRevision','Unknown')}")
-                print(f"              device time: {self.deviceAttributes.get('deviceTime','Unknown')}, cpu time: {self.deviceAttributes.get('cpuTime','Unknown')}")
-
-            self.currentStatus = 1
-        except Exception as e:
-            pglMessages.warning(f"Could not get current status: {e}")
-            self.currentStatus = 0
-            return self.currentStatus
 
     ################################################################
     # startEventLogging
@@ -725,9 +634,30 @@ class pglDataPixxDigitalIODevice(pglDigitalIODevice, pglDataPixxBase):
         self.dp.DPxWriteRegCache()
 
         # button codes (hardcoded, note that these maybe different for different responsePixx devices)
-        self.buttonCodes = {64528:'white left', 64513:'red left', 64514:'yellow left', 64516:'green left', 64520:'blue left', 
-                            65024:'white right', 64544:'red right', 64576:'yellow right', 64640:'green right', 64768:'blue right',
+        self.buttonCodes = {64528:'white left',
+                            64513:'red left',
+                            64514:'yellow left',
+                            64516:'green left',
+                            64520:'blue left', 
+                            65024:'white right',
+                            64544:'red right',
+                            64576:'yellow right',
+                            64640:'green right',
+                            64768:'blue right',
                             64512:'button release'}
+
+        # translation table to keyboard charcters for buttons
+        self.buttonToChar = {'white left':'5',
+                            'red left':'6',
+                            'yellow left':'7',
+                            'green left':'8',
+                            'blue left':'9',
+                            'white right':'0',
+                            'red right':'1',
+                            'yellow right':'2',
+                            'green right':'3',
+                            'blue right':'4',
+                            'button release':'_'}
 
         pglMessages.message("Started dataPixx event logging")
  
@@ -760,10 +690,11 @@ class pglDataPixxDigitalIODevice(pglDigitalIODevice, pglDataPixxBase):
 
             for x in eventData:
                 # Get the time of the event
-                time = round(x[0] - self.deviceStartTime, 2)
-                code = x[1]  # Digital input value
-                id = self.buttonCodes.get(code, 'Unknown')
-                events.append(pglEventResponsePixx(code, id, time))
+                deviceTime = x[0] - self.deviceStartTime
+                deviceCode = x[1]  # Digital input value
+                id = self.buttonCodes.get(deviceCode, 'Unknown')
+                keyChar = self.buttonToChar.get(id,'')
+                events.append(pglEventResponsePixx(deviceCode=deviceCode, id=id, deviceTime=deviceTime, timestamp=pglTimestamp.getSecs(),keyChar=keyChar))
             
             return events
         
