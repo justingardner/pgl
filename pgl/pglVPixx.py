@@ -65,11 +65,18 @@ class pglDataPixxBase(pglDevice):
         try:
             self.dp.DPxUpdateRegCache()
             if self.getError():
-                pglMessages.warning("Is DataPixx3 connected and turned on (green power light)")
+                pglMessages.warning("Is DataPixx3 connected and turned on (green power light)?")
                 return
 
         except Exception as e:
             pglMessages.warning(f"DataPixx: device opened but hardware communication failed: {e}")
+            return False
+
+        # get device time
+        try:
+            self.deviceStartTime = self.dp.DPxGetTime()
+        except Exception as e:
+            pglMessages.warning(f"Could not get device time")
             return False
 
         # print status
@@ -185,12 +192,7 @@ class pglDataPixx(pglDataPixxBase):
         #    print(f"(pglDataPixx) Failed to initialize DataPixx: {e}")
         #    self.device = None
         #    return  
-        
-        # button codes (hardcoded, note that these maybe different for different responsePixx devices)
-        self.buttonCodes = {64528:'white left', 64513:'red left', 64514:'yellow left', 64516:'green left', 64520:'blue left', 
-                            65024:'white right', 64544:'red right', 64576:'yellow right', 64640:'green right', 64768:'blue right',
-                            64512:'button release'}
-
+    
         
         # run status to get status
         #self.currentStatus = self.status()
@@ -700,24 +702,32 @@ class pglDataPixxDigitalIODevice(pglDigitalIODevice, pglDataPixxBase):
             self.currentStatus = 0
             return self.currentStatus
 
+    ################################################################
+    # startEventLogging
+    ################################################################
     def startEventLogging(self):
         '''
-        initializes data logging for button presses. Needs to be called after openDPx
-
+        Initializes data logging for button presses. Needs to be called after openDPx.
         '''
-       # Set up digital input logging
-        bufferBaseAddr = 12e6  # 12 MB base address
+        # Set up digital input logging (base address + buffer size in frames, single call)
+        bufferBaseAddr = 12000000  # 12 MB base address
         maxLogFrames = 1000
-        
-        self.dp.DPxSetDinBuffBaseAddr(int(bufferBaseAddr))
-        self.dp.DPxSetDinBuffSize(maxLogFrames * 10)  # 10 bytes per frame
-        
+        self.dp.DPxSetDinLog(bufferBaseAddr, maxLogFrames)
+
+        # Optional but used in VPixx's own demos: reduces jitter on button transitions
+        self.dp.DPxEnableDinDebounce()
+
         # Initialize status tracking dict
         self.dinStatus = {'currentReadFrame': 0}
-        
+
         # Start digital input logging
         self.dp.DPxStartDinLog()
         self.dp.DPxWriteRegCache()
+
+        # button codes (hardcoded, note that these maybe different for different responsePixx devices)
+        self.buttonCodes = {64528:'white left', 64513:'red left', 64514:'yellow left', 64516:'green left', 64520:'blue left', 
+                            65024:'white right', 64544:'red right', 64576:'yellow right', 64640:'green right', 64768:'blue right',
+                            64512:'button release'}
 
         pglMessages.message("Started dataPixx event logging")
  
