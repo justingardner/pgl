@@ -896,3 +896,93 @@ class pglDataPixx(pglDigitalIODevice, pglDataPixxBase):
 
         #profiler.disable()
         #pstats.Stats(profiler).sort_stats("cumulative").print_stats(30)
+
+    def setupConditions(self, numBits, pulseLen=3, samplingRate=1000, ramBaseAddress=8000000):
+        """
+        Pre-loads a lookup table of digital-out "words" into DATAPixx RAM -- one
+        entry per possible bit pattern -- so that any of the 2**numBits conditions
+        can be triggered later purely by address arithmetic (no RAM write needed
+        at trigger time).
+
+        Each condition's word IS the value written to the digital-out port, e.g.
+        condition 5 drives the bit pattern 0b101 on the output lines.
+
+        Args:
+            numBits (int): number of digital-out bits used to encode the word.
+                            Hardware limit is 24 (DPxGetDoutNumBits()).
+                            Number of conditions = 2**numBits.
+            pulseLen (int): how long, in samples (typically samplingRate, but could be in video rate), the word should be held before
+                            returning to 0.
+            samplingRate (int): Dout schedule rate in Hz (default 1000 Hz = 1 ms
+                                per sample). You'll need this same value again
+                                when you call SetDoutSchedule at trigger time.
+            ramBaseAddress (int): starting RAM address for the table. Adjusted up
+                                by 1 if odd, since Dout addresses must be even.
+
+        Returns:
+            dict describing the table layout -- store this, you'll need it to
+            compute per-condition addresses when triggering later.
+        """
+        if not (1 <= numBits <= 24):
+            raise ValueError("numBits must be between 1 and 24 (DATAPixx digital-out hardware limit).")
+
+        if ramBaseAddress % 2 != 0:
+            ramBaseAddress += 1
+
+        numConditions = 2 ** numBits
+
+        # Each condition = pulseLen repeats of the word, then one 0 sample to turn off.
+        samplesPerCondition = pulseLen + 1
+
+        # bytes per sample are 2 bytes 
+        BYTES_PER_SAMPLE = 2
+        bytesPerCondition = samplesPerCondition * BYTES_PER_SAMPLE
+
+        totalBytes = numConditions * bytesPerCondition
+        print(f"Building condition table: {numConditions} conditions, "
+            f"{bytesPerCondition} bytes each, {totalBytes / 1e6:.2f} MB total")
+
+        # Build the whole table as one flat list: [w0]*onSamples+[0], [w1]*onSamples+[0], ...
+        table = []
+        for word in range(numConditions):
+            table.extend([word] * pulseLen)
+            table.append(0)
+
+        # Single RAM write for the entire table -- avoids one transfer per condition.
+        self.dp.DPxWriteRam(ramBaseAddress, table)
+        #self.dp.DPxWriteRegCache()
+
+        self.conditionTable = {
+            'baseAddress': ramBaseAddress,
+            'bytesPerCondition': bytesPerCondition,
+            'samplesPerCondition': samplesPerCondition,
+            'numConditions': numConditions,
+            'samplingRate': samplingRate,
+        }
+        
+    def writeCondition(self, condition):
+        '''
+        write a condition word
+        '''
+        if not self.conditionTable:
+            pglMessages.warning(f"condition table not initialized, run setupConditionWords first")
+            return
+        
+        if condition < 0 or condition >= self.conditionTable['numConditions']:
+            pglMessages.warning(f"Condition out of range [0 {self.conditionTable['numConditions']-1}]: {condition}")
+            return
+        
+        # get the address for the condition
+        address = self.conditionTable['baseAddress'] + self.conditionTable['bytesPerCondition']*condition
+        
+        # - address: the location in memory where the signal is stored. Note the first argument is a delay, and we set it
+        # to trigger right away
+        self.dp.DPxSetDoutSchedule(0.0, self.conditionTable['samplingRate'], self.conditionTable['samplesPerCondition'], address)
+
+        #self.dp.DPxSetDoutSchedRate(1,'video')
+        #self.dp.DPxSetDoutSchedRate(self.conditionTable['samplingRate'],'hz')
+
+        # Start the digital output schedule to send the trigger signal
+        self.dp.DPxStartDoutSched()
+        self.dp.DPxWriteRegCache()
+  
