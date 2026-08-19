@@ -215,7 +215,7 @@ class pglDataPixxBase(pglDevice):
 
     # enableButtonSchedules: Modified from VPIxx example code
     ################################################################
-    def enableButtonSchedules(self, buttonMap = None, pulseWidth=50):
+    def enableButtonSchedules(self, buttonMap = None, pulseWidth=3):
         """
             Enable button schedules for the DataPixx device. Button schedules convert button press events into digital output waveforms.
 
@@ -253,6 +253,20 @@ class pglDataPixxBase(pglDevice):
                 'redRight': 1, 'yellowRight': 2, 'greenRight': 3, 'blueRight': 4, 'whiteRight': 5,
                 'redRightRelease': 6, 'yellowRightRelease': 7, 'greenRightRelease': 8, 'blueRightRelease': 9, 'whiteRightRelease': 10
             }
+        # put button pressed in upper 20-23 bits of digital output
+        startBit = 8
+        press8 = {
+            'whiteRight':  1 << startBit,
+            'redRight':    2 << startBit,
+            'yellowRight': 3 << startBit,
+            'greenRight':   4 << startBit,
+            'blueRight':    5 << startBit,
+            'whiteLeft':   6 << startBit,
+            'redLeft':     7 << startBit,
+            'yellowLeft':  8 << startBit,
+            'greenLeft':    9 << startBit,
+            'blueLeft':    10 << startBit,
+        }
         if buttonMap is None:
             # default button map
             buttonMap = allPress
@@ -269,11 +283,13 @@ class pglDataPixxBase(pglDevice):
                 buttonMap = rightPress
             elif buttonMap.lower() in ['rightpressrelease']:
                 buttonMap = rightPressRelease
+            elif buttonMap.lower() in ['press8']:
+                buttonMap = press8
             else:
-                print(f"(pglDataPixx:enableButtonSchedules) Unknown buttonMap type: {buttonMap} (defaulting to all).")
+                pglMessages.warning(f"Unknown buttonMap type: {buttonMap} (defaulting to all).")
                 buttonMap = allPress
         elif not isinstance(buttonMap, dict):
-            print(f"(pglDataPixx:enableButtonSchedules) buttonMap should be a string or a dictionary, got {type(buttonMap)}. Defaulting to all.")
+            pglMessages.warning(f"buttonMap should be a string or a dictionary, got {type(buttonMap)}. Defaulting to all.")
             buttonMap = allPress
 
         #Create our digital output waveforms. Each button press (rising edge) triggers a
