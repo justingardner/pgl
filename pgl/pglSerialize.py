@@ -20,9 +20,6 @@ from .pglMessages import pglMessages
 import fsspec
 from fsspec.core import url_to_fs
 
-# FIx, FIX, FIX, temporarily trying to shutdown pglSerialize from
-# printing all the missing and added fields
-verbose = 0
 ##########################
 # Recursively collect all subclasses
 ##########################
@@ -98,7 +95,8 @@ class pglSerialize:
     If you have a HasTraits class, then it will use trait_names() to save and load attributes.
     If you have a dataclass, then it will use fields() to save and load attributes
     '''
-    
+    verbose = False
+    _serializeUnregisteredFields = False
     ##########################
     # Save to JSON file
     ##########################
@@ -190,7 +188,7 @@ class pglSerialize:
         if obj is not None:
             self.copyTraitsFrom(obj)    
     ##########################
-    # toJSON
+    # toJSON: determines how to serialize to JSON different data types
     ##########################
     def toJSON(self, type="all"):
         def encodeObject(o):
@@ -253,32 +251,75 @@ class pglSerialize:
         return json.dumps(self, default=encodeObject, sort_keys=True, indent=4)
     
     ##########################
-    # toJSONdict
+    # toJSONdict: Decide what needs to be serialized.
     ##########################
     def toJSONdict(self, type="all"):
-        # Convert object to dict for JSON serialization
-        # Override in subclasses to control which attributes are included
-        
-        # If this is a HasTraits object, use trait_names()
-        if isinstance(self, HasTraits):
-            return {key: getattr(self, key) 
-                    for key in self.trait_names() 
-                    if pglShouldReadTraitForSerialize(self, key)}
-        
-        # If this is a dataclass, manually build dict (preserves nested objects)
-        if is_dataclass(self):
-            return {
+        isHasTraits = isinstance(self, HasTraits)
+        isDataClass = is_dataclass(self)
+
+        # Warn if both serialization mechanisms are present.
+        if isHasTraits and isDataClass:
+            pglMessages.warning(
+                f"{self.__class__.__name__} is both a HasTraits object \n"
+                f"and a dataclass. HasTraits attributes will be used for \n"
+                f"serialization; dataclass fields will be ignored.",
+            )
+
+        result = {}
+
+        # HasTraits takes precedence if both are present.
+        if isHasTraits:
+            result.update({
+                key: getattr(self, key)
+                for key in self.trait_names()
+                # logic in function above for what keys to save/ignore
+                # this function handles some traits that are lazy-loaded 
+                if pglShouldReadTraitForSerialize(self, key)
+            })
+
+        # Dataclass serialization.
+        elif isDataClass:
+            result.update({
                 f.name: getattr(self, f.name)
                 for f in fields(self)
-                if not f.name.startswith('_')
+                # do not save private variables starting with _
+                if not f.name.startswith("_")
+            })
+
+        # Find public __dict__ fields which weren't handled by
+        # HasTraits or dataclass serialization.
+        if hasattr(self, "__dict__"):
+            # unregistered fields
+            unregisteredFields = {
+                key: value
+                for key, value in self.__dict__.items()
+                if not key.startswith("_") and key not in result
             }
-    
-        # Otherwise use __dict__, skipping private attributes
-        return {
-            key: value
-            for key, value in self.__dict__.items()
-            if not key.startswith("_")
-        }
+
+            if unregisteredFields:
+                # if the class has _serialzeUnregisteredFields set to True
+                # then add those to the fields we will save
+                if self._serializeUnregisteredFields:
+                    result.update(unregisteredFields)
+                # if not, then warn that the fields will be dropped epending on verbose level
+                elif pglSerialize.verbose:
+                    pglMessages.warning(
+                        f"{self.__class__.__name__} has unregistered "
+                        f"attributes that will not be serialized: "
+                        f"{list(unregisteredFields.keys())}",
+                        level=0
+                    )
+
+        # If this is neither HasTraits nor a dataclass, preserve the
+        # normal behavior: serialize public __dict__ fields.
+        if not isHasTraits and not isDataClass:
+            return {
+                key: value
+                for key, value in self.__dict__.items()
+                if not key.startswith("_")
+            }
+
+        return result
     ##########################
     # fromJSON
     ##########################
@@ -345,24 +386,47 @@ class pglSerialize:
     @classmethod
     def fromJSONdict(cls, data, type="all", filename=None):
         """Create instance from dict. Override for custom initialization/validation"""
-        obj = cls.__new__(cls)
-        
+
         # If this is a HasTraits class, use updateTraitsFromDict
         if issubclass(cls, HasTraits):
-            obj.__init__()  # Initialize HasTraits properly
+            obj = cls.__new__(cls)
+            obj.__init__()
             obj.updateTraitsFromDict(data, filename=filename)
-            # If this is a dataclass, use __init__ to get defaults and validation
+            return obj
+
+        # If this is a dataclass, use normal __init__ for declared fields,
+        # then restore any registered/unregistered instance attributes.
         elif is_dataclass(cls):
-            # Get all field names
             fieldNames = {f.name for f in fields(cls)}
-            # Filter data to only include valid fields
-            init_data = {k: v for k, v in data.items() if k in fieldNames}
-            # Use normal __init__ (applies defaults, runs __post_init__, etc.)
-            return cls(**init_data)
+
+            # Normal dataclass fields go through __init__, which preserves
+            # defaults, validation, and __post_init__ behavior.
+            initData = {
+                key: value
+                for key, value in data.items()
+                if key in fieldNames
+            }
+
+            obj = cls(**initData)
+
+            # Restore unregistered fields if this class allows them.
+            if obj._serializeUnregisteredFields:
+                unregisteredFields = {
+                    key: value
+                    for key, value in data.items()
+                    if key not in fieldNames
+                }
+
+                for key, value in unregisteredFields.items():
+                    setattr(obj, key, value)
+
+            return obj
+
+        # Otherwise use __dict__
         else:
+            obj = cls.__new__(cls)
             obj.__dict__.update(data)
-        
-        return obj
+            return obj
     
     ##########################
     # updateTraitsFromDict - For HasTraits objects
@@ -446,14 +510,29 @@ class pglSerialize:
                     print(f"{'='*80}\n")
             else:
                 if pglShouldReadTraitForSerialize(self, key):
-                    pglMessages.message(f"'{key}' not found in {filename} using default {getattr(self, key)}", verbose=verbose)
+                    pglMessages.message(f"'{key}' not found in {filename} using default {getattr(self, key)}", verbose=pglSerialize.verbose)
 
-        
-        # Warn about unknown keys
-        extraKeys = set(data.keys()) - set(self.trait_names())
+        # Handle unknown keys
+        traitNames = set(self.trait_names())
+        extraKeys = set(data.keys()) - traitNames
+
         if extraKeys:
-            pglMessages.message(f"(pglSerialize) Unknown keys in {filename} (ignored): {list(extraKeys)}", verbose=verbose)
-
+            if self._serializeUnregisteredFields:
+                for key in extraKeys:
+                    try:
+                        setattr(self, key, data[key])
+                    except Exception as e:
+                        pglMessages.warning(
+                            f"Could not restore unregistered "
+                            f"attribute '{key}' from '{filename}': {e}",
+                            level=1
+                        )
+            else:
+                pglMessages.message(
+                    f"unknown keys in {filename} (ignored): "
+                    f"{list(extraKeys)}",
+                    verbose=pglSerialize.verbose
+                )
 
     def _getDetailedTypeInfo(self, obj):
         """
@@ -487,13 +566,12 @@ class pglSerialize:
     ##########################
     # copyTraitsFrom - Copy traits from another object
     ##########################
-    def copyTraitsFrom(self, other, verbose=True):
+    def copyTraitsFrom(self, other):
         """
         Copy trait/attribute values from another object.
         
         Args:
             other: Source object to copy from
-            verbose: Whether to print warnings on errors
         """
         # If both are HasTraits objects, use trait_names()
         if isinstance(self, HasTraits) and isinstance(other, HasTraits):
@@ -511,10 +589,8 @@ class pglSerialize:
                 try:
                     setattr(self, key, getattr(other, key))
                 except TraitError as e:
-                    if verbose:
-                        print(f"(pglSerialize) Could not copy trait '{key}': {e}")
+                    pglMessages.warning(f"Could not copy trait '{key}': {e}", verbose=pglSerialize.verbose)
                 except Exception as e:
-                    if verbose:
-                        print(f"(pglSerialize) Error copying '{key}': {e}")
-            elif verbose:
-                print(f"(pglSerialize) Source object missing attribute '{key}'")
+                    pglMessages.warning(f"Error copying '{key}': {e}", verbose=pglSerialize.verbose)
+            else:
+                pglMessages.message(f"Source object missing attribute '{key}'",verbose=pglSerialize.verbose)
