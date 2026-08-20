@@ -536,8 +536,9 @@ class pglDraw:
                 self.text(f"{radius:.1f}", x=radius, y=0, color=color, fontSize=fontSize, yAlign=1, xAlign=0)
                 self.text(f"-{radius:.1f}", x=-radius, y=0, color=color, fontSize=fontSize, yAlign=1, xAlign=0)
         
-        self.text(f"[distance: {self.distanceToScreen.cm:.1f} cm]", line=-4, xAlign=-1)
-        self.text(f"[{self.screenWidth.cm} x {self.screenHeight.cm}] cm", line=-3, xAlign=-1)
+        self.text(f"[distance: {self.distanceToScreen.cm:.1f} cm]", line=-5, xAlign=-1)
+        self.text(f"[{self.screenWidth.cm} x {self.screenHeight.cm}] cm", line=-4, xAlign=-1)
+        self.text(f"[{self.screenWidth.deg:.1f} x {self.screenHeight.deg:.1f}] deg", line=-3, xAlign=-1)
         self.text(f"[{self.screenWidth.pix} x {self.screenHeight.pix}] pixels frameRate: {self.frameRate}", line=-2, xAlign=-1)
 
         # draw polar angle lines
