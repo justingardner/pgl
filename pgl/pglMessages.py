@@ -27,8 +27,9 @@ class pglMessages:
             print(f"({cls.getCallerName(callerNameDepth)}) {msg}")
 
     @classmethod
-    def warning(cls, msg, level=2, callerNameDepth=2):
-        print(cls._formatMessage(msg,level,callerNameDepth))
+    def warning(cls, msg, level=2, callerNameDepth=2, verbose=True):
+        if verbose:
+            print(cls._formatMessage(msg,level,callerNameDepth))
     
     @classmethod
     def _formatMessage(cls, msg, level=2, callerNameDepth=3):
