@@ -181,11 +181,18 @@ class pglDevices:
         eventList = []
         for device in self.devices: 
             # poll each device for events
-            eventList = device.poll()
-            # add them to the events list
-            self.eventsAdd(eventList)
+            eventList.extend(device.poll())
+
         # return the eventList
         return eventList
+
+    def deviceStatus(self):
+        """
+        display status of all devices
+
+        This method iterates through all devices and calls their status method.
+        """
+        for device in self.devices: device.status()
 
 ################################################################
 #  Abstract base class defining the interface for

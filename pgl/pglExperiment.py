@@ -590,6 +590,10 @@ class pglExperiment(pglExperimentBase):
 
             # initialize eye tracker
             self.initEyeTracker()    
+
+            # display device status
+            self.pgl.deviceStatus()
+
         except Exception as e:
             pglMessages.warning(f"Could not open screen. Error {type(e).__name__}: {e}")    
             self.state.openScreen = False
@@ -784,7 +788,7 @@ class pglExperiment(pglExperimentBase):
 
             # grab any events that match the keyList and return their index within that list
             subjectResponses = [keyIndex for e in events if e.type == "keyboard" and e.eventType == "keydown" and e.keyCode in self.state.responseKeyCodesList for keyIndex in [self.state.responseKeyCodesList.index(e.keyCode)]]
-                
+
             # update tasks in current phase
             phaseDone = False
             updateTime = self.pgl.getSecs()
