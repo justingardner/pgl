@@ -36,6 +36,9 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 from .pglMessages import pglMessages
 import traceback
+import re
+
+
 
 #######################################
 # _pglTraitsDialog
@@ -694,10 +697,15 @@ class _pglTraitsDialog(QDialog):
             if len(lst) <= 1:
                 return
 
+            # make a sort key which sorts by numbers if they are in the name
+            def naturalSortKey(s):
+                return [int(chunk) if chunk.isdigit() else chunk.lower()
+                for chunk in re.split(r'(\d+)', s)]
+
             # sort the remaining values
             remaining = [x for x in lst if x is not obj]
             remaining.sort(
-                key=lambda x: str(getattr(x, keyTraitName))
+                key=lambda x: naturalSortKey(str(getattr(x, keyTraitName)))
             )
 
             # make list with selected item at top with 
