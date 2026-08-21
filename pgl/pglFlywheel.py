@@ -19,7 +19,7 @@ class pglFlywheelSession(pglTraitSettings):
     name = Unicode(help='Name of session',visible=False)
     subjectID = Unicode(help='subjectID', enable=False)
     id = Unicode(help='session ID', visible=False)
-    scans = List(Instance(pglFlywheelScan), help="Scans in session", settingsListKey="name", multiSelect=True)
+    scans = List(Instance(pglFlywheelScan), help="Scans in session", settingsListKey="name", multiSelect=True, maxRowsVisible=12)
 
 class pglFlywheelProject(pglTraitSettings):
     name = Unicode(help='Name of project',visible=False)
