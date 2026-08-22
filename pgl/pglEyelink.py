@@ -19,6 +19,7 @@ import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 import os
 from datetime import datetime
+from .pglMessages import pglMessages
 try:
     import pylink
     _HAVE_PYLINK = True
@@ -41,47 +42,71 @@ class pglEyelink(pglEyeTracker):
         """
         # call superclass constructor
         super().__init__(pgl, deviceType)
-        # get library
-        if not _HAVE_PYLINK:
-            print("(pglEyelink) ❌ pylink is not installed. Please install it from SR-Research website to use Eyelink.")
-            return
-        
-        print(f"(pglEyelink) Attempting to connect to Eyelink at {eyelinkAddress}...")
-        
-        if not self.eyelinkIsAvailable(eyelinkAddress=eyelinkAddress):
-            print(f"(pglEyelink) ❌ No Eyelink found at {eyelinkAddress}.")
-            self.eyelink = None
-            return
-        
-        # create an eyelink instance
+
         try:
-            self.eyelink = pylink.EyeLink(eyelinkAddress)
-        except RuntimeError as e:
-            print(f"(pglEyelink) Error initializing Eyelink: {e}")
-            self.eyelink = None
-            return
+            # get library
+            if not _HAVE_PYLINK:
+                pglMessages.warning(f"pylink is not installed. Please install it from SR-Research website to use Eyelink.")
+                return
         
-        # open a data file
-        self.edfFilename = ""
-        if not self.openEDF(edfFilename):
-            print(f"(pglEyelink) ❌ Not recording to EDF file because of error opening file")
+            print(f"(pglEyelink) Attempting to connect to Eyelink at {eyelinkAddress}...")
         
-        # send over a command to let the tracker know the correct screen resolution
-        if not self.pgl is None:
-            screenCoordsCommand = f"screen_pixel_coords = 0 0 {self.pgl.screenWidth.pix-1} {self.pgl.screenHeight.pix-1}"
-            self.eyelink.sendCommand(screenCoordsCommand)
-        
-            # setup our custom display so that the eyelink calls pgl functions
-            # to display targets for calibration and validation
-            pylink.closeGraphics()
-            self.customDisplay = pglEyelinkCustomDisplay(self.pgl, self.eyelink)
-            pylink.openGraphicsEx(self.customDisplay)
+            if not self.eyelinkIsAvailable(eyelinkAddress=eyelinkAddress):
+                pglMessages.warning(f"No Eyelink found at {eyelinkAddress}.")
+                self.eyelink = None
+                return
             
-            print(f"(pglEyelink) Using pgl display for Eyelink calibration and validation.")
+            # create an eyelink instance
+            try:
+                self.eyelink = pylink.EyeLink(eyelinkAddress)
+            except RuntimeError as e:
+                pglMessages.warning(f"(pglEyelink) Error initializing Eyelink: {e}")
+                self.eyelink = None
+                return
+            
+            # open a data file
+            self.edfFilename = ""
+            if not self.openEDF(edfFilename):
+                pglMessages.warning(f"Not recording to EDF file because of error opening file")
+            
+            # send over a command to let the tracker know the correct screen resolution
+            if not self.pgl is None:
+                screenCoordsCommand = f"screen_pixel_coords = 0 0 {self.pgl.screenWidth.pix-1} {self.pgl.screenHeight.pix-1}"
+                self.eyelink.sendCommand(screenCoordsCommand)
+            
+                # setup our custom display so that the eyelink calls pgl functions
+                # to display targets for calibration and validation
+                pylink.closeGraphics()
+                self.customDisplay = pglEyelinkCustomDisplay(self.pgl, self.eyelink)
+                pylink.openGraphicsEx(self.customDisplay)
+                
+                print(f"(pglEyelink) Using pgl display for Eyelink calibration and validation.")
+        except Exception as e:
+            pglMessages.warning("Could not initialize Eyelink: {e}")
 
     @staticmethod
     def eyelinkIsAvailable(eyelinkAddress="100.1.1.1", timeout=3.0):
-        """Check if EyeLink host PC is reachable before initializing pylink."""
+        """Return True if the EyeLink Host PC responds on its control port."""
+        import socket
+        try:
+            with socket.create_connection((eyelinkAddress, 5555), timeout=timeout):
+                return True
+        except socket.timeout:
+            pglMessages.warning(
+                f"EyeLink at {eyelinkAddress} did not respond within {timeout:.1f} seconds."
+            )
+            return False
+        except ConnectionRefusedError:
+            pglMessages.warning(
+                f"EyeLink host at {eyelinkAddress} refused the connection on TCP port 5555."
+            )
+            return False
+        except OSError as e:
+            pglMessages.warning(
+                f"EyeLink at {eyelinkAddress}:5555 is not reachable ({e})."
+            )
+            return False
+
         import threading        
         result = {'available': False, 'tracker': None}
         
