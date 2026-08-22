@@ -26,7 +26,9 @@ try:
 except ImportError:
     pylink = None
     _HAVE_PYLINK = False
-    
+
+# global variable to set print of debug messages
+debugVerbose = False 
 #############
 # Eyelink class
 #############
@@ -49,7 +51,7 @@ class pglEyelink(pglEyeTracker):
                 pglMessages.warning(f"pylink is not installed. Please install it from SR-Research website to use Eyelink.")
                 return
         
-            print(f"(pglEyelink) Attempting to connect to Eyelink at {eyelinkAddress}...")
+            pglMessages.message(f"(pglEyelink) Attempting to connect to Eyelink at {eyelinkAddress}...")
         
             if not self.eyelinkIsAvailable(eyelinkAddress=eyelinkAddress):
                 pglMessages.warning(f"No Eyelink found at {eyelinkAddress}.")
@@ -80,32 +82,13 @@ class pglEyelink(pglEyeTracker):
                 self.customDisplay = pglEyelinkCustomDisplay(self.pgl, self.eyelink)
                 pylink.openGraphicsEx(self.customDisplay)
                 
-                print(f"(pglEyelink) Using pgl display for Eyelink calibration and validation.")
+                pglMessages.message(f"(pglEyelink) Using pgl display for Eyelink calibration and validation.")
         except Exception as e:
-            pglMessages.warning("Could not initialize Eyelink: {e}")
+            pglMessages.warning(f"Could not initialize Eyelink: {e}")
 
     @staticmethod
     def eyelinkIsAvailable(eyelinkAddress="100.1.1.1", timeout=3.0):
         """Return True if the EyeLink Host PC responds on its control port."""
-        import socket
-        try:
-            with socket.create_connection((eyelinkAddress, 5555), timeout=timeout):
-                return True
-        except socket.timeout:
-            pglMessages.warning(
-                f"EyeLink at {eyelinkAddress} did not respond within {timeout:.1f} seconds."
-            )
-            return False
-        except ConnectionRefusedError:
-            pglMessages.warning(
-                f"EyeLink host at {eyelinkAddress} refused the connection on TCP port 5555."
-            )
-            return False
-        except OSError as e:
-            pglMessages.warning(
-                f"EyeLink at {eyelinkAddress}:5555 is not reachable ({e})."
-            )
-            return False
 
         import threading        
         result = {'available': False, 'tracker': None}
@@ -139,11 +122,11 @@ class pglEyelink(pglEyeTracker):
         """Destructor to clean up resources."""
         if self.eyelink is not None:
             if self.eyelink.isConnected():
-                print("(pglEyelink) Closing connection to Eyelink.")
+                pglMessages.message("(pglEyelink) Closing connection to Eyelink.")
                 try:
                     self.eyelink.close()
                 except Exception as e:
-                    print(f"(pglEyelink) Error closing Eyelink: {e}")
+                    pglMessages.warning(f"(pglEyelink) Error closing Eyelink: {e}")
 
 
     def start(self, filename="PGL00000"):
@@ -153,11 +136,11 @@ class pglEyelink(pglEyeTracker):
             filename: Name of file on Eyelink to save data to
         """
         if self.eyelink is None:
-            print("(pglEyelink) ❌ Cannot start recording: Eyelink is not initialized")
+            pglMessages.warning("Cannot start recording: Eyelink is not initialized",level=1)
             return
 
         if not self.edfFilename:
-            print(f("pglEyelink:start) ❌ data not being saved because openEDF has not been called"))
+            pglMessages.warning(f"Data not being saved because openEDF has not been called",level=1)
 
         # start recording
         error = self.eyelink.startRecording(1,1,1,1)
@@ -173,25 +156,25 @@ class pglEyelink(pglEyeTracker):
                 self.sendMessage(f"pgl: start getSecs={self.pgl.getSecs()}")
                 self.sendMessage(f"pgl: start screenWidthPix={self.pgl.screenWidth.pix} screenHeightPix={self.pgl.screenHeight.pix} screenWidthDeg={self.pgl.screenWidth.deg} screenHeightDeg={self.pgl.screenHeight.deg}")
 
-                print("(pglEyeTracker) Eye tracking started.")
+                pglMessages.message("Eye tracking started.")
             else:
-                print("(pglEyeTracker) Recording command sent but not confirmed")
+                pglMessages.warning("Recording command sent but not confirmed",level=1)
         else:
-            print(f"(pglEyeTracker) ❌ Could not start recording. Error: {error}")
+            pglMessages.warning(f"Could not start recording. Error: {error}")
 
     def sendMessage(self, message):
         '''sendMessage'''
         if not self.edfFilename:
-            print(f"(pglEyelink:sendMessage) ❌ Could not send message {message}, openEDF must be used to initialize file")
+            pglMessages.warning(f"Could not send message {message}, openEDF must be used to initialize file")
             return
         else:
-            print(f"(pglEyelink:sendMessage) Sending message {message}")
+            pglMessages.message(f"Sending message {message}")
         self.eyelink.sendMessage(message)
 
     def stop(self):
         """Stop eye tracking."""
         if self.eyelink is None:
-            print("(pglEyelink) ❌ Cannot stop recording: Eyelink is not initialized")
+            pglMessages.message("Cannot stop recording: Eyelink is not initialized")
             return False
         
         # Add small delay before stopping
@@ -211,10 +194,10 @@ class pglEyelink(pglEyeTracker):
     
         # Verify stopped
         if self.eyelink.isRecording() != 0:
-            print("(pglEyeTracker) Eye tracking stopped.")
+            pglMessages.message("(pglEyeTracker) Eye tracking stopped.")
             return True
         else:
-            print("(pglEyeTracker) Warning: Still recording after stop command")
+            pglMessages.warning("Still recording after stop command", level=1)
             return False    
 
     def openEDF(self, filename):
@@ -229,7 +212,7 @@ class pglEyelink(pglEyeTracker):
         # Ensure file name is valid (max 8 chars for DOS compatibility)
         filestem, fileext = os.path.splitext(filename)
         if len(filestem) > 8:
-            print(f"(pglEyeTracker) Warning: File name '{filename}' too long. Truncating to 8 chars.")
+            pglMessages.warning(f"File name '{filename}' too long. Truncating to 8 chars.",level=1)
             filestem = filestem[:8]
         filename = filestem + ".edf"
     
@@ -238,16 +221,16 @@ class pglEyelink(pglEyeTracker):
             error = self.eyelink.openDataFile(filename)
         
             if error == 0:
-                print(f"(pglEyeTracker) Data file opened: {filename}")
+                pglMessages.message(f"Data file opened: {filename}")
                 self.edfFilename = filename
                 return True
             else:
-                print(f"(pglEyeTracker) Failed to open data file. Error: {error}")
+                pglMessages.warning(f"Failed to open data file. Error: {error}")
                 self.edfFilename = ""
                 return False
             
         except Exception as e:
-            print(f"(pglEyeTracker) Exception opening file: {e}")
+            pglMessages.warning(f"Exception opening file: {e}")
             self.edfFilename = filename
             return False
         
@@ -265,10 +248,10 @@ class pglEyelink(pglEyeTracker):
         # Stop recording first
         if self.eyelink.isRecording():
             if not self.stop():
-                print("(pglEyeTracker) Warning: Issue stopping recording")
+                pglMessages.warning("Warning: Issue stopping recording", level=1)
         
         # Close file on Host PC
-        print("(pglEyeTracker) Closing data file...")
+        pglMessages.message("Closing data file...")
         self.eyelink.closeDataFile()
         pylink.msecDelay(100)
         
@@ -282,19 +265,19 @@ class pglEyelink(pglEyeTracker):
         filename = filename + ".edf"
         
         # Transfer file
-        print(f"(pglEyeTracker) Transferring data file...")
+        pglMessages.message(f"Transferring data file...")
         result = self.eyelink.receiveDataFile(self.edfFilename, filename)
         
         if result > 0:
             if os.path.exists(filename):
                 filesize = os.path.getsize(filename)
-                print(f"(pglEyeTracker) Successfully saved: {filename} ({filesize} bytes)")
+                pglMessages.message(f"(pglEyeTracker) Successfully saved: {filename} ({filesize} bytes)")
                 return True
             else:
-                print(f"(pglEyeTracker) Transfer reported success but file not found locally")
+                pglMessages.warning(f"Transfer reported success but file {filename} not found locally")
                 return False
         else:
-            print(f"(pglEyeTracker) Transfer failed. Error code: {result}")
+            pglMessages.warning(f"Transfer failed. Error code: {result}")
             return False        
     
     def setCustomCalibrationPoints(self, margin=0.2, numPoints=9):
@@ -305,7 +288,7 @@ class pglEyelink(pglEyeTracker):
             numPoints: Number of calibration points (5, 9, or 13) 
         """
         if self.eyelink is None:
-            print("(pglEyelink:setCustomCalibrationPoints) ❌ Eyelink is not initialized.")
+            pglMessages.warning("Eyelink is not initialized.",level=1)
             return
         
         # Set custom calibration targets based on screen size
@@ -346,7 +329,7 @@ class pglEyelink(pglEyeTracker):
                 ])
                 self.eyelink.sendCommand("calibration_type = HV13")
             case _:
-                print(f"(pglEyelink) Warning: {numPoints} points not supported, defaulting to 9")
+                pglMessages.warning(f"(pglEyelink) Warning: {numPoints} points not supported, defaulting to 9",level=1)
                 self.eyelink.sendCommand("calibration_type = HV9")
             
         # send the calibration targets
@@ -357,10 +340,13 @@ class pglEyelink(pglEyeTracker):
     def calibrate(self):
         """Calibrate the eye tracker."""
         if self.eyelink is not None:
+            # clear the jupyter notebook window
+            print("#"*80)
             print("(pglEyelink:calibrate) Starting calibration routine")
             print("             Enter: Show camera image")
             print("             C: (C)alibrate V: (V)alidate")
             print("             0 or Q: (Q)uit calibration")
+            print("#"*80)
             try:
                 # Put tracker in offline mode before calibration
                 self.eyelink.setOfflineMode()
@@ -379,14 +365,14 @@ class pglEyelink(pglEyeTracker):
                 self.eyelink.doTrackerSetup()
 
             except Exception as e:
-                print(f"(pglEyelink) Error during calibration: {e}")
+                pglMessages.warning(f"(pglEyelink) Error during calibration: {e}")
 
             finally:
                 # reset eatkeys
                 self.pgl.setEatKeys(eatKeys)
   
         else:
-            print("(pglEyelink) ❌ Eyelink is not initialized.")
+            pglMessages.warning("Eyelink is not initialized.")
 
 # define the custom display class for eyelink
 if _HAVE_PYLINK:
@@ -394,6 +380,9 @@ if _HAVE_PYLINK:
         def __init__(self, pgl, eyelink=None):
             # init super class
             super().__init__()
+
+            # if debug, will show print messages
+            self.debug = debugVerbose
             # store pgl and eyelink instance
             self.pgl = pgl
             self._tracker = eyelink
@@ -481,7 +470,7 @@ if _HAVE_PYLINK:
             self.cameraImageBuffer = np.zeros((height, width, 3), dtype=np.float32)
             # clear display
             self.clear_cal_display()
-            print("(pglEyelink) setup_image_display")
+            if self.debug: pglMessages.message("setup_image_display")
             return 1
 
         def image_title(self, text):
@@ -526,7 +515,7 @@ if _HAVE_PYLINK:
         def draw_cal_target(self, x, y):
             """ draw the calibration target, i.e., a bull's eye"""
             
-            print(f"(pglEyelink) Calibration target at ({x},{y})")
+            if self.debug: pglMessages.message(f"Calibration target at ({x},{y})")
 
             # draw target as a filled circle with a cross
             self.pgl.circle(x=x, y=y, radius=self.targetSizePixels/2, color=self.foregroundColor, fill=True, units='pix')
@@ -561,27 +550,27 @@ if _HAVE_PYLINK:
                     keyChar = event.keyChar
                     keyCode = event.keyCode
                     
-                    print(f">>> Processing keydown: '{keyChar}' (code: {keyCode})")
+                    if self.debug: pglMessages.message(f">>> Processing keydown: '{keyChar}' (code: {keyCode})")
                     
                     # Check if it's a special key in our map
                     if keyChar in self.keyMap:
                         pylinkKey = self.keyMap[keyChar]
-                        print(f">>> Mapped special key '{keyChar}' -> {pylinkKey}")
+                        if self.debug: pglMessages.message(f">>> Mapped special key '{keyChar}' -> {pylinkKey}")
                         keyboardEvents.append(pylink.KeyInput(pylinkKey, modifier))
                     
                     # Single character (letters, numbers, symbols)
                     elif keyChar and len(keyChar) == 1:
                         pylinkKey = ord(keyChar)
-                        print(f">>> Single char '{keyChar}' -> {pylinkKey}")
+                        if self.debug: pglMessages.message(f">>> Single char '{keyChar}' -> {pylinkKey}")
                         keyboardEvents.append(pylink.KeyInput(pylinkKey, modifier))
                     
                     # Fallback to keyCode
                     elif keyCode is not None:
-                        print(f">>> Using keyCode: {keyCode}")
+                        if self.debug: pglMessages.message(f">>> Using keyCode: {keyCode}")
                         keyboardEvents.append(pylink.KeyInput(keyCode, modifier))
                     
                     else:
-                        print(f">>> Skipping unknown key")
+                        if self.debug: pglMessages.message(f">>> Skipping unknown key")
             
             return keyboardEvents
         def draw_line(self, x1, y1, x2, y2, colorindex):
@@ -633,7 +622,7 @@ if _HAVE_PYLINK:
             self.clear_cal_display()
 
         def alert_printf(self, msg):
-            print(msg)
+            pglMessages.warning(msg, level=0)
 
 class pglEyelinkData(pglEyeTrackerData):
     """Parser for EyeLink .asc files."""
@@ -749,7 +738,7 @@ class pglEyelinkData(pglEyeTrackerData):
 
         # loop through each saccade event
         nBlinks = len(self.blinks['startTime'])
-        print(f"Converting {nBlinks} blink events to pglEyeTrackerData...")
+        pglMessages.message(f"Converting {nBlinks} blink events to pglEyeTrackerData...")
         for i in range(nBlinks):
             b = pglEventBlink(
                 timeStart=self.blinks['startTime'][i],

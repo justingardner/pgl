@@ -847,10 +847,15 @@ class pglExperiment(pglExperimentBase):
 
             # init the eyeink
             print(f"(pglExperiment) Initialize Eyelink with filename: {self.settings.edfFilename}")
-            self.eyeTracker = pglEyelink(pgl=self.pgl, edfFilename=self.settings.edfFilename)        
+            self.eyeTracker = pglEyelink(pgl=self.pgl, edfFilename=self.settings.edfFilename)  
+
+            # check if running
+            if self.eyeTracker.eyelink is None:
+                self.eyeTracker = None      
 
             # FIX: these should come from some settings
-            self.eyeTracker.setCustomCalibrationPoints(margin=0.7, numPoints=9)
+            if self.eyeTracker is not None:
+                self.eyeTracker.setCustomCalibrationPoints(margin=0.7, numPoints=9)
 
         elif self.settings.eyetracker[0] == "None":
             self.eyeTracker = None
@@ -870,11 +875,18 @@ class pglExperiment(pglExperimentBase):
             # FIX: These could be exposed 
             self.settings.calibrateKey = 'space'
             self.settings.calibrateKeyCode = self.keyboardMouse.charToKeyCode(self.settings.calibrateKey)
-            self.settings.skipCalibrationKey = 'enter'
+            self.settings.skipCalibrationKey = 'return'
             self.settings.skipCalibrationKeyCode = self.keyboardMouse.charToKeyCode(self.settings.skipCalibrationKey)
             # instructions
             displayText = f"Press {self.settings.calibrateKey} to calibrate eye tracker. {self.settings.skipCalibrationKey} to skip."
-            print("(pglExperiment:calibrateEyeTracker) " + displayText)
+            pglMessages.message(displayText)
+
+            k = self.pgl.devicesGetKeyboard()            
+            eatKeys = k.eatKeyCodes
+
+            # eat relevant keys
+            self.pgl.setEatKeys(keyChars=[self.settings.calibrateKey, self.settings.skipCalibrationKey])
+
             # wait till we get a response
             while self.state.waitingForCalibration:
                 self.pgl.text(displayText, y=0)
@@ -884,6 +896,10 @@ class pglExperiment(pglExperimentBase):
                 events = self.pgl.poll()
                 self.data.events.extend(events)
 
+                if events:
+                    for e in events:
+                        e.print()
+
                 # see if we have a match to startKey
                 if [e for e in events if e.type == "keyboard" and e.eventType == "keydown"and e.keyCode == self.settings.calibrateKeyCode]:
                     self.state.waitingForCalibration = False
@@ -892,7 +908,10 @@ class pglExperiment(pglExperimentBase):
                     self.state.waitingForCalibration = False
                     self.state.runCalibration = False
                     print("(pglExperiment:calibrateEyeTracker) Skipping eye tracker calibration.")
-                
+
+            # reset eat keys
+            self.pgl.setEatKeys(eatKeys)    
+            
             # if we should run calibration, then do it
             if self.state.runCalibration:
                 self.eyeTracker.calibrate()
