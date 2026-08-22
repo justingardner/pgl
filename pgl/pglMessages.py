@@ -24,7 +24,7 @@ class pglMessages:
     @classmethod
     def message(cls, msg, callerNameDepth=2, verbose=True):
         if verbose:
-            print(f"({cls.getCallerName(callerNameDepth)}) {msg}")
+            print(f"({cls.getCallerName(callerNameDepth)}) {cls.wrapText(msg)}")
 
     @classmethod
     def warning(cls, msg, level=2, callerNameDepth=2, verbose=True):
@@ -33,6 +33,7 @@ class pglMessages:
     
     @classmethod
     def _formatMessage(cls, msg, level=2, callerNameDepth=3):
+        msg = cls.wrapText(msg)
         if level == 0:
             msg = f"({cls.getCallerName(callerNameDepth)}) ⚠️ {msg} ⚠️"
         elif level == 1:
@@ -40,6 +41,38 @@ class pglMessages:
         elif level == 2:
             msg = "❌"*80 + "\n" + f"({cls.getCallerName(callerNameDepth+1)}) {msg}\n" + "❌"*80
         return(msg)
+    
+    @staticmethod
+    def wrapText(msg: str, lineLength: int = 80) -> str:
+        """
+        Split msg into lines, preferring to break at a space.
+        If no space is found within lineLength characters, break at lineLength anyway.
+
+        Args:
+            msg: The string to wrap.
+            lineLength: Max characters per line (default 80).
+
+        Returns:
+            The message with '\n' inserted as needed.
+        """
+        lines = []
+        remaining = msg
+
+        while len(remaining) > lineLength:
+            # Look for the last space within the lineLength window
+            breakAt = remaining.rfind(' ', 0, lineLength + 1)
+
+            if breakAt == -1:
+                # No space found within window; hard break at lineLength
+                breakAt = lineLength
+                lines.append(remaining[:breakAt])
+                remaining = remaining[breakAt:]
+            else:
+                lines.append(remaining[:breakAt])
+                remaining = remaining[breakAt + 1:]  # skip the space
+
+        lines.append(remaining)
+        return '\n'.join(lines) 
         
     @classmethod
     def oneTimeWarning(cls, msg, level=2):
