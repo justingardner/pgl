@@ -896,10 +896,6 @@ class pglExperiment(pglExperimentBase):
                 events = self.pgl.poll()
                 self.data.events.extend(events)
 
-                if events:
-                    for e in events:
-                        e.print()
-
                 # see if we have a match to startKey
                 if [e for e in events if e.type == "keyboard" and e.eventType == "keydown"and e.keyCode == self.settings.calibrateKeyCode]:
                     self.state.waitingForCalibration = False
@@ -911,7 +907,7 @@ class pglExperiment(pglExperimentBase):
 
             # reset eat keys
             self.pgl.setEatKeys(eatKeys)    
-            
+
             # if we should run calibration, then do it
             if self.state.runCalibration:
                 self.eyeTracker.calibrate()
