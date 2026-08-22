@@ -1097,6 +1097,7 @@ class pglDisplaySettingsList(pglTraitSettings):
         try:
             from pgl import pgl
             pgl = pgl()
+            pgl.cleanUp()
             from .pglExperiment import pglExperiment
             from .pglTasks import pglTestTask
 
@@ -1111,10 +1112,15 @@ class pglDisplaySettingsList(pglTraitSettings):
             
             # and run
             e.run()
-            
+
             # print settings
-            #self.settingsList[0].print()
-            #self.settingsList[0].displayModes[0].print()
+            if not e.state.runFinishedWithError:
+                self.settingsList[0].print()
+                self.settingsList[0].displayModes[0].print()
+            else:
+                # clean up windows just in case the window did no close properly
+                pgl.cleanUp()
+
 
         except Exception as e:
             pglMessages.warning(f"Could not run test. Error {type(e).__name__}: {e}")    
@@ -1265,10 +1271,15 @@ class pglSettingsList(pglTraitSettings):
             # and run
             e.run()
             
-            # print settings
-            self.settingsList[0].print()
-            self.settingsList[0].displays[0].print()
-            self.settingsList[0].displays[0].displayModes[0].print()
+            if not e.state.runFinishedWithError:
+                # print settings
+                self.settingsList[0].print()
+                self.settingsList[0].displays[0].print()
+                self.settingsList[0].displays[0].displayModes[0].print()
+            else:
+                # clean up windows just in case the window did no close properly
+                pgl.cleanUp()
+
         except Exception as e:
             pglMessages.warning(f"Could not run test. Error {type(e).__name__}: {e}")    
             return
