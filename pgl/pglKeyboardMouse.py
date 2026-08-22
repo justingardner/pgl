@@ -453,48 +453,53 @@ class pglEventKeyboard(pglEvent):
 # Keyboard input buffer for text entry
 ######################################
 class pglKeyBuffer:
-    def __init__(self, maxLineLength=40, wrapTolerance=3):
+    def __init__(
+        self,
+        maxLineLength=80,
+        wrapTolerance=3
+    ):
         """
-        Keyboard input buffer for text entry with automatic word wrapping.
+        Keyboard input buffer with word wrapping.
 
         Args:
             maxLineLength (int):
-                Preferred maximum number of characters per line.
+                Target maximum number of characters per displayed line.
 
             wrapTolerance (int):
-                Number of characters that a line may be under or over
-                maxLineLength when deciding where to wrap.
+                How far a line may be under/over maxLineLength when
+                choosing a word-wrap point.
 
-                Example:
-                    maxLineLength=80
-                    wrapTolerance=3
-
-                The wrapper will prefer a space near character 80,
-                searching within approximately 77-83 characters.
-
-        Notes:
-            - Newlines explicitly entered by the user are HARD breaks.
-            - Automatic wrapping does not cross hard breaks.
-            - Words are wrapped at spaces when possible.
-            - If no suitable space is found, a '-' is inserted and the
-              word is broken.
-            - Automatically inserted newlines and hyphens are regenerated
-              whenever the text changes.
-            - Cursor position is maintained in logical text coordinates,
-              so reflow does not move the user's cursor.
+        Behavior:
+            - User-entered newlines are preserved.
+            - Automatic wrapping occurs at spaces when possible.
+            - If a word is too long, a '-' is inserted and the word
+              is broken.
+            - Automatic line breaks are sticky during normal typing.
+            - Editing existing text causes local reflow.
+            - Cursor position always refers to the underlying buffer,
+              not the wrapped display representation.
         """
+
+        self.buffer = ""
+        self.cursorPosition = 0
 
         self.maxLineLength = maxLineLength
         self.wrapTolerance = wrapTolerance
 
-        # Logical text entered by the user.
-        #
-        # This contains user-entered newlines, but NOT automatically
-        # generated wrapping newlines or hyphens.
-        self.buffer = ""
+        # Positions of user-entered newline characters.
+        # These are positions in self.buffer.
+        self.hardBreaks = set()
 
-        # Cursor position in logical buffer coordinates.
-        self.cursorPosition = 0
+        # Positions in the underlying buffer where automatic visual
+        # line breaks occur.
+        #
+        # A break at position N means:
+        #
+        #     buffer[:N]
+        #     buffer[N:]
+        #
+        # are displayed on separate lines.
+        self.wrapBreaks = set()
 
         # MacOS key codes
         self.keyCodeMap = {
@@ -505,12 +510,12 @@ class pglKeyBuffer:
             38: 'j', 40: 'k', 45: 'n', 46: 'm',
 
             # Numbers
-            18: '1', 19: '2', 20: '3', 21: '4', 23: '5', 22: '6', 26: '7',
-            28: '8', 25: '9', 29: '0',
+            18: '1', 19: '2', 20: '3', 21: '4', 23: '5', 22: '6',
+            26: '7', 28: '8', 25: '9', 29: '0',
 
             # Special characters
-            27: '-', 24: '=', 33: '[', 30: ']', 41: ';', 39: "'", 42: '\\',
-            43: ',', 47: '.', 44: '/',
+            27: '-', 24: '=', 33: '[', 30: ']', 41: ';', 39: "'",
+            42: '\\', 43: ',', 47: '.', 44: '/',
 
             # Space
             49: ' ',
@@ -537,16 +542,18 @@ class pglKeyBuffer:
         # Special function key codes
         self.deleteKey = 51
         self.forwardDeleteKey = 117
+
         self.leftArrowKey = 123
         self.rightArrowKey = 124
         self.upArrowKey = 126
         self.downArrowKey = 125
+
         self.homeKey = 115
         self.endKey = 119
 
-    ##################################################################
-    # Keyboard processing
-    ##################################################################
+    ############################################################
+    # Event processing
+    ############################################################
 
     def processEvent(self, event):
         """
@@ -565,7 +572,7 @@ class pglKeyBuffer:
         Process a key code and update the buffer.
 
         Returns:
-            bool: True if buffer/cursor was modified.
+            True if the buffer/cursor was modified.
         """
 
         if modifiers is None:
@@ -575,13 +582,15 @@ class pglKeyBuffer:
                 'option': False
             }
 
-        # Editing keys
+        # Backspace
         if keyCode == self.deleteKey:
             return self.backspace()
 
+        # Forward delete
         elif keyCode == self.forwardDeleteKey:
             return self.delete()
 
+        # Cursor movement
         elif keyCode == self.leftArrowKey:
             return self.moveCursorLeft(
                 modifiers.get('command', False)
@@ -598,14 +607,19 @@ class pglKeyBuffer:
         elif keyCode == self.endKey:
             return self.moveCursorToEnd()
 
+        # Up/down are intentionally not implemented here.
+        # They require mapping the cursor into wrapped display lines.
+
         # Regular character
         elif keyCode in self.keyCodeMap:
+
             char = self.keyCodeMap[keyCode]
 
-            # Apply shift
             if modifiers.get('shift', False):
+
                 if char.isalpha():
                     char = char.upper()
+
                 elif char in self.shiftMap:
                     char = self.shiftMap[char]
 
@@ -613,17 +627,18 @@ class pglKeyBuffer:
 
         return False
 
-    ##################################################################
-    # Text modification
-    ##################################################################
+    ############################################################
+    # Text insertion
+    ############################################################
 
     def insertCharacter(self, char):
         """
-        Insert a character at the logical cursor position.
+        Insert a character at the cursor.
 
-        Newline characters inserted here are considered USER newline
-        characters and therefore become hard wrapping boundaries.
+        Newline creates a hard/user line break.
         """
+
+        oldPosition = self.cursorPosition
 
         self.buffer = (
             self.buffer[:self.cursorPosition]
@@ -633,59 +648,375 @@ class pglKeyBuffer:
 
         self.cursorPosition += len(char)
 
+        # Adjust existing break positions because text was inserted.
+        self._shiftBreaksAfterInsertion(
+            oldPosition,
+            len(char)
+        )
+
+        if char == '\n':
+            # This is a real user-entered newline.
+            self.hardBreaks.add(oldPosition)
+
+            # Remove automatic breaks immediately around it.
+            self.wrapBreaks.discard(oldPosition)
+            self.wrapBreaks.discard(oldPosition + 1)
+
+            # Reflow only the affected paragraph.
+            self._reflowAroundPosition(self.cursorPosition)
+
+        else:
+            # Normal typing.
+            #
+            # Reflow locally only if the current line has become too long.
+            self._wrapIfNecessary(self.cursorPosition)
+
         return True
+
+    ############################################################
+    # Backspace
+    ############################################################
 
     def backspace(self):
         """
-        Delete the character before the logical cursor.
+        Delete the character before the cursor.
+
+        Deleting causes local reflow because text may now fit
+        differently on the surrounding lines.
         """
 
-        if self.cursorPosition > 0:
+        if self.cursorPosition <= 0:
+            return False
 
-            self.buffer = (
-                self.buffer[:self.cursorPosition - 1]
-                + self.buffer[self.cursorPosition:]
-            )
+        deletePosition = self.cursorPosition - 1
 
-            self.cursorPosition -= 1
+        # Was this a user-entered newline?
+        wasHardBreak = deletePosition in self.hardBreaks
 
-            return True
+        # Remove character
+        self.buffer = (
+            self.buffer[:deletePosition]
+            + self.buffer[deletePosition + 1:]
+        )
 
-        return False
+        self.cursorPosition -= 1
+
+        # Update break positions
+        self._shiftBreaksAfterDeletion(deletePosition)
+
+        if wasHardBreak:
+            self.hardBreaks.remove(deletePosition)
+
+        # Reflow affected paragraph/region.
+        self._reflowAroundPosition(self.cursorPosition)
+
+        return True
+
+    ############################################################
+    # Forward delete
+    ############################################################
 
     def delete(self):
         """
-        Delete the character after the logical cursor.
+        Delete the character at the cursor and locally reflow.
         """
 
-        if self.cursorPosition < len(self.buffer):
+        if self.cursorPosition >= len(self.buffer):
+            return False
 
-            self.buffer = (
-                self.buffer[:self.cursorPosition]
-                + self.buffer[self.cursorPosition + 1:]
+        deletePosition = self.cursorPosition
+
+        wasHardBreak = deletePosition in self.hardBreaks
+
+        self.buffer = (
+            self.buffer[:deletePosition]
+            + self.buffer[deletePosition + 1:]
+        )
+
+        self._shiftBreaksAfterDeletion(deletePosition)
+
+        if wasHardBreak:
+            self.hardBreaks.remove(deletePosition)
+
+        self._reflowAroundPosition(self.cursorPosition)
+
+        return True
+
+    ############################################################
+    # Break bookkeeping
+    ############################################################
+
+    def _shiftBreaksAfterInsertion(self, position, amount):
+        """
+        Move break positions after inserted text.
+        """
+
+        self.hardBreaks = {
+            p + amount if p >= position else p
+            for p in self.hardBreaks
+        }
+
+        self.wrapBreaks = {
+            p + amount if p >= position else p
+            for p in self.wrapBreaks
+        }
+
+    def _shiftBreaksAfterDeletion(self, position):
+        """
+        Move/remove break positions after deleted text.
+        """
+
+        self.hardBreaks = {
+            p - 1 if p > position else p
+            for p in self.hardBreaks
+            if p != position
+        }
+
+        self.wrapBreaks = {
+            p - 1 if p > position else p
+            for p in self.wrapBreaks
+            if p != position
+        }
+
+    ############################################################
+    # Wrapping
+    ############################################################
+
+    def _wrapIfNecessary(self, cursorPosition):
+        """
+        Check the current visual line.
+
+        If it has exceeded maxLineLength + tolerance, create
+        a sticky wrap.
+
+        Existing lines before the current line are NOT reconsidered.
+        """
+
+        lineStart = self._getLineStart(cursorPosition)
+        lineEnd = self._getLineEnd(cursorPosition)
+
+        lineLength = lineEnd - lineStart
+
+        if lineLength <= self.maxLineLength + self.wrapTolerance:
+            return
+
+        # Find the best break point.
+        breakPosition = self._findBreakPosition(
+            lineStart,
+            lineEnd
+        )
+
+        if breakPosition is not None:
+            self.wrapBreaks.add(breakPosition)
+
+    def _findBreakPosition(self, lineStart, lineEnd):
+        """
+        Find a good place to wrap.
+
+        Prefer a space near maxLineLength.
+
+        If no suitable space exists, break the word and insert
+        a hyphen.
+        """
+
+        target = lineStart + self.maxLineLength
+
+        # Search for spaces around target.
+        lowerBound = max(
+            lineStart + 1,
+            target - self.wrapTolerance
+        )
+
+        upperBound = min(
+            lineEnd - 1,
+            target + self.wrapTolerance
+        )
+
+        candidates = []
+
+        for position in range(lowerBound, upperBound + 1):
+
+            if position < len(self.buffer) and self.buffer[position] == ' ':
+                candidates.append(position)
+
+        if candidates:
+
+            # Pick the closest space to target.
+            return min(
+                candidates,
+                key=lambda p: abs(p - target)
             )
 
-            return True
+        # No nearby space.
+        #
+        # Find the nearest space anywhere in the line.
+        spaces = [
+            p for p in range(lineStart + 1, lineEnd)
+            if self.buffer[p] == ' '
+        ]
 
-        return False
+        if spaces:
+            return min(
+                spaces,
+                key=lambda p: abs(p - target)
+            )
 
-    ##################################################################
+        # No space at all: this is one long word.
+        #
+        # We don't physically insert '-' here because that would
+        # alter the user's underlying text. Instead, the display
+        # representation inserts it at the wrap point.
+        return target
+
+    ############################################################
+    # Local reflow
+    ############################################################
+
+    def _reflowAroundPosition(self, position):
+        """
+        Reflow the paragraph containing position.
+
+        Explicit user-entered newlines remain permanent.
+        """
+
+        paragraphStart = self._getParagraphStart(position)
+        paragraphEnd = self._getParagraphEnd(position)
+
+        # Remove automatic breaks within this paragraph.
+        self.wrapBreaks = {
+            p for p in self.wrapBreaks
+            if not (
+                paragraphStart < p < paragraphEnd
+            )
+        }
+
+        # Recalculate wrapping for this paragraph.
+        lineStart = paragraphStart
+
+        while lineStart < paragraphEnd:
+
+            lineLength = paragraphEnd - lineStart
+
+            if lineLength <= self.maxLineLength:
+                break
+
+            breakPosition = self._findBreakPosition(
+                lineStart,
+                paragraphEnd
+            )
+
+            if breakPosition is None:
+                break
+
+            self.wrapBreaks.add(breakPosition)
+
+            # Continue after the break.
+            lineStart = breakPosition
+
+            # Skip the space that caused the wrap.
+            if (
+                lineStart < len(self.buffer)
+                and self.buffer[lineStart] == ' '
+            ):
+                lineStart += 1
+
+    ############################################################
+    # Line / paragraph helpers
+    ############################################################
+
+    def _getParagraphStart(self, position):
+        """
+        Find the start of the hard-newline-delimited paragraph.
+        """
+
+        hardBreaksBefore = [
+            p for p in self.hardBreaks
+            if p < position
+        ]
+
+        if not hardBreaksBefore:
+            return 0
+
+        return max(hardBreaksBefore) + 1
+
+    def _getParagraphEnd(self, position):
+        """
+        Find the end of the hard-newline-delimited paragraph.
+        """
+
+        hardBreaksAfter = [
+            p for p in self.hardBreaks
+            if p >= position
+        ]
+
+        if not hardBreaksAfter:
+            return len(self.buffer)
+
+        return min(hardBreaksAfter)
+
+    def _getLineStart(self, position):
+        """
+        Find the start of the current visual line.
+        """
+
+        breaks = [
+            p for p in self.wrapBreaks
+            if p < position
+        ]
+
+        hardBreaks = [
+            p for p in self.hardBreaks
+            if p < position
+        ]
+
+        candidates = breaks + hardBreaks
+
+        if not candidates:
+            return 0
+
+        lastBreak = max(candidates)
+
+        # Hard newline means next line starts after newline.
+        if lastBreak in self.hardBreaks:
+            return lastBreak + 1
+
+        return lastBreak
+
+    def _getLineEnd(self, position):
+        """
+        Find the end of the current visual line.
+        """
+
+        breaks = [
+            p for p in self.wrapBreaks
+            if p > position
+        ]
+
+        hardBreaks = [
+            p for p in self.hardBreaks
+            if p >= position
+        ]
+
+        candidates = breaks + hardBreaks
+
+        if not candidates:
+            return len(self.buffer)
+
+        return min(candidates)
+
+    ############################################################
     # Cursor movement
-    ##################################################################
+    ############################################################
 
     def moveCursorLeft(self, jumpToStart=False):
         """
-        Move cursor left by one logical character.
-
-        If jumpToStart is True, move to beginning of buffer.
+        Move cursor left by one position, or to beginning.
         """
 
         if jumpToStart:
-
             if self.cursorPosition != 0:
                 self.cursorPosition = 0
                 return True
-
             return False
 
         if self.cursorPosition > 0:
@@ -696,17 +1027,13 @@ class pglKeyBuffer:
 
     def moveCursorRight(self, jumpToEnd=False):
         """
-        Move cursor right by one logical character.
-
-        If jumpToEnd is True, move to end of buffer.
+        Move cursor right by one position, or to end.
         """
 
         if jumpToEnd:
-
             if self.cursorPosition != len(self.buffer):
                 self.cursorPosition = len(self.buffer)
                 return True
-
             return False
 
         if self.cursorPosition < len(self.buffer):
@@ -717,7 +1044,7 @@ class pglKeyBuffer:
 
     def moveCursorToStart(self):
         """
-        Move cursor to start of logical buffer.
+        Move cursor to beginning of buffer.
         """
 
         if self.cursorPosition != 0:
@@ -728,7 +1055,7 @@ class pglKeyBuffer:
 
     def moveCursorToEnd(self):
         """
-        Move cursor to end of logical buffer.
+        Move cursor to end of buffer.
         """
 
         if self.cursorPosition != len(self.buffer):
@@ -737,356 +1064,203 @@ class pglKeyBuffer:
 
         return False
 
-    ##################################################################
-    # Word wrapping
-    ##################################################################
-
-    def _wrapLine(self, line):
-        """
-        Wrap one logical line.
-
-        This operates only on a line between USER-entered newlines.
-
-        Returns:
-            list[str]: Automatically wrapped lines.
-        """
-
-        if not line:
-            return [""]
-
-        if self.maxLineLength <= 0:
-            return [line]
-
-        wrapped = []
-        remaining = line
-
-        while len(remaining) > self.maxLineLength:
-
-            # Preferred region around maxLineLength.
-            minLength = max(
-                1,
-                self.maxLineLength - self.wrapTolerance
-            )
-
-            maxLength = min(
-                len(remaining),
-                self.maxLineLength + self.wrapTolerance
-            )
-
-            # Look for spaces in the preferred region.
-            breakAt = None
-
-            for i in range(maxLength, minLength - 1, -1):
-                if remaining[i - 1] == ' ':
-                    breakAt = i - 1
-                    break
-
-            if breakAt is not None:
-                # Keep text before the space.
-                wrapped.append(remaining[:breakAt])
-
-                # Remove the wrapping space.
-                remaining = remaining[breakAt + 1:]
-
-                continue
-
-            # No space found in preferred region.
-            #
-            # Look backward for ANY space before maxLineLength.
-            for i in range(
-                min(self.maxLineLength, len(remaining)),
-                0,
-                -1
-            ):
-                if remaining[i - 1] == ' ':
-                    breakAt = i - 1
-                    break
-
-            if breakAt is not None:
-                wrapped.append(remaining[:breakAt])
-                remaining = remaining[breakAt + 1:]
-                continue
-
-            # No space available.
-            #
-            # Hard-break the word and add '-' to indicate that the
-            # word was broken.
-            breakLength = max(1, self.maxLineLength - 1)
-
-            wrapped.append(
-                remaining[:breakLength] + '-'
-            )
-
-            remaining = remaining[breakLength:]
-
-        wrapped.append(remaining)
-
-        return wrapped
-
-    def getWrappedText(self):
-        """
-        Return the logical buffer with automatic wrapping applied.
-
-        User-entered newlines are preserved exactly.
-        Automatically generated newlines are inserted between wrapped
-        lines.
-
-        Returns:
-            str: Display-ready wrapped text.
-        """
-
-        # Split ONLY on user-entered newlines.
-        hardLines = self.buffer.split('\n')
-
-        outputLines = []
-
-        for line in hardLines:
-            outputLines.extend(self._wrapLine(line))
-
-        return '\n'.join(outputLines)
-
-    ##################################################################
-    # Text / display
-    ##################################################################
+    ############################################################
+    # Text access
+    ############################################################
 
     def getText(self):
         """
-        Get the logical, unwrapped text.
+        Return the underlying user-entered text.
 
-        This is the text containing user-entered newlines only.
+        Automatic wrapping is NOT included.
         """
 
         return self.buffer
 
-    def getWrappedTextWithCursor(self, cursorChar='_'):
+    def getWrappedText(self):
         """
-        Get display-ready wrapped text with cursor.
+        Return text formatted for display.
 
-        The cursor is inserted at the logical cursor position, then
-        the entire text is wrapped. This keeps the cursor logically
-        attached to the user's position even when reflow occurs.
+        Automatic wrapping is included.
+        User-entered newlines are preserved.
+
+        Long words that must be broken receive a visual '-'.
+        The '-' is NOT added to self.buffer.
         """
 
-        before = self.buffer[:self.cursorPosition]
-        after = self.buffer[self.cursorPosition:]
+        if not self.buffer:
+            return ""
 
-        # Use a sentinel that cannot normally occur in user text.
-        sentinel = '\x00'
+        lines = []
 
-        text = before + sentinel + after
-
-        hardLines = text.split('\n')
-        outputLines = []
-
-        for line in hardLines:
-
-            # Find the cursor sentinel.
-            if sentinel in line:
-
-                cursorIndex = line.index(sentinel)
-
-                beforeCursor = line[:cursorIndex]
-                afterCursor = line[cursorIndex + 1:]
-
-                # Wrap the text before the cursor and after it separately
-                # so the cursor remains exactly at the logical position.
-                #
-                # Normally this means the cursor stays with the text
-                # immediately surrounding it.
-                combined = beforeCursor + sentinel + afterCursor
-
-                wrapped = self._wrapLineWithCursor(
-                    combined,
-                    sentinel
-                )
-
-                outputLines.extend(wrapped)
-
-            else:
-                outputLines.extend(self._wrapLine(line))
-
-        return '\n'.join(outputLines).replace(
-            sentinel,
-            cursorChar
+        # All visual breaks.
+        breaks = sorted(
+            self.hardBreaks | self.wrapBreaks
         )
 
-    def _wrapLineWithCursor(self, line, sentinel):
-        """
-        Wrap a line containing the cursor sentinel.
+        start = 0
 
-        The sentinel is treated as a zero-width character.
-        """
+        for breakPosition in breaks:
 
-        cursorIndex = line.index(sentinel)
+            if breakPosition < start:
+                continue
 
-        beforeCursor = line[:cursorIndex]
-        afterCursor = line[cursorIndex + 1:]
+            # Hard newline.
+            if breakPosition in self.hardBreaks:
 
-        # Wrap the whole line while preserving the cursor.
-        #
-        # Since the cursor does not represent actual text, temporarily
-        # replace it with a character that cannot affect word wrapping.
-        marker = '\x01'
-
-        temp = beforeCursor + marker + afterCursor
-
-        wrapped = []
-        remaining = temp
-
-        while len(remaining.replace(marker, '')) > self.maxLineLength:
-
-            # Number of REAL characters allowed on this line.
-            target = self.maxLineLength
-
-            # Search for a space near the target, counting the marker
-            # as zero characters.
-            realCount = 0
-            candidateSpaces = []
-
-            for i, char in enumerate(remaining):
-                if char != marker:
-                    realCount += 1
-
-                if char == ' ':
-                    candidateSpaces.append((realCount, i))
-
-                if realCount >= target + self.wrapTolerance:
-                    break
-
-            breakIndex = None
-
-            # Prefer the latest suitable space.
-            for realCount, index in reversed(candidateSpaces):
-                if (
-                    target - self.wrapTolerance
-                    <= realCount
-                    <= target + self.wrapTolerance
-                ):
-                    breakIndex = index
-                    break
-
-            if breakIndex is None:
-                # Look for any space before target.
-                for realCount, index in reversed(candidateSpaces):
-                    if realCount <= target:
-                        breakIndex = index
-                        break
-
-            if breakIndex is not None:
-
-                wrapped.append(
-                    remaining[:breakIndex]
+                lines.append(
+                    self.buffer[start:breakPosition]
                 )
 
-                remaining = remaining[breakIndex + 1:]
+                start = breakPosition + 1
 
             else:
-                # Hard break.
-                realCount = 0
-                breakIndex = 0
+                # Automatic word wrap.
+                line = self.buffer[start:breakPosition]
 
-                for i, char in enumerate(remaining):
-                    if char != marker:
-                        realCount += 1
+                # If the break isn't at a space, this is a
+                # long-word break, so display a hyphen.
+                if (
+                    breakPosition < len(self.buffer)
+                    and self.buffer[breakPosition] != ' '
+                ):
+                    line += '-'
 
-                    if realCount >= max(1, target - 1):
-                        breakIndex = i + 1
-                        break
+                lines.append(line)
 
-                chunk = remaining[:breakIndex]
+                # Don't display the wrapping space.
+                if (
+                    breakPosition < len(self.buffer)
+                    and self.buffer[breakPosition] == ' '
+                ):
+                    start = breakPosition + 1
+                else:
+                    start = breakPosition
 
-                # Add hyphen only if the cursor isn't immediately
-                # involved in the break.
-                if marker not in chunk:
-                    chunk += '-'
+        # Remaining text
+        lines.append(self.buffer[start:])
 
-                wrapped.append(chunk)
-                remaining = remaining[breakIndex:]
-
-        wrapped.append(remaining)
-
-        return wrapped
+        return '\n'.join(lines)
 
     def getTextWithCursor(self, cursorChar='|'):
         """
-        Get wrapped text with cursor.
+        Return the wrapped display text with cursor.
 
-        This is intended for display.
+        NOTE:
+            The cursor is based on the underlying buffer position.
         """
 
-        return self.getWrappedTextWithCursor(cursorChar)
+        wrapped = self.getWrappedText()
 
-    ##################################################################
+        # Build display text while mapping underlying positions
+        # to display positions.
+        display = []
+        displayPosition = 0
+
+        for i in range(len(self.buffer) + 1):
+
+            if i == self.cursorPosition:
+                display.append(cursorChar)
+
+            if i < len(self.buffer):
+                display.append(self.buffer[i])
+
+                # Add automatic visual newline.
+                if i + 1 in self.wrapBreaks:
+                    display.append('\n')
+
+                # Replace user newline with actual newline.
+                elif i in self.hardBreaks:
+                    display.append('\n')
+
+        return ''.join(display)
+
+    ############################################################
     # Buffer management
-    ##################################################################
+    ############################################################
 
     def clear(self):
         """
-        Clear the buffer and reset cursor.
+        Clear buffer and all wrapping state.
         """
 
         self.buffer = ""
         self.cursorPosition = 0
+        self.hardBreaks.clear()
+        self.wrapBreaks.clear()
 
     def setText(self, text):
         """
-        Set the logical buffer text.
+        Set buffer to specific text.
 
-        Newlines in text are treated as USER-ENTERED hard breaks.
+        Existing newlines are treated as user-entered hard breaks.
+
+        Automatic wrapping is recalculated.
         """
 
         self.buffer = text
         self.cursorPosition = len(text)
 
-    ##################################################################
-    # Cursor position
-    ##################################################################
+        # Every newline in supplied text is considered explicit.
+        self.hardBreaks = {
+            i for i, char in enumerate(text)
+            if char == '\n'
+        }
+
+        self.wrapBreaks.clear()
+
+        # Wrap each paragraph.
+        start = 0
+
+        for hardBreak in sorted(self.hardBreaks):
+            self._reflowParagraph(start, hardBreak)
+            start = hardBreak + 1
+
+        self._reflowParagraph(start, len(self.buffer))
+
+    def _reflowParagraph(self, start, end):
+        """
+        Wrap one paragraph.
+        """
+
+        lineStart = start
+
+        while lineStart < end:
+
+            if end - lineStart <= self.maxLineLength:
+                break
+
+            breakPosition = self._findBreakPosition(
+                lineStart,
+                end
+            )
+
+            if breakPosition is None:
+                break
+
+            self.wrapBreaks.add(breakPosition)
+
+            lineStart = breakPosition
+
+            if (
+                lineStart < len(self.buffer)
+                and self.buffer[lineStart] == ' '
+            ):
+                lineStart += 1
 
     def getCursorPosition(self):
         """
-        Get logical cursor position.
-
-        This is an index into the unwrapped logical buffer.
+        Return cursor position in underlying buffer.
         """
 
         return self.cursorPosition
 
     def setCursorPosition(self, position):
         """
-        Set logical cursor position.
-
-        Position is clamped to valid range.
+        Set cursor position, clamped to valid range.
         """
 
         self.cursorPosition = max(
             0,
             min(position, len(self.buffer))
         )
-
-    ##################################################################
-    # Wrapping configuration
-    ##################################################################
-
-    def setMaxLineLength(self, maxLineLength):
-        """
-        Change the preferred maximum line length.
-        """
-
-        if maxLineLength <= 0:
-            raise ValueError(
-                "maxLineLength must be greater than zero"
-            )
-
-        self.maxLineLength = maxLineLength
-
-    def setWrapTolerance(self, wrapTolerance):
-        """
-        Change the allowed wrapping tolerance.
-        """
-
-        if wrapTolerance < 0:
-            raise ValueError(
-                "wrapTolerance must be zero or greater"
-            )
-
-        self.wrapTolerance = wrapTolerance
