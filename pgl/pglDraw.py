@@ -673,10 +673,11 @@ class pglDraw:
                         revert to the top of the screen.
             xAlign (int): The horizontal alignment of the text. -1 = left, 0 = center, 1 = right.
             yAlign (int): The vertical alignment of the text. -1 = top, 0 = middle, 1 = bottom.
-            line (int): The line number to draw the text on. IF this
+            line (int or str): The line number to draw the text on. IF this
                         is set, y will be ignored and instead the text
                         will be drawn on the specified line from top of screen.
                         If line is negative, then from the bottom of the screen.
+                        If set to "center" will draw at the center of the secreen
             color (list or tuple, optional): RGB color values as a list or tuple of three floats in the range [0, 1].
             fontSize (int): The size of the font.
             fontName (str): The name of the font.
@@ -706,6 +707,11 @@ class pglDraw:
             # and update
             self.currentLine += 1
 
+        # center value
+        if line is not None and isinstance(line, str) and line.lower() == "center":
+            # get the middle line
+            line = linesPerScreen//2
+           
         # negative line numbers
         if line is not None and line < 0: line = linesPerScreen + line + 1
 
