@@ -137,7 +137,8 @@ class pglEventListener:
             self._lastEscTime = 0
         else:
             # Single ESC press, turn off eat keys
-            _pglEventListener.setEatKeys([])
+            self.setEatKeys([])
+            self.setEatAllKeys(False)
             self._lastEscTime = timestamp
  
     def getKeyboardEvent(self) -> Optional[Dict]:
@@ -223,6 +224,17 @@ class pglEventListener:
         with self._lock:
             return keyCode in self._keyStatus
     
+    def setEatAllKeys(self, eatAllKeys: bool = True) -> None:
+        """
+        Set whether all keyboard events should be suppressed from other applications.
+
+        Args:
+            eat: True to eat all keys, False to allow keys through.
+                Keys specified with setEatKeys() are still eaten when this is False.
+        """
+        self.eatAllKeys = eatAllKeys
+        _pglEventListener.setEatAllKeys(eatAllKeys)
+        
     def setEatKeys(self, keyCodes: Optional[List[int]] = None, keyChars: Optional[List[str]] = None) -> None:
         """
         Set which key events to suppress from reaching other applications.

@@ -22,7 +22,7 @@ static int listenerRunning = 0;
 static pthread_mutex_t eatKeysMutex; 
 static int eatKeys[MAX_EAT_KEYS];
 static int numEatKeys = 0;
-
+static int eatAllKeys = 0;
 
 // Forward declarations
 static void* eventLoopThread(void* arg);
@@ -61,6 +61,7 @@ static PyObject* listenerStart(PyObject* self, PyObject* args) {
     // Initialize mutex for eatKeys array
     pthread_mutex_init(&eatKeysMutex, NULL);
     numEatKeys = 0;
+    eatAllKeys = 0;
 
     // Store callback reference
     Py_INCREF(callback);
@@ -170,6 +171,22 @@ static PyObject* listenerSetEatKeys(PyObject* self, PyObject* args) {
 }
 
 /*
+ * Set whether all keys should be eaten (suppressed from OS)
+ */
+static PyObject* listenerSetEatAllKeys(PyObject* self, PyObject* args) {
+    int eatAll;
+    
+    if (!PyArg_ParseTuple(args, "p", &eatAll)) {
+        return NULL;
+    }
+    
+    pthread_mutex_lock(&eatKeysMutex);
+    eatAllKeys = eatAll;
+    pthread_mutex_unlock(&eatKeysMutex);
+    
+    Py_RETURN_NONE;
+}
+/*
  * Check if a keycode should be eaten (suppressed)
  */
 static int shouldEatKey(CGKeyCode keyCode) {
@@ -177,10 +194,15 @@ static int shouldEatKey(CGKeyCode keyCode) {
     
     pthread_mutex_lock(&eatKeysMutex);
     
-    for (int i = 0; i < numEatKeys; i++) {
-        if (eatKeys[i] == (int)keyCode) {
-            shouldEat = 1;
-            break;
+    if (eatAllKeys) {
+        shouldEat = 1;
+    } 
+    else {
+        for (int i = 0; i < numEatKeys; i++) {
+            if (eatKeys[i] == (int)keyCode) {
+                shouldEat = 1;
+                break;
+            }
         }
     }
     
@@ -359,6 +381,7 @@ static PyMethodDef listenerMethods[] = {
     {"stop", listenerStop, METH_NOARGS, "Stop the event listener"},
     {"isRunning", listenerIsRunning, METH_NOARGS, "Check if listener is running"},
     {"setEatKeys", listenerSetEatKeys, METH_VARARGS, "Set which keys to suppress from OS"},
+    {"setEatAllKeys", listenerSetEatAllKeys, METH_VARARGS, "Set whether to suppress all keys from OS"},
      {NULL, NULL, 0, NULL}
 };
 

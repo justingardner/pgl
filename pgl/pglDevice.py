@@ -172,6 +172,17 @@ class pglDevices:
         if keyboardDevice is not None:
             keyboardDevice.setEatKeys(keyCodes=keyCodes, keyChars=keyChars)
 
+    def setEatAllKeys(self, eatAllKeys=False):
+        '''
+        Set to eat all keys, if set to False will still eatKeys as set by setEatKeys
+
+        Args:
+            eatAllKeys (Bool): True/False to eat all keys or not
+        '''
+        keyboardDevice = self.devicesGetKeyboard()
+        if keyboardDevice is not None:
+            keyboardDevice.setEatAllKeys(eatAllKeys)
+
     def poll(self):
         """
         Poll all devices for updates.

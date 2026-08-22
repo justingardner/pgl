@@ -179,6 +179,16 @@ class pglKeyboardMouse(pglDevice):
         if self.isRunning():
             self.eatKeyCodes = self.listener.setEatKeys(keyCodes, keyChars)
     
+    def setEatAllKeys(self, eatAllKeys=False):
+        '''
+        Set to eat all keys or not. If set to False, will still eat any keys that setEatKeys is set to.
+
+        Args:
+            eatAllKeys (Bool): True/False eat all keys or not
+        '''
+        if self.isRunning():
+            self.listener.setEatAllKeys(eatAllKeys)
+
     def charToKeyCode(self, char):
         '''
         Convert a character to a key code using the charToKeyCode function.

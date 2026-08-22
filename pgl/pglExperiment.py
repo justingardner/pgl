@@ -665,12 +665,13 @@ class pglExperiment(pglExperimentBase):
             return
                 
 
-    def eatAllKeys(self, eat=False):
+    def setEatAllKeys(self, eatAllKeys=False):
         '''
+        Sets whether to eat all keys. If False, any keys specified by setEatKeys will still be eaten
         Args: 
-            eat: bool (whether to eat all keys or not)
+            eatAllKeys: bool (whether to eat all keys or not)
         '''
-        return self.pgl.eatAllKeys(eat)
+        return self.pgl.setEatAllKeys(eatAllKeys)
 
     def setEatKeys(self, eatKeys=""):
         '''
