@@ -35,7 +35,7 @@ from enum import Enum
 from . import pglTimestamp
 from .pglEyeTracker import pglEyeTracker
 from .pglEyelink import pglEyelink, pglEyelinkData
-from .pglSettings import pglSettingsManager, pglDisplaySettings, pglDisplayModeSettings, pglTraitSettings, pglStateDataSettings
+from .pglSettings import pglDisplaySettings, pglTraitSettings, pglStateDataSettings
 from .pglMessages import pglMessages
 import fsspec
 import posixpath
@@ -588,14 +588,14 @@ class pglExperiment(pglExperimentBase):
             self.pgl.flush()
             self.pgl.flush()
             
-            # mark that we have opened the screen
-            self.state.openScreen = True
-
             # initialize eye tracker
             self.initEyeTracker()    
 
             # display device status
             self.pgl.deviceStatus()
+
+            # mark that we have opened the screen
+            self.state.openScreen = True
 
         except Exception as e:
             pglMessages.warning(f"Could not open screen. Error {type(e).__name__}: {e}")    
@@ -687,6 +687,9 @@ class pglExperiment(pglExperimentBase):
         '''
         Run the experiment.
         '''
+        # default to error, as normal operation will set this to False
+        self.state.runFinishedWithError = True
+
         if self.state.openScreen == False:
             pglMessages.warning("Screen is not open. Call initScreen() before running the experiment.")
             return
@@ -831,6 +834,9 @@ class pglExperiment(pglExperimentBase):
         
         # close screen
         self.endScreen()
+
+        # if we got here then we finished the run without error
+        self.state.runFinishedWithError = False
     
     def initEyeTracker(self):
         '''Initialize eye tracker if we have an eye tracker.'''
@@ -1639,6 +1645,7 @@ class pglExperimentState(pglSerialize):
     currentPhaseIndex: int = 0
     #currentTasks: ListType[pglTask] = field(default_factory=list)
     openScreen: bool = False
+    runFinishedWithError: bool = False
     volumeNumber: int = 0
     experimentStarted: bool = False
     experimentDone: bool = False
