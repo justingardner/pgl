@@ -436,6 +436,9 @@ class pglExperiment(pglExperimentBase):
                 
             self.experimentSettings.subjectID = subjectID
             self.isInitialized=True
+            
+            # set to flush screen
+            self.flush = True
 
         except Exception as e:
             pglMessages.warning(f"Could not initialize experiment. Error {type(e).__name__}: {e}")    
@@ -800,7 +803,8 @@ class pglExperiment(pglExperimentBase):
                 if task.done(): phaseDone = True
             
             # update the screen
-            self.pgl.flush()
+            if self.flush: self.pgl.flush()
+            else: print("No flush")
 
             # go to next phase or end experiment
             if phaseDone:
