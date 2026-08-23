@@ -194,7 +194,7 @@ class pglEyelink(pglEyeTracker):
     
         # Verify stopped
         if self.eyelink.isRecording() != 0:
-            pglMessages.message("(pglEyeTracker) Eye tracking stopped.")
+            pglMessages.message("Eye tracking stopped.")
             return True
         else:
             pglMessages.warning("Still recording after stop command", level=1)
@@ -271,7 +271,7 @@ class pglEyelink(pglEyeTracker):
         if result > 0:
             if os.path.exists(filename):
                 filesize = os.path.getsize(filename)
-                pglMessages.message(f"(pglEyeTracker) Successfully saved: {filename} ({filesize} bytes)")
+                pglMessages.message(f"Successfully saved: {filename} ({filesize} bytes)")
                 return True
             else:
                 pglMessages.warning(f"Transfer reported success but file {filename} not found locally")
@@ -329,7 +329,7 @@ class pglEyelink(pglEyeTracker):
                 ])
                 self.eyelink.sendCommand("calibration_type = HV13")
             case _:
-                pglMessages.warning(f"(pglEyelink) Warning: {numPoints} points not supported, defaulting to 9",level=1)
+                pglMessages.warning(f"{numPoints} points not supported, defaulting to 9",level=1)
                 self.eyelink.sendCommand("calibration_type = HV9")
             
         # send the calibration targets
@@ -365,7 +365,7 @@ class pglEyelink(pglEyeTracker):
                 self.eyelink.doTrackerSetup()
 
             except Exception as e:
-                pglMessages.warning(f"(pglEyelink) Error during calibration: {e}")
+                pglMessages.warning(f"Error during calibration: {e}")
 
             finally:
                 # reset eatkeys
