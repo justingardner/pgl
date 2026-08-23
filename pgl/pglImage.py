@@ -483,7 +483,7 @@ class pglMovieFile(pglStimulusFile):
 
         else:
             fig = ax.figure
-            
+
         reader = self.get()
         if reader is None:
             return None
@@ -619,8 +619,8 @@ class pglMovieDatabase(pglStimulusDatabase):
 
         return self.stimuli[stimulusNum].get()
     
-    def display(self, ax=None):
-        self.stimuli[0].display(ax=ax)
+    def display(self, stimulusNum=0, ax=None):
+        self.stimuli[stimulusNum].display(ax=ax)
 
 ############################################
 # pglImageDatabse

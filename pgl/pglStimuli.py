@@ -14,6 +14,7 @@ import threading
 
 import numpy as np
 import matplotlib.pyplot as plt
+from .pglMessages import pglMessages
 
 #############
 # Stimuli class
@@ -1257,10 +1258,11 @@ class pglStimulusMovie(_pglStimulus):
         super().__init__(pgl)
         self.pgl = pgl
         self.filename = filename
+        self.movieNum = None
         
         # make sure that a screen is open
         if self.pgl.isOpen() is False: 
-            print(f"(pglStimulusMovie) ❌ No screen is open")
+            pglMessages.warning(f"No screen is open")
             return
         
         # send movie create command
@@ -1271,7 +1273,7 @@ class pglStimulusMovie(_pglStimulus):
         # get result
         result = self.pgl.s.read(np.float64)
         if (result < 0): 
-            print(f"(pglStimulusMovie:init) Error creating movie: {self.movieError.get(int(result),"Unrecogonized Error")}")
+            pglMessages.warning(f"Error creating movie {filename}: {self.movieError.get(int(result),"Unrecogonized Error")}")
             self.commandResults = self.pgl.s.readCommandResults(ackTime)
             return
         
