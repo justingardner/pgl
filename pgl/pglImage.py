@@ -318,13 +318,22 @@ class pglImageInstance:
        else:
            print(f"Image: {self.imageNum} ({self.width.pix}x{self.height.pix})")
 
-class pglImageFile(pglTraitSettings):
-
-    # filesystem, name and prefix for where the images were loaded from
+################################################
+# pglStimulusFile
+################################################
+class pglStimulusFile(pglTraitSettings):
+    # filesystem, name and prefix for where stimulus is saved
     name = Unicode(help="name of image")
     filesystem = Instance(AbstractFileSystem, allow_none=True, serialize=False, help="filesystem for serialization")
     filename= Unicode(allow_none=True, default_value="", help="Full path to images", visible=False)
     filesystemPrefix = Unicode(allow_none=True, default_value="", help="Prefix like ssh:// used for accessing filesystem", visible=False)
+
+################################################
+# pglImageFile
+################################################
+class pglImageFile(pglStimulusFile):
+
+    # filesystem, name and prefix for where the images were loaded from
     _size = Tuple(Int, Int, labels=("width","height"), property="size", enabled=False, allow_none=True, default_value=None, help="Image width x height")
     _mode = Unicode(allow_none=True, default_value=None, property="mode", enabled=False, help="Image mode")
     _format = Unicode(allow_none=True, default_value=None, property="format", enabled=False, help="Image format")
@@ -413,16 +422,19 @@ class pglImageFile(pglTraitSettings):
         ax.axis("off")
         return ax
 
-class pglImageDatabase(pglTraitSettings):
+################################################
+# pglStimulusDaabase
+################################################
+class pglStimulusDatabase(pglTraitSettings):
     
     # filesystem, name and prefix for where the images were loaded from
     filesystem = Instance(AbstractFileSystem, allow_none=True, serialize=False, help="filesystem for serialization")
-    dataPath = Unicode(allow_none=True, default_value="", help="Full path to images", visible=False)
+    dataPath = Unicode(allow_none=True, default_value="", help="Full path to stimuli", visible=False)
     filesystemPrefix = Unicode(allow_none=True, default_value="", help="Prefix like ssh:// used for accessing filesystem", visible=False)
-    images = List(Instance(pglImageFile), default_value=[], settingsListKey="name", traitDisplayName="Choose image", hasPlotButton=True, buttonFunction="display", help="List of images in database")
-    nImages = Int(0, help="Number of images")
+    stimuli = List(Instance(pglStimulusFile), default_value=[], settingsListKey="name", traitDisplayName="Choose stimulus", hasPlotButton=True, buttonFunction="display", help="List of stimuli in database")
+    nStimuli = Int(0, help="Number of stimuli", enable=False)
     
-    def __init__(self, dataPath=None, filesystem=None):
+    def __init__(self, dataPath=None, knownFileExtensions=None, filesystem=None, stimulusFileClass=pglStimulusFile):
         '''
         Initialize by pointing to a directory where images live
         '''
@@ -430,7 +442,7 @@ class pglImageDatabase(pglTraitSettings):
         if dataPath:
             # get known image extensions
             Image.init()
-            imageExts = set(Image.registered_extensions().keys())
+            imageExtensions = set(Image.registered_extensions().keys())
             
             # parse filesystem
             self.filesystem, self.fullDataPath, self.filesystemPrefix = pglBase.validateFilesystem(filesystem, dataPath)
@@ -438,62 +450,124 @@ class pglImageDatabase(pglTraitSettings):
                 pglMessages.warning("Could not resolve path to images")
                 return
                             
-            # look for images in directory
+            # look for stimuli in directory
             for f in self.filesystem.ls(self.fullDataPath, detail=True):
                 # only open files
                 if f["type"] != "file": continue
-                if os.path.splitext(f["name"])[1].lower() in imageExts:
-                    self.images.append(pglImageFile(
+                if os.path.splitext(f["name"])[1].lower() in knownFileExtensions:
+                    self.stimuli.append(stimulusFileClass(
                         name = os.path.basename(f["name"]),
                         filename = f["name"],
                         filesystem = self.filesystem,
                         filesystemPrefix = self.filesystemPrefix
                     ))
             # store number of images                    
-            self.nImages = len(self.images)
+            self.nStimuli = len(self.stimuli)
             
             # alphabetically sort the images by name
-            self.images.sort(key=lambda x: x.name.lower())
+            self.stimuli.sort(key=lambda x: x.name.lower())
             
             # and let the world know
-            pglMessages.message(f"Found {len(self.images)} image files in {os.path.basename(dataPath)}")
+            pglMessages.message(f"Found {self.nStimuli} image files in {os.path.basename(dataPath)}")
             
-    def preloadImage(self,imageNum):
+    def validateStimulusNum(self, stimulusNum):
+        '''
+        validate stimulus Num
+        
+        Args:
+            stimulusNum (int): stimulusNum to validate
+
+        Returns Bool for whether stimulusNum is valid or not
+        '''
+        if stimulusNum < 0 or stimulusNum >= self.nStimuli:
+            pglMessages.warning(f"Could not preload image: stimulusNum={stimulusNum} out of range [0,{self.nStimuli})")
+            return False
+        return True
+    
+    def preload(self,stimulusNum):
+        '''
+        preload - to be defined by subclasses, will do any preloading necessary for the asset type
+                  this default function validates stimulusNum and just returns whatever get returns
+        Args:
+            stimulusNum(int): Number of stimulus to preload
+        '''
+        if not self.validateStimulusNum(stimulusNum): return
+        return self.get(stimulusNum)
+        
+    def get(self, stimulusNum):
+        '''
+        get stimulus from database. define in subclass
+        
+        Args:
+            stimulusNum (int): number of stimulus to get
+        '''
+        pass
+    
+    def display(self, ax=None):
+        ''' 
+        display a representation of stimulus database. define in subclass
+        '''
+        pass
+    
+    def print(self):
+        '''
+        print a representation of stimulus database. define in subclass
+        '''
+        pass
+
+    def print(self):
+        '''
+        print a representation of stimulus database. 
+        '''
+        pglMessages.message(" ".join(f"{iImage}: {image.name}" for iImage, image in enumerate(self.stimuli)))      
+
+############################################
+# pglImageDatabse
+############################################
+class pglImageDatabase(pglStimulusDatabase):
+    def __init__(self, dataPath=None, filesystem=None):
+        '''
+        Initialize an image database
+        '''
+        # get known image extensions
+        Image.init()
+        imageExtensions = set(Image.registered_extensions().keys())
+            
+        # call super
+        super().__init__(dataPath=dataPath, knownFileExtensions=imageExtensions, filesystem=filesystem, stimulusFileClass=pglImageFile)
+
+    def preload(self,stimulusNum):
         '''
         preloadImage from database. This will preload the image into memory
         '''
-        if imageNum < 0 or imageNum >= self.nImages:
-            pglMessages.warning(f"Could not preload image: imageNum={imageNum} out of range [0,{self.nImages})")
-            return None
-        return self.images[imageNum].img
+        if not self.validateStimulusNum(stimulusNum): return
+        return self.stimuli[stimulusNum].img
         
-    def getImage(self,imageNum):
+    def get(self,stimulusNum):
         '''
-        getImage from database
+        get image stimulus from database.
         
         Args:
-            imageNum (int): number of image to get
+            stimulusNum (int): number of stimulus to get
         '''
-        if imageNum < 0 or imageNum >= self.nImages:
-            pglMessages.warning(f"Could not get image: imageNum={imageNum} out of range [0,{self.nImages})")
-            return None
-        return(self.images[imageNum].img)
+        if not self.validateStimulusNum(stimulusNum): return
+        return(self.stimuli[stimulusNum].img)
     
     def displayImage(self, ax=None):
-        images[0].display(ax=ax)
+        ''' 
+        display a representation of stimulus database. define in subclass
+        '''
+        pass
     
-    def print(self):
-        for iImage, image in enumerate(self.images):
-            print(f"{iImage}: {image.name} ",end="")        
-            #image.print()
-            
+
 class pglImageDatabaseWithManifest(pglImageDatabase):
     def __init__(self, dataPath=None, filesystem=None, filenameColumn="filename", indexColumn="index", captionColumn="caption_1"):
         super().__init__(dataPath,filesystem)
         if not self.filesystem: return
         if dataPath is None: return
+
         # now make a set of the filenames that we loaded
-        filenames = [image.name for image in self.images]
+        filenames = [stimulus.name for stimulus in self.stimuli]
         # load the the csv manifest
         self.manifest = None
         for csvFilename in self.filesystem.glob(os.path.join(dataPath, "*.csv")):
@@ -517,14 +591,14 @@ class pglImageDatabaseWithManifest(pglImageDatabase):
                     # and sort by the index value
                     # first make a dict which matches each filename to the index in the index column
                     indexByFilename = dict(zip(manifestFilenames, manifestIndex))
-                    # and sort our images
-                    self.images.sort(key=lambda x: indexByFilename[x.name])
+                    # and sort our stimuli
+                    self.stimuli.sort(key=lambda x: indexByFilename[x.name])
                     
-                    # set the captions of the images according to the manifest
+                    # set the captions of the stimuli according to the manifest
                     if manifestCaption is not None: 
                         captionByFilename = dict(zip(manifestFilenames, manifestCaption))
-                        for image in self.images:
-                            image.caption = captionByFilename[image.name]
+                        for stimulus in self.stimuli:
+                            stimulus.caption = captionByFilename[stimulus.name]
                     
                     pglMessages.message("Sorted and set captions from manifest")                    
             except Exception as e:
