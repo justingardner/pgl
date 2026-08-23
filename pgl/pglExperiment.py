@@ -20,11 +20,10 @@ from .pglKeyboardMouse import pglKeyboardMouse
 from pathlib import Path
 from IPython.display import display, HTML
 import ipywidgets as widgets
-from traitlets import Float, TraitError, TraitError, observe, Instance, Int, Unicode, Dict, validate, Bool
+from traitlets import Float, TraitError, TraitError, observe, Instance, Int, Unicode, Dict, validate, Bool, Tuple
 from .pglParameter import pglParameter, pglParameterBlock
 from .pglEvent import pglEvent
 from .pglSerialize import pglSerialize
-from typing import List as ListType, Optional, Tuple
 from traitlets import List
 from matplotlib import pyplot as plt
 import matplotlib.patches as patches
@@ -843,7 +842,7 @@ class pglExperiment(pglExperimentBase):
         if self.settings.eyetracker[0] == "Eyelink":
             # set edf filename to current date (note it has to be 8.3 characters
             # since SR Research has progressed from the days of DOS)
-            self.settings.edfFilename = f"P{datetime.now().strftime('%Y%m%d')}"
+            self.settings.edfFilename = f"{datetime.now().strftime('%Y%m%d')}"
 
             # init the eyeink
             print(f"(pglExperiment) Initialize Eyelink with filename: {self.settings.edfFilename}")
@@ -912,9 +911,9 @@ class pglExperiment(pglExperimentBase):
             if self.state.runCalibration:
                 self.eyeTracker.calibrate()
 
-    def saveEyeTrackerEvent(self, eventType="segment", taskID=None, trialNum=None, segmentNum=None, timestamp=None):
+    def saveEyeTrackerEvent(self, eventType="segment", taskID=None, trialNum=None, segmentNum=None, timestamp=None, phaseNum=None):
         '''Save an eye tracker event for synchronization. This is called by tasks during updates if settings.saveEyeTracker is True.'''
-        self.eyeTracker.sendMessage(f"pgl: {eventType} taskID={taskID} trialNum={trialNum} segmentNum={segmentNum} timestamp={timestamp}")
+        self.eyeTracker.sendMessage(f"pgl: {eventType} taskID={taskID} trialNum={trialNum} segmentNum={segmentNum} timestamp={timestamp} phaseNum={phaseNum}")
 
     def startPhase(self, phaseNum=0):
         '''
@@ -981,6 +980,9 @@ class pglTaskSettings(pglTraitSettings):
     fixedParameters = Dict(default_value={}, help="Dictionary of fixed parameters for the task.")
     saveEyeTracker = Bool(False, help="Whether to save eye tracker events this task (if we have an eye tracker).")    
     taskID = Int(0, help="Numeric identifier for the task, used for pglExperiment to keep track of tasks.")
+
+    # make sure that any settings that the experimenter writes into settings get saved
+    _serializeUnregisteredFields = True
 
     # observe changes to taskName and if taskSaveName is not set
     # set taskSaveName to a camelCase version of taskName
@@ -1095,23 +1097,27 @@ class pglTaskSettings(pglTraitSettings):
 ##############################################
 # State for pglTask
 ##############################################
-@dataclass
-class pglTaskState(pglSerialize):
-    phaseNum: Optional[int] = None
-    currentTrial: int = 0
-    currentSegment: int = 0
-    subjectResponses: ListType[int] = field(default_factory=list)
+class pglTaskState(pglTraitSettings):
+    phaseNum = Int(default_value=None, allow_none=True, help="Current experiment phase number.")
+    currentTrial = Int(default_value=0, help="Current trial number.")
+    currentSegment = Int(default_value=0, help="Current segment number.")
+    subjectResponses = List(Int(), help="List of subject response key codes.")
+
+    # make sure that any settings that the experimenter writes into settings get saved
+    _serializeUnregisteredFields = True
 
 ##############################################
 # State for pglTask
 ##############################################
-@dataclass
-class pglTaskData(pglSerialize):
-    startTime: Optional[float] = None
-    endTime: Optional[float] = None
-    events: ListType[pglEvent] = field(default_factory=list) 
-    params: ListType[dict] = field(default_factory=list)
-    
+class pglTaskData(pglTraitSettings):
+    startTime = Float(default_value=None, allow_none=True, help="Task start time.")
+    endTime = Float(default_value=None, allow_none=True, help="Task end time.")
+    events = List(Instance(pglEvent), help="List of task events.")
+    params = List(Dict(), help="List of task parameter dictionaries.")
+
+    # make sure that any settings that the experimenter writes into settings get saved
+    _serializeUnregisteredFields = True
+
     def display(self, taskName="task", responseMapping={True:('Correct','green'), False:('Incorrect','red')}, ax=None):
         '''
         Display the experiment data.
@@ -1182,7 +1188,7 @@ class pglTaskBase(pglTraitSettings):
         Save the task settings, state and data.
         '''
         try:
-            dataPath = Path(dataPath) / self.settings.taskSaveName
+            dataPath = Path(dataPath) / self.getTaskDirectoryName()
             dataPath.mkdir(parents=True, exist_ok=True)
         except Exception as e:
             print(f"(pglTask:save) ❌ Could not create task data directory {dataPath}: {e}")
@@ -1203,6 +1209,15 @@ class pglTaskBase(pglTraitSettings):
             pglMessages.warning(f"Could not save task parameters to {dataPath}: {e}")
         pglMessages.message(f"Saved task {self.settings.taskName} to {dataPath}")
 
+    def getTaskDirectoryName(self):
+        """Return the directory name used to save this task."""
+        taskDirectoryName = self.settings.taskSaveName
+        phaseNum = self.settings.phaseNum
+
+        if phaseNum is not None and phaseNum != 0:
+            taskDirectoryName += f"Phase{phaseNum:02d}"
+
+        return taskDirectoryName
     @classmethod
     def load(cls, dataPath, filesystem=None):
         '''
@@ -1362,7 +1377,7 @@ class pglTask(pglTaskBase):
         else:    
             # save eye tracker event for synchronization        
             if self.settings.saveEyeTracker:
-                self.e.saveEyeTrackerEvent(eventType="segment", taskID=self.settings.taskID, trialNum=self.state.currentTrial, segmentNum=self.state.currentSegment, timestamp=updateTime)
+                self.e.saveEyeTrackerEvent(eventType="segment", taskID=self.settings.taskID, trialNum=self.state.currentTrial, segmentNum=self.state.currentSegment, timestamp=updateTime, phaseNum=self.settings.phaseNum)
             
             # update to next segment
             self.state.currentSegment += 1
@@ -1384,7 +1399,7 @@ class pglTask(pglTaskBase):
 
         # save eye tracker event for synchronization        
         if self.settings.saveEyeTracker:
-            self.e.saveEyeTrackerEvent(eventType="trial", taskID=self.settings.taskID, trialNum=self.state.currentTrial, segmentNum=self.state.currentSegment, timestamp=startTime)
+            self.e.saveEyeTrackerEvent(eventType="trial", taskID=self.settings.taskID, trialNum=self.state.currentTrial, segmentNum=self.state.currentSegment, timestamp=startTime, phaseNum=self.settings.phaseNum)
 
         # get current parameters
         self.data.params.append({})
@@ -1431,7 +1446,6 @@ class pglTask(pglTaskBase):
         # store references
         self.state.subjectResponses = subjectResponses
         self.state.phaseNum = phaseNum
-        self.state.tasks = tasks
         
         # custom handling of events
         self.handleEvents(events)
@@ -1532,7 +1546,10 @@ class pglExperimentSettings(pglTraitSettings):
     experimentSaveName = Unicode("defaultExperiment", help="Name to use when saving experiment data (defaults to camelCase version of experimentName)")
     subjectID = Unicode("s0000", help="Identifier for the subject participating in the experiment.")
     tasks = List(Unicode(), default_value=[], help="Task names")
-    
+
+    # make sure that any settings that the experimenter writes into settings get saved
+    _serializeUnregisteredFields = True
+
     # observe changes to experimentName and if experimentSaveName is not set
     # set experimentSaveName to a camelCase version of experimentName
     @observe("experimentName")
@@ -1565,7 +1582,10 @@ class pglExperimentData(pglTraitSettings):
     startTime = Float(0.0, help="Time in secs of start of experiment")
     endTime = Float(0.0, help="Time in secs of end of experiment")
     events = List(Instance(pglEvent), default_value=[], help="List of events from experiment")
-    
+
+    # make sure that any settings that the experimenter writes into settings get saved
+    _serializeUnregisteredFields = True
+
     def __repr__(self):
         return f"pglExperimentData(startTime={self.startTime}, endTime={self.endTime}, {len(self.events)} events)"
     
@@ -1653,27 +1673,27 @@ class pglExperimentData(pglTraitSettings):
 ##############################################
 # State for pglExperiment
 ##############################################
-@dataclass
-class pglExperimentState(pglSerialize):
-    phaseNum: Optional[int] = None
-    phaseNums: Optional[ListType[int]] = None    
-    currentPhaseIndex: int = 0
-    #currentTasks: ListType[pglTask] = field(default_factory=list)
-    openScreen: bool = False
-    runFinishedWithError: bool = False
-    volumeNumber: int = 0
-    experimentStarted: bool = False
-    experimentDone: bool = False
-    responseKeyCodesList: ListType[int] = field(default_factory=list)
-    startKeyCode: int = 0
-    endKeyCode: int = 0
-    volumeTriggerKeyCode: int = 0
-    originalGammaTable: Optional[Tuple[npt.NDArray[np.int_], npt.NDArray[np.int_], npt.NDArray[np.int_]]] = None
-    gammaTable: Optional[Tuple[npt.NDArray[np.int_], npt.NDArray[np.int_], npt.NDArray[np.int_]]] = None
-    display: Optional[pglDisplaySettings] = None
-    originalScreenResolution: Optional[Tuple[int, int, int, int]] = None
-    screenResolution: Optional[Tuple[int, int, int, int]] = None
+class pglExperimentState(pglTraitSettings):
+    phaseNum = Int(default_value=None, allow_none=True, help="Current experiment phase number.")
+    phaseNums = List(trait=Int(), default_value=None, allow_none=True, help="List of experiment phase numbers.")
+    currentPhaseIndex = Int(default_value=0, help="Index into phaseNums for the current phase.")
+    openScreen = Bool(default_value=False, help="Whether the experiment screen is currently open.")
+    runFinishedWithError = Bool(default_value=False, help="Whether the experiment ended with an error.")
+    volumeNumber = Int(default_value=0, help="Current scanner-volume number.")
+    experimentStarted = Bool(default_value=False, help="Whether the experiment has started.")
+    experimentDone = Bool(default_value=False, help="Whether the experiment has completed.")
+    responseKeyCodesList = List(Int(), help="List of response key codes received during the experiment.")
+    startKeyCode = Int(default_value=0, help="Key code used to begin the experiment.")
+    endKeyCode = Int(default_value=0, help="Key code used to end the experiment.")
+    volumeTriggerKeyCode = Int(default_value=0, help="Key code received for each scanner-volume trigger.")
+    originalGammaTable = Tuple(List, List, List, default_value=None, allow_none=True, help="Original display gamma table: (red, green, blue).")
+    gammaTable = Tuple(List, List, List, default_value=None, allow_none=True, help="Current display gamma table: (red, green, blue).")
+    display = Instance(pglDisplaySettings, default_value=None, allow_none=True, help="Current display settings.")
+    originalScreenResolution = Tuple(Int(),Int(),Int(),Int(), default_value=None, allow_none=True, help="Original screen resolution: (left, top, width, height).")
+    screenResolution = Tuple(Int(),Int(),Int(),Int(), default_value=None, allow_none=True, help="Current screen resolution: (left, top, width, height).")
 
+    # make sure any variabels added by experimenter code gets saved
+    _serializeUnregisteredFields = True
 
 ##############################################
 # timelinePlot
