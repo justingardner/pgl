@@ -1274,6 +1274,8 @@ class pglStimulusMovie(_pglStimulus):
         result = self.pgl.s.read(np.float64)
         if (result < 0): 
             pglMessages.warning(f"Error creating movie {filename}: {self.movieError.get(int(result),"Unrecogonized Error")}")
+            if int(result)== -2:
+                pglMessages.warning("Permission errors can be caused by sandboxing of mglMetal.app. Consider unsandboxing using: codesign --force --deep --sign - {pgl.getPGLDir()}/mglMetal.app")
             self.commandResults = self.pgl.s.readCommandResults(ackTime)
             return
         
@@ -1304,9 +1306,9 @@ class pglStimulusMovie(_pglStimulus):
         '''
         Read the dimensions of the movie
         '''
-        if self.movieNum is None:
-            print(f"(pglStimulusMovie:readDimensions) ❌ Movie has been deleted")
-            return False
+        #if self.movieNum is None:
+        #    print(f"(pglStimulusMovie:readDimensions) ❌ Movie has been deleted")
+        #    return False
         
         # read details of movie
         self.frameRate = self.pgl.s.read(np.float64)
