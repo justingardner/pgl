@@ -168,7 +168,8 @@ class pglEyelink(pglEyeTracker):
             pglMessages.warning(f"Could not send message {message}, openEDF must be used to initialize file")
             return
         else:
-            pglMessages.message(f"Sending message {message}")
+            #pglMessages.message(f"Sending message {message}")
+            pass
         self.eyelink.sendMessage(message)
 
     def stop(self):

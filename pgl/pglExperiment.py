@@ -792,8 +792,16 @@ class pglExperiment(pglExperimentBase):
                     self.data.events.append(pglEventVolumeTrigger(timestamp=e.timestamp))
                     break
 
-            # grab any events that match the keyList and return their index within that list
-            subjectResponses = [keyIndex for e in events if e.type == "keyboard" and e.eventType == "keydown" and e.keyCode in self.state.responseKeyCodesList for keyIndex in [self.state.responseKeyCodesList.index(e.keyCode)]]
+            # grab any events that match the keyList and return their index within that list and timestamp
+            subjectResponses = [
+                (self.state.responseKeyCodesList.index(e.keyCode), e.timestamp)
+                for e in events
+                if (
+                    e.type == "keyboard"
+                    and e.eventType == "keydown"
+                    and e.keyCode in self.state.responseKeyCodesList
+                )
+            ]
 
             # update tasks in current phase
             phaseDone = False
@@ -806,7 +814,7 @@ class pglExperiment(pglExperimentBase):
             
             # update the screen
             if self.flush: self.pgl.flush()
-            else: print("No flush")
+            #else: print("No flush")
 
             # go to next phase or end experiment
             if phaseDone:
@@ -1102,6 +1110,7 @@ class pglTaskState(pglTraitSettings):
     currentTrial = Int(default_value=0, help="Current trial number.")
     currentSegment = Int(default_value=0, help="Current segment number.")
     subjectResponses = List(Int(), help="List of subject response key codes.")
+    gotResponse = Bool(default_value=False, help="whetehr the subject has responded or not")
 
     # make sure that any settings that the experimenter writes into settings get saved
     _serializeUnregisteredFields = True
@@ -1114,14 +1123,19 @@ class pglTaskData(pglTraitSettings):
     endTime = Float(default_value=None, allow_none=True, help="Task end time.")
     events = List(Instance(pglEvent), help="List of task events.")
     params = List(Dict(), help="List of task parameter dictionaries.")
+    responseMapping = Dict(default_value={True: ("Correct", "green"), False: ("Incorrect", "red")}, help="response mapping for handleSubjectResponses")
 
     # make sure that any settings that the experimenter writes into settings get saved
     _serializeUnregisteredFields = True
 
-    def display(self, taskName="task", responseMapping={True:('Correct','green'), False:('Incorrect','red')}, ax=None):
+    def display(self, taskName="task", responseMapping=None, ax=None):
         '''
         Display the experiment data.
         '''
+        # use responseMapping for displaying subject responses
+        if responseMapping is None:
+            responseMapping = self.responseMapping
+
         # get trial timestamps
         trialTimestamps = np.array([e.timestamp for e in self.events if isinstance(e, pglEventTrial)])
         if len(trialTimestamps) <= 2:
@@ -1444,7 +1458,7 @@ class pglTask(pglTaskBase):
         Update the task.
         '''
         # store references
-        self.state.subjectResponses = subjectResponses
+        self.state.subjectResponses = []
         self.state.phaseNum = phaseNum
         
         # custom handling of events
@@ -1467,14 +1481,16 @@ class pglTask(pglTaskBase):
         # if there are responses, call response callback
         if subjectResponses != []:
             # Pass each subjectResponse in sequence to handleSubjectResponse
-            for subjectResponse in subjectResponses:
+            for subjectResponse, timestamp in subjectResponses:
+                # adding subject response to state
+                self.state.subjectResponses.append(subjectResponse)
                 # call the subject response handler
-                responseType = self.handleSubjectResponse(subjectResponse, updateTime)
+                responseType = self.handleSubjectResponse(subjectResponse, timestamp)
                 # save as an event if responseType is not None
                 # responseType can be used to specify different types of responsees
                 # and is defined by the subclass
                 if responseType is not None:
-                    self.data.events.append(pglEventSubjectResponse(response=subjectResponse, timestamp=updateTime, responseType=responseType))
+                    self.data.events.append(pglEventSubjectResponse(response=subjectResponse, timestamp=timestamp, responseType=responseType))
                 
         # update the screen
         self.updateScreen()
