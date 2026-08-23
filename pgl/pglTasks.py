@@ -12,6 +12,7 @@ from .pglExperiment import pglTask
 from .pglStaircase import pglStaircaseUpDown
 import numpy as np
 from .pglParameter import pglParameter
+from .pglMessages import pglMessages
 
 #############
 # Fuxaton task: 2AFC on which arm of the fixation cross dims
@@ -266,3 +267,230 @@ class pglTestTask(pglTask):
         self.responseText = f"Subject response received: {response} at {updateTime - self.e.data.startTime:.2f} seconds"
 
 
+##############################################
+# Eye tracking calibration task
+##############################################
+class pglEyeTrackingCalibrationTask(pglTask):
+    
+    ########################
+    def __init__(self, pgl, nCalibrationPoints=17, calibrationWidth=10, calibrationHeight=10, nRepeats=1):
+        super().__init__(pgl)
+
+        # task name
+        self.settings.taskName = "Eye Tracking Calibration"
+        self.settings.calibrationPoints = self.makeCalibrationPoints(nCalibrationPoints=nCalibrationPoints, calibrationWidth=calibrationWidth, calibrationHeight=calibrationHeight)
+        if self.settings.calibrationPoints is None: return
+        self.settings.nCalibrationPoints = nCalibrationPoints
+        self.settings.calibrationWidth = calibrationWidth
+        self.settings.calibrationHeight = calibrationHeight
+
+        # number of repeats and trials
+        self.settings.nRepeats = nRepeats
+        self.settings.nTrials = nRepeats * nCalibrationPoints
+        
+        # set seglens
+        self.settings.seglen = [1]
+
+        # fixed parameters, these will automatically be saved in the settings file
+        self.settings.fixedParameters = {
+            'displayWidth': 30
+        }        
+        p = self.settings.fixedParameters
+        
+        # add parameters for calibration points
+        calibrationPoints = pglParameter('calibrationPoint',self.settings.calibrationPoints)        
+        self.addParameter(calibrationPoints)
+                            
+    ########################
+    # updateScren
+    ########################
+    def updateScreen(self):
+        '''
+        draw calibration points
+        '''
+        calibrationPoint = self.currentParams['calibrationPoint']
+        self.pgl.fixationABC(x=calibrationPoint[0], y=calibrationPoint[1])
+        
+
+    def makeCalibrationPoints(self, nCalibrationPoints, calibrationWidth, calibrationHeight):
+        """
+        Validate a requested calibration-point count and return calibration
+        target positions centered at (0, 0).
+
+        Parameters
+        ----------
+        nCalibrationPoints : int
+            Must be one of: 5, 9, 13, or 17.
+
+        calibrationWidth : float
+            Total horizontal width covered by calibration targets.
+            Targets range from -calibrationWidth / 2 to +calibrationWidth / 2.
+
+        calibrationHeight : float
+            Total vertical height covered by calibration targets.
+            Targets range from -calibrationHeight / 2 to +calibrationHeight / 2.
+
+        Returns
+        -------
+        list[tuple[float, float]]
+            List of (x, y) calibration-target coordinates.
+        """
+
+        validCalibrationPointCounts = (5, 9, 13, 17)
+
+        if nCalibrationPoints not in validCalibrationPointCounts:
+            pglMessages.warning(f"nCalibrationPoints must be one of {validCalibrationPointCounts}; got {nCalibrationPoints}")
+            return None
+
+        if not isinstance(calibrationWidth, (int, float)):
+            pglMessages.warning(f"calibrationWidth must be a finite numeric value; got {calibrationWidth!r}")
+            return None
+
+        if not isinstance(calibrationHeight, (int, float)):
+            pglMessages.warning(f"calibrationHeight must be a finite numeric value; got {calibrationHeight!r}")
+            return None
+
+        if calibrationWidth <= 0:
+            pglMessages.warning(f"calibrationWidth must be greater than zero; got {calibrationWidth}")
+            return None
+
+        if calibrationHeight <= 0:
+            pglMessages.warning(f"calibrationHeight must be greater than zero; got {calibrationHeight}")
+            return None
+
+        halfWidth = calibrationWidth / 2.0
+        halfHeight = calibrationHeight / 2.0
+
+        innerWidth = calibrationWidth / 4.0
+        innerHeight = calibrationHeight / 4.0
+
+        centerPoint = (0.0, 0.0)
+
+        # Four outer corners.
+        outerCornerPoints = [
+            (-halfWidth, -halfHeight),
+            ( halfWidth, -halfHeight),
+            ( halfWidth,  halfHeight),
+            (-halfWidth,  halfHeight),
+        ]
+
+        # Four midpoint targets on the outer rectangle.
+        outerEdgePoints = [
+            (0.0,       -halfHeight),  # top
+            (halfWidth,  0.0),         # right
+            (0.0,        halfHeight),  # bottom
+            (-halfWidth, 0.0),         # left
+        ]
+
+        # Four corners of an inner rectangle.
+        innerCornerPoints = [
+            (-innerWidth, -innerHeight),
+            ( innerWidth, -innerHeight),
+            ( innerWidth,  innerHeight),
+            (-innerWidth,  innerHeight),
+        ]
+
+        # Four midpoint targets on the inner rectangle.
+        innerEdgePoints = [
+            (0.0,        -innerHeight),
+            (innerWidth,  0.0),
+            (0.0,         innerHeight),
+            (-innerWidth, 0.0),
+        ]
+
+        if nCalibrationPoints == 5:
+            # Center + four corners.
+            calibrationPoints = [
+                centerPoint,
+                *outerCornerPoints,
+            ]
+
+        elif nCalibrationPoints == 9:
+            # Standard 3 x 3 layout:
+            # center + four corners + top/right/bottom/left edge midpoints.
+            calibrationPoints = [
+                centerPoint,
+                *outerCornerPoints,
+                *outerEdgePoints,
+            ]
+
+        elif nCalibrationPoints == 13:
+            # 9-point outer layout plus four inner-diagonal points.
+            calibrationPoints = [
+                centerPoint,
+                *outerCornerPoints,
+                *outerEdgePoints,
+                *innerCornerPoints,
+            ]
+
+        else:  # nCalibrationPoints == 17
+            # Outer 8-point ring + inner 8-point ring + center.
+            calibrationPoints = [
+                centerPoint,
+                *outerCornerPoints,
+                *outerEdgePoints,
+                *innerCornerPoints,
+                *innerEdgePoints,
+            ]
+
+        assert len(calibrationPoints) == nCalibrationPoints
+
+        return calibrationPoints
+
+##############################################
+# display a message and prompt for subject to hit key
+##############################################
+class pglMessageAckTask(pglTask):
+    
+    ########################
+    def __init__(self, pgl, message="Hit any button to continue", ackKey='space'):
+        super().__init__(pgl)
+
+        # task name
+        self.settings.taskName = "Acknowledge Message"
+
+        # set seglens
+        self.settings.seglen = [np.inf]
+
+        # fixed parameters, these will automatically be saved in the settings file
+        self.settings.fixedParameters = {
+            'message': message,
+            'ackKey': ackKey,
+        }        
+        self.settings.nTrials=1
+
+        #self.state.ackKeyCode = self.pgl.devicesGetKeyboard().charToKeyCode(self.settings.calibrateKey)
+
+        # eat only asked for key
+        #k = self.pgl.devicesGetKeyboard()            
+        #self.state.eatKeys = k.eatKeyCodes
+
+
+    ########################
+    # updateScren
+    ########################
+    def updateScreen(self):
+        '''
+        draw text
+        '''
+        self.pgl.text(self.settings.fixedParameters['message'],y=0)
+
+    ########################
+    # handleSubjectResponse
+    ########################    
+    def handleSubjectResponse(self, response, updateTime):
+        self.jumpSegment()
+
+
+    ########################
+    # handleEvents
+    ########################
+    def handleEvents(self, events):
+        '''
+        '''
+        #if [e for e in events if e.type == "keyboard" and e.eventType == "keydown"and e.keyCode == self.state.ackKeyCode]: 
+        #    self.jumpSegment()
+        pass
+
+
+        
