@@ -254,6 +254,29 @@ class pglDraw:
         self.line(x, y - size/2, x, y + size/2, color, units=units)
 
     ################################################################
+    # fixationABC
+    ################################################################
+    def fixationABC(self, size=1, x=0, y=0, color=1, backgroundColor =0, units=None):
+        '''
+        Draw ABC fixation cross from Thaler, Schütz, Goodale & Gegenfurtner (2013) Vision Research 76:31-42
+
+        Args:
+            size (float): size of fixation cross in degrees
+            x (float): The x coordinate of the center of the cross.
+            y (float): The y coordinate of the center of the cross.
+            color (list or tuple, optional): RGB color values as a list or tuple of three floats in the range [0, 1].
+            backgroundColor (list or tuple, optional): color for background disc
+        
+        Returns:
+            None
+        '''
+
+        self.arc(x,y,0,size/2,stopAngle=2*np.pi,borderSize=0,color=backgroundColor)
+        self.rect(x-size/2,y,width=size,height=size/4,color=color,hAlign='left',vAlign='center')
+        self.rect(x,y-size/2,width=size/4,height=size,color=color,hAlign='center',vAlign='top')
+        self.arc(x,y,0,size/10,stopAngle=2*np.pi,borderSize=0,color=backgroundColor)
+        
+    ################################################################
     # circle
     ################################################################
     def circle(self, radius=1, x=0, y=0, color=None, numSegments=36, fill=False, units=None):
