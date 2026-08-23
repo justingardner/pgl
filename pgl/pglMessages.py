@@ -43,7 +43,7 @@ class pglMessages:
         return(msg)
     
     @staticmethod
-    def wrapText(msg: str, lineLength: int = 80) -> str:
+    def wrapText(msg: str, lineLength: int = 120) -> str:
         """
         Split msg into lines, preferring to break at a space.
         If no space is found within lineLength characters, break at lineLength anyway.
