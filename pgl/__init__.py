@@ -4,7 +4,7 @@ from .pglDraw import pglDraw
 from .pglTransform import pglTransform
 from .pglProfile import pglProfile
 from .pglBatch import pglBatch
-from .pglImage import pglImage
+from .pglImage import pglImage, pglImageDatabase, pglImageDatabaseWithManifest, pglMovieDatabase
 from .pglStimuli import pglStimuli
 from .pglTimestamp import pglTimestamp
 from .pglDevice import pglDevice, pglDevices, pglDigitalIODevice, pglAnalogTraceData

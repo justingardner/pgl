@@ -828,7 +828,7 @@ class _pglTraitsDialog(QDialog):
                     buttonFunction = getattr(obj, plotButtonFunction, None)
                     if buttonFunction is not None:
                         self.figure.clear()
-                        buttonFunction(fig=self.figure)
+                        buttonFunction(self.figure)
                         self.plotCanvas.draw()
                 except Exception as e:
                     pglMessages.warning(f"Error refreshing plot: {e}")

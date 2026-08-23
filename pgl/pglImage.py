@@ -20,6 +20,10 @@ import posixpath
 import os
 import matplotlib.pyplot as plt
 import pandas as pd
+import imageio.v2 as imageio
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+
 
 #############
 # Image class
@@ -421,7 +425,77 @@ class pglImageFile(pglStimulusFile):
         ax.set_title(repr(self))
         ax.axis("off")
         return ax
+    
+################################################
+# pglMovieFile
+################################################
+class pglMovieFile(pglStimulusFile):
 
+    caption = Unicode(default_value="", help="Movie caption")
+
+    def get(self):
+        '''
+        Get movie-stimulus reader
+
+        Args:
+            stimulusNum (int): number of stimulus to get
+
+        Returns:
+            imageio reader, or None if unavailable/nonlocal.
+        '''
+        filesystem, filename, _ = pglBase.validateFilesystem(filesystem=self.filesystem, dataPath=self.filename, filesystemPrefix=self.filesystemPrefix)
+
+        # fsspec filesystems generally identify local files with protocol="file".
+        protocol = filesystem.protocol
+        if isinstance(protocol, (tuple, list)):
+            isLocal = "file" in protocol
+        else:
+            isLocal = protocol == "file"
+
+        if not isLocal:
+            pglMessages.warning(
+                f"Cannot yet read movie from nonlocal filesystem "
+                f"({protocol}): {filename}"
+            )
+            return None
+
+        # Do not open it with filesystem.open(): imageio/FFmpeg wants the
+        # actual local filename, and it manages the file handle itself.
+        localFilename = filesystem._strip_protocol(filename)
+
+        return imageio.get_reader(localFilename)
+
+    def display(self, ax=None):
+        '''
+        Display movie once in `ax`, without blocking.
+
+        If ax is omitted, create a new figure and axes.
+
+        Returns:
+            animation: Keep this reference if you want to control the animation.
+        '''
+        if ax is None:
+            fig, ax = plt.subplots()
+
+        elif isinstance(ax, plt.Figure):
+            fig = ax
+            ax = fig.add_subplot(111)
+
+        else:
+            fig = ax.figure
+            
+        reader = self.get()
+        if reader is None:
+            return None
+
+        fps = reader.get_meta_data().get("fps", 30)
+
+        # Read only the first frame now, so Matplotlib has something to display.
+        frameIterator = reader.iter_data()
+        firstFrame = next(frameIterator)
+
+        imageArtist = ax.imshow(firstFrame)
+        ax.axis("off")
 ################################################
 # pglStimulusDaabase
 ################################################
@@ -439,11 +513,9 @@ class pglStimulusDatabase(pglTraitSettings):
         Initialize by pointing to a directory where images live
         '''
         
+
         if dataPath:
-            # get known image extensions
-            Image.init()
-            imageExtensions = set(Image.registered_extensions().keys())
-            
+    
             # parse filesystem
             self.filesystem, self.fullDataPath, self.filesystemPrefix = pglBase.validateFilesystem(filesystem, dataPath)
             if not self.filesystem:
@@ -468,7 +540,7 @@ class pglStimulusDatabase(pglTraitSettings):
             self.stimuli.sort(key=lambda x: x.name.lower())
             
             # and let the world know
-            pglMessages.message(f"Found {self.nStimuli} image files in {os.path.basename(dataPath)}")
+            pglMessages.message(f"Found {self.nStimuli} stimulus files in {os.path.basename(dataPath)}")
             
     def validateStimulusNum(self, stimulusNum):
         '''
@@ -511,15 +583,44 @@ class pglStimulusDatabase(pglTraitSettings):
     
     def print(self):
         '''
-        print a representation of stimulus database. define in subclass
-        '''
-        pass
-
-    def print(self):
-        '''
         print a representation of stimulus database. 
         '''
         pglMessages.message(" ".join(f"{iImage}: {image.name}" for iImage, image in enumerate(self.stimuli)))      
+
+############################################
+# pglMovieDatabse
+############################################
+class pglMovieDatabase(pglStimulusDatabase):
+    def __init__(self, dataPath=None, filesystem=None):
+        '''
+        Initialize a movie database
+        '''
+        # call super
+        super().__init__(dataPath=dataPath, knownFileExtensions=['.mp4'], filesystem=filesystem, stimulusFileClass=pglMovieFile)
+
+    def preload(self,stimulusNum):
+        '''
+        preloadImage from database. This will preload the image into memory
+        '''
+        pass
+        
+    def get(self, stimulusNum):
+        '''
+        Get movie-stimulus reader from database.
+
+        Args:
+            stimulusNum (int): number of stimulus to get
+
+        Returns:
+            imageio reader, or None if unavailable/nonlocal.
+        '''
+        if not self.validateStimulusNum(stimulusNum):
+            return None
+
+        return self.stimuli[stimulusNum].get()
+    
+    def display(self, ax=None):
+        self.stimuli[0].display(ax=ax)
 
 ############################################
 # pglImageDatabse
@@ -553,9 +654,9 @@ class pglImageDatabase(pglStimulusDatabase):
         if not self.validateStimulusNum(stimulusNum): return
         return(self.stimuli[stimulusNum].img)
     
-    def displayImage(self, ax=None):
+    def display(self, ax=None):
         ''' 
-        display a representation of stimulus database. define in subclass
+        display a representation of stimulus at top of stimulus list. define in subclass
         '''
         pass
     
