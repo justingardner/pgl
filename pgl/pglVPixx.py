@@ -587,7 +587,7 @@ class pglDataPixx(pglDigitalIODevice, pglDataPixxBase):
         '''
         # initialize super
         super().__init__(deviceType)
-
+        if self.dp is None: return
         # no configured digital channels
         self.digitalChannels = {}
 
