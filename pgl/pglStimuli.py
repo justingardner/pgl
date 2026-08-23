@@ -1325,13 +1325,21 @@ class pglStimulusMovie(_pglStimulus):
         self.dimensionsReady.set() 
 
         return True
-
+    def __del__(self):
+        try:
+            if getattr(self, "movieNum", None) is not None:
+                movieNum = self.movieNum
+                self.delete()
+                pglMessages.message(f"Deleted movie {movieNum}")
+        except Exception:
+            # Never raise from a destructor, particularly during interpreter shutdown.
+            pass
     def delete(self):
         '''
         delete the movie stimulus
         '''
         if self.movieNum is None:
-            print(f"(pglStimulusMovie:setDisplayPosition) ❌ Movie has been deleted")
+            pglMessages.warning(f"Movie has been deleted",level=1)
             return False
         self.pgl.s.writeCommand("mglMovieDelete")
         ackTime = self.pgl.s.readAck()
