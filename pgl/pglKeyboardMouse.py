@@ -143,7 +143,13 @@ class pglKeyboardMouse(pglDevice):
             timestamp = keyEvent['timestamp']
             keyCode = keyEvent['keyCode']
             eventType = keyEvent['eventType']
-            
+
+            # Normalize numeric-keypad digits to top-row digit key codes.
+            keyCode = {
+                82: 29, 83: 18, 84: 19, 85: 20, 86: 21,
+                87: 23, 88: 22, 89: 26, 91: 28, 92: 25
+            }.get(keyCode, keyCode)
+
             # Extract modifier keys
             shift = keyEvent.get('shift', False)
             ctrl = keyEvent.get('control', False)
@@ -170,15 +176,52 @@ class pglKeyboardMouse(pglDevice):
     
     def setEatKeys(self, keyCodes=None, keyChars=None):
         '''
-        Set keys to eat so they don't propagate to the OS. 
+        Set keys to eat so they don't propagate to the OS.
+
+        Numeric top-row and keypad keys are treated as equivalent.
 
         Args:
-            keyCodes (list): List of key codes to eat.
-            keyChars (list): List of characters to eat (e.g., ["a", "b", "c", "space"]). Each character is converted to its key code.
+            keyCodes (list): List of macOS key codes to eat.
+            keyChars (list): List of characters to eat, e.g. ["a", "1"].
         '''
-        if self.isRunning():
-            self.eatKeyCodes = self.listener.setEatKeys(keyCodes, keyChars)
-    
+        if not self.isRunning():
+            return
+
+        keypadNumericToTopRowKeyCode = {
+            82: 29, 83: 18, 84: 19, 85: 20, 86: 21,
+            87: 23, 88: 22, 89: 26, 91: 28, 92: 25,
+        }
+
+        # Start with either passed key codes or no codes.
+        requestedKeyCodes = set(keyCodes or [])
+
+        # Convert requested characters before expanding keypad equivalents.
+        if keyChars is not None:
+            requestedKeyCodes.update(
+                charToKeyCode(keyChar)
+                for keyChar in keyChars
+            )
+
+        # Normalize keypad digits to their corresponding top-row codes.
+        normalizedKeyCodes = {
+            keypadNumericToTopRowKeyCode.get(keyCode, keyCode)
+            for keyCode in requestedKeyCodes
+        }
+
+        # Retain nonnumeric keys; include both physical forms of requested digits.
+        finalKeyCodes = [
+            rawKeyCode
+            for rawKeyCode in (
+                requestedKeyCodes | set(keypadNumericToTopRowKeyCode)
+            )
+            if keypadNumericToTopRowKeyCode.get(rawKeyCode, rawKeyCode)
+            in normalizedKeyCodes
+        ]
+
+        self.eatKeyCodes = self.listener.setEatKeys(
+            keyCodes=finalKeyCodes,
+            keyChars=None
+        )
     def setEatAllKeys(self, eatAllKeys=False):
         '''
         Set to eat all keys or not. If set to False, will still eat any keys that setEatKeys is set to.
