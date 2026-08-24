@@ -1275,7 +1275,7 @@ class pglStimulusMovie(_pglStimulus):
         if (result < 0): 
             pglMessages.warning(f"Error creating movie {filename}: {self.movieError.get(int(result),"Unrecogonized Error")}")
             if int(result)== -2:
-                pglMessages.warning("Permission errors can be caused by sandboxing of mglMetal.app. Consider unsandboxing using: codesign --force --deep --sign - {pgl.getPGLDir()}/mglMetal.app")
+                pglMessages.warning(f"Permission errors can be caused by sandboxing of mglMetal.app. Consider unsandboxing using: codesign --force --deep --sign - {pgl.getPGLDir()}/metal/mglMetal.app")
             self.commandResults = self.pgl.s.readCommandResults(ackTime)
             return
         
