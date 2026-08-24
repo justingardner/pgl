@@ -828,6 +828,10 @@ class pglExperiment(pglExperimentBase):
                     self.state.currentPhaseIndex += 1
                     self.startPhase(phaseNum=self.state.phaseNums[self.state.currentPhaseIndex])
 
+        # clear screen
+        self.pgl.clearScreen(self.settings.backgroundColor)
+        self.pgl.flush()
+
         # stop eye tracker recording if we have an eye tracker
         if self.eyeTracker is not None:
             self.eyeTracker.stop()

@@ -623,6 +623,19 @@ class pglMovieDatabase(pglStimulusDatabase):
         self.stimuli[stimulusNum].display(ax=ax)
 
 ############################################
+# pglMovieDatabse
+############################################
+#class pglMovieFoilDatabase(pglStateDataSettings):
+
+    #movies = List(Instance(pglMovieDatabase))
+    ##def loadMovies(self, dataPath, filesystem=None):
+    #   self.settings.movies
+    #def loadMoviesWithFoils(self, dataPath, foilsDataPath, filesystem=None):
+
+    
+
+
+############################################
 # pglImageDatabse
 ############################################
 class pglImageDatabase(pglStimulusDatabase):
