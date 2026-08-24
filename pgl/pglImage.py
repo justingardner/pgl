@@ -331,6 +331,10 @@ class pglStimulusFile(pglTraitSettings):
     filesystem = Instance(AbstractFileSystem, allow_none=True, serialize=False, help="filesystem for serialization")
     filename= Unicode(allow_none=True, default_value="", help="Full path to images", visible=False)
     filesystemPrefix = Unicode(allow_none=True, default_value="", help="Prefix like ssh:// used for accessing filesystem", visible=False)
+    caption = Unicode(default_value="", help="Image caption")
+    condition = Unicode(default_value="", help="condition")
+    conditionNum = Int(allow_none=True, default_value=None, help="conditionNum")
+
 
 ################################################
 # pglImageFile
@@ -342,7 +346,6 @@ class pglImageFile(pglStimulusFile):
     _mode = Unicode(allow_none=True, default_value=None, property="mode", enabled=False, help="Image mode")
     _format = Unicode(allow_none=True, default_value=None, property="format", enabled=False, help="Image format")
     _img = Instance(Image.Image, allow_none=True, default_value=None, serialize=False, visible=False, help="The loaded PIL image")
-    caption = Unicode(default_value="", help="Image caption")
     
     def _loadMetadata(self):
         pglMessages.message(f"Loading image metadata: {self.filesystemPrefix}/{self.filename}")
@@ -431,8 +434,6 @@ class pglImageFile(pglStimulusFile):
 ################################################
 class pglMovieFile(pglStimulusFile):
 
-    caption = Unicode(default_value="", help="Movie caption")
-
     def get(self):
         '''
         Get movie-stimulus reader
@@ -496,6 +497,7 @@ class pglMovieFile(pglStimulusFile):
 
         imageArtist = ax.imshow(firstFrame)
         ax.axis("off")
+
 ################################################
 # pglStimulusDaabase
 ################################################
@@ -512,18 +514,16 @@ class pglStimulusDatabase(pglTraitSettings):
         '''
         Initialize by pointing to a directory where images live
         '''
-        
-
         if dataPath:
     
             # parse filesystem
-            self.filesystem, self.fullDataPath, self.filesystemPrefix = pglBase.validateFilesystem(filesystem, dataPath)
+            self.filesystem, self.dataPath, self.filesystemPrefix = pglBase.validateFilesystem(filesystem, dataPath)
             if not self.filesystem:
                 pglMessages.warning("Could not resolve path to images")
                 return
                             
             # look for stimuli in directory
-            for f in self.filesystem.ls(self.fullDataPath, detail=True):
+            for f in self.filesystem.ls(self.dataPath, detail=True):
                 # only open files
                 if f["type"] != "file": continue
                 if os.path.splitext(f["name"])[1].lower() in knownFileExtensions:
@@ -541,7 +541,97 @@ class pglStimulusDatabase(pglTraitSettings):
             
             # and let the world know
             pglMessages.message(f"Found {self.nStimuli} stimulus files in {os.path.basename(dataPath)}")
-            
+
+    def useManifest(self, filenameColumn="filename", indexColumn="index", captionColumn=None, conditionColumn=None, conditionNumColumn=None):
+        """
+        Load stimulus ordering and optional metadata from a CSV manifest.
+
+        The manifest must contain filenameColumn and indexColumn. Optional
+        caption, condition, and conditionNum columns are copied onto each
+        stimulus object.
+        """
+
+        # Filenames of stimuli that were actually loaded
+        filenames = [stimulus.name for stimulus in self.stimuli]
+
+        # Find a CSV manifest
+        self.manifest = None
+        
+        csvFilenames=self.filesystem.glob(os.path.join(self.dataPath, "*.csv"))
+        if len(csvFilenames) == 0:
+            pglMessages.warning(f"Could not find a manifest in {self.dataPath}. Must be a file with .csv extension")
+            return
+        elif len(csvFilenames) > 1:
+            pglMessages.warning(f"Found multiple manifests in {self.dataPath}. Must be ONLY ONE file with .csv extension")
+            return
+
+        for csvFilename in csvFilenames:
+            try:
+                with self.filesystem.open(csvFilename) as f:
+                    dataFrame = pd.read_csv(f)
+
+                # Check required columns
+                if filenameColumn not in dataFrame.columns or indexColumn not in dataFrame.columns:
+                    pglMessages.message(
+                        f"Could not find {filenameColumn} and/or {indexColumn} "
+                        f"in {csvFilename}. Using alphabetical sort order"
+                    )
+                    return
+
+                # Make sure the manifest contains exactly the loaded stimuli
+                manifestFilenames = dataFrame[filenameColumn]
+
+                if set(manifestFilenames) != set(filenames):
+                    pglMessages.message(
+                        f"Manifest {csvFilename} does not contain exactly the "
+                        f"loaded stimulus files. Using alphabetical sort order"
+                    )
+                    return
+
+                # Keep the manifest
+                self.manifest = dataFrame
+
+                # Sort stimuli according to the manifest index
+                indexByFilename = dict(
+                    zip(manifestFilenames, dataFrame[indexColumn])
+                )
+
+                self.stimuli.sort(
+                    key=lambda stimulus: indexByFilename[stimulus.name]
+                )
+
+                # Create lookup table by filename
+                manifestByFilename = dataFrame.set_index(filenameColumn)
+
+                # Copy optional metadata onto each stimulus
+                for stimulus in self.stimuli:
+                    row = manifestByFilename.loc[stimulus.name]
+
+                    if captionColumn is not None:
+                        stimulus.caption = row[captionColumn]
+
+                    if conditionColumn is not None:
+                        stimulus.condition = row[conditionColumn]
+
+                    if conditionNumColumn is not None:
+                        value = row[conditionNumColumn]
+                        stimulus.conditionNum = (
+                            None if pd.isna(value) else int(value)
+                        )
+
+                pglMessages.message(
+                    f"Sorted and loaded stimulus metadata from "
+                    f"{os.path.basename(csvFilename)}"
+                )
+
+                return
+
+            except Exception as e:
+                pglMessages.warning(
+                    f"Error loading manifest {csvFilename}: {e}",
+                    level=1
+                )   
+
     def validateStimulusNum(self, stimulusNum):
         '''
         validate stimulus Num
@@ -623,19 +713,6 @@ class pglMovieDatabase(pglStimulusDatabase):
         self.stimuli[stimulusNum].display(ax=ax)
 
 ############################################
-# pglMovieDatabse
-############################################
-#class pglMovieFoilDatabase(pglStateDataSettings):
-
-    #movies = List(Instance(pglMovieDatabase))
-    ##def loadMovies(self, dataPath, filesystem=None):
-    #   self.settings.movies
-    #def loadMoviesWithFoils(self, dataPath, foilsDataPath, filesystem=None):
-
-    
-
-
-############################################
 # pglImageDatabse
 ############################################
 class pglImageDatabase(pglStimulusDatabase):
@@ -674,47 +751,3 @@ class pglImageDatabase(pglStimulusDatabase):
         pass
     
 
-class pglImageDatabaseWithManifest(pglImageDatabase):
-    def __init__(self, dataPath=None, filesystem=None, filenameColumn="filename", indexColumn="index", captionColumn="caption_1"):
-        super().__init__(dataPath,filesystem)
-        if not self.filesystem: return
-        if dataPath is None: return
-
-        # now make a set of the filenames that we loaded
-        filenames = [stimulus.name for stimulus in self.stimuli]
-        # load the the csv manifest
-        self.manifest = None
-        for csvFilename in self.filesystem.glob(os.path.join(dataPath, "*.csv")):
-            try:
-                # dataFrame for csv file
-                dataFrame = pd.read_csv(self.filesystem.open(csvFilename))
-
-                # check for specific columns that we wish to use
-                if filenameColumn in dataFrame.columns and indexColumn in dataFrame.columns:
-                    manifestFilenames = dataFrame[filenameColumn]
-                    manifestIndex = dataFrame[indexColumn]
-                else:
-                    pglMessages.message(f"Could not find {filenameColumn} and {indexColumn} in {csvFilename}. Using alphabetical sort order")
-                    return                
-                manifestCaption = dataFrame.get(captionColumn)
-                
-                # see if we have all images in the manifest
-                if set(manifestFilenames) == set(filenames):
-                    # good, let's keep the dataFrame
-                    self.manifest = dataFrame
-                    # and sort by the index value
-                    # first make a dict which matches each filename to the index in the index column
-                    indexByFilename = dict(zip(manifestFilenames, manifestIndex))
-                    # and sort our stimuli
-                    self.stimuli.sort(key=lambda x: indexByFilename[x.name])
-                    
-                    # set the captions of the stimuli according to the manifest
-                    if manifestCaption is not None: 
-                        captionByFilename = dict(zip(manifestFilenames, manifestCaption))
-                        for stimulus in self.stimuli:
-                            stimulus.caption = captionByFilename[stimulus.name]
-                    
-                    pglMessages.message("Sorted and set captions from manifest")                    
-            except Exception as e:
-                pglMessages.warning(f"Error loading manifest {csvFilename}: {e}", level=1)
-     
