@@ -30,7 +30,7 @@ class pglParameter(pglStateDataSettings):
     '''
     Class representing a parameter in the experiment.
     '''
-    def __init__(self, name: str, validValues: list|tuple|np.ndarray, description: str="", catchTrialEvery=None, randomSeed=None):
+    def __init__(self, name: str, validValues: list|tuple|np.ndarray, description: str="", randomize=True, catchTrialEvery=None, randomSeed=None):
         '''
         Initialize the parameter.
         
@@ -75,6 +75,9 @@ class pglParameter(pglStateDataSettings):
         # initialize random number generation
         self.setRandomSeed(randomSeed)
 
+        # set whether to randomize
+        self.settings.randomize = randomize
+        
         # set catchTrialEvery
         if catchTrialEvery:
             self.settings.catchTrialEvery = catchTrialEvery
@@ -159,7 +162,10 @@ class pglParameter(pglStateDataSettings):
         # compatible with tuples of parameters
         # from above and then shuffle
         parameterBlock = [(v,) for v in self.settings.validValues]
-        self._rng.shuffle(parameterBlock)
+        
+        # randomize the order
+        if self.settings.randomize:
+            self._rng.shuffle(parameterBlock)
         
         # return the block
         return (paramNames, parameterBlock)
