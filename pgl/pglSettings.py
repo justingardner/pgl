@@ -712,10 +712,17 @@ class pglTraitSettings(HasTraits, pglSerialize):
 
         return ordered
 
-    def print(self):
-        '''
-        print
-        '''
+    def print(self, all=False):
+        """
+        Print traitlet settings.
+
+        Parameters
+        ----------
+        all : bool, default=False
+            If True, print all traits, including traits inherited from
+            pglTraitSettings. If False, only print traits defined by the
+            child class.
+        """
         print(f"{self.__class__.__name__}:")
         print("-" * 40)
 
@@ -723,6 +730,10 @@ class pglTraitSettings(HasTraits, pglSerialize):
 
             # skip private/internal traits
             if name.startswith("_"):
+                continue
+
+            # Unless all=True, skip traits defined by pglTraitSettings
+            if not all and name in pglTraitSettings.__dict__:
                 continue
 
             label = trait.metadata.get("traitDisplayName", name)
