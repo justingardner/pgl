@@ -1414,7 +1414,7 @@ class pglStimulusMovie(_pglStimulus):
         # get rotation. This will default to 0 degrees if not 
         # recovered by mglMetal from avplayer
         rotation = self.preferredTransform.rotationAngle()
-        print(f"(pglMovie:setDisplayPosition) Rotation: {rotation} degrees")
+        #pglMessages.message(f"Rotation: {rotation} degrees")
         
         # Calculate aspect ratio if video dimensions are known
         if self.width == 0 or self.height == 0:
@@ -1589,8 +1589,8 @@ class pglStimulusMovie(_pglStimulus):
         self.commandResults = self.pgl.s.readCommandResults(ackTime)
         
         # print summary if verbose
-        if self.pgl.verbose>0:
-            print(f"(pglStimulusMovie:play) Movie played {len(self.presentedTimes)} frames.")
+        if self.pgl.verbose>1:
+            print(f"(pglStimulusMovie:play) Movie played {len(self.presentedTimes)} frames")
 
         # display frame statistics if versbose is set
         if self.pgl.verbose>0:

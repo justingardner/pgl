@@ -540,7 +540,7 @@ class pglStimulusDatabase(pglTraitSettings):
             self.stimuli.sort(key=lambda x: x.name.lower())
             
             # and let the world know
-            pglMessages.message(f"Found {self.nStimuli} stimulus files in {os.path.basename(dataPath)}")
+            pglMessages.message(f"Found {self.nStimuli} stimulus files in {dataPath}")
 
     def useManifest(self, filenameColumn="filename", indexColumn="index", captionColumn=None, conditionColumn=None, conditionNumColumn=None):
         """
