@@ -4,7 +4,7 @@ from .pglDraw import pglDraw
 from .pglTransform import pglTransform
 from .pglProfile import pglProfile
 from .pglBatch import pglBatch
-from .pglImage import pglImage, pglImageDatabase, pglImageDatabaseWithManifest, pglMovieDatabase
+from .pglImage import pglImage, pglImageDatabase, pglMovieDatabase
 from .pglStimuli import pglStimuli
 from .pglTimestamp import pglTimestamp
 from .pglDevice import pglDevice, pglDevices, pglDigitalIODevice, pglAnalogTraceData
@@ -19,13 +19,14 @@ from .pglTasks import pglFixationTaskLeftRight, pglBarTask, pglTestTask, pglEyeT
 from ._pglComm import pglSerial
 from .pglCalibration import pglDisplayCalibration, pglLuminanceCalibrationDeviceMinolta, pglDisplayLuminanceCalibrationData, pglLuminanceCalibrationDeviceDebug
 from .pglGammaTable import pglGammaTable 
-from .pglSettings import pglSettingsManager, pglDisplaySettings, pglDisplaySettingsList, pglDisplayModeSettings, pglSettings
+from .pglSettings import pglSettingsManager, pglDisplaySettings, pglDisplaySettingsList, pglDisplayModeSettings, pglSettings, pglTraitSettings, pglStateDataSettings
 from .pglEventListener import pglEventListener
 from .pglEyeTracker import pglEyeTracker
 from .pglDialog import pglDialogs
 from .pglMessages import pglMessages
 from .pglPipeline import pglChooseData
 from .pglFlywheel import pglFlywheel
+from .pglDigitalBrain import pglChooseBlock
 
 # Device specific imports (eye trackers, etc.)
 from .pglVPixx import pglProPixx, pglDataPixx
