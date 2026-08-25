@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 from pgl.pglImage import pglImageInstance
 import math
+from .pglMessages import pglMessages
 
 #############
 # Drawing class
@@ -617,67 +618,75 @@ class pglDraw:
     ######################################################
     def textCreate(self, textString, color=None, fontSize=40, fontName="Helvetica"):
         '''
-        Creates a text image from a text string, called by text but
-        you can call this directly and call text with the created image
-        if you intend to draw the string many times and want to avoid
-        the overhead of creating the image of the text each time.
+        Create a text texture on the mglMetal server.
 
-        Args:
-            textString (str): The text to create.
-            fontSize (int): The size of the font.
-            fontName (str): The name of the font.
-
-        Returns:
-            None
+        The initial implementation uses the current server-side text rendering
+        parameters. Per-call color, fontSize, and fontName will be applied later
+        using mglSetTextRenderingParameters.
         '''
-        # validate color
-        color = self.validateColor(color)
-        color = color.flatten()
-        
-        # Load Font
-        fontPath = "/System/Library/Fonts"
-        p = Path(fontName)
-        # add ttf suffix if not specified
-        if not p.suffix: fontName += ".ttc"
-        if p.is_absolute():
-            # If the fontName is an absolute path, use it directly
-            fontFullName = fontName
-        else:
-            # join with default font path
-            fontFullName = os.path.join(fontPath, fontName)
-        try:
-            # Try to load the specified font
-            font = ImageFont.truetype(fontFullName, fontSize)
-        except:
-            print(f"(pglDraw:text) Failed to load font '{fontName}' from '{fontPath}'. Using default font.")
-            fontFullName = os.path.join(fontPath,"Helvetica.ttc")
-            font = ImageFont.truetype(fontFullName, fontSize)
-        
-        # padding around text
-        padding = 11
 
-        # Create a dummy image to measure text size
-        dummyImg = Image.new("RGBA", (1, 1))
-        draw = ImageDraw.Draw(dummyImg)
+        # Require a normal Python string.
+        if not isinstance(textString, str):
+            pglMessages.warning("textString must be a string.")
+            return None
 
-        # Get bounding box for text sample of characters that are usually the tallest
-        # to get font height, get text width from actual string
-        bbox = draw.textbbox((0, 0), "HITLFEfhkl", font=font)
-        textHeight = bbox[3] - bbox[1]
-        bbox = draw.textbbox((0, 0), textString, font=font)
-        textWidth = bbox[2] - bbox[0]
+        # Warn when requested style settings are not yet applied server-side.
+        if color is not None or fontSize != 40 or fontName != "Helvetica":
+            pglMessages.warning("Per-call color, fontSize, and fontName are not yet supported by server-side text rendering. Using current server text-rendering settings.")
 
-        # Create an image with transparent background
-        img = Image.new("RGBA", (textWidth + 2 * padding, textHeight + 2 * padding), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(img)
+        # Request a new texture containing the rendered string.
+        self.s.writeCommand("mglCreateTextTexture")
+        ackTime = self.s.readAck()
 
-        # Draw anti-aliased text
-        draw.text((padding, padding), textString, font=font, fill=tuple(int(255*c) for c in color))
-        
-        # create the text image
-        img = self.imageCreate(np.array(img))
-        return img
-        
+        if ackTime is None:
+            pglMessages.message("Did not receive command acknowledgment.")
+            return None
+
+        # Send the string for server-side measurement and rendering.
+        self.s.write(textString)
+
+        # Read the text-specific query result timestamp.
+        result = self.s.read(np.float64)
+
+        if result is None:
+            pglMessages.message("Did not receive text texture results.")
+            return None
+
+        if result < 0:
+            pglMessages.message(f"Failed to create text texture for '{textString}'.")
+            return None
+
+        # Read texture dimensions and its assigned texture number.
+        textWidthPixels = self.s.read(np.uint32)
+        textHeightPixels = self.s.read(np.uint32)
+        textureNumber = self.s.read(np.uint32)
+        textureCount = self.s.read(np.uint32)
+
+        if (textWidthPixels is None or textHeightPixels is None or
+                textureNumber is None or textureCount is None):
+            pglMessages.message("Did not receive complete text texture data.")
+            return None
+
+        # Read generic command completion results after command-specific data.
+        self.commandResults = self.s.readCommandResults(ackTime)
+
+        # Convert NumPy scalar values to ordinary Python integers.
+        textWidthPixels = int(textWidthPixels)
+        textHeightPixels = int(textHeightPixels)
+        textureNumber = int(textureNumber)
+        textureCount = int(textureCount)
+
+        if textureNumber < 1:
+            pglMessages.message(f"Server returned invalid texture number for '{textString}'.")
+            return None
+
+        # Return a normal image instance backed by the server-created texture.
+        return pglImageInstance(
+            imageNum=textureNumber,
+            imageWidth = textWidthPixels,
+            imageHeight=textHeightPixels,
+            pgl=self
+        )
     ######################################################
     # text
     ######################################################
