@@ -625,7 +625,7 @@ class pglDraw:
     ######################################################
     def textSetRenderingParameters(self,fontName="Helvetica",fontSize=40,paddingPixels=11,foregroundColor=(1.0, 1.0, 1.0, 1.0),backgroundColor=(0.0, 0.0, 0.0, 0.0)):
         '''
-        Set the server-side parameters used by subsequent textCreate() calls.
+        Set the server-side parameters used by subsequent _textCreate() calls.
 
         Args:
             fontName: Name of the Mac/Core Text font to use.
@@ -745,7 +745,7 @@ class pglDraw:
     ######################################################
     # textCreate
     ######################################################
-    def textCreate(self, textString, color=None, fontSize=40, fontName="Helvetica"):
+    def _textCreate(self, textString, color=None, fontSize=40, fontName="Helvetica"):
         '''
         Create a text texture on the mglMetal server.
 
@@ -757,6 +757,10 @@ class pglDraw:
             pglMessages.warning("textString must be a string.")
             return None
 
+        # empty string, nothing to do.
+        if not str: 
+            pglMessages.warning("str is empty, returning none",level=0)
+            return None
         # Convert the requested text color to RGBA.
         #
         # validateColor(None) should produce the normal default text color.
@@ -855,10 +859,14 @@ class pglDraw:
         if isinstance(textString, pglImageInstance):
             textImage = textString
         elif isinstance(textString, str):
-            # create the text image
-            textImage = self.textCreate(textString, color, fontSize, fontName)
+            if textString:
+                # create the text image
+                textImage = self._textCreate(textString, color, fontSize, fontName)
+            else:
+                # empty string
+                return
         else:
-            print("(pglDraw:text) textString must be a string or pglImageInstance returned from textCreate.")
+            print("(pglDraw:text) textString must be a string or pglImageInstance returned from _textCreate.")
             return None
 
         # get text height in degrees
