@@ -27,7 +27,14 @@ class pglDraw:
     def __init__(self):   
         # set current line starting at top of screen
         self.currentLine = 1
-    
+        
+        self.textRenderingParameters = {
+            "fontName": "Helvetica",
+            "fontSize": 40.0,
+            "paddingPixels": 11,
+            "foregroundColor": (1.0, 1.0, 1.0, 1.0),
+            "backgroundColor": (0.0, 0.0, 0.0, 0.0)
+        }
 
     ################################################################
     # clearScreen
@@ -612,6 +619,128 @@ class pglDraw:
 
         # read the command results
         results = self.s.readCommandResults(ack)
+                
+    ######################################################
+    # textSetRenderingParameters
+    ######################################################
+    def textSetRenderingParameters(self,fontName="Helvetica",fontSize=40,paddingPixels=11,foregroundColor=(1.0, 1.0, 1.0, 1.0),backgroundColor=(0.0, 0.0, 0.0, 0.0)):
+        '''
+        Set the server-side parameters used by subsequent textCreate() calls.
+
+        Args:
+            fontName: Name of the Mac/Core Text font to use.
+            fontSize: Font size in pixels/points.
+            paddingPixels: Transparent or background-colored padding around text.
+            foregroundColor: RGB or RGBA text color, with values from 0 to 1.
+            backgroundColor: RGB or RGBA texture background color, with values
+                from 0 to 1.
+
+        Returns:
+            True when the server accepts the new parameters, otherwise False.
+        '''
+
+        # Validate the font name.
+        if not isinstance(fontName, str) or not fontName:
+            pglMessages.warning("fontName must be a nonempty string.")
+            return False
+
+        # Validate the font size.
+        if not isinstance(fontSize, (int, float, np.integer, np.floating)) or fontSize <= 0:
+            pglMessages.warning("fontSize must be a positive number.")
+            return False
+
+        # Validate the requested padding.
+        if not isinstance(paddingPixels, (int, np.integer)) or paddingPixels < 0:
+            pglMessages.warning("paddingPixels must be a nonnegative integer.")
+            return False
+
+        # Convert incoming colors to four-component RGBA float arrays.
+        foregroundColor = self.validateColor(foregroundColor).flatten()
+        backgroundColor = self.validateColor(backgroundColor).flatten()
+
+        if foregroundColor.size != 4 or backgroundColor.size != 4:
+            pglMessages.warning("foregroundColor and backgroundColor must resolve to RGBA colors.")
+            return False
+
+        # Request replacement of the current server-side text-rendering parameters.
+        self.s.writeCommand("mglSetTextRenderingParameters")
+        ackTime = self.s.readAck()
+
+        if ackTime is None:
+            pglMessages.message("Did not receive command acknowledgment.")
+            return False
+
+        # Send font and layout settings.
+        self.s.write(fontName)
+        self.s.write(np.float32(fontSize))
+        self.s.write(np.uint32(paddingPixels))
+
+        # Send text foreground color.
+        self.s.write(np.float32(foregroundColor[0]))
+        self.s.write(np.float32(foregroundColor[1]))
+        self.s.write(np.float32(foregroundColor[2]))
+        self.s.write(np.float32(foregroundColor[3]))
+
+        # Send texture background color.
+        self.s.write(np.float32(backgroundColor[0]))
+        self.s.write(np.float32(backgroundColor[1]))
+        self.s.write(np.float32(backgroundColor[2]))
+        self.s.write(np.float32(backgroundColor[3]))
+
+        # This command has only normal command completion results.
+        self.commandResults = self.s.readCommandResults(ackTime)
+
+        if self.commandResults is None:
+            pglMessages.message("Did not receive command results.")
+            return False
+
+        success = self.commandResults["success"]
+
+        if np.any(np.asarray(success) == 0):
+            pglMessages.message("Server did not accept text-rendering parameters.")
+            return False
+
+        # Remember the parameters now active on the Swift server.
+        self.textRenderingParameters = {
+            "fontName": fontName,
+            "fontSize": float(fontSize),
+            "paddingPixels": int(paddingPixels),
+            "foregroundColor": tuple(float(value) for value in foregroundColor),
+            "backgroundColor": tuple(float(value) for value in backgroundColor)
+        }
+
+        return True
+    
+    ######################################################
+    # _setTextRenderingParametersIfNeeded
+    ######################################################
+    def _setTextRenderingParametersIfNeeded(self,fontName,fontSize,paddingPixels,foregroundColor,backgroundColor):
+        '''
+        Update Swift text-rendering parameters only when they differ from
+        the parameters currently active on the server.
+        '''
+
+        foregroundColor = tuple(float(value) for value in foregroundColor)
+        backgroundColor = tuple(float(value) for value in backgroundColor)
+
+        requestedParameters = {
+            "fontName": fontName,
+            "fontSize": float(fontSize),
+            "paddingPixels": int(paddingPixels),
+            "foregroundColor": foregroundColor,
+            "backgroundColor": backgroundColor
+        }
+
+        if requestedParameters == self.textRenderingParameters:
+            return True
+
+        return self.textSetRenderingParameters(
+            fontName=fontName,
+            fontSize=fontSize,
+            paddingPixels=paddingPixels,
+            foregroundColor=foregroundColor,
+            backgroundColor=backgroundColor
+        )    
     
     ######################################################
     # textCreate
@@ -620,19 +749,37 @@ class pglDraw:
         '''
         Create a text texture on the mglMetal server.
 
-        The initial implementation uses the current server-side text rendering
-        parameters. Per-call color, fontSize, and fontName will be applied later
-        using mglSetTextRenderingParameters.
+        Text parameters are sent to Swift only when they differ from the
+        currently active server-side text-rendering parameters.
         '''
 
-        # Require a normal Python string.
         if not isinstance(textString, str):
             pglMessages.warning("textString must be a string.")
             return None
 
-        # Warn when requested style settings are not yet applied server-side.
-        if color is not None or fontSize != 40 or fontName != "Helvetica":
-            pglMessages.warning("Per-call color, fontSize, and fontName are not yet supported by server-side text rendering. Using current server text-rendering settings.")
+        # Convert the requested text color to RGBA.
+        #
+        # validateColor(None) should produce the normal default text color.
+        foregroundColor = self.validateColor(color).flatten()
+
+        if foregroundColor.size != 4:
+            pglMessages.warning("color must resolve to an RGBA color.")
+            return None
+
+        # Use the current standard text texture layout defaults.
+        paddingPixels = 11
+        backgroundColor = (0.0, 0.0, 0.0, 0.0)
+
+        # Apply requested settings only if they differ from the active settings.
+        if not self._setTextRenderingParametersIfNeeded(
+            fontName=fontName,
+            fontSize=fontSize,
+            paddingPixels=paddingPixels,
+            foregroundColor=foregroundColor,
+            backgroundColor=backgroundColor
+        ):
+            pglMessages.message("Could not set text-rendering parameters.")
+            return None
 
         # Request a new texture containing the rendered string.
         self.s.writeCommand("mglCreateTextTexture")
@@ -645,7 +792,7 @@ class pglDraw:
         # Send the string for server-side measurement and rendering.
         self.s.write(textString)
 
-        # Read the text-specific query result timestamp.
+        # Read text-specific query results.
         result = self.s.read(np.float64)
 
         if result is None:
@@ -656,7 +803,6 @@ class pglDraw:
             pglMessages.message(f"Failed to create text texture for '{textString}'.")
             return None
 
-        # Read texture dimensions and its assigned texture number.
         textWidthPixels = self.s.read(np.uint32)
         textHeightPixels = self.s.read(np.uint32)
         textureNumber = self.s.read(np.uint32)
@@ -667,25 +813,13 @@ class pglDraw:
             pglMessages.message("Did not receive complete text texture data.")
             return None
 
-        # Read generic command completion results after command-specific data.
         self.commandResults = self.s.readCommandResults(ackTime)
 
-        # Convert NumPy scalar values to ordinary Python integers.
-        textWidthPixels = int(textWidthPixels)
-        textHeightPixels = int(textHeightPixels)
-        textureNumber = int(textureNumber)
-        textureCount = int(textureCount)
-
-        if textureNumber < 1:
-            pglMessages.message(f"Server returned invalid texture number for '{textString}'.")
-            return None
-
-        # Return a normal image instance backed by the server-created texture.
         return pglImageInstance(
-            imageNum=textureNumber,
-            imageWidth = textWidthPixels,
-            imageHeight=textHeightPixels,
-            pgl=self
+            int(textureNumber),
+            int(textWidthPixels),
+            int(textHeightPixels),
+            self
         )
     ######################################################
     # text
