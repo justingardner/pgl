@@ -1370,42 +1370,43 @@ class pglTask(pglTaskBase):
         # start trial
         self.state.currentTrial = -1
         self.startTrial(startTime)
-        
+
     def startSegment(self, updateTime):
         '''
-        Start a segment.
+        Called exactly once, each time a new segment genuinely starts.
+        Override in subclasses to add custom per-segment behavior
+        (e.g. loading a stimulus). Base implementation does nothing.
+        '''    
+        pass
+
+    def _startSegment(self, updateTime):
         '''
-        # if the segment len is set to 0, it is a jump segment command
-        # so reset the segment length to how long actually elapsed
-        # so there is a record of how long we were in that segment
-        if self.state.currentSegment >=0 and self._thisTrialSeglen[self.state.currentSegment] == 0:
+        Internal control logic for advancing to the next segment or ending the trial.
+        Not meant to be overridden — override startSegment() instead for custom
+        per-segment behavior.
+        '''
+        if self.state.currentSegment >= 0 and self._thisTrialSeglen[self.state.currentSegment] == 0:
             self._thisTrialSeglen[self.state.currentSegment] = updateTime - self.state.segmentStartTime
 
-        # check for end of trial
-        if (self.state.currentSegment+1) >= self.settings.nSegments: 
-            # end the trial
+        if (self.state.currentSegment + 1) >= self.settings.nSegments:
             self.endTrial(updateTime)
-            # if we are done with all trials
-            if self.done(self.state.currentTrial+1):
-                # just update currentTrial, but do not start a new trial
-                self.state.currentTrial+=1
+            if self.done(self.state.currentTrial + 1):
+                self.state.currentTrial += 1
             else:
-                # start a new trial
-                self.startTrial(updateTime)
-        else:    
-            # save eye tracker event for synchronization        
+                self.startTrial(updateTime)   # recurses into _startSegment internally, not startSegment
+        else:
             if self.settings.saveEyeTracker:
-                self.e.saveEyeTrackerEvent(eventType="segment", taskID=self.settings.taskID, trialNum=self.state.currentTrial, segmentNum=self.state.currentSegment, timestamp=updateTime, phaseNum=self.settings.phaseNum)
-            
-            # update to next segment
+                self.e.saveEyeTrackerEvent(eventType="segment", taskID=self.settings.taskID,
+                    trialNum=self.state.currentTrial, segmentNum=self.state.currentSegment,
+                    timestamp=updateTime, phaseNum=self.settings.phaseNum)
+
             self.state.currentSegment += 1
             self.state.segmentStartTime = updateTime
             self.data.events.append(pglEventSegment(self.state.currentSegment, updateTime))
-            
-            # default to false, this will get reset
-            # at end of segment clock if set for this segment
             self.waitUntilVolumeTrigger = False
 
+            # a real segment actually started — call the overridable hook
+            self.startSegment(updateTime)
     def startTrial(self, startTime):
         '''
         Start a trial.
@@ -1427,7 +1428,7 @@ class pglTask(pglTaskBase):
 
         # start segment (startSegment will update currentSegment to 0)
         self.state.currentSegment = -1
-        self.startSegment(startTime)
+        self._startSegment(startTime)
         
         # get a random length for each segment. If segmin==segmax, then fixed length
         self._thisTrialSeglen = [
@@ -1461,6 +1462,7 @@ class pglTask(pglTaskBase):
         '''
         Update the task.
         '''
+        if self.data.endTime is not None: return
         # store references
         self.state.subjectResponses = []
         self.state.phaseNum = phaseNum
@@ -1472,7 +1474,7 @@ class pglTask(pglTaskBase):
         if self.waitUntilVolumeTrigger:
             if self.e.state.volumeNumber > self.lastVolumeNumber:
                 # volume trigger received, end segment
-                self.startSegment(updateTime)
+                self._startSegment(updateTime)
         if  updateTime - self.state.segmentStartTime >= self._thisTrialSeglen[self.state.currentSegment]:
             # check if we need to wait until volume trigger
             if self.settings.waitUntilVolumeTrigger[self.state.currentSegment]:
@@ -1480,7 +1482,7 @@ class pglTask(pglTaskBase):
                 self.lastVolumeNumber = self.e.state.volumeNumber
             else:
                 # call startSegment to begin next segment
-                self.startSegment(updateTime)
+                self._startSegment(updateTime)
         
         # if there are responses, call response callback
         if subjectResponses != []:
