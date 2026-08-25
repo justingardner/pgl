@@ -306,7 +306,7 @@ class pglImageInstance:
         self.imageNum = imageNum
         self.displayed = None
         if pgl.verbose>1: 
-            print(f"(pglImage:pglImageInstance) Created image instance with: {self.imageNum} ({self.width.pix}x{self.height.pix})")
+            pglMessages.message(f"Created image instance with: {self.imageNum} ({self.width.pix}x{self.height.pix})")
     def __del__(self):
         # call the pgl function 
         self.pgl.imageDelete(self)
