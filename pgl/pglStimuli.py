@@ -1119,15 +1119,15 @@ class pglStimulusBar(_pglStimulus):
         '''
         Display the bar stimulus.
         '''
-        # If we are counting in volumes
-        if self.nVolumesPerSweep is not None:
-            if self.volumeNumber is None:
-                self.initPass(volumeNumber=volumeNumber)
-            # or end of pass
-            elif (volumeNumber - self.volumeNumber) == self.nVolumesPerSweep:
-                # reset for next pass
-                self.initPass(volumeNumber=volumeNumber)
+        # Initialize the first pass in either time-based or volume-based mode.
+        if self.volumeNumber is None:
+            self.initPass(volumeNumber=volumeNumber)
 
+        # In volume-based mode only, restart after a completed sweep.
+        elif (self.nVolumesPerSweep is not None and
+            (volumeNumber - self.volumeNumber) == self.nVolumesPerSweep):
+            self.initPass(volumeNumber=volumeNumber) 
+            
         # rotate coordinate frame accordingly
         self.pgl.setTransformRotation(dir)
 
@@ -1275,7 +1275,7 @@ class pglStimulusMovie(_pglStimulus):
         if (result < 0): 
             pglMessages.warning(f"Error creating movie {filename}: {self.movieError.get(int(result),"Unrecogonized Error")}")
             if int(result)== -2:
-                pglMessages.warning(f"Permission errors can be caused by sandboxing of mglMetal.app. Consider unsandboxing using: codesign --force --deep --sign - {pgl.getPGLDir()}/metal/mglMetal.app")
+                pglMessages.warning(f"Permission errors can be caused by sandboxing of mglMetal.app. Consider unsandboxing using: codesign --force --deep --sign - {pgl.metalAppName}")
             self.commandResults = self.pgl.s.readCommandResults(ackTime)
             return
         
