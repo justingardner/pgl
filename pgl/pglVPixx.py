@@ -955,8 +955,7 @@ class pglDataPixx(pglDigitalIODevice, pglDataPixxBase):
         bytesPerCondition = samplesPerCondition * BYTES_PER_SAMPLE
 
         totalBytes = numConditions * bytesPerCondition
-        print(f"Building condition table: {numConditions} conditions, "
-            f"{bytesPerCondition} bytes each, {totalBytes / 1e6:.2f} MB total")
+        pglMessages.message(f"Building condition table: {numConditions} conditions, {bytesPerCondition} bytes each, {totalBytes / 1e6:.2f} MB total")
 
         # Build the whole table as one flat list: [w0]*onSamples+[0], [w1]*onSamples+[0], ...
         table = []
