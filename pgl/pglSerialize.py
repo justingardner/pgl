@@ -117,7 +117,8 @@ class pglSerialize:
             
             #pglMessages.message(f"Saving {self.__class__.__name__} to '{filename}'")
             with filesystem.open(filename, 'w') as f:
-                f.write(self.toJSON())
+                # call toJSON (filename is just for error displays)
+                f.write(self.toJSON(filename=filename))
         except PermissionError:
             pglMessages.warning(f"(pglSerialize) No permission to write to '{filename}'")
         except IsADirectoryError:
@@ -190,66 +191,249 @@ class pglSerialize:
     ##########################
     # toJSON: determines how to serialize to JSON different data types
     ##########################
-    def toJSON(self, type="all"):
-        def encodeObject(o):
-            # Custom encoding for pglSerialize objects
-            if isinstance(o, pglSerialize):
-                return {
-                    '__class__': o.__class__.__name__,
-                    **o.toJSONdict(type)
-                }
-            
-            # Handle datetime objects
-            elif isinstance(o, datetime):
-                return {
-                    '__datetime__': True,
-                    'value': o.isoformat()
-                }
-            
-            # Handle numpy arrays
-            elif isinstance(o, np.ndarray):
-                return {
-                    '__numpy__': True,
-                    'dtype': str(o.dtype),
-                    'shape': o.shape,
-                    'data': o.tolist()
-                }
-            
-            # Handle numpy scalar types
-            elif isinstance(o, (np.integer, np.floating)):
-                return o.item()
-            
-            # Handle tuples
-            elif isinstance(o, tuple):
-                return {
-                    '__tuple__': True,
-                    'items': [encodeObject(item) for item in o]
-                }
-            
-            # Handle HasTraits objects (non-pglSerialize)
-            elif isinstance(o, HasTraits) and not isinstance(o, pglSerialize):
-                return {
-                    '__hastraits__': True,
-                    '__class__': o.__class__.__name__,
-                    '__module__': o.__class__.__module__,
-                    **{key: encodeObject(getattr(o, key)) 
-                       for key in o.trait_names() if pglShouldReadTraitForSerialize(o, key)}
-                }
-            
-            # Recursively handle lists
-            elif isinstance(o, list):
-                return [encodeObject(item) for item in o]
-            
-            # Recursively handle dicts
-            elif isinstance(o, dict):
-                return {k: encodeObject(v) for k, v in o.items()}
-            
-            # Default handling
-            return o.__dict__ if hasattr(o, '__dict__') else str(o)
-        
-        # dump to JSON string using custom encoder defined above
-        return json.dumps(self, default=encodeObject, sort_keys=True, indent=4)
-    
+    def toJSON(self, type="all", filename=None):
+        """
+        Serialize this object to JSON.
+
+        Circular references are detected while traversing the object graph.
+        When a circular reference is encountered, that field is omitted and
+        a short warning is issued. Serialization then continues normally.
+        """
+
+        # Objects currently being traversed.
+        #
+        # This is intentionally an "active" set rather than a global "seen"
+        # set. The same object may legitimately appear in multiple places;
+        # only a reference back into the current traversal is a cycle.
+        activeObjects = {}
+
+        def encodeObject(o, path="root"):
+
+            # ----------------------------------------------------------
+            # Determine whether this object can participate in a cycle.
+            # ----------------------------------------------------------
+            trackObject = isinstance(
+                o,
+                (pglSerialize, HasTraits, list, dict, tuple)
+            )
+
+            objectId = id(o) if trackObject else None
+
+            # ----------------------------------------------------------
+            # Circular reference detected.
+            #
+            # Return a private sentinel so the caller can omit the field
+            # rather than writing "null" into the JSON.
+            # ----------------------------------------------------------
+            if trackObject and objectId in activeObjects:
+
+                pglMessages.warning(
+                    f"(pglSerialize) Circular reference skipped at "
+                    f"'{path}' ({o.__class__.__name__})",
+                    level=1
+                )
+
+                return _SERIALIZATION_SKIP
+
+            # Mark object as active.
+            if trackObject:
+                activeObjects[objectId] = o
+
+            try:
+
+                # ------------------------------------------------------
+                # Custom encoding for pglSerialize objects
+                # ------------------------------------------------------
+                if isinstance(o, pglSerialize):
+
+                    data = o.toJSONdict(type)
+
+                    result = {
+                        '__class__': o.__class__.__name__
+                    }
+
+                    for key, value in data.items():
+
+                        encoded = encodeObject(
+                            value,
+                            f"{path}.{key}"
+                        )
+
+                        # Omit fields that would create a cycle.
+                        if encoded is not _SERIALIZATION_SKIP:
+                            result[key] = encoded
+
+                    return result
+
+                # ------------------------------------------------------
+                # datetime
+                # ------------------------------------------------------
+                elif isinstance(o, datetime):
+
+                    return {
+                        '__datetime__': True,
+                        'value': o.isoformat()
+                    }
+
+                # ------------------------------------------------------
+                # numpy arrays
+                # ------------------------------------------------------
+                elif isinstance(o, np.ndarray):
+
+                    return {
+                        '__numpy__': True,
+                        'dtype': str(o.dtype),
+                        'shape': o.shape,
+                        'data': o.tolist()
+                    }
+
+                # ------------------------------------------------------
+                # numpy scalar types
+                # ------------------------------------------------------
+                elif isinstance(o, (np.integer, np.floating)):
+
+                    return o.item()
+
+                # ------------------------------------------------------
+                # tuples
+                # ------------------------------------------------------
+                elif isinstance(o, tuple):
+
+                    items = []
+
+                    for i, item in enumerate(o):
+
+                        encoded = encodeObject(
+                            item,
+                            f"{path}[{i}]"
+                        )
+
+                        # A tuple cannot have an omitted element without
+                        # changing its positional meaning, so preserve
+                        # the existing behavior by using None here.
+                        if encoded is _SERIALIZATION_SKIP:
+                            encoded = None
+
+                        items.append(encoded)
+
+                    return {
+                        '__tuple__': True,
+                        'items': items
+                    }
+
+                # ------------------------------------------------------
+                # HasTraits objects
+                # ------------------------------------------------------
+                elif isinstance(o, HasTraits) and not isinstance(o, pglSerialize):
+
+                    result = {
+                        '__hastraits__': True,
+                        '__class__': o.__class__.__name__,
+                        '__module__': o.__class__.__module__
+                    }
+
+                    for key in o.trait_names():
+
+                        if not pglShouldReadTraitForSerialize(o, key):
+                            continue
+
+                        encoded = encodeObject(
+                            getattr(o, key),
+                            f"{path}.{key}"
+                        )
+
+                        # Omit cyclic fields.
+                        if encoded is not _SERIALIZATION_SKIP:
+                            result[key] = encoded
+
+                    return result
+
+                # ------------------------------------------------------
+                # lists
+                # ------------------------------------------------------
+                elif isinstance(o, list):
+
+                    result = []
+
+                    for i, item in enumerate(o):
+
+                        encoded = encodeObject(
+                            item,
+                            f"{path}[{i}]"
+                        )
+
+                        # Lists are positional, so preserve the existing
+                        # list behavior by replacing a cyclic element
+                        # with None rather than shifting the remaining
+                        # elements.
+                        if encoded is _SERIALIZATION_SKIP:
+                            encoded = None
+
+                        result.append(encoded)
+
+                    return result
+
+                # ------------------------------------------------------
+                # dictionaries
+                # ------------------------------------------------------
+                elif isinstance(o, dict):
+
+                    result = {}
+
+                    for key, value in o.items():
+
+                        encoded = encodeObject(
+                            value,
+                            f"{path}.{key}"
+                        )
+
+                        # Omit cyclic dictionary values entirely.
+                        if encoded is not _SERIALIZATION_SKIP:
+                            result[key] = encoded
+
+                    return result
+
+                # ------------------------------------------------------
+                # ------------------------------------------------------
+                # JSON primitive
+                # ------------------------------------------------------
+                elif o is None or isinstance(o, (str, int, float, bool)):
+                    return o
+
+                # ------------------------------------------------------
+                # Unknown object
+                # ------------------------------------------------------
+                else:
+                    pglMessages.warning(
+                        f"(pglSerialize) Unsupported object skipped at "
+                        f"'{path}' ({o.__class__.__name__})"
+                        + (f" while saving '{filename}'" if filename else ""),
+                        level=1
+                    )
+                    return _SERIALIZATION_SKIP
+
+            finally:
+
+                if trackObject:
+                    activeObjects.pop(objectId, None)
+
+        # Private sentinel used to distinguish "omit this field" from
+        # an actual serialized None.
+        _SERIALIZATION_SKIP = object()
+
+        # IMPORTANT:
+        # Fully encode the object graph before handing anything to
+        # json.dumps(). This prevents json.dumps() from doing its own
+        # traversal and detecting a cycle that we failed to catch.
+        encoded = encodeObject(self, "root")
+
+        return json.dumps(
+            encoded,
+            sort_keys=True,
+            indent=4
+        )
+
+   
     ##########################
     # toJSONdict: Decide what needs to be serialized.
     ##########################
