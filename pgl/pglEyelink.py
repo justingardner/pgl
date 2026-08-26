@@ -11,7 +11,7 @@
 import sys, array
 import numpy as np
 from pynput import keyboard
-from .pglEyeTracker import pglEventBlink, pglEyeTracker, pglEyeTrackerData, pglEventSaccade, pglEventEyeTrackerTrial
+from .pglEyeTracker import pglEventBlink, pglEyeTracker, pglEyeTrackerData, pglEventSaccade, pglEventEyeTrackerTrial, pglEyePositionSample
 from pgl import pglEventKeyboard
 import socket
 import os
@@ -374,6 +374,78 @@ class pglEyelink(pglEyeTracker):
   
         else:
             pglMessages.warning("Eyelink is not initialized.")
+ 
+    def getEyePosition(self):
+        '''
+        Gets a sample of the current eye position.
+
+        Returns:
+            A dictionary with tuple values (x, y, pupilSize) for:
+                'left': left eye
+                'right': right eye
+                'either': whichever eye has valid data; if both have valid
+                        data, will be the average.
+
+            If there is no valid eye position data, the value will be None.
+            If an eye has valid x,y data but pupilSize is unavailable,
+            pupilSize will be None.
+        '''
+
+        if not self.isAvailable():
+            pglMessages.warning("Eyetracker is not available")
+            return {'left': None, 'right': None, 'either': None}
+
+        # Get sample from EyeLink.
+        sample = self.eyelink.getNewestSample()
+
+        if sample is None:
+            return {'left': None, 'right': None, 'either': None}
+
+        eyePositions = {
+            'left': self._getEyePositionFromSample(sample, 'left'),
+            'right': self._getEyePositionFromSample(sample, 'right')
+        }
+
+        # Add either eye position.
+        return self._addEitherEyePosition(eyePositions)
+
+
+    def _getEyePositionFromSample(self, sample, whichEye):
+        '''
+        Gets the eye position from a PyLink sample.
+
+        Returns:
+            A tuple (x, y, pupilSize), or None if no valid eye position
+            data is available. If valid x,y data is available but pupilSize
+            is not, pupilSize will be None.
+        '''
+
+        if whichEye == 'left':
+            if not sample.isLeftSample():
+                return None
+            eye = sample.getLeftEye()
+
+        elif whichEye == 'right':
+            if not sample.isRightSample():
+                return None
+            eye = sample.getRightEye()
+
+        else:
+            raise ValueError("whichEye must be 'left' or 'right'")
+
+        gaze = eye.getGaze()
+
+        if gaze is None:
+            return None
+
+        eyePositionSample = pglEyePositionSample(
+            x=gaze[0],
+            y=gaze[1], 
+            pupilSize = eye.getPupilSize(),
+            whichEye = whichEye,
+        )
+
+        return eyePositionSample
 
 # define the custom display class for eyelink
 if _HAVE_PYLINK:
