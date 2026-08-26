@@ -278,31 +278,49 @@ class pglEyeTrackingCalibrationTask(pglTask):
 
         # task name
         self.settings.taskName = "Eye Tracking Calibration"
-        self.settings.calibrationPoints = self.makeCalibrationPoints(nCalibrationPoints=nCalibrationPoints, calibrationWidth=calibrationWidth, calibrationHeight=calibrationHeight)
-        if self.settings.calibrationPoints is None: return
-        self.settings.nCalibrationPoints = nCalibrationPoints
-        self.settings.calibrationWidth = calibrationWidth
-        self.settings.calibrationHeight = calibrationHeight
+        
+        # calibration settings
+        self.settings.config.calibrationPoints = self.makeCalibrationPoints(nCalibrationPoints=nCalibrationPoints, calibrationWidth=calibrationWidth, calibrationHeight=calibrationHeight)
+        if self.settings.config.calibrationPoints is None: return
+        self.settings.config.nCalibrationPoints = nCalibrationPoints
+        self.settings.config.calibrationWidth = calibrationWidth
+        self.settings.config.calibrationHeight = calibrationHeight
 
+        # set parameters for stable fixation check. Duration is the time (in seconds) that
+        # stable fixation must be held for, Fixation tolerance is how far one sample
+        # can be (max) from the next sample to be considered stable fixation. If greater
+        # than this amount, then the duration interval is reset to 0. Samples are taken
+        # once every screen refresh
+        self.settings.config.stableDuration= 0.5
+        self.settings.config.stableFixationTolerance = 0.5
+        
         # number of repeats and trials
         self.settings.nRepeats = nRepeats
         self.settings.nTrials = nRepeats * nCalibrationPoints
         
-        # set seglens
-        self.settings.seglen = [1]
+        # First segment is to give subject time to acquire targer
+        # Second segment is over when stable fixation is detected
+        self.settings.seglen = [0.2, np.inf]
 
-        # fixed parameters, these will automatically be saved in the settings file
-        self.settings.fixedParameters = {
-            'displayWidth': 30
-        }        
-        p = self.settings.fixedParameters
-        
         # add parameters for calibration points
-        calibrationPoints = pglParameter('calibrationPoint',self.settings.calibrationPoints)        
+        calibrationPoints = pglParameter('calibrationPoint',self.settings.config.calibrationPoints)        
         self.addParameter(calibrationPoints)
                             
     ########################
-    # updateScren
+    # startSegment
+    ########################
+    def startSegment(self, startTime):
+        '''
+        Start a segment.
+        '''        
+        if self.state.currentSegment == 1:
+            # initialize stable fixation window
+            self.state.stableFixationStart = startTime
+            self.state.stableFixationSamples = []
+            
+
+    ########################
+    # updateScreen
     ########################
     def updateScreen(self):
         '''
@@ -311,6 +329,46 @@ class pglEyeTrackingCalibrationTask(pglTask):
         calibrationPoint = self.currentParams['calibrationPoint']
         self.pgl.fixationABC(x=calibrationPoint[0], y=calibrationPoint[1])
         
+        # if we are in the segment for testing stable fixation
+        if self.state.currentSegment == 1:
+            # get next sample
+            if self.e.eyetracker is None:
+                # no eye tracker initialized, just wait 1 s
+                if self.pgl.getSecs() - self.startSegment > (1 - self.seglen[0]):
+                    self.jumpSegment()
+            else:
+                # get eye position
+                eyePosition = self.e.eyetracker.getEyePosition().get('either',None)
+                
+                if eyePosition is None:
+                    # must be failed eye tracker, reset stableFixation
+                    self.state.stableFixationSamples = []
+                else:
+                    # check if this is the first sample
+                    if len(self.state.stableFixationSamples) == 0:
+                        # keep the time
+                        self.state.stableFixationStart = self.pgl.getSecs()
+                    # check distance of last fixation, note that - is overloaed for euclidean distance
+                    elif eyePosition - self.state.stableFixationSamples[-1] > self.settings.config.stableFixationTolerance:
+                        # sample is too far away from last fixation, so must have broken fixation, restart
+                        self.state.stableFixationSamples = []
+                        self.state.stableFixationStart = self.pgl.getSecs()
+                    # passed fixation tolerance test, so check if we now have passed duration 
+                    elif self.pgl.getSecs() - self.state.stableFixationStart > self.settings.config.stableDuration:
+                        # passed stable fixation test, so we now are done, jump to next segment will move to next fixation point
+                        self.jumpSegment()
+                    
+                    # save samp;e
+                    self.state.stableFixationSamples.append(eyePosition)
+                    
+    ########################
+    # handle events
+    ########################
+    def handleEvents(self, events):
+        for event in events:
+            if event.eventType == 'keydown' and event.keyChar == 'space':
+                # jump out of segment (can be used for aborting stable fixation check)
+                self.jumpSegment()
 
     def makeCalibrationPoints(self, nCalibrationPoints, calibrationWidth, calibrationHeight):
         """
