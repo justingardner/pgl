@@ -13,7 +13,61 @@ from .pglData import pglTimeSeries, pglEventsData
 from .pglEvent import pglEvent
 from dataclasses import dataclass, field
 import numpy as np
+from traitlets import Float
 
+################################
+# # class for an eye sample
+################################
+class pglEyePositionSample(pglTraitSettings):
+    '''
+    sample of an eye position
+    '''
+    x = Float(help='x position of gaze sample')
+    y = Float(help='y position of gaze sample')
+    pupilSize = Float(allow_none=True, help='pupilSize')
+    whichEye = Enum(values=['left', 'right', 'both', 'unknown'],default_value='unknown',help='Eye of gaze sample')
+    
+    def __init__(self, x, y, pupilSize=None, whichEye='unknown'):
+        '''
+        initialize with x, y and pupilSize
+        
+        Args:
+            x (float): x position of eye
+            y (float): y position of eye
+            pupilSize (float): pupil size
+            whichEye (str): EIther 'left', 'right', 'both' means the average of left/right, defaults to 'unknown'
+        '''
+        super().__init__()
+        self.x = x
+        self.y = y
+        self.pupilSize = pupilSize
+        self.whichEye = whichEye
+        
+    def __sub__(self, other):
+        '''
+        Subtraction operator computes euclidian distance between two samples
+        '''
+        return np.sqrt((self.x - other.x)**2 + (self.y - other.y)**2)
+    
+    @classmethod
+    def average(cls, samples):
+        '''
+        Returns the average of a collection of eye position samples.
+        '''
+
+        x = np.mean([sample.x for sample in samples])
+        y = np.mean([sample.y for sample in samples])
+
+        pupilSizes = [
+            sample.pupilSize
+            for sample in samples
+            if sample.pupilSize is not None
+        ]
+
+        pupilSize = np.mean(pupilSizes) if pupilSizes else None
+
+        return cls(x, y, pupilSize, 'both')
+    
 #################################################################
 # Parent class for eye tracker devices
 #################################################################
@@ -77,6 +131,54 @@ class pglEyeTracker(pglDevice):
         """
         # This method should be implemented by subclasses to save the eye tracking data
         raise NotImplementedError("saveData method must be implemented by subclasses of pglEyeTracker.")
+    
+    def getEyePosition(self):
+        '''
+        Gets a sample of the current eye position.
+
+        Returns:
+            A dictionary with pglEyePositionSample for:
+                'left': left eye
+                'right': right eye
+                'either': whichever eye has valid data; if both have valid
+                        data, will be the average.
+            If there is no data for an eye, its value will be None.
+            
+        '''
+        # This method should be implemented by subclasses
+        # note that the below_addEitherEyePosition can be used by subclass to compute
+        # the either entry from left and right entries 
+        raise NotImplementedError("getEyePosition method must be implemented by subclasses of pglEyeTracker.")
+        
+    def _addEitherEyePosition(self, eyePositions):
+        '''
+        Helper function, which can be called by subclassed getEyePosition.
+
+        Adds an 'either' entry to an eye position dictionary.
+        '''
+
+        left = eyePositions['left']
+        right = eyePositions['right']
+
+        if left is not None and right is not None:
+
+            eyePositions['either'] = pglEyePositionSample.average([left, right])
+            eyePositions['either'].whichEye = 'both'
+
+        elif left is not None:
+            
+            eyePositions['either'] = left
+            eyePositions['either'].whichEye = 'left'
+
+        elif right is not None:
+            eyePositions['either'] = right
+            eyePositions['either'].whichEye = 'right'
+
+        else:
+            eyePositions['either'] = None
+
+        return eyePositions
+
 
 #################################################################
 # saccade events
