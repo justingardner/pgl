@@ -40,6 +40,7 @@ import fsspec
 import posixpath
 from .pglBase import pglBase
 from .pglDialog import pglDialogs
+from types import SimpleNamespace
 
 #######################
 # for returning stats
@@ -989,7 +990,9 @@ class pglTaskSettings(pglTraitSettings):
     waitUntilVolumeTrigger = List(Bool(), help="List of nSegments where if set to true will run through the segment length and then wait for a volume trigger to continue.")
     nSegments = Int(help="Number of segments in the task.")
     nTrials = Float(np.inf, help="Number of trials to run for.")
+    # old way of doing this - config replaces
     fixedParameters = Dict(default_value={}, help="Dictionary of fixed parameters for the task.")
+    config = Instance(SimpleNamespace, help="Place for configuration variables")
     saveEyeTracker = Bool(False, help="Whether to save eye tracker events this task (if we have an eye tracker).")    
     taskID = Int(0, help="Numeric identifier for the task, used for pglExperiment to keep track of tasks.")
 
