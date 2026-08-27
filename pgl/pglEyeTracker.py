@@ -12,6 +12,7 @@ from pgl import pglDevice
 from .pglData import pglTimeSeries, pglEventsData
 from .pglEvent import pglEvent
 from dataclasses import dataclass, field
+from .pglMessages import pglMessages
 import numpy as np
 from traitlets import Float, Enum
 from .pglSettings import pglTraitSettings
@@ -27,8 +28,8 @@ class pglEyePositionSample(pglTraitSettings):
     y = Float(help='y position of gaze sample')
     pupilSize = Float(allow_none=True, help='pupilSize')
     whichEye = Enum(values=['left', 'right', 'both', 'unknown'],default_value='unknown',help='Eye of gaze sample')
-    
-    def __init__(self, x, y, pupilSize=None, whichEye='unknown'):
+    units = Enum(values=['device','pix','deg'],default_value='device',help='Units that x,y are in')
+    def __init__(self, x, y, pupilSize=None, whichEye='unknown', pix2deg=None, units=None):
         '''
         initialize with x, y and pupilSize
         
@@ -37,8 +38,25 @@ class pglEyePositionSample(pglTraitSettings):
             y (float): y position of eye
             pupilSize (float): pupil size
             whichEye (str): EIther 'left', 'right', 'both' means the average of left/right, defaults to 'unknown'
+            pix2deg (callable, optional): Function accepting (x, y) and returning (xDeg, yDeg). 
+                If provided, will use function to convert and save value in deg. Will also set units to 'deg'
+            units (str): Either 'device, 'pix' or 'deg. If ommitted will be set to device or deg depending on whether pix2deg is provided
+  
         '''
         super().__init__()
+
+        if units is not None: self.units = units
+
+        if pix2deg is not None:
+            if not callable(pix2deg):
+                pglMessages.warning("pix2deg must be a function accepting x and y and return xDeg, yDeg. Keeping coordinates in device coordinate frame")
+            else:
+                try:
+                    x, y = pix2deg(x,y)
+                    self.units='deg'
+                except Exception as e:
+                    pglMessages.warning("Error converting pix2dge: {e}")
+                
         self.x = x
         self.y = y
         self.pupilSize = pupilSize
@@ -66,6 +84,25 @@ class pglEyePositionSample(pglTraitSettings):
         ]
 
         pupilSize = np.mean(pupilSizes) if pupilSizes else None
+
+        return cls(x, y, pupilSize, 'both')
+    
+    @classmethod
+    def median(cls, samples):
+        '''
+        Returns the median of a collection of eye position samples.
+        '''
+
+        x = np.median([sample.x for sample in samples])
+        y = np.median([sample.y for sample in samples])
+
+        pupilSizes = [
+            sample.pupilSize
+            for sample in samples
+            if sample.pupilSize is not None
+        ]
+
+        pupilSize = np.median(pupilSizes) if pupilSizes else None
 
         return cls(x, y, pupilSize, 'both')
     

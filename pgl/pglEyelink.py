@@ -446,6 +446,7 @@ class pglEyelink(pglEyeTracker):
             y=gaze[1], 
             pupilSize = eye.getPupilSize(),
             whichEye = whichEye,
+            pix2deg = self.pgl.pix2deg
         )
 
         return eyePositionSample
