@@ -332,13 +332,13 @@ class pglEyeTrackingCalibrationTask(pglTask):
         # if we are in the segment for testing stable fixation
         if self.state.currentSegment == 1:
             # get next sample
-            if self.e.eyetracker is None:
+            if self.e.eyeTracker is None:
                 # no eye tracker initialized, just wait 1 s
                 if self.pgl.getSecs() - self.startSegment > (1 - self.seglen[0]):
                     self.jumpSegment()
             else:
                 # get eye position
-                eyePosition = self.e.eyetracker.getEyePosition().get('either',None)
+                eyePosition = self.e.eyeTracker.getEyePosition().get('either',None)
                 
                 if eyePosition is None:
                     # must be failed eye tracker, reset stableFixation
