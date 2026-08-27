@@ -10,9 +10,11 @@
 #############
 from .pglExperiment import pglTask
 from .pglStaircase import pglStaircaseUpDown
-import numpy as np
 from .pglParameter import pglParameter
 from .pglMessages import pglMessages
+from .pglEyeTracker import pglEyePositionSample
+import matplotlib.pyplot as plt
+import numpy as np
 
 #############
 # Fuxaton task: 2AFC on which arm of the fixation cross dims
@@ -305,7 +307,7 @@ class pglEyeTrackingCalibrationTask(pglTask):
         # add parameters for calibration points
         calibrationPoints = pglParameter('calibrationPoint',self.settings.config.calibrationPoints)        
         self.addParameter(calibrationPoints)
-                            
+        
     ########################
     # startSegment
     ########################
@@ -332,13 +334,14 @@ class pglEyeTrackingCalibrationTask(pglTask):
         # if we are in the segment for testing stable fixation
         if self.state.currentSegment == 1:
             # get next sample
-            if self.e.eyeTracker is None:
+            if self.e.eyetracker is None:
                 # no eye tracker initialized, just wait 1 s
                 if self.pgl.getSecs() - self.startSegment > (1 - self.seglen[0]):
                     self.jumpSegment()
+                    return
             else:
                 # get eye position
-                eyePosition = self.e.eyeTracker.getEyePosition().get('either',None)
+                eyePosition = self.e.eyetracker.getEyePosition().get('either',None)
                 
                 if eyePosition is None:
                     # must be failed eye tracker, reset stableFixation
@@ -353,14 +356,18 @@ class pglEyeTrackingCalibrationTask(pglTask):
                         # sample is too far away from last fixation, so must have broken fixation, restart
                         self.state.stableFixationSamples = []
                         self.state.stableFixationStart = self.pgl.getSecs()
-                    # passed fixation tolerance test, so check if we now have passed duration 
-                    elif self.pgl.getSecs() - self.state.stableFixationStart > self.settings.config.stableDuration:
-                        # passed stable fixation test, so we now are done, jump to next segment will move to next fixation point
-                        self.jumpSegment()
                     
                     # save samp;e
                     self.state.stableFixationSamples.append(eyePosition)
-                    
+
+                    # passed fixation tolerance test, so check if we now have passed duration 
+                    if self.pgl.getSecs() - self.state.stableFixationStart > self.settings.config.stableDuration:
+                        # passed stable fixation test, so we now are done,
+                        self.data.trialVariables[-1]['eyePosition'] = pglEyePositionSample.median(self.state.stableFixationSamples)
+                        #  jump to next segment will move to next fixation point
+                        self.jumpSegment()
+                        return
+                                        
     ########################
     # handle events
     ########################
@@ -370,6 +377,74 @@ class pglEyeTrackingCalibrationTask(pglTask):
                 # jump out of segment (can be used for aborting stable fixation check)
                 self.jumpSegment()
 
+    ########################
+    # display
+    ########################
+    def display(self, ax=None):
+        '''
+        Display calibration targets and measured eye positions.
+
+        Calibration targets are shown as solid circles. Eye positions measured
+        for trials are shown as '+' markers in the color corresponding to the
+        calibration target presented on that trial.
+        '''
+        # Create an axes if the caller did not provide one.
+        if ax is None:
+            figure, ax = plt.subplots()
+
+        calibrationPoints = self.settings.config.calibrationPoints
+
+        if not calibrationPoints:
+            pglMessages.warning("No calibration points available.")
+            return ax
+
+        # Get colormap for each of the calibration points, and make a dict to
+        # retrieve the right color for each calibration point
+        colorMap = plt.get_cmap('tab20')
+        pointColors = {
+            tuple(calibrationPoint): colorMap(pointIndex)
+            for pointIndex, calibrationPoint in enumerate(calibrationPoints)
+        }
+
+        # Draw every calibration target once as a filled circle.
+        for pointIndex, calibrationPoint in enumerate(calibrationPoints):
+            x, y = calibrationPoint
+            color = pointColors[tuple(calibrationPoint)]
+
+            ax.scatter(x,y,s=100,marker='o',color=color,edgecolors='white',linewidths=0.75,zorder=2,label=f'Calibration point {pointIndex + 1}')
+
+        # self.data.params and self.data.trialVariables have one entry
+        # per trial, in matching order.
+        for trialIndex, (trialParams, trialVariables) in enumerate(
+            zip(self.data.params, self.data.trialVariables)
+        ):
+            calibrationPoint = trialParams.get('calibrationPoint', None)
+
+            if calibrationPoint is None: continue
+
+            eyePosition = trialVariables.get('eyePosition', None)
+
+            # A trial can have no eyePosition, e.g. no tracker or aborted trial.
+            if eyePosition is None: continue
+
+            calibrationPoint = tuple(calibrationPoint)
+
+            # Plot measured position as a plus sign matching its target's color.
+            ax.scatter(eyePosition.x,eyePosition.y,s=150,marker='+',color=pointColors[calibrationPoint],linewidths=2.5,zorder=3)
+
+        ax.axhline(0, color='0.8', linewidth=0.75, zorder=0)
+        ax.axvline(0, color='0.8', linewidth=0.75, zorder=0)
+        ax.set_aspect('equal', adjustable='box')
+        ax.set_xlabel('Horizontal position (deg)')
+        ax.set_ylabel('Vertical position (deg)')
+        ax.set_title(self.settings.taskName)
+        ax.grid(True, alpha=0.25)
+
+        return ax
+    
+    ########################
+    # make calibration points
+    ########################
     def makeCalibrationPoints(self, nCalibrationPoints, calibrationWidth, calibrationHeight):
         """
         Validate a requested calibration-point count and return calibration
