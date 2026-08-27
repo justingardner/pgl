@@ -992,7 +992,7 @@ class pglTaskSettings(pglTraitSettings):
     nTrials = Float(np.inf, help="Number of trials to run for.")
     # old way of doing this - config replaces
     fixedParameters = Dict(default_value={}, help="Dictionary of fixed parameters for the task.")
-    config = Instance(SimpleNamespace, help="Place for configuration variables")
+    config = Instance(SimpleNamespace,args=(),kw={},help="Place for configuration variables")
     saveEyeTracker = Bool(False, help="Whether to save eye tracker events this task (if we have an eye tracker).")    
     taskID = Int(0, help="Numeric identifier for the task, used for pglExperiment to keep track of tasks.")
 
