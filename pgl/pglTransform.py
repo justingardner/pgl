@@ -244,14 +244,18 @@ class pglTransform:
     # go from pixels to device
     ################################################################
     def pix2deg(self, x, y):
-        '''
-        Convert pixel coordinates to device coordinates.
-        '''
+        """
+        Convert pixel coordinates to degree coordinates.
+
+        Accepts either scalar values or NumPy arrays.
+        """
         if self.xPix2Deg is None or self.yPix2Deg is None:
-            print("(pgl:pglTransform:pix2deg) xPix2Deg and yPix2Deg must be set before calling this function.")
             return None, None
-        
-        # scale to pixels and add offset
+
+        x = np.asarray(x)
+        y = np.asarray(y)
+
         xDeg = x * self.xPix2Deg - (self.screenWidth.deg / 2)
         yDeg = -y * self.yPix2Deg + (self.screenHeight.deg / 2)
+
         return xDeg, yDeg
