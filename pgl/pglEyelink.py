@@ -438,13 +438,16 @@ class pglEyelink(pglEyeTracker):
 
         gaze = eye.getGaze()
 
-        if gaze is None:
-            return None
+        if gaze is None: return None
+
+        # if we get a 0 pupil size then it has lost tracking so return None
+        pupilSize = eye.getPupilSize()
+        if pupilSize == 0: return None
 
         eyePositionSample = pglEyePositionSample(
             x=gaze[0],
             y=gaze[1], 
-            pupilSize = eye.getPupilSize(),
+            pupilSize = pupilSize,
             whichEye = whichEye,
             pix2deg = self.pgl.pix2deg
         )
