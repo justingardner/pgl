@@ -13,7 +13,8 @@ from .pglData import pglTimeSeries, pglEventsData
 from .pglEvent import pglEvent
 from dataclasses import dataclass, field
 import numpy as np
-from traitlets import Float
+from traitlets import Float, Enum
+from .pglSettings import pglTraitSettings
 
 ################################
 # # class for an eye sample
