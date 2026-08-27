@@ -44,6 +44,7 @@ class pglEyelink(pglEyeTracker):
         """
         # call superclass constructor
         super().__init__(pgl, deviceType)
+        self.isAvailable = False
 
         try:
             # get library
@@ -83,8 +84,10 @@ class pglEyelink(pglEyeTracker):
                 pylink.openGraphicsEx(self.customDisplay)
                 
                 pglMessages.message(f"(pglEyelink) Using pgl display for Eyelink calibration and validation.")
+                self.isAvailble=True
         except Exception as e:
             pglMessages.warning(f"Could not initialize Eyelink: {e}")
+
 
     @staticmethod
     def eyelinkIsAvailable(eyelinkAddress="100.1.1.1", timeout=3.0):
@@ -391,7 +394,7 @@ class pglEyelink(pglEyeTracker):
             pupilSize will be None.
         '''
 
-        if not self.isAvailable():
+        if not self.isAvailable:
             pglMessages.warning("Eyetracker is not available")
             return {'left': None, 'right': None, 'either': None}
 
