@@ -19,6 +19,7 @@ from traitlets import HasTraits, TraitError
 from .pglMessages import pglMessages
 import fsspec
 from fsspec.core import url_to_fs
+from types import SimpleNamespace
 
 ##########################
 # Recursively collect all subclasses
@@ -214,7 +215,7 @@ class pglSerialize:
             # ----------------------------------------------------------
             trackObject = isinstance(
                 o,
-                (pglSerialize, HasTraits, list, dict, tuple)
+                (pglSerialize, HasTraits, SimpleNamespace, list, dict, tuple)
             )
 
             objectId = id(o) if trackObject else None
@@ -401,6 +402,27 @@ class pglSerialize:
                     return o
 
                 # ------------------------------------------------------
+                # SimpleNamespace
+                # ------------------------------------------------------
+                elif isinstance(o, SimpleNamespace):
+
+                    result = {
+                        '__simplenamespace__': True
+                    }
+
+                    for key, value in vars(o).items():
+
+                        encoded = encodeObject(
+                            value,
+                            f"{path}.{key}"
+                        )
+
+                        if encoded is not _SERIALIZATION_SKIP:
+                            result[key] = encoded
+
+                    return result
+                
+                # ------------------------------------------------------
                 # Unknown object
                 # ------------------------------------------------------
                 else:
@@ -526,6 +548,11 @@ class pglSerialize:
             # Restore tuples
             if '__tuple__' in dct:
                 return tuple(dct['items'])
+
+            # Restore SimpleNamespace objects
+            if '__simplenamespace__' in dct:
+                dct.pop('__simplenamespace__')
+                return SimpleNamespace(**dct)            
             
             # Restore HasTraits objects
             if '__hastraits__' in dct:
