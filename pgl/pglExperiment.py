@@ -923,6 +923,9 @@ class pglExperiment(pglExperimentBase):
             # if we should run calibration, then do it
             if self.state.runCalibration:
                 self.eyeTracker.calibrate()
+                # and restart saving data, as calibrate seems to stop it
+                self.eyeTracker.start()
+
 
     def saveEyeTrackerEvent(self, eventType="segment", taskID=None, trialNum=None, segmentNum=None, timestamp=None, phaseNum=None):
         '''Save an eye tracker event for synchronization. This is called by tasks during updates if settings.saveEyeTracker is True.'''
