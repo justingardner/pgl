@@ -1130,6 +1130,7 @@ class pglTaskData(pglTraitSettings):
     endTime = Float(default_value=None, allow_none=True, help="Task end time.")
     events = List(Instance(pglEvent), help="List of task events.")
     params = List(Dict(), help="List of task parameter dictionaries.")
+    trialVariables=List(Dict(),help="List of task variable dictionaries. One for each trial, with any variables computed or discovered by task")
     responseMapping = Dict(default_value={True: ("Correct", "green"), False: ("Incorrect", "red")}, help="response mapping for handleSubjectResponses")
 
     # make sure that any settings that the experimenter writes into settings get saved
@@ -1429,6 +1430,10 @@ class pglTask(pglTaskBase):
         for parameter in self.parameters: 
             self.data.params[-1].update(parameter.get())
 
+        # initialize the trialVariables for this trial
+        # trialVariables are set by the task to store any computed, incidental, discovered trial-by-trial variables
+        self.data.trialVariables.append({})
+        
         # start segment (startSegment will update currentSegment to 0)
         self.state.currentSegment = -1
         self._startSegment(startTime)
