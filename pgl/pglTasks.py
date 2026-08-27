@@ -334,15 +334,16 @@ class pglEyeTrackingCalibrationTask(pglTask):
         # if we are in the segment for testing stable fixation
         if self.state.currentSegment == 1:
             # get next sample
-            if self.e.eyetracker is None:
+            if self.e.eyeTracker is None:
                 # no eye tracker initialized, just wait 1 s
                 if self.pgl.getSecs() - self.startSegment > (1 - self.seglen[0]):
                     self.jumpSegment()
+                    pglMessages.message("eye tracker is None")
                     return
             else:
                 # get eye position
-                eyePosition = self.e.eyetracker.getEyePosition().get('either',None)
-                
+                eyePosition = self.e.eyeTracker.getEyePosition().get('either',None)
+                print(f'{eyePosition},',end='')
                 if eyePosition is None:
                     # must be failed eye tracker, reset stableFixation
                     self.state.stableFixationSamples = []
@@ -351,19 +352,20 @@ class pglEyeTrackingCalibrationTask(pglTask):
                     if len(self.state.stableFixationSamples) == 0:
                         # keep the time
                         self.state.stableFixationStart = self.pgl.getSecs()
-                    # check distance of last fixation, note that - is overloaed for euclidean distance
+                    # check distance of last fixation, note that - is overloaded for euclidean distance
                     elif eyePosition - self.state.stableFixationSamples[-1] > self.settings.config.stableFixationTolerance:
                         # sample is too far away from last fixation, so must have broken fixation, restart
                         self.state.stableFixationSamples = []
                         self.state.stableFixationStart = self.pgl.getSecs()
                     
-                    # save samp;e
+                    # save sample
                     self.state.stableFixationSamples.append(eyePosition)
 
                     # passed fixation tolerance test, so check if we now have passed duration 
                     if self.pgl.getSecs() - self.state.stableFixationStart > self.settings.config.stableDuration:
                         # passed stable fixation test, so we now are done,
                         self.data.trialVariables[-1]['eyePosition'] = pglEyePositionSample.median(self.state.stableFixationSamples)
+                        pglMessages.message(f"stable fixation: {self.data.trialVariables[-1]['eyePosition']}")
                         #  jump to next segment will move to next fixation point
                         self.jumpSegment()
                         return
@@ -375,6 +377,7 @@ class pglEyeTrackingCalibrationTask(pglTask):
         for event in events:
             if event.eventType == 'keydown' and event.keyChar == 'space':
                 # jump out of segment (can be used for aborting stable fixation check)
+                pglMessages.message(f"stable fixation: {pglEyePositionSample.median(self.data.trialVariables[-1]['eyePosition'])}")
                 self.jumpSegment()
 
     ########################
