@@ -28,7 +28,7 @@ class pglEyePositionSample(pglTraitSettings):
     y = Float(help='y position of gaze sample')
     pupilSize = Float(allow_none=True, help='pupilSize')
     whichEye = Enum(values=['left', 'right', 'both', 'unknown'],default_value='unknown',help='Eye of gaze sample')
-    units = Enum(values=['device','pix','deg'],default_value='device',help='Units that x,y are in')
+    units = Enum(values=['device','pix','deg', 'unknown'],default_value='device',help='Units that x,y are in')
     def __init__(self, x, y, pupilSize=None, whichEye='unknown', pix2deg=None, units=None):
         '''
         initialize with x, y and pupilSize
@@ -45,6 +45,10 @@ class pglEyePositionSample(pglTraitSettings):
         '''
         super().__init__()
 
+        self.x = x
+        self.y = y
+        self.pupilSize = pupilSize
+        self.whichEye = whichEye
         if units is not None: self.units = units
 
         if pix2deg is not None:
@@ -52,28 +56,64 @@ class pglEyePositionSample(pglTraitSettings):
                 pglMessages.warning("pix2deg must be a function accepting x and y and return xDeg, yDeg. Keeping coordinates in device coordinate frame")
             else:
                 try:
-                    x, y = pix2deg(x,y)
-                    self.units='deg'
+                    self.x, self.y = pix2deg(x,y)
+                    self.units = 'deg'
                 except Exception as e:
-                    pglMessages.warning("Error converting pix2dge: {e}")
+                    pglMessages.warning(f"Error converting pix2dge: {e}")
                 
-        self.x = x
-        self.y = y
-        self.pupilSize = pupilSize
-        self.whichEye = whichEye
         
     def __sub__(self, other):
         '''
         Subtraction operator computes euclidian distance between two samples
         '''
         return np.sqrt((self.x - other.x)**2 + (self.y - other.y)**2)
-    
+
+    def __repr__(self):
+        '''
+        '''
+        return f"({self.x}, {self.y}) units={self.units} pupilSize={self.pupilSize} whichEye={self.whichEye}"
+
+    @classmethod
+    def _getAggregateMetadata(cls, samples):
+        """
+        Determine units and eye metadata for an aggregate of samples.
+
+        Warn when samples have mixed units or eye labels.
+        """
+        sampleUnits = {sample.units for sample in samples}
+        sampleEyes = {sample.whichEye for sample in samples}
+
+        if len(sampleUnits) == 1:
+            units = samples[0].units
+        else:
+            pglMessages.warning(
+                "Cannot safely aggregate eye-position samples with different "
+                f"units: {sorted(sampleUnits)}. Result units will be 'unknown'."
+            )
+
+            units = 'unknown'
+
+        if len(sampleEyes) == 1:
+            whichEye = samples[0].whichEye
+        else:
+            pglMessages.warning(
+                "Aggregating eye-position samples from different eyes: "
+                f"{sorted(sampleEyes)}. Setting whichEye to 'unknown'."
+            )
+            whichEye = 'unknown'
+
+        return units, whichEye
+
     @classmethod
     def average(cls, samples):
         '''
         Returns the average of a collection of eye position samples.
         '''
+        samples = list(samples)
 
+        if not samples:
+            raise ValueError("Cannot aggregate an empty collection of samples")
+        
         x = np.mean([sample.x for sample in samples])
         y = np.mean([sample.y for sample in samples])
 
@@ -85,13 +125,24 @@ class pglEyePositionSample(pglTraitSettings):
 
         pupilSize = np.mean(pupilSizes) if pupilSizes else None
 
-        return cls(x, y, pupilSize, 'both')
+        units, whichEye = cls._getAggregateMetadata(samples)
+        return cls(
+            x=x,
+            y=y,
+            pupilSize=pupilSize,
+            whichEye=whichEye,
+            units=units,
+        )
     
     @classmethod
     def median(cls, samples):
         '''
         Returns the median of a collection of eye position samples.
         '''
+        samples = list(samples)
+
+        if not samples:
+            raise ValueError("Cannot aggregate an empty collection of samples")
 
         x = np.median([sample.x for sample in samples])
         y = np.median([sample.y for sample in samples])
@@ -104,7 +155,14 @@ class pglEyePositionSample(pglTraitSettings):
 
         pupilSize = np.median(pupilSizes) if pupilSizes else None
 
-        return cls(x, y, pupilSize, 'both')
+        units, whichEye = cls._getAggregateMetadata(samples)
+        return cls(
+            x=x,
+            y=y,
+            pupilSize=pupilSize,
+            whichEye=whichEye,
+            units=units,
+        )
     
 #################################################################
 # Parent class for eye tracker devices
