@@ -84,7 +84,7 @@ class pglEyelink(pglEyeTracker):
                 pylink.openGraphicsEx(self.customDisplay)
                 
                 pglMessages.message(f"(pglEyelink) Using pgl display for Eyelink calibration and validation.")
-                self.isAvailble=True
+                self.isAvailable=True
         except Exception as e:
             pglMessages.warning(f"Could not initialize Eyelink: {e}")
 
