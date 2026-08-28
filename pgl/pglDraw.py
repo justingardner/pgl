@@ -347,6 +347,143 @@ class pglDraw:
                 y2 = y + radius[1] * np.sin(angle2)
                 self.line(x1, y1, x2, y2, color)
 
+    ####################################################
+    # ellipse
+    ####################################################
+    def ellipse(
+        self,
+        width=1,
+        height=1,
+        x=0,
+        y=0,
+        color=None,
+        numSegments=72,
+        fill=False,
+        rotation=0,
+        units=None
+    ):
+        """
+        Draw an ellipse.
+
+        Args:
+            width (float): Full width of the ellipse.
+            height (float): Full height of the ellipse.
+            x (float): X coordinate of the center.
+            y (float): Y coordinate of the center.
+            color (list or tuple, optional): RGB color values in [0, 1].
+            numSegments (int): Number of line segments used to approximate
+                the ellipse. Default is 72.
+            fill (bool): Whether to fill the ellipse. Default is False.
+            rotation (float): Rotation of the ellipse in degrees,
+                counterclockwise. Default is 0.
+            units (str, optional): Units of x, y, width and height.
+                "pix" specifies pixels; otherwise degrees.
+
+        Returns:
+            None
+        """
+
+        # Validate color
+        color = self.validateColor(color, withAlpha=False)
+
+        # Validate number of segments
+        if not isinstance(numSegments, (int, np.integer)) or numSegments < 3:
+            print("(pglDraw:ellipse) numSegments must be an integer >= 3.")
+            return
+
+        # Convert dimensions to radii
+        radiusX = width / 2
+        radiusY = height / 2
+
+        # Convert units if necessary
+        if units is None:
+            pass
+        elif units.lower() in ("pixels", "pix", "pixel", "px"):
+            x, y = self.pix2deg(x, y)
+            radiusX *= self.xPix2Deg
+            radiusY *= self.yPix2Deg
+        elif units != "device":
+            print(f"(pglDraw:ellipse) Invalid units '{units}'. Using deg units.")
+
+        # Generate angles around the ellipse
+        angles = np.linspace(
+            0,
+            2 * np.pi,
+            numSegments + 1,
+            dtype=np.float32
+        )
+
+        # Generate unrotated ellipse
+        ellipseX = radiusX * np.cos(angles)
+        ellipseY = radiusY * np.sin(angles)
+
+        # Convert rotation from degrees to radians internally
+        rotationRadians = np.deg2rad(rotation)
+
+        # Apply rotation
+        if rotationRadians != 0:
+            cosRotation = np.cos(rotationRadians)
+            sinRotation = np.sin(rotationRadians)
+
+            rotatedX = (
+                ellipseX * cosRotation -
+                ellipseY * sinRotation
+            )
+
+            rotatedY = (
+                ellipseX * sinRotation +
+                ellipseY * cosRotation
+            )
+
+            ellipseX = rotatedX
+            ellipseY = rotatedY
+
+        # Translate to requested center
+        ellipseX += x
+        ellipseY += y
+
+        if fill:
+            # Create one quad for each segment.
+            #
+            # The four vertices form a triangle fan:
+            #
+            #       p1
+            #      /  \
+            #     /    \
+            #    C------p2
+            #
+            # C = center
+
+            vertices = np.zeros(
+                (numSegments, 4, 2),
+                dtype=np.float32
+            )
+
+            for i in range(numSegments):
+                vertices[i] = np.array([
+                    [x, y],
+                    [ellipseX[i], ellipseY[i]],
+                    [ellipseX[i + 1], ellipseY[i + 1]],
+                    [x, y]
+                ], dtype=np.float32)
+
+            self.quad(
+                vertices,
+                color=color,
+                units="device"
+            )
+
+        else:
+            # Draw all segments in a single mglLine command.
+            self.line(
+                ellipseX[:-1],
+                ellipseY[:-1],
+                ellipseX[1:],
+                ellipseY[1:],
+                color=color,
+                units="device"
+            )
+
     ################################################################
     # quad
     ################################################################
