@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QCoreApplication, QTimer, Signal
 from PySide6.QtGui import QColor
 from traitlets import (
-    HasTraits, Float, Int, List, Unicode, Bool, Tuple, TraitType
+    HasTraits, Float, Int, List, Unicode, Bool, Tuple, TraitType, Enum
 )
 from .pglSerialize import pglSerialize
 import sys, subprocess, tempfile
@@ -344,6 +344,9 @@ class _pglTraitsDialog(QDialog):
         elif isinstance(trait, List):
             self._addList(traitName, trait, current, helpText, settingsObject, layout, settingsKey)        
 
+        # Enum
+        elif isinstance(trait, Enum):
+            self._addEnum(traitName, trait, current, helpText, settingsObject, layout, settingsKey)        
     #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
     # ----- Multi-select list -----
     #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
@@ -1281,7 +1284,48 @@ class _pglTraitsDialog(QDialog):
 
         edit.textChanged.connect(onChange)
         self._register(traitName, trait, edit, lambda v: edit.setText(str(v) if v is not None else ""), layout, settingsKey)
+    #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
+    # ----- Enum -> dropdown -----
+    #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
+    def _addEnum(self, traitName, trait, current, helpText, settingsObject, layout=None, settingsKey=None):
+        combo = CenteredComboBox()
 
+        enumValues = list(trait.values)   # fixed allowed values, preserve original types
+
+        combo.addItems([str(o) for o in enumValues])
+
+        if current in enumValues:
+            combo.setCurrentIndex(enumValues.index(current))
+        elif enumValues:
+            combo.setCurrentIndex(0)
+
+        combo.setToolTip(helpText)
+
+        combo.setMinimumWidth(280)
+        combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        combo.view().setMinimumWidth(combo.sizeHint().width())
+        combo.setMaxVisibleItems(12)
+
+        def onChange(index):
+            if self._updatingWidget:
+                return
+
+            selected = enumValues[index]
+
+            self._commit(settingsObject, traitName, selected)
+
+        combo.currentIndexChanged.connect(onChange)
+
+        def setter(value):
+            combo.blockSignals(True)
+
+            if value in enumValues:
+                combo.setCurrentIndex(enumValues.index(value))
+
+            combo.blockSignals(False)
+
+        self._register(traitName, trait, combo, setter, layout, settingsKey)
+        
     #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
     # ----- List -> dropdown -----
     #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
