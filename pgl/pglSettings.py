@@ -27,6 +27,7 @@ from collections import OrderedDict
 from .pglMessages import pglMessages
 import uuid
 import posixpath
+from os.path import exists, join
 
 #######################################
 # Mixin class for pgl to provide settings management
@@ -67,6 +68,53 @@ class pglSettingsManager:
         # and save
         self._saveModifiedSettings(modified, original)
 
+    def eyeTrackerSettings(self, eyeTracker=None, settings=None, settingsName=None):
+        '''
+        brings up dialog of settings for eye tracker
+        
+        Args:
+            eyetracker (string): If set, brings up settings for particularl eye tracker (e.g. eyelink, trackPixx)
+            settings (pglSettings): If set, brings up eyetracker settings for the eyetracker in settings
+            settingsName (string): Name of settings, if set, gets corresponding settings and brings up eyetracker settings based on that one
+        '''
+        eyeTrackerSettings = self.getEyeTrackerSettings(eyeTracker=eyeTracker, settings=settings, settingsName=settingsName)
+        if eyeTrackerSettings is None: 
+            pglMessages.message("No eye tracker for settings")
+            return
+        eyeTrackerSettings = pglDialogs.traitsDialog(eyeTrackerSettings)
+        if eyeTrackerSettings is not None:
+            dataPath = self.getEyeTrackersDir()
+            eyeTrackerSettings.save(filename=join(dataPath, 'eyelink.json'))
+        
+    def getEyeTrackerSettings(self, eyeTracker=None, settings=None, settingsName=None):
+        '''
+        get settings for eye tracker
+        
+        Args:
+            eyetracker (string): If set, brings up settings for particularl eye tracker (e.g. eyelink, trackPixx)
+            settings (pglSettings): If set, brings up eyetracker settings for the eyetracker in settings
+            settingsName (string): Name of settings, if set, gets corresponding settings and brings up eyetracker settings based on that one
+        
+        Returns:
+            pglEyeTrackerSettings
+        '''
+        from .pglEyelink import pglEyelinkSettings
+
+        # get eye tracker 
+        if eyeTracker is None:
+            settings = self.getSettings(settingsName=settingsName, settings=settings)
+            if settings is not None:
+                eyeTracker = settings.eyetracker[0]
+        
+        if eyeTracker is None:
+            pglMessages.message("No eye tracker to calibrte")
+        elif eyeTracker.lower() == 'eyelink':            
+            dataPath = join(self.getEyeTrackersDir(), 'eyelink.json')
+            if exists(dataPath):
+                return pglEyelinkSettings.load(filename=dataPath)
+            else:
+                return pglEyelinkSettings()
+                        
     def isShiftPressed(self):
         flags = Quartz.CGEventSourceFlagsState(Quartz.kCGEventSourceStateHIDSystemState)
         return bool(flags & Quartz.kCGEventFlagMaskShift) 
@@ -526,6 +574,28 @@ class pglSettingsManager:
                 return None
 
         return displayDir
+
+    @classmethod
+    def getEyeTrackersDir(cls):
+        """
+        Get the directory where eye tracker settings are stored
+
+        Returns:
+            str: The directory path where eye tracker settingss are stored
+        """
+        # get the eyeTrackersDir
+        eyeTrackersDir = cls.getPGLSettingsDir() / "eyetrackers"
+        
+        # check if it exists, create if not
+        if not eyeTrackersDir.exists():
+            try:
+                eyeTrackersDir.mkdir(parents=True, exist_ok=True)
+                pglMessages.message(f"Created directory: {eyeTrackersDir}")
+            except Exception as e:
+                pglMessages.warning(f"Error creating directory {eyeTrackersDir}: {e}")
+                return None
+
+        return eyeTrackersDir
 
     @classmethod
     def getCalibrationsDir(cls):
@@ -1167,7 +1237,7 @@ class pglSettings(pglTraitSettings):
     manualPreStart = Bool(False, help="Whether to manually start the experiment before the volume trigger")
     closeScreenOnEnd = Bool(True, help="Whether to close the screen when the experiment ends")
     backgroundColor = List(trait=Float(min=0.0, max=1.0), default_value=[0.5, 0.5, 0.5],minlen=3,maxlen=3,help="Background color as a list of RGB values").tag(isRGB=True)
-    eyetracker =  List(Unicode(), default_value=['None', 'Eyelink'], help="Eyetracker")
+    eyetracker = List(Unicode(), default_value=['None', 'Eyelink'], help="Eyetracker")
     
     def __init__(self):
         super().__init__()
