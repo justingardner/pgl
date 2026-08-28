@@ -76,7 +76,7 @@ class pglEyelink(pglEyeTracker):
             if not self.pgl is None:
                 screenCoordsCommand = f"screen_pixel_coords = 0 0 {self.pgl.screenWidth.pix-1} {self.pgl.screenHeight.pix-1}"
                 self.eyelink.sendCommand(screenCoordsCommand)
-            
+
                 # setup our custom display so that the eyelink calls pgl functions
                 # to display targets for calibration and validation
                 pylink.closeGraphics()
@@ -466,7 +466,10 @@ if _HAVE_PYLINK:
             # store pgl and eyelink instance
             self.pgl = pgl
             self._tracker = eyelink
-            
+
+            # Configure EyeLink camera image (maybe hallucinated by chatGPT)
+            #self._tracker.sendCommand("draw_link_crosshairs = ON")
+
             # background and foreground colors
             self.backgroundColor = (0.5, 0.5, 0.5)
             self.foregroundColor = (0, 0, 0)
@@ -581,6 +584,11 @@ if _HAVE_PYLINK:
                 if self.cameraImageTitle:
                     # Draw title
                     self.pgl.text(self.cameraImageTitle,fontSize=10,color=(0,0,0),x=im.displayLeft+(im.displayRight-im.displayLeft)/2,y=im.displayTop+0.5)
+
+                # TUrn this on - and maybe it draws cross hairs (might bave to set on the eye tracker computer)
+                # right now, the coordinates need to be converted to work with draw_line
+                #self.draw_cross_hair()
+
                 # flush to screen
                 self.pgl.flush()
                 
@@ -654,19 +662,24 @@ if _HAVE_PYLINK:
             
             return keyboardEvents
         def draw_line(self, x1, y1, x2, y2, colorindex):
-            """ draw lines"""
-            self.pgl.line(x1, y1, x2, y2, self.getColorFromIndex(colorindex),units='pix')        
+            """
+              draw lines. Coordinate frame needs to be worked out - as this is called when  draw_cross_hair is
+              run at the end of the image, but the coordinate frame appears to be centered on the center
+              of the image because you get negative coordinates - the image size is stored in self.cameraImageSize as a tuple
+
+            """
+            pglMessages.message(f"line: {x1},{y1}->{x2},{y2}")
+            self.pgl.line(x1, y1, x2, y2, self.getColorFromIndex(colorindex),units='pix')    
             
         def draw_lozenge(self, x, y, width, height, colorindex):
             """ draw the search limits with two lines and two arcs. Docs say this is never called
                 so it has not been tested. """
 
-            # coordinates for a diamond around fixation cross.
-            coords = [ (x, y-height/2), (x+width/2, y),
-                       (x, y+height/2), (x-width/2, y)]
             # Draw as a quad
-            self.pgl.quad(coords, self.getColorFromIndex(colorindex), units='pix')
-            
+            color = self.getColorFromIndex(colorindex)
+
+            self.pgl.ellipse( x=x, y=y, width=width, height=height, color=color, fill=False, units='pix' )
+
         def get_mouse_state(self):
             """ get mouse position and states. Docs say this:
             This function should return the mouse location and the state at the time of call. ((x,y),state). At the moment we
