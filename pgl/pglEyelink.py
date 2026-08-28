@@ -26,9 +26,19 @@ try:
 except ImportError:
     pylink = None
     _HAVE_PYLINK = False
+from .pglEyeTracker import pglEyeTrackerSettings
+from traitlets import Enum, Float
 
 # global variable to set print of debug messages
 debugVerbose = False 
+
+#############
+# Eyelink settings
+#############
+class pglEyelinkSettings(pglEyeTrackerSettings):
+    nEyelinkCalibrationPoints = Enum(values=[5,9,13],default_value=9,help='Number of points for calibration for Eyelink calibriation')
+    eyelinkCalibrationProportion = Float(0.7, min=0.0, max=1.0, help='Proportion of screen over which to do calibration')
+    
 #############
 # Eyelink class
 #############
