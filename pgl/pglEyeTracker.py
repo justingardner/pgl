@@ -14,9 +14,20 @@ from .pglEvent import pglEvent
 from dataclasses import dataclass, field
 from .pglMessages import pglMessages
 import numpy as np
-from traitlets import Float, Enum
+from traitlets import Float, Enum, Unicode, Int
 from .pglSettings import pglTraitSettings
 
+################################
+# setting
+################################
+class pglEyeTrackerSettings(pglTraitSettings):
+    nCalibrationPoints = Enum(values=[5,9,13,17],default_value=17,help='Number of points for calibration')
+    calibrationWidth = Float(0.5, min=0.0, max=1.0, help='Proportion of width of screen over which to do calibration')
+    calibrationHeight = Float(0.5, min=0.0, max=1.0, help='Proportion of height of screen over which to do calibration')
+    skipCalibrationPointKey = Unicode('space', help='Key used to abort calibration point (typically when tracker cannot get calibration lockj)')
+    stableDuration = Int(500, min=0, help='Duration in ms for a fixation during calibration to count as a stable fixation')
+    stableFixationTolerance = Float(0.5, min=0.0, help='Max distance in degrees between each fixation sample to still be considered a stable fixation')
+    
 ################################
 # # class for an eye sample
 ################################
