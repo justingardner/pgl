@@ -852,6 +852,9 @@ class pglExperiment(pglExperimentBase):
     
     def initEyeTracker(self):
         '''Initialize eye tracker if we have an eye tracker.'''
+        # load eye tracker settings
+        self.eyeTrackerSettings = self.getEyeTrackerSettings(settings=self.settings)
+        
         if self.settings.eyetracker[0] == "Eyelink":
             # set edf filename to current date (note it has to be 8.3 characters
             # since SR Research has progressed from the days of DOS)
@@ -865,9 +868,12 @@ class pglExperiment(pglExperimentBase):
             if self.eyeTracker.eyelink is None:
                 self.eyeTracker = None      
 
-            # FIX: these should come from some settings
+            # get from settings
+            nEyelinkCalibrationPoints = self.eyeTrackerSettings.nEyelinkCalibration
+            eyelinkCalibrationProportion = self.eyeTrackerSettings.eyelinkCalibrationProportion
+ 
             if self.eyeTracker is not None:
-                self.eyeTracker.setCustomCalibrationPoints(margin=0.7, numPoints=9)
+                self.eyeTracker.setCustomCalibrationPoints(margin=eyelinkCalibrationProportion, numPoints=nEyelinkCalibrationPoints)
 
         elif self.settings.eyetracker[0] == "None":
             self.eyeTracker = None
