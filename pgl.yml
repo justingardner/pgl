@@ -225,7 +225,6 @@ dependencies:
       - invoke==3.0.3
       - labjack-ljm==1.23.0
       - paramiko==5.0.0
-      - pgl==0.1.0
       - pynacl==1.6.2
       - pyobjc==12.2.1
       - pyobjc-framework-accessibility==12.2.1
