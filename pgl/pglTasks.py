@@ -275,30 +275,39 @@ class pglTestTask(pglTask):
 class pglEyeTrackingCalibrationTask(pglTask):
     
     ########################
-    def __init__(self, pgl, nCalibrationPoints=17, calibrationWidth=10, calibrationHeight=10, nRepeats=1):
+    def __init__(self, pgl):
         super().__init__(pgl)
 
         # task name
         self.settings.taskName = "Eye Tracking Calibration"
-        
+
+    ########################
+    def configure(self, e):
+        '''
+        Configure the eye tracker settings, this will be called by initScreen once the experiment is setup
+        '''
+        # compute calibration Width and Height as percentage of screen
+        calibrationWidth = e.eyeTrackerSettings.calibrationWidth
+        calibrationHeight = e.eyeTrackerSettings.calibrationHeight
+
         # calibration settings
-        self.settings.config.calibrationPoints = self.makeCalibrationPoints(nCalibrationPoints=nCalibrationPoints, calibrationWidth=calibrationWidth, calibrationHeight=calibrationHeight)
+        self.settings.config.calibrationPoints = self.makeCalibrationPoints(nCalibrationPoints=e.eyeTrackerSettings.nCalibrationPoints, calibrationWidth=calibrationWidth, calibrationHeight=calibrationHeight)
         if self.settings.config.calibrationPoints is None: return
-        self.settings.config.nCalibrationPoints = nCalibrationPoints
-        self.settings.config.calibrationWidth = calibrationWidth
-        self.settings.config.calibrationHeight = calibrationHeight
+        self.settings.config.nCalibrationPoints = e.eyeTrackerSettings.nCalibrationPoints
+        self.settings.config.calibrationWidth = e.eyeTrackerSettings.calibrationWidth
+        self.settings.config.calibrationHeight = e.eyeTrackerSettings.calibrationHeight
 
         # set parameters for stable fixation check. Duration is the time (in seconds) that
         # stable fixation must be held for, Fixation tolerance is how far one sample
         # can be (max) from the next sample to be considered stable fixation. If greater
         # than this amount, then the duration interval is reset to 0. Samples are taken
         # once every screen refresh
-        self.settings.config.stableDuration= 0.5
-        self.settings.config.stableFixationTolerance = 0.5
+        self.settings.config.stableDuration= float(e.eyeTrackerSettings.stableDuration)/1000.0
+        self.settings.config.stableFixationTolerance = e.eyeTrackerSettings.stableFixationTolerance
         
         # number of repeats and trials
-        self.settings.nRepeats = nRepeats
-        self.settings.nTrials = nRepeats * nCalibrationPoints
+        self.settings.nRepeats = e.eyeTrackerSettings.nRepeats
+        self.settings.nTrials = e.eyeTrackerSettings.nRepeats * e.eyeTrackerSettings.nCalibrationPoints
         
         # First segment is to give subject time to acquire targer
         # Second segment is over when stable fixation is detected
@@ -377,7 +386,6 @@ class pglEyeTrackingCalibrationTask(pglTask):
         for event in events:
             if event.eventType == 'keydown' and event.keyChar == 'space':
                 # jump out of segment (can be used for aborting stable fixation check)
-                pglMessages.message(f"stable fixation: {pglEyePositionSample.median(self.data.trialVariables[-1]['eyePosition'])}")
                 self.jumpSegment()
 
     ########################
@@ -589,18 +597,15 @@ class pglMessageAckTask(pglTask):
         self.settings.seglen = [np.inf]
 
         # fixed parameters, these will automatically be saved in the settings file
-        self.settings.fixedParameters = {
-            'message': message,
-            'ackKey': ackKey,
-        }        
+        self.settings.config.message = message
+        self.settings.config.ackKey = ackKey
         self.settings.nTrials=1
 
-        #self.state.ackKeyCode = self.pgl.devicesGetKeyboard().charToKeyCode(self.settings.calibrateKey)
+    ########################
+    def configure(self, e):
 
-        # eat only asked for key
-        #k = self.pgl.devicesGetKeyboard()            
-        #self.state.eatKeys = k.eatKeyCodes
-
+        self.state.ackKeyCode = self.pgl.devicesGetKeyboard().charToKeyCode(self.settings.config.ackKey)
+        print(f"Key: {self.state.ackKeyCode}")
 
     ########################
     # updateScren
@@ -609,7 +614,7 @@ class pglMessageAckTask(pglTask):
         '''
         draw text
         '''
-        self.pgl.text(self.settings.fixedParameters['message'],y=0)
+        self.pgl.text(self.settings.config.message,y=0)
 
     ########################
     # handleSubjectResponse
@@ -624,9 +629,8 @@ class pglMessageAckTask(pglTask):
     def handleEvents(self, events):
         '''
         '''
-        #if [e for e in events if e.type == "keyboard" and e.eventType == "keydown"and e.keyCode == self.state.ackKeyCode]: 
-        #    self.jumpSegment()
-        pass
+        if [e for e in events if e.type == "keyboard" and e.eventType == "keydown"and e.keyCode == self.state.ackKeyCode]: 
+            self.jumpSegment()
 
 
         
