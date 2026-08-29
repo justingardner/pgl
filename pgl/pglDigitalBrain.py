@@ -231,6 +231,7 @@ class pglDigitalBrainMemoryTask(pglTask):
         Handle the subject response. Returns the value 0-4 if correct see responseMapping above for explanation
         For incorrect answers returns 5-9
         '''
+        
         # already received a response
         if self.state.gotResponse: return None
         # mark that we got a response
