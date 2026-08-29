@@ -589,10 +589,21 @@ class pglExperiment(pglExperimentBase):
             self.pgl.flush()
             
             # initialize eye tracker
-            self.initEyeTracker()    
+            try:
+                self.initEyeTracker()    
+            except Exception as e:
+                pglMessages.warning(f"Could not initialize eye tracker: {e}")
 
             # display device status
             self.pgl.deviceStatus()
+
+            # call configure on all tasks, this allows any task with configure implemeneted
+            # to use information from the initialized pglExperiment in its configurtion
+            for task in self.tasks:
+                try:
+                    task.configure(self)
+                except Exception as e:
+                    pglMessages.warning(f"Could not configure task {task.settings.taskName}: {e}")
 
             # mark that we have opened the screen
             self.state.openScreen = True
@@ -853,7 +864,7 @@ class pglExperiment(pglExperimentBase):
     def initEyeTracker(self):
         '''Initialize eye tracker if we have an eye tracker.'''
         # load eye tracker settings
-        self.eyeTrackerSettings = self.getEyeTrackerSettings(settings=self.settings)
+        self.eyeTrackerSettings = self.pgl.getEyeTrackerSettings(settings=self.settings)
         
         if self.settings.eyetracker[0] == "Eyelink":
             # set edf filename to current date (note it has to be 8.3 characters
@@ -869,7 +880,7 @@ class pglExperiment(pglExperimentBase):
                 self.eyeTracker = None      
 
             # get from settings
-            nEyelinkCalibrationPoints = self.eyeTrackerSettings.nEyelinkCalibration
+            nEyelinkCalibrationPoints = self.eyeTrackerSettings.nEyelinkCalibrationPoints
             eyelinkCalibrationProportion = self.eyeTrackerSettings.eyelinkCalibrationProportion
  
             if self.eyeTracker is not None:
@@ -960,8 +971,20 @@ class pglExperiment(pglExperimentBase):
         '''
         # Create the directory to save data into (dataDir/experimentSaveName/subjectID/YYYYMMDD_HHMMSS)
         try:
-            dataPath = Path(self.settings.dataPath).expanduser() / self.experimentSettings.experimentSaveName / self.experimentSettings.subjectID / self.experimentSettings.sessionName / self.experimentSettings.runName
-            dataPath.mkdir(parents=True, exist_ok=True)    
+            dataPath = (
+                Path(self.settings.dataPath).expanduser()
+                / self.experimentSettings.experimentSaveName
+                / self.experimentSettings.subjectID
+                / self.experimentSettings.sessionName
+                / self.experimentSettings.runName
+            )
+
+            # If the run directory already exists, append a timestamp to its name.
+            if dataPath.exists():
+                timestamp = datetime.now().strftime("%H-%M-%S")
+                dataPath = dataPath.parent / f"{dataPath.name}_{timestamp}"
+
+            dataPath.mkdir(parents=True, exist_ok=False)
         except Exception as e:
             print(f"(pglExperiment:save) ❌ Could not create data directory {dataPath}: {e}")
             return
@@ -1368,6 +1391,12 @@ class pglTask(pglTaskBase):
         self.e = None
         self.waitUntilVolumeTrigger = False
 
+    def configure(self, e):
+        '''
+        Configure gets called on tasks, just after initScreen runs so that tasks can use
+        any information needed from the pglExperiment to initialize, 
+        '''
+        pass
 
     def start(self, startTime):
         '''
