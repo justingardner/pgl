@@ -277,6 +277,14 @@ class pglSerialize:
                     }
 
                 # ------------------------------------------------------
+                # pathlib.Path
+                # ------------------------------------------------------
+                elif isinstance(o, Path):
+
+                    return {
+                        '__path__': True,
+                        'value': str(o)
+                    }                # ------------------------------------------------------
                 # numpy arrays
                 # ------------------------------------------------------
                 elif isinstance(o, np.ndarray):
@@ -541,6 +549,10 @@ class pglSerialize:
             if '__datetime__' in dct:
                 return datetime.fromisoformat(dct['value'])
             
+            # Restore pathlib.Path objects
+            if '__path__' in dct:
+                return Path(dct['value'])
+
             # Restore numpy arrays
             if '__numpy__' in dct:
                 return np.array(dct['data'], dtype=dct['dtype']).reshape(dct['shape'])
