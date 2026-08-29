@@ -26,7 +26,7 @@ from .pglDialog import pglDialogs
 from .pglMessages import pglMessages
 from .pglPipeline import pglChooseData
 from .pglFlywheel import pglFlywheel
-from .pglDigitalBrain import pglChooseBlock
+from .pglDigitalBrain import pglChooseBlock, pglDigitalBrainMemoryTask, pglDigitalBrainConfigure
 
 # Device specific imports (eye trackers, etc.)
 from .pglVPixx import pglProPixx, pglDataPixx
