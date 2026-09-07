@@ -1,4 +1,4 @@
-name: pgl
+name: pgl_mne
 channels:
 - conda-forge
 dependencies:
@@ -217,3 +217,4 @@ dependencies:
 - platformdirs
 - libsodium
 - aiohttp
+- mne
