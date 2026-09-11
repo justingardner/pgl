@@ -105,8 +105,8 @@ class pglDigitalBrainMemoryTask(pglTask):
         self.settings.fixedParameters = {
             #'moviePath':'/Users/Shared/digital-assets/stimulus/digital/0008',
             #'moviePath':'/Users/justin/Desktop/testvideos',
-            'moviePath':'/Users/Shared/digital',
-            #'moviePath':'/Users/justin/Desktop/digital',
+            #'moviePath':'/Users/Shared/digital',
+            'moviePath':'/Users/justin/Desktop/digitalbrain/digital',
             'displayWidth': displayWidth,
             'subjectNum': subjectNum,
             'dayNum': dayNum,
