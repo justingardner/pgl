@@ -237,15 +237,27 @@ class pglExperimentBase(pglStateDataSettings):
         # return the created object
         return obj
        
-    def addTask(self, task, addToTaskList=True):
+    def addTask(self, task, addToTaskList=True, addPhase=False):
         '''
         Add a task to the experiment.
+        
+        Args:
+            addPhase (bool): If True, the task will be added as a new phase. If False, it will be added to the current phase.
         '''
         # give it a reference to pgl and experiment
         task.pgl = self.pgl
         task.e = self
         self.nTasks += 1
         task.taskID = self.nTasks
+
+        # if we want to add the task as a new phase
+        if addPhase and self.tasks is not None:            
+            maxPhaseNum = max(
+                (task.settings.phaseNum for task in self.tasks
+                if task.settings.phaseNum is not None),
+                default=-1
+            )
+            task.settings.phaseNum = maxPhaseNum + 1
 
         # set whether to save eye tracker info
         if self.eyeTracker is not None:
@@ -960,7 +972,21 @@ class pglExperiment(pglExperimentBase):
         # set start time
         startTime = self.pgl.getSecs()
         for task in self.currentTasks:
-            task.start(startTime)
+            if task.start(startTime) == False:
+                # if task start returns Fales, then end it and remove it form the current tasks list
+                pglMessages.warning(f"(pglExperiment:startPhase) Task {task.settings.taskName} failed to start. Ending task.")
+                task.end()
+                self.currentTasks.remove(task)
+            
+        # if there are no currentTasks, it means that all the tasks for this phase have already been completed, so we should move to the next phase    
+        if len(self.currentTasks) == 0:
+            # check if we have ended all phases 
+            if self.state.phaseNum >= len(self.state.phaseNums)-1:
+                self.state.experimentDone = True
+            else:
+                # update phase
+                self.state.currentPhaseIndex += 1
+                self.startPhase(phaseNum=self.state.phaseNums[self.state.currentPhaseIndex])
 
         print(f"(pglExperiment:startPhase) Starting phase: {self.state.phaseNum}/{len(self.state.phaseNums)}")
         
@@ -1409,10 +1435,23 @@ class pglTask(pglTaskBase):
         # set task start time
         self.data.startTime = startTime
         
+        # run overrideable startTask methos
+        if self.startTask(startTime) == False:
+            return False
+        
         # start trial
         self.state.currentTrial = -1
         self.startTrial(startTime)
+        
+        return True
 
+    def startTask(self, startTime):
+        '''
+        Can be overridden in subclasses to add custom behavior when the task starts.
+        Must return True to run the task as intended, or False to abort running the task
+        '''
+        return True
+    
     def startSegment(self, updateTime):
         '''
         Called exactly once, each time a new segment genuinely starts.
