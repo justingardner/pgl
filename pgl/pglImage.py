@@ -519,7 +519,7 @@ class pglStimulusDatabase(pglTraitSettings):
             # parse filesystem
             self.filesystem, self.dataPath, self.filesystemPrefix = pglBase.validateFilesystem(filesystem, dataPath)
             if not self.filesystem:
-                pglMessages.warning("Could not resolve path to images")
+                pglMessages.warning(f"Could not resolve path to images: {self.dataPaths}")
                 return
                             
             # look for stimuli in directory
@@ -646,13 +646,17 @@ class pglStimulusDatabase(pglTraitSettings):
             return False
         return True
     
-    def preload(self,stimulusNum):
+    def preload(self,stimulusNum=None):
         '''
         preload - to be defined by subclasses, will do any preloading necessary for the asset type
                   this default function validates stimulusNum and just returns whatever get returns
         Args:
             stimulusNum(int): Number of stimulus to preload
         '''
+        if stimulusNum is None:
+            for stimulusNum in range(self.nStimuli):
+                self.preload(stimulusNum)
+            return
         if not self.validateStimulusNum(stimulusNum): return
         return self.get(stimulusNum)
         
@@ -727,10 +731,15 @@ class pglImageDatabase(pglStimulusDatabase):
         # call super
         super().__init__(dataPath=dataPath, knownFileExtensions=imageExtensions, filesystem=filesystem, stimulusFileClass=pglImageFile)
 
-    def preload(self,stimulusNum):
+    def preload(self,stimulusNum=None):
         '''
         preloadImage from database. This will preload the image into memory
         '''
+        if stimulusNum is None:
+            for stimulusNum in range(self.nStimuli):
+                self.preload(stimulusNum)
+            return
+
         if not self.validateStimulusNum(stimulusNum): return
         return self.stimuli[stimulusNum].img
         
