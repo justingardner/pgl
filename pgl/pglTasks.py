@@ -286,6 +286,20 @@ class pglEyeTrackingCalibrationTask(pglTask):
         '''
         Configure the eye tracker settings, this will be called by initScreen once the experiment is setup
         '''
+        if e.eyeTrackerSettings is None:
+            pglMessages.message("No eye tracker settings found, cannot run eye tracking calibration task")
+            self.settings.config.hasEyeTracker = False
+            return
+        
+        # check if eye tracker is initialized
+        if e.eyeTracker is None:
+            pglMessages.message("No eye tracker initialized, cannot run eye tracking calibration task")
+            self.settings.config.hasEyeTracker = False
+            return
+        
+        # has eye tracker
+        self.settings.config.hasEyeTracker = True
+        
         # compute calibration Width and Height as percentage of screen
         calibrationWidth = e.eyeTrackerSettings.calibrationWidth
         calibrationHeight = e.eyeTrackerSettings.calibrationHeight
@@ -316,7 +330,19 @@ class pglEyeTrackingCalibrationTask(pglTask):
         # add parameters for calibration points
         calibrationPoints = pglParameter('calibrationPoint',self.settings.config.calibrationPoints)        
         self.addParameter(calibrationPoints)
-        
+       
+    ########################
+    # startSegment
+    ########################
+    def startTask(self, startTime):
+        '''
+        If no eye tracker is initialized, then return False to abort running this task
+        '''
+        if self.settings.config.hasEyeTracker == False: 
+            return False
+        else:
+            return True
+
     ########################
     # startSegment
     ########################
@@ -399,6 +425,10 @@ class pglEyeTrackingCalibrationTask(pglTask):
         for trials are shown as '+' markers in the color corresponding to the
         calibration target presented on that trial.
         '''
+        if self.settings.config.hasEyeTracker == False: 
+            pglMessages.message("No eye tracker initialized, cannot display eye tracking calibration task")
+            return
+        
         # Create an axes if the caller did not provide one.
         if ax is None:
             figure, ax = plt.subplots()
