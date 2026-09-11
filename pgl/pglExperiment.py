@@ -1587,6 +1587,9 @@ class pglTask(pglTaskBase):
         # Guard against calling end() twice
         if self.data.endTime is not None: return
 
+        # call end task
+        self.endTask()
+        
         # record end time
         print(f"Ending task {self.settings.taskName}")
         endTime = self.pgl.getSecs()
@@ -1596,6 +1599,12 @@ class pglTask(pglTaskBase):
         self.data.events.append(pglEventSegment(self.state.currentSegment, endTime, eventType=pglEventSegment.boundaryType.END))
         self.data.events.append(pglEventTrial(self.state.currentTrial, endTime, eventType=pglEventTrial.boundaryType.END))
 
+    def endTask(self):
+        '''
+        subclass overrideable function that gets called for any end of task processing
+        '''
+        pass
+    
     def jumpSegment(self):
         '''
         Jump to the next segment.
