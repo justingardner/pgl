@@ -175,7 +175,8 @@ class pglSettingsManager:
         # Get CGDisplayCreateUUIDFromDisplayID
         try:
             from ColorSync import CGDisplayCreateUUIDFromDisplayID
-        except ImportError:
+        except ImportError as e:
+            pglMessages.message(f"CGDisplayCreateUUIDFromDisplayID not found in ColorSync, trying Quartz: {e}")
             # fallback: some builds expose it under Quartz
             from Quartz import CGDisplayCreateUUIDFromDisplayID
             
@@ -1252,6 +1253,9 @@ class pglSettings(pglTraitSettings):
         '''
         # call super function to load all fields
         cls = super().load(filename=filename, filesystem=filesystem)
+        if cls is None:
+            pglMessages.warning(f"Could not load settings from {filename}")
+            return None
         
         # reload the displays
         cls.reloadDisplays()
