@@ -24,9 +24,10 @@ from .pglEventListener import pglEventListener
 from .pglEyeTracker import pglEyeTracker
 from .pglDialog import pglDialogs
 from .pglMessages import pglMessages
-from .pglPipeline import pglChooseData
+from .pglPipeline import pglActionLoadSession, pglSession
 from .pglFlywheel import pglFlywheel
 from .pglDigitalBrain import pglChooseBlock, pglDigitalBrainMemoryTask, pglDigitalBrainConfigure
+from .pglChoose import pglChoose
 
 # Device specific imports (eye trackers, etc.)
 from .pglVPixx import pglProPixx, pglDataPixx
@@ -34,12 +35,12 @@ from .pglTrackPixx import pglTrackPixx3
 from .pglLabJack import pglLabJack
 from .pglEyelink import pglEyelinkData
 from .pglVWFA import pglVWFATask
+from .pglEyelink import pglEyelink
 
 try:
     import pylink
-    from .pglEyelink import pglEyelinkCustomDisplay, pglEyelink
 except ImportError:
-    pglMessages.message("pylink not found, pglEyelink class will not be available. Download with: pip install sr-research-pylink")
+    pass
 
 class pgl(pglBase, pglResolution, pglDraw, pglTransform, pglProfile, pglBatch, pglImage, pglStimuli, pglTimestamp, pglDevices, pglEvents, pglCommandReplayer, pglFrameGrab, pglGammaTable, pglSettingsManager, pglMessages, pglDialogs):
     """
