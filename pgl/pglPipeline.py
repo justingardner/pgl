@@ -72,6 +72,22 @@ class pglActionHistory(pglTraitSettings):
         self.endTime = pglTimestamp.getSecs()
         self.runDuration = self.endTime-self.startTime
         
+    def __repr__(self):
+        '''
+        string representation
+        '''
+        if self.actionStatus.value > pglActionStatus.CONFIGURED.value:
+            return f"{self.actionName} ran at {datetime.fromisoformat(self.runDateTime).strftime("%H:%M:%S %d/%m/%Y")} with status: {self.actionStatus.name} duration: {pglTimestamp.formatDuration(self.runDuration)}"
+        else:
+            return f"{self.actionName} status: {self.actionStatus.name}"
+    
+    def print(self):
+        '''
+        print action history
+        '''
+        print(self.__repr__())
+           
+
 ########################
 # class pglActionable
 ########################
@@ -80,6 +96,17 @@ class pglActionable(pglTraitSettings):
     An actionable is any data structure that accepts an action history
     '''
     actionHistory = List(Instance(pglActionHistory),help="History of actions that have been run")
+    
+    def history(self):
+        '''
+        display history
+        '''
+        if not self.actionHistory:
+            pglMessages.message(f"{type(self).__name__} has no history")
+            return
+    
+        for iAction, action in enumerate(self.actionHistory):
+            print(f"{iAction}: {action}")
     
 ########################
 # class pglAction
