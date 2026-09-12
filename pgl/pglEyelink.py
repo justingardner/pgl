@@ -59,7 +59,7 @@ class pglEyelink(pglEyeTracker):
         try:
             # get library
             if not _HAVE_PYLINK:
-                pglMessages.warning(f"pylink is not installed. Please install it from SR-Research website to use Eyelink.")
+                pglMessages.warning(f"pylink is not installed. Please install it from SR-Research website to use Eyelink. Download with: pip install sr-research-pylink")
                 return
         
             pglMessages.message(f"(pglEyelink) Attempting to connect to Eyelink at {eyelinkAddress}...")
