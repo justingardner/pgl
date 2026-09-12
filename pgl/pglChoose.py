@@ -17,6 +17,8 @@ from .pglSession import pglRun
 from fsspec import AbstractFileSystem
 from traitlets import Unicode, List, Instance
 import re
+from .pglParameter import pglParameter
+from traitlets import HasTraits, Float, Int, List, Tuple, TraitError, Unicode, Dict, default, link, Bool, TraitType, Instance
 
 ##################################################################
 # pglChooseSession. Base class for walking directory structures.
@@ -384,3 +386,16 @@ class pglChoose():
 
         return(selectedPaths)
  
+##################################
+# pglTrialsByParameter
+##################################
+class pglTrialsByParameter(pglTraitSettings):
+    parameterName = Unicode(help="Name of parameter that was used to sort trials by")
+    parameterValues = List(help="List of all values that the parameter can take")
+    parameter = Instance(pglParameter, help="The pglParameter instance of the parameter")
+    nTrialsTotal = Int(help="total number of trials")
+    volumes = List(List(Int()),help="A list of lists of volumes, one list for each value of the parameter")
+    startTimes = List(List(Float()),help="A list of lists of times, one list for each value of the parameter")
+    trialNums = List(List(Int()),help="A list of lists of trial volumes, one list for each value of the parameter")
+    nTrials = List(Int(),help="A list of number of trials, one list for each value of the parameter")
+           

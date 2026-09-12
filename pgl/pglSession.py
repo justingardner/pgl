@@ -15,6 +15,7 @@ from .pglExperiment import pglExperimentData, pglExperimentBase, pglExperimentSe
 from traitlets import HasTraits, Float, Int, List, Tuple, TraitError, Unicode, Dict, default, link, Bool, TraitType, Instance
 from fsspec import AbstractFileSystem
 from .pglSettings import pglSettings, pglSettingsManager, pglTraitSettings
+from .pglPipeline import pglActionable
 
 ##################################
 # pglRun
@@ -241,7 +242,7 @@ class pglRun(pglExperimentBase):
 ##################################
 # pglSession
 ##################################
-class pglSession(pglTraitSettings):
+class pglSession(pglActionable):
 
     # filesystem, name and prefix for where the session is loaded from
     filesystem = Instance(AbstractFileSystem, allow_none=True, serialize=False, help="filesystem for serialization")
