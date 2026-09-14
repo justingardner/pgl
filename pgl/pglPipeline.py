@@ -74,18 +74,24 @@ class pglActionHistory(pglTraitSettings):
         
     def __repr__(self):
         '''
+        simple string representation
+        '''
+        return f"{self.actionName} status: {self.actionStatus.name}"
+    
+    def toString(self):
+        '''
         string representation
         '''
         if self.actionStatus.value > pglActionStatus.CONFIGURED.value:
             return f"{self.actionName} ran at {datetime.fromisoformat(self.runDateTime).strftime("%H:%M:%S %d/%m/%Y")} with status: {self.actionStatus.name} duration: {pglTimestamp.formatDuration(self.runDuration)}"
         else:
             return f"{self.actionName} status: {self.actionStatus.name}"
-    
+
     def print(self):
         '''
         print action history
         '''
-        print(self.__repr__())
+        print(self.toString())
            
 
 ########################
@@ -106,7 +112,7 @@ class pglActionable(pglTraitSettings):
             return
     
         for iAction, action in enumerate(self.actionHistory):
-            print(f"{iAction}: {action}")
+            print(f"{iAction}: {action.toString()}")
     
 ########################
 # class pglAction
