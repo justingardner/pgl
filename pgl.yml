@@ -217,3 +217,5 @@ dependencies:
 - platformdirs
 - libsodium
 - aiohttp
+- pyside6
+- imageio
