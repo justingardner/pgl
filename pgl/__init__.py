@@ -24,7 +24,7 @@ from .pglEventListener import pglEventListener
 from .pglEyeTracker import pglEyeTracker
 from .pglDialog import pglDialogs
 from .pglMessages import pglMessages
-from .pglActions import pglActionLoadSession
+from .pglActions import pglActionLoadSession, pglActionLoadFieldline
 from .pglFlywheel import pglFlywheel
 from .pglDigitalBrain import pglChooseBlock, pglDigitalBrainMemoryTask, pglDigitalBrainConfigure
 from .pglChoose import pglChoose

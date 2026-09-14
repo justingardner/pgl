@@ -63,7 +63,143 @@ class pglActionLoadSession(pglAction):
         
         # and return
         return session
-        
+
+#################################
+# class pglActionLoadFieldline
+#################################
+class pglActionLoadFieldlineSettings(pglTraitSettings):
+    selectedPaths = List(Unicode(), help="Paths of fif files selected for loading")
+    filesystemPrefix = Unicode("", help="Filesystem prefix like ssh:// which can be set if the files are not local")
+
+class pglActionLoadFieldline(pglAction):
+    
+    # settings
+    settings = Instance(
+        pglActionLoadFieldlineSettings,
+        help="Settings for loading Fieldline data",
+    )
+    
+    def configure(self, fullDataPath: str=None, settings: pglSettings=None, settingsName: str=None, filesystem: AbstractFileSystem=None, filesystemPrefix: str=None, dataPath: str=None) -> None:
+        """
+        Choose Fieldline FIF files and store their paths in settings.
+        """
+
+        # Choose the FIF files to load.
+        filesystem, fifList, filesystemPrefix = pglChoose.getFieldline(
+            fullDataPath=fullDataPath,
+            settings=settings,
+            settingsName=settingsName,
+            filesystem=filesystem,
+            filesystemPrefix=filesystemPrefix,
+            dataPath=dataPath,
+        )
+
+        # User cancelled or the data path could not be accessed.
+        if filesystem is None:
+            return
+
+        # Put selected FIF paths into settings.
+        self.settings = pglActionLoadFieldlineSettings()
+        self.settings.selectedPaths = fifList
+        self.settings.filesystemPrefix = filesystemPrefix or ""
+    
+        # We are now configured, so call super to set status.
+        super().configure()    
+    
+    def _run(self):
+        """
+        Load selected Fieldline FIF files and concatenate them into one
+        MNE Raw object when more than one file was selected.
+        """
+
+        if self.settings is None or not self.settings.selectedPaths:
+            pglMessages.warning(
+                "(pglActionLoadFieldline:_run) No Fieldline FIF files selected"
+            )
+            return None
+
+        fifList = self.settings.selectedPaths
+        filesystemPrefix = self.settings.filesystemPrefix or ""
+
+        # Validate/reconstruct the filesystem once, using the first selected
+        # FIF path plus the saved filesystem prefix.
+        from pgl import pglBase
+        import mne
+        filesystem, firstFifPath, filesystemPrefix = pglBase.validateFilesystem(
+            dataPath=fifList[0],
+            filesystemPrefix=filesystemPrefix,
+        )
+
+        if filesystem is None:
+            pglMessages.warning(
+                "(pglActionLoadFieldline:_run) "
+                f"Could not access Fieldline FIF file: {fifList[0]}"
+            )
+            return None
+
+        rawList = []
+
+        for fifPath in fifList:
+            try:
+                pglMessages.message(f"Loading Fieldline FIF file: {fifPath}")
+
+                # MNE does not directly use an fsspec ssh:// URL. Open the
+                # path through the established fsspec filesystem and provide
+                # the resulting binary file object to MNE.
+                #
+                # preload=True ensures the data are loaded before fifFile is
+                # closed when leaving the context manager.
+                with filesystem.open(fifPath, "rb") as fifFile:
+                    raw = mne.io.read_raw_fif(
+                        fifFile,
+                        preload=True,
+                        verbose=False,
+                    )
+
+                rawList.append(raw)
+
+            except Exception as e:
+                pglMessages.warning(
+                    "(pglActionLoadFieldline:_run) "
+                    f"Could not load FIF file {fifPath}: {e}"
+                )
+
+        if not rawList:
+            pglMessages.warning(
+                "(pglActionLoadFieldline:_run) No Fieldline FIF files loaded"
+            )
+            return None
+
+        # A single selected FIF does not need concatenation.
+        if len(rawList) == 1:
+            raw = rawList[0]
+
+        else:
+            try:
+                pglMessages.message(
+                    f"Concatenating {len(rawList)} Fieldline FIF files"
+                )
+
+                # concatenate_raws modifies rawList[0] in place and also
+                # returns that same combined Raw object.
+                raw = mne.concatenate_raws(
+                    rawList,
+                    preload=True,
+                    verbose=False,
+                )
+
+            except Exception as e:
+                pglMessages.warning(
+                    "(pglActionLoadFieldline:_run) "
+                    f"Could not concatenate Fieldline FIF files: {e}"
+                )
+                return None
+
+        # Store the result on the action.
+        self.raw = raw
+
+        return raw    
+    
 ##################################################################
 # class pglActionRecreateExperimentDataFromTasks
 ##################################################################
