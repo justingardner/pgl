@@ -21,148 +21,462 @@ from .pglParameter import pglParameter
 from traitlets import HasTraits, Float, Int, List, Tuple, TraitError, Unicode, Dict, default, link, Bool, TraitType, Instance
 
 ##################################################################
-# pglChooseSession. Base class for walking directory structures.
-# implements reading of child directories and putting them in a list
-# creating a class around those directories, see pglChoose classes below
+# Generic chooser hierarchy
+#
+# This is eager about discovering the filesystem hierarchy, so the
+# complete tree is present when pglTraitsDialog opens.  It is lazy
+# only about opening/reading expensive leaf data objects, e.g. pglRun.
+#
+# Each chooser class describes one filesystem level:
+#
+#     entryType      What this level represents: "directory" or "file"
+#     namePattern    Optional regex applied to the basename
+#     requiredFiles  Optional direct filenames required in a directory
+#     childClass     Class representing entries below this level
+#
+# pglTraitsDialog needs no changes: each class retains its own
+# childList trait metadata, including display name and multiSelect.
 ##################################################################
 class pglChooseLevel(pglTraitSettings):
-    '''
-    Base class for one level of the dataPath hierarchy (experiment,
-    subject, run, ...). Subclasses just declare which class their
-    children are; discovery logic itself lives here
-    '''
-    name = Unicode("", help="Name of this level (experiment name, subjectID, etc.)", visible=False)
-    childList = List(Instance(pglTraitSettings), settingsListKey="name", help="List of child levels found under this one")
-    # subclasses override this with the class to instantiate for each
-    # child directory found; None means this is a leaf level (no
-    # further recursion into subdirectories)
+    """
+    Base class for one level of a filesystem chooser hierarchy.
+
+    Subclasses normally only need to declare:
+
+        entryType = "directory"     # or "file"
+        namePattern = r"...",       # optional
+        requiredFiles = (...)       # optional, directories only
+        childClass = SomeClass      # None for leaves
+
+    and, for dialog display, redeclare childList with the desired
+    trait metadata.
+    """
+
+    # ----------------------------------------------------------------
+    # Traits shared by every filesystem node
+    # ----------------------------------------------------------------
+    name = Unicode(
+        "",
+        help="Name of this filesystem entry",
+        visible=False,
+    )
+
+    dataPath = Unicode(
+        "",
+        allow_none=True,
+        help="Path within the filesystem for this entry",
+        visible=False,
+    )
+
+    childList = List(
+        Instance(pglTraitSettings),
+        settingsListKey="name",
+        help="Child filesystem entries",
+    )
+
+    filesystem = Instance(
+        AbstractFileSystem,
+        allow_none=True,
+        serialize=False,
+        help="Filesystem used to access this entry",
+        visible=False,
+    )
+
+    filesystemPrefix = Unicode(
+        "",
+        allow_none=True,
+        help="Filesystem prefix used to recreate this path",
+        visible=False,
+    )
+
+    # Retained in case other code currently refers to fullDataPath.
+    # dataPath is the path actually used by this chooser hierarchy.
+    fullDataPath = Unicode(
+        "",
+        allow_none=True,
+        help="Full path to data",
+        visible=False,
+    )
+
+    # ----------------------------------------------------------------
+    # Per-class filesystem schema
+    #
+    # These are normal class attributes rather than traits. They define
+    # what the class represents; they are not user-editable settings.
+    # ----------------------------------------------------------------
+    entryType = "directory"
+    namePattern = None
+    requiredFiles = ()
     childClass = None
-    
-    filesystem = Instance(AbstractFileSystem, allow_none=True, serialize=False, help="filesystem for serialization",visible=False)
-    fullDataPath = Unicode(allow_none=True, default_value="", help="Full path to data", visible=False)
-    filesystemPrefix = Unicode(allow_none=True, default_value="", help="Prefix like ssh:// used for accessing filesystem", visible=False)
 
+    def __init__(
+            self,
+            name="",
+            dataPath="",
+            filesystem=None,
+            filesystemPrefix=None,
+            entries=None,
+        ):
+            super().__init__()
 
-    def __init__(self, name="", dataPath="", filesystem=None, filesystemPrefix=None, entries=None):
-        super().__init__()
+            # The root node may be constructed directly, without a filesystem.
+            # Child nodes are always passed the already-established filesystem
+            # from their parent, and must NOT re-validate or re-infer it.
+            if filesystem is None:
+                filesystem, dataPath, filesystemPrefix = pglBase.validateFilesystem(
+                    filesystem=filesystem,
+                    dataPath=dataPath,
+                    filesystemPrefix=filesystemPrefix,
+                )
 
-        self.name = name
-        self.filesystem, self.dataPath, self.filesystemPrefix = pglBase.validateFilesystem(filesystem=filesystem, dataPath=dataPath, filesystemPrefix=filesystemPrefix)
-        self.childList = self._getChildren(entries) if self.childClass is not None else []
+            self.name = name
+            self.dataPath = str(dataPath)
+            self.fullDataPath = str(dataPath)
+            self.filesystem = filesystem
+            self.filesystemPrefix = filesystemPrefix or ""
 
+            if self.childClass is not None and self.filesystem is not None:
+                self.childList = self._getChildren(entries=entries)
+            else:
+                self.childList = []
+    # ----------------------------------------------------------------
+    # Factory
+    # ----------------------------------------------------------------
     @classmethod
-    def create(cls, name="", dataPath="", filesystem=None, filesystemPrefix=None):
-        '''
-        Factory method: validates that dataPath qualifies as this
-        level (via _isValid), then builds the instance and, for
-        non-leaf levels, checks that it actually ended up with at
-        least one valid child. A level with no valid children isn't
-        considered valid itself (e.g. a subject directory with no
-        valid runs isn't really a subject). Returns None if either
-        check fails, otherwise returns the fully-built instance.
-        '''
-        filesystem, dataPath, filesystemPrefix = pglBase.validateFilesystem(filesystem=filesystem, dataPath=dataPath, filesystemPrefix=filesystemPrefix)
+    def create(
+        cls,
+        name="",
+        dataPath="",
+        filesystem=None,
+        filesystemPrefix=None,
+        entry=None,
+    ):
+        """
+        Create one chooser node.
 
-        # load all the entries in the directory
-        try:
-            entries = filesystem.ls(dataPath, detail=True)
-        except (FileNotFoundError, OSError):
+        The root path is validated when the top-level chooser is created.
+        Descendant paths come directly from filesystem.ls(), so reuse the
+        parent's filesystem rather than repeatedly calling
+        validateFilesystem().
+        """
+
+        # This should normally only occur if someone directly calls:
+        #
+        #     pglChooseExperiment.create(dataPath="...")
+        #
+        # Rather than building it below an existing chooser node.
+        if filesystem is None:
+            filesystem, dataPath, filesystemPrefix = pglBase.validateFilesystem(
+                filesystem=filesystem,
+                dataPath=dataPath,
+                filesystemPrefix=filesystemPrefix,
+            )
+
+        if filesystem is None:
             return None
-        
-        # check if the disrecotry is valid (this is an overwriteable function for specific
-        # checks like if the directory contains all the files necessary for a run)
-        if not cls._isValid(name=name, dataPath=dataPath, filesystem=filesystem, entries=entries):
+
+        entries = None
+
+        # We need a directory listing if:
+        #   1. This node has children to discover, or
+        #   2. This node validates itself based on contained files.
+        #
+        # A file leaf needs neither.
+        if cls.childClass is not None or cls.requiredFiles:
+            try:
+                entries = filesystem.ls(dataPath, detail=True)
+            except (FileNotFoundError, OSError):
+                return None
+
+        if not cls._isValid(
+            name=name,
+            dataPath=dataPath,
+            filesystem=filesystem,
+            entry=entry,
+            entries=entries,
+        ):
             return None
 
-        # there are some children create the instance, note that we use the original filesystem
-        # and dataPath so that the dataPath can be stored with its filesystem prefix if it has one
-        instance = cls(name=name, dataPath=dataPath, filesystem=filesystem, filesystemPrefix=filesystemPrefix, entries=entries)
+        instance = cls(
+            name=name,
+            dataPath=dataPath,
+            filesystem=filesystem,
+            filesystemPrefix=filesystemPrefix,
+            entries=entries,
+        )
 
-        # There should be a list of children now (this is what selection is over).
-        # So, drop out here if the list is empty. Alternatively, if this is a leaf
-        # (i.e. has no childClass) then no check necessary
-        if cls.childClass is not None and len(instance.childList) == 0:
+        # Preserve existing chooser behavior: do not show a parent branch
+        # unless it eventually contains at least one valid leaf.
+        if cls.childClass is not None and not instance.childList:
             return None
 
-        # return the initialized instance
         return instance
 
+    # ----------------------------------------------------------------
+    # Generic validation
+    # ----------------------------------------------------------------
     @classmethod
-    def _isValid(cls, name=None, dataPath=None, filesystem=None, entries=None):
-        '''
-        Subclass-overrideable check for whether dataPath qualifies as
-        this level based on its own properties (name pattern, presence
-        of a specific file, etc). Default: always valid.
-        '''
+    def _isValid(
+        cls,
+        name=None,
+        dataPath=None,
+        filesystem=None,
+        entry=None,
+        entries=None,
+    ):
+        """
+        Generic validation shared by all chooser levels.
+
+        Subclasses may override this for special validation, but should
+        normally start by calling super()._isValid(...).
+
+        Returns True if this filesystem entry is valid for cls.
+        """
+
+        # Validate whether the entry is a file or directory.
+        #
+        # The root object is instantiated directly rather than through
+        # create(), so entry can be None there. Every child created by
+        # _getChildren() receives a real fsspec detail dictionary.
+        if entry is not None:
+            if entry.get("type") != cls.entryType:
+                return False
+
+        # Optional regex validation of the entry basename.
+        if cls.namePattern is not None:
+            if name is None or re.match(cls.namePattern, name) is None:
+                return False
+
+        # Optional direct-file validation for directory entries.
+        #
+        # Example:
+        #
+        #     requiredFiles = ("events.tsv", "params.json")
+        #
+        if cls.requiredFiles:
+            if entries is None:
+                return False
+
+            fileNames = {
+                item["name"].rstrip("/").rsplit("/", 1)[-1]
+                for item in entries
+                if item.get("type") == "file"
+            }
+
+            if not set(cls.requiredFiles).issubset(fileNames):
+                return False
+
         return True
 
-    def _getChildren(self, entries):
-        '''
-        Find all directories directly under dataPath and instantiate
-        one childClass instance per directory that passes validation
-        (including the "has valid children" check, if applicable).
-        '''
-    
+    # ----------------------------------------------------------------
+    # Find child entries
+    # ----------------------------------------------------------------
+    def _getChildren(self, entries=None):
+        """
+        Create one childClass object for every valid direct child of
+        self.dataPath.
+
+        There is intentionally no hardcoded directory filtering here.
+        The child class declares whether it accepts directories or files
+        through childClass.entryType.
+        """
+
         if entries is None:
-            entries = self.filesystem.ls(self.dataPath, detail=True)
+            try:
+                entries = self.filesystem.ls(self.dataPath, detail=True)
+            except (FileNotFoundError, OSError):
+                return []
 
         children = []
+
         for entry in entries:
-            if entry["type"] != "directory":
-                continue
-            childName = entry["name"].rstrip("/").split("/")[-1]
-            child = self.childClass.create(name=childName, dataPath=entry["name"], filesystem=self.filesystem, filesystemPrefix=self.filesystemPrefix)
+            entryPath = entry["name"]
+            entryName = entryPath.rstrip("/").rsplit("/", 1)[-1]
+
+            child = self.childClass.create(
+                name=entryName,
+                dataPath=entryPath,
+                filesystem=self.filesystem,
+                filesystemPrefix=self.filesystemPrefix,
+                entry=entry,
+            )
+
             if child is not None:
                 children.append(child)
-        return children        
-             
-################################################################################
-# Each one of these classes sits at one level of the file structure hierarchy
-# So they can be used to walk the experiment directory and load runs
-################################################################################        
-class pglChooseRun(pglChooseLevel):
 
-    # this is the root, so no more recursion beyond this point
+        return children
+
+
+################################################################################
+# Standard experiment chooser hierarchy
+#
+# Expected structure:
+#
+#     dataPath/
+#         experiment/
+#             s00001/
+#                 session/
+#                     run/
+#
+# The dialog behavior remains exactly as before because each level still
+# declares childList metadata that pglTraitsDialog already understands.
+################################################################################
+
+class pglChooseRun(pglChooseLevel):
+    """
+    Leaf representing one experiment run directory.
+
+    pglRun construction remains lazy: merely discovering and displaying
+    runs does not open their contents.
+    """
+
+    entryType = "directory"
     childClass = None
 
-    dataPath = Unicode(allow_none=True, default_value=None, help="Where the data for this run lives", enabled=False)
+    _tasks = Unicode(
+        "",
+        allow_none=True,
+        help="Stimulus type used for this run",
+        enabled=False,
+    )
 
-    _tasks = Unicode(allow_none=True, default_value="", help="Stimulus type used for this run", enabled=False)
-    _run = Instance(pglRun, allow_none=True, default_value=None, serialize=False, help="Class representing run data", visible=False)
-    
+    _run = Instance(
+        pglRun,
+        allow_none=True,
+        default_value=None,
+        serialize=False,
+        help="Class representing run data",
+        visible=False,
+    )
+
     @property
     def tasks(self):
-        '''String representing tasks, lazy-loaded.'''
+        """Lazy-load task names only when requested."""
         if not self._tasks:
             self._tasks = self.run.getTaskNames()
         return self._tasks
 
     @property
     def run(self):
-        '''String representing tasks, lazy-loaded.'''
-        if not self._run:
-            self.run = pglRun(fullDataPath=self.dataPath, filesystem=self.filesystem, filesystemPrefix=self.filesystemPrefix)   
+        """Lazy-load the expensive pglRun object only when needed."""
+        if self._run is None:
+            self._run = pglRun(
+                fullDataPath=self.dataPath,
+                filesystem=self.filesystem,
+                filesystemPrefix=self.filesystemPrefix,
+            )
         return self._run
-    
+
     @run.setter
     def run(self, value):
         self._run = value
 
-    # display
     def display(self, fig=None):
-        '''
-        display the run
-        '''
+        """Called by the existing traits-dialog display button."""
         self.run.display(fig=fig)
 
+
 class pglChooseSession(pglChooseLevel):
-    childList = List(Instance(pglTraitSettings), settingsListKey="name", traitDisplayName="Select run(s)", multiSelect=True, maxRowsVisible=6, hasPlotButton=True, buttonFunction="display", help="Runs in session dir")
+    """
+    Directory containing run directories.
+    """
+
+    childList = List(
+        Instance(pglTraitSettings),
+        settingsListKey="name",
+        traitDisplayName="Select run(s)",
+        multiSelect=True,
+        maxRowsVisible=6,
+        hasPlotButton=True,
+        buttonFunction="display",
+        help="Runs in session directory",
+    )
+
+    entryType = "directory"
     childClass = pglChooseRun
-                
+
+
 class pglChooseSubject(pglChooseLevel):
+    """
+    Subject directory, required to have the form s#####.
+    """
+
+    childList = List(
+        Instance(pglTraitSettings),
+        settingsListKey="name",
+        traitDisplayName="Choose session",
+        help="Sessions in subject directory",
+    )
+
+    entryType = "directory"
+    namePattern = r"^s\d+$"
+    childClass = pglChooseSession
+
+
+class pglChooseExperiment(pglChooseLevel):
+    """
+    Experiment directory containing subject directories.
+    """
+
+    childList = List(
+        Instance(pglTraitSettings),
+        settingsListKey="name",
+        traitDisplayName="Choose subject",
+        help="Subjects in experiment directory",
+    )
+
+    entryType = "directory"
+    childClass = pglChooseSubject
+
+
+class pglChooseData(pglChooseLevel):
+    """
+    Top-level data directory containing experiment directories.
+    """
+
+    childList = List(
+        Instance(pglTraitSettings),
+        settingsListKey="name",
+        traitDisplayName="Choose experiment",
+        help="Experiments in data path",
+    )
+
+    entryType = "directory"
+    childClass = pglChooseExperiment
+    
+################################################################################
+# pglChooseFieldline
+################################################################################        
+class pglFieldlineRun(pglTraitSettings):
+    name = Unicode("", help="Name of the fif file", visible=False)
+    
+class pglChooseFieldline(pglTraitSettings):
+    childList = List(Instance(pglFieldlineRun), settingsListKey="name", traitDisplayName="Select run(s)", multiSelect=True, maxRowsVisible=6, hasPlotButton=True, buttonFunction="display", help="Runs in session dir")
+
+    def __init__(self, dataPath="", filesystem=None, filesystemPrefix=""):
+        super().__init__()
+        # validate filesystem        
+        filesystem, dataPath, filesystemPrefix = pglBase.validateFilesystem(filesystem=filesystem, dataPath=dataPath, filesystemPrefix=filesystemPrefix)
+
+        entries = filesystem.ls(dataPath, detail=True)
+
+        self.childList = [pglFieldlineRun(name=entry["name"].rstrip("/").split("/")[-1]) for entry in entries if entry["type"] == "file" and entry["name"].lower().endswith(".fif")]
+
+    @classmethod
+    def create(cls, name="", dataPath="", filesystem=None, filesystemPrefix=None):
+        '''
+        '''
+        instance = cls(dataPath=dataPath, filesystem=filesystem, filesystemPrefix=filesystemPrefix)
+        return instance
+
+class pglChooseFieldlineSession(pglChooseLevel):
+    childList = List(Instance(pglTraitSettings), settingsListKey="name", traitDisplayName="Select run(s)", multiSelect=True, maxRowsVisible=6, hasPlotButton=True, buttonFunction="display", help="Runs in session dir")
+    childClass = pglChooseFieldline
+                
+class pglChooseFieldlineSubject(pglChooseLevel):
     # re-declare childList, so we can give it a proper name
     childList = List(Instance(pglTraitSettings), settingsListKey="name", traitDisplayName="Choose session", help="Sessions in subject dir")
-    childClass = pglChooseSession
+    childClass = pglChooseFieldlineSession
     
     @classmethod
     def _isValid(cls, name=None, dataPath=None, filesystem=None, entries=None):
@@ -171,16 +485,19 @@ class pglChooseSubject(pglChooseLevel):
         lastDir = Path(dataPath).name
         return bool(re.match(r"^s\d+$", lastDir))
     
-class pglChooseExperiment(pglChooseLevel):
+class pglChooseFieldlineExperiment(pglChooseLevel):
     # re-declare childList, so we can give it a proper name
     childList = List(Instance(pglTraitSettings), settingsListKey="name", traitDisplayName="Choose subject", help="Subjects in experiment dir")
-    childClass = pglChooseSubject
+    childClass = pglChooseFieldlineSubject
     
-class pglChooseData(pglChooseLevel):
+class pglChooseFieldlineData(pglChooseLevel):
     # re-declare childList, so we can give it a proper name
     childList = List(Instance(pglTraitSettings), settingsListKey="name", traitDisplayName="Choose experiment", help="Experiments in data path")
-    childClass = pglChooseExperiment
+    childClass = pglChooseFieldlineExperiment
     
+##############################
+# pglChoose
+##############################
 class pglChoose():
     '''
     Class which provides ways to choose runs and experiment directories
