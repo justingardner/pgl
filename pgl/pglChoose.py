@@ -333,21 +333,9 @@ class pglChooseRun(pglChooseLevel):
     entryType = "directory"
     childClass = None
 
-    _tasks = Unicode(
-        "",
-        allow_none=True,
-        help="Stimulus type used for this run",
-        enabled=False,
-    )
+    _tasks = Unicode("",allow_none=True,help="Stimulus type used for this run",enabled=False,)
 
-    _run = Instance(
-        pglRun,
-        allow_none=True,
-        default_value=None,
-        serialize=False,
-        help="Class representing run data",
-        visible=False,
-    )
+    _run = Instance(pglRun,allow_none=True,default_value=None,serialize=False,help="Class representing run data",visible=False,)
 
     @property
     def tasks(self):
@@ -445,54 +433,126 @@ class pglChooseData(pglChooseLevel):
     childClass = pglChooseExperiment
     
 ################################################################################
-# pglChooseFieldline
-################################################################################        
-class pglFieldlineRun(pglTraitSettings):
-    name = Unicode("", help="Name of the fif file", visible=False)
-    
-class pglChooseFieldline(pglTraitSettings):
-    childList = List(Instance(pglFieldlineRun), settingsListKey="name", traitDisplayName="Select run(s)", multiSelect=True, maxRowsVisible=6, hasPlotButton=True, buttonFunction="display", help="Runs in session dir")
+# Fieldline chooser hierarchy
+#
+# Expected structure:
+#
+#     dataPath/
+#         experiment/
+#             s00001/
+#                 session/
+#                     someRecording.fif
+#                     anotherRecording.fif
+#
+# The leaf is a FIF FILE rather than a run DIRECTORY.
+#
+# Like pglChooseRun, pglChooseFieldline is intentionally lightweight:
+# discovering the tree does not read FIF contents.  Add a lazy Fieldline/MNE
+# object here later if/when you want a display button or data preview.
+################################################################################
 
-    def __init__(self, dataPath="", filesystem=None, filesystemPrefix=""):
-        super().__init__()
-        # validate filesystem        
-        filesystem, dataPath, filesystemPrefix = pglBase.validateFilesystem(filesystem=filesystem, dataPath=dataPath, filesystemPrefix=filesystemPrefix)
 
-        entries = filesystem.ls(dataPath, detail=True)
+class pglChooseFieldline(pglChooseLevel):
+    """
+    Leaf representing one Fieldline FIF file.
 
-        self.childList = [pglFieldlineRun(name=entry["name"].rstrip("/").split("/")[-1]) for entry in entries if entry["type"] == "file" and entry["name"].lower().endswith(".fif")]
+    dataPath is inherited from pglChooseLevel and contains the full path
+    to the FIF file.  This is what pglChoose.walkInstances() returns for
+    selected files.
+    """
 
-    @classmethod
-    def create(cls, name="", dataPath="", filesystem=None, filesystemPrefix=None):
-        '''
-        '''
-        instance = cls(dataPath=dataPath, filesystem=filesystem, filesystemPrefix=filesystemPrefix)
-        return instance
+    entryType = "file"
+    namePattern = r"^.*\.[Ff][Ii][Ff]$"
+    childClass = None
+
+    # ------------------------------------------------------------------------
+    # Later, if desired, add lazy Fieldline loading here. For example:
+    #
+    # _fieldline = Instance(pglFieldline, allow_none=True,
+    #                       default_value=None, serialize=False)
+    #
+    # @property
+    # def fieldline(self):
+    #     if self._fieldline is None:
+    #         self._fieldline = pglFieldline(
+    #             fullDataPath=self.dataPath,
+    #             filesystem=self.filesystem,
+    #             filesystemPrefix=self.filesystemPrefix,
+    #         )
+    #     return self._fieldline
+    #
+    # def display(self, fig=None):
+    #     self.fieldline.display(fig=fig)
+    #
+    # Do not add hasPlotButton=True below until this class has a real
+    # display() method.
+    # ------------------------------------------------------------------------
+
 
 class pglChooseFieldlineSession(pglChooseLevel):
-    childList = List(Instance(pglTraitSettings), settingsListKey="name", traitDisplayName="Select run(s)", multiSelect=True, maxRowsVisible=6, hasPlotButton=True, buttonFunction="display", help="Runs in session dir")
+    """
+    Directory containing Fieldline FIF files.
+    """
+
+    childList = List(
+        Instance(pglTraitSettings),
+        settingsListKey="name",
+        traitDisplayName="Select Fieldline run(s)",
+        multiSelect=True,
+        maxRowsVisible=6,
+        help="Fieldline FIF files in session directory",
+    )
+
+    entryType = "directory"
     childClass = pglChooseFieldline
-                
+
+
 class pglChooseFieldlineSubject(pglChooseLevel):
-    # re-declare childList, so we can give it a proper name
-    childList = List(Instance(pglTraitSettings), settingsListKey="name", traitDisplayName="Choose session", help="Sessions in subject dir")
+    """
+    Subject directory. Only directories of the form s##### are included.
+    """
+
+    childList = List(
+        Instance(pglTraitSettings),
+        settingsListKey="name",
+        traitDisplayName="Choose session",
+        help="Sessions in Fieldline subject directory",
+    )
+
+    entryType = "directory"
+    namePattern = r"^s\d+$"
     childClass = pglChooseFieldlineSession
-    
-    @classmethod
-    def _isValid(cls, name=None, dataPath=None, filesystem=None, entries=None):
-        
-        # check whether it is a directory of form sXXXXX
-        lastDir = Path(dataPath).name
-        return bool(re.match(r"^s\d+$", lastDir))
-    
+
+
 class pglChooseFieldlineExperiment(pglChooseLevel):
-    # re-declare childList, so we can give it a proper name
-    childList = List(Instance(pglTraitSettings), settingsListKey="name", traitDisplayName="Choose subject", help="Subjects in experiment dir")
+    """
+    Experiment directory containing Fieldline subject directories.
+    """
+
+    childList = List(
+        Instance(pglTraitSettings),
+        settingsListKey="name",
+        traitDisplayName="Choose subject",
+        help="Subjects in Fieldline experiment directory",
+    )
+
+    entryType = "directory"
     childClass = pglChooseFieldlineSubject
-    
+
+
 class pglChooseFieldlineData(pglChooseLevel):
-    # re-declare childList, so we can give it a proper name
-    childList = List(Instance(pglTraitSettings), settingsListKey="name", traitDisplayName="Choose experiment", help="Experiments in data path")
+    """
+    Top-level Fieldline data directory containing experiment directories.
+    """
+
+    childList = List(
+        Instance(pglTraitSettings),
+        settingsListKey="name",
+        traitDisplayName="Choose experiment",
+        help="Experiments in Fieldline data path",
+    )
+
+    entryType = "directory"
     childClass = pglChooseFieldlineExperiment
     
 ##############################
@@ -635,7 +695,134 @@ class pglChoose():
                         return (filesystem, fullDataPath, filesystemPrefix)
               
         return (filesystem, fullDataPath, filesystemPrefix)
-    
+
+    @classmethod
+    def getFieldline(cls,fullDataPath=None,settings=None,settingsName=None,filesystem=None,filesystemPrefix=None,dataPath=None):
+        """
+        Display a Fieldline chooser and return selected FIF file paths.
+
+        The expected hierarchy is:
+
+            dataPath/
+                experiment/
+                    s#####/
+                        session/
+                            recording.fif
+
+        Parameters
+        ----------
+        fullDataPath : str or Path, optional
+            Root of the Fieldline hierarchy. If supplied, it takes precedence
+            over dataPath and settings.
+
+        settings : pglSettings, optional
+            Settings object whose dataPath will be used if neither fullDataPath
+            nor dataPath is supplied.
+
+        settingsName : str, optional
+            Name passed to pglSettingsManager.getSettings() if settings must be
+            loaded automatically.
+
+        filesystem : fsspec.AbstractFileSystem, optional
+            Filesystem used to access the data.
+
+        filesystemPrefix : str, optional
+            Prefix retained for later reconstruction of the filesystem, such as
+            an ssh:// prefix.
+
+        dataPath : str or Path, optional
+            Root of the Fieldline hierarchy.
+
+        Returns
+        -------
+        tuple
+            (filesystem, fifPaths, filesystemPrefix)
+
+            filesystem:
+                The validated fsspec filesystem.
+
+            fifPaths:
+                A list of selected full FIF paths, or None if the user cancels
+                or no files are selected.
+
+            filesystemPrefix:
+                Prefix returned by pglBase.validateFilesystem().
+
+        Examples
+        --------
+        filesystem, fifPaths, filesystemPrefix = pglChoose.chooseFieldline(
+            dataPath="/Users/justin/Desktop/digitalbrain"
+        )
+
+        if fifPaths:
+            for fifPath in fifPaths:
+                print(fifPath)
+        """
+
+        # `fullDataPath` is simply an alternate explicit name for the root
+        # Fieldline data path.
+        if fullDataPath is not None:
+            dataPath = fullDataPath
+
+        # Obtain dataPath from settings only if the caller did not provide one.
+        if not dataPath:
+            if settings is None:
+                settings = pglSettingsManager.getSettings(settingsName=settingsName)
+
+            if settings is None:
+                pglMessages.warning(
+                    f"Could not find settings {settingsName}"
+                )
+                return (None, None, None)
+
+            dataPath = settings.dataPath
+
+        # Validate the root filesystem/path once. Descendants reuse this same
+        # filesystem object through pglChooseLevel; they are not revalidated.
+        filesystem, dataPath, filesystemPrefix = pglBase.validateFilesystem(
+            filesystem=filesystem,
+            dataPath=dataPath,
+            filesystemPrefix=filesystemPrefix,
+        )
+
+        if filesystem is None:
+            pglMessages.warning(
+                f"Could not access Fieldline data path: {dataPath}"
+            )
+            return (None, None, None)
+
+        # Construct the complete chooser tree. This performs filesystem
+        # discovery only; it does not load/open the potentially large FIF files.
+        chooser = pglChooseFieldlineData(
+            dataPath=dataPath,
+            filesystem=filesystem,
+            filesystemPrefix=filesystemPrefix,
+        )
+
+        # If no valid experiment -> subject -> session -> FIF path exists,
+        # there is no useful chooser to show.
+        if not chooser.childList:
+            pglMessages.message(
+                f"No Fieldline FIF files found below {dataPath}"
+            )
+            return (filesystem, [], filesystemPrefix)
+
+        chooser = pglDialogs.traitsDialog(chooser)
+
+        if chooser is None:
+            pglMessages.message("No Fieldline files selected")
+            return (None, None, filesystemPrefix)
+
+        # pglChooseFieldline leaves inherit dataPath from pglChooseLevel, so the
+        # existing generic tree walker returns full selected FIF paths.
+        fifPaths = cls.walkInstances(chooser)
+
+        if not fifPaths:
+            pglMessages.message("No Fieldline files selected")
+            return (filesystem, [], filesystemPrefix)
+
+        return (filesystem, fifPaths, filesystemPrefix)
+
     @ classmethod
     def _chooseDialog(cls, fullDataPath, filesystem=None, chooseLevel=None, allowMultipleRuns=False):
         '''
