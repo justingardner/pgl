@@ -7,19 +7,19 @@
 
 from .pglMessages import pglMessages
 from .pglSettings import pglTraitSettings
-from traitlets import HasTraits, Float, Int, List, Tuple, TraitError, Unicode, Dict, default, link, Bool, TraitType, Instance
 from pathlib import Path
 from .pglExperiment import pglEventSegment
 from .pglSettings import pglSettings
 from .pglDialog import pglDialogs
 from typing import Annotated
-import numpy as np
-import matplotlib.pyplot as plt
 from .pglChoose import pglChoose
-from fsspec import AbstractFileSystem
 from .pglPipeline import pglAction
 from .pglSession import pglSession, pglMNE
-
+import numpy as np
+from numbers import Integral
+import matplotlib.pyplot as plt
+from fsspec import AbstractFileSystem
+from traitlets import HasTraits, Float, Int, List, Tuple, TraitError, Unicode, Dict, default, link, Bool, TraitType, Instance
 
 #################################
 # Collection of predefined actions
@@ -289,65 +289,105 @@ class pglActions():
                 pglSession
             '''
             import mne
-            import pandas as pd
             
-            # get the events
-            session.mne.events = mne.find_events(session.mne.raw, stim_channel=self.triggerChannel, shortest_event=self.triggerShortestEvent)
+            # get the events and make a basic eventsID which will just label each event with a string of the number
+            session.mne.events.raw = mne.find_events(session.mne.raw, stim_channel=self.triggerChannel, shortest_event=self.triggerShortestEvent)
+            session.mne.eventsID.raw = {str(int(eventCode)): int(eventCode) for eventCode in sorted(set(session.mne.events.raw[:, 2]))}
             
-            # Create event labels
-            session.mne.eventLabels = pd.DataFrame()
-            session.mne.eventLabels['code'] = session.mne.events[:, 2]
-            
-            # read in the events
-            for iTriggerLabels, triggerLabels in enumerate(self.triggerLabels):
-                # default to nan for labels
-                session.mne.eventLabels[self.triggerLabelNames[iTriggerLabels]] = pd.NA
-                unusedLabels = []
-                
-                for label, codes in triggerLabels.items():
-                    # Permit a single integer for a code (or it can be a range)
-                    if isinstance(codes, int): codes = [codes]
+            rawEvents = session.mne.events.raw
+            rawCodes = rawEvents[:, 2]
 
-                    # label all the events
-                    mask = session.mne.eventLabels["code"].isin(codes)
-                    session.mne.eventLabels.loc[mask, self.triggerLabelNames[iTriggerLabels]] = label
+            for setName, setLabels in zip(self.triggerLabelNames, self.triggerLabels):
 
-                    # check if the labels were not used
-                    if not mask.any(): unusedLabels.append(label)
-                
-                if unusedLabels:
+                # Start with no event assigned to a group.
+                assignedMask = np.zeros(len(rawEvents), dtype=bool)
+
+                # Copy the raw events. We will replace only events[:, 2].
+                remappedEvents = rawEvents.copy()
+
+                # MNE format: {"labelName": integerEventCode}
+                eventID = {}
+
+                nextEventCode = 1
+
+                for label, codes in setLabels.items():
+
+                    # Permit a single integer or an iterable/range of integers.
+                    if isinstance(codes, Integral):
+                        codes = [codes]
+
+                    mask = np.isin(rawCodes, list(codes))
+
+                    # Warn if a configured label did not occur in the recording.
+                    if not mask.any():
+                        pglMessages.warning(
+                            f"Label '{label}' in event set '{setName}' "
+                            f"did not match any raw event.",
+                            level=1,
+                        )
+                        continue
+
+                    # Do not allow one raw event code to belong to multiple labels.
+                    overlapMask = mask & assignedMask
+
+                    if overlapMask.any():
+                        overlappingCodes = np.unique(rawCodes[overlapMask]).tolist()
+
+                        raise ValueError(
+                            f"Event set '{labelSetName}' has overlapping label definitions. "
+                            f"Label '{label}' overlaps an earlier label for raw event codes: "
+                            f"{overlappingCodes}"
+                        )
+
+                    # Give this label a new grouped MNE event code.
+                    eventID[label] = nextEventCode
+
+                    # Replace the third events column with the new grouped code.
+                    remappedEvents[mask, 2] = nextEventCode
+
+                    assignedMask |= mask
+                    nextEventCode += 1
+
+                # Report raw trigger codes that were not assigned a label.
+                if (~assignedMask).any():
+                    unlabeledCodes = np.unique(rawCodes[~assignedMask]).tolist()
+
                     pglMessages.warning(
-                        f"Trigger label column '{self.triggerLabelNames[iTriggerLabels]}': the following labels "
-                        f"were configured but not used by any event: {unusedLabels}",
-                    level=1,
-                    )
-                # Check whether every event received a label in this column.
-                unlabeledMask = session.mne.eventLabels[self.triggerLabelNames[iTriggerLabels]].isna()
-                if unlabeledMask.any():
-                    unlabeledCodes = session.mne.eventLabels.loc[unlabeledMask,"code"].unique()
-
-                    pglMessages.warning(f"Trigger label column '{self.triggerLabelNames[iTriggerLabels]}' did not label "
-                        f"{unlabeledMask.sum()} of {len(session.mne.eventLabels)} events. "
-                        f"Unlabeled codes: {unlabeledCodes.tolist()}",
+                        f"Event set '{setName}' did not assign labels to "
+                        f"{(~assignedMask).sum()} of {len(rawEvents)} events. "
+                        f"Unlabeled raw codes: {unlabeledCodes}",
                         level=1,
                     )
+
+                # Keep only events that belong to this labeling scheme.
+                # This prevents MNE warnings about event codes missing from event_id.
+                remappedEvents = remappedEvents[assignedMask]
+
+                # Store the matching events and event_id under the scheme name.
+                setattr(session.mne.events, setName, remappedEvents)
+                setattr(session.mne.eventsID, setName, eventID)
             
-            # make labels for display using the first one
-            if session.mne.eventLabels.shape[1] >= 3:
-                labelColumn = session.mne.eventLabels.columns[1]
-                eventID = (
-                    session.mne.eventLabels[["code", labelColumn]]
-                    .dropna()
-                    .drop_duplicates()
-                    .set_index(labelColumn)["code"]
-                    .to_dict()
-                )
+            
+            # get the first triggerLabel if it exists
+            if self.triggerLabelNames:
+                events = getattr(session.mne.events, self.triggerLabelNames[0])
+                eventsID = getattr(session.mne.eventsID, self.triggerLabelNames[0])
             else:
-                eventID = None
-                
+                events = session.mne.events.raw
+                eventsID = session.mne.eventsID.raw
 
             # and display
-            mne.viz.plot_events(session.mne.events, event_id=eventID, sfreq=session.mne.raw.info["sfreq"], first_samp=session.mne.raw.first_samp)
+            fig, ax = plt.subplots(figsize=(24, 8))
+
+            mne.viz.plot_events(
+                events,
+                event_id=eventsID,
+                sfreq=session.mne.raw.info["sfreq"],
+                first_samp=session.mne.raw.first_samp,
+                axes=ax,
+            )
+
+            fig.tight_layout()
             
             return session
         

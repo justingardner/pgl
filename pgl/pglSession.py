@@ -17,6 +17,7 @@ from fsspec import AbstractFileSystem
 from .pglSettings import pglSettings, pglSettingsManager, pglTraitSettings
 from .pglPipeline import pglActionable
 from .pglMessages import pglMessages
+from types import SimpleNamespace
 import pandas as pd
 try:
     import mne
@@ -255,8 +256,8 @@ class pglMNE(pglActionable):
     rawFilenames = List(Unicode(allow_none=True), help="filenames of raw (if they exist)")
     rawFilesystemPrefix = List(Unicode(allow_none=True), help="filenames of raw (if they exist)", serialize=False)
     epochs = List(Any(), help='List of all epochs')
-    events = Instance(klass=np.ndarray, allow_none=True, default_value=None, help="events created by MNE")
-    eventLabels = Instance(klass=pd.DataFrame,allow_none=True,default_value=None,help="Labels of events, one line for each event as a panda dataframe")
+    events = Instance(SimpleNamespace, default_value=SimpleNamespace(), help="events created by MNE")
+    eventsID = Instance(SimpleNamespace, default_value=SimpleNamespace(), help="Labels of events, one line for each event as a panda dataframe")
 
     def __init__(self):
         super().__init__()
