@@ -368,16 +368,18 @@ class pglActions():
                 setattr(session.mne.eventsID, setName, eventID)
             
             
+            # display
+            fig, ax = plt.subplots(figsize=(24, 8))
+
             # get the first triggerLabel if it exists
             if self.triggerLabelNames:
                 events = getattr(session.mne.events, self.triggerLabelNames[0])
                 eventsID = getattr(session.mne.eventsID, self.triggerLabelNames[0])
+                fig.suptitle(f"{self.triggerLabelNames[0]} events")
             else:
                 events = session.mne.events.raw
                 eventsID = session.mne.eventsID.raw
-
-            # and display
-            fig, ax = plt.subplots(figsize=(24, 8))
+                fig.suptitle("Raw events")
 
             mne.viz.plot_events(
                 events,
@@ -389,6 +391,69 @@ class pglActions():
 
             fig.tight_layout()
             
+            return session
+
+    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
+    # filter
+    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
+    class mneFilter(pglAction):
+        
+        lowCutoff = Float(0.0, help="Low pass cutoff for filtering")
+        highCutoff = Float(0.0, help="High pass cutoff for filtering")
+        notch = Bool(True, help="apply notch filter")
+        notchFrequency = Float(60.0, help="Frequency at which to notch")
+        
+        ################################
+        # configure
+        ################################
+        def configure(
+            self,
+            lowCutoff: float = 1.0,
+            highCutoff: float = 80.0,
+            notch: bool = True,
+            notchFrequency: float = 60.0        
+        ) -> None:
+
+            # set cutoffs
+            self.lowCutoff = lowCutoff
+            self.highCutoff = highCutoff
+            self.notch = notch
+            self.notchFrequency = notchFrequency
+            
+            # we are now configured, so call super to set status
+            super().configure()
+            
+        ################################
+        # run
+        ################################
+        def _run(self, session: pglSession) -> pglSession:
+            '''
+           Run the filtering
+            
+            Returns:
+                pglSession: fitered session
+            '''
+            # import mne
+            import mne
+            
+            # check for mne session
+            if session.mne is None or session.mne.raw is None:
+                self.setError("session does not have raw mne loaded")
+                return None
+                
+            # apply low and high pass filter
+            session.mne.raw.load_data().filter(l_freq=self.lowCutoff,h_freq=None)
+            session.mne.raw.load_data().filter(l_freq=None,h_freq=self.highCutoff)
+            
+            # apply notch filter
+            if self.notch:                
+                meg_picks = mne.pick_types(session.mne.raw.info, meg=True)
+                session.mne.raw.notch_filter(freqs=self.notchFrequency, picks=meg_picks)
+            
+            # display spectrum    
+            session.mne.raw.compute_psd(fmax=100).plot(average=False, picks="data", exclude="bads",amplitude=False)            
+            
+            # and return
             return session
         
 ##################################################################
