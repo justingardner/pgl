@@ -256,9 +256,11 @@ class pglMNE(pglActionable):
     rawFilenames = List(Unicode(allow_none=True), help="filenames of raw (if they exist)")
     rawFilesystemPrefix = List(Unicode(allow_none=True), help="filenames of raw (if they exist)", serialize=False)
     epochs = List(Any(), help='List of all epochs')
-    events = Instance(SimpleNamespace, default_value=SimpleNamespace(), help="events created by MNE")
-    eventsID = Instance(SimpleNamespace, default_value=SimpleNamespace(), help="Labels of events, one line for each event as a panda dataframe")
-
+    events = Instance(np.ndarray, default_value=None, allow_none=True, help="Canonical MNE events array: [sample, previousValue, rawEventCode].")
+    eventsID = Instance(pd.DataFrame, default_value=None, allow_none=True, help="Event metadata DataFrame: one row per event and one column per labeling scheme.")
+    epochs = Any(default_value=None, allow_none=True, help="MNE Epochs object created from events with eventsID as metadata.")
+    evoked = Any(default_value=None, allow_none=True, help="Grand-average MNE Evoked object created from epochs.")
+    
     def __init__(self):
         super().__init__()
         if mne is None:

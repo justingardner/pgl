@@ -19,7 +19,8 @@ import numpy as np
 from numbers import Integral
 import matplotlib.pyplot as plt
 from fsspec import AbstractFileSystem
-from traitlets import HasTraits, Float, Int, List, Tuple, TraitError, Unicode, Dict, default, link, Bool, TraitType, Instance
+from traitlets import HasTraits, Enum, Float, Int, List, Tuple, TraitError, Unicode, Dict, default, link, Bool, TraitType, Instance
+import pandas as pd
 
 #################################
 # Collection of predefined actions
@@ -241,40 +242,32 @@ class pglActions():
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
     class mneConfigureEvents(pglAction):
         
-        triggerChannel = Unicode("", help="Paths of runs selected for loading")
+        triggerChannel = Unicode("di2", help="Paths of runs selected for loading")
         triggerShortestEvent = Int(1, help="shortest event length for a trigger")
-        triggerLabels = List(Dict(allow_none=True, default_value={}), help='dict of all trigger names where key is trigger number and value is name')
-        triggerLabelNames = List(Unicode(), help='Names of the trigger label dicts')
+        triggerLabelSets = Dict(default_value={},help=("Mapping of scheme name to label definitions. "
+            "Example: {'stimulusType': {'thingsStim': range(1, 201), "
+            "'blank': [1022], 'catch': [1023]}}"
+            ),
+        )
+        tmin = Float(0.0, help="Time to start triggered epoch in seconds")
+        tmax = Float(1.0, help="Time to end triggered epoch in seconds")
         
         ################################
         # configure
         ################################
-        def configure(self, triggerChannel="di2", triggerShortestEvent = 1, triggerLabels=None, triggerLabelNames=None) -> None:
+        def configure(self, triggerChannel: str = None, triggerShortestEvent: int = 1, triggerLabelSets: Dict = None, tmin: float = None, tmax: float = None) -> None:
 
             # Set the trigger channel
-            self.triggerChannel = triggerChannel
-            self.triggerShortestEvent = triggerShortestEvent
+            if triggerChannel: self.triggerChannel = triggerChannel
+            if triggerShortestEvent: self.triggerShortestEvent = triggerShortestEvent
 
             # get triggerLabels            
-            if triggerLabels is None:
-                self.triggerLabels = []
-            elif isinstance(triggerLabels,dict):
-                self.triggerLabels = [triggerLabels]
-            else:
-                self.triggerLabels = triggerLabels
-
-            # get triggerLabelNames
-            if triggerLabelNames is None:
-                self.triggerLabelNames = []
-            elif isinstance(triggerLabelNames,str):
-                self.triggerLabelNames = [triggerLabelNames]
-            else:
-                self.triggerLabelNames = triggerLabelNames
-                
-            # check for the same length
-            if len(self.triggerLabels) != len(self.triggerLabelNames):
-                pglMessages.warning(f"Mismatched number of labels ({len(self.triggerLabels)}) and labelNames ({len(self.triggerLabelNames)})",level=1)                
+            if triggerLabelSets: self.triggerLabelSets = triggerLabelSets
             
+            # tmin and tmax are min and max in seconds of epochs
+            if tmin: self.tmin = tmin
+            if tmax: self.tmax = tmax
+                
             # we are now configured, so call super to set status
             super().configure()
             
@@ -282,115 +275,286 @@ class pglActions():
         # run
         ################################
         def _run(self, session: pglSession):
-            '''
-            Run the action to find events, this will put up a dialog for confirmation from the experimenter
-            
-            Returns:
-                pglSession
-            '''
+            """
+            Find raw trigger events, create an event-label DataFrame, create one Epochs
+            object with metadata, create one grand-average Evoked object, and display
+            events using the first configured labeling scheme.
+
+            Stores:
+                session.mne.events:
+                    Canonical MNE events array, shape (nEvents, 3):
+                    [sample, previousValue, rawTriggerCode].
+
+                session.mne.eventsID:
+                    Pandas DataFrame with one row per event. Includes the raw event
+                    code plus one column for each configured labeling scheme.
+
+                session.mne.epochs:
+                    One MNE Epochs object with session.mne.eventsID attached as
+                    metadata.
+
+                session.mne.evoked:
+                    Grand-average Evoked object across all epochs.
+            """
             import mne
-            
-            # get the events and make a basic eventsID which will just label each event with a string of the number
-            session.mne.events.raw = mne.find_events(session.mne.raw, stim_channel=self.triggerChannel, shortest_event=self.triggerShortestEvent)
-            session.mne.eventsID.raw = {str(int(eventCode)): int(eventCode) for eventCode in sorted(set(session.mne.events.raw[:, 2]))}
-            
-            rawEvents = session.mne.events.raw
-            rawCodes = rawEvents[:, 2]
 
-            for setName, setLabels in zip(self.triggerLabelNames, self.triggerLabels):
+            # -------------------------------------------------------------------------
+            # Find the canonical raw events matrix.
+            # MNE format: [sample, previousValue, eventCode]
+            # -------------------------------------------------------------------------
+            events = mne.find_events(
+                session.mne.raw,
+                stim_channel=self.triggerChannel,
+                shortest_event=self.triggerShortestEvent,
+            )
 
-                # Start with no event assigned to a group.
-                assignedMask = np.zeros(len(rawEvents), dtype=bool)
+            if len(events) == 0:
+                raise RuntimeError(
+                    f"No events found in trigger channel '{self.triggerChannel}'."
+                )
 
-                # Copy the raw events. We will replace only events[:, 2].
-                remappedEvents = rawEvents.copy()
+            rawCodes = events[:, 2].astype(int)
 
-                # MNE format: {"labelName": integerEventCode}
-                eventID = {}
+            # -------------------------------------------------------------------------
+            # Make the event-label DataFrame.
+            #
+            # This is the canonical location for all alternate event grouping schemes.
+            # One event may have a label in multiple scheme columns.
+            # -------------------------------------------------------------------------
+            eventsDf = pd.DataFrame(
+                {
+                    "sample": events[:, 0].astype(int),
+                    "previousValue": events[:, 1].astype(int),
+                    "code": rawCodes,
+                }
+            )
 
-                nextEventCode = 1
+            # A readable representation of the original raw trigger code.
+            eventsDf["rawLabel"] = eventsDf["code"].astype(str)
 
-                for label, codes in setLabels.items():
+            # -------------------------------------------------------------------------
+            # Add one DataFrame column per label scheme.
+            #
+            # triggerLabelSets format:
+            #
+            # {
+            #     "stimulusType": {
+            #         "thingsStim": range(1, 201),
+            #         "blank": [1022],
+            #         "catch": [1023],
+            #     },
+            #     "responseType": {
+            #         "correct": [2001],
+            #         "incorrect": [2002],
+            #     },
+            # }
+            # -------------------------------------------------------------------------
+            for schemeName, labelDefinitions in self.triggerLabelSets.items():
 
-                    # Permit a single integer or an iterable/range of integers.
-                    if isinstance(codes, Integral):
-                        codes = [codes]
+                # Start with no event assigned in this scheme.
+                schemeLabels = pd.Series(
+                    np.nan,
+                    index=eventsDf.index,
+                    dtype=object,
+                )
 
-                    mask = np.isin(rawCodes, list(codes))
+                for configuredLabel, configuredCodes in labelDefinitions.items():
 
-                    # Warn if a configured label did not occur in the recording.
+                    labelName = str(configuredLabel)
+
+                    # Permit a single integer, list, tuple, set, NumPy array, or range.
+                    if isinstance(configuredCodes, Integral):
+                        codes = [int(configuredCodes)]
+
+                    elif isinstance(configuredCodes, str):
+                        raise TypeError(
+                            f"Label '{labelName}' in scheme '{schemeName}' has a "
+                            f"string trigger-code definition ({configuredCodes!r}). "
+                            f"Use an integer or iterable of integers instead."
+                        )
+
+                    else:
+                        try:
+                            codes = [int(code) for code in configuredCodes]
+                        except TypeError as error:
+                            raise TypeError(
+                                f"Label '{labelName}' in scheme '{schemeName}' must "
+                                f"map to an integer or iterable of integers."
+                            ) from error
+
+                    mask = eventsDf["code"].isin(codes).to_numpy()
+
+                    # Warn if configured event codes are absent from the recording.
                     if not mask.any():
                         pglMessages.warning(
-                            f"Label '{label}' in event set '{setName}' "
-                            f"did not match any raw event.",
+                            f"Label '{labelName}' in event scheme '{schemeName}' "
+                            f"did not match any raw event codes.",
                             level=1,
                         )
                         continue
 
-                    # Do not allow one raw event code to belong to multiple labels.
-                    overlapMask = mask & assignedMask
+                    # An event can only get one label within a single scheme.
+                    overlapMask = mask & schemeLabels.notna().to_numpy()
 
                     if overlapMask.any():
-                        overlappingCodes = np.unique(rawCodes[overlapMask]).tolist()
+                        overlappingCodes = np.unique(
+                            eventsDf.loc[overlapMask, "code"].to_numpy()
+                        ).tolist()
 
                         raise ValueError(
-                            f"Event set '{labelSetName}' has overlapping label definitions. "
-                            f"Label '{label}' overlaps an earlier label for raw event codes: "
-                            f"{overlappingCodes}"
+                            f"Event scheme '{schemeName}' has overlapping label "
+                            f"definitions. Label '{labelName}' overlaps a prior "
+                            f"label for raw trigger codes: {overlappingCodes}"
                         )
 
-                    # Give this label a new grouped MNE event code.
-                    eventID[label] = nextEventCode
+                    schemeLabels.loc[mask] = labelName
 
-                    # Replace the third events column with the new grouped code.
-                    remappedEvents[mask, 2] = nextEventCode
+                eventsDf[schemeName] = schemeLabels
 
-                    assignedMask |= mask
-                    nextEventCode += 1
+                # Report trigger codes that did not receive a label in this scheme.
+                unlabeledMask = eventsDf[schemeName].isna().to_numpy()
 
-                # Report raw trigger codes that were not assigned a label.
-                if (~assignedMask).any():
-                    unlabeledCodes = np.unique(rawCodes[~assignedMask]).tolist()
+                if unlabeledMask.any():
+                    unlabeledCodes = np.unique(
+                        eventsDf.loc[unlabeledMask, "code"].to_numpy()
+                    ).tolist()
 
                     pglMessages.warning(
-                        f"Event set '{setName}' did not assign labels to "
-                        f"{(~assignedMask).sum()} of {len(rawEvents)} events. "
+                        f"Event scheme '{schemeName}' did not assign labels to "
+                        f"{unlabeledMask.sum()} of {len(eventsDf)} events. "
                         f"Unlabeled raw codes: {unlabeledCodes}",
                         level=1,
                     )
 
-                # Keep only events that belong to this labeling scheme.
-                # This prevents MNE warnings about event codes missing from event_id.
-                remappedEvents = remappedEvents[assignedMask]
+            # -------------------------------------------------------------------------
+            # Store the single canonical event representation.
+            # -------------------------------------------------------------------------
+            session.mne.events = events
+            session.mne.eventsID = eventsDf
 
-                # Store the matching events and event_id under the scheme name.
-                setattr(session.mne.events, setName, remappedEvents)
-                setattr(session.mne.eventsID, setName, eventID)
-            
-            
-            # display
-            fig, ax = plt.subplots(figsize=(24, 8))
+            # -------------------------------------------------------------------------
+            # Create one Epochs object.
+            #
+            # MNE still needs an event_id mapping to create Epochs. This mapping is
+            # local because the DataFrame is now the authoritative label store.
+            #
+            # Every raw trigger code is included, even if it has no label in one or
+            # more configured grouping schemes.
+            # -------------------------------------------------------------------------
+            rawEventId = {
+                f"raw/{int(code)}": int(code)
+                for code in np.unique(rawCodes)
+            }
 
-            # get the first triggerLabel if it exists
-            if self.triggerLabelNames:
-                events = getattr(session.mne.events, self.triggerLabelNames[0])
-                eventsID = getattr(session.mne.eventsID, self.triggerLabelNames[0])
-                fig.suptitle(f"{self.triggerLabelNames[0]} events")
-            else:
-                events = session.mne.events.raw
-                eventsID = session.mne.eventsID.raw
-                fig.suptitle("Raw events")
-
-            mne.viz.plot_events(
-                events,
-                event_id=eventsID,
-                sfreq=session.mne.raw.info["sfreq"],
-                first_samp=session.mne.raw.first_samp,
-                axes=ax,
+            epochs = mne.Epochs(
+                session.mne.raw,
+                events=session.mne.events,
+                event_id=rawEventId,
+                tmin=self.tmin,
+                tmax=self.tmax,
+                baseline=None,
+                metadata=session.mne.eventsID,
+                preload=True,
+                verbose=False,
             )
 
-            fig.tight_layout()
-            
+            session.mne.epochs = epochs
+
+            # One grand-average Evoked over all retained epochs.
+            session.mne.evoked = epochs.average()
+
+            # -------------------------------------------------------------------------
+            # Make a temporary events array for displaying the FIRST label scheme.
+            #
+            # This does not get stored. The canonical event data remains:
+            #     session.mne.events
+            #     session.mne.eventsID
+            #
+            # We cannot permanently replace raw event codes with one scheme's grouped
+            # codes because that would discard information needed by other schemes.
+            # -------------------------------------------------------------------------
+            fig, ax = plt.subplots(figsize=(24, 8))
+
+            if self.triggerLabelSets:
+                firstSchemeName = next(iter(self.triggerLabelSets))
+
+                plotMask = eventsDf[firstSchemeName].notna().to_numpy()
+
+                if plotMask.any():
+                    plotEvents = events[plotMask].copy()
+                    plotLabels = eventsDf.loc[plotMask, firstSchemeName]
+
+                    # Keep labels in their configured dictionary order where possible.
+                    configuredLabels = [
+                        str(labelName)
+                        for labelName in self.triggerLabelSets[firstSchemeName]
+                        if str(labelName) in set(plotLabels)
+                    ]
+
+                    plotEventId = {
+                        labelName: eventCode
+                        for eventCode, labelName in enumerate(configuredLabels, start=1)
+                    }
+
+                    # Temporarily map label strings back to MNE integer event codes.
+                    plotEvents[:, 2] = (
+                        plotLabels.map(plotEventId)
+                        .to_numpy(dtype=int)
+                    )
+
+                    mne.viz.plot_events(
+                        plotEvents,
+                        event_id=plotEventId,
+                        sfreq=session.mne.raw.info["sfreq"],
+                        first_samp=session.mne.raw.first_samp,
+                        axes=ax,
+                        show=False,
+                    )
+
+                    fig.suptitle(f"Events grouped by: {firstSchemeName}")
+
+                else:
+                    pglMessages.warning(
+                        f"The first event scheme '{firstSchemeName}' did not label "
+                        f"any events. Displaying raw events instead.",
+                        level=1,
+                    )
+
+                    rawPlotEventId = {
+                        str(int(code)): int(code)
+                        for code in np.unique(rawCodes)
+                    }
+
+                    mne.viz.plot_events(
+                        events,
+                        event_id=rawPlotEventId,
+                        sfreq=session.mne.raw.info["sfreq"],
+                        first_samp=session.mne.raw.first_samp,
+                        axes=ax,
+                        show=False,
+                    )
+
+                    fig.suptitle("Raw events")
+
+            else:
+                rawPlotEventId = {
+                    str(int(code)): int(code)
+                    for code in np.unique(rawCodes)
+                }
+
+                mne.viz.plot_events(
+                    events,
+                    event_id=rawPlotEventId,
+                    sfreq=session.mne.raw.info["sfreq"],
+                    first_samp=session.mne.raw.first_samp,
+                    axes=ax,
+                    show=False,
+                )
+
+                fig.suptitle("Raw events")
+
+            fig.tight_layout(rect=(0, 0, 1, 0.96))
+
             return session
 
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
@@ -453,6 +617,119 @@ class pglActions():
             # display spectrum    
             session.mne.raw.compute_psd(fmax=100).plot(average=False, picks="data", exclude="bads",amplitude=False)            
             
+            # and return
+            return session
+        
+    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
+    # bads handling
+    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
+    class mneBads(pglAction):
+        
+        # parameters
+        method = Enum(["interpolate", "drop"], default_value="interpolate", help="Method for handling bads")
+        excludeWhenPositionIsNaN = Bool(True, help="If a sensor was 'excluded' during data collection, usually because for some reason it didn't turn on, it's position may show up as NaN but it will not be marked as 'bad'. Lets double check for any cases like this to make sure we mark and drop these sensors.")
+        extraBads = List(Unicode(), help="List of extra sensors to exclude as bads")
+        interpolationOrigin = Enum(["auto", "zero"],default_value="zero",help=(
+                "Set origin for interpolation. 'auto' fits a sphere from head "
+                "digitization points and requires raw.info['dig'] to contain "
+                "sufficient extra (headshape) or EEG points -- cardinal/HPI points "
+                "alone are not enough and will raise an error. 'zero' sets the "
+                "origin to [0,0,0] in the head coordinate frame, i.e. the "
+                "fiducial-based head center (midpoint of LPA/RPA) -- accurate only "
+                "if fiducials were placed by convention rather than measured "
+                "asymmetrically."
+            ),
+        )
+        
+        ################################
+        # configure
+        ################################
+        def configure(
+            self,
+            method: str = None,
+            excludeWhenPositionIsNaN: bool = None,
+            extraBads: list = None,
+            interpolationOrigin: str = None,
+        ) -> None:
+
+            # set parameters
+            if method: self.method = method
+            if excludeWhenPositionIsNaN: self.excludeWhenPostionIsNan = self.excludeWhenPositionIsNaN
+            if extraBads: self.extraBads = extraBads
+            if interpolationOrigin: self.interpolationOrigin = interpolationOrigin
+             
+            # we are now configured, so call super to set status
+            super().configure()
+            
+        ################################
+        # run
+        ################################
+        def _run(self, session: pglSession) -> pglSession:
+            '''
+            Run the bads processing
+            
+            Returns:
+                pglSession: session
+            '''
+            # import mne
+            import mne
+            
+            # check for mne session
+            if session.mne is None or session.mne.raw is None:
+                self.setError("session does not have raw mne loaded")
+                return None
+
+            # set extra bads if they are configured                
+            if self.extraBads:
+                # validate the extrabads list by comparing against actual channel names
+                validChNames = set(session.mne.raw.info["ch_names"])
+                invalidBads = [ch for ch in self.extraBads if ch not in validChNames]
+                
+                # if we have invalids then abort, otherwise extend the bads list
+                if invalidBads:
+                    self.setError(f"extraBads contains channels not found in raw data: {invalidBads}")
+                    return None
+                else:
+                    session.mne.raw.info["bads"].extend(self.extraBads)
+            
+            # exclude any sensors that have NaN in their location
+            if self.excludeWhenPositionIsNaN:
+                bads_NaNs=[]
+                # look for channels that have NaN in their locations,
+                # as this indicates that they were excluded during data collection
+                for i in range(0,session.mne.raw.info["nchan"]):
+                    ch_pos = session.mne.raw.info["chs"][i]["loc"][:3]
+                    if np.isnan(ch_pos).any():
+                        bads_NaNs.append(session.mne.raw.info["chs"][i]["ch_name"])
+                
+                # we found some bad channels
+                if bads_NaNs:
+                    # check if they are in the existing channels
+                    existingBads = set(session.mne.raw.info["bads"])
+                    newBads = [ch for ch in bads_NaNs if ch not in existingBads]
+                    pglMessages.message(f"Found {len(bads_NaNs)} channels with NaNs in the location, indicating they were excluded: {bads_NaNs}. ")
+                    # message and add any new Bads
+                    if newBads:
+                        pglMessages.message(f"{len(newBads)} were not already marked bad and have been added.")
+                        session.mne.raw.info["bads"].extend(newBads)
+
+            # what to do with the bads
+            bads = session.mne.raw.info["bads"]
+            if bads:
+                if self.method == "interpolate":
+                    pglMessages.message(f"Interpolating {len(bads)} bad sesnsors: {bads}", emphasize=True)
+                    #-- Interpolate bads - set origin to zero in "HEAD" frame
+                    if self.interpolationOrigin == "zero":
+                        session.mne.raw.interpolate_bads(origin=[0,0,0],reset_bads=True)
+                    else:
+                        session.mne.raw.interpolate_bads(origin="auto",reset_bads=True)
+                else:
+                    pglMessages.message(f"Dropping {len(bads)} bad sesnsors: {bads}", emphasize=True)
+                    #-- drop bads
+                    session.mne.raw.drop_channels(session.mne.raw.info["bads"])
+            else:
+                pglMessages.message(f"No bad sensors to {self.method}")
+
             # and return
             return session
         

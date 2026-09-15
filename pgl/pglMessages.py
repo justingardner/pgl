@@ -22,13 +22,30 @@ class pglMessages:
     _oneTimeWarnings = set()
     
     @classmethod
-    def message(cls, msg, callerNameDepth=2, verbose=True, wrapText=True):
+    def message(cls, msg, callerNameDepth=None, verbose=True, wrapText=True, emphasize=False):
+        
+        # get the callerNameDepth
+        if callerNameDepth is None: callerNameDepth = 2
+        else:
+            # add one (to account for the formatMessage call)
+            callerNameDepth += 1
+            
+        # display message
         if verbose:
+            if emphasize:print("+="*40)
             if wrapText: msg=cls.wrapText(msg)
             print(f"({cls.getCallerName(callerNameDepth)}) {msg}")
+            if emphasize:print("+="*40)
 
     @classmethod
-    def warning(cls, msg, level=2, callerNameDepth=2, verbose=True,wrapText=True):
+    def warning(cls, msg, level=2, callerNameDepth=None, verbose=True,wrapText=True):
+        # get the callerNameDepth
+        if callerNameDepth is None: callerNameDepth = 2
+        else:
+            # add one (to account for the formatMessage call)
+            callerNameDepth += 1
+        
+        # display the message            
         if verbose:
             print(cls._formatMessage(msg,level,callerNameDepth,wrapText))
     
