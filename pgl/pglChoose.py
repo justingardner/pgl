@@ -18,7 +18,7 @@ from fsspec import AbstractFileSystem
 from traitlets import Unicode, List, Instance
 import re
 from .pglParameter import pglParameter
-from traitlets import HasTraits, Float, Int, List, Tuple, TraitError, Unicode, Dict, default, link, Bool, TraitType, Instance
+from traitlets import HasTraits, Any, Float, Int, List, Tuple, TraitError, Unicode, Dict, default, link, Bool, TraitType, Instance
 
 ##################################################################
 # Generic chooser hierarchy
@@ -556,6 +556,33 @@ class pglChooseFieldlineData(pglChooseLevel):
     childClass = pglChooseFieldlineExperiment
     
 ##############################
+# pglChooseListItem
+##############################
+class pglChooseListItem(pglTraitSettings):
+    value = Any(
+        default_value=None,
+        visible=False,
+    )
+
+    displayName = Unicode(
+        "",
+        help="Value displayed in list",
+    )
+
+##############################
+# pglChooseList
+##############################
+class pglChooseList(pglTraitSettings):
+    items = List(
+        Instance(pglChooseListItem),
+        settingsListKey="displayName",
+        traitDisplayName="Choose",
+        multiSelect=True,
+        maxRowsVisible=10,
+        help="Items to choose from",
+    )
+
+##############################
 # pglChoose
 ##############################
 class pglChoose():
@@ -822,6 +849,115 @@ class pglChoose():
             return (filesystem, [], filesystemPrefix)
 
         return (filesystem, fifPaths, filesystemPrefix)
+
+    @classmethod
+    def chooseList(cls,values,key=None,traitDisplayName="Choose",maxRowsVisible=10,help=None):
+        """
+        Display a dialog for choosing one or more items from a list.
+
+        Parameters
+        ----------
+        values : list
+            List of values/items to choose from.
+
+        key : str or callable, optional
+            Determines the value displayed in the chooser.
+
+            If None:
+                The item itself is displayed.
+
+            If str:
+                The named attribute/key is displayed. This works for both
+                objects and dictionaries.
+
+            If callable:
+                The callable is passed each item and its return value is
+                displayed.
+
+        traitDisplayName : str
+            Display name for the chooser.
+
+        maxRowsVisible : int
+            Maximum number of rows shown by the dialog.
+
+        help : str, optional
+            Help text for the chooser.
+
+        Returns
+        -------
+        list or None
+            List containing the originally supplied selected values.
+
+            Returns None if the user cancels or nothing is selected.
+
+        Notes
+        -----
+        The dialog always permits multiple selection and always returns a
+        list. Thus a single selection is returned as a one-element list.
+
+        The dynamically-created pglTraitSettings objects are only used as
+        dialog models. The original objects supplied in `values` are
+        returned.
+        """
+
+        if values is None:
+            return None
+
+        values = list(values)
+
+        if not values:
+            pglMessages.message("No items to choose from")
+            return None
+
+        # --------------------------------------------------------------
+        # Determine how an item should be displayed.
+        # --------------------------------------------------------------
+        def getDisplayValue(item):
+            if key is None:
+                return item
+
+            if callable(key):
+                return key(item)
+
+            if isinstance(item, dict):
+                return item[key]
+
+            return getattr(item, key)
+
+        # --------------------------------------------------------------
+        # Create dialog items.
+        # --------------------------------------------------------------
+        items = [
+            pglChooseListItem(
+                value=value,
+                displayName=str(getDisplayValue(value)),
+            )
+            for value in values
+        ]
+
+        chooser = pglChooseList(items=items)
+
+        # --------------------------------------------------------------
+        # Show dialog.
+        # --------------------------------------------------------------
+        chooser = pglDialogs.traitsDialog(chooser)
+
+        if chooser is None:
+            return []
+
+        # --------------------------------------------------------------
+        # Return the original values corresponding to selected items.
+        # --------------------------------------------------------------
+        selectedValues = [
+            item.value
+            for item in chooser.items
+            if item.isSelected
+        ]
+
+        if not selectedValues:
+            return []
+
+        return selectedValues
 
     @ classmethod
     def _chooseDialog(cls, fullDataPath, filesystem=None, chooseLevel=None, allowMultipleRuns=False):

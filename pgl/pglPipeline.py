@@ -107,12 +107,21 @@ class pglActionable(pglTraitSettings):
         '''
         display history
         '''
+        # print status
+        self.print()
+        
         if not self.actionHistory:
             pglMessages.message(f"{type(self).__name__} has no history")
             return
     
         for iAction, action in enumerate(self.actionHistory):
             print(f"{iAction}: {action.toString()}")
+            
+    def print(self, verbose=False):
+        '''
+        print should print the status of the class (which appears at the top of the history list)
+        '''
+        super().print() 
     
 ########################
 # class pglAction
@@ -136,10 +145,27 @@ class pglAction(pglActionable):
         self.version = "0.0"
 
     def configure(self) -> None:
+        '''
+        Configure the action, this should be subclassed, and the subclass should call this super function
+        when done configured to establish that the action was actually properly configured
+        '''
+        
         # set status
         self.status = pglActionStatus.CONFIGURED
         
-    def run(self):
+    def isConfigured(self):
+        '''
+        check whether the action is configured or not
+        '''
+        return self.status.value >= pglActionStatus.CONFIGURED.value
+        
+    def run(self, *args, **kwargs):
+        
+        # check to make sure that the action is configured
+        if not self.isConfigured():
+            pglMessages.warning(f"Action {self.name} is not yet configured.", level=1)
+            return None
+            
         # set status
         self.status = pglActionStatus.RUNNING
 
@@ -149,7 +175,7 @@ class pglAction(pglActionable):
         # run the action
         try:
             # try to run the action
-            result = self._run()            
+            result = self._run(*args, **kwargs)            
             self.status = pglActionStatus.SUCCESS
             
             # update the action history
@@ -173,8 +199,8 @@ class pglAction(pglActionable):
             self.actionHistory[-1].update(self)
             
             # print warning message
-            pglMessage.warning(f"Error running action {self.name}: {e}")
-            raise e
+            pglMessages.warning(f"Error running action {self.name}: {e}")
+            return None
     
     def _run(self):
         '''
@@ -182,6 +208,21 @@ class pglAction(pglActionable):
         '''
         pass
     
+    def setError(self, errorString: str | None = None, e: Exception | None = None) -> None:
+        # set error status
+        self.status = pglActionStatus.FAILED
+        
+        # store the exception
+        if errorString:self.error = Exception(errorString)
+        if e: self.error = e
+        
+        # warn if both are set
+        if errorString and e:
+            pglMessages.warning("Both errorString and exception passed, only keeping exception", level=1)
+            
+        # print the error message
+        pglMessages.warning(f"{e}",callerNameDepth=2)
+
     def print(self, verbose=False):
         '''
         print the action
@@ -190,13 +231,3 @@ class pglAction(pglActionable):
         if verbose:
             self.settings.print()
    
-##########################
-# pglPipeline
-##########################
-class pglPipeline(pglAction):
-    # init
-    #--------------------------------
-    def __init__(self):
-        super().__init__()
-        pass
-    
