@@ -249,13 +249,11 @@ class pglActions():
             "'blank': [1022], 'catch': [1023]}}"
             ),
         )
-        tmin = Float(0.0, help="Time to start triggered epoch in seconds")
-        tmax = Float(1.0, help="Time to end triggered epoch in seconds")
         
         ################################
         # configure
         ################################
-        def configure(self, triggerChannel: str = None, triggerShortestEvent: int = 1, triggerLabelSets: Dict = None, tmin: float = None, tmax: float = None) -> None:
+        def configure(self, triggerChannel: str = None, triggerShortestEvent: int = 1, triggerLabelSets: Dict = None) -> None:
 
             # Set the trigger channel
             if triggerChannel: self.triggerChannel = triggerChannel
@@ -264,10 +262,6 @@ class pglActions():
             # get triggerLabels            
             if triggerLabelSets: self.triggerLabelSets = triggerLabelSets
             
-            # tmin and tmax are min and max in seconds of epochs
-            if tmin: self.tmin = tmin
-            if tmax: self.tmax = tmax
-                
             # we are now configured, so call super to set status
             super().configure()
             
@@ -277,8 +271,7 @@ class pglActions():
         def _run(self, session: pglSession):
             """
             Find raw trigger events, create an event-label DataFrame, create one Epochs
-            object with metadata, create one grand-average Evoked object, and display
-            events using the first configured labeling scheme.
+            object with metadata, and display events using the first configured labeling scheme.
 
             Stores:
                 session.mne.events:
@@ -293,8 +286,6 @@ class pglActions():
                     One MNE Epochs object with session.mne.eventsID attached as
                     metadata.
 
-                session.mne.evoked:
-                    Grand-average Evoked object across all epochs.
             """
             import mne
 
@@ -431,37 +422,6 @@ class pglActions():
             # -------------------------------------------------------------------------
             session.mne.events = events
             session.mne.eventsID = eventsDf
-
-            # -------------------------------------------------------------------------
-            # Create one Epochs object.
-            #
-            # MNE still needs an event_id mapping to create Epochs. This mapping is
-            # local because the DataFrame is now the authoritative label store.
-            #
-            # Every raw trigger code is included, even if it has no label in one or
-            # more configured grouping schemes.
-            # -------------------------------------------------------------------------
-            rawEventId = {
-                f"raw/{int(code)}": int(code)
-                for code in np.unique(rawCodes)
-            }
-
-            epochs = mne.Epochs(
-                session.mne.raw,
-                events=session.mne.events,
-                event_id=rawEventId,
-                tmin=self.tmin,
-                tmax=self.tmax,
-                baseline=None,
-                metadata=session.mne.eventsID,
-                preload=True,
-                verbose=False,
-            )
-
-            session.mne.epochs = epochs
-
-            # One grand-average Evoked over all retained epochs.
-            session.mne.evoked = epochs.average()
 
             # -------------------------------------------------------------------------
             # Make a temporary events array for displaying the FIRST label scheme.
@@ -730,6 +690,81 @@ class pglActions():
             else:
                 pglMessages.message(f"No bad sensors to {self.method}")
 
+            # and return
+            return session
+        
+    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
+    # make epochs
+    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
+    class mneCreateEpochs(pglAction):
+
+        # parameters
+        tmin = Float(0.0, help="Time to start triggered epoch in seconds")
+        tmax = Float(1.0, help="Time to end triggered epoch in seconds")
+                
+        ################################
+        # configure
+        ################################
+        def configure(self, tmin: float = None, tmax: float = None) -> None:
+
+            # tmin and tmax are min and max in seconds of epochs
+            if tmin: self.tmin = tmin
+            if tmax: self.tmax = tmax
+                
+            # we are now configured, so call super to set status
+            super().configure()
+            
+        ################################
+        # run
+        ################################
+        def _run(self, session: pglSession) -> pglSession:
+            '''
+            Display the grand average
+            
+            Returns:
+                pglSession: fitered session
+            '''
+            # import mne
+            import mne
+
+            # check for mne session
+            if session.mne is None or session.mne.raw is None:
+                self.setError("session does not have raw mne loaded")
+                return None
+
+            # -------------------------------------------------------------------------
+            # Create one Epochs object.
+            #
+            # MNE still needs an event_id mapping to create Epochs. This mapping is
+            # local because the DataFrame is now the authoritative label store.
+            #
+            # Every raw trigger code is included, even if it has no label in one or
+            # more configured grouping schemes.
+            # -------------------------------------------------------------------------
+            rawCodes = session.mne.events[:, 2].astype(int)
+            rawEventId = {
+                f"raw/{int(code)}": int(code)
+                for code in np.unique(rawCodes)
+            }
+
+            epochs = mne.Epochs(
+                session.mne.raw,
+                events=session.mne.events,
+                event_id=rawEventId,
+                tmin=self.tmin,
+                tmax=self.tmax,
+                baseline=None,
+                metadata=session.mne.eventsID,
+                preload=True,
+                verbose=False,
+            )
+
+            session.mne.epochs = epochs
+
+            # create the grand average and plot
+            evoked = session.mne.epochs.average()
+            evoked.plot()
+            
             # and return
             return session
         

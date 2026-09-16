@@ -221,7 +221,7 @@ class pglAction(pglActionable):
             pglMessages.warning("Both errorString and exception passed, only keeping exception", level=1)
             
         # print the error message
-        pglMessages.warning(f"{e}",callerNameDepth=2)
+        pglMessages.warning(f"{self.error}",callerNameDepth=2)
 
     def print(self, verbose=False):
         '''
