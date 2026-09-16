@@ -761,9 +761,154 @@ class pglActions():
 
             session.mne.epochs = epochs
 
+            # and return
+            return session
+        
+    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
+    # plot evoked
+    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
+    class mnePlotEvoked(pglAction):
+
+        # parameters
+        set = Unicode(allow_none=True, default_value=True, help="Name of label set passed to configure events from which to compute evoked (defaults to first set)")
+        label = Unicode(allow_none=True, default_value=True, help="Name of label passed in the set to configure events for which to compute the evoked (defaults to average across all event types)")
+        picks = Unicode("mag",help="For topomap plotting type of topomap e.g. eeg, mag, grad - defined by mne")
+                
+        ################################
+        # configure
+        ################################
+        def configure(self, **kwargs) -> None:
+
+            # set traitlets
+            self.configureTraits(**kwargs)     
+            
+            # we are now configured, so call super to set status
+            super().configure()
+            
+        ################################
+        # run
+        ################################
+        def _run(self, session: pglSession) -> pglSession:
+            '''
+            Display the evoked
+            
+            Returns:
+                pglSession: session
+            '''
+            # import mne
+            import mne
+
+            # check for mne session
+            if session.mne is None or session.mne.raw is None:
+                self.setError("Session does not have raw mne loaded")
+                return None
+
+            if session.mne.epochs is None:
+                self.setError("Session does not have epochs created")
+                return None
+
             # create the grand average and plot
-            evoked = session.mne.epochs.average()
-            evoked.plot()
+            if self.set is None:
+                self.set = session.mne.eventsID.columns[3]
+            elif self.set not in session.mne.eventsID.columns:
+                pglMessages.warning(f"Could not find label set: {self.set}")
+                return
+            
+            if self.label is None:
+                # just get average across all conditions
+                session.mne.evoked = session.mne.epochs.average()
+            else:
+                labels = session.mne.eventsID[self.set].dropna().unique()
+                if self.label not in labels:
+                    pglMessages.warning(f"Unknown label {self.label!r} in column {self.set!r}. Available labels: {list(labels)}")
+                    return
+                session.mne.evoked = session.mne.epochs[f'{self.set} == "{self.label}"'].average()
+
+            fig = session.mne.evoked.plot_joint(times="peaks",picks=self.picks,show=False)
+            fig.set_size_inches(20, 8)
+            
+            # and return
+            return session
+    
+    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
+    # downsample evoked
+    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
+    class mneDownsampleEvoked(pglAction):
+
+        # parameters
+        downsampleFrequency = Float(200.0, help="Downsample frequency")
+                
+        ################################
+        # configure
+        ################################
+        def configure(self, **kwargs) -> None:
+
+            # set traitlets
+            self.configureTraits(**kwargs)     
+            
+            # we are now configured, so call super to set status
+            super().configure()
+            
+        ################################
+        # run
+        ################################
+        def _run(self, session: pglSession) -> pglSession:
+            '''
+            Downsample the evoked. Works from raw to avoid boundary effects
+            
+            Returns:
+                pglSession: session
+            '''
+            # import mne
+            import mne
+
+            # check for mne session
+            if session.mne is None or session.mne.raw is None:
+                self.setError("Session does not have raw mne loaded")
+                return None
+
+            if session.mne.epochs is None:
+                self.setError("Session does not have epochs created")
+                return None
+
+
+            if session.mne.raw.info["sfreq"] < self.downsampleFrequency:
+                self.setError(f"Raw sampling rate is {session.mne.raw.info['sfreq']} Hz, below requested target rate of {self.downsampleFrequency} Hz.")
+                return None
+
+            # Copy so session.mne.raw remains unchanged.
+            # resample() needs loaded data.
+            raw = session.mne.raw.copy().load_data()
+
+            # MNE returns (rawResampled, eventsResampled) when `events=` is supplied.
+            raw, events = raw.resample(
+                sfreq=self.downsampleFrequency,
+                npad="auto",
+                events=session.mne.events,
+                verbose=False,
+            )
+            
+            # MNE requires an event_id mapping from label -> integer event code.
+            # Here we epoch every raw trigger code.
+            eventId = {
+                str(int(code)): int(code)
+                for code in np.unique(events[:, 2])
+            }
+
+            epochs = mne.Epochs(
+                raw=raw,
+                events=events,
+                event_id=eventId,
+                tmin=session.mne.epochs.tmin,
+                tmax=session.mne.epochs.tmax,
+                baseline=(session.mne.epochs.tmin, 0),
+                preload=True,
+                metadata=session.mne.eventsID.copy(),
+                reject_by_annotation=True,
+                verbose=False,
+            )
+
+            session.mne.epochs = epochs
             
             # and return
             return session

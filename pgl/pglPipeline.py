@@ -153,6 +153,19 @@ class pglAction(pglActionable):
         # set status
         self.status = pglActionStatus.CONFIGURED
         
+    def configureTraits(self, **kwargs) -> None:
+        validTraits = self.traits()
+
+        unknownKeys = set(kwargs) - set(validTraits)
+        if unknownKeys:
+            unknownText = ", ".join(sorted(unknownKeys))
+            errorMessage = f"{type(self).__name__}.configure() got unknown trait argument(s): {unknownText}"
+            pglMessages.warning(errorMessage)
+            raise TypeError(errorMessage)
+
+        for name, value in kwargs.items():
+            self.set_trait(name, value)
+        
     def isConfigured(self):
         '''
         check whether the action is configured or not
