@@ -912,7 +912,318 @@ class pglActions():
             
             # and return
             return session
-        
+
+    class mneComputeNCSNR(pglAction):
+        """
+        Compute single-sensor noise-corrected SNR (NCSNR).
+
+        Example:
+
+            action.configure(
+                set="grouped",
+                label="things",
+                conditionIDColumn="code",
+                chType="mag",
+            )
+
+        This selects all epochs where:
+
+            epochs.metadata["grouped"] == "things"
+
+        It then treats each unique value in `epochs.metadata["code"]` as a
+        separate signal condition. Multiple trials with the same code are treated
+        as repetitions of that same condition.
+        """
+
+        channelName = Unicode(allow_none=True, default_value=None, help="Full or partial channel name. If None, use the largest absolute Evoked response.")
+        chType = Unicode("mag", help="MNE channel type for automatic peak-channel selection, e.g. eeg, mag, or grad.")
+        set = Unicode(allow_none=True, default_value=None, help="Metadata column used to select trials, e.g. grouped.")
+        label = Unicode(allow_none=True, default_value=None, help="Metadata label used to select trials, e.g. things.")
+        conditionIDColumn = Unicode("code", help="Metadata column identifying individual signal conditions.")
+
+        ################################
+        # configure
+        ################################
+        def configure(self, **kwargs) -> None:
+
+            self.configureTraits(**kwargs)
+            super().configure()
+
+        ################################
+        # run
+        ################################
+        def _run(self, session: pglSession):
+            # ---------------------------------------------------------------------
+            # Validate session data.
+            # ---------------------------------------------------------------------
+            if not hasattr(session.mne, "epochs"):
+                self.setError("session.mne.epochs does not exist.")
+                return None
+
+            if not hasattr(session.mne, "eventsID"):
+                self.setError("session.mne.eventsID does not exist.")
+                return None
+
+            epochs = session.mne.epochs
+            eventsID = session.mne.eventsID
+
+            if epochs.metadata is None:
+                self.setError("session.mne.epochs.metadata does not exist. Attach session.mne.eventsID when creating Epochs.")
+                return None
+
+            # ---------------------------------------------------------------------
+            # Validate configured selection fields.
+            # ---------------------------------------------------------------------
+            if self.set is None:
+                self.setError("No set was configured. For example: set='grouped'.")
+                return None
+
+            if self.label is None:
+                self.setError("No label was configured. For example: label='things'.")
+                return None
+
+            if self.set not in eventsID.columns:
+                self.setError(f"Column {self.set!r} does not exist in session.mne.eventsID. Available columns: {list(eventsID.columns)}")
+                return None
+
+            if self.set not in epochs.metadata.columns:
+                self.setError(f"Column {self.set!r} does not exist in epochs.metadata. Available columns: {list(epochs.metadata.columns)}")
+                return None
+
+            if self.conditionIDColumn not in eventsID.columns:
+                self.setError(f"Condition-ID column {self.conditionIDColumn!r} does not exist in session.mne.eventsID. Available columns: {list(eventsID.columns)}")
+                return None
+
+            if self.conditionIDColumn not in epochs.metadata.columns:
+                self.setError(f"Condition-ID column {self.conditionIDColumn!r} does not exist in epochs.metadata. Available columns: {list(epochs.metadata.columns)}")
+                return None
+
+            availableLabels = eventsID[self.set].dropna().unique()
+
+            if self.label not in availableLabels:
+                self.setError(f"Label {self.label!r} does not occur in eventsID[{self.set!r}]. Available labels: {list(availableLabels)}")
+                return None
+
+            # ---------------------------------------------------------------------
+            # Resolve analysis channel.
+            #
+            # If no channel name is configured, use the channel that has the
+            # largest absolute response anywhere in session.mne.evoked.
+            # ---------------------------------------------------------------------
+            evokedPeakTime = None
+            evokedPeakAmplitude = None
+
+            if self.channelName is None:
+                if not hasattr(session.mne, "evoked"):
+                    self.setError("channelName was not provided and session.mne.evoked does not exist. Provide channelName or create an Evoked first.")
+                    return None
+
+                try:
+                    channelName, evokedPeakTime, evokedPeakAmplitude = session.mne.evoked.get_peak(ch_type=self.chType, mode="abs", return_amplitude=True)
+                except Exception as error:
+                    self.setError(f"Could not find an Evoked peak channel for chType={self.chType!r}: {error}")
+                    return None
+
+                if channelName not in epochs.ch_names:
+                    self.setError(f"Automatically selected Evoked peak channel {channelName!r} does not occur in session.mne.epochs.")
+                    return None
+
+                pglMessages.message(f"No channelName provided; using Evoked peak channel {channelName!r} at {evokedPeakTime * 1000:.1f} ms.")
+
+            else:
+                matchingChannels = [name for name in epochs.ch_names if self.channelName.lower() in name.lower()]
+
+                if not matchingChannels:
+                    self.setError(f"No channel matched {self.channelName!r}. Available channels: {epochs.ch_names}")
+                    return None
+
+                if len(matchingChannels) > 1:
+                    self.setError(f"Channel query {self.channelName!r} matched multiple channels: {matchingChannels}. Use a more specific name.")
+                    return None
+
+                channelName = matchingChannels[0]
+
+            # ---------------------------------------------------------------------
+            # Identify the individual conditions from the complete events table.
+            #
+            # For example, with:
+            #
+            #     set="grouped"
+            #     label="things"
+            #     conditionIDColumn="code"
+            #
+            # this may yield:
+            #
+            #     [2, 3, 4, ..., 200]
+            # ---------------------------------------------------------------------
+            eventSelectionMask = eventsID[self.set].eq(self.label)
+
+            conditionIDs = eventsID.loc[eventSelectionMask, self.conditionIDColumn].dropna().unique().tolist()
+
+            try:
+                conditionIDs = sorted(conditionIDs)
+            except TypeError:
+                conditionIDs = sorted(conditionIDs, key=str)
+
+            if len(conditionIDs) < 2:
+                self.setError(f"Selection {self.set!r} == {self.label!r} has only {len(conditionIDs)} unique IDs in {self.conditionIDColumn!r}. NCSNR requires at least two conditions.")
+                return None
+
+            # ---------------------------------------------------------------------
+            # Extract trial data for every condition.
+            #
+            # Crucially, extraction uses epochs.metadata rather than eventsID,
+            # because some original events may have been dropped by MNE.
+            # ---------------------------------------------------------------------
+            retainedLabelMask = epochs.metadata[self.set].eq(self.label)
+
+            if not retainedLabelMask.any():
+                self.setError(f"No retained epochs have {self.set!r} == {self.label!r}.")
+                return None
+
+            conditionData = {}
+            conditionMeans = {}
+            nRepsPerCondition = {}
+            missingConditions = []
+            insufficientRepetitions = {}
+
+            for conditionID in conditionIDs:
+                conditionMask = (retainedLabelMask & epochs.metadata[self.conditionIDColumn].eq(conditionID)).to_numpy()
+
+                if not conditionMask.any():
+                    missingConditions.append(conditionID)
+                    continue
+
+                # data shape: (nRepetitions, nTimes)
+                data = epochs[conditionMask].get_data(picks=[channelName])[:, 0, :]
+                nReps = data.shape[0]
+
+                if nReps < 2:
+                    insufficientRepetitions[conditionID] = nReps
+                    continue
+
+                conditionData[conditionID] = data
+                conditionMeans[conditionID] = data.mean(axis=0)
+                nRepsPerCondition[conditionID] = nReps
+
+            if missingConditions:
+                self.setError(f"No retained epochs were found for condition IDs within {self.set!r} == {self.label!r}: {missingConditions}")
+                return None
+
+            if insufficientRepetitions:
+                details = ", ".join(f"{conditionID}: {nReps}" for conditionID, nReps in insufficientRepetitions.items())
+                self.setError(f"NCSNR requires at least 2 repetitions per condition. Insufficient conditions (ID: nReps): {details}")
+                return None
+
+            # This preserves the order in which usable condition data were stored.
+            conditionIDs = list(conditionData)
+
+            # ---------------------------------------------------------------------
+            # 1. Estimate typical single-trial noise.
+            #
+            # Within each condition, calculate trial-to-trial variance at every
+            # time point. Average those variance estimates across conditions.
+            # ---------------------------------------------------------------------
+            noiseVarByCondition = np.asarray([np.var(conditionData[conditionID], axis=0, ddof=1) for conditionID in conditionIDs])
+
+            noiseVar = noiseVarByCondition.mean(axis=0)
+            noiseSTD = np.sqrt(noiseVar)
+
+            # ---------------------------------------------------------------------
+            # 2. Estimate noise-corrected signal variance across condition means.
+            # ---------------------------------------------------------------------
+            conditionMeansArray = np.asarray([conditionMeans[conditionID] for conditionID in conditionIDs])
+            repsArray = np.asarray([nRepsPerCondition[conditionID] for conditionID in conditionIDs])
+
+            observedVar = np.var(conditionMeansArray, axis=0, ddof=1)
+
+            residualNoiseVar = np.mean(noiseVarByCondition / repsArray[:, np.newaxis], axis=0)
+
+            # The estimate can be slightly negative due to finite sampling.
+            signalVar = np.maximum(observedVar - residualNoiseVar, 0)
+            signalSTD = np.sqrt(signalVar)
+
+            # ---------------------------------------------------------------------
+            # 3. NCSNR = signal SD / typical single-trial noise SD.
+            # ---------------------------------------------------------------------
+            ncsnr = np.divide(signalSTD, noiseSTD, out=np.full_like(signalSTD, np.nan, dtype=float), where=noiseSTD > 0)
+
+            # Each condition receives equal weight, even if repetition counts vary.
+            grandMean = conditionMeansArray.mean(axis=0)
+            times = epochs.times.copy()
+
+            if np.all(np.isnan(ncsnr)):
+                peakIndex = None
+                peakTime = np.nan
+                peakNcsnr = np.nan
+            else:
+                peakIndex = np.nanargmax(ncsnr)
+                peakTime = times[peakIndex]
+                peakNcsnr = ncsnr[peakIndex]
+
+            # ---------------------------------------------------------------------
+            # Store results.
+            # ---------------------------------------------------------------------
+            session.mne.ncsnr = {
+                "channelName": channelName,
+                "chType": self.chType,
+                "set": self.set,
+                "label": self.label,
+                "conditionIDColumn": self.conditionIDColumn,
+                "conditionIDs": conditionIDs,
+                "nConditions": len(conditionIDs),
+                "nRepsPerCondition": nRepsPerCondition,
+                "times": times,
+                "conditionMeans": conditionMeansArray,
+                "grandMean": grandMean,
+                "noiseVarByCondition": noiseVarByCondition,
+                "noiseVar": noiseVar,
+                "noiseSTD": noiseSTD,
+                "observedVar": observedVar,
+                "residualNoiseVar": residualNoiseVar,
+                "signalVar": signalVar,
+                "signalSTD": signalSTD,
+                "ncsnr": ncsnr,
+                "peakIndex": peakIndex,
+                "peakTime": peakTime,
+                "peakNcsnr": peakNcsnr,
+                "evokedPeakTime": evokedPeakTime,
+                "evokedPeakAmplitude": evokedPeakAmplitude,
+            }
+
+            # ---------------------------------------------------------------------
+            # Plot.
+            # ---------------------------------------------------------------------
+            with plt.rc_context({"figure.constrained_layout.use": False, "figure.autolayout": False}):
+                fig, axes = plt.subplots(2, 1, figsize=(22, 8), sharex=True, layout=None)
+
+                axes[0].plot(times, grandMean, color="black", linewidth=1.25)
+                axes[0].axvline(0, color="gray", linestyle="--", linewidth=1)
+                axes[0].set_ylabel("Grand mean\n(native units)")
+                axes[0].set_title(f"Grand mean across {len(conditionIDs)} conditions — {channelName}")
+                axes[0].grid(alpha=0.25)
+
+                axes[1].plot(times, ncsnr, color="tab:blue", linewidth=1.25)
+                axes[1].axvline(0, color="gray", linestyle="--", linewidth=1)
+
+                if peakIndex is not None:
+                    axes[1].axvline(peakTime, color="tab:red", linestyle="--", linewidth=1)
+                    axes[1].plot(peakTime, peakNcsnr, marker="o", color="tab:red")
+                    axes[1].annotate(f"Peak: {peakNcsnr:.3f}\n{peakTime * 1000:.1f} ms", xy=(peakTime, peakNcsnr), xytext=(8, 8), textcoords="offset points", color="tab:red")
+
+                axes[1].set_xlabel("Time (s)")
+                axes[1].set_ylabel("Noise-corrected SNR")
+                axes[1].set_title("NCSNR across individual conditions")
+                axes[1].grid(alpha=0.25)
+
+                fig.suptitle(f"NCSNR: {self.set} = {self.label} | condition IDs from {self.conditionIDColumn}", fontsize=14)
+                fig.subplots_adjust(left=0.07, right=0.98, bottom=0.08, top=0.90, hspace=0.35)
+
+                plt.show()
+
+            return session
+
+
 ##################################################################
 # class pglActionRecreateExperimentDataFromTasks
 ##################################################################
