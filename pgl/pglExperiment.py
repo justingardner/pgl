@@ -1352,6 +1352,14 @@ class pglTaskBase(pglTraitSettings):
         from pgl import pglTimestamp
         timestamp = pglTimestamp()
         
+        if self.data.startTime is None:
+            pglMessages.message(f"Task {self.settings.taskName} was never run")
+            return
+        
+        if self.data.endTime is None:
+            pglMessages.message(f"Task {self.settings.taskName} has no endTime")
+            return
+        
         # print task name and number of trials
         print(f"Task: {self.settings.taskName} | Trials: {self.state.currentTrial+1}")
         print(f"Duration={timestamp.formatDuration(self.data.endTime - self.data.startTime)} | startTime={self.data.startTime} | endTime={self.data.endTime}")

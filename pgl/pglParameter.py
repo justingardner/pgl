@@ -520,7 +520,7 @@ class pglParameterNestedBlock(pglParameterBlock):
     Note how every 3 trials param1 will go through all of its values. Every 6 trials
     each value of param1 will see each value of param2    
     '''
-    def __init__(self, parameters: list, name: str="", description: str="", cathcTrialEvery=None, randomSeed=None):
+    def __init__(self, parameters: list, name: str="", description: str="", catchTrialEvery=None, randomSeed=None):
         # validate parameters, in particular the parameters can only include pglParameterBatch
         # if it is in the last place of the list 
         for i, p in enumerate(parameters):
