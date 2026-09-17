@@ -772,15 +772,17 @@ class pglActions():
         # parameters
         set = Unicode(allow_none=True, default_value=True, help="Name of label set passed to configure events from which to compute evoked (defaults to first set)")
         label = Unicode(allow_none=True, default_value=True, help="Name of label passed in the set to configure events for which to compute the evoked (defaults to average across all event types)")
-        picks = Unicode("mag",help="For topomap plotting type of topomap e.g. eeg, mag, grad - defined by mne")
-                
+        picks = Unicode("mag",help="For topomap plotting type of topomap e.g. eeg, mag, grad - defined by mne - also can be name (or initial part of name of a sensor)")
+        minFreq = Float(0.0, help="minimum frequency for display of frequency plot of evoked")
+        maxFreq = Float(np.inf, help="minimum frequency for display of frequency plot of evoked")
+        
         ################################
         # configure
         ################################
         def configure(self, **kwargs) -> None:
 
             # set traitlets
-            self.configureTraits(**kwargs)     
+            self.configureTraits(**kwargs)   
             
             # we are now configured, so call super to set status
             super().configure()
@@ -798,6 +800,9 @@ class pglActions():
             # import mne
             import mne
 
+            # validate picks
+            self.picks = session.mne.validatePicks(self.picks)
+            
             # check for mne session
             if session.mne is None or session.mne.raw is None:
                 self.setError("Session does not have raw mne loaded")
@@ -824,8 +829,49 @@ class pglActions():
                     return
                 session.mne.evoked = session.mne.epochs[f'{self.set} == "{self.label}"'].average()
 
-            fig = session.mne.evoked.plot_joint(times="peaks",picks=self.picks,show=False)
+            if session.mne.isSensor(self.picks):
+                fig = session.mne.evoked.plot(picks=[self.picks],show=False)
+                
+                evoked = session.mne.evoked.copy().pick([self.picks])
+                timeSeries = evoked.data[0]
+                sampleRate = evoked.info["sfreq"]
+
+                fftValues = np.fft.rfft(timeSeries)
+                freqs = np.fft.rfftfreq(len(timeSeries), d=1 / sampleRate)
+                magnitude = np.abs(fftValues)
+
+                figFft, ax = plt.subplots(figsize=(12, 6))
+                ax.stem(freqs, magnitude, linefmt="C0-", markerfmt="C0.", basefmt=" ")
+                ax.set(xlabel="Frequency (Hz)", ylabel="FFT magnitude", title=f"Evoked FFT magnitude: {self.picks}", xlim=(self.minFreq, self.maxFreq))
+                figFft.tight_layout()
+                
+                
+            else:
+                fig = session.mne.evoked.plot_joint(times="peaks",picks=self.picks,show=False)
             fig.set_size_inches(20, 8)
+            
+            # Spectrum of the evoked response
+            if session.mne.isSensor(self.picks):
+                evoked = session.mne.evoked.copy()
+                nTimes = evoked.data.shape[1]
+                spectrum = evoked.compute_psd(method="welch", picks=[self.picks], fmin=self.minFreq, fmax=self.maxFreq, n_fft=nTimes, n_per_seg=nTimes, n_overlap=0, window="boxcar", remove_dc=True)
+                psds, freqs = spectrum.get_data(return_freqs=True)
+                # get the first sepctrum and convert to fT^2/Hz
+                psd = psds[0] * 1e30
+                # get rid of dc
+                psd = psd[1:]
+                freqs = freqs[1:]
+            else:
+                spectrum = session.mne.evoked.compute_psd(method="welch", picks=self.picks, fmin=self.minFreq, fmax=self.maxFreq)
+                psds, freqs = spectrum.get_data(return_freqs=True)
+                psd = psds.mean(axis=0)
+                # convert to fT^2/Hz
+                psd = psd * 1e30
+
+            figPsd, ax = plt.subplots(figsize=(12, 6))
+            ax.stem(freqs, psd, linefmt="C0-", markerfmt="C0.", basefmt=" ")
+            ax.set(xlabel="Frequency (Hz)", ylabel="Power spectral density (fT²/Hz)", title=f"Evoked response spectrum: {self.picks}")
+            figPsd.tight_layout()
             
             # and return
             return session
@@ -1221,6 +1267,96 @@ class pglActions():
 
                 plt.show()
 
+            return session
+ 
+    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
+    # action stub
+    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
+    class stub(pglAction):
+
+        # parameters
+                
+        ################################
+        # configure
+        ################################
+        def configure(self, **kwargs) -> None:
+
+            # set parameters
+            self.configureTraits(**kwargs)
+                
+            # we are now configured, so call super to set status
+            super().configure()
+            
+        ################################
+        # run
+        ################################
+        def _run(self, session: pglSession) -> pglSession:
+            '''
+            
+            
+            Returns:
+                pglSession:  session
+            '''
+            # import mne
+            import mne
+
+            # check for mne session
+            if session.mne is None or session.mne.raw is None:
+                self.setError("session does not have raw mne loaded")
+                return None
+
+            # check for mne epochs
+            if session.mne.epochs is None:
+                self.setError("session does not have epochs created: run mneCreateEpochs")
+                return None
+
+            # and return
+            return session
+
+    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
+    # eyeblink detecion
+    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
+    class mneEyeblinkDetection(pglAction):
+
+        # parameters
+        leftEyeChannel = Unicode('L401', help="Left channel used for detecting eye blink")
+        rightEyeChannel = Unicode('R401', help="Left channel used for detecting eye blink")
+                
+        ################################
+        # configure
+        ################################
+        def configure(self, **kwargs) -> None:
+
+            # set parameters
+            self.configureTraits(**kwargs)
+                
+            # we are now configured, so call super to set status
+            super().configure()
+            
+        ################################
+        # run
+        ################################
+        def _run(self, session: pglSession) -> pglSession:
+            '''
+            
+            
+            Returns:
+                pglSession:  session
+            '''
+            # import mne
+            import mne
+
+            # check for mne session
+            if session.mne is None or session.mne.raw is None:
+                self.setError("session does not have raw mne loaded")
+                return None
+
+            # check for mne epochs
+            if session.mne.epochs is None:
+                self.setError("session does not have epochs created: run mneCreateEpochs")
+                return None
+
+            # and return
             return session
 
 

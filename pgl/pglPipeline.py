@@ -109,6 +109,8 @@ class pglActionable(pglTraitSettings):
         '''
         # print status
         self.print()
+        from pgl import pglBase
+        pglBase.printHeader("action history")
         
         if not self.actionHistory:
             pglMessages.message(f"{type(self).__name__} has no history")
