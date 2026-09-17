@@ -1035,6 +1035,47 @@ class pglExperiment(pglExperimentBase):
         # and call parent to save rest
         super().save(dataPath=dataPath)
     
+    def getLastRun(self):
+        '''
+        will load the last run of the experiment, so parameters that were run last can be checked
+        '''
+        try:
+            # import pglRun
+            from .pglSession import pglRun
+            
+            # path where this experiment is being stored
+            dataPath = (
+                Path(self.settings.dataPath).expanduser()
+                / self.experimentSettings.experimentSaveName
+                / self.experimentSettings.subjectID
+                / self.experimentSettings.sessionName
+            )
+
+            # files that indicate there is an actual run            
+            requiredFiles = {"experimentSettings.json", "settings.json", "state.json", "data.json"}
+
+            # find all the run directories
+            runDirs = [
+                directory
+                for directory in [dataPath, *dataPath.rglob("*")]
+                if directory.is_dir() and all((directory / fileName).is_file() for fileName in requiredFiles)
+            ]
+
+            # init variables
+            lastRunTime = 0
+            lastRun = None
+            
+            # check all runs and find the last one
+            for runDir in runDirs:
+                fullDataPath = dataPath / runDir
+                run = pglRun(fullDataPath=fullDataPath)
+                if run.data.startTime > lastRunTime:
+                    lastRun = run
+            return lastRun
+        
+        except Exception as e:
+            pglMessages.warning(f"Unable to load last run: {e}")
+    
 ##############################################
 # Settings for pglTask
 ##############################################

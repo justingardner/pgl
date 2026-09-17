@@ -23,6 +23,8 @@ try:
     import mne
 except ImportError:
     mne = None
+from .pglBase import pglBase
+from pathlib import Path
 
 ##################################
 # pglRun
@@ -118,11 +120,10 @@ class pglRun(pglExperimentBase):
         '''
         # init super
         super().__init__()
-            
+        
         # keep the path and filesystem
-        if filesystem is not None and fullDataPath is not None:
-            self.filesystem, self.fullDataPath, self.filesystemPrefix = pglBase.validateFilesystem(filesystem=filesystem,dataPath=fullDataPath,filesystemPrefix=filesystemPrefix)
-    
+        self.filesystem, self.fullDataPath, self.filesystemPrefix = pglBase.validateFilesystem(filesystem=filesystem,dataPath=fullDataPath,filesystemPrefix=filesystemPrefix)
+
     def getTaskNames(self):
         '''
         Extracts task names from experimentSettings

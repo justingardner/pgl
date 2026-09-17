@@ -781,7 +781,7 @@ class pglBase:
         # ------------------------------------------------------------
         # 1. Normalize dataPath and separate any embedded prefix
         # ------------------------------------------------------------
-
+        dataPath = str(dataPath) if dataPath is not None else None
         if dataPath is None or dataPath == "":
             dataPath = ""
             dataPathPrefix = ""
