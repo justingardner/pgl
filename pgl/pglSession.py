@@ -309,6 +309,98 @@ class pglMNE(pglActionable):
             if not isinstance(value, mne.io.BaseRaw):
                 raise TypeError(f"raw must be an mne.io.BaseRaw, got {type(value)}")
         self._raw = value
+        
+    def validatePicks(self, picks):
+        """
+        Validate a single MNE pick selector.
+
+        Returns either:
+
+        - An available channel-type selector, such as ``"mag"``, ``"grad"``,
+        ``"eeg"``, or ``"eog"``.
+        - An exact channel name.
+        - The full channel name resolved from a partial sensor name via
+        :meth:`lookupSensor`.
+
+        Raises
+        ------
+        ValueError
+            If ``picks`` is empty, is not an available channel type, and cannot
+            be resolved to a sensor/channel name.
+        """
+        if not isinstance(picks, str) or not picks.strip():
+            raise ValueError("picks must be a non-empty string")
+
+        picks = picks.strip()
+
+        # First allow an exact channel name, including names which happen to
+        # overlap with a possible MNE selector.
+        if picks in self.raw.ch_names:
+            return picks
+
+        # These are the actual direct channel types available in this recording,
+        # e.g. "mag", "grad", "eeg", "eog", "stim", etc.
+        availableTypes = self.raw.get_channel_types(
+                unique=True,
+                only_data_chs=False,
+            )
+
+        if picks.lower() in availableTypes:
+            return picks.lower()
+
+        # Resolve a partial sensor/channel name using lookupSensor
+        sensorName = self.lookupSensor(picks)
+
+        if sensorName is not None:
+            return sensorName
+
+        raise ValueError(
+            f"Invalid picks value {picks!r}. "
+            f"Available channel types: {', '.join(availableTypes)}. "
+            f"Use a full channel name or a resolvable partial sensor name."
+        )
+    
+    def isSensor(self, name):
+        '''
+        check if the name is a sensor
+        '''
+        if self.lookupSensor(name, verbose=False) is not None:
+            return True
+        return False
+        
+    def lookupSensor(self, name, verbose=True):
+        '''
+        helper function to lookup the full sensor name from a parital match
+        
+        Args:
+            name (str): A parital name of a sensor like R401
+            
+        Returns:
+            str of full name of sensor or None if no match, or no unique match
+        '''
+
+        if self.raw is None:
+            pglMessages.warning(f"No raw is loaded")
+            return None
+        
+        matchingChannels = [
+            channelName
+            for channelName in self.raw.ch_names
+            if channelName.lower().startswith(name.lower())
+        ]
+
+        if not matchingChannels:
+            if verbose: pglMessages.warning(f"no matching sensor to: {name}")
+            return None
+
+        if len(matchingChannels) > 1:
+            if verbose: pglMessages.warning(f"Multiple channels start with {name!r}: {matchingChannels}")
+            return None
+
+        # return the match
+        return(matchingChannels[0])
+
+        
 
 ##################################
 # pglSession
