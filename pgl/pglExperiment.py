@@ -1097,7 +1097,18 @@ class pglExperiment(pglExperimentBase):
         
         except Exception as e:
             pglMessages.warning(f"Unable to load last run: {e}")
-    
+
+    def getLastRunParameters(self, task=None):
+        '''
+        Get the parameters from the last run
+        '''
+        lastRun = self.getLastRun(task)
+        if lastRun: 
+            return lastRun.parameters
+        else:
+            None
+        
+
 ##############################################
 # Settings for pglTask
 ##############################################
