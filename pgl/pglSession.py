@@ -310,11 +310,11 @@ class pglMNE(pglActionable):
             pglMessages.warning("mne library is not available. Need to add to environment")
             return
         
-    def add(self, data: mne.io.BaseRaw | mne.BaseEpochs, filename: str = None, filesystemPrefix: str = None):
+    def add(self, data, filename: str = None, filesystemPrefix: str = None):
         '''
         add data to the pglMNE instance. Handles known types like mne raw or epochs
         '''
-        
+        import mne
         # save either raw or epochs
         if isinstance(data, mne.io.BaseRaw):
             self.raws.append(data)
