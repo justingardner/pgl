@@ -635,7 +635,6 @@ class pglMessageAckTask(pglTask):
     def configure(self, e):
 
         self.state.ackKeyCode = self.pgl.devicesGetKeyboard().charToKeyCode(self.settings.config.ackKey)
-        print(f"Key: {self.state.ackKeyCode}")
 
     ########################
     # updateScren

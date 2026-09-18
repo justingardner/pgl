@@ -284,7 +284,6 @@ class pglParameter(pglStateDataSettings):
         '''
         Load the parameter settings, state and data.         
         '''
-        print(f"DUH: {parameterDir}")
         # validate filesystem
         filesystem, parameterDir, _ = pglBase.validateFilesystem(filesystem, parameterDir)
 

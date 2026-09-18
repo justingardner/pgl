@@ -1079,6 +1079,7 @@ class pglExperiment(pglExperimentBase):
                 run = pglRun(fullDataPath=fullDataPath)
                 if run.data.startTime > lastRunTime:
                     lastRun = run
+                    lastRunTime = run.data.startTime
                     
             # if we found a last run and task was set, return the matching task (if it exists)        
             if lastRun is not None and task is not None:
@@ -1089,7 +1090,7 @@ class pglExperiment(pglExperimentBase):
                     return None
                 # get the task from the run
                 lastTask = lastRun.getTaskAt(taskIndex)
-                print(f"Last Task: {lastTask}")
+                #print(f"Last Task: {lastTask}")
                 return lastTask
                 
             return lastRun
