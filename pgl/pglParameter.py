@@ -212,6 +212,9 @@ class pglParameter(pglStateDataSettings):
         # save random number generator state
         self.state.randomNumberGeneratorState = self._rng.bit_generator.state
         
+        # add parameter name
+        dataPath = Path(dataPath) / self.settings.name
+        
         # call parent to save
         super().save(dataPath=dataPath, filesystem=filesystem, filesystemPrefix=filesystemPrefix)
     
@@ -281,7 +284,7 @@ class pglParameter(pglStateDataSettings):
         '''
         Load the parameter settings, state and data.         
         '''
-        
+        print(f"DUH: {parameterDir}")
         # validate filesystem
         filesystem, parameterDir, _ = pglBase.validateFilesystem(filesystem, parameterDir)
 

@@ -41,6 +41,7 @@ class pglRun(pglExperimentBase):
     _settings = Instance(pglSettings, allow_none=True, default_value=None, help="settings that this experiment was run with")
     _data = Instance(pglExperimentData, allow_none=True, default_value=None, help="data from experiemnt")
     _tasks = List(Instance(pglTaskBase), allow_none=True, default_value=None, help="tasks from experiment")
+    _taskCache = Dict(default_value={}, help="Tasks loaded individually by index")
     
     ##########################
     # Lazy-loaded properties
@@ -110,6 +111,47 @@ class pglRun(pglExperimentBase):
             if task.settings.taskSaveName == taskName:
                 return task
         return None
+
+    def getTaskAt(self, taskIndex):
+        """
+        Return one task by index without initializing/loading self.tasks.
+        
+        This supports lazy-loadig without loading all the tasks
+
+        Loaded tasks are cached, so repeated calls for the same index return
+        the same object without reading from disk again.
+        """
+        taskNames = self.experimentSettings.tasks
+
+        if not isinstance(taskIndex, int):
+            raise TypeError(f"taskIndex must be an int, got {type(taskIndex).__name__}")
+
+        if taskIndex < 0:
+            taskIndex += len(taskNames)
+
+        if taskIndex < 0 or taskIndex >= len(taskNames):
+            raise IndexError(f"Task index {taskIndex} is outside 0 to {len(taskNames) - 1}")
+
+        if taskIndex not in self._taskCache:
+            taskName = f"task{taskIndex+1:02d}_{taskNames[taskIndex]}"
+
+            pglMessages.message(
+                f"Loading task {taskIndex}: {taskName} "
+                f"for {self.filesystemPrefix}/{self.fullDataPath}"
+            )
+
+            filesystem, fullDataPath, _ = pglBase.validateFilesystem(
+                filesystem=self.filesystem,
+                dataPath=self.fullDataPath,
+                filesystemPrefix=self.filesystemPrefix,
+            )
+
+            self._taskCache[taskIndex] = pglTaskBase.load(
+                dataPath=str(Path(fullDataPath) / taskName),
+                filesystem=filesystem,
+            )
+
+        return self._taskCache[taskIndex]
 
     def __init__(self, fullDataPath=None, filesystem=None, filesystemPrefix=None):
         '''

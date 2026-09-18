@@ -248,7 +248,7 @@ class pglExperimentBase(pglStateDataSettings):
         task.pgl = self.pgl
         task.e = self
         self.nTasks += 1
-        task.taskID = self.nTasks
+        task.settings.taskID = self.nTasks
 
         # if we want to add the task as a new phase
         if addPhase and self.tasks is not None:            
@@ -1035,9 +1035,17 @@ class pglExperiment(pglExperimentBase):
         # and call parent to save rest
         super().save(dataPath=dataPath)
     
-    def getLastRun(self):
+    def getLastRun(self, task=None):
         '''
         will load the last run of the experiment, so parameters that were run last can be checked
+        
+        Args:
+            task (pglTask): If set then will return the matching task - typically called by a task
+            
+        Returns:
+            pglRun (if task is not set)
+            pglTask (if task is set)
+            None if there is no last experiment or o match
         '''
         try:
             # import pglRun
@@ -1071,6 +1079,19 @@ class pglExperiment(pglExperimentBase):
                 run = pglRun(fullDataPath=fullDataPath)
                 if run.data.startTime > lastRunTime:
                     lastRun = run
+                    
+            # if we found a last run and task was set, return the matching task (if it exists)        
+            if lastRun is not None and task is not None:
+                # figure which task this is
+                taskIndex = next((index for index, t in enumerate(self.tasks) if t is task), None)
+                if taskIndex is None:
+                    pglMessages.warning(f"Could not find matching task for {task.settings.taskName}")
+                    return None
+                # get the task from the run
+                lastTask = lastRun.getTaskAt(taskIndex)
+                print(f"Last Task: {lastTask}")
+                return lastTask
+                
             return lastRun
         
         except Exception as e:
@@ -1332,11 +1353,8 @@ class pglTaskBase(pglTraitSettings):
 
     def getTaskDirectoryName(self):
         """Return the directory name used to save this task."""
-        taskDirectoryName = self.settings.taskSaveName
-        phaseNum = self.settings.phaseNum
 
-        if phaseNum is not None and phaseNum != 0:
-            taskDirectoryName += f"Phase{phaseNum:02d}"
+        taskDirectoryName = f"task{self.settings.taskID:02d}_{self.settings.taskSaveName}"
 
         return taskDirectoryName
     @classmethod
