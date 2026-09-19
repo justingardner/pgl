@@ -1044,4 +1044,4 @@ class pglItem(pglTraitSettings):
     name = Unicode("")
     
 class pglList(pglTraitSettings):
-    settingsList = List(Instance(pglItem), settingsListKey="name", style="dropdown", multiSelect=True, traitDisplayName="Choose items", help="List of items")
+    itemList = List(Instance(pglItem), settingsListKey="name", style="dropdown", multiSelect=True, traitDisplayName="Choose items", help="List of items")

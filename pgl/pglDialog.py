@@ -1081,38 +1081,74 @@ class _pglTraitsDialog(QDialog):
     # ----- add multi select dropdown -----
     #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
     def _addMultiSelectDropdown(self, traitName, trait, current, helpText,
-                                settingsObject, layout=None, settingsKey=None):
+                            settingsObject, layout=None, settingsKey=None):
         if layout is None:
             layout = self.formLayout
 
         keyTraitName = trait.metadata["settingsListKey"]
 
         combo = CheckableComboBox()
+        combo.setToolTip(helpText)
 
-        for obj in current:
-            combo.addItem(
-                str(getattr(obj, keyTraitName)),
-                userData=obj,
-                checked=bool(getattr(obj, "isSelected", False))
-            )
+        # These are the objects currently represented by the dropdown,
+        # not necessarily the objects present when it was first built.
+        state = {
+            "objects": [],
+            "updating": False,
+        }
+
+        def setter(newList):
+            """Retarget the dropdown and load each object's selection state."""
+            wasUpdating = state["updating"]
+            signalsBlocked = combo.blockSignals(True)
+            state["updating"] = True
+
+            try:
+                # Copy the container, but retain the actual settings objects.
+                state["objects"] = list(newList) if newList is not None else []
+
+                combo.clear()
+
+                for obj in state["objects"]:
+                    combo.addItem(
+                        str(getattr(obj, keyTraitName)),
+                        checked=bool(getattr(obj, "isSelected", False)),
+                    )
+            finally:
+                state["updating"] = wasUpdating
+                combo.blockSignals(signalsBlocked)
+                combo.update()
 
         def onSelectionChanged(_):
-            selected = set(combo.checkedData())
+            if self._updatingWidget or state["updating"]:
+                return
 
-            for obj in current:
-                obj.isSelected = obj in selected
+            # Snapshot before writing: trait observers may refresh widgets
+            # synchronously while these assignments are taking place.
+            changes = [
+                (obj, combo.isItemChecked(row))
+                for row, obj in enumerate(state["objects"])
+            ]
 
+            state["updating"] = True
+            try:
+                for obj, checked in changes:
+                    if bool(getattr(obj, "isSelected", False)) != checked:
+                        self._commit(obj, "isSelected", checked)
+            finally:
+                state["updating"] = False
+
+        setter(current)
         combo.selectionChanged.connect(onSelectionChanged)
 
         self._register(
             traitName,
             trait,
             combo,
-            lambda v: None,
+            setter,
             layout,
-            settingsKey
+            settingsKey,
         )
-
     #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
     # ----- Float with min/max -----
     #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
