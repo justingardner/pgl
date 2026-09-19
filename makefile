@@ -30,7 +30,9 @@ pgl.yml: pglPinned.yml scripts/makeFlexibleEnvironment.py
 		--input pglPinned.yml \
 		--output pgl.yml \
 		--name pgl \
-		--python "python=3.12"
+		--python "python=3.12" \
+		--addConda pyside6 \
+		--addConda imageio
 
 # Create/update the flexible PGL + MNE environment description.
 pgl_mne.yml: pglPinned.yml scripts/makeFlexibleEnvironment.py
@@ -39,6 +41,8 @@ pgl_mne.yml: pglPinned.yml scripts/makeFlexibleEnvironment.py
 		--output pgl_mne.yml \
 		--name pgl_mne \
 		--python "python=3.12" \
+		--addConda pyside6 \
+		--addConda imageio \
 		--addConda mne
 
 pgl_yml: pgl.yml
