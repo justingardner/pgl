@@ -1039,3 +1039,9 @@ class pglTrialsByParameter(pglTraitSettings):
     trialNums = List(List(Int()),help="A list of lists of trial volumes, one list for each value of the parameter")
     nTrials = List(Int(),help="A list of number of trials, one list for each value of the parameter")
            
+
+class pglItem(pglTraitSettings):
+    name = Unicode("")
+    
+class pglList(pglTraitSettings):
+    settingsList = List(Instance(pglItem), settingsListKey="name", style="dropdown", multiSelect=True, traitDisplayName="Choose items", help="List of items")

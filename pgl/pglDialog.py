@@ -15,14 +15,16 @@ from PySide6.QtWidgets import (
     QApplication, QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLabel, QLineEdit, QSpinBox, QDoubleSpinBox, QCheckBox, QComboBox,
     QSlider, QPushButton, QWidget, QScrollArea, QDialogButtonBox, QAbstractSpinBox,
-    QStylePainter, QStyleOptionComboBox, QStyle, QMessageBox, QSizePolicy,
+    QStylePainter, QStyleOptionComboBox, QStyle, QMessageBox, QSizePolicy, QListView,
     QGraphicsDropShadowEffect
 )
 from PySide6.QtCore import Qt, QCoreApplication, QTimer, Signal
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QStandardItemModel
+
 from traitlets import (
     HasTraits, Float, Int, List, Unicode, Bool, Tuple, TraitType, Enum
 )
+
 from .pglSerialize import pglSerialize
 import sys, subprocess, tempfile
 from pathlib import Path
@@ -294,8 +296,17 @@ class _pglTraitsDialog(QDialog):
                 # if empty list just move on
                 return
             else:
-                self._addMultiSelectList(traitName, trait, current, helpText, settingsObject, layout, settingsKey)
-
+                if trait.metadata.get("style") == "dropdown":
+                    self._addMultiSelectDropdown(
+                        traitName, trait, current, helpText,
+                        settingsObject, layout, settingsKey
+                    )
+                else:
+                    self._addMultiSelectList(
+                        traitName, trait, current, helpText,
+                        settingsObject, layout, settingsKey
+                    )
+                
         # a settings list
         elif isinstance(trait, List) and "settingsListKey" in trait.metadata:
             if not current:
@@ -1066,6 +1077,42 @@ class _pglTraitsDialog(QDialog):
         # and show the first item in the list
         showSelection(0)
         
+    #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
+    # ----- add multi select dropdown -----
+    #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
+    def _addMultiSelectDropdown(self, traitName, trait, current, helpText,
+                                settingsObject, layout=None, settingsKey=None):
+        if layout is None:
+            layout = self.formLayout
+
+        keyTraitName = trait.metadata["settingsListKey"]
+
+        combo = CheckableComboBox()
+
+        for obj in current:
+            combo.addItem(
+                str(getattr(obj, keyTraitName)),
+                userData=obj,
+                checked=bool(getattr(obj, "isSelected", False))
+            )
+
+        def onSelectionChanged(_):
+            selected = set(combo.checkedData())
+
+            for obj in current:
+                obj.isSelected = obj in selected
+
+        combo.selectionChanged.connect(onSelectionChanged)
+
+        self._register(
+            traitName,
+            trait,
+            combo,
+            lambda v: None,
+            layout,
+            settingsKey
+        )
+
     #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
     # ----- Float with min/max -----
     #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
@@ -1964,6 +2011,212 @@ class _ClickableRow(QWidget):
         if event.button() == Qt.LeftButton:
             self.clicked.emit()
         super().mousePressEvent(event)
+
+from PySide6.QtCore import QEvent, Qt, Signal
+from PySide6.QtGui import QStandardItem, QStandardItemModel
+from PySide6.QtWidgets import (
+    QComboBox,
+    QListView,
+    QStyle,
+    QStyleOptionComboBox,
+    QStylePainter,
+)
+
+
+class CheckableComboBox(QComboBox):
+    selectionChanged = Signal(list)
+    selectionClosed = Signal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        self._popupOpen = False
+        self._pressedIndex = None
+
+        self.setEditable(False)
+        self.setView(QListView(self))
+        self.setModel(QStandardItemModel(self))
+
+        # Install these after setView()/setModel(), so our filters
+        # receive events before the combo box's default handlers.
+        self.view().installEventFilter(self)
+        self.view().viewport().installEventFilter(self)
+
+        self.model().itemChanged.connect(self._onItemChanged)
+
+    def eventFilter(self, obj, event):
+        eventType = event.type()
+
+        if obj is self.view().viewport():
+            if eventType in (
+                QEvent.Type.MouseButtonPress,
+                QEvent.Type.MouseButtonDblClick,
+            ):
+                if event.button() == Qt.MouseButton.LeftButton:
+                    index = self.view().indexAt(
+                        event.position().toPoint()
+                    )
+
+                    self._pressedIndex = (
+                        index if index.isValid() else None
+                    )
+
+                    if index.isValid():
+                        self.view().setCurrentIndex(index)
+
+                    # Prevent Qt from treating this as a normal
+                    # single-selection combo box click.
+                    return True
+
+            elif eventType == QEvent.Type.MouseButtonRelease:
+                if event.button() == Qt.MouseButton.LeftButton:
+                    index = self.view().indexAt(
+                        event.position().toPoint()
+                    )
+
+                    if (
+                        self._pressedIndex is not None
+                        and index.isValid()
+                        and index == self._pressedIndex
+                    ):
+                        self._toggleItem(index.row())
+
+                    self._pressedIndex = None
+
+                    # Consume release too, so the popup stays open.
+                    return True
+
+        if obj is self.view() or obj is self.view().viewport():
+            if eventType == QEvent.Type.KeyPress:
+                if event.key() == Qt.Key.Key_Space:
+                    index = self.view().currentIndex()
+
+                    if index.isValid() and not event.isAutoRepeat():
+                        self._toggleItem(index.row())
+
+                    return True
+
+                if event.key() in (
+                    Qt.Key.Key_Return,
+                    Qt.Key.Key_Enter,
+                    Qt.Key.Key_Escape,
+                ):
+                    self.hidePopup()
+                    return True
+
+        return super().eventFilter(obj, event)
+
+    def paintEvent(self, event):
+        """Draw the normal combo box with our selection summary."""
+        option = QStyleOptionComboBox()
+        self.initStyleOption(option)
+
+        count = len(self.checkedItems())
+        option.currentText = (
+            "None selected" if count == 0 else f"{count} selected"
+        )
+
+        # Do not display the current item's icon in the summary.
+        option.currentIcon = type(option.currentIcon)()
+
+        painter = QStylePainter(self)
+        painter.drawComplexControl(
+            QStyle.ComplexControl.CC_ComboBox,
+            option,
+        )
+        painter.drawControl(
+            QStyle.ControlElement.CE_ComboBoxLabel,
+            option,
+        )
+
+    def showPopup(self):
+        self._pressedIndex = None
+        self.view().setMinimumWidth(self.width())
+
+        super().showPopup()
+        self._popupOpen = self.view().isVisible()
+
+    def hidePopup(self):
+        wasOpen = self._popupOpen
+        self._popupOpen = False
+        self._pressedIndex = None
+
+        super().hidePopup()
+        self.update()
+
+        if wasOpen:
+            self.selectionClosed.emit(len(self.checkedItems()))
+
+    def addItem(self, text, userData=None, checked=False):
+        item = QStandardItem(text)
+
+        item.setFlags(
+            Qt.ItemFlag.ItemIsEnabled
+            | Qt.ItemFlag.ItemIsSelectable
+            | Qt.ItemFlag.ItemIsUserCheckable
+        )
+
+        if userData is not None:
+            item.setData(userData, Qt.ItemDataRole.UserRole)
+
+        item.setCheckState(
+            Qt.CheckState.Checked
+            if checked
+            else Qt.CheckState.Unchecked
+        )
+
+        self.model().appendRow(item)
+        self.update()
+
+    def addItems(self, texts, checked=False):
+        for text in texts:
+            self.addItem(text, checked=checked)
+
+    def checkedItems(self):
+        return [
+            self.model().item(row).text()
+            for row in range(self.model().rowCount())
+            if self.isItemChecked(row)
+        ]
+
+    def checkedData(self):
+        return [
+            self.model().item(row).data(Qt.ItemDataRole.UserRole)
+            for row in range(self.model().rowCount())
+            if self.isItemChecked(row)
+        ]
+
+    def setItemChecked(self, index, checked=True):
+        if not 0 <= index < self.model().rowCount():
+            return
+
+        item = self.model().item(index)
+        item.setCheckState(
+            Qt.CheckState.Checked
+            if checked
+            else Qt.CheckState.Unchecked
+        )
+
+        # itemChanged handles updating and emitting the signal.
+
+    def isItemChecked(self, index):
+        if not 0 <= index < self.model().rowCount():
+            return False
+
+        return (
+            self.model().item(index).checkState()
+            == Qt.CheckState.Checked
+        )
+
+    def _toggleItem(self, row):
+        item = self.model().item(row)
+
+        if item is not None and item.isEnabled() and item.isCheckable():
+            self.setItemChecked(row, not self.isItemChecked(row))
+
+    def _onItemChanged(self, item):
+        self.update()
+        self.selectionChanged.emit(self.checkedItems())
 
 
 #####################################################################
