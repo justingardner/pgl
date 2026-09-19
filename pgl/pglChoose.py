@@ -1049,12 +1049,40 @@ class pglChoose():
         l = pglDialogs.traitsDialog(l)
         
         # extract selected
-        return [item.name for item in l.itemList if item.isSelected]
+        if l:
+            return [item.name for item in l.itemList if item.isSelected]
+        else:
+            return []
         
+    # ----------------------------------------------------------------
+    # chooseItems
+    # ----------------------------------------------------------------
+    @classmethod
+    def chooseItem(cls, itemList):
+        '''
+        choose from a list of items
         
+        Args:
+            itemList (list of str) list of itmes to choose from
+            
+        Returns:
+            List of chosen items
+        '''
+        # validate
+        if not isinstance(itemList, list) or not all(isinstance(item, str) for item in itemList):
+            pglMessages.warning("itemList must be a list of strings")
+            return []
 
-
- 
+        # put up dialong
+        l = pglListSelectOne(itemList=[pglItem(name=item) for item in itemList])
+        l = pglDialogs.traitsDialog(l)
+        
+        # extract selected
+        if l:
+            return l.itemList[0].name
+        else:
+            return None
+        
 ##################################
 # pglTrialsByParameter
 ##################################
@@ -1070,7 +1098,10 @@ class pglTrialsByParameter(pglTraitSettings):
            
 
 class pglItem(pglTraitSettings):
-    name = Unicode("")
+    name = Unicode("",visible=False)
     
 class pglList(pglTraitSettings):
     itemList = List(Instance(pglItem), settingsListKey="name", style="dropdown", multiSelect=True, traitDisplayName="Choose items", help="List of items")
+
+class pglListSelectOne(pglTraitSettings):
+    itemList = List(Instance(pglItem), settingsListKey="name", traitDisplayName="Choose item", help="List of items")
