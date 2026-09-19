@@ -306,7 +306,6 @@ class pglChooseLevel(pglTraitSettings):
 
         return children
 
-
 ################################################################################
 # Standard experiment chooser hierarchy
 #
@@ -1025,6 +1024,36 @@ class pglChoose():
             selectedPaths.extend(cls.walkInstances(child, depth + 1))
 
         return(selectedPaths)
+
+    # ----------------------------------------------------------------
+    # chooseItems
+    # ----------------------------------------------------------------
+    @classmethod
+    def chooseItems(cls, itemList):
+        '''
+        choose from a list of items
+        
+        Args:
+            itemList (list of str) list of itmes to choose from
+            
+        Returns:
+            List of chosen items
+        '''
+        # validate
+        if not isinstance(itemList, list) or not all(isinstance(item, str) for item in itemList):
+            pglMessages.warning("itemList must be a list of strings")
+            return []
+
+        # put up dialong
+        l = pglList(itemList=[pglItem(name=item) for item in itemList])
+        l = pglDialogs.traitsDialog(l)
+        
+        # extract selected
+        return [item.name for item in l.itemList if item.isSelected]
+        
+        
+
+
  
 ##################################
 # pglTrialsByParameter
