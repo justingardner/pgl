@@ -19,6 +19,7 @@ from traitlets import Unicode, List, Instance
 import re
 from .pglParameter import pglParameter
 from traitlets import HasTraits, Any, Float, Int, List, Tuple, TraitError, Unicode, Dict, default, link, Bool, TraitType, Instance
+from .pglSettings import pglItem
 
 ##################################################################
 # Generic chooser hierarchy
@@ -1097,9 +1098,6 @@ class pglTrialsByParameter(pglTraitSettings):
     nTrials = List(Int(),help="A list of number of trials, one list for each value of the parameter")
            
 
-class pglItem(pglTraitSettings):
-    name = Unicode("",visible=False)
-    
 class pglList(pglTraitSettings):
     itemList = List(Instance(pglItem), settingsListKey="name", style="dropdown", multiSelect=True, traitDisplayName="Choose items", help="List of items")
 

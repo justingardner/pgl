@@ -28,6 +28,8 @@ from .pglMessages import pglMessages
 import uuid
 import posixpath
 from os.path import exists, join
+from copy import deepcopy
+
 
 #######################################
 # Mixin class for pgl to provide settings management
@@ -729,6 +731,7 @@ class pglSettingsManager:
 
         return(settings)
 
+
 ##################################################
 # used for inheritence
 ##################################################
@@ -958,7 +961,12 @@ class pglStateDataSettings(pglTraitSettings):
         else:
             data.save(filename=posixpath.join(dataPath, "data.json"), filesystem=filesystem)
             
-    
+##################################################
+# pglItem
+##################################################
+class pglItem(pglTraitSettings):
+    name = Unicode("",visible=False)    
+
 ##################################################
 # display Settings 
 ##################################################
@@ -1218,7 +1226,7 @@ class pglDisplaySettingsWindowed(pglDisplaySettings):
     windowPosition = Tuple(Int(), Int(), labels=("x","y"), default_value=(0, 0), help="Position of window in pixels", visible=True)
     windowSize = Tuple(Int(), Int(), labels=("width","height"), default_value=(800, 600), help="Size of window in pixels", visible=True)
     displayModes = List(Instance(pglDisplayModeSettings), settingsListKey="modeName", hideKey=True, highlightSelector=False, traitDisplayName="pixelDims", help="All supported display modes", visible=False)
- 
+
 ##################################################
 # Settings 
 ##################################################
@@ -1238,7 +1246,9 @@ class pglSettings(pglTraitSettings):
     manualPreStart = Bool(False, help="Whether to manually start the experiment before the volume trigger")
     closeScreenOnEnd = Bool(True, help="Whether to close the screen when the experiment ends")
     backgroundColor = List(trait=Float(min=0.0, max=1.0), default_value=[0.5, 0.5, 0.5],minlen=3,maxlen=3,help="Background color as a list of RGB values").tag(isRGB=True)
-    eyetracker = List(Unicode(), default_value=['None', 'Eyelink'], help="Eyetracker")
+    digitalIO = List(Instance(pglItem), default_value=[pglItem(name='DATAPixx'),pglItem(name='LabJack')], settingsListKey="name", multiSelect=True, style="dropdown", help='Select which devices to use for digital IO')
+    devices = List(Instance(pglItem), default_value=[pglItem(name='RESPONSEPixx')], settingsListKey="name", multiSelect=True, style="dropdown", help='Select which devices to use for digital IO')
+    eyetracker = List(Unicode(), default_value=['None', 'Eyelink', 'TRACKPixx'], help="Eyetracker")
     
     def __init__(self):
         super().__init__()
@@ -1260,8 +1270,73 @@ class pglSettings(pglTraitSettings):
         # reload the displays
         cls.reloadDisplays()
         
+        # reconcile fields for which defaults might change over time so that they include
+        # any new defaults we add
+        cls.reconcileDefaults('digitalIO')
+        cls.reconcileDefaults('devices')
+        cls.reconcileDefaults('eyetracker')
+        
         return cls
     
+    #classmethod
+    def reconcileDefaults(self, traitName):
+        """
+        Append missing defaults and normalize capitalization.
+
+        Supports string lists and object lists with settingsListKey metadata.
+        Preserves loaded order, custom entries, and other object settings.
+        """
+        trait = self.traits().get(traitName)
+        if not isinstance(trait, List):
+            raise TypeError(f"{traitName!r} must be a List trait")
+
+        # trait_defaults also supports defaults defined with @default.
+        defaultValues = self.trait_defaults(traitName)
+        loadedValues = list(getattr(self, traitName))
+        keyName = trait.metadata.get("settingsListKey")
+
+        def getName(item):
+            name = getattr(item, keyName) if keyName else item
+            if not isinstance(name, str):
+                raise TypeError(
+                    f"{traitName!r} must contain strings or objects "
+                    "with a string settingsListKey"
+                )
+            return name
+
+        defaultsByName = {
+            getName(item).casefold(): item
+            for item in defaultValues
+        }
+
+        # Correct capitalization without replacing loaded objects.
+        loadedNames = set()
+
+        for index, item in enumerate(loadedValues):
+            foldedName = getName(item).casefold()
+            loadedNames.add(foldedName)
+
+            if foldedName in defaultsByName:
+                defaultItem = defaultsByName[foldedName]
+
+                if keyName:
+                    defaultName = getName(defaultItem)
+                    if getName(item) != defaultName:
+                        setattr(item, keyName, defaultName)
+                else:
+                    loadedValues[index] = defaultItem
+
+        # Copy missing defaults so mutable objects are not shared.
+        for defaultItem in defaultValues:
+            foldedName = getName(defaultItem).casefold()
+
+            if foldedName not in loadedNames:
+                loadedValues.append(deepcopy(defaultItem))
+                loadedNames.add(foldedName)
+
+        # Reassign rather than mutate the trait list in place.
+        setattr(self, traitName, loadedValues)
+        
     def save(self, filename=None, filesystem=None, filesystemPrefix=None):
         '''
         save
@@ -1373,3 +1448,5 @@ class pglSettingsList(pglTraitSettings):
         super().__init__()
         if settingsList is not None:
             self.settingsList = settingsList
+
+
