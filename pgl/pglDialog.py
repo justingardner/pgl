@@ -172,7 +172,7 @@ class _pglTraitsDialog(QDialog):
         self.formLayout.setRowWrapPolicy(QFormLayout.DontWrapRows)
 
         for traitName, trait in self._getOrderedTraits().items():
-            if traitName.startswith('_') and not trait.metadata.get("property", None):
+            if traitName.startswith('_') and not trait.metadata.get("property", None) and trait.metadata.get("visible") is not True:
                 continue
             self._addTraitWidget(traitName, trait)
 
@@ -385,7 +385,7 @@ class _pglTraitsDialog(QDialog):
         #--------------------
         def buildRows():
             for name, childTrait in self._getOrderedTraits(current[0]).items():
-                if name.startswith("_") and not childTrait.metadata.get("property", None):
+                if name.startswith("_") and not childTrait.metadata.get("property", None) and childTrait.metadata.get("visible") is not True:
                     continue
                 if hideKey and name == keyTraitName:
                     continue
@@ -688,7 +688,7 @@ class _pglTraitsDialog(QDialog):
         #--------------------
         def buildRows():
             for name, childTrait in self._getOrderedTraits(current[0]).items():
-                if name.startswith("_") and not childTrait.metadata.get("property", None):
+                if name.startswith("_") and not childTrait.metadata.get("property", None) and childTrait.metadata.get("visible") is not True:
                     continue
 
                 if hideKey and name == keyTraitName:
