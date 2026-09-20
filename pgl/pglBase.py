@@ -56,12 +56,12 @@ class pglBase:
     ################################################################
     def __init__(self):
         
-        self.printHeader("pglBase: init")
+        pglMessages.printHeader("pglBase: init")
         # print how you can get error log
-        print("(pgl) mglMetal error log can be viewed in MacOS Console app by searching for PROCESS mglMetal or in a terminal with:")
-        print("      log stream --level info --process mglMetal")
-        print("(pgl) To search for something specifc, e.g. messages from mglMovie:")        
-        print("      log stream --predicate 'eventMessage CONTAINS \"mglMovie\"' --style syslog --level info")
+        pglMessages.print("(pgl) mglMetal error log can be viewed in MacOS Console app by searching for PROCESS mglMetal or in a terminal with:")
+        pglMessages.print("      log stream --level info --process mglMetal")
+        pglMessages.print("(pgl) To search for something specifc, e.g. messages from mglMovie:")        
+        pglMessages.print("      log stream --predicate 'eventMessage CONTAINS \"mglMovie\"' --style syslog --level info")
 
         # check os
         if not self.checkOS():
@@ -78,8 +78,8 @@ class pglBase:
 
         # print what we are doing
         if self.verbose > 0: 
-            print("(pglBase) Main library instance created")
-            self.printHeader()
+            pglMessages.message("Main library instance created")
+            pglMessages.printHeader()
     
     ################################################################
     # Delete Function
@@ -88,7 +88,7 @@ class pglBase:
 
         self.close()  # close the socket if it exists
         # print what we are doing
-        if self.verbose > 0: print("(pglBase) Main library closed")
+        if self.verbose > 0: pglMessages.message("Main library closed")
     
     ################################################################
     # Verbose property
@@ -101,7 +101,7 @@ class pglBase:
     def verbose(self, level):
         # Set the verbosity level.
         if level < 0 or level > 2:
-            print("(pglBase) Verbosity level must be between 0 and 2")
+            pglMessages.message("Verbosity level must be between 0 and 2")
         else:
             # set the verbosity level
             self._verbose = level
@@ -112,7 +112,7 @@ class pglBase:
                 self.s.verbose = level
 
         # Print the new verbosity level
-        if self._verbose > 0: print(f"(pglBase) Verbosity level set to {self._verbose}")
+        if self._verbose > 0: pglMessages.message(f"Verbosity level set to {self._verbose}")
 
     ################################################################
     # getPGLDir
@@ -148,14 +148,14 @@ class pglBase:
         Returns:
             bool: True if the screen was opened successfully, False otherwise.
         """
-        self.printHeader("pglBase:open")
+        pglMessages.printHeader("pglBase:open")
         # get how many displays we have
         (numDisplays, defaultDisplay) = self.getNumDisplaysAndDefault()
         if whichScreen is None: whichScreen = defaultDisplay
 
         # Check if the screen number is valid
         if whichScreen < 0 or whichScreen >= numDisplays:
-            print(f"(pglBase:open) ❌ Error: Invalid screen number {whichScreen}. Must be between 0 and {numDisplays-1}.")
+            pglMessages.warning(f"Error: Invalid screen number {whichScreen}. Must be between 0 and {numDisplays-1}.")
             return False
 
         # Check whether any screen positioning was provided, in which
@@ -236,7 +236,7 @@ class pglBase:
         self.clearScreen(backgroundColor)
         self.flush()
         
-        self.printHeader()
+        pglMessages.printHeader()
         # success
         return True
  
@@ -258,8 +258,8 @@ class pglBase:
         
         # Print what we are doing
         if self.verbose > 0: 
-            self.printHeader("pglBase:close")
-            print("(pglBase:close) Closing connection to mglMetal application")
+            pglMessages.printHeader("pglBase:close")
+            pglMessages.message("Closing connection to mglMetal application")
 
         # Check if the socket is connected
         if not self.s:
@@ -283,7 +283,7 @@ class pglBase:
         # Close the socket
         self.s.close()
         self.s = None
-        if self.verbose>0: self.printHeader()
+        if self.verbose>0: pglMessages.printHeader()
         return True
     
     ################################################################
@@ -304,7 +304,7 @@ class pglBase:
         """
         # make sure that a screen is open
         if self.isOpen() is False: 
-            print(f"(pglBase:flush) ❌ No screen is open")
+            pglMessages.warning(f"No screen is open",level=1)
             return None
         self.s.writeCommand("mglFlush")
         self.commandResults = self.s.readCommandResults()
@@ -348,13 +348,13 @@ class pglBase:
         """
         # make sure that a screen is open
         if self.s is None: 
-            print(f"(pglBase:setDesiredFrameRate) ❌ No screen is open")
+            pglMessages.warning(f"No screen is open",level=1)
             return
         try:
             # pause interrupts so we don't get interrupted by Ctrl-C
             self.pauseInterrupts()
             # send the commands
-            print(f"(mglSetDesiredFrameRate: {desiredFrameRate})")
+            pglMessages.message(f"mglSetDesiredFrameRate: {desiredFrameRate})")
             self.s.writeCommand("mglSetDesiredFrameRate")
             self.s.write(np.uint32(desiredFrameRate))
             self.commandResults = self.s.readCommandResults()
@@ -379,7 +379,7 @@ class pglBase:
         """
         # make sure that a screen is open
         if self.s is None: 
-            print(f"(pglBase:setWindowFrameInDisplay) ❌ No screen is open")
+            pglMessages.warning(f"No screen is open",level=1)
             return
         try:
             # pause interrupts so we don't get interrupted by Ctrl-C
@@ -417,14 +417,14 @@ class pglBase:
         """
         # make sure that a screen is open
         if self.s is None: 
-            print(f"(pglBase:getWindowFrameInDisplay) ❌ No screen is open")
+            pglMessages.warning(f"No screen is open",level=1)
             return {}
 
         self.s.writeCommand("mglGetWindowFrameInDisplay")
         ack = self.s.readAck()
         responseIncoming = self.s.read(np.double)
         if responseIncoming < 0:
-            print(f"(pglBase:getWindowFrameInDisplay) ❌ Error getting window frame size")
+            pglMessages.warning(f"Error getting window frame size",level=1)
             windowLocation = {}
         else:
             windowLocation = {'whichScreen': self.s.read(np.uint32),
@@ -455,7 +455,7 @@ class pglBase:
         '''
         # make sure that a screen is open
         if self.isOpen() is False or self.s is None: 
-            print(f"(pglBase:getInfo) ❌ No screen is open")
+            pglMessages.warning(f"No screen is open",level=1)
             return {}
 
         # send command
@@ -470,7 +470,7 @@ class pglBase:
             
             # the key is always a string
             if command != "mglSendString":
-                print(f"(pgl:getInfo) ❌ Unexpected key command: {command}")
+                pglMessages.warning(f"Unexpected key command: {command}",level=1)
                 break
             key = self.s.readString()
 
@@ -484,12 +484,12 @@ class pglBase:
             elif valueCommand == "mglSendDoubleArray":
                 info[key] = self.s.readArray(np.double)
             else:
-                print(f"(pgl:getInfo) ❌ Unexpected value command: {valueCommand}")
+                pglMessages.warning(f"Unexpected value command: {valueCommand}",level=1)
                 break
 
             # print what we got
             if self.verbose>1:
-                print(f"(pgl:getInfo) {key}: {info[key]}")
+                pglMessages.message(f"{key}: {info[key]}")
                 
         # get command results
         self.commandResults = self.s.readCommandResults(ack)  
@@ -512,7 +512,7 @@ class pglBase:
         """
         # make sure that a screen is open
         if self.s is None: 
-            print(f"(pglBase:fullScreen) ❌ No screen is open")
+            pglMessages.warning(f"No screen is open",level=1)
             return False
 
         if goFullScreen:
@@ -521,7 +521,7 @@ class pglBase:
             self.s.writeCommand("mglWindowed")
         self.commandResults = self.s.readCommandResults()
         if self.commandResults.get('success',False) is False:
-            print("(pglBase:fullscreen) ❌ Error setting fullscreen mode")
+            pglMessages.warning("Error setting fullscreen mode",level=1)
             return False
         return True
 
@@ -536,7 +536,7 @@ class pglBase:
             tuple: (cpuTime, gpuTime)
         """
         if self.isOpen() is False:
-            print(f"(pglBase:getTimestamps) ❌ No screen is open")
+            pglMessages.warning(f"No screen is open",level=1)
             return {}
 
         self.s.writeCommand("mglSampleTimestamps")
@@ -559,7 +559,7 @@ class pglBase:
             double: targetPresentationTimestamp
         """
         if self.isOpen() is False:
-            print(f"(pglBase:getTargetPresentationTimestamp) ❌ No screen is open")
+            pglMessages.warning(f"No screen is open",level=1)
             return 0
 
         self.s.writeCommand("mglGetTargetPresentationTimestamp")
@@ -613,7 +613,7 @@ class pglBase:
                     if index < value.size:
                         value = value[index]
                     else:
-                        print(f"Index {index} out of bounds for {field} array")
+                        pglMessages.print(f"Index {index} out of bounds for {field} array")
                         value = None
                         continue
                 # get the value and save it to extractedValues
@@ -632,13 +632,13 @@ class pglBase:
         for field in extractedValues.keys():
             value = extractedValues[field]
             if field in commandsInt:
-                print(f"{prefix} {field}: {int(value)}")
+                pglMessages.print(f"{prefix} {field}: {int(value)}")
             elif field in commandsCPUTime:
-                print(f"{prefix} {field}: {(value * 1000.0 - relativeToTime):0.3f} ms {postfix}")
+                pglMessages.print(f"{prefix} {field}: {(value * 1000.0 - relativeToTime):0.3f} ms {postfix}")
             elif field in commandsGPUTime:
-                print(f"{prefix} {field}: {((value / 1000000.0)-relativeToTime):.3f} ms")
+                pglMessages.print(f"{prefix} {field}: {((value / 1000000.0)-relativeToTime):.3f} ms")
             else:
-                print(f"{prefix} {field}: {value}")
+                pglMessages.print(f"{prefix} {field}: {value}")
 
 
     ################################################################
@@ -669,7 +669,7 @@ class pglBase:
         """
         # get python information
         self.pythonVersion = sys.version
-        print(f"(pgl:checkOS) Python version: {self.pythonVersion}")
+        pglMessages.message(f"Python version: {self.pythonVersion}")
         
         # check keyboard
         
@@ -693,13 +693,14 @@ class pglBase:
                 modelName = self.cpuInfo.get("Model Name", "Unknown Model").strip()
                 modelID = self.cpuInfo.get("Model Identifier", "Unknown Identifier").strip()
                 osVersion = self.macOSversion[0].strip()
-                print(f"(pgl:checkOS) Running on {modelName} ({modelID}) with macOS version: {osVersion}")
-            if self.verbose > 0: print("(pgl:checkOS)",
-                                        self.cpuInfo.get("Processor", "Unknown "),
-                                        "Cores:",
-                                        self.cpuInfo.get("Total Number of Cores", "Unknown "),
-                                        "Memory:",
-                                        self.cpuInfo.get("Memory", "Unknown "))
+                pglMessages.message(f"Running on {modelName} ({modelID}) with macOS version: {osVersion}")
+            if self.verbose > 0: 
+                if self.verbose > 0:
+                    pglMessages.message(
+                        f"{self.cpuInfo.get('Processor', 'Unknown')} "
+                        f"Cores: {self.cpuInfo.get('Total Number of Cores', 'Unknown')} "
+                        f"Memory: {self.cpuInfo.get('Memory', 'Unknown')}"
+                    )
             # Print GPU info
             if self.verbose > 0:
                 for gpuName, gpuInfo in self.gpuInfo.items():
@@ -707,7 +708,7 @@ class pglBase:
                     gpuBus = gpuInfo.get("Bus", "Unknown")
                     gpuMetalSupport = gpuInfo.get("Metal Support", "Unknown metal")
                     gpuNumCores = gpuInfo.get("Total Number of Cores", "Unknown")
-                    print(f"(pgl:checkOS) GPU: {gpuChipset} ({gpuBus}) {gpuNumCores} cores, {gpuMetalSupport} support" )
+                    pglMessages.message(f"GPU: {gpuChipset} ({gpuBus}) {gpuNumCores} cores, {gpuMetalSupport} support" )
                     displays = gpuInfo.get("Displays", [])
                     for iDisplay, display in enumerate(displays):
                         displayName = display.get("DisplayName", "Unnamed")
@@ -716,20 +717,14 @@ class pglBase:
                         #display gamma table size
                         displayGammaTableSize = self.getGammaTableSize(iDisplay)
                         if display.get("Main Display", "No") == "Yes":
-                            print(f"(pgl:checkOS)   {displayName} [Main Display]: {displayResolution} ({displayType}) GammaTable size: {displayGammaTableSize}")
+                            pglMessages.message(f"   {displayName} [Main Display]: {displayResolution} ({displayType}) GammaTable size: {displayGammaTableSize}")
                         else:
-                            print(f"(pgl:checkOS)   {displayName}: {displayResolution} ({displayType}) GammaTable size: {displayGammaTableSize}")
+                            pglMessages.message(f"   {displayName}: {displayResolution} ({displayType}) GammaTable size: {displayGammaTableSize}")
 
-            if self.verbose > 1:
-                # print detailed information
-                print("(pgl:checkOS) Hardware info")
-                pprint.pprint(self.hardwareInfo)
-                print("(pgl:checkOS) GPU info")
-                pprint.pprint(self.gpuInfo)
             return True
         else:
             # not macOS
-            print("(pgl:checkOS) PGL is only supported on macOS")
+            pglMessages.warning("PGL is only supported on macOS")
             return False
     
     
@@ -738,7 +733,7 @@ class pglBase:
     ################################################################
     def save(self, filepath = None):
         if filepath is None:
-            print("(pglBase:save) No filepath given, saving to Desktop.")
+            pglMessages.message("No filepath given, saving to Desktop.")
             filepath = str(Path.home() / "Desktop" / "pgl.json")
         try:
             # initialize state (FIX: this should go in init!)            
@@ -757,7 +752,7 @@ class pglBase:
             self.state.save(filepath)
 
         except Exception as e:
-            print(f"(pglBase:save) Failed to save to {filepath}: {e}")
+            pglMessages.warning(f"Failed to save to {filepath}: {e}")
 
     ################################################################
     # # validate filesystem: used for fsspec 
@@ -867,12 +862,12 @@ class pglBase:
         '''
         for proc in psutil.process_iter(['name']):
             if proc.info['name'] == 'mglMetal':
-                print(f"(pglBase:shutdownAll) Shutting down mglMetal process: {proc.pid}")
+                pglMessages.message(f"Shutting down mglMetal process: {proc.pid}")
                 proc.terminate()
                 try:
                     proc.wait(timeout=5)
                 except TimeoutExpired:
-                    print(f"(pglBase:shutdownAll) Forcefully killing mglMetal process: {proc.pid}")
+                    pglMessages.message(f"Forcefully killing mglMetal process: {proc.pid}")
                     proc.kill()
 
     ################################################################
@@ -883,7 +878,7 @@ class pglBase:
         Remove orphaned sockets
         '''
         if not hasattr(self, 'metalSocketPath'):
-            print("(pglBase:removeOrphanedSockets) No metalSocketPath defined, cannot remove orphaned sockets")
+            pglMessages.warning("No metalSocketPath defined, cannot remove orphaned sockets",level=1)
             return
         
         socketPattern = os.path.join(self.metalSocketPath, "pglMetal.socket.*")
@@ -903,24 +898,24 @@ class pglBase:
         
         # print out open sockets
         for socket in list(set(openMetalSockets)):
-            print(f"(pglBase:removeOrphanedSockets) Found open socket: {socket}")
+            pglMessages.message(f"Found open socket: {socket}")
 
         nRemovedSockets = 0
         for socketPath in glob.glob(socketPattern):
             # check if it is one that mglMetal is using
             if not socketPath in openMetalSockets:
-                print(f"(pglBase:removeOrphanedSockets) Removing orphaned socket: {socketPath}")
+                pglMessages.message(f"Removing orphaned socket: {socketPath}")
                 try:
                     os.remove(socketPath)
                     nRemovedSockets += 1
                 except OSError as e:
-                    print(f"(pglBase:removeOrphanedSockets) Failed to remove {socketPath}: {e}")
+                    pglMessages.warning(f"Failed to remove {socketPath}: {e}",level=1)
         
         # Display how many sockets were removed
         if nRemovedSockets > 0:
-            print(f"(pglBase:removeOrphanedSockets) Removed {nRemovedSockets} orphaned sockets")
+            pglMessages.message(f"Removed {nRemovedSockets} orphaned sockets")
         else:
-            print(f"(pglBase:removeOrphanedSockets) No orphaned sockets found in {self.metalSocketPath}")
+            pglMessages.message(f"No orphaned sockets found in {self.metalSocketPath}")
     #################################################################
     # Pause interrupts
     #################################################################
@@ -943,19 +938,6 @@ class pglBase:
         Restore interrupts by re-enabling the SIGINT signal (Ctrl-C).
         """
         signal.signal(signal.SIGINT, self.originalHandler)
-
-    #################################################################
-    # Print a header
-    #################################################################
-    @staticmethod
-    def printHeader(str="", len=80, fillChar="="):
-        '''
-        Print a header with a given string centered
-        '''
-        if str == "":
-            print(fillChar * len)
-        else:
-            print(f" {str} ".center(len, fillChar))
 
     ###################################
     # make valid filename
@@ -1009,7 +991,7 @@ class pglBase:
 
         if latestBuildPath:
             if self.verbose > 0:
-                print(f"(pglBase:getMetalAppName) Using latest build: {latestBuildPath}")
+                pglMessages.message(f"Using latest build: {latestBuildPath}")
             return latestBuildPath
         return stableAppPath
     #################################################################
@@ -1154,7 +1136,7 @@ def getCPUInfo():
         cpuInfo["Processor"] = processor
         return cpuInfo
     except Exception as e:
-        print(f"(pglBase:getCPUInfo) Warning: {e}")
+        pglMessages.warning(f"Warning: {e}")
         return {}
 
 ################
@@ -1225,17 +1207,8 @@ def getGPUInfo():
         return gpuInfo
 
     except Exception as e:
-        print(f"(pglBase:getGPUInfo) Warning: Parsing failed with error: {e}")
+        pglMessages.warning(f"Parsing failed with error: {e}")
         return {}
-
-def printHeader(str="", len=80, fillChar="="):
-    '''
-    Print a header with a given string centered
-    '''
-    if str == "":
-        print(fillChar * len)
-    else:
-        print(f" {str} ".center(len, fillChar))
 
 ##############################################
 # State for pglState

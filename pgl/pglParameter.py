@@ -187,7 +187,7 @@ class pglParameter(pglStateDataSettings):
         self.state.currentTrialInBlock = 0
         
         # display block information        
-        print(f"Block {self.state.blockNum+1}: {len(parameterBlock)} trials randomized over: {paramNames}")
+        pglMessages.message(f"Block {self.state.blockNum+1}: {len(parameterBlock)} trials randomized over: {paramNames}", messageType='parameter')
 
     def print(self):
         """
@@ -240,7 +240,7 @@ class pglParameter(pglStateDataSettings):
             if not filesystem.exists(str(parameterDir)):
                 raise FileNotFoundError(f"Data directory {parameterDir} does not exist.")
         except Exception as e:
-            print(f"(pglParameter:from_file) ❌ Could not access data directory {parameterDir}: {e}")
+            pglMessages.warning(f"Could not access data directory {parameterDir}: {e}")
             return
 
         try:
@@ -249,7 +249,7 @@ class pglParameter(pglStateDataSettings):
             with filesystem.open(settingsPath, "r") as f:
                 data = json.loads(f.read())
         except Exception as e:
-            print(f"(pglParameter) Could not load settings.json from {parameterDir}: {e}")
+            pglMessages.warning(f"(pglParameter) Could not load settings.json from {parameterDir}: {e}")
             return        
         
         # get the className
@@ -304,7 +304,7 @@ class pglParameter(pglStateDataSettings):
         self._rng.__setstate__(self.state.randomNumberGeneratorState)
         
         # give user feedback on load
-        print(f"(pglParameter:load) Loaded parameter {self.settings.name} from: {parameterDir}")        
+        pglMessages.message(f"(pglParameter:load) Loaded parameter {self.settings.name} from: {parameterDir}", messageType='parameter')        
     
     @classmethod
     def from_settings_state_data(cls, settings, state, data):

@@ -15,30 +15,73 @@ import threading
 
 
 #################################################################
-# warnings
+# messages and warnings
 #################################################################
 class pglMessages:
-    # keep track of oneTimeWarnings
+    # Keep track of oneTimeWarnings
     _oneTimeWarnings = set()
+
+    # Shared configuration for what messages to display
+    _verbose = True
+    _enabledTypes = None
+
+    @classmethod
+    def setVerbose(cls, verbose):
+        cls._verbose = bool(verbose)
+
+    @classmethod
+    def setEnabledTypes(cls, enabledTypes=None):
+        """
+        enabledTypes:
+            None              -> allow all types
+            "debug"           -> allow only debug messages
+            {"debug", "info"} -> allow only debug and info messages
+            set()             -> allow no types
+        """
+        if enabledTypes is None:
+            cls._enabledTypes = None
+        elif isinstance(enabledTypes, str):
+            cls._enabledTypes = frozenset({enabledTypes})
+        else:
+            cls._enabledTypes = frozenset(enabledTypes)
+
+    @classmethod
+    def _shouldPrint(cls, messageType, verbose=True):
+        # Both global and per-call verbosity must permit output.
+        if not cls._verbose or not verbose:
+            return False
+
+        return (
+            cls._enabledTypes is None
+            or messageType in cls._enabledTypes
+        )
     
     @classmethod
-    def message(cls, msg, callerNameDepth=None, verbose=True, wrapText=True, emphasize=False):
+    def message(cls, msg, format=True, callerNameDepth=None, verbose=True, wrapText=True, emphasize=False, messageType='pgl'):
+        
+        # do not print if the messageType is disabled or verbose is false
+        if not cls._shouldPrint(messageType, verbose): return
         
         # get the callerNameDepth
         if callerNameDepth is None: callerNameDepth = 2
         else:
-            # add one (to account for the formatMessage call)
+            # add one (to account for the message call)
             callerNameDepth += 1
             
         # display message
-        if verbose:
-            if emphasize:print("+="*40)
-            if wrapText: msg=cls.wrapText(msg)
+        if emphasize:print("+="*40)
+        if wrapText: msg=cls.wrapText(msg)
+        if format:
             print(f"({cls.getCallerName(callerNameDepth)}) {msg}")
-            if emphasize:print("+="*40)
+        else:
+            print(msg)
+        if emphasize:print("+="*40)
 
     @classmethod
-    def warning(cls, msg, level=2, callerNameDepth=None, verbose=True,wrapText=True):
+    def warning(cls, msg, level=2, callerNameDepth=None, verbose=True,wrapText=True, messageType='pgl'):
+        
+        # do not print if the messageType is disabled or verbose is false
+        if level < 1 and not cls._shouldPrint(messageType, verbose): return
         # get the callerNameDepth
         if callerNameDepth is None: callerNameDepth = 2
         else:
@@ -219,3 +262,29 @@ class pglMessages:
                     return f"{moduleName.split('.')[-1]}:{functionName}"
                 else:
                     return functionName
+    #################################################################
+    # Print a header
+    #################################################################
+    @classmethod
+    def printHeader(cls, str="", len=80, fillChar="=", messageType='pgl', verbose=True):
+        '''
+        Print a header with a given string centered
+        '''
+
+        # do not print if the messageType is disabled or verbose is false
+        if not cls._shouldPrint(messageType, verbose): return        
+        
+        if str == "":
+            print(fillChar * len)
+        else:
+            print(f" {str} ".center(len, fillChar))
+
+    #################################################################
+    # plain print
+    #################################################################
+    @classmethod
+    def print(cls, str="", flush=True, messageType='pgl', verbose=True, end="\n"):
+        # do not print if the messageType is disabled or verbose is false
+        if not cls._shouldPrint(messageType, verbose): return        
+        
+        print(str,flush=flush,end=end)

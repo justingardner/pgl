@@ -14,6 +14,7 @@ from typing import Callable, Dict, List, Optional, Set
 import threading
 import atexit
 import time
+from .pglMessages import pglMessages
 
 #############
 # EventListener
@@ -61,11 +62,11 @@ class pglEventListener:
             RuntimeError: If listener already running or thread creation failed
         """
         if self._running:
-            print("(pglEventListener) Listener already running")
+            pglMessages.message("Listener already running")
             return
         
         if _pglEventListener.isRunning():
-            print("(pglEventListener) ❌ Another listener is already running in this process")
+            pglMessages.warning("Another listener is already running in this process")
             self._running = False
             return
         
@@ -281,7 +282,7 @@ class pglEventListener:
                 if keyCode is not None:
                     allKeyCodes.append(keyCode)
                 else:
-                    print(f"(pglEventListener) Warning: Could not convert '{char}' to keycode")
+                    pglMessages.warning(f"Could not convert '{char}' to keycode",level=1)
     
         # Remove duplicates
         allKeyCodes = list(set(allKeyCodes))
@@ -290,9 +291,9 @@ class pglEventListener:
         _pglEventListener.setEatKeys(allKeyCodes)
     
         if allKeyCodes:
-            print(f"(pglEventListener) Eating {len(allKeyCodes)} keys: {sorted(keyCodeToChar(allKeyCodes))}")
+            pglMessages.message(f"Eating {len(allKeyCodes)} keys: {sorted(keyCodeToChar(allKeyCodes))}")
         else:
-            print("(pglEventListener) Not eating any keys")
+            pglMessages.message("Not eating any keys")
             
         return allKeyCodes
  
@@ -461,7 +462,7 @@ def charToKeyCode(char: str) -> Optional[int]:
     """
     # Handle list input recursively
     if isinstance(char, list):
-        return [self.charToKeyCode(c) for c in char]
+        return [charToKeyCode(c) for c in char]
 
     # Letter keycodes (case-insensitive)
     charMapLetters = {

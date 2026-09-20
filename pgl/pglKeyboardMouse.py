@@ -45,7 +45,7 @@ class pglKeyboardMouse(pglDevice):
         Start the keyboard listener.
         '''
         if self.isRunning(): return
-        print(f"(pglKeyboardMouse:start) Starting keyboard and mouse event listener.")
+        pglMessages.message(f"Starting keyboard and mouse event listener.")
         
         # start the listener
         self.listener = pglEventListener()
@@ -63,7 +63,7 @@ class pglKeyboardMouse(pglDevice):
         '''
         if self.isRunning(): 
             self.listener.stop()
-        print(f"(pglKeyboardMouse:stop) Stopping keyboard listener.")
+        pglMessages.message(f"Stopping keyboard listener.")
         
     def checkAccessibilityPermission(self):
         """
@@ -104,7 +104,7 @@ class pglKeyboardMouse(pglDevice):
                     pass
 
         if error:
-            print(f"(pglKeyboardMouse) ❌ {error.rstrip('\n')}")
+            pglMessages.warning(error.rstrip('\n'))
         else:
             accessibilityPermission = True
         
@@ -259,10 +259,10 @@ class pglPynputKeyboard(pglDevice):
         super().__init__(deviceType="pglKeyboard")
 
         if not self.checkAccessibilityPermission():
-            print("(pglKeyboard) ❌ This app is not authorized for Accessibility input monitoring. No keyboard events will be detected!!")
-            print("              Go to System Settings → Privacy & Security → Accessibility and add this app.")
-            print("              If you are running VS Code and it already has permissions granted, try running directly from a terminal with:")
-            print("              /Applications/Visual\\ Studio\\ Code.app/Contents/MacOS/Electron")
+            pglMessages.warning("This app is not authorized for Accessibility input monitoring. No keyboard events will be detected!!",level=1)
+            pglMessages.warning("              Go to System Settings → Privacy & Security → Accessibility and add this app.",level=1)
+            pglMessages.warning("              If you are running VS Code and it already has permissions granted, try running directly from a terminal with:",level=1)
+            pglMessages.warning("              /Applications/Visual\\ Studio\\ Code.app/Contents/MacOS/Electron",level=1)
             return
 
         self.start(eatKeys)
@@ -272,7 +272,7 @@ class pglPynputKeyboard(pglDevice):
         Start the keyboard listener.
         '''
         if self.isRunning(): return
-        print(f"(pglKeyboard:start) Starting keyboard listener.")
+        pglMessages.message(f"Starting keyboard listener.")
         
         # Create a thread-safe queue
         self.keyQueue = Queue()
@@ -297,14 +297,14 @@ class pglPynputKeyboard(pglDevice):
         self.alt = False
         self.cmd = False
 
-        print("(pglKeyboard) Keyboard listener initialized.")
+        pglMessages.message("Keyboard listener initialized.")
     
     def stop(self):
         '''
         Stop the keyboard listener.
         '''
         if self.isRunning(): self.stopListener()
-        print(f"(pglKeyboard:stop) Stopping keyboard listener.")
+        pglMessages.message(f"Stopping keyboard listener.")
 
         
     def checkAccessibilityPermission(self):
@@ -344,11 +344,11 @@ class pglPynputKeyboard(pglDevice):
         stderr_output = stderr_capture.getvalue()
 
         if error:
-            print(f"(pglKeyboard) ❌ {error.rstrip('\n')}")
+            pglMessages.warning(error.rstrip('\n'))
         elif stdout_output:
-            print(f"(pglKeyboard) ❌ {stdout_output.rstrip('\n')}")
+            pglMessages.warning(stdout_output.rstrip('\n'))
         elif stderr_output:
-            print(f"(pglKeyboard) ❌ {stderr_output.rstrip('\n')}")
+            pglMessages.warning(stderr_output.rstrip('\n'))
         else:
             accessibilityPermission = True
         
@@ -398,7 +398,7 @@ class pglPynputKeyboard(pglDevice):
         # stop the thread
         if hasattr(self, 'listenerThread') and self.listenerThread.is_alive():
             self.listenerThread.join(timeout=1)
-        print("(pglKeyboard) Listener thread stopped")
+        pglMessages.message("Listener thread stopped")
 
     def isRunning(self):
         '''

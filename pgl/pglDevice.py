@@ -68,7 +68,7 @@ class pglDevice:
         Clean up the _pglDevice instance.
         """
         # Perform any necessary cleanup here
-        print(f"(pglDevice) Cleaning up device of type {self.deviceType}")
+        pglMessages.message(f"Cleaning up device of type {self.deviceType}")
         pass
 
     def poll(self):
@@ -132,9 +132,9 @@ class pglDevices:
         """
         if isinstance(device, pglDevice):
             self.devices.append(device)
-            print(f"(pglDevices) Added device: {device.deviceType}")
+            pglMessages.message(f"Added device: {device.deviceType}")
         else:
-            print("(pglDevices) Error: Device must be an instance of pglDevice.")
+            pglMessages.warning("Device must be an instance of pglDevice.")
 
     def devicesGet(self, deviceType):
         '''
@@ -343,7 +343,7 @@ class pglDigitalIODevice(pglDevice):
                 # reset the state
                 self.digitalOutput(channel, 0)
             except Exception as e:
-                print(f"(pglLabJack:setDigitalOutput) Error restoring {self.digitalChannel[channel]["name"]}: {e}")
+                pglMessages.warning(f"Error restoring digital output channel {channel}: {e}")
 
         # set high
         timestamp = self.digitalOutput(channel, 1)
@@ -497,7 +497,7 @@ class pglAnalogTraceData(pglSerialize):
 
         # warn if caller supplied more names than there are channels
         if len(channelNames) > self.numChannels:
-            print(f"(pglAnalogTraceData) Warning: {len(channelNames)} names given but only {self.numChannels} channels. Extra names ignored.")
+            pglMessages.warning(f"(pglAnalogTraceData) Warning: {len(channelNames)} names given but only {self.numChannels} channels. Extra names ignored.")
         
         # store the normalized channel names
         self.channelNames = normalizedChannelNames
@@ -535,19 +535,19 @@ class pglAnalogTraceData(pglSerialize):
                 - 'ignoredSamples': number of samples ignored from the beginning
         '''
         if self.time is None or self.data is None:
-            print("(pglLabJack:getCycles) No data provided.")
+            pglMessages.message("No data provided.")
             return None
         
         # Validate ignoreInitial parameter
         if ignoreInitial is not None:
             if not isinstance(ignoreInitial, (int, float)):
-                print(f"(pglLabJack:getCycles) Error: ignoreInitial must be a number or None, got {type(ignoreInitial).__name__}")
+                pglMessages.warning(f"Error: ignoreInitial must be a number or None, got {type(ignoreInitial).__name__}")
                 return None
             if ignoreInitial < 0:
-                print(f"(pglLabJack:getCycles) Error: ignoreInitial must be non-negative, got {ignoreInitial}")
+                pglMessages.warning(f"Error: ignoreInitial must be non-negative, got {ignoreInitial}")
                 return None
             if ignoreInitial >= self.time[-1] - self.time[0]:
-                print(f"(pglLabJack:getCycles) Error: ignoreInitial ({ignoreInitial}s) is greater than or equal to total data duration ({self.time[-1] - self.time[0]:.3f}s)")
+                pglMessages.warning(f"Error: ignoreInitial ({ignoreInitial}s) is greater than or equal to total data duration ({self.time[-1] - self.time[0]:.3f}s)")
                 return None
         
         # Filter data if ignoreInitial is specified
@@ -560,7 +560,7 @@ class pglAnalogTraceData(pglSerialize):
             maskIndices = np.where(self.time >= startTime)[0]
             
             if len(maskIndices) == 0:
-                print(f"(pglLabJack:getCycles) Error: No data remains after ignoring initial {ignoreInitial}s")
+                pglMessages.warning(f"Error: No data remains after ignoring initial {ignoreInitial}s")
                 return None
             
             startIdx = maskIndices[0]
@@ -573,7 +573,7 @@ class pglAnalogTraceData(pglSerialize):
             else:
                 data = self.data[startIdx:, :]
             
-            print(f"(pglLabJack:getCycles) Ignoring first {ignoreInitial}s ({ignoredSamples} samples)")
+            pglMessages.message(f"Ignoring first {ignoreInitial}s ({ignoredSamples} samples)")
         
         # Handle single or multi-channel data
         if data.ndim == 1:
@@ -593,7 +593,7 @@ class pglAnalogTraceData(pglSerialize):
             risingEdges = np.where(np.diff(aboveThreshold.astype(int)) > 0)[0] + 1
             
             if len(risingEdges) < 2:
-                print(f"(pglLabJack:getCycles) Warning: Found {len(risingEdges)} rising edges. Need at least 2 for cycle analysis.")
+                pglMessages.warning(f"Found {len(risingEdges)} rising edges. Need at least 2 for cycle analysis.")
                 return None
             
             # Calculate cycle length from detected triggers
@@ -607,7 +607,7 @@ class pglAnalogTraceData(pglSerialize):
         else:
             # Use fixed cycleLen
             if cycleLen is None:
-                print("(pglLabJack:getCycles) Must provide either cycleLen or digitalSyncChannel/digitalSyncThreshold.")
+                pglMessages.warning("Must provide either cycleLen or digitalSyncChannel/digitalSyncThreshold.")
                 return None
                 
             dt = np.mean(np.diff(time))
@@ -615,7 +615,7 @@ class pglAnalogTraceData(pglSerialize):
             
             # Check if data is long enough for at least one cycle
             if len(time) < samplesPerCycle:
-                print(f"(pglLabJack:getCycles) Warning: Data length ({len(time)} samples) is shorter than one cycle ({samplesPerCycle} samples).")
+                pglMessages.warning(f"Warning: Data length ({len(time)} samples) is shorter than one cycle ({samplesPerCycle} samples).")
                 return None
             
             # Generate regular cycle starts
@@ -653,7 +653,7 @@ class pglAnalogTraceData(pglSerialize):
                 cycles.append(cycle)
             
             if len(cycles) == 0:
-                print(f"(pglLabJack:getCycles) No complete cycles found for channel {ch}.")
+                pglMessages.message(f"No complete cycles found for channel {ch}.")
                 return None
             
             # Convert to array (numCycles, samplesPerCycle)
@@ -707,7 +707,7 @@ class pglAnalogTraceData(pglSerialize):
         retval = {}
 
         if self.time is None or self.data is None:
-            print("(pglLabJack:plotAnalogRead) No data to plot.")
+            pglMessages.message("No data to plot.")
             return
         
         # Determine number of rows needed

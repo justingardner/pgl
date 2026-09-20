@@ -7,7 +7,7 @@ import sys, time, struct, subprocess, os, re
 from socket import socket, AF_UNIX, SOCK_STREAM
 import numpy as np
 import time
-
+from .pglMessages import pglMessages
 
 class _pglComm:
     # init variables
@@ -25,25 +25,23 @@ class _pglComm:
         attempt = 0
 
         # display what we are doing
-        sys.stdout.write("(pgl:_pglComm) ")
-        sys.stdout.flush()
+        pglMessages.print("(pgl:_pglComm) ", end="", flush=True)
         while True:
             try:
                 self.s = socket(AF_UNIX, SOCK_STREAM)
                 self.s.connect(socketName)
                 self.socketName = socketName
-                print("Connected to:", socketName)
+                pglMessages.print(f"Connected to: {socketName}")
                 return
             except (FileNotFoundError, ConnectionRefusedError):
                 # Keep trying until timeout
                 elapsed = time.time() - startTime
                 if elapsed > timeout:
-                    print("\n(pgl:_pglComm) ❌ Timeout: Could not connect to socket:", socketName)
+                    pglMessages.warning(f"\nTimeout: Could not connect to socket: {socketName}",level=1)
                     self.s = None
                     return None
                 # Print a dot for feedback
-                sys.stdout.write(".")
-                sys.stdout.flush()
+                pglMessages.print(".", end="", flush=True)
                 time.sleep(0.5)  # Wait before retrying
 
     def isOpen(self):
@@ -59,9 +57,9 @@ class _pglComm:
         if os.path.exists(self.socketName):
             try:
                 os.remove(self.socketName)
-                print("(pgl:_pglComm) Closed socket:", self.socketName)
+                pglMessages.message(f"Closed socket: {self.socketName}")
             except Exception as e:
-                print("(pgl:_pglComm) ❌ Error closing socket:", e)
+                pglMessages.warning(f"Error closing socket: {e}",level=1)
             finally:
                 self.s = None
 
@@ -71,7 +69,7 @@ class _pglComm:
         """
         # check socket
         if not self.s:
-            print("(pgl:_pglComm) ❌ Not connected to socket")
+            pglMessages.warning(f"Not connected to socket",level=1)
             return
         # Pack data for sending
         if type(message) == np.uint16:
@@ -105,14 +103,14 @@ class _pglComm:
             raise TypeError("Unsupported data type")
 
         try:
-            if self.verbose>=3:print(f"(pgl:_pglComm) Sending message with length {len(packed)} bytes")
+            if self.verbose>=3:pglMessages.message(f"Sending message with length {len(packed)} bytes")
              # if we are logging commands for replay, log the command values
             if self.pgl.commandRecording: self.pgl.logCommandData(packed)
             # send the packed data
             self.s.sendall(packed)
-            if self.verbose > 1: print("(pgl:_pglComm) Message sent:", message)
+            if self.verbose > 1: pglMessages.message(f"Message sent: {message}")
         except Exception as e:
-            print("(pgl:_pglComm) ❌ Error sending message:", e)
+            pglMessages.warning(f"Error sending message: {e}")
     
     def writeCommand(self, commandName):
         """
@@ -125,18 +123,18 @@ class _pglComm:
             bool: True if the command was sent successfully, False otherwise.
         """
         if not self.s:
-            print("(pgl:_pglComm) ❌ Not connected to socket")
+            pglMessages.warning(f"Not connected to socket",level=1)
             return False
         
         # get the command value from the string
         commandValue = self.getCommandValue(commandName)
         if commandValue is None:
-            print(f"(pgl:_pglComm) ❌ Command '{commandName}' not found")
+            pglMessages.warning(f"Command '{commandName}' not found",level=1)
             return False
         
         # display command if high verbosity is set
         if self.verbose>1:
-            print(f"(pgl:_pglComm) Sending command: {commandName} (value: {commandValue})")
+            pglMessages.message(f"Sending command: {commandName} (value: {commandValue})")
 
         # if we are logging commands for replay, log the command
         if self.pgl.commandRecording: self.pgl.logCommandValue(commandValue)
@@ -156,7 +154,7 @@ class _pglComm:
             bool: True if the command was sent successfully, False otherwise.
         """
         if not self.s:
-            print("(pgl:_pglComm) ❌ Not connected to socket")
+            pglMessages.warning("Not connected to socket",level=1)
             return False
         
         for chunk in commandData: self.s.sendall(chunk)
@@ -189,14 +187,14 @@ class _pglComm:
                  numeric value is available via self.getCommandName if needed.
         """
         if not self.s:
-            print("(pgl:_pglComm:readCommandCode) ❌ Not connected to socket")
+            pglMessages.warning("Not connected to socket",level=1)
             return None
 
         try:
             # read the raw command value as a uint16
             commandValue = self.read(np.uint16)
             if commandValue is None:
-                print("(pgl:_pglComm:readCommandCode) ❌ Error reading command code")
+                pglMessages.warning("Error reading command code")
                 return None
             # convert to a plain python int so it can be used as a dict key
             commandValue = int(commandValue)
@@ -204,18 +202,18 @@ class _pglComm:
             # look up the command name from the value
             commandName = self.getCommandName(commandValue)
             if commandName is None:
-                print(f"(pgl:_pglComm:readCommandCode) ❌ Unknown command code: {commandValue}")
+                pglMessages.warning(f"Unknown command code: {commandValue}")
                 # still return the raw value so caller can decide what to do
                 return commandValue
 
             # display command if high verbosity is set
             if self.verbose > 1:
-                print(f"(pgl:_pglComm:readCommandCode) Read command: {commandName} (value: {commandValue})")
+                pglMessages.message(f"Read command: {commandName} (value: {commandValue})")
 
             return commandName
 
         except Exception as e:
-            print("(pgl:_pglComm:readCommandCode) ❌ Error reading command code:", e)
+            pglMessages.warning(f"Error reading command code: {e}")
             return None
         
     def read(self, dataType, numRows=1, numCols=1, numSlices=1):
@@ -223,7 +221,7 @@ class _pglComm:
         Read a message from the socket.
         """
         if not self.s:
-            print("(pgl:_pglComm) ❌ Not connected to socket")
+            pglMessages.warning(f"Not connected to socket",level=1)
             return None
 
         try:
@@ -232,13 +230,13 @@ class _pglComm:
             packed = self.recvBlocking(numBytes)
             # check length of packed data
             if len(packed) != numBytes:
-                print(f"(pgl:_pglComm:read) ❌ Expected {numBytes} bytes ({numRows}x{numCols}x{numSlices} of {np.dtype(dataType).itemsize}), but received {len(packed)} bytes")
+                pglMessages.warning(f"Expected {numBytes} bytes ({numRows}x{numCols}x{numSlices} of {np.dtype(dataType).itemsize}), but received {len(packed)} bytes")
                 return None
             else:
                 # unpack the data and reshape it
                 return np.squeeze(np.frombuffer(packed, dtype=dataType).reshape((numRows, numCols, numSlices)))
         except Exception as e:
-            print("(pgl:_pglComm:read) ❌ Error reading message:", e)
+            pglMessages.warning(f"Error reading message: {e}")
             return None
     
     def readString(self):
@@ -252,14 +250,14 @@ class _pglComm:
             str: The decoded string, or None if an error occurs.
         """
         if not self.s:
-            print("(pgl:_pglComm:readString) ❌ Not connected to socket")
+            pglMessages.warning(f"Not connected to socket",level=1)
             return None
 
         try:
             # read the length prefix (number of utf-16 code units) as uint16
             codeUnitCount = self.read(np.uint16)
             if codeUnitCount is None:
-                print("(pgl:_pglComm:readString) ❌ Error reading string length")
+                pglMessages.warning(f"Error reading string length")
                 return None
             # convert to a plain python int for byte math
             codeUnitCount = int(codeUnitCount)
@@ -274,14 +272,14 @@ class _pglComm:
             # read the raw utf-16 bytes
             packed = self.recvBlocking(numBytes)
             if len(packed) != numBytes:
-                print(f"(pgl:_pglComm:readString) ❌ Expected {numBytes} bytes, but received {len(packed)} bytes")
+                pglMessages.warning(f"Expected {numBytes} bytes, but received {len(packed)} bytes")
                 return None
 
             # decode as little endian utf-16
             return bytes(packed).decode('utf-16le')
 
         except Exception as e:
-            print("(pgl:_pglComm:readString) ❌ Error reading string:", e)
+            pglMessages.warning(f"Error reading string: {e}")
             return None
     
     def readArray(self, dataType):
@@ -289,7 +287,7 @@ class _pglComm:
         Read a message from the socket.
         """
         if not self.s:
-            print("(pgl:_pglComm) ❌ Not connected to socket")
+            pglMessages.warning(f"Not connected to socket",level=1)
             return None
 
         try:
@@ -300,13 +298,13 @@ class _pglComm:
             packed = self.recvBlocking(numBytes)
             # check length of packed data
             if len(packed) != numBytes:
-                print(f"(pgl:_pglComm:readArray) ❌ Expected {numBytes} bytes ({numElements} of {np.dtype(dataType).itemsize}), but received {len(packed)} bytes")
+                pglMessages.warning(f"Expected {numBytes} bytes ({numElements} of {np.dtype(dataType).itemsize}), but received {len(packed)} bytes")
                 return None
             else:
                 # unpack the data and reshape it
                 return np.frombuffer(packed, dtype=dataType)
         except Exception as e:
-            print("(pgl:_pglComm:readArray) ❌ Error reading message:", e)
+            pglMessages.warning(f"Error reading message: {e}")
             return None
 
     def recvBlocking(self, numBytes):
@@ -333,17 +331,17 @@ class _pglComm:
             float: The acknowledgment time from the socket, or None if an error occurs.
         """
         if not self.s:
-            print("(pgl:_pglComm:readAck) ❌ Not connected to socket")
+            pglMessages.warning("Not connected to socket",level=1)
             return None
         
         try:
             ack = self.read(np.double)
             if ack is None:
-                print("(pgl:_pglComm:readAck) ❌ Error reading acknowledgment")
+                pglMessages.warning(f"Error reading acknowledgment")
                 return None
             return ack
         except Exception as e:
-            print("(pgl:_pglComm:readAck) ❌ Error reading acknowledgment:", e)
+            pglMessages.warning(f"Error reading acknowledgment: {e}")
             return None
     def readCommandResults(self, ack=None, nCommands=1):
         """
@@ -353,7 +351,7 @@ class _pglComm:
             np.ndarray: The results read from the socket, or None if an error occurs.
         """
         if not self.s:
-            print("(pgl:_pglComm:readCommandResults) ❌ Not connected to socket")
+            pglMessages.warning(f"Not connected to socket",level=1)
             return None
         
         try:
@@ -376,7 +374,7 @@ class _pglComm:
             return(commandResults)
         
         except Exception as e:
-            print("(pgl:_pglComm:readCommandResults) ❌ Error reading results:", e)
+            pglMessages.warning(f"Error reading results: {e}")
             return None
 
 
@@ -393,7 +391,7 @@ class _pglComm:
 
         # check for file
         if not os.path.isfile(filename):
-            print(f"(pgl:_pglComm:parseCommandValues) ❌ Error: File not found: {filename}")
+            pglMessages.warning(f"Error: File not found: {filename}")
             # close connection, since we are now screwed
             self.close()
             return
@@ -438,7 +436,7 @@ class _pglComm:
                 if 'pgl' in line:
                     return int(line.split()[1])
         except Exception as e:
-            print("(pgl:_pglComm) ❌ Error finding PID:", e)
+            pglMessages.warning(f"Error finding PID: {e}",level=1)
         return None
     
    
@@ -460,7 +458,7 @@ class pglSerial:
         try:
             import serial
         except ImportError:
-            print("(pglSerialComm) ❌ Error: pyserial library is not installed. Please install it to use serial communication.")
+            pglMessages.warning(f"Error: pyserial library is not installed. Please install it to use serial communication.")
             self.serial = None
             return
 
@@ -495,17 +493,17 @@ class pglSerial:
             
             # if there are no ports, then return displaying error
             if len(ports) == 0:
-                print("(pglSerialComm) ❌ No serial ports found.")
+                pglMessages.warning("No serial ports found.")
                 self.serial = None
                 return
             else:
                 # display info about each port
                 for iPort, port in enumerate(ports):
-                    print(f"(pglSerialComm) {iPort}: {port.device} - {port.description}")
-                print(f"(pglSerialComm) {len(ports)}: Cancel")
+                    pglMessages.message(f"{iPort}: {port.device} - {port.description}")
+                pglMessages.message(f"{len(ports)}: Cancel")
                 
                 # ask user to select port
-                print(f"(pglSerialComm) Select port [0-{len(ports)}]: ")
+                pglMessages.message(f"Select port [0-{len(ports)}]: ")
                 
                 # wait for user to select port
                 portIndex = int(input(""))
@@ -513,9 +511,9 @@ class pglSerial:
                 if portIndex < 0 or portIndex >= len(ports):
                     # if len(ports) then user cancelled so no error message
                     if portIndex == len(ports):
-                        print("(pglSerialComm) Cancelled")
+                        pglMessages.message("Cancelled")
                     else:
-                        print("(pglSerialComm) ❌ Invalid port index.")
+                        pglMessages.warning("Invalid port index.")
                     self.serial = None
                     return
                 
@@ -524,11 +522,11 @@ class pglSerial:
         try:
             # open port
             self.serial = serial.Serial(port, baudrate, timeout=timeout, bytesize=dataLen, parity=parity, stopbits=stopBits)
-            print(f"(pglSerialComm) Connected to serial port: {port} at {baudrate} baud.")
+            pglMessages.message(f"Connected to serial port: {port} at {baudrate} baud.")
         
         except Exception as e:
             # check for error on opening port
-            print(f"(pglSerialComm) ❌ Error connecting to serial port {port}: {e}")
+            pglMessages.warning(f"Error connecting to serial port {port}: {e}")
             self.serial = None
     
     def write(self, data):
@@ -536,7 +534,7 @@ class pglSerial:
         Write data to the serial port.
         '''
         if self.serial is None:
-            print("(pglSerialComm) ❌ Serial port not initialized.")
+            pglMessages.warning("Serial port not initialized.",level=1)
             return
         try:
             # flush anything in the input buffer
@@ -548,7 +546,7 @@ class pglSerial:
             self.serial.write(data)
             
         except Exception as e:
-            print(f"(pglSerialComm) ❌ Error writing to serial port: {e}")
+            pglMessages.warning(f"Error writing to serial port: {e}")
     
     def read(self, timeout=10.0):
         """
@@ -556,7 +554,7 @@ class pglSerial:
         for a response.
         """
         if self.serial is None:
-            print("(pglSerialComm) ❌ Serial port not initialized.")
+            pglMessages.warning("Serial port not initialized.")
             return None
 
         start_time = time.time()
@@ -585,11 +583,11 @@ class pglSerial:
             if received_data:
                 return bytes(received_data)  # return as immutable bytes
             else:
-                print("(pglSerialComm) ❌ No data received before timeout.")
+                pglMessages.warning(" No data received before timeout.")
                 return None
 
         except Exception as e:
-            print(f"(pglSerialComm) ❌ Error reading from serial port: {e}")
+            pglMessages.warning(f"Error reading from serial port: {e}")
             return None
         
     def flush(self):
@@ -597,13 +595,13 @@ class pglSerial:
         Flush the serial port input and output buffers.
         '''
         if self.serial is None:
-            print("(pglSerialComm) ❌ Serial port not initialized.")
+            pglMessages.warning("Serial port not initialized.")
             return
         try:
             self.serial.reset_input_buffer()
             self.serial.reset_output_buffer()
         except Exception as e:
-            print(f"(pglSerialComm) ❌ Error flushing serial port: {e}")
+            pglMessages.warning(f"Error flushing serial port: {e}")
             
     def close(self):
         '''
@@ -614,7 +612,7 @@ class pglSerial:
         try:
             self.serial.close()
         except Exception as e:
-            print(f"(pglSerialComm) ❌ Error closing serial port: {e}") 
+            pglMessages.warning(f"Error closing serial port: {e}") 
     
     def isOpen(self):
         '''

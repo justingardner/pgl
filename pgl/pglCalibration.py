@@ -11,7 +11,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from ._pglComm import pglSerial
-from .pglBase import printHeader
 from .pglSettings import pglSettings, pglDisplaySettings, pglSettingsManager, pglTraitSettings
 from traitlets import Unicode, Int, Instance, Dict, Tuple, Float, List
 from datetime import datetime
@@ -25,6 +24,7 @@ from scipy.io import loadmat
 from .pglMessages import pglMessages
 from scipy.interpolate import PchipInterpolator
 from .pglSettings import pglSettingsManager
+from datetime import datetime, date as Date
 
 ##########################
 # Calibration device class
@@ -70,7 +70,7 @@ class pglLuminanceCalibrationDeviceDebug(pglLuminanceCalibrationDevice):
         Measure the display characteristics using debug device.
         '''
         self.currentMeasurement = np.random.rand()
-        print(f"(pglLuminanceCalibrationDeviceDebug) Measurement: {self.currentMeasurement}")
+        pglMessages.message(f"Measurement: {self.currentMeasurement}")
         return self.currentMeasurement
     
 ####################################################
@@ -87,24 +87,24 @@ class pglLuminanceCalibrationDeviceMinolta(pglLuminanceCalibrationDevice):
         super().__init__(description, verbose)
         
         # tell user to connect device and turn on
-        printHeader("Connect Minolta CS-100A")
-        print("(pglCalibrationDeviceMinolta) Connect the Minolta CS-100A to the serial port")
-        print("(pglCalibrationDeviceMinolta) hold down F key and turn it on.")
-        print("(pglCalibrationDeviceMinolta) You should see the letter C on the Minolta display.")
-        print("(pglCalibrationDeviceMinolta) Press Enter to continue...")
+        pglMessages.printHeader("Connect Minolta CS-100A")
+        pglMessages.print("(pglCalibrationDeviceMinolta) Connect the Minolta CS-100A to the serial port")
+        pglMessages.print("(pglCalibrationDeviceMinolta) hold down F key and turn it on.")
+        pglMessages.print("(pglCalibrationDeviceMinolta) You should see the letter C on the Minolta display.")
+        pglMessages.print("(pglCalibrationDeviceMinolta) Press Enter to continue...")
         input()
         
         # init serial port
-        printHeader("Choose Serial Port")
-        print("(pglCalibrationDeviceMinolta) Select the serial port that the Minolta CS-100A is connected to.")        
-        print("(pglCalibrationDeviceMinolta) This should appear as something like:")
-        print("(pglCalibrationDeviceMinolta)   /dev/cu.usbserial-110 - USB-Serial Controller Device")
+        pglMessages.printHeader("Choose Serial Port")
+        pglMessages.print("(pglCalibrationDeviceMinolta) Select the serial port that the Minolta CS-100A is connected to.")        
+        pglMessages.print("(pglCalibrationDeviceMinolta) This should appear as something like:")
+        pglMessages.print("(pglCalibrationDeviceMinolta)   /dev/cu.usbserial-110 - USB-Serial Controller Device")
         self.serial = pglSerial(dataLen=7, parity='e', stopBits=2, baudrate=4800, timeout=5.0)
 
         if self.serial.isOpen() is False:
-            printHeader("Cancelled")
+            pglMessages.printHeader("Cancelled")
         else:
-            printHeader("Minolta CS-100A Connected")
+            pglMessages.printHeader("Minolta CS-100A Connected")
     def __del__(self):
         '''
         Destructor for the Minolta calibration device.
@@ -142,7 +142,7 @@ class pglLuminanceCalibrationDeviceMinolta(pglLuminanceCalibrationDevice):
             if s.startswith('ER'):
                 errorCode = s[2:4]
                 errorMessage = errorCodes.get(errorCode, 'Unknown error')
-                print(f"(pglCalibrationDeviceMinolta) ❌ Error from device: {errorMessage} (Code: {errorCode})")
+                pglMessages.warning(f"Error from device: {errorMessage} (Code: {errorCode})")
                 return None
         
             # Split at first comma to separate 'OK13' from the rest
@@ -159,11 +159,11 @@ class pglLuminanceCalibrationDeviceMinolta(pglLuminanceCalibrationDevice):
             luminance, x, y = values
 
             if self.verbose:
-                print(f"(pglCalibrationDeviceMinolta) Luminance={luminance}, x={x}, y={y} (mode={mode})")
+                pglMessages.print(f"(pglCalibrationDeviceMinolta) Luminance={luminance}, x={x}, y={y} (mode={mode})")
             return luminance
         
         except Exception as e:
-            print(f"(pglCalibrationDeviceMinolta) ❌ Error parsing response ({r}): {e}")
+            pglMessages.warning(f"Error parsing response ({r}): {e}")
             return None
     
 
@@ -264,7 +264,7 @@ class pglDisplayCalibration():
         '''
         validModes = ["minmax", "minsearch", "full", "done"]
         if mode not in validModes:
-            print(f"(pglCalibration) Invalid calibration mode: {mode}. Valid modes are: {validModes}")
+            pglMessages.warning(f"Invalid calibration mode: {mode}. Valid modes are: {validModes}")
             return
         self._calibrationMode = mode
         # get save location for current mode
@@ -411,7 +411,7 @@ class pglDisplayCalibration():
         self.pgl.waitSecs(0.1)
 
         # display
-        print(f"Total read time: {analogReadDurationSecs:.2f} seconds, (n={numRepeats}, trialLen={trialDurationSecs:.2f} s, totalDuration={totalDurationSecs:.2f} s)")
+        pglMessages.message(f"Total read time: {analogReadDurationSecs:.2f} seconds, (n={numRepeats}, trialLen={trialDurationSecs:.2f} s, totalDuration={totalDurationSecs:.2f} s)")
 
         useBatch = True
         
@@ -490,7 +490,7 @@ class pglDisplayCalibration():
         # get analog data
         analogTraceData = self.analogInputDevice.stopAnalogRead(waitToFinish=True)
         if analogTraceData:
-            print(f"Analog read complete (duration={self.pgl.getSecs() - startTime:.2f} s). Read {analogTraceData.nSamples} samples.")
+            pglMessages.message(f"Analog read complete (duration={self.pgl.getSecs() - startTime:.2f} s). Read {analogTraceData.nSamples} samples.")
         else:
             pglMessages.warning(f"Calibration failed. This may be because the scanRate: {scanRate} was set to high")
             
@@ -534,7 +534,7 @@ class pglDisplayCalibration():
                 for making a gamma of 2.2 for videos
         '''
         if self.luminanceCalibrationDevice is None:
-            print("(pglDisplayCalibration) No luminance calibration device specified. Please specify on initialization of pglDisplayCalibration or use addLuminanceCalibrationDevice")
+            pglMessages.warning("No luminance calibration device specified. Please specify on initialization of pglDisplayCalibration or use addLuminanceCalibrationDevice")
             return None
 
         # initialize calibration data
@@ -551,7 +551,7 @@ class pglDisplayCalibration():
         e.settings.closeScreenOnEnd = True
         e.initScreen()
         if self.pgl.isOpen() is False:
-            print(f"(pglCalibration:calibrate) Display {settingsName} did not open, cannot calibrate.")
+            pglMessages.warning(f"Display {settingsName} did not open, cannot calibrate.")
             return None
         
         # run calibraiton
@@ -589,13 +589,13 @@ class pglDisplayCalibration():
             nSteps (int): Number of steps in the validation. (None will use the same as calibration)
         '''
         if self.luminanceCalibrationDevice is None:
-            print("(pglDisplayCalibration) No luminance calibration device specified. Please specify on initialization of pglDisplayCalibration")
+            pglMessages.warning("No luminance calibration device specified. Please specify on initialization of pglDisplayCalibration")
             return None
 
         if not self.checkLuminanceCalibrationData(self.luminanceCalibrationData):
-            print("(pglDisplayCalibration:validate) Calibration data is not valid. Cannot run validation.")
+            pglMessages.warning("Calibration data is not valid. Cannot run validation.")
             return None
-        print("(pglCalibration) Starting validation with inverse gamma correction...")
+        pglMessages.message("(pglCalibration) Starting validation with inverse gamma correction...")
         
         closeScreenOnEnd = False
         if e is None:
@@ -608,7 +608,7 @@ class pglDisplayCalibration():
             e.initScreen()
             closeScreenOnEnd = True
             if self.pgl.isOpen() is False:
-                print(f"(pglCalibration:validate) Display {self.luminanceCalibrationData.settingsName} did not open, cannot validate.")
+                pglMessages.message(f"Display {self.luminanceCalibrationData.settingsName} did not open, cannot validate.")
                 return None
         
         # defaults for nRepeats and nSteps
@@ -703,20 +703,20 @@ class pglDisplayCalibration():
             self.currentLuminanceCalibrationData.metalInfo = self.pgl.info()
             
         except Exception as ex:
-            print(f"(pglCalibration) Warning: Could not get display info: {ex}")
+            pglMessages.warning(f"Could not get display info: {ex}")
         
         # set the current display
         self.setDisplay()
 
         # now, tell operator to make sure everything is setup before continuing
         if validate:
-            print("(pglCalibration) Starting validation measurement...")
-            printHeader("Validating calibration with inverse gamma")
+            pglMessages.message("Starting validation measurement...")
+            pglMessages.printHeader("Validating calibration with inverse gamma")
         else:
-            print("(pglCalibration) Please ensure the calibration device is properly positioned and ready.")
-            print("(pglCalibration) Press Enter to continue...")
+            pglMessages.message("Please ensure the calibration device is properly positioned and ready.")
+            pglMessages.message("Press Enter to continue...")
             #input("")
-            printHeader("Establishing min and max values")
+            pglMessages.printHeader("Establishing min and max values")
         
         # loop to set display and make measurements
         while (self.setDisplay() != -1):
@@ -750,20 +750,20 @@ class pglDisplayCalibration():
         '''
         
         if luminanceCalibrationData is None:
-            print("(pglDisplayCalibration) No calibration data available. Please run calibrate() first.")
+            pglMessages.warning("No calibration data available. Please run calibrate() first.")
             return False
         
         # Check that calibration data is complete
         if not hasattr(luminanceCalibrationData, 'calibrationValues') or \
         not hasattr(luminanceCalibrationData, 'calibrationMeasurements'):
-            print("(pglDisplayCalibration:checkLuminanceCalibrationData) Calibration data is incomplete. Please run calibrate() first.")
+            pglMessages.warning("Calibration data is incomplete. Please run calibrate() first.")
             return False
         
         # Verify the calibration data matches expected size
         expectedSize = luminanceCalibrationData.nRepeats * luminanceCalibrationData.nSteps
         if len(luminanceCalibrationData.calibrationValues) != expectedSize or \
         len(luminanceCalibrationData.calibrationMeasurements) != expectedSize:
-            print(f"(pglDisplayCalibration:checkLuminanceCalibrationData) Calibration data size mismatch. Expected {expectedSize}, got {len(self.luminanceCalibrationData.calibrationValues)}")
+            pglMessages.warning(f"Calibration data size mismatch. Expected {expectedSize}, got {len(self.luminanceCalibrationData.calibrationValues)}")
             return False
         return True 
 
@@ -771,7 +771,7 @@ class pglDisplayCalibration():
         '''
         Display results of calibration and validation
         '''
-        if self.checkLLuminanceCalibrationData(self.luminanceCalibrationData):
+        if self.checkLuminanceCalibrationData(self.luminanceCalibrationData):
             self.luminanceCalibrationData.display()
         if self.checkLuminanceCalibrationData(self.luminanceValidationData):
             self.luminanceValidationData.display(gamma=1.0)
@@ -786,11 +786,11 @@ class pglDisplayCalibration():
             self.progressBar = tqdm(total=self.currentLuminanceCalibrationData.nSteps*self.currentLuminanceCalibrationData.nRepeats, desc="Calibrating", unit="measurements")
         else:
             if self.calibrationMode == "minmax":
-                print(f"(pglCalibration) {self.calibrationValueGet(-1)}: {self.calibrationMeasurementGet(-1)}")
+                pglMessages.print(f"{self.calibrationValueGet(-1)}: {self.calibrationMeasurementGet(-1)}")
             elif self.calibrationMode == "minsearch":
-                print(f"(pglCalibration) {self.calibrationValueGet(-1)}: {self.calibrationMeasurementGet(-1)}")
+                pglMessages.print(f"{self.calibrationValueGet(-1)}: {self.calibrationMeasurementGet(-1)}")
             elif self.calibrationMode == "full":
-                print(f"{self.calibrationMeasurementGet(-1):<6} ", end="")
+                pglMessages.print(f"{self.calibrationMeasurementGet(-1):<6} ", end="")
                 if self.progressBar is not None:
                     self.progressBar.update(1)
         
@@ -815,7 +815,7 @@ class pglDisplayCalibration():
             # this mode is to do a full calibration
             return self.getFullCalibrationValue()
         else:
-            print("(pglCalibration) Calibration is complete.")
+            pglMessages.message("Calibration is complete.")
             return None
     
     def getMinMaxCalibrationValue(self):
@@ -844,7 +844,7 @@ class pglDisplayCalibration():
             else:
                 # this calibration mode is to try to find the min value
                 self.calibrationMode = "minsearch"
-                print("(pglCalibration) Minimum value was not measurable, trying to find a measureable minimum")
+                pglMessages.message("Minimum value was not measurable, trying to find a measureable minimum")
                 return self.getFindMinCalibrationValue()
                 
         # return the value that was set
@@ -874,7 +874,7 @@ class pglDisplayCalibration():
                     self.findMinUnmeasurableVal = self.calibrationValueGet(-1)
             # if we are within epsilon of the unmeasurable value, then accept
             if (self.findMinMeasurableVal-self.findMinUnmeasurableVal) < self.epsilon:
-                print(f"(pglCalibration) Minimum measurable value found: {self.findMinMeasurableVal}")
+                pglMessages.message(f"Minimum measurable value found: {self.findMinMeasurableVal}")
                 self.minCalibrationVal = self.findMinMeasurableVal
                 self.calibrationMode = "full"
                 return self.getFullCalibrationValue()
@@ -893,19 +893,19 @@ class pglDisplayCalibration():
         if self.fullCalibrationIndex is None:
             self.fullCalibrationIndex = self.calibrationIndex
             # display the min and max value
-            printHeader(f"Starting Full Calibration between {self.minCalibrationVal} and {self.maxCalibrationVal}")
+            pglMessages.printHeader(f"Starting Full Calibration between {self.minCalibrationVal} and {self.maxCalibrationVal}")
             self.displayProgress(startProgress=True)
 
         if ((self.calibrationIndex-self.fullCalibrationIndex) % self.currentLuminanceCalibrationData.nRepeats) == 0:
             # set the next value to measure
             self.currentStep = (self.calibrationIndex-self.fullCalibrationIndex) // self.currentLuminanceCalibrationData.nRepeats
             if self.currentStep == self.currentLuminanceCalibrationData.nSteps:
-                print(f"")
-                printHeader("Full calibration complete.")
+                pglMessages.print(f"")
+                pglMessages.printHeader("Full calibration complete.")
                 self.calibrationMode = "done"
                 return -1
             value = self.minCalibrationVal + (self.maxCalibrationVal - self.minCalibrationVal) * (self.currentStep / (self.currentLuminanceCalibrationData.nSteps - 1))
-            print(f"\n(pglCalibration) Measuring step {self.currentStep+1:>3d}/{self.currentLuminanceCalibrationData.nSteps}: {value:.4f} = ", end="")
+            pglMessages.print(f"\n(pglCalibration) Measuring step {self.currentStep+1:>3d}/{self.currentLuminanceCalibrationData.nSteps}: {value:.4f} = ", end="")
             self.calibrationValueAppend(value)
         else:
             # repeat last value
@@ -963,7 +963,7 @@ class pglDisplayCalibration():
         Measure the display using the calibration device
         '''
         if self.luminanceCalibrationDevice is None:
-            print("(pglDisplayCalibration) No calibration device specified.")
+            pglMessages.message("No calibration device specified.")
 
         # make measurement
         self.calibrationMeasurementAppend(self.luminanceCalibrationDevice.measure())
@@ -982,7 +982,7 @@ class pglDisplayCalibration():
         '''
         # check calibration data
         if not self.checkLuminanceCalibrationData(self.luminanceCalibrationData):
-            print("(pglCalibration) Calibration data is not valid. Cannot save.")
+            pglMessages.warning("Calibration data is not valid. Cannot save.")
             return None
         
         # save the calibration data
@@ -1005,7 +1005,7 @@ class pglDisplayCalibration():
         
         filepath = pglDisplayCalibration.getCalibrationFilepath(displayName, makePath=False, calibrationType=calibrationType)
         if filepath is None:
-            print(f"(pglDisplayCalibration:chooseCalibrationFilepath) Could not get filepath for calibrations")
+            pglMessages.warning(f"Could not get filepath for calibrations")
             return
         
         # get all directories
@@ -1028,11 +1028,11 @@ class pglDisplayCalibration():
 
         # nothing to show
         if len(dirList) == 0:
-            print(f"(pglDisplayCalibration:chooseCalibrationFilepath) ❌ No calibration directories found in: {filepath}")
+            pglMessages.warning(f"No calibration directories found in: {filepath}")
             return None
 
         # print header
-        print(f"(pglDisplayCalibration:chooseCalibrationFilepath) Calibration directory: {filepath}")
+        pglMessages.message(f"Calibration directory: {filepath}")
 
         # print each directory
         for i, d in enumerate(dirList, start=1):
@@ -1059,13 +1059,13 @@ class pglDisplayCalibration():
                 # not a typical name, just show it
                 printName = d.name
 
-            print(f"{i}. {printName}", flush=True)
+            pglMessages.print(f"{i}. {printName}", flush=True)
 
         # ask the user to choose
-        print("\nSelect a directory number: ", flush=True)
+        pglMessages.print("\nSelect a directory number: ", flush=True)
         choice = int(input())
         if choice < 1 or choice > len(dirList):
-            print(f"(pglCalibration:chooseCalibrationFilepath) ❌ Invalid choice: {choice}")
+            pglMessages.warning(f"Invalid choice: {choice}",level=1)
             return None
 
         # return the chosen directory
@@ -1106,7 +1106,7 @@ class pglDisplayCalibration():
         else:
             # check that the path exists
             if not filepath.exists() or not filepath.is_dir():
-                print(f"(pglDisplayCalibration:getCalibrationFilepath) ❌ Could not find calibration directory: {filepath}")
+                pglMessages.warning(f"Could not find calibration directory: {filepath}")
                 return None
         
         return(filepath)
@@ -1140,7 +1140,7 @@ class pglDisplayTemporalCalibrationData(pglTraitSettings):
             fig:     matplotlib fig to plot into, None to create new plot
         '''
         if self.analogTraceData is None:
-            print(f"(pglDisplaytemporalCalibrationData:No data to display)")
+            pglMessages.message(f"No data to display)")
             return
         
         # display the analog traces        
@@ -1184,7 +1184,7 @@ class pglDisplayTemporalCalibrationData(pglTraitSettings):
         if filename is None:
             filename = "calibration"
         
-        print(f"(pglDisplayTemporalCalibrationData:load) Loading {filepath / filename}")
+        pglMessages.message(f"Loading {filepath / filename}")
         
         # call super load to instantiate the object and load it                
         return super(pglDisplayTemporalCalibrationData, cls).load(filepath / filename)    
@@ -1205,7 +1205,7 @@ class pglDisplayTemporalCalibrationData(pglTraitSettings):
         # draw vertical lines for onset and offset of video frames
         if self.onsetDelay is not None:
             times = [self.onsetDelay + 1000*i/self.frameRate for i in range(self.stimulusDurationFrames[1]+1)]
-            print(f"times: {times}")
+            pglMessages.print(f"times: {times}")
             [plt.axvline(x=t, color='red', linestyle='--') for t in times]
 
     def computeFrameOnsetDelay(self):
@@ -1268,13 +1268,13 @@ class pglDisplayTemporalCalibrationData(pglTraitSettings):
         # Make sure we have enough points to fit
         linearFit = False
         if rightIndex - leftIndex < 3:
-            print("Warning: fitting window too small, using fallback")
+            pglMessages.warning("Warning: fitting window too small, using fallback",level=1)
         else:
             # Fit linear function over this adaptive window
             xFit = np.arange(leftIndex, rightIndex + 1)
             yFit = cycle[leftIndex:rightIndex + 1]
-            print(f"xFit: {xFit}")
-            print(f"yFit: {yFit}")
+            pglMessages.print(f"xFit: {xFit}")
+            pglMessages.print(f"yFit: {yFit}")
             coeffs = np.polyfit(xFit, yFit, 1)
             m, c = coeffs
             
@@ -1350,7 +1350,7 @@ class pglDisplayLuminanceCalibrationData(pglTraitSettings):
         if filename is None:
             filename = "calibration"
 
-        print(filepath / filename)
+        pglMessages.print(filepath / filename)
         # call parent to save
         super().save(filepath / filename)
     
@@ -1372,7 +1372,7 @@ class pglDisplayLuminanceCalibrationData(pglTraitSettings):
         if filename is None:
             filename = "calibration.json"
         
-        print(f"(pglDisplayLuminanceCalibrationData:load) Loading {filepath / filename}")
+        pglMessages.print(f"Loading {filepath / filename}")
         
         # call super load to instantiate the object and load it                
         return super(pglDisplayLuminanceCalibrationData, cls).load(filepath / filename)
@@ -1388,13 +1388,13 @@ class pglDisplayLuminanceCalibrationData(pglTraitSettings):
         try:
             matData = loadmat(filename, squeeze_me=True, struct_as_record=False)
         except Exception as loadError:
-            print(f"Failed to load {filename}: {loadError}")
+            pglMessages.warning(f"Failed to load {filename}: {loadError}")
             return None
 
         # check for calib strcuture
         calib = matData.get('calib', None)
         if calib is None:
-            print(f"(pglDisplayLuminanceCalibrationData:loadMatlab) Could not find calib structure in: {filename}")
+            pglMessages.warning(f"Could not find calib structure in: {filename}")
             return None
         
         # instantiate the class
@@ -1404,7 +1404,7 @@ class pglDisplayLuminanceCalibrationData(pglTraitSettings):
         try:
             c.creationDateTime = datetime.strptime(calib.date, '%d-%b-%Y %H:%M:%S')
         except (AttributeError, ValueError) as dateError:
-            print(f"(pglDisplayLuminanceCalibrationData:loadMatlab) Could not parse date: {dateError}")
+            pglMessages.warning(f"Could not parse date: {dateError}")
             c.creationDateTime = None
             
         # set num repeats, because we only have the stored median value, always set to 1
@@ -1452,19 +1452,19 @@ class pglDisplayLuminanceCalibrationData(pglTraitSettings):
         Args:
             verbose (bool): If True, print detailed information.
         '''   
-        print("="*80)
-        print (f"Calibration Data for settings: {self.settingsName}")
+        pglMessages.printHeader()
+        pglMessages.print (f"Calibration Data for settings: {self.settingsName}")
         if self.gammaTableSize > 0:
-            print (f"Gamma Table Size: {self.gammaTableSize}")
-        print (f"Creation Date and Time: {self.creationDateTime}")
-        print (f"Number of Repeats: {self.nRepeats} number of Steps: {self.nSteps}")
+            pglMessages.print (f"Gamma Table Size: {self.gammaTableSize}")
+        pglMessages.print (f"Creation Date and Time: {self.creationDateTime}")
+        pglMessages.print (f"Number of Repeats: {self.nRepeats} number of Steps: {self.nSteps}")
         if verbose:
             values, measurements, minMeasurements, maxMeasurements = self.getMedianMeasurements()
             for iStep in range(self.nSteps):
-                print(f"Step {iStep:3d}/{self.nSteps}: {values[iStep]:<5.3f} = median: {measurements[iStep]:<7.3f} (min: {minMeasurements[iStep]:<7.3f}, max: {maxMeasurements[iStep]:<7.3f}, percent difference: {((maxMeasurements[iStep]-minMeasurements[iStep])/measurements[iStep]*100):<5.3f}%)")
+                pglMessages.print(f"Step {iStep:3d}/{self.nSteps}: {values[iStep]:<5.3f} = median: {measurements[iStep]:<7.3f} (min: {minMeasurements[iStep]:<7.3f}, max: {maxMeasurements[iStep]:<7.3f}, percent difference: {((maxMeasurements[iStep]-minMeasurements[iStep])/measurements[iStep]*100):<5.3f}%)")
             # compute max difference between max and min in percentage
             maxDiff = np.max(np.abs(maxMeasurements - minMeasurements)/measurements * 100)
-            print(f"Maximum difference between max and min measurements: {maxDiff:.3f}%")
+            pglMessages.print(f"Maximum difference between max and min measurements: {maxDiff:.3f}%")
         if verbose > 1:
             super().print()
             
@@ -1508,7 +1508,7 @@ class pglDisplayLuminanceCalibrationData(pglTraitSettings):
             inverseGamma (float): If not None, will plot the inverse table to achieve the input value
         '''
         if self.calibrationValues is None or self.calibrationMeasurements is None:
-            print("(pglDisplayLuminanceCalibrationData) No calibration data to display.")
+            pglMessages.message("No calibration data to display.")
             return
 
         # set the ideal gamma if we have one saved
@@ -1834,12 +1834,12 @@ class pglDisplayLuminanceCalibrationData(pglTraitSettings):
 
         inverseGammaTable = self.calculateInverseGamma(gamma, self.gammaTableSize)
         if inverseGammaTable == None:
-            pglMessages.warning("Not able to compute gamma table for display {display.displayName}")
+            pglMessages.warning(f"Not able to compute gamma table for display {display.displayName}")
             return
         
         # check display Num
         if display.currentDisplayNum == -1:
-            pglMessages.warning("Display {display.displayName} is not currently connected, cannot set gamma table")
+            pglMessages.warning(f"Display {display.displayName} is not currently connected, cannot set gamma table")
             return
 
         # set the gamma table
