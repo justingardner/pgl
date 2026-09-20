@@ -1246,13 +1246,21 @@ class pglSettings(pglTraitSettings):
     manualPreStart = Bool(False, help="Whether to manually start the experiment before the volume trigger")
     closeScreenOnEnd = Bool(True, help="Whether to close the screen when the experiment ends")
     backgroundColor = List(trait=Float(min=0.0, max=1.0), default_value=[0.5, 0.5, 0.5],minlen=3,maxlen=3,help="Background color as a list of RGB values").tag(isRGB=True)
-    digitalIO = List(Instance(pglItem), default_value=[pglItem(name='DATAPixx'),pglItem(name='LabJack')], settingsListKey="name", multiSelect=True, style="dropdown", help='Select which devices to use for digital IO')
-    devices = List(Instance(pglItem), default_value=[pglItem(name='RESPONSEPixx')], settingsListKey="name", multiSelect=True, style="dropdown", help='Select which devices to use for digital IO')
+    _digitalIO = List(Instance(pglItem), default_value=[pglItem(name='DATAPixx'),pglItem(name='LabJack')], settingsListKey="name", multiSelect=True, style="dropdown", traitDisplayName="digitalIO", help='Select which devices to use for digital IO',visible=True)
+    _devices = List(Instance(pglItem), default_value=[pglItem(name='RESPONSEPixx')], settingsListKey="name", multiSelect=True, style="dropdown", traitDisplayName="devices", help='Select which devices to use for digital IO', visible=True)
     eyetracker = List(Unicode(), default_value=['None', 'Eyelink', 'TRACKPixx'], help="Eyetracker")
     
     def __init__(self):
         super().__init__()
         self.reloadDisplays()
+    
+    @property
+    def digitalIO(self):
+        return [d.name for d in self._digitalIO if d.isSelected]
+
+    @property
+    def devices(self):
+        return [d.name for d in self._devices if d.isSelected]
 
     @classmethod
     def load(cls, filename, filesystem=None):
@@ -1272,8 +1280,8 @@ class pglSettings(pglTraitSettings):
         
         # reconcile fields for which defaults might change over time so that they include
         # any new defaults we add
-        cls.reconcileDefaults('digitalIO')
-        cls.reconcileDefaults('devices')
+        cls.reconcileDefaults('_digitalIO')
+        cls.reconcileDefaults('_devices')
         cls.reconcileDefaults('eyetracker')
         
         return cls

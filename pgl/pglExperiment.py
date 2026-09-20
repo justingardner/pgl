@@ -608,6 +608,12 @@ class pglExperiment(pglExperimentBase):
 
             # display device status
             self.pgl.deviceStatus()
+            
+            # set up digitalIO
+            self.initDigitalIO()
+            
+            # set up devices
+            self.initDevices()
 
             # call configure on all tasks, this allows any task with configure implemeneted
             # to use information from the initialized pglExperiment in its configurtion
@@ -873,6 +879,37 @@ class pglExperiment(pglExperimentBase):
         # if we got here then we finished the run without error
         self.state.runFinishedWithError = False
     
+    def initDigitalIO(self):
+        '''
+        initialize digital IO device if settings calls for them to be initialized
+        '''
+        print("*^"*40)
+        print(self.settings.digitalIO)
+        print("*^"*40)
+        #for digitalIO in self.settings.digitalIO:
+            
+
+    def endDigitalIO(self):
+        '''
+        end digitalIO devices
+        '''
+        
+    def initDevices(self):
+        '''
+        initialize devices
+        '''
+        print("*^"*40)
+        print(self.settings.devices)
+        print("*^"*40)
+        #for digitalIO in self.settings.digitalIO:
+            
+
+    def endDevices(self):
+        '''
+        end digitalIO devices
+        '''
+        
+        
     def initEyeTracker(self):
         '''Initialize eye tracker if we have an eye tracker.'''
         # load eye tracker settings
