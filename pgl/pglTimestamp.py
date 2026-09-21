@@ -71,7 +71,8 @@ class pglTimestamp:
             parts.append(f"{minutes} min{'s' if minutes != 1 else ''}")
         if secs:
             parts.append(f"{secs}s")
-        if ms or not parts:
+        # only print ms, if nothing else printed
+        if not parts:
             parts.append(f"{ms}ms")
 
         return " ".join(parts)
