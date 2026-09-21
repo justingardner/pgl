@@ -1039,7 +1039,23 @@ class pglExperiment(pglExperimentBase):
                 self.state.currentPhaseIndex += 1
                 self.startPhase(phaseNum=self.state.phaseNums[self.state.currentPhaseIndex])
 
-        
+    def isAbortedRun(self):
+        '''
+        heuristics to reutnr true/false on aborted runs
+        '''
+        aborted = False
+        for task in self.tasks:
+            if task.settings.nTrials != np.inf:
+                # if less trials than nTrials were run, then it is aborted
+                if task.state.currentTrial+1 < task.settings.nTrials:
+                    pglMessages.message(f"Detected aborted task with {task.state.currentTrial+1}/{task.settings.nTrials} trials run: {task.settings.taskSaveName}", messageType='experiment')
+                    aborted=True
+            else:
+                # if less than 10 trials were run it is aborted
+                if task.state.currentTrial < 10:
+                    pglMessages.message(f"Detected aborted task with less than 10 trials: {task.settings.taskSaveName}",messageType='experiment')
+                    aborted=True
+        return aborted
     
     def save(self):
         '''
@@ -1047,12 +1063,17 @@ class pglExperiment(pglExperimentBase):
         '''
         # Create the directory to save data into (dataDir/experimentSaveName/subjectID/YYYYMMDD_HHMMSS)
         try:
+            if self.settings.saveAbortedRunsToTrash and self.isAbortedRun():
+                runName = Path("trash") / self.experimentSettings.runName
+            else:
+                runName = self.experimentSettings.runName
+            
             dataPath = (
                 Path(self.settings.dataPath).expanduser()
                 / self.experimentSettings.experimentSaveName
                 / self.experimentSettings.subjectID
                 / self.experimentSettings.sessionName
-                / self.experimentSettings.runName
+                / runName
             )
 
             # If the run directory already exists, append a timestamp to its name.
@@ -1145,10 +1166,10 @@ class pglExperiment(pglExperimentBase):
                     for fileName in requiredFiles
                 )
 
-            # Include dataPath itself, as well as any nested run directories.
+            # Look for runDirs
             runDirs = (
                 directory
-                for directory in (dataPath, *dataPath.rglob("*"))
+                for directory in dataPath.iterdir()
                 if isRunDirectory(directory)
             )
 
