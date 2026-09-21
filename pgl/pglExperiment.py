@@ -1224,12 +1224,18 @@ class pglExperiment(pglExperimentBase):
         try:
             self.setVerbose(verbose=False)
             tasks = self.getLastRun(task=task, allRuns=True)
+
+            self.setVerbose()
+            if tasks: self.pgl.printHeader("previous runs from this session", messageType='experiment')
                         
             for iRun, task in enumerate(tasks):
                 self.setVerbose()
                 pglMessages.print(f"{iRun:2d}:{task.settings.taskSaveName} nTrials={task.state.currentTrial:3d} ran {pglTimestamp.formatDuration(self.pgl.getSecs()-task.data.startTime)} ago", messageType='experiment')
                 self.setVerbose(verbose=False)
+            
             self.setVerbose()
+            if tasks: self.pgl.printHeader(messageType='experiment')
+
             
         except Exception as e:
             pglMessages.warning(f"Unable to load last run: {e}")
