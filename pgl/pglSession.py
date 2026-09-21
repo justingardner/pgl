@@ -19,6 +19,7 @@ from .pglPipeline import pglActionable
 from .pglMessages import pglMessages
 from types import SimpleNamespace
 import pandas as pd
+from .pglExperiment import pglTask
 try:
     import mne
 except ImportError:
@@ -89,14 +90,14 @@ class pglRun(pglExperimentBase):
     def tasks(self):
         '''Experiment tasks'''
         if self._tasks is None:
-            print("GOT NONE HERE")
             pglMessages.message(f"Loading tasks for: {self.filesystemPrefix}/{self.fullDataPath}")
             filesystem, fullDataPath, _ = pglBase.validateFilesystem(filesystem=self.filesystem, dataPath=self.fullDataPath, filesystemPrefix=self.filesystemPrefix)
             taskNames = self.experimentSettings.tasks
             self._tasks = []
-            for taskName in taskNames:
+            for iTask, taskName in enumerate(taskNames):
                 print(f"taskName: {taskName}")
-                self._tasks.append(pglTaskBase.load(dataPath=f"{fullDataPath}{filesystem.sep}{taskName}", filesystem=filesystem))
+                taskDirName = pglTask.getTaskDirectoryName(iTask,taskName)
+                self._tasks.append(pglTaskBase.load(dataPath=f"{fullDataPath}{filesystem.sep}{taskDirName}", filesystem=filesystem))
         return self._tasks
 
     @tasks.setter
@@ -458,7 +459,7 @@ class pglSession(pglActionable):
     runs = List(Instance(pglRun), allow_none=True, help="List of all runs")
     
     # mne MEG/EEG data
-    mne = Instance(pglMNE, help="MEG/EEG data in the form of an MNE variable")
+    mne = Instance(pglMNE, allow_none=True, help="MEG/EEG data in the form of an MNE variable")
     
     def __init__(self, filesystem=None, filesystemPrefix='', runList=[]):
         '''

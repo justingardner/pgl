@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Annotated
 from .pglTimestamp import pglTimestamp
 from datetime import datetime
+import inspect
 
 ########################
 # action status
@@ -138,14 +139,63 @@ class pglAction(pglActionable):
     
     # init action
     #-----------------
-    def __init__(self):
-        '''
-        initialize the action
-        '''
+    def __init__(self, **kwargs):
+        super().__init__()
+
+        # initialize basic action
         self.name = self.__class__.__name__
         self.status = pglActionStatus.INITIALIZED
         self.version = "0.0"
 
+    @classmethod
+    def execute(cls, **kwargs):
+        """Create, configure, and run an action, returning its result."""
+        action = cls()
+
+        configureNames = cls._getKeywordNames(action.configure)
+
+        # run() is a wrapper; _run() declares the actual run parameters.
+        runNames = (
+            cls._getKeywordNames(action.run)
+            | cls._getKeywordNames(action._run)
+        )
+
+        # Catch misspelled or unsupported arguments.
+        unknownNames = set(kwargs) - (configureNames | runNames)
+        if unknownNames:
+            unknownText = ", ".join(sorted(unknownNames))
+            raise TypeError(
+                f"{cls.__name__}.execute() got unknown argument(s): "
+                f"{unknownText}"
+            )
+
+        configureArgs = {
+            name: value
+            for name, value in kwargs.items()
+            if name in configureNames
+        }
+
+        runArgs = {
+            name: value
+            for name, value in kwargs.items()
+            if name in runNames
+        }
+
+        action.configure(**configureArgs)
+        return action.run(**runArgs)
+
+    @staticmethod
+    def _getKeywordNames(method):
+        """Return explicitly declared parameters accepting keyword arguments."""
+        return {
+            name
+            for name, parameter in inspect.signature(method).parameters.items()
+            if parameter.kind in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            )
+        }
+        
     def configure(self) -> None:
         '''
         Configure the action, this should be subclassed, and the subclass should call this super function

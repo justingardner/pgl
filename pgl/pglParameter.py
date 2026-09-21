@@ -30,7 +30,7 @@ class pglParameter(pglStateDataSettings):
     '''
     Class representing a parameter in the experiment.
     '''
-    def __init__(self, name: str, validValues: list|tuple|np.ndarray, description: str="", randomize=True, catchTrialEvery=None, randomSeed=None):
+    def __init__(self, name: str|None = None, validValues: list|tuple|np.ndarray|None=None, description: str="", randomize=True, catchTrialEvery=None, randomSeed=None):
         '''
         Initialize the parameter.
         
@@ -41,6 +41,10 @@ class pglParameter(pglStateDataSettings):
                 E.g. catchTrialEvery=5 will randomly return a None every 5 trials 
             description (str, optional): Description string describing the parameter.
         '''
+        if name is None and validValues is None:
+            # this is an init call from a save (like in a list) which does not use the load_from_file methods
+            # and should just init the instance and return 
+            return
         # initialize state, data, and settings
         if not hasattr(self, 'settings') or self.settings is None:
             self.settings = pglParameterSettings()
@@ -451,27 +455,42 @@ class pglParameterBlock(pglParameter):
         self._rng.shuffle(block)
         # and return
         return (self.settings.parameterNames, block)
-    
+
+    def save(self, dataPath='.', filesystem=None, filesystemPrefix=None):
+        '''
+        Save the parameter settings, state and data. Handles saving the parameters in the block       
+        '''
+        # call parent to save
+        super().save(dataPath=dataPath, filesystem=filesystem, filesystemPrefix=filesystemPrefix)
+
+        # need a path to save parameteres in block
+        dataPath = Path(dataPath) / self.settings.name / "parameters"
+        
+        # save each parameter in the block there
+        for p in self.settings.parameters:
+            p.save(dataPath=dataPath, filesystem=filesystem, filesystemPrefix=filesystemPrefix)
+        
     def load(self, parameterDir,filesystem=None):
         '''
-        Load function handles recreation of self.settings.parameters list
-        As these will just get saved out as a dicts because they are not
-        derived from pglSerialize.
+        Load the pparameter block including the parameters being blocked over
         '''
         # call super
         super().load(parameterDir, filesystem=filesystem)
 
-        # now for each parameter recreate the structure
-        parameters = []
-        for i, p in enumerate(self.settings.parameters):
-            # get the saved structures
-            settings = p['settings']
-            state = p['state']
-            data = p['data']
-
-            # and recreate the parameter
-            parameters.append(pglParameter.from_settings_state_data(settings,state,data))
+        # path for parameters in the block
+        parameterDir = Path(parameterDir) / "parameters"
         
+        # load each parameter
+        parameters = []
+        for name in self.settings.parameterNames:
+            
+            # get the saved structures
+            parameter = pglParameter.from_file(parameterDir / name, filesystem=filesystem)
+            if parameter is None:
+                pglMessages.warning(f"Skipping parameter {name} that failed to load: {parameterDir / name}")
+                continue
+            parameters.append(parameter)
+
         # now reset the parameters
         self.settings.parameters = parameters
 ##########################

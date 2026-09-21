@@ -218,7 +218,8 @@ class pglExperimentBase(pglStateDataSettings):
             
             for iTask, taskName in enumerate(obj.experimentSettings.tasks):
                 # get the task directory
-                taskPath = f"{experimentPath}{filesystem.sep}{taskName}"
+                taskDirName = pglTask.getTaskDirectoryName(iTask,taskName)
+                taskPath = f"{experimentPath}{filesystem.sep}{taskDirName}"
 
                 # load the task data
                 if filesystem.isdir(taskPath):
@@ -483,7 +484,7 @@ class pglExperiment(pglExperimentBase):
             self.state.display = self.settings.displays[0]
         
             # make pgl quieter
-            self.initVerbose()
+            self.setVerbose()
             
             # close all other screens
             self.pgl.cleanUp()
@@ -805,6 +806,7 @@ class pglExperiment(pglExperimentBase):
         pglMessages.message(f"Experiment started.",messageType='experiment')
         self.startPhase(phaseNum=0)
         self.data.startTime = self.pgl.getSecs()
+        self.data.startDate = datetime.now().astimezone().isoformat()
 
         while not self.state.experimentDone:
             
@@ -1083,23 +1085,43 @@ class pglExperiment(pglExperimentBase):
         # and call parent to save rest
         super().save(dataPath=dataPath)
     
-    def getLastRun(self, task=None):
-        '''
-        will load the last run of the experiment, so parameters that were run last can be checked
-        
+    def getLastRun(self, task=None, allRuns=False):
+        """Load saved runs or their matching tasks.
+
         Args:
-            task (pglTask): If set then will return the matching task - typically called by a task
-            
+            task (pglTask, optional): A task from self.tasks. When provided,
+                return the task at the same index in each selected run.
+            allRuns (bool): Return all matches, newest first, instead of
+                only the latest run's match.
+
         Returns:
-            pglRun (if task is not set)
-            pglTask (if task is set)
-            None if there is no last experiment or o match
-        '''
+            When allRuns=False:
+                pglRun, pglTask, or None if no match exists.
+            When allRuns=True:
+                A list of pglRun or pglTask objects, or an empty list.
+                Tasks missing from a saved run are omitted.
+        """
         try:
-            # import pglRun
             from .pglSession import pglRun
-            
-            # path where this experiment is being stored
+
+            emptyResult = [] if allRuns else None
+
+            # Resolve the requested task's position in the current experiment.
+            taskIndex = None
+            if task is not None:
+                taskIndex = next(
+                    (index for index, currentTask in enumerate(self.tasks)
+                    if currentTask is task),
+                    None,
+                )
+
+                if taskIndex is None:
+                    pglMessages.warning(
+                        f"Could not find matching task for {task.settings.taskName}"
+                    )
+                    return emptyResult
+
+            # Directory containing this session's saved runs.
             dataPath = (
                 Path(self.settings.dataPath).expanduser()
                 / self.experimentSettings.experimentSaveName
@@ -1107,42 +1129,56 @@ class pglExperiment(pglExperimentBase):
                 / self.experimentSettings.sessionName
             )
 
-            # files that indicate there is an actual run            
-            requiredFiles = {"experimentSettings.json", "settings.json", "state.json", "data.json"}
+            if not dataPath.is_dir():
+                return emptyResult
 
-            # find all the run directories
-            runDirs = [
+            requiredFiles = (
+                "experimentSettings.json",
+                "settings.json",
+                "state.json",
+                "data.json",
+            )
+
+            def isRunDirectory(directory):
+                return directory.is_dir() and all(
+                    (directory / fileName).is_file()
+                    for fileName in requiredFiles
+                )
+
+            # Include dataPath itself, as well as any nested run directories.
+            runDirs = (
                 directory
-                for directory in [dataPath, *dataPath.rglob("*")]
-                if directory.is_dir() and all((directory / fileName).is_file() for fileName in requiredFiles)
+                for directory in (dataPath, *dataPath.rglob("*"))
+                if isRunDirectory(directory)
+            )
+
+            runs = [
+                pglRun(fullDataPath=runDir)
+                for runDir in runDirs
             ]
 
-            # init variables
-            lastRunTime = 0
-            lastRun = None
+            if not runs:
+                return emptyResult
+
+            runs.sort(key=lambda run: run.data.startTime, reverse=True)
+
+            # Only inspect the latest run unless all runs were requested.
+            selectedRuns = runs if allRuns else runs[:1]
+
+            if task is None:
+                return selectedRuns if allRuns else selectedRuns[0]
+
+            matchingTasks = []
+            for run in selectedRuns:
+                savedTask = run.getTaskAt(taskIndex)
+                if savedTask is not None:
+                    matchingTasks.append(savedTask)
+
+            if allRuns:
+                return matchingTasks
+
+            return matchingTasks[0] if matchingTasks else None
             
-            # check all runs and find the last one
-            for runDir in runDirs:
-                fullDataPath = dataPath / runDir
-                run = pglRun(fullDataPath=fullDataPath)
-                if run.data.startTime > lastRunTime:
-                    lastRun = run
-                    lastRunTime = run.data.startTime
-                    
-            # if we found a last run and task was set, return the matching task (if it exists)        
-            if lastRun is not None and task is not None:
-                # figure which task this is
-                taskIndex = next((index for index, t in enumerate(self.tasks) if t is task), None)
-                if taskIndex is None:
-                    pglMessages.warning(f"Could not find matching task for {task.settings.taskName}")
-                    return None
-                # get the task from the run
-                lastTask = lastRun.getTaskAt(taskIndex)
-                #print(f"Last Task: {lastTask}")
-                return lastTask
-                
-            return lastRun
-        
         except Exception as e:
             pglMessages.warning(f"Unable to load last run: {e}")
 
@@ -1156,10 +1192,34 @@ class pglExperiment(pglExperimentBase):
         else:
             None
             
-    def initVerbose(self):
+    def printLastRuns(self, task):
+        '''
+        displays last runs in session
+        eex
+        Args:
+            task (pglTask): If set will display how many trials were run in specified task
+            
+        '''
+        try:
+            self.setVerbose(verbose=False)
+            tasks = self.getLastRun(task=task, allRuns=True)
+                        
+            for iRun, task in enumerate(tasks):
+                self.setVerbose()
+                pglMessages.print(f"{iRun:2d}:{task.settings.taskSaveName} nTrials={task.state.currentTrial:3d} ran {pglTimestamp.formatDuration(self.pgl.getSecs()-task.data.startTime)} ago", messageType='experiment')
+                self.setVerbose(verbose=False)
+            self.setVerbose()
+            
+        except Exception as e:
+            pglMessages.warning(f"Unable to load last run: {e}")
+
+    def setVerbose(self, verbose=True):
         if not self.settings.verbose:
             # only let experiment and parameter message through (warnings will also print)
-            pglMessages.setEnabledTypes(['experiment','parameter'])
+            if verbose:
+                pglMessages.setEnabledTypes(['experiment','parameter'])
+            else:
+                pglMessages.setEnabledTypes(set())
             self.pgl.verbose=False
 
     def endVerbose(self):
@@ -1402,7 +1462,7 @@ class pglTaskBase(pglTraitSettings):
         Save the task settings, state and data.
         '''
         try:
-            dataPath = Path(dataPath) / self.getTaskDirectoryName()
+            dataPath = Path(dataPath) / self._getTaskDirectoryName()
             dataPath.mkdir(parents=True, exist_ok=True)
         except Exception as e:
             pglMessages.warning(f"Could not create task data directory {dataPath}: {e}")
@@ -1423,12 +1483,20 @@ class pglTaskBase(pglTraitSettings):
             pglMessages.warning(f"Could not save task parameters to {dataPath}: {e}")
         pglMessages.message(f"Saved task {self.settings.taskName} to {dataPath}")
 
-    def getTaskDirectoryName(self):
+    def _getTaskDirectoryName(self):
         """Return the directory name used to save this task."""
 
-        taskDirectoryName = f"task{self.settings.taskID:02d}_{self.settings.taskSaveName}"
+        #taskDirectoryName = f"task{self.settings.taskID:02d}_{self.settings.taskSaveName}"
+        taskDirectoryName = self.getTaskDirectoryName(taskID=self.settings.taskID-1,taskName=self.settings.taskSaveName)
 
         return taskDirectoryName
+    
+    @classmethod
+    def getTaskDirectoryName(cls, taskID, taskName):
+        
+        taskDirectoryName = f"task{taskID+1:02d}_{taskName}"
+        return taskDirectoryName
+    
     @classmethod
     def load(cls, dataPath, filesystem=None):
         '''
@@ -1772,7 +1840,7 @@ class pglTask(pglTaskBase):
         pglMessages.message(f"Ending task {self.settings.taskName}",messageType='experiment')
         endTime = self.pgl.getSecs()
         self.data.endTime = endTime
-        
+        pglMessages.message(f"THE END TIME IS HERE: {endTime} {self.data.endTime}")
         # put in time stamps for end of last segment and trial
         self.data.events.append(pglEventSegment(self.state.currentSegment, endTime, eventType=pglEventSegment.boundaryType.END))
         self.data.events.append(pglEventTrial(self.state.currentTrial, endTime, eventType=pglEventTrial.boundaryType.END))
@@ -1835,6 +1903,7 @@ class pglExperimentSettings(pglTraitSettings):
 ##############################################
 class pglExperimentData(pglTraitSettings):
     startTime = Float(0.0, help="Time in secs of start of experiment")
+    startDateTime = Unicode("", help="Experiment start date and time in ISO format")
     endTime = Float(0.0, help="Time in secs of end of experiment")
     events = List(Instance(pglEvent), default_value=[], help="List of events from experiment")
 
