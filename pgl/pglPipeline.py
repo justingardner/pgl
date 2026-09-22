@@ -148,17 +148,22 @@ class pglAction(pglActionable):
         self.version = "0.0"
 
     @classmethod
-    def execute(cls, **kwargs):
+    def execute(cls, *args, **kwargs):
         """Create, configure, and run an action, returning its result."""
+        
         action = cls()
-
         configureNames = cls._getKeywordNames(action.configure)
+        runNames = cls._getKeywordNames(action.run) | cls._getKeywordNames(action._run)
+        validText = ", ".join(sorted(configureNames | runNames)) or "(none)"
 
-        # run() is a wrapper; _run() declares the actual run parameters.
-        runNames = (
-            cls._getKeywordNames(action.run)
-            | cls._getKeywordNames(action._run)
-        )
+        if args:
+            pglMessages.warning(f"{cls.__name__}.execute() requires keyword arguments, but received {len(args)} positional argument(s). Accepted keyword arguments: {validText}. Pass arguments as name=value.")
+            raise TypeError(f"{cls.__name__}.execute() requires keyword arguments")
+
+        # no positional argument allowed
+        if args:
+            pglMessages.warning(f"Requires keyword arguments, but received {len(args)} positional argument(s). Pass arguments by name—for example: {cls.__name__}.execute(session=session, all=True)")
+
 
         # Catch misspelled or unsupported arguments.
         unknownNames = set(kwargs) - (configureNames | runNames)
