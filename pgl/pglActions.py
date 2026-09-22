@@ -168,6 +168,122 @@ class pglActions():
             # return the session
             return session
 
+    ################################################################
+    # load NetStation
+    ################################################################
+    class loadNetStation(pglAction):
+
+        # settings
+        selectedPaths = List(Unicode(), help="Paths of MFF recording directories selected for loading")
+        filesystemPrefix = Unicode("", help="Filesystem prefix like ssh:// for non-local recordings")
+
+        ################################
+        # configure
+        ################################
+        def configure(self, fullDataPath: str=None, settings: pglSettings=None, settingsName: str=None, filesystem: AbstractFileSystem=None, filesystemPrefix: str=None, dataPath: str=None) -> None:
+            """
+            Choose NetStation MFF recordings and store their paths.
+            """
+
+            # Choose the MFF recordings to load.
+            filesystem, mffList, filesystemPrefix = pglChoose.getNetStation(fullDataPath=fullDataPath, settings=settings, settingsName=settingsName, filesystem=filesystem, filesystemPrefix=filesystemPrefix, dataPath=dataPath)
+
+            # User cancelled or the data path could not be accessed.
+            if filesystem is None:
+                return
+
+            # Store selected MFF paths.
+            self.selectedPaths = mffList or []
+            self.filesystemPrefix = filesystemPrefix or ""
+
+            # We are now configured, so call super to set status.
+            super().configure()
+
+        ################################
+        # run
+        ################################
+        def _run(self, session: pglSession | None = None, verbose: bool = True):
+            """
+            Load selected NetStation MFF recordings into pglMNE.
+
+            Remote MFF packages are copied to temporary local storage.
+            Data are preloaded before the temporary copies are removed.
+            """
+
+            if not self.selectedPaths:
+                self.setError("No NetStation MFF recordings selected")
+                return None
+
+            # Load libraries.
+            from pathlib import Path
+            from tempfile import TemporaryDirectory
+            from fsspec.implementations.local import LocalFileSystem
+            from pgl import pglBase
+
+            try:
+                import mne
+            except ImportError as e:
+                self.setError(f"mne library not available: {e}")
+                return None
+
+            # Recreate the filesystem using the saved path and prefix.
+            filesystem, _, _ = pglBase.validateFilesystem(dataPath=self.selectedPaths[0], filesystemPrefix=self.filesystemPrefix)
+
+            if filesystem is None:
+                self.setError(f"Could not access NetStation MFF recording: {self.selectedPaths[0]}")
+                return None
+
+            # Initialize the class which holds MNE data.
+            mneData = pglMNE()
+            loadedCount = 0
+
+            # Load the MFF recordings.
+            for mffPath in self.selectedPaths:
+                try:
+                    if verbose:
+                        pglMessages.message(f"Loading NetStation MFF recording: {mffPath}")
+
+                    if not filesystem.isdir(mffPath):
+                        raise ValueError("Expected an MFF recording directory")
+
+                    if isinstance(filesystem, LocalFileSystem):
+                        # MNE can read local MFF packages directly.
+                        localMffPath = filesystem._strip_protocol(mffPath)
+                        raw = mne.io.read_raw_egi(localMffPath, preload=True, verbose=False)
+
+                    else:
+                        # MNE needs the complete MFF package on local storage.
+                        with TemporaryDirectory(prefix="pglNetStation_") as tempDir:
+                            recordingName = str(mffPath).rstrip("/").rsplit("/", 1)[-1]
+                            localMffPath = Path(tempDir) / recordingName
+
+                            if verbose:
+                                pglMessages.message("Copying remote MFF package to temporary local storage")
+
+                            filesystem.get(str(mffPath).rstrip("/"), str(localMffPath), recursive=True)
+                            raw = mne.io.read_raw_egi(str(localMffPath), preload=True, verbose=False)
+
+                        # preload=True keeps signal data available after cleanup.
+
+                    # Save the original source path rather than the temporary path.
+                    mneData.add(raw, filename=mffPath, filesystemPrefix=self.filesystemPrefix)
+                    loadedCount += 1
+
+                except Exception as e:
+                    self.setError(f"Could not load MFF recording {mffPath}: {e}")
+
+            # Do not add an empty container if every recording failed.
+            if loadedCount == 0:
+                return None
+
+            # If session is None, create one.
+            if session is None: session = pglSession()
+
+            # Add the MNE data to the session.
+            session.add(mneData)
+
+            return session
+
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
     # concatenate
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
@@ -564,18 +680,36 @@ class pglActions():
             if session.mne is None or session.mne.raw is None:
                 self.setError("session does not have raw mne loaded")
                 return None
+            
+            # Select EEG and MEG channels, excluding channels marked bad.
+            dataPicks = mne.pick_types(session.mne.raw.info, meg=True, eeg=True, exclude="bads")
                 
             # apply low and high pass filter
-            session.mne.raw.load_data().filter(l_freq=self.lowCutoff,h_freq=None)
-            session.mne.raw.load_data().filter(l_freq=None,h_freq=self.highCutoff)
+            session.mne.raw.load_data().filter(l_freq=self.lowCutoff,h_freq=None,picks=dataPicks)
+            session.mne.raw.load_data().filter(l_freq=None,h_freq=self.highCutoff,picks=dataPicks)
             
             # apply notch filter
             if self.notch:                
                 meg_picks = mne.pick_types(session.mne.raw.info, meg=True)
-                session.mne.raw.notch_filter(freqs=self.notchFrequency, picks=meg_picks)
+                session.mne.raw.notch_filter(freqs=self.notchFrequency, picks=dataPicks)
             
             # display spectrum    
-            session.mne.raw.compute_psd(fmax=100).plot(average=False, picks="data", exclude="bads",amplitude=False)            
+            maxFrequency = min(100.0, session.mne.raw.info["sfreq"] / 2)
+            spectrum = session.mne.raw.compute_psd(picks=dataPicks, fmax=maxFrequency)
+            power = spectrum.get_data()
+
+            # Identify zero-power or invalid channels.
+            zeroChannels = [name for name, values in zip(spectrum.ch_names, power) if np.all(values == 0)]
+            invalidChannels = [name for name, values in zip(spectrum.ch_names, power) if not np.all(np.isfinite(values))]
+            plotChannels = [name for name in spectrum.ch_names if name not in zeroChannels + invalidChannels]
+
+            print(f"Zero-power channels: {zeroChannels}")
+            print(f"Nonfinite-power channels: {invalidChannels}")
+
+            if plotChannels:
+                spectrum.plot(picks=plotChannels, average=False, amplitude=False)
+            else:
+                pglMessages.warning("No channels with valid nonzero power to plot")
             
             # and return
             return session
@@ -865,7 +999,7 @@ class pglActions():
                 spectrum = session.mne.evoked.compute_psd(method="welch", picks=self.picks, fmin=self.minFreq, fmax=self.maxFreq)
                 psds, freqs = spectrum.get_data(return_freqs=True)
                 psd = psds.mean(axis=0)
-                # convert to fT^2/Hz
+                # convert to fT^2/Hz    
                 psd = psd * 1e30
 
             figPsd, ax = plt.subplots(figsize=(12, 6))
