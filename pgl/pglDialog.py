@@ -155,7 +155,26 @@ class _pglTraitsDialog(QDialog):
             entry['setter'](value)
         finally:
             self._updatingWidget = False
+            
+    def _onPlotWindowClosed(self):
+        """Reset plot controls when the separate window is closed."""
 
+        self.plotCanvas.setVisible(False)
+        self.plotButtonState = False
+        self.settingsListPlotButtonState = False
+        self.multiSelectPlotButtonState = False
+
+        for state in self._selectedSettings.values():
+            if "plotVisible" in state:
+                state["plotVisible"] = False
+
+        button = self._activePlotButton
+        if button is not None:
+            wasBlocked = button.blockSignals(True)
+            button.setChecked(False)
+            button.blockSignals(wasBlocked)
+
+        self._activePlotButton = None
     #########################################
     # UI construction
     #########################################
@@ -176,13 +195,18 @@ class _pglTraitsDialog(QDialog):
                 continue
             self._addTraitWidget(traitName, trait)
 
-        # Shared matplotlib axis for any plot-button traits
-        self.figure = Figure(figsize=(5, 3))
+        # Shared matplotlib figure, displayed in a separate window.
+        self.plotWindow = _PlotWindow(self)
+        self.figure = Figure(figsize=(10, 7), constrained_layout=True)
         self.plotAxis = self.figure.add_subplot(111)
-        self.plotCanvas = ScrollableFigureCanvas(self.figure)
-        self.plotCanvas.setMinimumHeight(680)
+        self.plotCanvas = _WindowFigureCanvas(self.figure, self.plotWindow)
+
+        plotLayout = QVBoxLayout(self.plotWindow)
+        plotLayout.setContentsMargins(0, 0, 0, 0)
+        plotLayout.addWidget(self.plotCanvas)
+
         self.plotCanvas.setVisible(False)
-        self.formLayout.addRow(self.plotCanvas)
+        self.finished.connect(lambda result: self._onPlotWindowClosed())
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -253,7 +277,19 @@ class _pglTraitsDialog(QDialog):
         # give hint for window to stay on top
         self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
         self.show()
-        
+
+        # Position half a dialog-width to the right of its normal centered position.
+        screenRect = self.screen().availableGeometry()
+        dialogRect = self.frameGeometry()
+
+        x = screenRect.left() + screenRect.width() // 2
+        y = screenRect.top() + (screenRect.height() - dialogRect.height()) // 2
+
+        # Keep the dialog within the available screen area.
+        x = max(screenRect.left(), min(x, screenRect.right() - dialogRect.width() + 1))
+        y = max(screenRect.top(), min(y, screenRect.bottom() - dialogRect.height() + 1))
+
+        self.move(x, y)        
     def _getOrderedTraits(self, obj=None):
         """Return traits in class definition order (like getOrderedTraits)."""
         if obj is None:
@@ -846,9 +882,9 @@ class _pglTraitsDialog(QDialog):
                         self.plotCanvas.draw()
                 except Exception as e:
                     pglMessages.warning(f"Error refreshing plot: {e}")
-            elif hasattr(self, "plotCanvas"):
-                self.plotCanvas.setVisible(False)
-                self.plotCanvas.draw()
+            #elif hasattr(self, "plotCanvas"):
+            #    self.plotCanvas.setVisible(False)
+            #    self.plotCanvas.draw()
                 
             if setDefault:                
                 # update the default checkbox state
@@ -1517,29 +1553,25 @@ class _pglTraitsDialog(QDialog):
                     self.plotCanvas.draw()
 
         def onSelectionChanged(index):
-            if self._activePlotButton is not None and self._activePlotButton is not button:
-                prev = self._activePlotButton
-                prev.blockSignals(True)
-                prev.setChecked(False)
-                prev.blockSignals(False)
+            if self._updatingWidget or index < 0:
+                return
 
-            button.blockSignals(True)
-            button.setChecked(True)
-            button.blockSignals(False)
+            # Only refresh if this control already owns the displayed plot.
+            refreshPlot = self._activePlotButton is button and button.isChecked() and self.plotWindow.isVisible()
 
-            self._activePlotButton = button
-            self.plotButtonState = True
-
-            # move selected to top
+            # Preserve the existing selected-first settings convention.
             selected = combo.itemText(index)
             opts = [combo.itemText(i) for i in range(combo.count())]
             newList = [selected] + [x for x in opts if x != selected]
 
-            combo.blockSignals(True)
-            self._commit(settingsObject, traitName, newList)
-            combo.blockSignals(False)
+            wasBlocked = combo.blockSignals(True)
+            try:
+                self._commit(settingsObject, traitName, newList)
+            finally:
+                combo.blockSignals(wasBlocked)
 
-            updatePlot()            
+            if refreshPlot:
+                updatePlot()     
         
         button.toggled.connect(onButtonToggled)
         combo.currentIndexChanged.connect(onSelectionChanged)
@@ -2254,7 +2286,84 @@ class CheckableComboBox(QComboBox):
         self.update()
         self.selectionChanged.emit(self.checkedItems())
 
+class _PlotWindow(QDialog):
+    """Plot window initially placed left of its owner, then remembering geometry."""
 
+    def __init__(self, owner):
+        super().__init__(owner)
+        self.owner = owner
+        self._savedGeometry = None
+        self.setWindowTitle("Plot")
+        self.setWindowModality(Qt.NonModal)
+
+    def _placeInitially(self):
+        gap = 8
+        ownerRect = self.owner.frameGeometry()
+        screenRect = self.owner.screen().availableGeometry()
+
+        # Available space to the left, excluding a small gap.
+        availableWidth = max(0, ownerRect.left() - screenRect.left() - gap)
+        targetWidth = min(ownerRect.width(), availableWidth)
+        targetHeight = min(ownerRect.height(), screenRect.height())
+
+        # resize() uses client dimensions; account for the window frame.
+        frameWidth = self.frameGeometry().width() - self.width()
+        frameHeight = self.frameGeometry().height() - self.height()
+
+        # Respect Qt's minimum usable size.
+        minSize = self.minimumSizeHint().expandedTo(self.minimumSize())
+        clientWidth = max(1, minSize.width(), targetWidth - frameWidth)
+        clientHeight = max(1, minSize.height(), targetHeight - frameHeight)
+        self.resize(clientWidth, clientHeight)
+
+        # Place the actual resulting frame beside the main dialog.
+        plotRect = self.frameGeometry()
+        x = max(screenRect.left(), ownerRect.left() - gap - plotRect.width())
+        y = max(screenRect.top(), min(ownerRect.top(), screenRect.bottom() - plotRect.height() + 1))
+        self.move(x, y)
+
+    def setVisible(self, visible):
+        wasVisible = self.isVisible()
+
+        if not visible and wasVisible:
+            self._savedGeometry = self.saveGeometry()
+
+        super().setVisible(visible)
+
+        if visible and not wasVisible:
+            savedGeometry = getattr(self, "_savedGeometry", None)
+            if savedGeometry is not None:
+                self.restoreGeometry(savedGeometry)
+            else:
+                self._placeInitially()
+
+    def closeEvent(self, event):
+        self.owner._onPlotWindowClosed()
+        event.accept()
+
+    def reject(self):
+        self.close()
+
+class _WindowFigureCanvas(FigureCanvasQTAgg):
+    """Make existing canvas visibility calls control its separate window."""
+
+    def __init__(self, figure, plotWindow):
+        self.plotWindow = None
+        super().__init__(figure)
+        self.plotWindow = plotWindow
+
+    def setVisible(self, visible):
+        super().setVisible(visible)
+
+        if self.plotWindow is None:
+            return
+
+        self.plotWindow.setVisible(visible)
+
+        if visible:
+            self.plotWindow.raise_()
+            self.plotWindow.activateWindow()
+            
 #####################################################################
 # pglTraitsDialog: what gets called by the user. This rund
 # pglTraitsDialogStandalone which runs outside the jupyter notebook
