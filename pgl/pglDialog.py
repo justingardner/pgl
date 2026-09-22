@@ -370,7 +370,7 @@ class _pglTraitsDialog(QDialog):
         maxRowsVisible = trait.metadata.get("maxRowsVisible", 5)
         plotButtonFunction = trait.metadata.get("buttonFunction", None)
         hasPlotButton = trait.metadata.get("hasPlotButton", None)
-        self.multiSelectPlotButtonState = False
+
         if layout is None:
             layout = self.formLayout
 
@@ -378,7 +378,7 @@ class _pglTraitsDialog(QDialog):
         settingsKey = (objectName, traitName)
         self.traitWidgets.setdefault(settingsKey, {})
 
-        state = {"list": current, "focused": current[0], "key": settingsKey, "rows": {}}
+        state = {"list": current, "focused": current[0], "key": settingsKey, "rows": {}, "plotVisible": False}
         self._selectedSettings[settingsKey] = state
 
         # Build the detail rows for whichever object currently has focus
@@ -398,17 +398,6 @@ class _pglTraitsDialog(QDialog):
         #------------------------------
         def updateFields(obj):
             self._updatingWidget = True
-            # update plot if visible
-            #if self.multiSelectPlotButtonState:
-            #    try:
-            #        buttonFunction = getattr(obj,plotButtonFunction,None)
-            #        if buttonFunction:
-            #            buttonFunction(self.figure)
-            #        else:
-            #            pglMessages.warning(f"Button function {buttonFunction} not found for {obj}")
-            #    except Exception as e:
-            #        pglMessages.warning(f"Could not run {buttonFunction}: {e}")
-            # update fields
             try:
                 for name in childNames:
                     # read what the underlying property is (usually the trait, but
@@ -447,6 +436,28 @@ class _pglTraitsDialog(QDialog):
             row.style().polish(row)
             row.update()
 
+        def updatePlot():
+            obj = state["focused"]
+
+            try:
+                buttonFunction = getattr(obj, plotButtonFunction, None) if plotButtonFunction else None
+                if not callable(buttonFunction):
+                    pglMessages.warning(f"{obj.name} does not have function: {plotButtonFunction}")
+                    state["plotVisible"] = False
+                    self.plotCanvas.setVisible(False)
+                    return
+
+                self.figure.clear()
+                buttonFunction(self.figure)
+                self.plotCanvas.setVisible(True)
+                self.plotCanvas.draw_idle()
+                state["plotVisible"] = True
+
+            except Exception as e:
+                state["plotVisible"] = False
+                self.plotCanvas.setVisible(False)
+                pglMessages.warning(f"Error calling plotButton function {plotButtonFunction}: {e}")
+        
         # Set which object's details are shown below the scroll area
         #------------------------------
         def setFocus(obj):
@@ -462,9 +473,9 @@ class _pglTraitsDialog(QDialog):
 
             proxy.retarget(obj)
             updateFields(obj)
-            if hasattr(self, "plotCanvas"):
-                self.plotCanvas.setVisible(False)
-                self.plotCanvas.draw()
+
+            if hasPlotButton and state["plotVisible"] and hasattr(self, "plotCanvas"):
+                updatePlot()
                 
         # Keep a checkbox synced if isSelected changes from elsewhere
         # (e.g. select all / select none, or programmatic changes)
@@ -577,26 +588,15 @@ class _pglTraitsDialog(QDialog):
         selectNoneButton.clicked.connect(onSelectNone)
         
         if hasPlotButton:
-            plotButton = QPushButton("display")
+            plotButton = QPushButton(trait.metadata.get("buttonLabel", "display"))
+
             def onPlotButton():
-                try:
-                    # get which list item has focus
-                    obj = state["focused"]
-                    # and call its plot function
-                    buttonFunction = getattr(obj,plotButtonFunction,None)
-                    if buttonFunction:
-                        if not self.multiSelectPlotButtonState:
-                            self.plotCanvas.setVisible(True)
-                            buttonFunction(self.figure)
-                            self.multiSelectPlotButtonState = True
-                        else:
-                            self.plotCanvas.setVisible(False)
-                            self.multiSelectPlotButtonState = False
-                    else:
-                        print(f"{obj.name} does not have function: {plotButtonFunction}")
-                except Exception as e:
-                    pglMessages.warning(f"Error calling plotButton function {plotButtonFunction}: {e}")
-                    
+                if state["plotVisible"]:
+                    state["plotVisible"] = False
+                    self.plotCanvas.setVisible(False)
+                else:
+                    updatePlot()
+
             buttonLayout.addWidget(plotButton)
             plotButton.clicked.connect(onPlotButton)
 
