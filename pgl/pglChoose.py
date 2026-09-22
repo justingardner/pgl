@@ -20,194 +20,69 @@ import re
 from .pglParameter import pglParameter
 from traitlets import HasTraits, Any, Float, Int, List, Tuple, TraitError, Unicode, Dict, default, link, Bool, TraitType, Instance
 from .pglSettings import pglItem
+import os
+from datetime import datetime, timezone
+from fsspec.implementations.local import LocalFileSystem
 
-##################################################################
-# Generic chooser hierarchy
-#
-# This is eager about discovering the filesystem hierarchy, so the
-# complete tree is present when pglTraitsDialog opens.  It is lazy
-# only about opening/reading expensive leaf data objects, e.g. pglRun.
-#
-# Each chooser class describes one filesystem level:
-#
-#     entryType      What this level represents: "directory" or "file"
-#     namePattern    Optional regex applied to the basename
-#     requiredFiles  Optional direct filenames required in a directory
-#     childClass     Class representing entries below this level
-#
-# pglTraitsDialog needs no changes: each class retains its own
-# childList trait metadata, including display name and multiSelect.
-##################################################################
+
 class pglChooseLevel(pglTraitSettings):
-    """
-    Base class for one level of a filesystem chooser hierarchy.
+    """Filesystem chooser with eager hierarchy discovery and lazy leaf loading."""
 
-    Subclasses normally only need to declare:
+    # Shared traits
+    name = Unicode("", help="Name of this filesystem entry", visible=False)
+    dataPath = Unicode("", allow_none=True, help="Path within the filesystem for this entry", visible=False)
+    childList = List(Instance(pglTraitSettings), settingsListKey="name", help="Child filesystem entries")
+    filesystem = Instance(AbstractFileSystem, allow_none=True, serialize=False, help="Filesystem used to access this entry", visible=False)
+    filesystemPrefix = Unicode("", allow_none=True, help="Filesystem prefix used to recreate this path", visible=False)
+    fullDataPath = Unicode("", allow_none=True, help="Full path to data", visible=False)
 
-        entryType = "directory"     # or "file"
-        namePattern = r"...",       # optional
-        requiredFiles = (...)       # optional, directories only
-        childClass = SomeClass      # None for leaves
-
-    and, for dialog display, redeclare childList with the desired
-    trait metadata.
-    """
-
-    # ----------------------------------------------------------------
-    # Traits shared by every filesystem node
-    # ----------------------------------------------------------------
-    name = Unicode(
-        "",
-        help="Name of this filesystem entry",
-        visible=False,
-    )
-
-    dataPath = Unicode(
-        "",
-        allow_none=True,
-        help="Path within the filesystem for this entry",
-        visible=False,
-    )
-
-    childList = List(
-        Instance(pglTraitSettings),
-        settingsListKey="name",
-        help="Child filesystem entries",
-    )
-
-    filesystem = Instance(
-        AbstractFileSystem,
-        allow_none=True,
-        serialize=False,
-        help="Filesystem used to access this entry",
-        visible=False,
-    )
-
-    filesystemPrefix = Unicode(
-        "",
-        allow_none=True,
-        help="Filesystem prefix used to recreate this path",
-        visible=False,
-    )
-
-    # Retained in case other code currently refers to fullDataPath.
-    # dataPath is the path actually used by this chooser hierarchy.
-    fullDataPath = Unicode(
-        "",
-        allow_none=True,
-        help="Full path to data",
-        visible=False,
-    )
-
-    # ----------------------------------------------------------------
     # Per-class filesystem schema
-    #
-    # These are normal class attributes rather than traits. They define
-    # what the class represents; they are not user-editable settings.
-    # ----------------------------------------------------------------
     entryType = "directory"
     namePattern = None
     requiredFiles = ()
     childClass = None
 
-    def __init__(
-            self,
-            name="",
-            dataPath="",
-            filesystem=None,
-            filesystemPrefix=None,
-            entries=None,
-        ):
-            super().__init__()
+    def __init__(self, name="", dataPath="", filesystem=None, filesystemPrefix=None, entries=None):
+        super().__init__()
 
-            # The root node may be constructed directly, without a filesystem.
-            # Child nodes are always passed the already-established filesystem
-            # from their parent, and must NOT re-validate or re-infer it.
-            if filesystem is None:
-                filesystem, dataPath, filesystemPrefix = pglBase.validateFilesystem(
-                    filesystem=filesystem,
-                    dataPath=dataPath,
-                    filesystemPrefix=filesystemPrefix,
-                )
+        # Validate only the root; children reuse their parent's filesystem.
+        if filesystem is None:
+            filesystem, dataPath, filesystemPrefix = pglBase.validateFilesystem(filesystem=filesystem, dataPath=dataPath, filesystemPrefix=filesystemPrefix)
 
-            self.name = name
-            self.dataPath = str(dataPath)
-            self.fullDataPath = str(dataPath)
-            self.filesystem = filesystem
-            self.filesystemPrefix = filesystemPrefix or ""
+        self.name = name
+        self.dataPath = str(dataPath)
+        self.fullDataPath = str(dataPath)
+        self.filesystem = filesystem
+        self.filesystemPrefix = filesystemPrefix or ""
+        self.childList = self._getChildren(entries=entries) if self.childClass is not None and self.filesystem is not None else []
 
-            if self.childClass is not None and self.filesystem is not None:
-                self.childList = self._getChildren(entries=entries)
-            else:
-                self.childList = []
     # ----------------------------------------------------------------
     # Factory
     # ----------------------------------------------------------------
     @classmethod
-    def create(
-        cls,
-        name="",
-        dataPath="",
-        filesystem=None,
-        filesystemPrefix=None,
-        entry=None,
-    ):
-        """
-        Create one chooser node.
+    def create(cls, name="", dataPath="", filesystem=None, filesystemPrefix=None, entry=None):
+        """Create a valid node, omitting branches with no valid leaves."""
 
-        The root path is validated when the top-level chooser is created.
-        Descendant paths come directly from filesystem.ls(), so reuse the
-        parent's filesystem rather than repeatedly calling
-        validateFilesystem().
-        """
-
-        # This should normally only occur if someone directly calls:
-        #
-        #     pglChooseExperiment.create(dataPath="...")
-        #
-        # Rather than building it below an existing chooser node.
         if filesystem is None:
-            filesystem, dataPath, filesystemPrefix = pglBase.validateFilesystem(
-                filesystem=filesystem,
-                dataPath=dataPath,
-                filesystemPrefix=filesystemPrefix,
-            )
+            filesystem, dataPath, filesystemPrefix = pglBase.validateFilesystem(filesystem=filesystem, dataPath=dataPath, filesystemPrefix=filesystemPrefix)
 
         if filesystem is None:
             return None
 
         entries = None
 
-        # We need a directory listing if:
-        #   1. This node has children to discover, or
-        #   2. This node validates itself based on contained files.
-        #
-        # A file leaf needs neither.
+        # List directories only when needed for discovery or validation.
         if cls.childClass is not None or cls.requiredFiles:
             try:
                 entries = filesystem.ls(dataPath, detail=True)
             except (FileNotFoundError, OSError):
                 return None
 
-        if not cls._isValid(
-            name=name,
-            dataPath=dataPath,
-            filesystem=filesystem,
-            entry=entry,
-            entries=entries,
-        ):
+        if not cls._isValid(name=name, dataPath=dataPath, filesystem=filesystem, entry=entry, entries=entries):
             return None
 
-        instance = cls(
-            name=name,
-            dataPath=dataPath,
-            filesystem=filesystem,
-            filesystemPrefix=filesystemPrefix,
-            entries=entries,
-        )
+        instance = cls(name=name, dataPath=dataPath, filesystem=filesystem, filesystemPrefix=filesystemPrefix, entries=entries)
 
-        # Preserve existing chooser behavior: do not show a parent branch
-        # unless it eventually contains at least one valid leaf.
         if cls.childClass is not None and not instance.childList:
             return None
 
@@ -217,52 +92,20 @@ class pglChooseLevel(pglTraitSettings):
     # Generic validation
     # ----------------------------------------------------------------
     @classmethod
-    def _isValid(
-        cls,
-        name=None,
-        dataPath=None,
-        filesystem=None,
-        entry=None,
-        entries=None,
-    ):
-        """
-        Generic validation shared by all chooser levels.
+    def _isValid(cls, name=None, dataPath=None, filesystem=None, entry=None, entries=None):
+        """Validate entry type, optional name pattern, and required files."""
 
-        Subclasses may override this for special validation, but should
-        normally start by calling super()._isValid(...).
+        if entry is not None and entry.get("type") != cls.entryType:
+            return False
 
-        Returns True if this filesystem entry is valid for cls.
-        """
+        if cls.namePattern is not None and (name is None or re.match(cls.namePattern, name) is None):
+            return False
 
-        # Validate whether the entry is a file or directory.
-        #
-        # The root object is instantiated directly rather than through
-        # create(), so entry can be None there. Every child created by
-        # _getChildren() receives a real fsspec detail dictionary.
-        if entry is not None:
-            if entry.get("type") != cls.entryType:
-                return False
-
-        # Optional regex validation of the entry basename.
-        if cls.namePattern is not None:
-            if name is None or re.match(cls.namePattern, name) is None:
-                return False
-
-        # Optional direct-file validation for directory entries.
-        #
-        # Example:
-        #
-        #     requiredFiles = ("events.tsv", "params.json")
-        #
         if cls.requiredFiles:
             if entries is None:
                 return False
 
-            fileNames = {
-                item["name"].rstrip("/").rsplit("/", 1)[-1]
-                for item in entries
-                if item.get("type") == "file"
-            }
+            fileNames = {item["name"].rstrip("/").rsplit("/", 1)[-1] for item in entries if item.get("type") == "file"}
 
             if not set(cls.requiredFiles).issubset(fileNames):
                 return False
@@ -270,17 +113,74 @@ class pglChooseLevel(pglTraitSettings):
         return True
 
     # ----------------------------------------------------------------
+    # Creation-time sorting
+    # ----------------------------------------------------------------
+    @staticmethod
+    def _asTimestamp(value):
+        """Normalize Unix seconds, datetime objects, or ISO timestamps."""
+
+        if value is None:
+            return None
+
+        try:
+            if isinstance(value, str):
+                try:
+                    return float(value)
+                except ValueError:
+                    value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+            if isinstance(value, datetime):
+                # Treat timestamps without timezone information as UTC.
+                if value.tzinfo is None:
+                    value = value.replace(tzinfo=timezone.utc)
+                return value.timestamp()
+
+            return float(value)
+        except (TypeError, ValueError, OverflowError, OSError):
+            return None
+
+    def _getCreationTime(self, entry):
+        """Return creation time in Unix seconds, or None if unavailable."""
+
+        if isinstance(self.filesystem, LocalFileSystem):
+            try:
+                statInfo = os.stat(self.filesystem._strip_protocol(entry["name"]))
+            except OSError:
+                return None
+
+            birthTime = getattr(statInfo, "st_birthtime", None)
+
+            # Older Python versions expose Windows creation time as st_ctime.
+            if birthTime is None and os.name == "nt":
+                birthTime = statInfo.st_ctime
+
+            # Do not use local fsspec "created": it may actually be Unix ctime.
+            return self._asTimestamp(birthTime)
+
+        # Remote metadata names depend on the filesystem backend.
+        for key in ("birthtime", "st_birthtime", "created", "creation_time", "creationTime", "timeCreated", "CreationTime"):
+            creationTime = self._asTimestamp(entry.get(key))
+            if creationTime is not None:
+                return creationTime
+
+        return None
+
+    def _childSortKey(self, entry):
+        """Sort leaves oldest first, branches newest first, unknown times last."""
+
+        creationTime = self._getCreationTime(entry)
+        entryName = entry["name"].rstrip("/").rsplit("/", 1)[-1]
+        childrenAreLeaves = self.childClass.childClass is None
+        sortTime = creationTime if creationTime is not None else 0
+        sortTime = sortTime if childrenAreLeaves else -sortTime
+
+        return (creationTime is None, sortTime, entryName.casefold(), entryName)
+
+    # ----------------------------------------------------------------
     # Find child entries
     # ----------------------------------------------------------------
     def _getChildren(self, entries=None):
-        """
-        Create one childClass object for every valid direct child of
-        self.dataPath.
-
-        There is intentionally no hardcoded directory filtering here.
-        The child class declares whether it accepts directories or files
-        through childClass.entryType.
-        """
+        """Create valid direct children in creation-time order."""
 
         if entries is None:
             try:
@@ -290,22 +190,19 @@ class pglChooseLevel(pglTraitSettings):
 
         children = []
 
-        for entry in entries:
+        # Filter by the child class's declared type before sorting.
+        candidateEntries = [entry for entry in entries if entry.get("type") == self.childClass.entryType]
+
+        for entry in sorted(candidateEntries, key=self._childSortKey):
             entryPath = entry["name"]
             entryName = entryPath.rstrip("/").rsplit("/", 1)[-1]
-
-            child = self.childClass.create(
-                name=entryName,
-                dataPath=entryPath,
-                filesystem=self.filesystem,
-                filesystemPrefix=self.filesystemPrefix,
-                entry=entry,
-            )
+            child = self.childClass.create(name=entryName, dataPath=entryPath, filesystem=self.filesystem, filesystemPrefix=self.filesystemPrefix, entry=entry)
 
             if child is not None:
                 children.append(child)
 
         return children
+
 
 ################################################################################
 # Standard experiment chooser hierarchy
@@ -432,129 +329,123 @@ class pglChooseData(pglChooseLevel):
     entryType = "directory"
     childClass = pglChooseExperiment
     
-################################################################################
-# Fieldline chooser hierarchy
-#
-# Expected structure:
-#
-#     dataPath/
-#         experiment/
-#             s00001/
-#                 session/
-#                     someRecording.fif
-#                     anotherRecording.fif
-#
-# The leaf is a FIF FILE rather than a run DIRECTORY.
-#
-# Like pglChooseRun, pglChooseFieldline is intentionally lightweight:
-# discovering the tree does not read FIF contents.  Add a lazy Fieldline/MNE
-# object here later if/when you want a display button or data preview.
-################################################################################
-
-
-class pglChooseFieldline(pglChooseLevel):
+def makeRecordingChooser(
+    formatName,
+    entryType,
+    namePattern,
+    requiredFiles=(),
+):
     """
-    Leaf representing one Fieldline FIF file.
+    Build a recording chooser hierarchy for one format.
 
-    dataPath is inherited from pglChooseLevel and contains the full path
-    to the FIF file.  This is what pglChoose.walkInstances() returns for
-    selected files.
+    Returns the top-level data chooser class.
+
+    formatName should be suitable for use in a Python class name,
+    e.g. "Fieldline" or "NetStation".
     """
 
-    entryType = "file"
-    namePattern = r"^.*\.[Ff][Ii][Ff]$"
-    childClass = None
+    classPrefix = f"pglChoose{formatName}"
 
-    # ------------------------------------------------------------------------
-    # Later, if desired, add lazy Fieldline loading here. For example:
-    #
-    # _fieldline = Instance(pglFieldline, allow_none=True,
-    #                       default_value=None, serialize=False)
-    #
-    # @property
-    # def fieldline(self):
-    #     if self._fieldline is None:
-    #         self._fieldline = pglFieldline(
-    #             fullDataPath=self.dataPath,
-    #             filesystem=self.filesystem,
-    #             filesystemPrefix=self.filesystemPrefix,
-    #         )
-    #     return self._fieldline
-    #
-    # def display(self, fig=None):
-    #     self.fieldline.display(fig=fig)
-    #
-    # Do not add hasPlotButton=True below until this class has a real
-    # display() method.
-    # ------------------------------------------------------------------------
-
-
-class pglChooseFieldlineSession(pglChooseLevel):
-    """
-    Directory containing Fieldline FIF files.
-    """
-
-    childList = List(
-        Instance(pglTraitSettings),
-        settingsListKey="name",
-        traitDisplayName="Select Fieldline run(s)",
-        multiSelect=True,
-        maxRowsVisible=6,
-        help="Fieldline FIF files in session directory",
+    # Recording leaf: no children, even when it represents a directory.
+    recordingClass = type(
+        classPrefix,
+        (pglChooseLevel,),
+        {
+            "__module__": __name__,
+            "entryType": entryType,
+            "namePattern": namePattern,
+            "requiredFiles": tuple(requiredFiles),
+            "childClass": None,
+        },
     )
 
-    entryType = "directory"
-    childClass = pglChooseFieldline
-
-
-class pglChooseFieldlineSubject(pglChooseLevel):
-    """
-    Subject directory. Only directories of the form s##### are included.
-    """
-
-    childList = List(
-        Instance(pglTraitSettings),
-        settingsListKey="name",
-        traitDisplayName="Choose session",
-        help="Sessions in Fieldline subject directory",
+    sessionClass = type(
+        f"{classPrefix}Session",
+        (pglChooseLevel,),
+        {
+            "__module__": __name__,
+            "entryType": "directory",
+            "childClass": recordingClass,
+            "childList": List(
+                Instance(pglTraitSettings),
+                settingsListKey="name",
+                traitDisplayName=f"Select {formatName} run(s)",
+                multiSelect=True,
+                maxRowsVisible=6,
+                help=f"{formatName} recordings in session directory",
+            ),
+        },
     )
 
-    entryType = "directory"
-    namePattern = r"^s\d+$"
-    childClass = pglChooseFieldlineSession
-
-
-class pglChooseFieldlineExperiment(pglChooseLevel):
-    """
-    Experiment directory containing Fieldline subject directories.
-    """
-
-    childList = List(
-        Instance(pglTraitSettings),
-        settingsListKey="name",
-        traitDisplayName="Choose subject",
-        help="Subjects in Fieldline experiment directory",
+    subjectClass = type(
+        f"{classPrefix}Subject",
+        (pglChooseLevel,),
+        {
+            "__module__": __name__,
+            "entryType": "directory",
+            "namePattern": r"^s\d+$",
+            "childClass": sessionClass,
+            "childList": List(
+                Instance(pglTraitSettings),
+                settingsListKey="name",
+                traitDisplayName="Choose session",
+                help=f"Sessions in {formatName} subject directory",
+            ),
+        },
     )
 
-    entryType = "directory"
-    childClass = pglChooseFieldlineSubject
-
-
-class pglChooseFieldlineData(pglChooseLevel):
-    """
-    Top-level Fieldline data directory containing experiment directories.
-    """
-
-    childList = List(
-        Instance(pglTraitSettings),
-        settingsListKey="name",
-        traitDisplayName="Choose experiment",
-        help="Experiments in Fieldline data path",
+    experimentClass = type(
+        f"{classPrefix}Experiment",
+        (pglChooseLevel,),
+        {
+            "__module__": __name__,
+            "entryType": "directory",
+            "childClass": subjectClass,
+            "childList": List(
+                Instance(pglTraitSettings),
+                settingsListKey="name",
+                traitDisplayName="Choose subject",
+                help=f"Subjects in {formatName} experiment directory",
+            ),
+        },
     )
 
-    entryType = "directory"
-    childClass = pglChooseFieldlineExperiment
-    
+    dataClass = type(
+        f"{classPrefix}Data",
+        (pglChooseLevel,),
+        {
+            "__module__": __name__,
+            "entryType": "directory",
+            "childClass": experimentClass,
+            "childList": List(
+                Instance(pglTraitSettings),
+                settingsListKey="name",
+                traitDisplayName="Choose experiment",
+                help=f"Experiments in {formatName} data path",
+            ),
+        },
+    )
+
+    return dataClass
+
+
+# ------------------------------------------------------------------
+# Format-specific declarations
+# ------------------------------------------------------------------
+
+pglChooseFieldlineData = makeRecordingChooser(
+    formatName="Fieldline",
+    entryType="file",
+    namePattern=r"^.*\.[Ff][Ii][Ff]$",
+)
+
+pglChooseNetStationData = makeRecordingChooser(
+    formatName="NetStation",
+    entryType="directory",
+    namePattern=r"^.*\.[Mm][Ff][Ff]$",
+    # Optional lightweight package validation:
+    # requiredFiles=("info.xml", "signal1.bin"),
+)    
 ##############################
 # pglChooseListItem
 ##############################
@@ -724,77 +615,91 @@ class pglChoose():
         return (filesystem, fullDataPath, filesystemPrefix)
 
     @classmethod
-    def getFieldline(cls,fullDataPath=None,settings=None,settingsName=None,filesystem=None,filesystemPrefix=None,dataPath=None):
+    def getFieldline(
+        cls,
+        fullDataPath=None,
+        settings=None,
+        settingsName=None,
+        filesystem=None,
+        filesystemPrefix=None,
+        dataPath=None,
+    ):
+        """Choose FIF files from an experiment/subject/session hierarchy."""
+        return cls._getRecordings(
+            chooserClass=pglChooseFieldlineData,
+            formatName="Fieldline",
+            fullDataPath=fullDataPath,
+            settings=settings,
+            settingsName=settingsName,
+            filesystem=filesystem,
+            filesystemPrefix=filesystemPrefix,
+            dataPath=dataPath,
+        )
+
+    @classmethod
+    def getNetStation(
+        cls,
+        fullDataPath=None,
+        settings=None,
+        settingsName=None,
+        filesystem=None,
+        filesystemPrefix=None,
+        dataPath=None,
+    ):
+        """Choose MFF packages from an experiment/subject/session hierarchy."""
+        return cls._getRecordings(
+            chooserClass=pglChooseNetStationData,
+            formatName="NetStation",
+            fullDataPath=fullDataPath,
+            settings=settings,
+            settingsName=settingsName,
+            filesystem=filesystem,
+            filesystemPrefix=filesystemPrefix,
+            dataPath=dataPath,
+        )
+
+    @classmethod
+    def _getRecordings(
+        cls,
+        chooserClass,
+        formatName,
+        fullDataPath=None,
+        settings=None,
+        settingsName=None,
+        filesystem=None,
+        filesystemPrefix=None,
+        dataPath=None,
+    ):
         """
-        Display a Fieldline chooser and return selected FIF file paths.
+        Display a recording chooser using the supplied hierarchy class.
 
-        The expected hierarchy is:
+        Expected structure:
+            dataPath/experiment/s#####/session/recording
 
-            dataPath/
-                experiment/
-                    s#####/
-                        session/
-                            recording.fif
-
-        Parameters
-        ----------
-        fullDataPath : str or Path, optional
-            Root of the Fieldline hierarchy. If supplied, it takes precedence
-            over dataPath and settings.
-
-        settings : pglSettings, optional
-            Settings object whose dataPath will be used if neither fullDataPath
-            nor dataPath is supplied.
-
-        settingsName : str, optional
-            Name passed to pglSettingsManager.getSettings() if settings must be
-            loaded automatically.
-
-        filesystem : fsspec.AbstractFileSystem, optional
-            Filesystem used to access the data.
-
-        filesystemPrefix : str, optional
-            Prefix retained for later reconstruction of the filesystem, such as
-            an ssh:// prefix.
-
-        dataPath : str or Path, optional
-            Root of the Fieldline hierarchy.
+        fullDataPath is an alternate name for the hierarchy root,
+        not a direct path to an individual recording.
 
         Returns
         -------
         tuple
-            (filesystem, fifPaths, filesystemPrefix)
+            (filesystem, recordingPaths, filesystemPrefix)
 
-            filesystem:
-                The validated fsspec filesystem.
-
-            fifPaths:
-                A list of selected full FIF paths, or None if the user cancels
-                or no files are selected.
-
-            filesystemPrefix:
-                Prefix returned by pglBase.validateFilesystem().
-
-        Examples
-        --------
-        filesystem, fifPaths, filesystemPrefix = pglChoose.chooseFieldline(
-            dataPath="/Users/justin/Desktop/digitalbrain"
-        )
-
-        if fifPaths:
-            for fifPath in fifPaths:
-                print(fifPath)
+            recordingPaths is:
+                A list of selected recording paths on success.
+                [] if no recordings are found or selected.
+                None if canceled or filesystem setup fails.
         """
 
-        # `fullDataPath` is simply an alternate explicit name for the root
-        # Fieldline data path.
+        # Explicit fullDataPath takes precedence over dataPath.
         if fullDataPath is not None:
             dataPath = fullDataPath
 
-        # Obtain dataPath from settings only if the caller did not provide one.
+        # Fall back to settings when no explicit root was supplied.
         if not dataPath:
             if settings is None:
-                settings = pglSettingsManager.getSettings(settingsName=settingsName)
+                settings = pglSettingsManager.getSettings(
+                    settingsName=settingsName
+                )
 
             if settings is None:
                 pglMessages.warning(
@@ -804,8 +709,7 @@ class pglChoose():
 
             dataPath = settings.dataPath
 
-        # Validate the root filesystem/path once. Descendants reuse this same
-        # filesystem object through pglChooseLevel; they are not revalidated.
+        # Validate once; all descendant nodes reuse this filesystem.
         filesystem, dataPath, filesystemPrefix = pglBase.validateFilesystem(
             filesystem=filesystem,
             dataPath=dataPath,
@@ -814,41 +718,40 @@ class pglChoose():
 
         if filesystem is None:
             pglMessages.warning(
-                f"Could not access Fieldline data path: {dataPath}"
+                f"Could not access {formatName} data path: {dataPath}"
             )
             return (None, None, None)
 
-        # Construct the complete chooser tree. This performs filesystem
-        # discovery only; it does not load/open the potentially large FIF files.
-        chooser = pglChooseFieldlineData(
+        # Discover recordings without loading their signal data.
+        chooser = chooserClass(
             dataPath=dataPath,
             filesystem=filesystem,
             filesystemPrefix=filesystemPrefix,
         )
 
-        # If no valid experiment -> subject -> session -> FIF path exists,
-        # there is no useful chooser to show.
         if not chooser.childList:
             pglMessages.message(
-                f"No Fieldline FIF files found below {dataPath}"
+                f"No {formatName} recordings found below {dataPath}"
             )
             return (filesystem, [], filesystemPrefix)
 
         chooser = pglDialogs.traitsDialog(chooser)
 
         if chooser is None:
-            pglMessages.message("No Fieldline files selected")
+            pglMessages.message(
+                f"No {formatName} recordings selected"
+            )
             return (None, None, filesystemPrefix)
 
-        # pglChooseFieldline leaves inherit dataPath from pglChooseLevel, so the
-        # existing generic tree walker returns full selected FIF paths.
-        fifPaths = cls.walkInstances(chooser)
+        recordingPaths = cls.walkInstances(chooser)
 
-        if not fifPaths:
-            pglMessages.message("No Fieldline files selected")
+        if not recordingPaths:
+            pglMessages.message(
+                f"No {formatName} recordings selected"
+            )
             return (filesystem, [], filesystemPrefix)
 
-        return (filesystem, fifPaths, filesystemPrefix)
+        return (filesystem, recordingPaths, filesystemPrefix)
 
     @classmethod
     def chooseList(cls,values,key=None,traitDisplayName="Choose",maxRowsVisible=10,help=None):
