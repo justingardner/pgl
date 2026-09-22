@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QCoreApplication, QTimer, Signal
 from PySide6.QtGui import QColor, QStandardItemModel
+from PySide6.QtCore import QPoint, QPropertyAnimation, QEasingCurve
 
 from traitlets import (
     HasTraits, Float, Int, List, Unicode, Bool, Tuple, TraitType, Enum
@@ -282,7 +283,8 @@ class _pglTraitsDialog(QDialog):
         screenRect = self.screen().availableGeometry()
         dialogRect = self.frameGeometry()
 
-        x = screenRect.left() + screenRect.width() // 2
+        #x = screenRect.left() + screenRect.width() // 2
+        x = screenRect.left() + (screenRect.width() - dialogRect.width()) // 2
         y = screenRect.top() + (screenRect.height() - dialogRect.height()) // 2
 
         # Keep the dialog within the available screen area.
@@ -2287,55 +2289,94 @@ class CheckableComboBox(QComboBox):
         self.selectionChanged.emit(self.checkedItems())
 
 class _PlotWindow(QDialog):
-    """Plot window initially placed left of its owner, then remembering geometry."""
+    """Move the main dialog first, then reveal the plot beside it."""
 
     def __init__(self, owner):
         super().__init__(owner)
         self.owner = owner
         self._savedGeometry = None
+        self._opening = False
+        self._moveAnimation = None
         self.setWindowTitle("Plot")
         self.setWindowModality(Qt.NonModal)
+
+    def setVisible(self, visible):
+        if not visible:
+            # Cancel a pending first opening.
+            self._opening = False
+            if self._moveAnimation is not None:
+                self._moveAnimation.stop()
+
+            if self.isVisible():
+                self._savedGeometry = self.saveGeometry()
+
+            super().setVisible(False)
+            return
+
+        if self.isVisible() or self._opening:
+            return
+
+        # Subsequent openings reuse the saved geometry without animation.
+        if self._savedGeometry is not None:
+            super().setVisible(True)
+            self.restoreGeometry(self._savedGeometry)
+            return
+
+        self._opening = True
+
+        screenRect = self.owner.screen().availableGeometry()
+        ownerRect = self.owner.frameGeometry()
+
+        targetX = screenRect.left() + screenRect.width() // 2
+        targetX = max(screenRect.left(), min(targetX, screenRect.right() - ownerRect.width() + 1))
+        shiftX = targetX - ownerRect.left()
+
+        if not shiftX:
+            self._showInitially()
+            return
+
+        startPos = self.owner.pos()
+        self._moveAnimation = QPropertyAnimation(self.owner, b"pos", self)
+        self._moveAnimation.setDuration(250)
+        self._moveAnimation.setStartValue(startPos)
+        self._moveAnimation.setEndValue(startPos + QPoint(shiftX, 0))
+        self._moveAnimation.setEasingCurve(QEasingCurve.InOutCubic)
+        self._moveAnimation.finished.connect(self._showInitially)
+        self._moveAnimation.start()
+
+    def _showInitially(self):
+        if not self._opening:
+            return
+
+        self._opening = False
+
+        # The movement has finished. Show and position before the next paint.
+        super().setVisible(True)
+        self._placeInitially()
+        self.raise_()
+        self.activateWindow()
 
     def _placeInitially(self):
         gap = 8
         ownerRect = self.owner.frameGeometry()
         screenRect = self.owner.screen().availableGeometry()
 
-        # Available space to the left, excluding a small gap.
         availableWidth = max(0, ownerRect.left() - screenRect.left() - gap)
         targetWidth = min(ownerRect.width(), availableWidth)
         targetHeight = min(ownerRect.height(), screenRect.height())
 
-        # resize() uses client dimensions; account for the window frame.
         frameWidth = self.frameGeometry().width() - self.width()
         frameHeight = self.frameGeometry().height() - self.height()
 
-        # Respect Qt's minimum usable size.
         minSize = self.minimumSizeHint().expandedTo(self.minimumSize())
         clientWidth = max(1, minSize.width(), targetWidth - frameWidth)
         clientHeight = max(1, minSize.height(), targetHeight - frameHeight)
         self.resize(clientWidth, clientHeight)
 
-        # Place the actual resulting frame beside the main dialog.
         plotRect = self.frameGeometry()
         x = max(screenRect.left(), ownerRect.left() - gap - plotRect.width())
         y = max(screenRect.top(), min(ownerRect.top(), screenRect.bottom() - plotRect.height() + 1))
         self.move(x, y)
-
-    def setVisible(self, visible):
-        wasVisible = self.isVisible()
-
-        if not visible and wasVisible:
-            self._savedGeometry = self.saveGeometry()
-
-        super().setVisible(visible)
-
-        if visible and not wasVisible:
-            savedGeometry = getattr(self, "_savedGeometry", None)
-            if savedGeometry is not None:
-                self.restoreGeometry(savedGeometry)
-            else:
-                self._placeInitially()
 
     def closeEvent(self, event):
         self.owner._onPlotWindowClosed()
