@@ -201,7 +201,6 @@ class pglRun(pglExperimentBase):
             for iTask, task in enumerate(self.tasks):
                 task.display(ax=axes[iTask + 1])
 
-            plt.show()
             return fig
 
         except Exception as e:
