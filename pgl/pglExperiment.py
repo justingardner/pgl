@@ -806,7 +806,7 @@ class pglExperiment(pglExperimentBase):
         pglMessages.message(f"Experiment started.",messageType='experiment')
         self.startPhase(phaseNum=0)
         self.data.startTime = self.pgl.getSecs()
-        self.data.startDate = datetime.now().astimezone().isoformat()
+        self.data.startDateTime = datetime.now().astimezone().isoformat()
 
         while not self.state.experimentDone:
             
@@ -1415,7 +1415,7 @@ class pglTaskData(pglTraitSettings):
     # make sure that any settings that the experimenter writes into settings get saved
     _serializeUnregisteredFields = True
 
-    def display(self, taskName="task", responseMapping=None, ax=None):
+    def display(self, taskName="task", responseMapping=None, nTotalTrials=None, ax=None):
         '''
         Display the experiment data.
         '''
@@ -1461,20 +1461,33 @@ class pglTaskData(pglTraitSettings):
                     if event.responseType in responseCounts:
                         responseCounts[event.responseType] += 1
                         
-        timeline.setTitle(f"{taskName}: {nTrials} trials")
+        # compute duration
+        if self.endTime is not None and self.startTime is not None:
+            duration = pglTimestamp.formatDuration(self.endTime-self.startTime)
+        else:
+            duration = ""
         
-        # display legend
+        if nTotalTrials is not None and not np.isinf(nTotalTrials):
+            trials = f"{nTrials}/{int(nTotalTrials)}"
+        else:
+            trials = f"{nTrials}"
+            
+        timeline.setTitle(f"{taskName}: {trials} trials, {duration}")
+        
+        # Display legend.
         legend = [{'label': 'Segment', 'color': 'blue'}]
-        # add the response values
-        if gotResponse:
-            for respType, (label, color) in responseMapping.items():
-                # get statistics for this response type
-                count = responseCounts.get(respType, 0)
-                percent = (count / sum(responseCounts.values()) * 100) if nTrials > 0 else 0
-                legend.append({'label': f'{label} (n={count}: {percent:.1f}%)', 'color': color})
-        timeline.addLegend(legend)
-        if not ax: timeline.show()
 
+        if gotResponse:
+            totalResponses = sum(responseCounts.values())
+            for respType, (label, color) in responseMapping.items():
+                count = responseCounts.get(respType, 0)
+                if count != 0:
+                    percent = count / totalResponses * 100 if totalResponses > 0 else 0
+                    legend.append({'label': f'{label} (n={count}: {percent:.1f}%)', 'color': color})
+
+        timeline.addLegend(legend)
+        if ax is None:
+            timeline.show()
 ##############################################
 # Task base 
 ##############################################
@@ -1569,7 +1582,7 @@ class pglTaskBase(pglTraitSettings):
         '''
         Display the task data
         '''
-        self.data.display(taskName=self.settings.taskName, ax=ax)
+        self.data.display(taskName=self.settings.taskName, nTotalTrials=self.settings.nTrials, ax=ax)
     
     def print(self):
         '''
@@ -1998,8 +2011,14 @@ class pglExperimentData(pglTraitSettings):
             elif event.type == "volumeTrigger":
                 timeline.addTriangleMarker(time=event.timestamp - self.startTime, color='blue', direction='up')
                 nVols += 1
-                
-        timeline.setTitle("Experiment Events")
+        
+        if self.startDateTime != "":
+            dateTime = datetime.fromisoformat(self.startDateTime)
+            readableTime = dateTime.strftime("%I:%M %p").lstrip("0")
+            timeline.setTitle(f"Experiment Events: {dateTime:%b. %d, %Y} at {readableTime}")
+        else:
+            timeline.setTitle("Experiment Events")
+            
         timeline.addLegend([{'label': f'Keypress (n={nKeys})', 'color': 'green'},{'label': f'Volumes (n={nVols})', 'color': 'blue'}])
         if not ax: timeline.show()
     def getTriggerStats(self):
