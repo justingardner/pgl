@@ -173,27 +173,39 @@ class pglRun(pglExperimentBase):
         '''
         return(", ".join(self.experimentSettings.tasks))
     
-    def display(self, ax=None):
-        '''
-        display plot of the run
-        '''
-        # display
+    def display(self, fig=None):
+        """
+        Display plot of the run.
+
+        If fig is provided, replace its contents with the run plots.
+        """
         try:
-            # compute how many axes we need
             nTasks = len(self.tasks)
-            fig, _ = plt.subplots(nTasks+1,1,figsize=(12,4*(nTasks+1)), constrained_layout=True)
-            
-            # display experiment
-            self.data.display(ax=fig.axes[0])
-            
-            # display tasks
+            nRows = nTasks + 1
+
+            if fig is None:
+                fig = plt.figure(
+                    figsize=(12, 4 * nRows),
+                    constrained_layout=True,
+                )
+            else:
+                fig.clear()
+                fig.set_layout_engine("constrained")
+
+            axes = fig.subplots(nRows, 1, squeeze=False)[:, 0]
+
+            # Display experiment
+            self.data.display(ax=axes[0])
+
+            # Display tasks
             for iTask, task in enumerate(self.tasks):
-                task.display(ax=fig.axes[iTask+1])
-            
+                task.display(ax=axes[iTask + 1])
+
             plt.show()
-            
+            return fig
+
         except Exception as e:
-            print(f"error: {e}")
+            pglMessages.warning(f"error: {e}")
     
     def getTrialsByParameter(self, parameterName: str, taskName: str = None):
         '''
