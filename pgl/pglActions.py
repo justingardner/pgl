@@ -21,6 +21,7 @@ import matplotlib.pyplot as plt
 from fsspec import AbstractFileSystem
 from traitlets import HasTraits, Enum, Float, Int, List, Tuple, TraitError, Unicode, Dict, default, link, Bool, TraitType, Instance
 import pandas as pd
+from .pglExperiment import pglEventTrial, pglEventSegment
 
 #################################
 # Collection of predefined actions
@@ -1404,6 +1405,214 @@ class pglActions():
             return session
  
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
+    # eyeblink detecion
+    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
+    class mneEyeblinkDetection(pglAction):
+
+        # parameters
+        leftEyeChannel = Unicode('L401', help="Left channel used for detecting eye blink")
+        rightEyeChannel = Unicode('R401', help="Left channel used for detecting eye blink")
+                
+        ################################
+        # configure
+        ################################
+        def configure(self, **kwargs) -> None:
+
+            # set parameters
+            self.configureTraits(**kwargs)
+                
+            # we are now configured, so call super to set status
+            super().configure()
+            
+        ################################
+        # run
+        ################################
+        def _run(self, session: pglSession) -> pglSession:
+            '''            
+            Returns:
+                pglSession:  session
+            '''
+            # import mne
+            import mne
+
+            # check for mne session
+            if session.mne is None or session.mne.raw is None:
+                self.setError("session does not have raw mne loaded")
+                return None
+
+            # look up left and right eye channels
+            leftEyeChannel = session.mne.lookupSensor(self.leftEyeChannel)
+            if leftEyeChannel is None:
+                pglMessages.warning(f"Could not find left eye channel: {self.leftEyeChannel}")
+            rightEyeChannel = session.mne.lookupSensor(self.rightEyeChannel)
+            if rightEyeChannel is None:
+                pglMessages.warning(f"Could not find left eye channel: {self.rightEyeChannel}")
+            
+            # extract data from two frontal OPM sensors
+            ch1_data = raw.copy().pick_channels([self.rightEyeChannel]).get_data()[0] 
+            ch2_data = raw.copy().pick_channels(['L401_bz-s92']).get_data()[0] 
+            # differential signal (Left - Right)
+            occ_signal = ch1_data - ch2_data
+            # create new channel called EOG
+            sfreq = raw.info['sfreq']
+            new_ch_name = 'EOG' 
+            info_new = mne.create_info([new_ch_name], sfreq=sfreq, ch_types=['eog'])            
+
+            # and return
+            return session
+
+    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
+    # align
+    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
+    class alignSessionToMNE(pglAction):
+
+        # parameters
+        runNum = Int(0, min=0, help='run in session for alignment')
+        taskName = Unicode('', help='task used for alignment')
+        taskID = Int(allow_none=True, default_value=None, help='ID of task, used to disambiguate when there are multiple instance of a task in the experiment')
+        trialNum = Int(0, min=0, help='trial in run for alignment')
+        segmentNum = Int(0, min=0, help='segment in trial for alignment')
+        
+        channelName = Unicode("", help='name of channel in mne for alignment')
+        pulseNum = Int(0, min=0, help='Number of pulse in channel to use for alignment')
+        highCutoff = Float(0.5, help='Cutoff value of channel to consider as an event')
+                
+        ################################
+        # configure
+        ################################
+        def configure(self, **kwargs) -> None:
+
+            # set parameters
+            self.configureTraits(**kwargs)
+                
+            # we are now configured, so call super to set status
+            super().configure()
+            
+        ################################
+        # run
+        ################################
+        def _run(self, session: pglSession) -> pglSession:
+            '''
+            Aligns triggers as recorded in eeg/meg session to trial events as recorded in session
+            
+            Returns:
+                pglSession:  session
+            '''
+            # validate runNum
+            if self.runNum > len(session.runs):
+                self.setError(f"Specififed alignment run ({self.runNum}) is not in range of number of runs: 0-{len(session.runs)}")
+                return None
+            
+            # get the run
+            run = session.runs[self.runNum]
+            
+            # get the task, if taskName is not set get the task that has the largest number of trials run, preferring
+            # tasks in which settings.nTrials has been set (i.e. that have been set to run nTrials and have completed those trials)
+            if self.taskName == '':
+                hasNTrialsSet = False
+                task = None
+
+                # for each task 
+                for t in run.tasks:
+                    # for the first task, select it
+                    if task is None:
+                        task = t
+                        hasNTrialsSet = t.settings.nTrials != np.inf
+                        continue
+                    # if all the previous tasks have not had infinite trails set
+                    if not hasNTrialsSet:
+                        # then either the task has more trials than the last one, or it has a finite number of trials set
+                        if t.settings.nTrials != np.inf or t.data.nTrials > task.data.nTrials:
+                            task = t
+                            hasNTrialsSet = t.settings.nTrials != np.inf
+                    # only tasks that have nTrials set and have larger number of trials
+                    elif t.settings.nTrials != np.inf and t.data.nTrials > task.data.nTrials:
+                        task = t
+            else:
+                # named task asked for, so try to find it 
+                matchingTasks = [(iTask, t) for iTask, t in enumerate(run.tasks) if t.taskName == self.taskName]
+
+                # no match
+                if not matchingTasks:
+                    self.setError(f"No task matches taskName '{self.taskName}'")
+                    return None
+
+                #single match just return it
+                if len(matchingTasks) == 1:
+                    task = matchingTasks[0][1]
+                    
+                # muultiple matches, see if taskID is se
+                elif self.taskID is None:
+                    self.setError(f"Multiple tasks match taskName '{self.taskName}'; specify taskID")
+                    return None
+                else:
+                    task = next((t for iTask, t in matchingTasks if iTask == self.taskID), None)
+                    if task is None:
+                        self.setError(f"No task matches taskName '{self.taskName}' and taskID {self.taskID}")
+                        return None
+            
+            # validate trialNum
+            if self.trialNum >= task.data.nTrials:
+                self.setError(f"trialNum {self.trialNum} out of range: 0-{task.data.nTrials}")
+                return None
+                            
+            # validate segNum
+            if self.segmentNum >= len(task.settings.seglen):
+                self.setError(f"segmentNum {self.segmentNum} out of range: 0-{len(task.settings.seglen)}")
+                return None
+                    
+            # get session reference time
+            iTrial = -1
+            sessionReferenceTime = None
+            for e in task.data.events:
+                if isinstance(e, pglEventTrial):
+                    iTrial+=1
+                elif isinstance(e, pglEventSegment):
+                    # if we found the matching trial and segment
+                    if self.trialNum==iTrial and e.segmentNum == self.segmentNum:
+                        sessionReferenceTime = e.timestamp
+            
+            # no session reference time
+            if sessionReferenceTime is None:
+                self.setError(f"Could not find matching trial and segment number for reference time")
+                return None
+                   
+            pglMessages.message(f"Found session reference time: {sessionReferenceTime}")     
+            
+            # set all runs to have this sessionReferenceTime
+            for run in session.runs:
+                run.data.referenceTime = sessionReferenceTime            
+            
+            # import mne
+            import mne
+
+            # check for mne session
+            if session.mne is None or session.mne.raw is None:
+                self.setError("session does not have raw mne loaded")
+                return None
+
+            if not isinstance(self.channelName, str) or self.channelName not in session.mne.raw.ch_names:
+                self.setError(f"Unknown channelName: {self.channelName!r}")
+                return None
+
+            channelData = session.mne.raw.get_data(picks=[self.channelName])[0]
+            isHigh = channelData > self.highCutoff
+
+            # Find low-to-high transitions; count an initially high channel as a pulse.
+            pulseSamples = np.flatnonzero(np.diff(isHigh.astype(int), prepend=0) == 1)
+
+            if self.pulseNum > len(pulseSamples):
+                self.setError(f"Requested pulse {self.pulseNum}, but found only {len(pulseSamples)} pulses on {self.channelName!r}")
+                return None
+
+            session.mne.referenceTime = float(session.mne.raw.times[pulseSamples[self.pulseNum]])
+            
+            pglMessages.message(f"Found mne reference time: {session.mne.referenceTime}")
+
+            # and return
+            return session
+
+    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
     # action stub
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
     class stub(pglAction):
@@ -1446,53 +1655,6 @@ class pglActions():
 
             # and return
             return session
-
-    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
-    # eyeblink detecion
-    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
-    class mneEyeblinkDetection(pglAction):
-
-        # parameters
-        leftEyeChannel = Unicode('L401', help="Left channel used for detecting eye blink")
-        rightEyeChannel = Unicode('R401', help="Left channel used for detecting eye blink")
-                
-        ################################
-        # configure
-        ################################
-        def configure(self, **kwargs) -> None:
-
-            # set parameters
-            self.configureTraits(**kwargs)
-                
-            # we are now configured, so call super to set status
-            super().configure()
-            
-        ################################
-        # run
-        ################################
-        def _run(self, session: pglSession) -> pglSession:
-            '''
-            
-            
-            Returns:
-                pglSession:  session
-            '''
-            # import mne
-            import mne
-
-            # check for mne session
-            if session.mne is None or session.mne.raw is None:
-                self.setError("session does not have raw mne loaded")
-                return None
-
-            # check for mne epochs
-            if session.mne.epochs is None:
-                self.setError("session does not have epochs created: run mneCreateEpochs")
-                return None
-
-            # and return
-            return session
-
 
 ##################################################################
 # class pglActionRecreateExperimentDataFromTasks
