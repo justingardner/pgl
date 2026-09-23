@@ -62,6 +62,9 @@ class pglMessages:
         # do not print if the messageType is disabled or verbose is false
         if not cls._shouldPrint(messageType, verbose): return
         
+        # FIX - temporary get rid of detailed messages
+        if messageType=='detailed': return
+        
         # get the callerNameDepth
         if callerNameDepth is None: callerNameDepth = 2
         else:

@@ -51,7 +51,7 @@ class pglRun(pglExperimentBase):
     def experimentSettings(self):
         '''Experiment settings, loaded from disk on first access.'''
         if self._experimentSettings is None:
-            pglMessages.message(f"Loading experiment settings for: {self.filesystemPrefix}/{self.fullDataPath}")
+            pglMessages.message(f"Loading experiment settings for: {self.filesystemPrefix}/{self.fullDataPath}",messageType='detailed')
             filesystem, fullDataPath, _ = pglBase.validateFilesystem(filesystem=self.filesystem, dataPath=self.fullDataPath, filesystemPrefix=self.filesystemPrefix)
             self._experimentSettings = pglExperimentSettings.load(filename=Path(fullDataPath) / "experimentSettings", filesystem=filesystem)
         return self._experimentSettings
@@ -64,7 +64,7 @@ class pglRun(pglExperimentBase):
     def settings(self):
         '''Settings the experiment was run with, loaded on first access.'''
         if self._settings is None:
-            pglMessages.message(f"Loading settings for: {self.filesystemPrefix}/{self.fullDataPath}")
+            pglMessages.message(f"Loading settings for: {self.filesystemPrefix}/{self.fullDataPath}",messageType='detailed')
             filesystem, fullDataPath, _ = pglBase.validateFilesystem(filesystem=self.filesystem, dataPath=self.fullDataPath, filesystemPrefix=self.filesystemPrefix)
             self._settings = pglSettings.load(filename=Path(fullDataPath) / "settings", filesystem=filesystem)
         return self._settings
@@ -77,7 +77,7 @@ class pglRun(pglExperimentBase):
     def data(self):
         '''Experiment data, loaded from disk on first access.'''
         if self._data is None:
-            pglMessages.message(f"Loading data for: {self.filesystemPrefix}/{self.fullDataPath}")
+            pglMessages.message(f"Loading data for: {self.filesystemPrefix}/{self.fullDataPath}",messageType='detailed')
             filesystem, fullDataPath, _ = pglBase.validateFilesystem(filesystem=self.filesystem, dataPath=self.fullDataPath, filesystemPrefix=self.filesystemPrefix)
             self._data = pglExperimentData.load(filename=Path(fullDataPath) / "data", filesystem=filesystem)
         return self._data
@@ -90,12 +90,11 @@ class pglRun(pglExperimentBase):
     def tasks(self):
         '''Experiment tasks'''
         if self._tasks is None:
-            pglMessages.message(f"Loading tasks for: {self.filesystemPrefix}/{self.fullDataPath}")
+            pglMessages.message(f"Loading tasks for: {self.filesystemPrefix}/{self.fullDataPath}",messageType='detailed')
             filesystem, fullDataPath, _ = pglBase.validateFilesystem(filesystem=self.filesystem, dataPath=self.fullDataPath, filesystemPrefix=self.filesystemPrefix)
             taskNames = self.experimentSettings.tasks
             self._tasks = []
             for iTask, taskName in enumerate(taskNames):
-                print(f"taskName: {taskName}")
                 taskDirName = pglTask.getTaskDirectoryName(iTask,taskName)
                 self._tasks.append(pglTaskBase.load(dataPath=f"{fullDataPath}{filesystem.sep}{taskDirName}", filesystem=filesystem))
         return self._tasks
@@ -136,10 +135,7 @@ class pglRun(pglExperimentBase):
         if taskIndex not in self._taskCache:
             taskName = f"task{taskIndex+1:02d}_{taskNames[taskIndex]}"
 
-            pglMessages.message(
-                f"Loading task {taskIndex}: {taskName} "
-                f"for {self.filesystemPrefix}/{self.fullDataPath}"
-            )
+            pglMessages.message(f"Loading task {taskIndex}: {taskName} for {self.filesystemPrefix}/{self.fullDataPath}",messageType='detailed')
 
             filesystem, fullDataPath, _ = pglBase.validateFilesystem(
                 filesystem=self.filesystem,
@@ -233,7 +229,7 @@ class pglRun(pglExperimentBase):
                 task = next((t for t in self.tasks if t.settings.taskSaveName.lower() == taskName.lower()), None)
         
         if task is None:
-            print(f"(pglExperimentAnalysis:getTrialsByParameter) ❌ Could not find {taskName} in experiemnt.\nValid tasks are: {' '.join(t.settings.taskName for t in self.tasks)}")
+            pglMessages.warning(f"Could not find {taskName} in experiemnt.\nValid tasks are: {' '.join(t.settings.taskName for t in self.tasks)}")
             return None
                 
         # gather all the different parameter names
@@ -253,7 +249,7 @@ class pglRun(pglExperimentBase):
         # get the matching parameter
         parameter = next((p for p in parameters if p.settings.name == parameterName), None)
         if parameter is None:
-            print(f"(pglExperimentAnalysis:getTrialsByParameter) ❌ Could not find '{parameterName}' in parameters {[p.settings.name for p in parameters]}")
+            pglMessages.warning(f"Could not find '{parameterName}' in parameters {[p.settings.name for p in parameters]}")
             return
         
         # initialize the list of lists for volumes by conditions        
@@ -308,6 +304,7 @@ class pglMNE(pglActionable):
     
     raws = List(Any(), help='List of all raws associated with this class. Note that instance is not typed to mne.io.BaseRaw until runtime',serialize=False)
     _raw = Any(allow_none=True, default_value=None, help='The single raw, which is usually generated by concatenate action, but can also be the first in the raws list if there is only one')
+    rawReferenceTime = Float(allow_none=True, default_value=None, help='reference time for the raw to compare to session reference time')
     rawFilenames = List(Unicode(allow_none=True), help="filenames of raw (if they exist)")
     rawFilesystemPrefix = List(Unicode(allow_none=True), help="filenames of raw (if they exist)", serialize=False)
     epochs = List(Any(), help='List of all epochs')
