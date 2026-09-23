@@ -1415,6 +1415,19 @@ class pglTaskData(pglTraitSettings):
     # make sure that any settings that the experimenter writes into settings get saved
     _serializeUnregisteredFields = True
 
+    @property
+    def nTrials(self):
+        '''
+        Compute number of trials that have been run
+        '''
+        nTrials = 0
+        for event in self.events:
+            # if we find a new trial event, reset the beginning time
+            if isinstance(event, pglEventTrial):
+                if event.eventType == "start":
+                    nTrials += 1
+        return nTrials
+
     def display(self, taskName="task", responseMapping=None, nTotalTrials=None, ax=None):
         '''
         Display the experiment data.
@@ -1542,7 +1555,7 @@ class pglTaskBase(pglTraitSettings):
         '''
         Load the task data.
         '''
-        pglMessages.message(f"(pglTask:load) Loading task data from: {dataPath}")
+        pglMessages.message(f"Loading task data from: {dataPath}", messageType='detailed')
 
         # validate filesystem
         filesystem, taskPath, _ = pglBase.validateFilesystem(filesystem, dataPath)
