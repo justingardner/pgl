@@ -152,7 +152,7 @@ class pglAction(pglActionable):
         """Create, configure, and run an action, returning its result."""
         
         action = cls()
-        configureNames = cls._getKeywordNames(action.configure)
+        configureNames = cls._getKeywordNames(action.configure) | set(action.traits())
         runNames = cls._getKeywordNames(action.run) | cls._getKeywordNames(action._run)
         validText = ", ".join(sorted(configureNames | runNames)) or "(none)"
 
