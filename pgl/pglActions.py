@@ -1506,51 +1506,12 @@ class pglActions():
             # get the run
             run = session.runs[self.runNum]
             
-            # get the task, if taskName is not set get the task that has the largest number of trials run, preferring
-            # tasks in which settings.nTrials has been set (i.e. that have been set to run nTrials and have completed those trials)
-            if self.taskName == '':
-                hasNTrialsSet = False
-                task = None
-
-                # for each task 
-                for t in run.tasks:
-                    # for the first task, select it
-                    if task is None:
-                        task = t
-                        hasNTrialsSet = t.settings.nTrials != np.inf
-                        continue
-                    # if all the previous tasks have not had infinite trails set
-                    if not hasNTrialsSet:
-                        # then either the task has more trials than the last one, or it has a finite number of trials set
-                        if t.settings.nTrials != np.inf or t.data.nTrials > task.data.nTrials:
-                            task = t
-                            hasNTrialsSet = t.settings.nTrials != np.inf
-                    # only tasks that have nTrials set and have larger number of trials
-                    elif t.settings.nTrials != np.inf and t.data.nTrials > task.data.nTrials:
-                        task = t
-            else:
-                # named task asked for, so try to find it 
-                matchingTasks = [(iTask, t) for iTask, t in enumerate(run.tasks) if t.taskName == self.taskName]
-
-                # no match
-                if not matchingTasks:
-                    self.setError(f"No task matches taskName '{self.taskName}'")
-                    return None
-
-                #single match just return it
-                if len(matchingTasks) == 1:
-                    task = matchingTasks[0][1]
-                    
-                # muultiple matches, see if taskID is se
-                elif self.taskID is None:
-                    self.setError(f"Multiple tasks match taskName '{self.taskName}'; specify taskID")
-                    return None
-                else:
-                    task = next((t for iTask, t in matchingTasks if iTask == self.taskID), None)
-                    if task is None:
-                        self.setError(f"No task matches taskName '{self.taskName}' and taskID {self.taskID}")
-                        return None
-            
+            # get the task
+            task = run.getTask(taskName=self.taskName, taskID=self.taskID)
+            if task is None:
+                self.setError("Could not get task")
+                return None
+                       
             # validate trialNum
             if self.trialNum >= task.data.nTrials:
                 self.setError(f"trialNum {self.trialNum} out of range: 0-{task.data.nTrials}")
@@ -1611,6 +1572,254 @@ class pglActions():
 
             # and return
             return session
+
+    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
+    # action stub
+    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
+    class alignSegmentsToTriggers(pglAction):
+
+        # parameters
+        segments = List(Int(), allow_none=True, default_value=None, help='List of segments to align to')
+        taskName = Unicode('', help='task used for alignment')
+        taskID = Int(allow_none=True, default_value=None, help='ID of task, used to disambiguate when there are multiple instance of a task in the experiment')
+
+        channelName = Unicode("", help='name of channel in mne for alignment')
+        highCutoff = Float(0.5, help='Cutoff value of channel to consider as an event')
+                
+        ################################
+        # configure
+        ################################
+        def configure(self, segments: int|list|None = None, **kwargs) -> None:
+
+            if segments == None: segments = 0
+            
+            # single int
+            if isinstance(segments, int):
+                self.segments = [segments]
+            else:
+                self.segments = segments
+
+            # set parameters
+            self.configureTraits(**kwargs)
+                            
+            # we are now configured, so call super to set status
+            super().configure()
+            
+        ################################
+        # run
+        ################################
+        def _run(self, session: pglSession) -> pglSession:
+
+            # Check MNE data.
+            if session.mne is None or session.mne.raw is None:
+                self.setError("Session does not have raw MNE loaded")
+                return None
+
+            raw = session.mne.raw
+
+            if (not isinstance(self.channelName, str) or self.channelName not in raw.ch_names):
+                self.setError(f"Unknown channelName: {self.channelName!r}")
+                return None
+
+            mneReferenceTime = getattr(session.mne, "referenceTime", None)
+            if mneReferenceTime is None:
+                self.setError("MNE referenceTime is not set; run alignment first")
+                return None
+
+            # Detect trigger onsets. Count an initially high channel as a trigger.
+            channelData = raw.get_data(picks=[self.channelName])[0]
+            isHigh = channelData > self.highCutoff
+
+            # get trigger times
+            triggerIndexes = np.flatnonzero(np.diff(isHigh.astype(int), prepend=0) == 1)
+            triggerTimes = raw.times[triggerIndexes]
+            triggerAlignedTimes = triggerTimes - mneReferenceTime
+
+            # Collect segment times across all runs on the same reference-time axis.
+            segmentAlignedTimes = []
+
+            for runNum, run in enumerate(session.runs):
+                task = run.getTask(taskName=self.taskName, taskID=self.taskID)
+
+                if task is None:
+                    self.setError(f"Could not get task for run {runNum}")
+                    return None
+
+                sessionReferenceTime = getattr(run.data, "referenceTime", None)
+                if sessionReferenceTime is None:
+                    self.setError(f"Run {runNum} referenceTime is not set; run alignment first")
+                    return None
+
+                for e in task.data.events:
+                    if (isinstance(e, pglEventSegment) and e.segmentNum in self.segments):
+                        segmentAlignedTimes.append(e.timestamp - sessionReferenceTime)
+
+            segmentAlignedTimes = np.asarray(segmentAlignedTimes, dtype=float)
+
+            nSegments = len(segmentAlignedTimes)
+            nTriggers = len(triggerAlignedTimes)
+            pglMessages.message(f"nSegments: {nSegments} nTriggers: {nTriggers}")
+
+            if nSegments == 0:
+                self.setError("No segment events matched self.segments")
+                return None
+
+            if nTriggers < nSegments:
+                self.setError(f"Not enough triggers: found {nTriggers} triggers for {nSegments} segments")
+                return None
+
+            # Trigger times are sorted. For each segment, compare the trigger
+            # immediately before it with the trigger immediately after it.
+            insertionIndexes = np.searchsorted(
+                triggerAlignedTimes, segmentAlignedTimes
+            )
+
+            leftIndexes = np.clip(insertionIndexes - 1, 0, nTriggers - 1)
+            rightIndexes = np.clip(insertionIndexes, 0, nTriggers - 1)
+
+            leftDistances = np.abs(
+                triggerAlignedTimes[leftIndexes] - segmentAlignedTimes
+            )
+            rightDistances = np.abs(
+                triggerAlignedTimes[rightIndexes] - segmentAlignedTimes
+            )
+
+            # Prefer the earlier trigger in an exact tie.
+            matchedTriggerIndexes = np.where(
+                leftDistances <= rightDistances,
+                leftIndexes,
+                rightIndexes,
+            )
+
+            # Enforce one trigger per segment.
+            uniqueIndexes, matchCounts = np.unique(
+                matchedTriggerIndexes, return_counts=True
+            )
+
+            nReusedTriggers = int(np.count_nonzero(matchCounts > 1))
+
+            if nReusedTriggers:
+                self.setError(
+                    f"Ambiguous matching: {nReusedTriggers} triggers were selected "
+                    "as the nearest trigger by multiple segments. "
+                    "Cannot make a one-to-one match using nearest triggers alone."
+                )
+                return None
+
+            # Subset: one trigger per segment, in segment-event order.
+            matchedTriggerTimes = triggerTimes[matchedTriggerIndexes]
+            matchedTriggerSamples = triggerIndexes[matchedTriggerIndexes]
+            matchedTriggerAlignedTimes = (
+                triggerAlignedTimes[matchedTriggerIndexes]
+            )
+
+            # Identify unused triggers.
+            unusedTriggerMask = np.ones(nTriggers, dtype=bool)
+            unusedTriggerMask[uniqueIndexes] = False
+
+            unmatchedTriggerTimes = triggerTimes[unusedTriggerMask]
+            nUnmatched = len(unmatchedTriggerTimes)
+
+            pglMessages.message(
+                f"Matched {nSegments} segments to {len(matchedTriggerTimes)} "
+                f"of {nTriggers} triggers; {nUnmatched} triggers were unmatched."
+            )
+
+            # Positive difference means the trigger occurred after the segment.
+            timeDifferencesMs = (
+                matchedTriggerAlignedTimes - segmentAlignedTimes
+            ) * 1000.0
+
+            absoluteDifferencesMs = np.abs(timeDifferencesMs)
+
+            meanMs = float(np.mean(timeDifferencesMs))
+            medianMs = float(np.median(timeDifferencesMs))
+            stdMs = float(np.std(timeDifferencesMs))
+            minMs = float(np.min(timeDifferencesMs))
+            maxMs = float(np.max(timeDifferencesMs))
+            meanAbsoluteMs = float(np.mean(absoluteDifferencesMs))
+            maxAbsoluteMs = float(np.max(absoluteDifferencesMs))
+
+            pglMessages.message(
+                "Timing differences (trigger - segment, ms):\n"
+                f"  Mean:           {meanMs:.3f}\n"
+                f"  Median:         {medianMs:.3f}\n"
+                f"  SD:             {stdMs:.3f}\n"
+                f"  Minimum:        {minMs:.3f}\n"
+                f"  Maximum:        {maxMs:.3f}\n"
+                f"  Mean absolute:  {meanAbsoluteMs:.3f}\n"
+                f"  Max absolute:   {maxAbsoluteMs:.3f}"
+            )
+
+            # Plot timing differences.
+            fig, ax = plt.subplots(figsize=(8, 4))
+
+            ax.hist(
+                timeDifferencesMs,
+                bins="auto",
+                edgecolor="black",
+                alpha=0.75,
+            )
+            ax.axvline(0, color="black", linestyle="--", label="Zero difference")
+            ax.axvline(
+                meanMs,
+                color="red",
+                linestyle=":",
+                label=f"Mean: {meanMs:.3f} ms",
+            )
+
+            ax.set_xlabel("Trigger time − segment time (ms)")
+            ax.set_ylabel("Number of matched segments")
+            ax.set_title(f"Segment–trigger timing differences (n={nSegments})")
+            ax.legend()
+
+            fig.tight_layout()
+            plt.show()
+
+            # Sort for display without changing the original segment order.
+            segmentPlotTimes = np.sort(segmentAlignedTimes)
+
+            fig, (triggerAx, segmentAx) = plt.subplots(
+                2, 1,
+                figsize=(12, 5),
+                sharex=True,
+            )
+
+            # All detected triggers, including those that may remain unmatched.
+            triggerAx.eventplot(
+                triggerAlignedTimes,
+                lineoffsets=0,
+                linelengths=0.8,
+                colors="tab:blue",
+            )
+            triggerAx.set_title(f"All detected triggers (n={nTriggers})")
+            triggerAx.set_ylabel("Triggers")
+            triggerAx.set_yticks([])
+            triggerAx.set_ylim(-0.6, 0.6)
+
+            # All segment events selected by self.segments.
+            segmentAx.eventplot(
+                segmentPlotTimes,
+                lineoffsets=0,
+                linelengths=0.8,
+                colors="tab:orange",
+            )
+            segmentAx.set_title(f"All selected segments (n={nSegments})")
+            segmentAx.set_ylabel("Segments")
+            segmentAx.set_xlabel("Time relative to alignment reference (s)")
+            segmentAx.set_yticks([])
+            segmentAx.set_ylim(-0.6, 0.6)
+
+            for ax in (triggerAx, segmentAx):
+                ax.axvline(0, color="black", linestyle="--", alpha=0.5)
+                ax.grid(axis="x", alpha=0.3)
+
+            fig.tight_layout()
+            plt.show()
+            
+            return session
+
+
 
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
     # action stub

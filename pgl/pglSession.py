@@ -103,14 +103,54 @@ class pglRun(pglExperimentBase):
     def tasks(self, value):
         self._tasks = value
         
-    def getTask(self, taskName):
+    def getTask(self, taskName='', taskID=None):
         '''
-        get a named task
+        get the task, if taskName is not set get the task that has the largest number of trials run, preferring
+        tasks in which settings.nTrials has been set (i.e. that have been set to run nTrials and have completed those trials)
         '''
-        for task in self.tasks:
-            if task.settings.taskSaveName == taskName:
-                return task
-        return None
+        if taskName == '':
+            hasNTrialsSet = False
+            task = None
+
+            # for each task 
+            for t in self.tasks:
+                # for the first task, select it
+                if task is None:
+                    task = t
+                    hasNTrialsSet = t.settings.nTrials != np.inf
+                    continue
+                # if all the previous tasks have not had infinite trails set
+                if not hasNTrialsSet:
+                    # then either the task has more trials than the last one, or it has a finite number of trials set
+                    if t.settings.nTrials != np.inf or t.data.nTrials > task.data.nTrials:
+                        task = t
+                        hasNTrialsSet = t.settings.nTrials != np.inf
+                # only tasks that have nTrials set and have larger number of trials
+                elif t.settings.nTrials != np.inf and t.data.nTrials > task.data.nTrials:
+                    task = t
+        else:
+            # named task asked for, so try to find it 
+            matchingTasks = [(iTask, t) for iTask, t in enumerate(self.tasks) if t.taskName == taskName]
+
+            # no match
+            if not matchingTasks:
+                pglMessages.warning(f"No task matches taskName '{taskName}'")
+                return None
+
+            #single match just return it
+            if len(matchingTasks) == 1:
+                task = matchingTasks[0][1]
+                
+            # muultiple matches, see if taskID is se
+            elif taskID is None:
+                pglMessages.warning(f"Multiple tasks match taskName '{taskName}'; specify taskID")
+                return None
+            else:
+                task = next((t for iTask, t in matchingTasks if iTask == taskID), None)
+                if task is None:
+                    pglMessages.warning(f"No task matches taskName '{taskName}' and taskID {taskID}")
+                    return None
+        return task
 
     def getTaskAt(self, taskIndex):
         """
