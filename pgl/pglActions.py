@@ -1578,66 +1578,121 @@ class pglActions():
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
     class alignSegmentsToTriggers(pglAction):
 
-        # parameters
+        # Parameters
         segments = List(Int(), allow_none=True, default_value=None, help='List of segments to align to')
-        taskName = Unicode('', help='task used for alignment')
-        taskID = Int(allow_none=True, default_value=None, help='ID of task, used to disambiguate when there are multiple instance of a task in the experiment')
+        taskName = Unicode('', help='Task used for alignment')
+        taskID = Int(
+            allow_none=True,
+            default_value=None,
+            help='ID of task, used to disambiguate multiple instances of a task',
+        )
 
-        channelName = Unicode("", help='name of channel in mne for alignment')
+        channelName = Unicode('', help='Name of channel in MNE for alignment')
         highCutoff = Float(0.5, help='Cutoff value of channel to consider as an event')
-                
+
+        outputChannelName = Unicode(
+            'trigger',
+            help='Name of output trigger channel; empty string disables output',
+        )
+        useSegmentTimeAsTruth = Bool(
+            True,
+            help='Use corrected segment times rather than recorded digital pulse times for output triggers',
+        )
+
         ################################
         # configure
         ################################
-        def configure(self, segments: int|list|None = None, **kwargs) -> None:
+        def configure(self, segments: int | list | None = None, **kwargs) -> None:
 
-            if segments == None: segments = 0
-            
-            # single int
+            if segments is None:
+                segments = 0
+
             if isinstance(segments, int):
                 self.segments = [segments]
             else:
                 self.segments = segments
 
-            # set parameters
             self.configureTraits(**kwargs)
-                            
-            # we are now configured, so call super to set status
             super().configure()
-            
+
         ################################
         # run
         ################################
         def _run(self, session: pglSession) -> pglSession:
 
-            # Check MNE data.
+            import mne
+
+            def histogramEdges(values):
+                if values.size == 0:
+                    return np.linspace(0, 1, 81)
+
+                lower, upper = float(np.min(values)), float(np.max(values))
+                padding = max((upper - lower) * 0.025, abs(lower) * 1e-9, 1e-6)
+                return np.linspace(lower - padding, upper + padding, 81)
+
+            def plotHistogram(ax, values, edges, color, title, xlabel):
+                ax.hist(values, bins=edges, edgecolor="black", linewidth=0.4, color=color, alpha=0.8)
+                ax.set_xlim(edges[0], edges[-1])
+                ax.set_title(f"{title} (n={values.size})")
+                ax.set_xlabel(xlabel)
+                ax.set_ylabel("Count")
+                ax.ticklabel_format(axis="x", style="plain", useOffset=False)
+                ax.set_axisbelow(True)
+                ax.grid(axis="y", alpha=0.3)
+
+                if values.size:
+                    medianMs = float(np.median(values))
+                    ax.axvline(medianMs, color="red", linestyle=":", label=f"Median: {medianMs:.6g} ms")
+                    ax.legend()
+
+            def plotIntervalWindow(ax, values, edges, color, title, rangeName):
+                visibleMask = (values >= edges[0]) & (values <= edges[-1])
+                visibleValues = values[visibleMask]
+                nMissing = int(values.size - visibleValues.size)
+                windowTitle = f"{title} — {rangeName} range; {nMissing}/{values.size} outside window"
+                plotHistogram(ax, visibleValues, edges, color, windowTitle, "Inter-pulse interval (ms)")
+
+            # Validate MNE data and the common reference.
             if session.mne is None or session.mne.raw is None:
                 self.setError("Session does not have raw MNE loaded")
                 return None
 
             raw = session.mne.raw
+            sfreq = float(raw.info["sfreq"])
 
-            if (not isinstance(self.channelName, str) or self.channelName not in raw.ch_names):
+            if not isinstance(self.channelName, str) or self.channelName not in raw.ch_names:
                 self.setError(f"Unknown channelName: {self.channelName!r}")
                 return None
 
             mneReferenceTime = getattr(session.mne, "referenceTime", None)
-            if mneReferenceTime is None:
-                self.setError("MNE referenceTime is not set; run alignment first")
+            if mneReferenceTime is None or not np.isfinite(mneReferenceTime):
+                self.setError("MNE referenceTime is missing or invalid; run alignment first")
                 return None
 
-            # Detect trigger onsets. Count an initially high channel as a trigger.
+            if self.outputChannelName:
+                if not self.outputChannelName.strip():
+                    self.setError("outputChannelName must not contain only whitespace")
+                    return None
+
+                if self.outputChannelName in raw.ch_names:
+                    pglMessages.message(f"Output channel {self.outputChannelName!r} already exists. Overwriting")
+
+            # Detect onsets, counting an initially high channel as a trigger.
             channelData = raw.get_data(picks=[self.channelName])[0]
             isHigh = channelData > self.highCutoff
-
-            # get trigger times
             triggerIndexes = np.flatnonzero(np.diff(isHigh.astype(int), prepend=0) == 1)
             triggerTimes = raw.times[triggerIndexes]
             triggerAlignedTimes = triggerTimes - mneReferenceTime
+            nTriggers = triggerAlignedTimes.size
 
-            # Collect segment times across all runs on the same reference-time axis.
-            segmentAlignedTimes = []
+            if nTriggers == 0:
+                self.setError("No triggers detected")
+                return None
 
+            usedTriggerMask = np.zeros(nTriggers, dtype=bool)
+            runResults = []
+
+            # Match and correct each run independently; keep plotting data local.
             for runNum, run in enumerate(session.runs):
                 task = run.getTask(taskName=self.taskName, taskID=self.taskID)
 
@@ -1645,181 +1700,387 @@ class pglActions():
                     self.setError(f"Could not get task for run {runNum}")
                     return None
 
-                sessionReferenceTime = getattr(run.data, "referenceTime", None)
-                if sessionReferenceTime is None:
-                    self.setError(f"Run {runNum} referenceTime is not set; run alignment first")
+                oldReferenceTime = getattr(run.data, "referenceTime", None)
+                if oldReferenceTime is None or not np.isfinite(oldReferenceTime):
+                    self.setError(f"Run {runNum} referenceTime is missing or invalid; run alignment first")
                     return None
 
-                for e in task.data.events:
-                    if (isinstance(e, pglEventSegment) and e.segmentNum in self.segments):
-                        segmentAlignedTimes.append(e.timestamp - sessionReferenceTime)
+                segmentTimestamps = np.asarray([
+                    e.timestamp for e in task.data.events
+                    if isinstance(e, pglEventSegment) and e.segmentNum in self.segments
+                ], dtype=float)
 
-            segmentAlignedTimes = np.asarray(segmentAlignedTimes, dtype=float)
+                if segmentTimestamps.size == 0:
+                    self.setError(f"No segment events matched self.segments in run {runNum}")
+                    return None
 
-            nSegments = len(segmentAlignedTimes)
-            nTriggers = len(triggerAlignedTimes)
-            pglMessages.message(f"nSegments: {nSegments} nTriggers: {nTriggers}")
+                if not np.all(np.isfinite(segmentTimestamps)):
+                    self.setError(f"Run {runNum} has non-finite segment timestamps")
+                    return None
 
-            if nSegments == 0:
-                self.setError("No segment events matched self.segments")
+                if segmentTimestamps.size > nTriggers:
+                    self.setError(f"Run {runNum} has more selected segments than available triggers")
+                    return None
+
+                segmentAlignedTimes = segmentTimestamps - oldReferenceTime
+
+                # Find the nearest trigger on either side; prefer the earlier one in a tie.
+                insertionIndexes = np.searchsorted(triggerAlignedTimes, segmentAlignedTimes)
+                leftIndexes = np.clip(insertionIndexes - 1, 0, nTriggers - 1)
+                rightIndexes = np.clip(insertionIndexes, 0, nTriggers - 1)
+                leftDistances = np.abs(triggerAlignedTimes[leftIndexes] - segmentAlignedTimes)
+                rightDistances = np.abs(triggerAlignedTimes[rightIndexes] - segmentAlignedTimes)
+                matchedIndexes = np.where(leftDistances <= rightDistances, leftIndexes, rightIndexes)
+
+                # Preserve one-to-one matching within and across runs.
+                if np.unique(matchedIndexes).size != matchedIndexes.size:
+                    self.setError(f"Run {runNum}: multiple segments selected the same nearest trigger")
+                    return None
+
+                if np.any(usedTriggerMask[matchedIndexes]):
+                    self.setError(f"Run {runNum}: a matched trigger was already assigned to another run")
+                    return None
+
+                usedTriggerMask[matchedIndexes] = True
+                matchedTriggerAlignedTimes = triggerAlignedTimes[matchedIndexes]
+
+                # Decrease the reference by the median trigger-minus-segment offset.
+                originalDifferences = matchedTriggerAlignedTimes - segmentAlignedTimes
+                medianOffsetSeconds = float(np.median(originalDifferences))
+                newReferenceTime = float(oldReferenceTime - medianOffsetSeconds)
+
+                # Keep the established pairs and compute corrected residuals.
+                correctedSegmentTimes = segmentTimestamps - newReferenceTime
+                timeDifferencesMs = (matchedTriggerAlignedTimes - correctedSegmentTimes) * 1000
+
+                # Compute intervals within this run only, using its matched triggers.
+                triggerPlotTimes = np.sort(matchedTriggerAlignedTimes)
+                segmentPlotTimes = np.sort(correctedSegmentTimes)
+                triggerIntervalsMs = np.diff(triggerPlotTimes) * 1000
+                segmentIntervalsMs = np.diff(segmentPlotTimes) * 1000
+
+                runResults.append({
+                    "run": run,
+                    "runNum": runNum,
+                    "referenceTime": newReferenceTime,
+                    "referenceShiftMs": -medianOffsetSeconds * 1000,
+                    "correctedSegmentTimes": correctedSegmentTimes.copy(),
+                    "matchedTriggerAlignedTimes": matchedTriggerAlignedTimes.copy(),
+                    "triggerPlotTimes": triggerPlotTimes,
+                    "segmentPlotTimes": segmentPlotTimes,
+                    "triggerIntervalsMs": triggerIntervalsMs,
+                    "segmentIntervalsMs": segmentIntervalsMs,
+                    "timeDifferencesMs": timeDifferencesMs,
+                })
+
+            if not runResults:
+                self.setError("Session has no runs")
                 return None
 
-            if nTriggers < nSegments:
-                self.setError(f"Not enough triggers: found {nTriggers} triggers for {nSegments} segments")
-                return None
+            # Validate and prepare the output channel before modifying raw or runs.
+            stimRaw = None
 
-            # Trigger times are sorted. For each segment, compare the trigger
-            # immediately before it with the trigger immediately after it.
-            insertionIndexes = np.searchsorted(
-                triggerAlignedTimes, segmentAlignedTimes
-            )
+            if self.outputChannelName:
+                sampleArrays = []
+                valueArrays = []
 
-            leftIndexes = np.clip(insertionIndexes - 1, 0, nTriggers - 1)
-            rightIndexes = np.clip(insertionIndexes, 0, nTriggers - 1)
+                for result in runResults:
+                    run = result["run"]
+                    runNum = result["runNum"]
 
-            leftDistances = np.abs(
-                triggerAlignedTimes[leftIndexes] - segmentAlignedTimes
-            )
-            rightDistances = np.abs(
-                triggerAlignedTimes[rightIndexes] - segmentAlignedTimes
-            )
+                    # Preserve segment-event order so trigger codes stay paired
+                    # with the corresponding events.
+                    eventAlignedTimes = (
+                        result["correctedSegmentTimes"]
+                        if self.useSegmentTimeAsTruth
+                        else result["matchedTriggerAlignedTimes"]
+                    )
 
-            # Prefer the earlier trigger in an exact tie.
-            matchedTriggerIndexes = np.where(
-                leftDistances <= rightDistances,
-                leftIndexes,
-                rightIndexes,
-            )
+                    triggerValues = getattr(run, "triggers", None)
+                    if triggerValues is None:
+                        self.setError(f"Run {runNum}: run.triggers is missing")
+                        return None
 
-            # Enforce one trigger per segment.
-            uniqueIndexes, matchCounts = np.unique(
-                matchedTriggerIndexes, return_counts=True
-            )
+                    try:
+                        triggerValues = np.asarray(triggerValues)
+                    except (TypeError, ValueError) as exc:
+                        self.setError(f"Run {runNum}: could not read run.triggers: {exc}")
+                        return None
 
-            nReusedTriggers = int(np.count_nonzero(matchCounts > 1))
+                    if triggerValues.ndim != 1:
+                        self.setError(f"Run {runNum}: run.triggers must be a one-dimensional array")
+                        return None
 
-            if nReusedTriggers:
-                self.setError(
-                    f"Ambiguous matching: {nReusedTriggers} triggers were selected "
-                    "as the nearest trigger by multiple segments. "
-                    "Cannot make a one-to-one match using nearest triggers alone."
+                    if triggerValues.size != eventAlignedTimes.size:
+                        self.setError(
+                            f"Run {runNum}: run.triggers has {triggerValues.size} values, "
+                            f"but there are {eventAlignedTimes.size} selected segment events"
+                        )
+                        return None
+
+                    # Reject strings, objects, complex values, and booleans.
+                    if triggerValues.dtype.kind not in "iuf":
+                        self.setError(f"Run {runNum}: run.triggers must contain numeric integer codes")
+                        return None
+
+                    # Zero is reserved for baseline. Codes must be exactly
+                    # representable in MNE's floating-point raw data.
+                    if (
+                        not np.all(np.isfinite(triggerValues))
+                        or np.any(triggerValues <= 0)
+                        or np.any(triggerValues > 2**53 - 1)
+                        or np.any(triggerValues != np.floor(triggerValues))
+                    ):
+                        self.setError(
+                            f"Run {runNum}: trigger codes must be finite positive integers "
+                            f"no larger than {2**53 - 1}; zero is reserved for baseline"
+                        )
+                        return None
+
+                    # Return from the common aligned timebase to raw-relative seconds.
+                    eventRawTimes = eventAlignedTimes + mneReferenceTime
+
+                    if not np.all(np.isfinite(eventRawTimes)):
+                        self.setError(f"Run {runNum}: output trigger times are non-finite")
+                        return None
+
+                    # Index into raw's data. Do not add raw.first_samp here.
+                    eventSamples = raw.time_as_index(eventRawTimes, use_rounding=True)
+
+                    outside = (eventSamples < 0) | (eventSamples >= raw.n_times)
+                    if np.any(outside):
+                        self.setError(
+                            f"Run {runNum}: {np.count_nonzero(outside)} output triggers "
+                            "fall outside the raw recording"
+                        )
+                        return None
+
+                    sampleArrays.append(eventSamples)
+                    valueArrays.append(triggerValues.astype(np.float64))
+
+                    # Retain each run's generated sample positions for plotting.
+                    result["outputSamples"] = np.sort(eventSamples)
+
+                allSamples = np.concatenate(sampleArrays)
+                allValues = np.concatenate(valueArrays)
+
+                # Sort samples and codes together, including across run boundaries.
+                order = np.argsort(allSamples)
+                allSamples = allSamples[order]
+                allValues = allValues[order]
+
+                sampleGaps = np.diff(allSamples)
+
+                if np.any(sampleGaps == 0):
+                    self.setError("Multiple output triggers map to the same raw sample")
+                    return None
+
+                # Require a zero sample between pulses so repeated codes remain distinct.
+                if np.any(sampleGaps == 1):
+                    self.setError(
+                        "Output triggers occupy adjacent samples; one-sample pulses "
+                        "need at least one zero sample between them"
+                    )
+                    return None
+
+                # Build one-sample pulses directly on the original raw sample grid.
+                triggerTrace = np.zeros(raw.n_times, dtype=np.float64)
+                triggerTrace[allSamples] = allValues
+
+                stimInfo = mne.create_info(
+                    ch_names=[self.outputChannelName],
+                    sfreq=sfreq,
+                    ch_types=["stim"],
                 )
-                return None
+                stimRaw = mne.io.RawArray(
+                    triggerTrace[np.newaxis, :],
+                    stimInfo,
+                    first_samp=raw.first_samp,
+                    verbose=False,
+                )
+                stimRaw.set_meas_date(raw.info["meas_date"])
 
-            # Subset: one trigger per segment, in segment-event order.
-            matchedTriggerTimes = triggerTimes[matchedTriggerIndexes]
-            matchedTriggerSamples = triggerIndexes[matchedTriggerIndexes]
-            matchedTriggerAlignedTimes = (
-                triggerAlignedTimes[matchedTriggerIndexes]
+            # Pool within-run intervals, never concatenated pulse times.
+            triggerIntervalsMs = np.concatenate([r["triggerIntervalsMs"] for r in runResults])
+            segmentIntervalsMs = np.concatenate([r["segmentIntervalsMs"] for r in runResults])
+            timeDifferencesMs = np.concatenate([r["timeDifferencesMs"] for r in runResults])
+
+            triggerEdges = histogramEdges(triggerIntervalsMs)
+            segmentEdges = histogramEdges(segmentIntervalsMs)
+            differenceEdges = histogramEdges(timeDifferencesMs)
+
+            # Add a generated-trigger subplot directly below each run overlay.
+            hasOutput = stimRaw is not None
+            rowsPerRun = 2 if hasOutput else 1
+            nRows = 3 + rowsPerRun * len(runResults)
+
+            fig = plt.figure(figsize=(15, 2.8 * nRows), constrained_layout=True)
+            grid = fig.add_gridspec(nRows, 2)
+
+            triggerLeftAx = fig.add_subplot(grid[0, 0])
+            triggerRightAx = fig.add_subplot(grid[0, 1])
+            segmentLeftAx = fig.add_subplot(grid[1, 0], sharex=triggerLeftAx)
+            segmentRightAx = fig.add_subplot(grid[1, 1], sharex=triggerRightAx)
+            differenceAx = fig.add_subplot(grid[2, :])
+
+            # Left column: trigger range. Right column: segment range.
+            plotIntervalWindow(
+                triggerLeftAx, triggerIntervalsMs, triggerEdges,
+                "tab:blue", "Trigger intervals", "trigger",
+            )
+            plotIntervalWindow(
+                segmentLeftAx, segmentIntervalsMs, triggerEdges,
+                "tab:orange", "Segment intervals", "trigger",
+            )
+            plotIntervalWindow(
+                triggerRightAx, triggerIntervalsMs, segmentEdges,
+                "tab:blue", "Trigger intervals", "segment",
+            )
+            plotIntervalWindow(
+                segmentRightAx, segmentIntervalsMs, segmentEdges,
+                "tab:orange", "Segment intervals", "segment",
             )
 
-            # Identify unused triggers.
-            unusedTriggerMask = np.ones(nTriggers, dtype=bool)
-            unusedTriggerMask[uniqueIndexes] = False
-
-            unmatchedTriggerTimes = triggerTimes[unusedTriggerMask]
-            nUnmatched = len(unmatchedTriggerTimes)
-
-            pglMessages.message(
-                f"Matched {nSegments} segments to {len(matchedTriggerTimes)} "
-                f"of {nTriggers} triggers; {nUnmatched} triggers were unmatched."
+            plotHistogram(
+                differenceAx, timeDifferencesMs, differenceEdges, "tab:purple",
+                "Matched timing differences after per-run correction",
+                "Trigger time − segment time (ms)",
             )
+            differenceAx.axvline(0, color="black", linestyle="--", alpha=0.5)
 
-            # Positive difference means the trigger occurred after the segment.
-            timeDifferencesMs = (
-                matchedTriggerAlignedTimes - segmentAlignedTimes
-            ) * 1000.0
+            for runIndex, result in enumerate(runResults):
+                rowNum = 3 + rowsPerRun * runIndex
+                ax = fig.add_subplot(grid[rowNum, :])
 
-            absoluteDifferencesMs = np.abs(timeDifferencesMs)
+                triggerPlotTimes = result["triggerPlotTimes"]
+                segmentPlotTimes = result["segmentPlotTimes"]
+                plotOrigin = segmentPlotTimes[0]
 
-            meanMs = float(np.mean(timeDifferencesMs))
-            medianMs = float(np.median(timeDifferencesMs))
-            stdMs = float(np.std(timeDifferencesMs))
-            minMs = float(np.min(timeDifferencesMs))
-            maxMs = float(np.max(timeDifferencesMs))
-            meanAbsoluteMs = float(np.mean(absoluteDifferencesMs))
-            maxAbsoluteMs = float(np.max(absoluteDifferencesMs))
+                ax.eventplot(
+                    triggerPlotTimes - plotOrigin,
+                    lineoffsets=0,
+                    linelengths=0.8,
+                    colors="tab:blue",
+                    linewidths=1.5,
+                    label="Matched triggers",
+                    zorder=2,
+                )
+                ax.eventplot(
+                    segmentPlotTimes - plotOrigin,
+                    lineoffsets=0,
+                    linelengths=0.4,
+                    colors="tab:orange",
+                    linewidths=2,
+                    label="Session pulses",
+                    zorder=3,
+                )
 
-            pglMessages.message(
-                "Timing differences (trigger - segment, ms):\n"
-                f"  Mean:           {meanMs:.3f}\n"
-                f"  Median:         {medianMs:.3f}\n"
-                f"  SD:             {stdMs:.3f}\n"
-                f"  Minimum:        {minMs:.3f}\n"
-                f"  Maximum:        {maxMs:.3f}\n"
-                f"  Mean absolute:  {meanAbsoluteMs:.3f}\n"
-                f"  Max absolute:   {maxAbsoluteMs:.3f}"
-            )
-
-            # Plot timing differences.
-            fig, ax = plt.subplots(figsize=(8, 4))
-
-            ax.hist(
-                timeDifferencesMs,
-                bins="auto",
-                edgecolor="black",
-                alpha=0.75,
-            )
-            ax.axvline(0, color="black", linestyle="--", label="Zero difference")
-            ax.axvline(
-                meanMs,
-                color="red",
-                linestyle=":",
-                label=f"Mean: {meanMs:.3f} ms",
-            )
-
-            ax.set_xlabel("Trigger time − segment time (ms)")
-            ax.set_ylabel("Number of matched segments")
-            ax.set_title(f"Segment–trigger timing differences (n={nSegments})")
-            ax.legend()
-
-            fig.tight_layout()
-            plt.show()
-
-            # Sort for display without changing the original segment order.
-            segmentPlotTimes = np.sort(segmentAlignedTimes)
-
-            fig, (triggerAx, segmentAx) = plt.subplots(
-                2, 1,
-                figsize=(12, 5),
-                sharex=True,
-            )
-
-            # All detected triggers, including those that may remain unmatched.
-            triggerAx.eventplot(
-                triggerAlignedTimes,
-                lineoffsets=0,
-                linelengths=0.8,
-                colors="tab:blue",
-            )
-            triggerAx.set_title(f"All detected triggers (n={nTriggers})")
-            triggerAx.set_ylabel("Triggers")
-            triggerAx.set_yticks([])
-            triggerAx.set_ylim(-0.6, 0.6)
-
-            # All segment events selected by self.segments.
-            segmentAx.eventplot(
-                segmentPlotTimes,
-                lineoffsets=0,
-                linelengths=0.8,
-                colors="tab:orange",
-            )
-            segmentAx.set_title(f"All selected segments (n={nSegments})")
-            segmentAx.set_ylabel("Segments")
-            segmentAx.set_xlabel("Time relative to alignment reference (s)")
-            segmentAx.set_yticks([])
-            segmentAx.set_ylim(-0.6, 0.6)
-
-            for ax in (triggerAx, segmentAx):
-                ax.axvline(0, color="black", linestyle="--", alpha=0.5)
+                shiftMs = result["referenceShiftMs"]
+                ax.set_title(
+                    f"Run {result['runNum']} — {segmentPlotTimes.size} pairs; "
+                    f"reference shift={shiftMs:.6f} ms"
+                )
+                ax.set_ylabel("Events")
+                ax.set_yticks([])
+                ax.set_ylim(-0.6, 0.6)
+                ax.legend(loc="upper right")
                 ax.grid(axis="x", alpha=0.3)
 
-            fig.tight_layout()
+                xlabel = "Time relative to first corrected selected segment in this run (s)"
+
+                if hasOutput:
+                    outputAx = fig.add_subplot(grid[rowNum + 1, :], sharex=ax)
+                    outputSamples = result["outputSamples"]
+
+                    # Read actual generated codes from the trace, at their rounded
+                    # raw sample positions, then convert to the overlay's timebase.
+                    outputTimes = outputSamples / sfreq - mneReferenceTime - plotOrigin
+                    outputValues = triggerTrace[outputSamples]
+
+                    # Draw each one-sample pulse with its true width and amplitude.
+                    # NaN separators avoid joining separate pulses.
+                    pulseTimes = np.column_stack((
+                        outputTimes,
+                        outputTimes,
+                        outputTimes + 1 / sfreq,
+                        outputTimes + 1 / sfreq,
+                        np.full(outputTimes.size, np.nan),
+                    )).ravel()
+                    pulseValues = np.column_stack((
+                        np.zeros(outputValues.size),
+                        outputValues,
+                        outputValues,
+                        np.zeros(outputValues.size),
+                        np.full(outputValues.size, np.nan),
+                    )).ravel()
+
+                    outputAx.axhline(0, color="black", linewidth=0.6, alpha=0.5)
+                    outputAx.plot(
+                        pulseTimes, pulseValues,
+                        color="tab:green", linewidth=1,
+                        label=self.outputChannelName,
+                    )
+                    outputAx.scatter(
+                        outputTimes, outputValues,
+                        color="tab:green", s=12, zorder=3,
+                    )
+
+                    timingSource = (
+                        "corrected segment times"
+                        if self.useSegmentTimeAsTruth
+                        else "matched recorded pulse times"
+                    )
+                    outputAx.set_title(
+                        f"Run {result['runNum']} — generated triggers "
+                        f"(n={outputSamples.size}; {timingSource})"
+                    )
+                    outputAx.set_xlabel(xlabel)
+                    outputAx.set_ylabel("Trigger code")
+                    outputAx.ticklabel_format(axis="y", style="plain", useOffset=False)
+                    outputAx.set_ylim(-0.05 * outputValues.max(), 1.1 * outputValues.max())
+                    outputAx.legend(loc="upper right")
+                    outputAx.grid(alpha=0.3)
+                    ax.tick_params(axis="x", labelbottom=False)
+
+                    # Both plots use the same limits and time origin.
+                    left = min(
+                        triggerPlotTimes[0] - plotOrigin,
+                        segmentPlotTimes[0] - plotOrigin,
+                        outputTimes[0],
+                    )
+                    right = max(
+                        triggerPlotTimes[-1] - plotOrigin,
+                        segmentPlotTimes[-1] - plotOrigin,
+                        outputTimes[-1] + 1 / sfreq,
+                    )
+                    padding = max((right - left) * 0.025, 2 / sfreq)
+                    ax.set_xlim(left - padding, right + padding)
+                else:
+                    ax.set_xlabel(xlabel)
+
             plt.show()
-            
+
+            # All runs and output triggers have validated.
+            # Add the channel, then commit corrected run reference times.
+            # Add or overwrite the output channel.
+            if stimRaw is not None:
+                raw.load_data()
+
+                if self.outputChannelName in raw.ch_names:
+                    raw.apply_function(
+                        lambda data: triggerTrace.copy(),
+                        picks=[self.outputChannelName],
+                        channel_wise=True,
+                    )
+                    raw.set_channel_types({self.outputChannelName: "stim"})
+                else:
+                    raw.add_channels([stimRaw], force_update_info=True)
+
+            # Commit corrected run reference times.
+            for result in runResults:
+                result["run"].data.referenceTime = result["referenceTime"]
+
             return session
-
-
 
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
     # action stub
