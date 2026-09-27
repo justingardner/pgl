@@ -8,394 +8,377 @@
 ##############
 # Imports
 ##############
+import re
 import numpy as np
-import h5py
-from dataclasses import fields, is_dataclass
-from pathlib import Path
-from .pglEvent import pglEvent
-      
-############################
+import pandas as pd
+import xarray as xr
+from traitlets import Any, validate
+from .pglMessages import pglMessages
+from .pglPipeline import pglActionable
+
+##################################
 # pglDataMatrix
-############################
-class pglDataMatrix:
+##################################
+class pglDataMatrix(pglActionable):
     """
-    Base class that wraps either:
-        - an in-memory NumPy array
-        - an HDF5 dataset
+    Generic wrapper around an xarray DataArray or Dataset.
+
+    Makes no assumptions about dimensions, coordinates, or data sources.
+    Missing public attributes and indexing delegate to the underlying xarray.
+    Delegated operations return native xarray objects.
+
+    Use .data for arithmetic or functions requiring an actual xarray object.
+    Attributes defined by pglActionable or this wrapper take precedence.
     """
-    # ---------------------------------------------------------
-    # Construction
-    # --------------------------------------------------------
-    @classmethod
-    def fromArray(cls, data, channelNames, units, sampleRate=None):
-        '''
-        initialize the data matrix from array data - stored internally
-        as a numpy array until save is called when it gets backed by an hdf5
-        
-        Args:
-            data: matrix of data. Channels are in columns
-            channelNames (list): string labels for each channel
-            sampleRate (float): sampleRate of data
-            units (list): string labels of units
-        '''
-        
-        # initialize class 
-        obj = cls.__new__(cls)
 
-        # store the data
-        obj._data = np.asarray(data)
+    data = Any(default_value=None, allow_none=True, serialize=False, help="Underlying xarray DataArray or Dataset")
 
-        # validate channelNames length
-        if len(channelNames) != obj._data.shape[1]:
-            raise ValueError(
-                f"(pglDataMatrix:fromArray) channelNames has {len(channelNames)} entries "
-                f"but data has {obj._data.shape[1]} columns."
-            )
-        # validate channelNames has no duplicates
-        if len(set(channelNames)) != len(channelNames):
-            raise ValueError(
-                "(pglDataMatrix:fromArray) channelNames must be unique."
-            )
-        # save channelNames
-        obj.channelNames = list(channelNames)
-        
-        # validate units     and sve    
-        if len(units) != obj._data.shape[1]:
-            raise ValueError(
-                f"(pglDataMatrix:fromArray) units has {len(units)} entries "
-                f"but data has {obj._data.shape[1]} columns."
-            )
-        obj.units = list(units)
-        
-        # save sampleRate
-        obj.sampleRate = sampleRate
+    def __init__(self, data=None):
+        super().__init__()
+        self.data = data
 
-        # not used for memory backed storage
-        obj._h5 = None
-        obj.filePath = None
+    @validate("data")
+    def validateData(self, proposal):
+        data = proposal["value"]
+        if data is not None and not isinstance(data, (xr.DataArray, xr.Dataset)):
+            raise TypeError("data must be an xarray.DataArray, xarray.Dataset, or None")
+        return data
 
-        return obj
+    def requireData(self):
+        """Return the underlying xarray object, or raise if empty."""
+        if self.data is None:
+            raise ValueError("No data have been assigned")
+        return self.data
 
-    @classmethod
-    def fromFile(cls, filePath, mode="r"):
-
-        # initialize class
-        obj = cls.__new__(cls)
-
-        # -----------------------------
-        # filePath validation
-        # -----------------------------
-        if filePath is None:
-            raise ValueError("(pglDataMatrix:fromFile) filePath is None")
-
-        if not isinstance(filePath, (str, Path)):
-            raise TypeError("(pglDataMatrix:fromFile) filePath must be a str or Path")
-
-        path = Path(filePath)
-
-        if not path.exists():
-            raise FileNotFoundError(f"(pglDataMatrix:fromFile) file not found: {filePath}")
-
-        # -----------------------------
-        # open file
-        # -----------------------------
-        obj.filePath = str(path)
-        obj._h5 = h5py.File(path, mode)
-        obj._data = None
+    def __getattr__(self, attrName):
+        """Delegate missing public attributes to xarray."""
+        if attrName.startswith("_"):
+            raise AttributeError(f"{type(self).__name__!r} has no attribute {attrName!r}")
 
         try:
-            # -----------------------------
-            # required dataset checks
-            # -----------------------------
-            required = ["data", "channelNames", "units"]
+            data = object.__getattribute__(self, "data")
+        except AttributeError:
+            data = None
 
-            for key in required:
-                if key not in obj._h5:
-                    raise ValueError(f"(pglDataMatrix:fromFile) missing dataset '{key}'")
-
-            data = obj._h5["data"]
-
-            if data.ndim != 2:
-                raise ValueError("(pglDataMatrix:fromFile) 'data' must be 2D (samples x channels)")
-
-            numChannels = data.shape[1]
-
-            # -----------------------------
-            # channelNames
-            # -----------------------------
-            obj.channelNames = [
-                c.decode() if isinstance(c, bytes) else c
-                for c in obj._h5["channelNames"][()]
-            ]
-
-            if len(obj.channelNames) != numChannels:
-                raise ValueError(
-                    f"(pglDataMatrix:fromFile) channelNames has {len(obj.channelNames)} entries "
-                    f"but data has {numChannels} columns."
-                )
-
-            if len(set(obj.channelNames)) != len(obj.channelNames):
-                raise ValueError(
-                    "(pglDataMatrix:fromFile) channelNames must be unique."
-                )
-
-            # -----------------------------
-            # units
-            # -----------------------------
-            obj.units = [
-                u.decode() if isinstance(u, bytes) else u
-                for u in obj._h5["units"][()]
-            ]
-
-            if len(obj.units) != numChannels:
-                raise ValueError(
-                    f"(pglDataMatrix:fromFile) units has {len(obj.units)} entries "
-                    f"but data has {numChannels} columns."
-                )
-
-            # -----------------------------
-            # metadata
-            # -----------------------------
-            obj.sampleRate = obj._h5.attrs.get("sampleRate", None)
-        
-        except Exception:
-            
-            obj._h5.close()
-            raise
-
-        return obj
-    
-    # ---------------------------------------------------------
-    # Mutation
-    # ---------------------------------------------------------
-    def addRow(self, row):
-        '''
-        Append one or more rows of data to the matrix.
-
-        Args:
-            row: 1D array-like (single row) or 2D array-like (multiple rows).
-                 Number of columns must match len(self.channelNames).
-        '''
-        row = np.asarray(row)
-
-        # normalize a single row into shape (1, numChannels)
-        if row.ndim == 1:
-            row = row[np.newaxis, :]
-
-        if row.ndim != 2:
-            raise ValueError(
-                f"(pglDataMatrix:addRow) row must be 1D or 2D, got {row.ndim}D"
-            )
-
-        numChannels = len(self.channelNames)
-        if row.shape[1] != numChannels:
-            raise ValueError(
-                f"(pglDataMatrix:addRow) row has {row.shape[1]} columns, "
-                f"expected {numChannels} to match channelNames"
-            )
-
-        if self._h5 is None:
-            # in-memory: just stack onto the numpy array
-            self._data = np.vstack([self._data, row])
-        else:
-            # make sure we can append to the file
-            if self._h5.mode == "r":
-                raise ValueError(
-                    "(pglDataMatrix:addRow) file was opened read-only "
-                    "(mode='r'); reopen with fromFile(path, mode='r+') to add rows"
-                )
-                
-            # hdf5-backed: resize dataset and write new rows in place
-            dataset = self._h5["data"]
-            oldRows = dataset.shape[0]
-            newRows = oldRows + row.shape[0]
-
+        if data is not None:
             try:
-                dataset.resize(newRows, axis=0)
-            except TypeError as e:
-                raise TypeError(
-                    "(pglDataMatrix:addRow) underlying hdf5 dataset is not "
-                    "resizable (was it created with maxshape=(None, numChannels))?"
-                ) from e
+                return getattr(data, attrName)
+            except AttributeError:
+                pass
 
-            dataset[oldRows:newRows, :] = row
-            
-    # ---------------------------------------------------------
-    # Internal helpers
-    # ---------------------------------------------------------
-    def _dataset(self):
-        """
-        Returns either:
-            NumPy array
-        or
-            h5py Dataset
+        raise AttributeError(f"{type(self).__name__!r} has no attribute {attrName!r}")
 
-        Neither caller nor derived classes need to know which.
-        """
-        if self._h5 is None:
-            return self._data
-        
-        # returns the _h5 structure which implements lazy-loading
-        return self._h5["data"]
-
-    def _channelIndex(self, channelName):
-        '''
-        Returns the index of a named chanel
-        '''
-        try:
-            return self.channelNames.index(channelName)
-
-        except ValueError:
-            print(f"(pglDataMatrix:_channelIndex) Unknown channel '{channelName}'")
-            return None
-
-    # ---------------------------------------------------------
-    # Data access
-    # ---------------------------------------------------------
     def __getitem__(self, key):
-        '''
-        Allows access for keys like 
-        dataMatrix['key']
-        '''
-        dataset = self._dataset()
+        return self.requireData()[key]
 
-        if isinstance(key, str):
-            index = self._channelIndex(key)
-            if index is None:
-                return None
-            else:
-                return dataset[:, index]
-        print("(pglDataMatrix:__getitem__) Key must be a string of field in channelNames")
-        return None
+    def __setitem__(self, key, value):
+        self.requireData()[key] = value
 
-    #def __getattr__(self, name):
-    #    '''
-    #    ALlows access like
-    #    dataMatrix.key
-    #    '''
-    #    # check first to make sure that channelNames is 
-    #    # a field - otherwise this code we end up in 
-    #    # ifinite recursion trying to find non-existient fields
-    #    if "channelNames" in self.__dict__:
-    #
-    #        # if the name exist in channels, then return it
-    #        if name in self.channelNames:
-    #            return self[name]
-    #    
-    #    # throw error if not found
-    #    raise AttributeError(name)
+    def __len__(self):
+        return len(self.requireData())
 
-    def get(self, channelName):
-        '''
-        explicit call
-        '''
-        if channelName not in self.channelNames:
-            return None
-        return self[channelName]
+    def __iter__(self):
+        return iter(self.requireData())
 
-    # ---------------------------------------------------------
-    # Saving
-    # ---------------------------------------------------------
-    def save(self, filePath=None, overwrite=True):
-        '''
-        Save the data matrix to hdf5.
+    def __contains__(self, key):
+        return key in self.requireData()
 
-        If this object is backed by an in-memory NumPy array (created via
-        fromArray), this creates a new hdf5 file at filePath.
+    def __repr__(self):
+        if self.data is None:
+            return f"{type(self).__name__}(empty)"
+        return f"{type(self).__name__}\n{self.data!r}"
 
-        If this object is already file-backed (created via fromFile), any
-        rows added via addRow are already live in the open hdf5 file, so
-        this just flushes pending writes to disk. filePath is ignored in
-        this case since the object is already tied to its own file.
 
-        Args:
-            filePath (str): Path to save to. Only used for in-memory-backed
-              objects. Ignored for file-backed objects.
-            overwrite (bool): whether to overwrite an existing file when
-              creating a new hdf5 file. Only used for in-memory-backed objects.
-        '''
-        # already file-backed: nothing to create, just flush pending writes
-        if self._h5 is not None:
-            self._h5.flush()
-            return
+##################################
+# pglEpochsDataMatrix
+##################################
+class pglEpochsDataMatrix(pglDataMatrix):
+    """
+    MNE-specific import of trial × sensor × time data.
 
-        # in-memory-backed: need a filePath to create a new file
-        if filePath is None:
-            raise ValueError("(pglDataMatrix:save) No file path specified.")
+    Quality coordinates:
+        trialBad: Trial fails configured MNE rejection or contains non-finite
+                  signal values in imported sensors.
+        sensorBad: Sensor is marked bad in MNE Info.
+        timeBad: Relative time point contains a non-finite value anywhere in
+                 the returned matrix. This does not localize artifacts.
 
-        if Path(filePath).exists() and not overwrite:
-            raise FileExistsError(
-                f"(pglDataMatrix:save) '{filePath}' already exists and overwrite=False"
-            )
+    dropBadData=True removes marked bad data sensors, then rejected or
+    non-finite trials. dropBadData=False retains available data with labels.
 
-        # open file
-        with h5py.File(filePath, "w") as f:
+    Only MNE data channels are imported; auxiliary channels are excluded.
+    Requires preloaded epochs. Previously dropped trials cannot be restored.
+    Annotation rejection depends on how the source epochs were constructed.
 
-            # create the dataset, resizable so addRow can grow it later
-            f.create_dataset(
-                "data",
-                data=self._dataset(),
-                compression="gzip",
-                chunks=True,
-                maxshape=(None, len(self.channelNames)),
-            )
+    Clean import guarantees finite values and respects configured rejection,
+    but does not detect unmarked artifacts. Later mutation can invalidate
+    these guarantees.
+    """
 
-            # create channel names
-            f.create_dataset(
-                "channelNames",
-                data=np.array(self.channelNames, dtype="S")
-            )
-
-            # create units
-            f.create_dataset(
-                "units",
-                data=np.array(self.units, dtype="S")
-            )
-
-            # create sampleRate
-            if self.sampleRate is not None:
-                f.attrs["sampleRate"] = self.sampleRate
-
-            # class name and version number
-            f.attrs["className"] = self.__class__.__name__
-            f.attrs["dataMatrixVersion"] = 1.0
-                
-            # subclass hook to save metadata
-            self._saveMetadata(f)
-
-        # save filename
-        self.filePath = filePath
-        
-    def _saveMetadata(self, h5file):
+    @classmethod
+    def fromEpochs(cls, epochs, matrixName="epochs", verbose=True, dropBadData=True):
         """
-        Save class-specific metadata.
-        Subclasses can override.
+        Import MNE epochs without modifying the source.
+
+        Trial IDs come from epochs.selection. Metadata columns become
+        trial-prefixed camelCap coordinates, such as trialCondition.
+
+        Import counts describe currently available epochs, not trials
+        already removed upstream.
         """
-        pass
-        
-    def close(self):
-        '''
-        Close file if there is one open
-        '''
-        if self._h5 is not None:
-            self._h5.close()
-            self._h5 = None
-    
-    # ---------------------------------------------------------
-    # for using as a with
-    # ---------------------------------------------------------   
-    def __enter__(self):
-        return self
+        import mne
 
-    def __exit__(self, excType, excValue, traceback):
-        self.close()
-    # ---------------------------------------------------------
-    # Properties
-    # ---------------------------------------------------------
-    @property
-    def shape(self):
-        return self._dataset().shape
+        if not isinstance(epochs, mne.BaseEpochs):
+            raise TypeError("epochs must be an mne.BaseEpochs instance")
 
+        if not epochs.preload:
+            raise ValueError("Epochs must be preloaded. To retain rejected trials, preload without rejection thresholds and configure those thresholds afterward.")
+
+        inputTrialCount = len(epochs.events)
+        if inputTrialCount == 0:
+            raise ValueError("No epochs are available")
+
+        if verbose:
+            importMode = "dropping bad data" if dropBadData else "retaining data with bad labels"
+            pglMessages.message(f"Importing MNE epochs: {importMode}.")
+
+        # Evaluate configured rejection separately, with all source channels.
+        checkedEpochs = epochs.copy()
+        checkedEpochs.drop_bad(verbose=False)
+        mneTrialBad = ~np.isin(epochs.selection, checkedEpochs.selection)
+        del checkedEpochs
+
+        # Preserve currently available, preloaded trials on this separate copy.
+        importEpochs = epochs.copy()
+        importEpochs.drop_bad(reject=None, flat=None, verbose=False)
+
+        if not np.array_equal(importEpochs.selection, epochs.selection):
+            raise ValueError("Some source epochs could not be retained; cannot safely align their quality labels")
+
+        inputSensorCount = len(importEpochs.ch_names)
+        markedBadNames = set(importEpochs.info["bads"])
+
+        # Initially include bad data sensors so they can be counted and labeled.
+        # MNE raises if no data channels are available.
+        importEpochs.pick(picks="data", exclude=())
+
+        sensorNames = np.asarray(importEpochs.ch_names, dtype=str)
+        sensorTypes = np.asarray(importEpochs.get_channel_types(), dtype=str)
+        sensorBad = np.isin(sensorNames, list(markedBadNames))
+        auxiliarySensorCount = inputSensorCount - len(sensorNames)
+        badSensorCount = int(sensorBad.sum())
+        dataValues = importEpochs.get_data(copy=True, verbose=False)
+
+        if not np.array_equal(importEpochs.selection, epochs.selection):
+            raise ValueError("Reading data changed the available trials; cannot safely align their quality labels")
+
+        if any(size == 0 for size in dataValues.shape):
+            raise ValueError("No trial × sensor × time data are available")
+
+        # Discarded sensors must not invalidate otherwise usable trials.
+        sensorMask = ~sensorBad if dropBadData else np.ones(len(sensorNames), dtype=bool)
+
+        if not sensorMask.any():
+            raise ValueError("No good data sensors remain")
+
+        if not sensorMask.all():
+            dataValues = dataValues[:, sensorMask, :]
+
+        sensorNames = sensorNames[sensorMask]
+        sensorTypes = sensorTypes[sensorMask]
+        sensorBad = sensorBad[sensorMask]
+
+        nonFiniteTrialBad = ~np.isfinite(dataValues).all(axis=(1, 2))
+        trialBad = mneTrialBad | nonFiniteTrialBad
+        badTrialCount = int(trialBad.sum())
+        mneBadTrialCount = int(mneTrialBad.sum())
+        nonFiniteTrialCount = int(nonFiniteTrialBad.sum())
+        trialMask = ~trialBad if dropBadData else np.ones(inputTrialCount, dtype=bool)
+
+        if not trialMask.any():
+            raise ValueError("No good trials remain")
+
+        if not trialMask.all():
+            dataValues = dataValues[trialMask]
+
+        # Aggregate non-finite values over retained trials and sensors.
+        timeBad = ~np.isfinite(dataValues).all(axis=(0, 1))
+
+        coords = {
+            "trial": ("trial", importEpochs.selection[trialMask].copy()),
+            "sensor": ("sensor", sensorNames),
+            "time": ("time", importEpochs.times.copy()),
+            "trialBad": ("trial", trialBad[trialMask]),
+            "sensorBad": ("sensor", sensorBad),
+            "timeBad": ("time", timeBad),
+            "eventSample": ("trial", importEpochs.events[trialMask, 0].copy()),
+            "eventCode": ("trial", importEpochs.events[trialMask, 2].copy()),
+            "sensorType": ("sensor", sensorTypes),
+        }
+
+        metadataColumnMap = {}
+
+        if importEpochs.metadata is not None:
+            trialMetadata = importEpochs.metadata.iloc[np.flatnonzero(trialMask)]
+
+            if not trialMetadata.columns.is_unique:
+                raise ValueError("Metadata column names must be unique")
+
+            for columnName in trialMetadata.columns:
+                coordName = cls.getMetadataCoordName(columnName)
+
+                if coordName in coords:
+                    raise ValueError(f"Metadata column {columnName!r} produces a duplicate coordinate: {coordName!r}")
+
+                coords[coordName] = ("trial", trialMetadata[columnName].to_numpy(copy=True))
+                metadataColumnMap[coordName] = str(columnName)
+
+        attrs = {
+            "source": "mne.Epochs",
+            "samplingFrequency": float(importEpochs.info["sfreq"]),
+            "eventId": dict(importEpochs.event_id),
+            "metadataColumnMap": metadataColumnMap,
+            "dropBadData": bool(dropBadData),
+            "inputTrialCount": inputTrialCount,
+            "markedBadSensorCount": len(markedBadNames),
+            "badSensorCount": badSensorCount,
+            "badTrialCount": badTrialCount,
+            "mneBadTrialCount": mneBadTrialCount,
+            "nonFiniteTrialCount": nonFiniteTrialCount,
+            "excludedAuxiliarySensorCount": auxiliarySensorCount,
+        }
+
+        data = xr.DataArray(dataValues, dims=("trial", "sensor", "time"), coords=coords, name=matrixName, attrs=attrs)
+
+        data.coords["time"].attrs.update({"units": "s", "description": "Time relative to the epoch event"})
+        data.coords["trial"].attrs["description"] = "Original retained epoch index from MNE epochs.selection"
+        data.coords["eventSample"].attrs["description"] = "Event sample number in MNE recording sample coordinates"
+        data.coords["trialBad"].attrs["description"] = "True for MNE-rejected trials or trials with non-finite values"
+        data.coords["sensorBad"].attrs["description"] = "True for sensors marked bad in MNE Info"
+        data.coords["timeBad"].attrs["description"] = "True where any retained trial/sensor has a non-finite value"
+
+        # MNE-specific validation stays outside the generic constructor.
+        cls.validateEpochsData(data, requireClean=dropBadData)
+        matrix = cls(data)
+
+        if verbose:
+            matrix.printImportSummary()
+
+        return matrix
+
+    @staticmethod
+    def validateEpochsData(data, requireClean=False):
+        """Validate MNE-specific dimensions and quality coordinates."""
+        if not isinstance(data, xr.DataArray):
+            raise TypeError("Epochs data must be an xarray.DataArray")
+
+        if data.dims != ("trial", "sensor", "time"):
+            raise ValueError("Epochs data must have dimensions ('trial', 'sensor', 'time')")
+
+        if any(size == 0 for size in data.shape):
+            raise ValueError("Epochs data cannot have empty dimensions")
+
+        if not np.isfinite(data.coords["time"].values).all():
+            raise ValueError("Time coordinates must be finite")
+
+        for coordName, dimName in (("trialBad", "trial"), ("sensorBad", "sensor"), ("timeBad", "time")):
+            if coordName not in data.coords:
+                raise ValueError(f"Missing quality coordinate: {coordName}")
+
+            coord = data.coords[coordName]
+
+            if coord.dims != (dimName,):
+                raise ValueError(f"{coordName} must use the {dimName!r} dimension")
+
+            if coord.dtype != np.dtype(bool):
+                raise TypeError(f"{coordName} must contain boolean values")
+
+            if requireClean and coord.values.any():
+                raise ValueError(f"Clean epochs data cannot contain True in {coordName}")
+
+        if requireClean and not np.isfinite(data.values).all():
+            raise ValueError("Clean epochs data must contain only finite values")
+
+    @staticmethod
+    def getMetadataCoordName(columnName):
+        """Convert a metadata column name into a trial-prefixed camelCap name."""
+        nameParts = re.findall(r"[A-Za-z0-9]+", str(columnName))
+
+        if not nameParts:
+            raise ValueError(f"Metadata column has no usable name: {columnName!r}")
+
+        return "trial" + "".join(namePart[0].upper() + namePart[1:] for namePart in nameParts)
+
+    @staticmethod
+    def formatPreview(items, maxItems=4, maxLength=45):
+        """Return a bounded, single-line preview."""
+        itemList = list(items)
+        labels = []
+
+        for item in itemList[:maxItems]:
+            label = " ".join(str(item).split())
+            if len(label) > maxLength:
+                label = label[:maxLength - 3] + "..."
+            labels.append(label)
+
+        if len(itemList) > maxItems:
+            labels.append(f"... (+{len(itemList) - maxItems} more)")
+
+        return ", ".join(labels) if labels else "none"
+
+    def printImportSummary(self):
+        """Print a compact import overview, including trial grouping labels."""
+        data = self.requireData()
+        attrs = data.attrs
+        qualityAction = "Dropped" if attrs["dropBadData"] else "Retained and labeled"
+
+        sensorCounts = pd.Series(data.sensorType.values).value_counts()
+        sensorLabels = [f"{sensorType}: {int(typeCount)}" for sensorType, typeCount in sensorCounts.items()]
+
+        eventCounts = pd.Series(data.eventCode.values).value_counts()
+        eventLabels = []
+
+        for eventCode, eventCount in eventCounts.items():
+            eventNames = [eventName for eventName, mappedCode in attrs["eventId"].items() if mappedCode == eventCode]
+            eventLabel = " / ".join(eventNames) or str(eventCode)
+            eventLabels.append(f"{eventLabel} ({int(eventCount)})")
+
+        metadataCoords = list(attrs["metadataColumnMap"])
+        metadataLabels = []
+
+        for coordName in metadataCoords[:4]:
+            coordValues = pd.Series(data.coords[coordName].values)
+            uniqueValues = coordValues.dropna().unique()
+            missingCount = int(coordValues.isna().sum())
+            coordSummary = f"{coordName}: {len(uniqueValues)} unique [{self.formatPreview(uniqueValues, maxItems=3)}]"
+
+            if missingCount:
+                coordSummary += f", {missingCount} missing"
+
+            metadataLabels.append(coordSummary)
+
+        if len(metadataCoords) > 4:
+            metadataLabels.append(f"+{len(metadataCoords) - 4} more fields")
+
+        trialCount = data.sizes["trial"]
+        sensorCount = data.sizes["sensor"]
+        timeCount = data.sizes["time"]
+        timeStart = float(data.time.values[0])
+        timeEnd = float(data.time.values[-1])
+        badTimeCount = int(data.timeBad.values.sum())
+        metadataSummary = "; ".join(metadataLabels) if metadataLabels else "none"
+
+        summaryLines = [
+            f"Loaded {data.name}: {trialCount} trials × {sensorCount} sensors × {timeCount} time points",
+            f"{qualityAction} on import: {attrs['badSensorCount']} bad data sensors; {attrs['badTrialCount']} bad trials (MNE: {attrs['mneBadTrialCount']}; non-finite: {attrs['nonFiniteTrialCount']}; may overlap)",
+            f"Sensors: {self.formatPreview(sensorLabels)}; {attrs['markedBadSensorCount']} marked bad in source; {attrs['excludedAuxiliarySensorCount']} auxiliary channels excluded",
+            f"Time: {timeStart:.4f} to {timeEnd:.4f} s; {attrs['samplingFrequency']:g} Hz; {badTimeCount} time points labeled bad",
+            f"Trial IDs: original epoch indices; event groups: {self.formatPreview(eventLabels)}",
+            f"Metadata: {metadataSummary}",
+        ]
+
+        pglMessages.print("\n".join(summaryLines))
+       
 #######################
 # # pglTimeSeries
 #######################
