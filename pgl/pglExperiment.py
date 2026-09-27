@@ -1893,7 +1893,6 @@ class pglTask(pglTaskBase):
         pglMessages.message(f"Ending task {self.settings.taskName}",messageType='experiment')
         endTime = self.pgl.getSecs()
         self.data.endTime = endTime
-        pglMessages.message(f"THE END TIME IS HERE: {endTime} {self.data.endTime}")
         # put in time stamps for end of last segment and trial
         self.data.events.append(pglEventSegment(self.state.currentSegment, endTime, eventType=pglEventSegment.boundaryType.END))
         self.data.events.append(pglEventTrial(self.state.currentTrial, endTime, eventType=pglEventTrial.boundaryType.END))
