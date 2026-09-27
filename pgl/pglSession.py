@@ -26,6 +26,7 @@ except ImportError:
     mne = None
 from .pglBase import pglBase
 from pathlib import Path
+from .pglData import pglEpochsDataMatrix
 
 ##################################
 # pglRun
@@ -336,7 +337,7 @@ class pglRun(pglExperimentBase):
             trialNums=trialNums,
             nTrials=nTrials
         )
-
+        
 ##################################
 # pglMNE
 ##################################
@@ -491,8 +492,43 @@ class pglMNE(pglActionable):
 
         # return the match
         return(matchingChannels[0])
+    
+    def getDataMatrix(self, verbose=True, dropBadData=True):
+        """Return epochs as a pglEpochsDataMatrix, or None if import fails."""
+        import mne
 
-        
+        if self.epochs is None:
+            pglMessages.warning("Cannot create data matrix: no epochs have been loaded or created.")
+            return None
+
+        if not isinstance(self.epochs, mne.BaseEpochs):
+            pglMessages.warning(f"Cannot create data matrix: expected MNE Epochs, got {type(self.epochs).__name__}.")
+            return None
+
+        if len(self.epochs.events) == 0:
+            pglMessages.warning("Cannot create data matrix: no epochs are available.")
+            return None
+
+        try:
+            epochs = self.epochs
+
+            if not epochs.preload:
+                # Load a copy to leave the source unchanged and defer threshold
+                # rejection so fromEpochs can label bad trials before removing them.
+                epochs = epochs.copy()
+                rejectCriteria = epochs.reject
+                flatCriteria = epochs.flat
+                epochs.reject = None
+                epochs.flat = None
+                epochs.load_data(verbose=False)
+                epochs.reject = rejectCriteria
+                epochs.flat = flatCriteria
+
+            return pglEpochsDataMatrix.fromEpochs(epochs, verbose=verbose, dropBadData=dropBadData)
+
+        except (ValueError, TypeError, RuntimeError, OSError) as error:
+            pglMessages.warning(f"Cannot create data matrix: {error}")
+            return None
 
 ##################################
 # pglSession
