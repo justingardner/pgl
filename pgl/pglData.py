@@ -225,7 +225,7 @@ class pglEpochsDataMatrix(pglDataMatrix):
                 raise ValueError("Metadata column names must be unique")
 
             for columnName in trialMetadata.columns:
-                coordName = cls.getMetadataCoordName(columnName)
+                coordName = str(columnName)
 
                 if coordName in coords:
                     raise ValueError(f"Metadata column {columnName!r} produces a duplicate coordinate: {coordName!r}")
@@ -298,16 +298,6 @@ class pglEpochsDataMatrix(pglDataMatrix):
 
         if requireClean and not np.isfinite(data.values).all():
             raise ValueError("Clean epochs data must contain only finite values")
-
-    @staticmethod
-    def getMetadataCoordName(columnName):
-        """Convert a metadata column name into a trial-prefixed camelCap name."""
-        nameParts = re.findall(r"[A-Za-z0-9]+", str(columnName))
-
-        if not nameParts:
-            raise ValueError(f"Metadata column has no usable name: {columnName!r}")
-
-        return "trial" + "".join(namePart[0].upper() + namePart[1:] for namePart in nameParts)
 
     @staticmethod
     def formatPreview(items, maxItems=4, maxLength=45):
