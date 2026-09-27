@@ -1008,6 +1008,21 @@ class pglActions():
             ax.set(xlabel="Frequency (Hz)", ylabel="Power spectral density (fT²/Hz)", title=f"Evoked response spectrum: {self.picks}")
             figPsd.tight_layout()
             
+            # Third figure: single peak response, with sensor labels
+            if not session.mne.isSensor(self.picks):
+                evokedTopo = session.mne.evoked.copy().pick(self.picks)
+                peakChannel, peakTime = evokedTopo.get_peak(ch_type=self.picks, mode="abs")
+                #figPeak = evokedTopo.plot_topomap(times=[peakTime], ch_type=self.picks, show_names=True, sensors=True, contours=6, time_unit="ms", size=8, show=False)
+                figPeak = evokedTopo.plot_topomap(times=[peakTime], ch_type=self.picks, show_names=True, sensors=True, contours=6, time_unit="ms", size=8, vlim=(-30, 30), cmap=("RdBu_r", False), show=False)
+                figPeak.set_size_inches(12, 10)
+                figPeak.suptitle(f"Peak response: {peakTime * 1000:.1f} ms ({peakChannel})", fontsize=18)
+                figPeak.subplots_adjust(top=0.88)
+                # Enlarge sensor labels and the timepoint title
+                for ax in figPeak.axes:
+                    for text in ax.texts:
+                        text.set_fontsize(16)
+                    ax.title.set_fontsize(20)
+
             # and return
             return session
     
@@ -1590,14 +1605,8 @@ class pglActions():
         channelName = Unicode('', help='Name of channel in MNE for alignment')
         highCutoff = Float(0.5, help='Cutoff value of channel to consider as an event')
 
-        outputChannelName = Unicode(
-            'trigger',
-            help='Name of output trigger channel; empty string disables output',
-        )
-        useSegmentTimeAsTruth = Bool(
-            True,
-            help='Use corrected segment times rather than recorded digital pulse times for output triggers',
-        )
+        outputChannelName = Unicode('trigger',help='Name of output trigger channel; empty string disables output')
+        useSegmentTimeAsTruth = Bool(True, help='Use corrected segment times rather than recorded digital pulse times for output triggers')
 
         ################################
         # configure
