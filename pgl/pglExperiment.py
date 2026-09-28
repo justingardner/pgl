@@ -41,6 +41,7 @@ import posixpath
 from .pglBase import pglBase
 from .pglDialog import pglDialogs
 from types import SimpleNamespace
+from .pglDevice import pglDigitalIODevice
 
 #######################
 # for returning stats
@@ -894,25 +895,42 @@ class pglExperiment(pglExperimentBase):
         '''
         initialize digital IO device if settings calls for them to be initialized
         '''
-        pglMessages.printHeader()
-        pglMessages.print(self.settings.digitalIO)
-        pglMessages.printHeader()
-        #for digitalIO in self.settings.digitalIO:
-            
+        for digitalIODevice in self.settings.digitalIO:
+            if digitalIODevice.lower() == "labjack":
+                
+                # try to initialize labjack device
+                from .pglLabJack import pglLabJack
+                labJack = pglLabJack()
+                
+                # if it is working
+                if labJack.isActive:
+                    self.state.digitalIODevices.append(labJack)
+                    pglMessages.message("LabJack initialized")
+                else:
+                    pglMessages.message("LabJack did not initialize")
+                                        
+            elif digitalIODevice.lower() == "datapixx":
+                pglMessages.warning("DataPixx needs to be implemented in initDigitalIO")
+            else:
+                pglMessages.warning("Unknown digitalIO device: {digitalIODevice}")       
 
     def endDigitalIO(self):
         '''
         end digitalIO devices
         '''
+        # close all devices
+        for digitalIODevice in self.state.digitalIODevices:
+            digitalIODevice.close()
+        # empty list
+        self.state.digitalIoDevices = []
         
     def initDevices(self):
         '''
         initialize devices
         '''
-        pglMessages.printHeader()
-        pglMessages.print(self.settings.devices)
-        pglMessages.printHeader()
-        #for digitalIO in self.settings.digitalIO:
+        if self.settings.devices:
+            pglMessages.warning('Devices not implemented yet')
+
             
 
     def endDevices(self):
@@ -2073,7 +2091,7 @@ class pglExperimentState(pglTraitSettings):
     display = Instance(pglDisplaySettings, default_value=None, allow_none=True, help="Current display settings.")
     originalScreenResolution = Tuple(Int(),Int(),Int(),Int(), default_value=None, allow_none=True, help="Original screen resolution: (left, top, width, height).")
     screenResolution = Tuple(Int(),Int(),Int(),Int(), default_value=None, allow_none=True, help="Current screen resolution: (left, top, width, height).")
-
+    digitalIODevices = List(Instance(pglDigitalIODevice), help="List of digitalIOdevices the experiment is using", serialize=False)
     # make sure any variabels added by experimenter code gets saved
     _serializeUnregisteredFields = True
 
