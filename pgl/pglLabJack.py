@@ -96,94 +96,120 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
     
     def setupDigitalOutput(self, channel=0, pulseLen=5, groupName="FIO", channelName=None, **kwargs):
         """
-        Configure a digital output.
+        Configure a T7 digital output and cache its device-timed pulse request.
 
         Args:
-            channel (int): Logical channel ID. Also used as the physical pin
-                index when channelName is None.
-            pulseLen (int): Pulse duration in milliseconds.
-            groupName (str): Hardware bank used when channelName is None,
-                e.g. "FIO", "EIO", "CIO", "MIO", or "DIO".
-            channelName (str or None): Explicit physical pin name, e.g. "EIO4".
-                Overrides groupName and the physical interpretation of channel.
+            channel (int): Logical channel ID. Also the physical pin index when
+                channelName is omitted.
+            pulseLen (float): Pulse duration in milliseconds.
+            groupName (str or None): Hardware bank; defaults to FIO.
+            channelName (str or None): Explicit physical pin name.
+
+        Returns:
+            bool: True on success, False on failure.
         """
         if self.h is None:
-            pglMessages.warning("(pglLabJack:setupDigitalOutput) LabJack device not connected.", level=1)
-            self.digitalOutputConfigured = False
+            pglMessages.warning("LabJack is not connected")
             return False
 
-        if isinstance(pulseLen, bool) or not isinstance(pulseLen, (int, float)) or not np.isfinite(pulseLen) or pulseLen <= 0:
-            pglMessages.warning("pulseLen must be a positive finite number")
+        if self.type != "T7":
+            pglMessages.warning(f"This digital output implementation currently supports T7 only; connected device is {self.type}")
             return False
 
-        if not isinstance(channel, int) or channel < 0:
-            pglMessages.warning("channel must be a nonnegative integer", level=2)
-            return False
-    
         if isinstance(channel, bool) or not isinstance(channel, int) or channel < 0:
-            pglMessages.warning("channel must be a nonnegative integer", level=2)
+            pglMessages.warning("channel must be a nonnegative integer")
+            return False
+
+        if isinstance(pulseLen, bool) or not isinstance(pulseLen, (int, float)) or not np.isfinite(pulseLen) or not 0 < pulseLen <= 100:
+            pglMessages.warning("pulseLen must be a positive finite number no greater than 100 milliseconds")
+            return False
+
+        pulseMicroseconds = int(round(pulseLen * 1000))
+        if pulseMicroseconds < 1:
+            pglMessages.warning("Pulse duration must round to at least 1 microsecond")
             return False
 
         if channelName is None:
-            # Treat an unspecified group as the default hardware bank.
             groupName = "FIO" if groupName is None else groupName
-            validChannelGroups = {"FIO", "EIO", "CIO", "MIO", "DIO"}
-
-            if groupName not in validChannelGroups:
+            if groupName not in {"FIO", "EIO", "CIO", "MIO", "DIO"}:
                 pglMessages.warning(f"Invalid channel group: {groupName}")
                 return False
-
             channelName = f"{groupName}{channel}"
 
         if not isinstance(channelName, str) or not channelName:
-            pglMessages.warning("channelName must be a nonempty string", level=2)
+            pglMessages.warning("channelName must be a nonempty string")
+            return False
+
+        # Use the same lock order as word setup, sending, and shutdown.
+        if not self._wordPulseLock.acquire(blocking=False):
+            pglMessages.warning("Cannot configure digital output while word output or configuration is active")
             return False
 
         try:
-            # For individual LJM T-series digital I/O registers,
-            # writing LOW also configures the pin as an output.
-            if self.type == "T7":
-                address, _ = self.ljm.nameToAddress(channelName)
-                dioBaseAddress, _ = self.ljm.nameToAddress("DIO0")
-                if not 0 <= address - dioBaseAddress < 23:
-                    pglMessages.warning(f"{channelName!r} is not an individual T7 DIO register")
+            channelAddress, channelType = self.ljm.nameToAddress(channelName)
+            dioBaseAddress, _ = self.ljm.nameToAddress("DIO0")
+            dioBit = channelAddress - dioBaseAddress
+
+            if not 0 <= dioBit < 23:
+                pglMessages.warning(f"{channelName!r} is not an individual T7 DIO register")
+                return False
+
+            # Do not silently invalidate an existing word configuration.
+            if channel in self.wordDigitalChanels:
+                pglMessages.warning(f"Channel {channel} is already part of a configured word; reset the configuration before changing it")
+                return False
+
+            waitAddress, waitType = self.ljm.nameToAddress("WAIT_US_BLOCKING")
+
+            with self._digitalIOLock:
+                if self.h is None:
+                    pglMessages.warning("LabJack is not connected")
                     return False
 
-            with self._digitalIOLock:
-                self.ljm.eWriteName(self.h, channelName, 0)
+                # Writing the individual pin LOW also sets it as an output.
+                self.ljm.eWriteAddress(self.h, channelAddress, channelType, 0)
+
+                super().setupDigitalOutput(channel, pulseLen)
+                self.digitalChannels[channel].update({
+                    "name": channelName,
+                    "address": channelAddress,
+                    "dataType": channelType,
+                    "dioBit": dioBit,
+                    "pulseMicroseconds": pulseMicroseconds,
+                    "pulseAddresses": [channelAddress, waitAddress, channelAddress],
+                    "pulseTypes": [channelType, waitType, channelType],
+                    "pulseValues": [1, pulseMicroseconds, 0],
+                })
+                self.digitalOutputConfigured = True
+
+            pglMessages.message(f"Logical channel {channel}: {channelName} configured as output, set to LOW")
+            return True
+
         except Exception as e:
-            pglMessages.warning(f"(pglLabJack:setupDigitalOutput) Error setting up {channelName}: {e}")
-            self.digitalOutputConfigured = False
+            pglMessages.warning(f"Error configuring digital channel {channel}: {e}")
             return False
 
-        super().setupDigitalOutput(channel, pulseLen)
-        self.digitalChannels[channel]["name"] = channelName
-        self.digitalOutputConfigured = True
-
-        pglMessages.message(f"Logical channel {channel}: {channelName} configured as output, set to LOW")
-        return True
+        finally:
+            self._wordPulseLock.release()
 
     def digitalOutput(self, channel, state):
-        """Set a configured channel; return a host completion timestamp or None."""
-        if self.h is None:
-            pglMessages.warning("LabJack is not connected")
-            return None
+        """Set a configured pin; return a host completion timestamp or None."""
+        with self._digitalIOLock:
+            if self.h is None:
+                pglMessages.warning("LabJack is not connected")
+                return None
 
-        config = self.digitalChannels.get(channel)
-        if config is None or "name" not in config:
-            pglMessages.warning(f"Digital output channel {channel!r} has not been configured")
-            return None
+            config = self.digitalChannels.get(channel)
+            if config is None:
+                pglMessages.warning(f"Digital output channel {channel!r} has not been configured")
+                return None
 
-        channelName = config["name"]
-
-        try:
-            with self._digitalIOLock:
-                self.ljm.eWriteName(self.h, channelName, 1 if state else 0)
-                timestamp = pglTimestamp.getSecs()
-            return timestamp
-        except Exception as e:
-            pglMessages.warning(f"Error writing {channelName}: {e}")
-            return None
+            try:
+                self.ljm.eWriteAddress(self.h, config["address"], config["dataType"], 1 if state else 0)
+                return pglTimestamp.getSecs()
+            except Exception as e:
+                pglMessages.warning(f"Error writing digital channel {channel}: {e}")
+                return None
           
     def startAnalogRead(self, duration=2, channels=[0], scanRate=1000, scansPerRead=1000, voltageRange=10.0):
         '''
@@ -377,15 +403,15 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
                     self.digitalOutputConfigured = False
         
     def setupDigitalOutputWord(self, channels=None, **kwargs):
-        """Configure T7 word channels, ordered from lowest to highest word bit."""
-        if self.h is None:
-            pglMessages.warning("LabJack is not connected")
-            return False
+        """
+        Configure T7 word channels in lowest-to-highest bit order.
 
-        if self.type != "T7":
-            pglMessages.warning(f"Port-based word output has only been implemented for T7; connected device is {self.type}")
-            return False
+        All selected channels must have the same configured pulseLen.
+        Caches DIO_INHIBIT; external changes to that register are not supported.
 
+        Returns:
+            bool: True on success, False on failure.
+        """
         if channels is None:
             pglMessages.warning("No digital word channels supplied")
             return False
@@ -395,61 +421,71 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
             pglMessages.warning("At least one digital word channel is required")
             return False
 
+        if any(isinstance(channel, bool) or not isinstance(channel, int) or channel < 0 for channel in channels):
+            pglMessages.warning("Word channels must be nonnegative integer logical IDs")
+            return False
+
         if len(channels) != len(set(channels)):
             pglMessages.warning("Digital word channels must be unique")
             return False
 
-        missingChannels = set(channels) - self.digitalChannels.keys()
-        if missingChannels:
-            pglMessages.warning(f"Channels have not been configured: {sorted(missingChannels)}")
-            return False
-
         if not self._wordPulseLock.acquire(blocking=False):
-            pglMessages.warning("Cannot configure word channels while a word pulse is active")
+            pglMessages.warning("Cannot configure word channels while word output or configuration is active")
             return False
 
         try:
-            dioBaseAddress, _ = self.ljm.nameToAddress("DIO0")
-            dioBits = []
-
-            for channel in channels:
-                channelName = self.digitalChannels[channel]["name"]
-                address, _ = self.ljm.nameToAddress(channelName)
-                dioBit = address - dioBaseAddress
-
-                if not 0 <= dioBit < 23:
-                    pglMessages.warning(f"{channelName!r} is not an individual T7 DIO register")
+            with self._digitalIOLock:
+                if self.h is None:
+                    pglMessages.warning("LabJack is not connected")
                     return False
 
-                dioBits.append(dioBit)
+                if self.type != "T7":
+                    pglMessages.warning(f"Digital word output currently supports T7 only; connected device is {self.type}")
+                    return False
 
-            if len(dioBits) != len(set(dioBits)):
-                pglMessages.warning("Multiple logical channels refer to the same physical DIO pin")
-                return False
+                missingChannels = set(channels) - self.digitalChannels.keys()
+                if missingChannels:
+                    pglMessages.warning(f"Channels have not been configured: {sorted(missingChannels)}")
+                    return False
 
-            pulseLengths = {self.digitalChannels[channel]["pulseLen"] for channel in channels}
-            if len(pulseLengths) != 1:
-                pglMessages.warning("All channels in a digital word must have the same pulseLen")
-                return False
+                dioBits = [self.digitalChannels[channel]["dioBit"] for channel in channels]
+                if len(dioBits) != len(set(dioBits)):
+                    pglMessages.warning("Multiple logical channels refer to the same physical DIO pin")
+                    return False
 
-            pulseLen = next(iter(pulseLengths))
-            pulseMicroseconds = int(round(pulseLen * 1000))
-            if not 1 <= pulseMicroseconds <= 100000:
-                pglMessages.warning("Hardware-timed word pulse must be between 1 microsecond and 100 milliseconds")
-                return False
-            
-            # Verify access to the registers used by this implementation.
-            with self._digitalIOLock:
-                self.ljm.eReadName(self.h, "DIO_STATE")
-                self.ljm.eReadName(self.h, "DIO_INHIBIT")
-                self.ljm.nameToAddress("WAIT_US_BLOCKING")
+                pulseLengths = {self.digitalChannels[channel]["pulseLen"] for channel in channels}
+                if len(pulseLengths) != 1:
+                    pglMessages.warning("All channels in a digital word must have the same pulseLen")
+                    return False
 
-            self.wordDigitalChanels = channels
-            self.wordBits = len(channels)
-            self.wordMaxValue = (1 << self.wordBits) - 1
-            self.wordDIOBits = dioBits
-            self.wordDIOMask = sum(1 << bit for bit in dioBits)
-            self.wordPulseLen = pulseLen
+                pulseLen = next(iter(pulseLengths))
+                pulseMicroseconds = self.digitalChannels[channels[0]]["pulseMicroseconds"]
+
+                stateAddress, stateType = self.ljm.nameToAddress("DIO_STATE")
+                inhibitAddress, inhibitType = self.ljm.nameToAddress("DIO_INHIBIT")
+                waitAddress, waitType = self.ljm.nameToAddress("WAIT_US_BLOCKING")
+
+                # Read once at configuration time, not on every send.
+                originalInhibit = int(self.ljm.eReadAddress(self.h, inhibitAddress, inhibitType))
+                self.ljm.eReadAddress(self.h, stateAddress, stateType)
+
+                physicalMasks = [1 << bit for bit in dioBits]
+                wordMask = sum(physicalMasks)
+                inhibitMask = ((1 << 23) - 1) ^ wordMask
+
+                self.wordDigitalChanels = channels
+                self.wordBits = len(channels)
+                self.wordMaxValue = (1 << self.wordBits) - 1
+                self.wordDIOBits = dioBits
+                self.wordDIOMask = wordMask
+                self.wordPulseLen = pulseLen
+
+                self.wordOriginalInhibit = originalInhibit
+                self.wordInhibitMask = inhibitMask
+                self.wordPhysicalMasks = physicalMasks
+                self.wordPulseAddresses = [inhibitAddress, stateAddress, waitAddress, stateAddress, inhibitAddress]
+                self.wordPulseTypes = [inhibitType, stateType, waitType, stateType, inhibitType]
+                self.wordPulseValues = [inhibitMask, 0, pulseMicroseconds, 0, originalInhibit]
 
             return True
 
@@ -462,138 +498,100 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
           
     def digitalOutputPulse(self, channel):
         """
-        Pulse one configured T7 digital output using a device-side delay.
+        Send a device-timed pulse and leave the pin LOW.
 
         Returns:
-            float or None: Host timestamp immediately before submitting the pulse
-                sequence, or None on error. This is not a measured hardware onset.
+            float or None: Host submission timestamp, or None on error.
 
         Note:
-            Blocks until the pulse finishes. The output is left LOW.
+            Blocks until the pulse finishes.
         """
-        if self.h is None:
-            pglMessages.warning("LabJack is not connected")
-            return None
-
-        if self.type != "T7":
-            pglMessages.warning("Device-timed digital pulses are currently implemented only for T7")
-            return None
-
-        config = self.digitalChannels.get(channel)
-        if config is None or "name" not in config:
-            pglMessages.warning(f"Digital output channel {channel!r} has not been configured")
-            return None
-
-        channelName = config["name"]
-
-        try:
-            pulseLen = config["pulseLen"]
-            if isinstance(pulseLen, bool) or not isinstance(pulseLen, (int, float)) or not np.isfinite(pulseLen):
-                pglMessages.warning("pulseLen must be a finite number")
+        with self._digitalIOLock:
+            if self.h is None:
+                pglMessages.warning("LabJack is not connected")
                 return None
 
-            pulseMicroseconds = int(round(pulseLen * 1000))
-            if not 1 <= pulseMicroseconds <= 100000:
-                pglMessages.warning("Device-timed pulse must be between 1 microsecond and 100 milliseconds")
+            config = self.digitalChannels.get(channel)
+            if config is None:
+                pglMessages.warning(f"Digital output channel {channel!r} has not been configured")
                 return None
 
-            with self._digitalIOLock:
-                # Recheck after acquiring the lock in case the device was closed.
-                if self.h is None:
-                    pglMessages.warning("LabJack is not connected")
-                    return None
+            try:
+                timestamp = pglTimestamp.getSecs()
+                self.ljm.eWriteAddresses(self.h, 3, config["pulseAddresses"], config["pulseTypes"], config["pulseValues"])
+                return timestamp
 
+            except Exception as e:
+                # The HIGH write may have succeeded before a later failure.
                 try:
-                    timestamp = pglTimestamp.getSecs()
-                    self.ljm.eWriteNames(self.h, 3, [channelName, "WAIT_US_BLOCKING", channelName], [1, pulseMicroseconds, 0])
-                except Exception:
-                    # The HIGH write may have succeeded before a later failure.
-                    try:
-                        self.ljm.eWriteName(self.h, channelName, 0)
-                    except Exception as cleanupError:
-                        pglMessages.warning(f"Could not clear {channelName} after pulse failure: {cleanupError}")
-                    raise
+                    self.ljm.eWriteAddress(self.h, config["address"], config["dataType"], 0)
+                except Exception as cleanupError:
+                    pglMessages.warning(f"Could not clear digital channel {channel}: {cleanupError}")
 
-            return timestamp
-
-        except Exception as e:
-            pglMessages.warning(f"Error sending digital pulse on {channelName}: {e}")
-            return None      
+                pglMessages.warning(f"Error pulsing digital channel {channel}: {e}")
+                return None
         
     def digitalOutputWord(self, outputWord):
         """
-        Pulse a T7 digital word using a device-side blocking delay.
-
-        The duration comes from the shared pulseLen of the configured word channels.
+        Send a device-timed word and leave its selected pins LOW.
 
         Returns:
-            float or None: Host timestamp immediately before submitting the pulse
-                sequence, or None on error. This is not a measured hardware onset.
+            float or None: Host submission timestamp, or None on error.
 
         Note:
-            This method blocks until the pulse sequence and inhibit restoration finish.
+            Blocks until the pulse and inhibit restoration finish.
         """
-        if self.h is None or not self.wordDIOBits:
-            pglMessages.warning("Digital word output has not been configured")
-            return None
-
-        if self.type != "T7":
-            pglMessages.warning("Hardware-timed word output is currently implemented only for T7")
-            return None
-
-        if isinstance(outputWord, bool) or not isinstance(outputWord, int):
-            pglMessages.warning("outputWord must be an integer")
-            return None
-
-        if not 0 <= outputWord <= self.wordMaxValue:
-            pglMessages.warning(f"outputWord must be between 0 and {self.wordMaxValue}: {outputWord}")
-            return None
-
-        pulseMicroseconds = int(round(self.wordPulseLen * 1000))
-        if not 1 <= pulseMicroseconds <= 100000:
-            pglMessages.warning("Hardware-timed word pulse must be between 1 microsecond and 100 milliseconds")
-            return None
-
         if not self._wordPulseLock.acquire(blocking=False):
-            pglMessages.warning("Previous digital word pulse is still active")
+            pglMessages.warning("Digital word output or configuration is currently busy")
             return None
 
         try:
-            physicalState = sum(((outputWord >> iBit) & 1) << dioBit for iBit, dioBit in enumerate(self.wordDIOBits))
-            inhibitMask = ((1 << 23) - 1) ^ self.wordDIOMask
+            if not self.wordDIOBits:
+                pglMessages.warning("Digital word output has not been configured")
+                return None
+
+            if isinstance(outputWord, bool) or not isinstance(outputWord, int) or not 0 <= outputWord <= self.wordMaxValue:
+                pglMessages.warning(f"outputWord must be an integer between 0 and {self.wordMaxValue}")
+                return None
+
+            physicalState = 0
+            remainingBits = outputWord
+
+            for physicalMask in self.wordPhysicalMasks:
+                if remainingBits & 1:
+                    physicalState |= physicalMask
+                remainingBits >>= 1
+                if not remainingBits:
+                    break
+
+            # Reuse the request array while protected by the word lock.
+            self.wordPulseValues[1] = physicalState
 
             with self._digitalIOLock:
                 if self.h is None:
                     pglMessages.warning("LabJack is not connected")
                     return None
 
-                originalInhibit = int(self.ljm.eReadName(self.h, "DIO_INHIBIT"))
-
                 try:
-                    # Protect all pins outside the configured word.
-                    self.ljm.eWriteName(self.h, "DIO_INHIBIT", inhibitMask)
-
-                    # All three operations are submitted in one request.
                     timestamp = pglTimestamp.getSecs()
-                    self.ljm.eWriteNames(self.h, 3, ["DIO_STATE", "WAIT_US_BLOCKING", "DIO_STATE"], [physicalState, pulseMicroseconds, 0])
+                    self.ljm.eWriteAddresses(self.h, 5, self.wordPulseAddresses, self.wordPulseTypes, self.wordPulseValues)
+                    return timestamp
 
-                except Exception:
-                    # Execution may have stopped after setting the word HIGH.
+                except Exception as e:
+                    # A failed request may have executed only part of the sequence.
                     try:
-                        self.ljm.eWriteName(self.h, "DIO_INHIBIT", inhibitMask)
-                        self.ljm.eWriteName(self.h, "DIO_STATE", 0)
+                        self.ljm.eWriteAddress(self.h, self.wordPulseAddresses[0], self.wordPulseTypes[0], self.wordInhibitMask)
+                        self.ljm.eWriteAddress(self.h, self.wordPulseAddresses[1], self.wordPulseTypes[1], 0)
                     except Exception as cleanupError:
-                        pglMessages.warning(f"Could not clear word pins after failure: {cleanupError}")
-                    raise
+                        pglMessages.warning(f"Could not clear word pins: {cleanupError}")
+                    finally:
+                        try:
+                            self.ljm.eWriteAddress(self.h, self.wordPulseAddresses[0], self.wordPulseTypes[0], self.wordOriginalInhibit)
+                        except Exception as restoreError:
+                            pglMessages.warning(f"Could not restore DIO_INHIBIT: {restoreError}")
 
-                finally:
-                    self.ljm.eWriteName(self.h, "DIO_INHIBIT", originalInhibit)
-
-            return timestamp
-
-        except Exception as e:
-            pglMessages.warning(f"Error sending digital word {outputWord}: {e}")
-            return None
+                    pglMessages.warning(f"Error sending digital word {outputWord}: {e}")
+                    return None
 
         finally:
             self._wordPulseLock.release()
