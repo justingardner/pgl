@@ -323,7 +323,15 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
         """
         Clean up the labJack instance
         """
+        self.close()
+            
+    def close(self):
+        '''
+        close if open
+        '''
         # Perform any necessary cleanup here
         if self.h is not None:
             self.ljm.close(self.h)
             self.h = None
+        
+        
