@@ -24,11 +24,22 @@ from .pglMessages import pglMessages
 from .pglTimestamp import pglTimestamp
 import time
 import threading
+from .pglSettings import pglTraitSettings
+from traitlets import Unicode, Float, Union
 
 #################################################################
 # Parent class for devices
 #################################################################
-class pglDevice:
+class pglDevice(pglTraitSettings):
+    
+    deviceType = Unicode("", help='Name of device type')
+    deviceDescription = Unicode(allow_none=True, default_value=None, help='Device description')
+    startTime = Unicode(allow_none=True, default_value=None, help='start time of device as timestamp')
+    startTimeSecs = Float(allow_none=True, default_value=None, help='start time of device as getSecs')
+    # do not try to serialze unregistered fields because they will contain handles and other information that is not needed
+    _serializeUnregisteredFields = False
+
+
     """
     Parent class for all pglDevice types
     """
@@ -51,6 +62,7 @@ class pglDevice:
             self.deviceDescription = deviceDescription
         # set the initialization time
         self.startTime = pglTimestamp.getDateAndTime()
+        self.startTimeSecs = pglTimestamp.getSecs()
         # set the device status
         self.currentStatus = 0
         # some fields about the device that will be set by subclasses
@@ -314,23 +326,39 @@ class pglDigitalIODevice(pglDevice):
               
         
     def digitalOutputWord(self, outputWord):
-        '''
-        Will put out a pulse on the digital channels setup with setupDigitalOutputWord
-        representing the outputWord        
-        
-        Args:
-            channels (list of int): channels to use in word
-        '''
+        """
+        Pulse the set bits of a digital word.
+
+        Returns:
+            float or None: Timestamp returned for the first HIGH bit.
+                None if configuration is missing, validation or a write fails,
+                or outputWord is zero (no pulse).
+        """
+        if not self.wordDigitalChanels:
+            pglMessages.warning("Digital word channels have not been configured")
+            return None
+
+        if isinstance(outputWord, bool) or not isinstance(outputWord, int):
+            pglMessages.warning("outputWord must be an integer")
+            return None
+
         if outputWord < 0 or outputWord > self.wordMaxValue:
-            pglMessages.warning(f"outputWord must be between 0 and {self.wordMaxValue}: {outputWord}",level=1)
-            return
-        
-        # write each bit out
-        for iBit in range(self.wordBits):
-            val = (outputWord >> iBit) & 0x1
-            # send pulses for all positive ones
-            if val: self.digitalOutputPulse(self.wordDigitalChanels[iBit])
-            
+            pglMessages.warning(f"outputWord must be between 0 and {self.wordMaxValue}: {outputWord}", level=1)
+            return None
+
+        firstTimestamp = None
+
+        for iBit, channel in enumerate(self.wordDigitalChanels):
+            if (outputWord >> iBit) & 0x1:
+                timestamp = self.digitalOutputPulse(channel)
+                if timestamp is None:
+                    pglMessages.warning(f"Failed to send word {outputWord} on channel {channel}; earlier bits may already have pulsed")
+                    return None
+
+                if firstTimestamp is None:
+                    firstTimestamp = timestamp
+
+        return firstTimestamp            
     def digitalOutputPulse(self, channel):
         '''
         Send a digital output pulse. Call setupDigitalOutput() first to configure the channel.
