@@ -836,16 +836,16 @@ class pglActions():
         # parameters
         tmin = Float(0.0, help="Time to start triggered epoch in seconds")
         tmax = Float(1.0, help="Time to end triggered epoch in seconds")
+        baseline = Tuple(Float, Float, allow_none=True, default_value=None, help="Baseline for epochs, mne uses this tuple to find the beginning and end of the interval to get the average of and subtract that from the interval, set to None for no baselining")
                 
         ################################
         # configure
         ################################
-        def configure(self, tmin: float = None, tmax: float = None) -> None:
+        def configure(self, **kwargs) -> None:
 
-            # tmin and tmax are min and max in seconds of epochs
-            if tmin: self.tmin = tmin
-            if tmax: self.tmax = tmax
-                
+            # set traitlets
+            self.configureTraits(**kwargs)   
+            
             # we are now configured, so call super to set status
             super().configure()
             
@@ -888,7 +888,7 @@ class pglActions():
                 event_id=rawEventId,
                 tmin=self.tmin,
                 tmax=self.tmax,
-                baseline=None,
+                baseline=self.baseline,
                 metadata=session.mne.eventsID,
                 preload=True,
                 verbose=False,
@@ -1097,7 +1097,7 @@ class pglActions():
                 event_id=eventId,
                 tmin=session.mne.epochs.tmin,
                 tmax=session.mne.epochs.tmax,
-                baseline=(session.mne.epochs.tmin, 0),
+                baseline=session.mne.epochs.baseline,
                 preload=True,
                 metadata=session.mne.eventsID.copy(),
                 reject_by_annotation=True,
