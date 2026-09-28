@@ -895,6 +895,17 @@ class pglExperiment(pglExperimentBase):
         '''
         initialize digital IO device if settings calls for them to be initialized
         '''
+        
+        # end (just in case digitalIO was already started)
+        self.endDigitalIO()
+        
+        # clear any existing configuration
+        self.state.digitalIODevices = []
+        self.state.triggerWords = {}
+        self.state.triggers = {}
+        self.settings.digitalIOWords = []
+        self.settings.digitalIOChannels = []
+
         for digitalIODevice in self.settings.digitalIO:
             if digitalIODevice.lower() == "labjack":
                 
@@ -902,7 +913,7 @@ class pglExperiment(pglExperimentBase):
                 from .pglLabJack import pglLabJack
                 labJack = pglLabJack()
                 
-                # if it is working
+                # if it is working add it
                 if labJack.isActive:
                     self.state.digitalIODevices.append(labJack)
                     pglMessages.message("LabJack initialized")
@@ -910,10 +921,271 @@ class pglExperiment(pglExperimentBase):
                     pglMessages.message("LabJack did not initialize")
                                         
             elif digitalIODevice.lower() == "datapixx":
-                pglMessages.warning("DataPixx needs to be implemented in initDigitalIO")
+                
+                # try to initialize datapixx
+                from .pglVPixx import pglDataPixx
+                dataPixx = pglDataPixx()
+                
+                if dataPixx.isActive:
+                    self.state.digitalIODevices.append(dataPixx)
+                    pglMessages.message("DataPixx initialized")
+                else:
+                    pglMessages.message("DataPixx did not initialize")
             else:
-                pglMessages.warning("Unknown digitalIO device: {digitalIODevice}")       
+                pglMessages.warning(f"Unknown digitalIO device: {digitalIODevice}")       
+        
 
+    def getDigitalIODevice(self, digitalIODevice = None):
+        '''
+        Returns the digitalIODevice that has been initialized or None if there is no digialIODevice
+        Without any arguments returns the 1st in the list if there is more than one (digialIODevices are
+        selected in pgl.settings()
+        
+        Args:
+            digitalIODevice (pglDigitalIODevice): Type of digitalIODevice to return (e.g. pglLabJack). If there
+                is no match, then None will be returned. 
+        '''
+        
+        # no digitalIODevice specified, return the first in list
+        if digitalIODevice is None:
+            return next(iter(self.state.digitalIODevices), None)
+
+        # look for device and return it if specified
+        return next((device for device in self.state.digitalIODevices if isinstance(device, digitalIODevice)),None)
+        
+    def configureTriggers(self, channels, groupName=None, digitalIODevice=None, pulseLen=5):
+        """
+        Configure named triggers on the digital IO device.
+
+        Args:
+            channels (dict, int, str, or list): A dictionary mapping trigger keys to
+                channel numbers or physical pin names, or unnamed channel values.
+                Integer values specify logical channel numbers. Physical pin names
+                receive automatically allocated logical IDs. Unnamed entries receive
+                keys such as "trigger00", based on their logical channel number.
+            groupName (str or None): Hardware bank used for numeric channel values.
+            digitalIODevice (type or None): Device class to select; None uses the first device.
+            pulseLen (int): Pulse duration in milliseconds.
+        """
+        if isinstance(channels, dict):
+            entries = list(channels.items())
+            explicitKeys = True
+        elif isinstance(channels, (int, str)):
+            entries = [(None, channels)]
+            explicitKeys = False
+        elif isinstance(channels, (list, tuple, range)):
+            entries = [(None, value) for value in channels]
+            explicitKeys = False
+        else:
+            raise TypeError("channels must be a dictionary, integer, string, or sequence of channel values")
+
+        if not entries:
+            return
+
+        # Validate input before allocating IDs or changing hardware.
+        for channelKey, value in entries:
+            if explicitKeys and (not isinstance(channelKey, str) or not channelKey):
+                pglMessages.warning("Each channelKey must be a nonempty string")
+                return
+            if isinstance(value, bool) or not isinstance(value, (int, str)):
+                pglMessages.warning("Each channel must be an integer or a physical pin name")
+                return
+            if isinstance(value, int) and value < 0:
+                pglMessages.warning("Channel numbers must be nonnegative")
+                return
+            if isinstance(value, str) and not value:
+                pglMessages.warning("Physical pin names must be nonempty")
+                return
+
+        device = self.getDigitalIODevice(digitalIODevice=digitalIODevice)
+        if device is None:
+            pglMessages.warning("No matching digitalIO device has been found. Make sure that devices have been configured in pgl.settings() and are properly connected")
+            return
+
+        # Reserve existing IDs and explicitly requested IDs before allocating new ones.
+        usedChannels = {config.channel for config in self.settings.digitalIOChannels}
+        usedChannels.update(device.digitalChannels)
+        usedChannels.update(value for _, value in entries if isinstance(value, int))
+        nextChannel = max(usedChannels, default=-1) + 1
+
+        existingKeys = {config.channelKey for config in self.settings.digitalIOChannels}
+        existingKeys.update(self.state.triggers)
+
+        # Build and validate all metadata before configuring hardware.
+        channelSettings = []
+        for channelKey, value in entries:
+            if isinstance(value, str):
+                channel = nextChannel
+                channelName = value
+                nextChannel += 1
+            else:
+                channel = value
+                channelName = None
+
+            if channelKey is None:
+                channelKey = f"trigger{channel:02d}"
+
+            if channelKey in existingKeys:
+                pglMessages.warning(f"Trigger key already configured: {channelKey}")
+                return
+
+            existingKeys.add(channelKey)
+            config = pglDigitalIOChannel(channelKey=channelKey, channel=channel, channelName=channelName, groupName=groupName, pulseLen=pulseLen, deviceType=device.deviceType)
+            channelSettings.append(config)
+
+        existingChannels = set(device.digitalChannels)
+        newChannels = [config.channel for config in channelSettings]
+
+        if len(newChannels) != len(set(newChannels)) or existingChannels.intersection(newChannels):
+            pglMessages.warning("Logical channel numbers must be unique on each device")
+            return
+
+        for config in channelSettings:
+            if not device.setupDigitalOutput(channel=config.channel, channelName=config.channelName, groupName=config.groupName, pulseLen=config.pulseLen):
+                pglMessages.warning(f"Failed to configure trigger {config.channelKey!r}")
+                return
+
+            self.settings.digitalIOChannels.append(config)
+            self.state.triggers[config.channelKey] = (config, device)
+    
+    def configureTriggerWords(self, wordDict: dict, digitalIODevice=None, channels=None, pulseLen=5):
+        """
+        Configure named trigger words.
+
+        Args:
+            wordDict (dict[str, int]): Word names mapped to unsigned integer values.
+            digitalIODevice (type or None): Device class to select; None uses the first device.
+            channels (list[int | str] or None): Configured logical channel numbers or
+                physical channel names, ordered from lowest to highest bit.
+                None uses all configured channels in logical channel number order.
+            pulseLen (int): Pulse duration in milliseconds, stored with each word.
+        """
+        device = self.getDigitalIODevice(digitalIODevice=digitalIODevice)
+        if device is None:
+            pglMessages.warning("No matching digitalIO device has been found. Make sure that devices have been configured in pgl.settings() and are properly connected")
+            return
+
+        if not isinstance(wordDict, dict):
+            pglMessages.warning("wordDict must be a dictionary mapping word names to integer values")
+            return
+
+        configuredChannels = [config for config, configuredDevice in self.state.triggers.values() if configuredDevice is device]
+
+        if channels is None:
+            selectedChannels = sorted(configuredChannels, key=lambda config: config.channel)
+        else:
+            channels = [channels] if isinstance(channels, (int, str)) else list(channels)
+            selectedChannels = []
+
+            for channel in channels:
+                if isinstance(channel, bool) or not isinstance(channel, (int, str)):
+                    pglMessages.warning("Each channel must be an integer channel number or a string channel name")
+                    return
+
+                if isinstance(channel, int):
+                    matches = [config for config in configuredChannels if config.channel == channel]
+                else:
+                    matches = [config for config in configuredChannels if config.channelName == channel]
+
+                if not matches:
+                    pglMessages.warning(f"Channel {channel!r} is not configured for {device.deviceType}")
+                    return
+                if len(matches) > 1:
+                    pglMessages.warning(f"Channel {channel!r} matches multiple configured entries")
+                    return
+
+                selectedChannels.append(matches[0])
+
+        channelNumbers = [config.channel for config in selectedChannels]
+
+        if not channelNumbers:
+            pglMessages.warning("At least one configured channel is required for trigger words")
+            return
+        if len(channelNumbers) != len(set(channelNumbers)):
+            pglMessages.warning("Each logical channel can appear only once in a trigger word")
+            return
+
+        # Check the device's actual configuration before its setup method is called.
+        missingChannels = set(channelNumbers) - device.digitalChannels.keys()
+        if missingChannels:
+            pglMessages.warning(f"Channels are not initialized on the selected device: {sorted(missingChannels)}")
+            return
+
+        maxValue = (1 << len(channelNumbers)) - 1
+        existingKeys = {word.key for word in self.settings.digitalIOWords}
+        existingKeys.update(self.state.triggerWords)
+
+        # Validate all metadata before changing the device's word configuration.
+        wordSettings = []
+        for key, value in wordDict.items():
+            if not isinstance(key, str) or not key:
+                pglMessages.warning("Each word key must be a nonempty string")
+                return
+            if key in existingKeys:
+                pglMessages.warning(f"Trigger word already configured for {device.deviceType}: {key}")
+                return
+            if isinstance(value, bool) or not isinstance(value, int):
+                pglMessages.warning(f"Value for word '{key}' must be an integer")
+                return
+            if not 0 <= value <= maxValue:
+                pglMessages.warning(f"Value for word '{key}' must be between 0 and {maxValue}")
+                return
+
+            word = pglDigitalIOWord(key=key, value=value, pulseLen=pulseLen, deviceType=device.deviceType)
+            wordSettings.append(word)
+
+        # check for existing configuration - 
+        hasConfiguredWords = any(wordDevice is device for _, wordDevice in self.state.triggerWords.values())
+        if hasConfiguredWords and channelNumbers != device.wordDigitalChanels:
+            pglMessages.warning("Cannot change word channels while trigger words are configured on this device")
+            return
+        
+        # configure the ouptut channels for writing words
+        device.setupDigitalOutputWord(channels=channelNumbers)
+
+        # and keep the settings and state 
+        for word in wordSettings:
+            self.settings.digitalIOWords.append(word)
+            self.state.triggerWords[word.key] = (word, device)
+    
+    def sendTriggerWord(self, key, task=None):
+        """Send a configured trigger word by its unique key."""
+        target = self.state.triggerWords.get(key)
+        if target is None:
+            pglMessages.warning(f"Trigger word {key!r} has not been configured")
+            return
+
+        # get the word and device to send
+        word, device = target
+        
+        # send it
+        timestamp = device.digitalOutputWord(word.value)
+        if timestamp is None: pglMessages.warning(f"Device did not return a timestamp",level=1)
+
+        e = pglEventOutputTrigger(triggerName=key, triggerWord=word.value, timestamp=timestamp)
+        self.data.events.append(e)
+
+        if task is not None: task.data.events.append(e)
+
+    def sendTrigger(self, key, task=None):
+        """Send a configured trigger; return its timestamp or None."""
+        target = self.state.triggers.get(key)
+        if target is None:
+            pglMessages.warning(f"Trigger {key!r} has not been configured")
+            return
+
+        config, device = target
+        timestamp = device.digitalOutputPulse(config.channel)
+        if timestamp is None: pglMessages.warning(f"Device did not return a timestamp",level=1)
+
+        e = pglEventOutputTrigger(triggerName=key, triggerValue=config.channel, timestamp=timestamp)
+        self.data.events.append(e)
+
+        if task is not None:
+            task.data.events.append(e)
+
+        return timestamp        
+    
     def endDigitalIO(self):
         '''
         end digitalIO devices
@@ -922,7 +1194,9 @@ class pglExperiment(pglExperimentBase):
         for digitalIODevice in self.state.digitalIODevices:
             digitalIODevice.close()
         # empty list
-        self.state.digitalIoDevices = []
+        self.state.digitalIODevices = []
+        self.state.triggers = {}
+        self.state.triggerWords = {}
         
     def initDevices(self):
         '''
@@ -1928,6 +2202,29 @@ class pglTask(pglTaskBase):
         # set current segment length to 0 to force jump
         self._thisTrialSeglen[self.state.currentSegment] = 0
 
+
+##############################################
+# small class to carry information about digital IO words
+##############################################
+class pglDigitalIOWord(pglTraitSettings):
+    # channel
+    key = Unicode("", help='String that can be used by sendTriggerWord to set word value')
+    value = Int(help="Word that will be sent")
+    pulseLen = Int(help="length of pulse")
+    deviceType = Unicode("", help="type of device that the channel was configured on")
+    
+##############################################
+# small class to carry information about digitalIOChannels
+##############################################
+class pglDigitalIOChannel(pglTraitSettings):
+
+    channelKey = Unicode(help="Unique trigger name associated with the logical channel")
+    channel = Int(help="Channel number that has been configured")
+    channelName = Unicode(allow_none=True, default_value=None, help="Name of channel if available")
+    groupName = Unicode(allow_none=True, help='Name of channel group')
+    pulseLen = Int(help="length of pulse that has been configured")
+    deviceType = Unicode("", help="type of device that the channel was configured on")
+    
 ##############################################
 # Settings for pglExperiment
 ##############################################
@@ -1939,6 +2236,8 @@ class pglExperimentSettings(pglTraitSettings):
     experimentSaveName = Unicode("defaultExperiment", help="Name to use when saving experiment data (defaults to camelCase version of experimentName)")
     subjectID = Unicode("s0000", help="Identifier for the subject participating in the experiment.")
     tasks = List(Unicode(), default_value=[], help="Task names")
+    digitalIOChannels = List(Instance(pglDigitalIOChannel), help='List of digitalIO channesl that have been configured')
+    digitalIOWords = List(Instance(pglDigitalIOWord), default_value=[], help='List of words, keys and associated values that have been configured')
 
     # make sure that any settings that the experimenter writes into settings get saved
     _serializeUnregisteredFields = True
@@ -2091,7 +2390,9 @@ class pglExperimentState(pglTraitSettings):
     display = Instance(pglDisplaySettings, default_value=None, allow_none=True, help="Current display settings.")
     originalScreenResolution = Tuple(Int(),Int(),Int(),Int(), default_value=None, allow_none=True, help="Original screen resolution: (left, top, width, height).")
     screenResolution = Tuple(Int(),Int(),Int(),Int(), default_value=None, allow_none=True, help="Current screen resolution: (left, top, width, height).")
-    digitalIODevices = List(Instance(pglDigitalIODevice), help="List of digitalIOdevices the experiment is using", serialize=False)
+    digitalIODevices = List(Instance(pglDigitalIODevice), help="List of digitalIOdevices the experiment is using")
+    triggerWords = Dict(help="Runtime lookup of trigger word keys to configurations and devices")
+    triggers = Dict(help="Runtime lookup of trigger keys to configurations and devices")
     # make sure any variabels added by experimenter code gets saved
     _serializeUnregisteredFields = True
 
@@ -2379,3 +2680,23 @@ class pglEventVolumeTrigger(pglEvent):
         
         # set attributes
         self.timestamp = timestamp
+
+#################################################################
+# Events that specifys a trigger was sent
+#################################################################
+class pglEventOutputTrigger(pglEvent):
+    
+    def __init__(self, triggerName=None, triggerValue=None, triggerWord=None, timestamp=None):
+        super().__init__(type="outputTrigger")
+        
+        # set attributes
+        self.timestamp = timestamp
+        self.triggerName = triggerName
+
+        # set value
+        if triggerValue is not None:
+            self.value = triggerValue
+            self.triggerWord = False
+        elif triggerWord is not None:
+            self.value = triggerWord
+            self.triggerWord = True
