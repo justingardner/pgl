@@ -108,6 +108,12 @@ class pglDevice:
         Should be implemented in subclass, defaults to returning True
         '''
         return True
+    
+    def close(self):
+        '''
+        Close the device
+        '''
+        pass
         
 #################################################################
 # pglDevices is mixed into pgl and handles multiple pglDevice instances
