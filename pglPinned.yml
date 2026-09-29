@@ -39,7 +39,7 @@ dependencies:
   - prompt_toolkit=3.0.52=hd3eb1b0_1
   - llvm-openmp=22.1.2=h4714345_1
   - asttokens=3.0.1=py312hca03da5_0
-  - openssl=3.6.3=hd24854e_0
+  - openssl=3.6.4
   - brotli-python=1.2.0=py312h5b255a4_0
   - google-auth=2.47.0=py312hca03da5_0
   - jupyterlab_widgets=3.0.16=py312hca03da5_1
@@ -64,10 +64,10 @@ dependencies:
   - krb5=1.22.2=hfd3d5f3_1
   - pexpect=4.9.0=py312hca03da5_1
   - debugpy=1.8.21=py312h50f4ffc_0
-  - ca-certificates=2026.6.17=hbd8a1cb_0
+  - ca-certificates=2026.7.22
   - websockets=16.0=py312haa24f5a_0
   - fastapi-cli=0.0.20=py312hca03da5_0
-  - certifi=2026.6.17=py312hca03da5_0
+  - certifi=2026.7.22
   - rich-toolkit=0.17.1=py312hca03da5_0
   - aws-c-cal=0.9.14=hb9ed60c_4
   - pyasn1=0.6.3=py312hca03da5_0
@@ -218,4 +218,5 @@ dependencies:
   - platformdirs=4.9.4=py312hca03da5_0
   - libsodium=1.0.21=h58dafb5_1
   - aiohttp=3.14.1=py312haa24f5a_0
+  - xarray
 prefix: /Users/justin/miniforge3/envs/pgl

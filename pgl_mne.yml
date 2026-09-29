@@ -217,6 +217,7 @@ dependencies:
 - platformdirs
 - libsodium
 - aiohttp
+- xarray
 - pyside6
 - imageio
 - mne
