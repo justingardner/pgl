@@ -1159,7 +1159,7 @@ class pglExperiment(pglExperimentBase):
         target = self.state.triggerWords.get(key)
         
         if target is None:
-            pglMessages.warning(f"Trigger word {key!r} has not been configured",level=1)
+            pglMessages.message(f"Trigger word {key!r} has not been configured")
             # setup trigger event
             e = pglEventOutputTrigger(triggerName=key, triggerWord=None, timestamp=pglTimestamp.getSecs(), triggerSent=False)
         else:
@@ -1183,7 +1183,7 @@ class pglExperiment(pglExperimentBase):
         """Send a configured trigger; return its timestamp or None."""
         target = self.state.triggers.get(key)
         if target is None:
-            pglMessages.warning(f"Trigger {key!r} has not been configured", level=1)
+            pglMessages.message(f"Trigger {key!r} has not been configured")
             e = pglEventOutputTrigger(triggerName=key, triggerValue=None,
                                     timestamp=pglTimestamp.getSecs(), triggerSent=False)
             timestamp = None
@@ -1766,7 +1766,9 @@ class pglTaskData(pglTraitSettings):
         trialStart = None
         gotResponse = False
         gotOutputTrigger = False
+        gotUnsentTrigger = False
         nTrials = 0
+        
         for event in self.events:
             # if we find a new trial event, reset the beginning time
             if isinstance(event, pglEventTrial):
@@ -1787,11 +1789,16 @@ class pglTaskData(pglTraitSettings):
                         responseCounts[event.responseType] += 1
                 # display output trigger events
                 elif isinstance(event, pglEventOutputTrigger):
-                    if event.timestamp is not None:
-                        gotOutputTrigger = True
+                    if event.timestamp is not None:                        
                         value = getattr(event, "value", None)
                         label = f"{value}" if value is not None else 'x'
-                        timeline.addTriangleMarker(time=event.timestamp - trialStart, color='purple', label=label, direction='down')
+                        sent = getattr(event, "triggerSent", True)
+                        if sent:
+                            gotOutputTrigger = True
+                        else:
+                            gotUnsentTrigger = True
+                        # display triangle
+                        timeline.addTriangleMarker(time=event.timestamp - trialStart, color='purple' if sent else 'orange', label=label, direction='down')                        
                         
         # compute duration
         if self.endTime is not None and self.startTime is not None:
@@ -1819,6 +1826,9 @@ class pglTaskData(pglTraitSettings):
         
         if gotOutputTrigger:
             legend.append({'label': 'Output trigger', 'color': 'purple'})
+        
+        if gotUnsentTrigger:
+            legend.append({'label': 'Output trigger', 'color': 'orange'})
 
         timeline.addLegend(legend)
         if ax is None:
@@ -2058,61 +2068,54 @@ class pglTask(pglTaskBase):
             else:
                 self.startTrial(updateTime)   # recurses into _startSegment internally, not startSegment
         else:
+            self.state.currentSegment += 1
+            self.state.segmentStartTime = updateTime
+            self.data.events.append(pglEventSegment(self.state.currentSegment, updateTime))
+
             if self.settings.saveEyeTracker:
                 self.e.saveEyeTrackerEvent(eventType="segment", taskID=self.settings.taskID,
                     trialNum=self.state.currentTrial, segmentNum=self.state.currentSegment,
                     timestamp=updateTime, phaseNum=self.settings.phaseNum)
 
-            self.state.currentSegment += 1
-            self.state.segmentStartTime = updateTime
-            self.data.events.append(pglEventSegment(self.state.currentSegment, updateTime))
             self.waitUntilVolumeTrigger = False
-
-            # a real segment actually started — call the overridable hook
             self.startSegment(updateTime)
+            
     def startTrial(self, startTime):
         '''
         Start a trial.
         '''
-        # update values
         self.state.currentTrial += 1
+        self.state.currentSegment = -1
         self.data.events.append(pglEventTrial(self.state.currentTrial, startTime))
         self.state.trialStartTime = startTime
 
-        # save eye tracker event for synchronization        
         if self.settings.saveEyeTracker:
-            self.e.saveEyeTrackerEvent(eventType="trial", taskID=self.settings.taskID, trialNum=self.state.currentTrial, segmentNum=self.state.currentSegment, timestamp=startTime, phaseNum=self.settings.phaseNum)
+            self.e.saveEyeTrackerEvent(eventType="trial", taskID=self.settings.taskID,
+                trialNum=self.state.currentTrial, segmentNum=self.state.currentSegment,
+                timestamp=startTime, phaseNum=self.settings.phaseNum)
 
-        # get current parameters
+        # parameters and trial variables
         self.data.params.append({})
         self.currentParams = self.data.params[-1]
-        for parameter in self.parameters: 
+        for parameter in self.parameters:
             self.data.params[-1].update(parameter.get())
-
-        # initialize the trialVariables for this trial
-        # trialVariables are set by the task to store any computed, incidental, discovered trial-by-trial variables
         self.data.trialVariables.append({})
-        
-        # start segment (startSegment will update currentSegment to 0)
-        self.state.currentSegment = -1
-        self._startSegment(startTime)
-        
-        # get a random length for each segment. If segmin==segmax, then fixed length
+
+        # draw segment lengths before any segment starts
         self._thisTrialSeglen = [
-            # if either segmin or segmax is infinite, set to infinite
-            float('inf') if math.isinf(min_val) or math.isinf(max_val) 
-            # otherwise choose a random length between min and max
+            float('inf') if math.isinf(min_val) or math.isinf(max_val)
             else random.uniform(min_val, max_val)
             for min_val, max_val in zip(self.settings.segmin, self.settings.segmax)
         ]
 
-        # print trial
+        # print trial header before the segment hook can print anything
         pglMessages.print(f"({self.settings.taskName}) Trial {self.state.currentTrial+1}: ", end='', messageType='experiment')
-        
-        # and variable settings
-        for name,value in self.data.params[-1].items():
+        for name, value in self.data.params[-1].items():
             pglMessages.print(f'{name}={value}', end=' ', messageType='experiment')
-        pglMessages.print(f"", messageType='experiment')
+        pglMessages.print("", messageType='experiment')
+
+        # now start the first segment (currentSegment -1 -> 0)
+        self._startSegment(startTime)
 
     def endTrial(self, endTime):
         '''
@@ -2354,6 +2357,7 @@ class pglExperimentData(pglTraitSettings):
         nVols = 0
         nKeys = 0
         nOutputTriggers = 0
+        nUnsentTriggers = 0
         
         # init timeline
         timeline = timelinePlot(ax=ax, startTime=startTime, endTime=max(self.endTime-self.startTime,10))
@@ -2374,8 +2378,13 @@ class pglExperimentData(pglTraitSettings):
                 if event.timestamp is not None:
                     value = getattr(event, "value", None)
                     label = f"{value}" if value is not None else 'x'
-                    timeline.addTriangleMarker(time=event.timestamp - self.startTime, color='purple', label=label, direction='up')
-                    nOutputTriggers += 1
+                    sent = getattr(event, "triggerSent", True)
+                    if sent:
+                        nOutputTriggers += 1
+                    else:
+                        nUnsentTriggers += 1
+                    # set marker
+                    timeline.addTriangleMarker(time=event.timestamp - self.startTime, color='purple' if sent else 'orange', label=label, direction='up') 
         
         if self.startDateTime != "":
             dateTime = datetime.fromisoformat(self.startDateTime)
@@ -2391,6 +2400,10 @@ class pglExperimentData(pglTraitSettings):
         
         if nOutputTriggers > 0:
             legend.append({'label': f'Output triggers (n={nOutputTriggers})', 'color': 'purple'})
+
+        if nUnsentTriggers > 0:
+            legend.append({'label': f'Unsent triggers (n={nUnsentTriggers})', 'color': 'orange'})
+
         timeline.addLegend(legend)
         
         if not ax: timeline.show()
