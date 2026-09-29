@@ -1157,40 +1157,52 @@ class pglExperiment(pglExperimentBase):
     def sendTriggerWord(self, key, task=None):
         """Send a configured trigger word by its unique key."""
         target = self.state.triggerWords.get(key)
-        if target is None:
-            pglMessages.warning(f"Trigger word {key!r} has not been configured")
-            return
-
-        # get the word and device to send
-        word, device = target
         
-        # send it
-        timestamp = device.digitalOutputWord(word.value)
-        if timestamp is None: pglMessages.warning(f"Device did not return a timestamp",level=1)
+        if target is None:
+            pglMessages.warning(f"Trigger word {key!r} has not been configured",level=1)
+            # setup trigger event
+            e = pglEventOutputTrigger(triggerName=key, triggerWord=None, timestamp=pglTimestamp.getSecs(), triggerSent=False)
+        else:
+            # get the word and device to send
+            word, device = target
+            # send it
+            timestamp = device.digitalOutputWord(word.value)
+            if timestamp is None: 
+                pglMessages.warning(f"Device did not return a timestamp",level=1)
+                # setup trigger event
+                e = pglEventOutputTrigger(triggerName=key, triggerWord=word.value, timestamp=pglTimestamp.getSecs(), triggerSent=False)
+            else:
+                # setup trigger event
+                e = pglEventOutputTrigger(triggerName=key, triggerWord=word.value, timestamp=timestamp, triggerSent=True)
 
-        e = pglEventOutputTrigger(triggerName=key, triggerWord=word.value, timestamp=timestamp)
+        # add event to events
         self.data.events.append(e)
-
         if task is not None: task.data.events.append(e)
 
     def sendTrigger(self, key, task=None):
         """Send a configured trigger; return its timestamp or None."""
         target = self.state.triggers.get(key)
         if target is None:
-            pglMessages.warning(f"Trigger {key!r} has not been configured")
-            return
+            pglMessages.warning(f"Trigger {key!r} has not been configured", level=1)
+            e = pglEventOutputTrigger(triggerName=key, triggerValue=None,
+                                    timestamp=pglTimestamp.getSecs(), triggerSent=False)
+            timestamp = None
+        else:
+            config, device = target
+            timestamp = device.digitalOutputPulse(config.channel)
+            if timestamp is None:
+                pglMessages.warning("Device did not return a timestamp", level=1)
+                e = pglEventOutputTrigger(triggerName=key, triggerValue=config.channel,
+                                        timestamp=pglTimestamp.getSecs(), triggerSent=False)
+            else:
+                e = pglEventOutputTrigger(triggerName=key, triggerValue=config.channel,
+                                        timestamp=timestamp, triggerSent=True)
 
-        config, device = target
-        timestamp = device.digitalOutputPulse(config.channel)
-        if timestamp is None: pglMessages.warning(f"Device did not return a timestamp",level=1)
-
-        e = pglEventOutputTrigger(triggerName=key, triggerValue=config.channel, timestamp=timestamp)
         self.data.events.append(e)
-
         if task is not None:
             task.data.events.append(e)
 
-        return timestamp        
+        return timestamp    
     
     def endDigitalIO(self):
         '''
@@ -1753,6 +1765,7 @@ class pglTaskData(pglTraitSettings):
         # for each event, add to timeline
         trialStart = None
         gotResponse = False
+        gotOutputTrigger = False
         nTrials = 0
         for event in self.events:
             # if we find a new trial event, reset the beginning time
@@ -1772,6 +1785,13 @@ class pglTaskData(pglTraitSettings):
                     # update response counts
                     if event.responseType in responseCounts:
                         responseCounts[event.responseType] += 1
+                # display output trigger events
+                elif isinstance(event, pglEventOutputTrigger):
+                    if event.timestamp is not None:
+                        gotOutputTrigger = True
+                        value = getattr(event, "value", None)
+                        label = f"{value}" if value is not None else 'x'
+                        timeline.addTriangleMarker(time=event.timestamp - trialStart, color='purple', label=label, direction='down')
                         
         # compute duration
         if self.endTime is not None and self.startTime is not None:
@@ -1796,6 +1816,9 @@ class pglTaskData(pglTraitSettings):
                 if count != 0:
                     percent = count / totalResponses * 100 if totalResponses > 0 else 0
                     legend.append({'label': f'{label} (n={count}: {percent:.1f}%)', 'color': color})
+        
+        if gotOutputTrigger:
+            legend.append({'label': 'Output trigger', 'color': 'purple'})
 
         timeline.addLegend(legend)
         if ax is None:
@@ -2321,16 +2344,16 @@ class pglExperimentData(pglTraitSettings):
         # Get the time at which start the timeline, if there is a keyboard
         # event that happens before the start of the experiment (like when the experimenter
         # hits space to start the experiment), then adjust the start time to show that as a negative time)
+        startTime = 0
         firstKeydownEvent = next((event for event in self.events if event.type == "keyboard" and event.eventType == "keydown"), None)
         if firstKeydownEvent is not None:
             if firstKeydownEvent.timestamp < self.startTime:
                 startTime = firstKeydownEvent.timestamp - self.startTime
-        else:
-            startTime = 0
             
         # track number of volumes
         nVols = 0
         nKeys = 0
+        nOutputTriggers = 0
         
         # init timeline
         timeline = timelinePlot(ax=ax, startTime=startTime, endTime=max(self.endTime-self.startTime,10))
@@ -2347,6 +2370,12 @@ class pglExperimentData(pglTraitSettings):
             elif event.type == "volumeTrigger":
                 timeline.addTriangleMarker(time=event.timestamp - self.startTime, color='blue', direction='up')
                 nVols += 1
+            elif event.type == "outputTrigger":
+                if event.timestamp is not None:
+                    value = getattr(event, "value", None)
+                    label = f"{value}" if value is not None else 'x'
+                    timeline.addTriangleMarker(time=event.timestamp - self.startTime, color='purple', label=label, direction='up')
+                    nOutputTriggers += 1
         
         if self.startDateTime != "":
             dateTime = datetime.fromisoformat(self.startDateTime)
@@ -2355,7 +2384,15 @@ class pglExperimentData(pglTraitSettings):
         else:
             timeline.setTitle("Experiment Events")
             
-        timeline.addLegend([{'label': f'Keypress (n={nKeys})', 'color': 'green'},{'label': f'Volumes (n={nVols})', 'color': 'blue'}])
+        legend = [{'label': f'Keypress (n={nKeys})', 'color': 'green'}]
+        
+        if nVols > 0:
+            legend.append({'label': f'Volumes (n={nVols})', 'color': 'blue'})
+        
+        if nOutputTriggers > 0:
+            legend.append({'label': f'Output triggers (n={nOutputTriggers})', 'color': 'purple'})
+        timeline.addLegend(legend)
+        
         if not ax: timeline.show()
     def getTriggerStats(self):
         '''
@@ -2693,12 +2730,13 @@ class pglEventVolumeTrigger(pglEvent):
 #################################################################
 class pglEventOutputTrigger(pglEvent):
     
-    def __init__(self, triggerName=None, triggerValue=None, triggerWord=None, timestamp=None):
+    def __init__(self, triggerName=None, triggerValue=None, triggerWord=None, timestamp=None, triggerSent=True):
         super().__init__(type="outputTrigger")
         
         # set attributes
         self.timestamp = timestamp
         self.triggerName = triggerName
+        self.triggerSent = triggerSent
 
         # set value
         if triggerValue is not None:
