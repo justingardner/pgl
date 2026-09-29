@@ -887,6 +887,12 @@ class pglExperiment(pglExperimentBase):
         
         # close screen
         self.endScreen()
+        
+        # end digital IO
+        self.endDigitalIO()
+        
+        # end devices
+        self.endDevices()
 
         # if we got here then we finished the run without error
         self.state.runFinishedWithError = False
@@ -1211,6 +1217,7 @@ class pglExperiment(pglExperimentBase):
         '''
         end digitalIO devices
         '''
+        pass
         
         
     def initEyeTracker(self):
