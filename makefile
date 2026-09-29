@@ -8,6 +8,14 @@ force:
 clean:
 	rm -rf build *.so *.egg-info __pycache__
 
+# Keep "make" alone building the extensions.
+.DEFAULT_GOAL := build
+
+.PHONY: yml
+yml:
+	$(MAKE) refreshPglPinned
+	$(MAKE) pgl.yml pgl_mne.yml
+
 ###############################################
 # update of yml file for dependencies
 ###############################################
