@@ -22,6 +22,8 @@ from fsspec import AbstractFileSystem
 from traitlets import HasTraits, Enum, Float, Int, List, Tuple, TraitError, Unicode, Dict, default, link, Bool, TraitType, Instance
 import pandas as pd
 from .pglExperiment import pglEventTrial, pglEventSegment
+import matplotlib
+from tqdm.auto import tqdm
 
 #################################
 # Collection of predefined actions
@@ -1026,6 +1028,155 @@ class pglActions():
             # and return
             return session
     
+    class mnePlotEvokedEach(pglAction):
+
+        # Parameters
+        set = Unicode(default_value=None, allow_none=True, help="Label set used to group epochs (defaults to the first set)")
+        picks = Unicode("mag", help="Channel type to plot: mag, grad, or eeg")
+        nCols = Int(4, min=1, help="Number of labels across each row")
+
+        ################################
+        # configure
+        ################################
+        def configure(self, **kwargs) -> None:
+            self.configureTraits(**kwargs)
+            super().configure()
+
+        ################################
+        # run
+        ################################
+        def _run(self, session: pglSession) -> pglSession:
+            """
+            Compute and plot label-specific evoked responses with a progress bar.
+            Display each completed row as a separate figure.
+            """
+
+            import mne
+
+            # Check session
+            if session.mne is None or session.mne.raw is None:
+                self.setError("Session does not have raw mne loaded")
+                return None
+
+            if session.mne.epochs is None:
+                self.setError("Session does not have epochs created")
+                return None
+
+            # Validate channel type
+            self.picks = session.mne.validatePicks(self.picks)
+
+            if self.picks not in ("mag", "grad", "eeg"):
+                self.setError("picks must be a channel type: mag, grad, or eeg")
+                return None
+
+            epochs = session.mne.epochs
+            eventsID = session.mne.eventsID
+
+            # Resolve label set
+            labelSet = self.set
+
+            if labelSet is None:
+                if len(eventsID.columns) <= 3:
+                    self.setError("No label sets found in eventsID")
+                    return None
+
+                labelSet = eventsID.columns[3]
+
+            if labelSet not in eventsID.columns:
+                self.setError(f"Could not find label set: {labelSet}")
+                return None
+
+            if epochs.metadata is None or labelSet not in epochs.metadata.columns:
+                self.setError(f"Epoch metadata does not contain label set: {labelSet}")
+                return None
+
+            # Select channels once; average only the channels needed for plotting
+            megType = self.picks if self.picks in ("mag", "grad") else False
+            channelIndices = mne.pick_types(epochs.info, meg=megType, eeg=self.picks == "eeg", exclude="bads")
+
+            if len(channelIndices) == 0:
+                self.setError(f"No usable {self.picks!r} channels found")
+                return None
+
+            # Build label-to-epoch selections without computing evoked responses yet
+            labels = eventsID[labelSet].dropna().unique()
+            selections = []
+
+            for label in labels:
+                mask = epochs.metadata[labelSet].eq(label).fillna(False).to_numpy(dtype=bool)
+                epochIndices = np.flatnonzero(mask)
+
+                if len(epochIndices) == 0:
+                    pglMessages.warning(f"No epochs remaining for label {label!r}; skipping")
+                    continue
+
+                selections.append((label, epochIndices))
+
+            if not selections:
+                self.setError(f"No epochs found for labels in {labelSet!r}")
+                return None
+
+            nLabels = len(selections)
+            nCols = min(self.nCols, nLabels)
+            nRows = (nLabels + nCols - 1) // nCols
+
+            # Inline notebooks require explicit display to show rows during execution
+            inlineBackend = "inline" in matplotlib.get_backend().lower()
+
+            if inlineBackend:
+                from IPython.display import display
+
+            # Prevent automatic redraws while constructing each row.
+            # The previous interactive state is restored when this block exits.
+            with plt.ioff(), tqdm(total=nLabels, desc="Evoked plots", unit="stimulus") as progress:
+
+                for row in range(nRows):
+                    rowSelections = selections[row * nCols:(row + 1) * nCols]
+
+                    # Fixed layout avoids expensive constrained-layout calculations
+                    fig = plt.figure(figsize=(5 * nCols, 6), constrained_layout=False)
+                    outerGrid = fig.add_gridspec(1, nCols, left=0.055, right=0.97, bottom=0.12, top=0.80, wspace=0.45)
+                    fig.suptitle(f"Evoked responses by {labelSet} — {self.picks} — row {row + 1}/{nRows}", fontsize=16)
+
+                    for col, (label, epochIndices) in enumerate(rowSelections):
+                        progress.set_postfix_str(f"Row {row + 1}/{nRows}: {label}", refresh=True)
+
+                        # Compute this stimulus immediately before plotting it
+                        evoked = epochs[epochIndices].average(picks=channelIndices)
+                        _, peakTime = evoked.get_peak(ch_type=self.picks, mode="abs")
+
+                        # Topomap and colorbar above, evoked below
+                        innerGrid = outerGrid[0, col].subgridspec(2, 2, height_ratios=[1.25, 1], width_ratios=[1, 0.05], hspace=0.40, wspace=0.08)
+
+                        axTopo = fig.add_subplot(innerGrid[0, 0])
+                        axColorbar = fig.add_subplot(innerGrid[0, 1])
+                        axEvoked = fig.add_subplot(innerGrid[1, :])
+
+                        # Topomap at this label's peak response
+                        evoked.plot_topomap(times=[peakTime], ch_type=self.picks, axes=[axTopo, axColorbar], colorbar=True, sensors=True, contours=6, time_unit="ms", cmap=("RdBu_r", False), vlim=(-30, 30), show=False)
+                        #evoked.plot_topomap(times=[peakTime], ch_type=self.picks, axes=[axTopo, axColorbar], colorbar=True, sensors=True, contours=6, time_unit="ms", show=False)
+                        axTopo.set_title(f"{label}\nn = {len(epochIndices)} | peak = {peakTime * 1000:.1f} ms", fontsize=11)
+                        axColorbar.tick_params(labelsize=8)
+
+                        # Butterfly plot of all selected channels
+                        evoked.plot(axes=axEvoked, spatial_colors=True, gfp=False, time_unit="ms", show=False)
+                        axEvoked.axvline(peakTime * 1000, color="black", linestyle="--", linewidth=1)
+                        axEvoked.set_title("")
+                        axEvoked.tick_params(labelsize=8)
+
+                        progress.update(1)
+
+                    # Display this completed row before computing the next one
+                    if inlineBackend:
+                        display(fig)
+                        plt.close(fig)
+                    else:
+                        plt.show(block=False)
+                        fig.canvas.draw_idle()
+                        plt.pause(0.05)
+
+            return session
+
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
     # downsample evoked
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
@@ -1034,17 +1185,6 @@ class pglActions():
         # parameters
         downsampleFrequency = Float(200.0, help="Downsample frequency")
                 
-        ################################
-        # configure
-        ################################
-        def configure(self, **kwargs) -> None:
-
-            # set traitlets
-            self.configureTraits(**kwargs)     
-            
-            # we are now configured, so call super to set status
-            super().configure()
-            
         ################################
         # run
         ################################
@@ -1136,14 +1276,6 @@ class pglActions():
         set = Unicode(allow_none=True, default_value=None, help="Metadata column used to select trials, e.g. grouped.")
         label = Unicode(allow_none=True, default_value=None, help="Metadata label used to select trials, e.g. things.")
         conditionIDColumn = Unicode("code", help="Metadata column identifying individual signal conditions.")
-
-        ################################
-        # configure
-        ################################
-        def configure(self, **kwargs) -> None:
-
-            self.configureTraits(**kwargs)
-            super().configure()
 
         ################################
         # run
@@ -1428,17 +1560,6 @@ class pglActions():
         leftEyeChannel = Unicode('L401', help="Left channel used for detecting eye blink")
         rightEyeChannel = Unicode('R401', help="Left channel used for detecting eye blink")
                 
-        ################################
-        # configure
-        ################################
-        def configure(self, **kwargs) -> None:
-
-            # set parameters
-            self.configureTraits(**kwargs)
-                
-            # we are now configured, so call super to set status
-            super().configure()
-            
         ################################
         # run
         ################################
