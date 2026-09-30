@@ -147,6 +147,16 @@ class pglAction(pglActionable):
         self.status = pglActionStatus.INITIALIZED
         self.version = "0.0"
 
+    # configure
+    ################################
+    def configure(self, **kwargs) -> None:
+
+        # set traitlets
+        self.configureTraits(**kwargs)     
+        
+        # set status
+        self.status = pglActionStatus.CONFIGURED
+
     @classmethod
     def execute(cls, *args, **kwargs):
         """Create, configure, and run an action, returning its result."""
@@ -200,16 +210,7 @@ class pglAction(pglActionable):
                 inspect.Parameter.KEYWORD_ONLY,
             )
         }
-        
-    def configure(self) -> None:
-        '''
-        Configure the action, this should be subclassed, and the subclass should call this super function
-        when done configured to establish that the action was actually properly configured
-        '''
-        
-        # set status
-        self.status = pglActionStatus.CONFIGURED
-        
+                
     def configureTraits(self, **kwargs) -> None:
         validTraits = self.traits()
 
