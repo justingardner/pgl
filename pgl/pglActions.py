@@ -1047,11 +1047,18 @@ class pglActions():
         ################################
         def _run(self, session: pglSession) -> pglSession:
             """
-            Compute and plot label-specific evoked responses with a progress bar.
-            Display each completed row as a separate figure.
+            Compute label-specific evoked responses with a progress bar.
+            Display each completed row as a static image, independent of
+            the notebook's interactive Matplotlib backend.
             """
 
             import mne
+            import numpy as np
+            from io import BytesIO
+            from matplotlib.figure import Figure
+            from matplotlib.backends.backend_agg import FigureCanvasAgg
+            from IPython.display import display, Image
+            from tqdm.auto import tqdm
 
             # Check session
             if session.mne is None or session.mne.raw is None:
@@ -1090,7 +1097,7 @@ class pglActions():
                 self.setError(f"Epoch metadata does not contain label set: {labelSet}")
                 return None
 
-            # Select channels once; average only the channels needed for plotting
+            # Select channels once
             megType = self.picks if self.picks in ("mag", "grad") else False
             channelIndices = mne.pick_types(epochs.info, meg=megType, eeg=self.picks == "eeg", exclude="bads")
 
@@ -1098,7 +1105,7 @@ class pglActions():
                 self.setError(f"No usable {self.picks!r} channels found")
                 return None
 
-            # Build label-to-epoch selections without computing evoked responses yet
+            # Find epochs for each label
             labels = eventsID[labelSet].dropna().unique()
             selections = []
 
@@ -1120,60 +1127,53 @@ class pglActions():
             nCols = min(self.nCols, nLabels)
             nRows = (nLabels + nCols - 1) // nCols
 
-            # Inline notebooks require explicit display to show rows during execution
-            inlineBackend = "inline" in matplotlib.get_backend().lower()
-
-            if inlineBackend:
-                from IPython.display import display
-
-            # Prevent automatic redraws while constructing each row.
-            # The previous interactive state is restored when this block exits.
-            with plt.ioff(), tqdm(total=nLabels, desc="Evoked plots", unit="stimulus") as progress:
+            with tqdm(total=nLabels, desc="Evoked plots", unit="stimulus") as progress:
 
                 for row in range(nRows):
                     rowSelections = selections[row * nCols:(row + 1) * nCols]
 
-                    # Fixed layout avoids expensive constrained-layout calculations
-                    fig = plt.figure(figsize=(5 * nCols, 6), constrained_layout=False)
-                    outerGrid = fig.add_gridspec(1, nCols, left=0.055, right=0.97, bottom=0.12, top=0.80, wspace=0.45)
-                    fig.suptitle(f"Evoked responses by {labelSet} — {self.picks} — row {row + 1}/{nRows}", fontsize=16)
+                    # Create an independent static figure, not a pyplot/widget figure
+                    fig = Figure(figsize=(5 * nCols, 6), dpi=100, constrained_layout=False)
+                    FigureCanvasAgg(fig)
 
-                    for col, (label, epochIndices) in enumerate(rowSelections):
-                        progress.set_postfix_str(f"Row {row + 1}/{nRows}: {label}", refresh=True)
+                    try:
+                        outerGrid = fig.add_gridspec(1, nCols, left=0.055, right=0.97, bottom=0.12, top=0.80, wspace=0.45)
+                        fig.suptitle(f"Evoked responses by {labelSet} — {self.picks} — row {row + 1}/{nRows}", fontsize=16)
 
-                        # Compute this stimulus immediately before plotting it
-                        evoked = epochs[epochIndices].average(picks=channelIndices)
-                        _, peakTime = evoked.get_peak(ch_type=self.picks, mode="abs")
+                        for col, (label, epochIndices) in enumerate(rowSelections):
+                            progress.set_postfix_str(f"Row {row + 1}/{nRows}: {label}", refresh=True)
 
-                        # Topomap and colorbar above, evoked below
-                        innerGrid = outerGrid[0, col].subgridspec(2, 2, height_ratios=[1.25, 1], width_ratios=[1, 0.05], hspace=0.40, wspace=0.08)
+                            # Compute this stimulus immediately before plotting
+                            evoked = epochs[epochIndices].average(picks=channelIndices)
+                            _, peakTime = evoked.get_peak(ch_type=self.picks, mode="abs")
 
-                        axTopo = fig.add_subplot(innerGrid[0, 0])
-                        axColorbar = fig.add_subplot(innerGrid[0, 1])
-                        axEvoked = fig.add_subplot(innerGrid[1, :])
+                            # Topomap and colorbar above, evoked below
+                            innerGrid = outerGrid[0, col].subgridspec(2, 2, height_ratios=[1.25, 1], width_ratios=[1, 0.05], hspace=0.40, wspace=0.08)
 
-                        # Topomap at this label's peak response
-                        evoked.plot_topomap(times=[peakTime], ch_type=self.picks, axes=[axTopo, axColorbar], colorbar=True, sensors=True, contours=6, time_unit="ms", cmap=("RdBu_r", False), vlim=(-30, 30), show=False)
-                        #evoked.plot_topomap(times=[peakTime], ch_type=self.picks, axes=[axTopo, axColorbar], colorbar=True, sensors=True, contours=6, time_unit="ms", show=False)
-                        axTopo.set_title(f"{label}\nn = {len(epochIndices)} | peak = {peakTime * 1000:.1f} ms", fontsize=11)
-                        axColorbar.tick_params(labelsize=8)
+                            axTopo = fig.add_subplot(innerGrid[0, 0])
+                            axColorbar = fig.add_subplot(innerGrid[0, 1])
+                            axEvoked = fig.add_subplot(innerGrid[1, :])
 
-                        # Butterfly plot of all selected channels
-                        evoked.plot(axes=axEvoked, spatial_colors=True, gfp=False, time_unit="ms", show=False)
-                        axEvoked.axvline(peakTime * 1000, color="black", linestyle="--", linewidth=1)
-                        axEvoked.set_title("")
-                        axEvoked.tick_params(labelsize=8)
+                            # Fixed color limits and no interactive colorbar
+                            evoked.plot_topomap(times=[peakTime], ch_type=self.picks, axes=[axTopo, axColorbar], colorbar=True, sensors=True, contours=6, time_unit="ms", cmap=("RdBu_r", False), vlim=(-30, 30), show=False)
+                            axTopo.set_title(f"{label}\nn = {len(epochIndices)} | peak = {peakTime * 1000:.1f} ms", fontsize=11)
+                            axColorbar.tick_params(labelsize=8)
 
-                        progress.update(1)
+                            # Butterfly plot explicitly attached to this row's axes
+                            evoked.plot(axes=axEvoked, spatial_colors=True, gfp=False, time_unit="ms", show=False)
+                            axEvoked.axvline(peakTime * 1000, color="black", linestyle="--", linewidth=1)
+                            axEvoked.set_title("")
+                            axEvoked.tick_params(labelsize=8)
 
-                    # Display this completed row before computing the next one
-                    if inlineBackend:
-                        display(fig)
-                        plt.close(fig)
-                    else:
-                        plt.show(block=False)
-                        fig.canvas.draw_idle()
-                        plt.pause(0.05)
+                            progress.update(1)
+
+                        # Render and display only this row; no live widget or callbacks
+                        with BytesIO() as buffer:
+                            fig.savefig(buffer, format="png", dpi=100, facecolor="white")
+                            display(Image(data=buffer.getvalue()))
+
+                    finally:
+                        fig.clear()
 
             return session
 
@@ -2211,7 +2211,167 @@ class pglActions():
                 result["run"].data.referenceTime = result["referenceTime"]
 
             return session
+        
+    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
+    # blink ICA: fit and display components
+    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
+    class mneBlinkICA(pglAction):
 
+        chType = Unicode("mag", help="Channel type to fit ICA on: mag, grad or eeg (one type: the component topography is later used as sensor weights)")
+        nComponents = Int(20, min=2, help="Number of ICA components")
+        nShow = Int(10, min=1, help="Number of leading components (largest explained variance first) to display")
+        fitHighPass = Float(1.0, help="ICA is fit on data high-passed at this frequency (skipped if raw is already high-passed at or above it)")
+        decim = Int(5, min=1, help="Use every nth sample when fitting the ICA")
+        randomState = Int(42, help="Random seed for FastICA")
+
+        ################################
+        # run
+        ################################
+        def _run(self, session: pglSession) -> pglSession:
+            '''
+            Fit ICA and display the leading topographies (labeled ICA000, ICA001, ...).
+            Choose the blink component by eye and pass its number to mneMarkBlinks.
+
+            Stores: session.mne.blinkICA
+            '''
+            import mne
+
+            if session.mne is None or session.mne.raw is None:
+                self.setError("session does not have raw mne loaded")
+                return None
+            if self.chType not in ("mag", "grad", "eeg"):
+                self.setError("chType must be mag, grad or eeg")
+                return None
+
+            raw = session.mne.raw
+            picks = mne.pick_types(raw.info, meg=self.chType if self.chType in ("mag", "grad") else False,
+                                   eeg=self.chType == "eeg", exclude="bads")
+
+            # Fit on a copy only if something must change: the high-pass, or old blink marks.
+            # Old marks must be hidden, otherwise the blinks are excluded from the fit and
+            # the blink component disappears.
+            oldMarks = np.flatnonzero(raw.annotations.description == "BAD_blink")
+            needsHighPass = raw.info["highpass"] < self.fitHighPass - 1e-6
+            fitRaw = raw
+            if len(oldMarks) or needsHighPass:
+                fitRaw = raw.copy().load_data()
+                annotations = fitRaw.annotations.copy()
+                annotations.delete(oldMarks)
+                fitRaw.set_annotations(annotations)
+                if needsHighPass:
+                    fitRaw.filter(l_freq=self.fitHighPass, h_freq=None, picks=picks, verbose=False)
+
+            pglMessages.message(f"Fitting ICA with {self.nComponents} components on {len(picks)} {self.chType} channels")
+            ica = mne.preprocessing.ICA(n_components=min(self.nComponents, len(picks) - 1),
+                                        method="fastica", random_state=self.randomState, max_iter="auto")
+            ica.fit(fitRaw, picks=picks, decim=self.decim, reject_by_annotation=True, verbose=False)
+
+            session.mne.blinkICA = ica
+            ica.plot_components(picks=list(range(min(self.nShow, ica.n_components_))), show=False)
+            return session
+
+    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
+    # mark blinks as bad segments
+    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
+    class mneMarkBlinks(pglAction):
+
+        component = Int(0, min=0, help="ICA component (from mneBlinkICA) whose topography weights the sensors")
+        lowCutoff = Float(1.0, help="Low edge (Hz) of the band-pass on the weighted channel; 0 for none")
+        highCutoff = Float(10.0, help="High edge (Hz) of the band-pass on the weighted channel; 0 for none")
+        threshold = Float(5.0, help="Event criterion in robust SDs (median/MAD) of the filtered channel")
+        minSeparation = Float(0.5, min=0.0, help="Bounce guard: peaks closer than this (s) collapse to the largest one")
+        windowBefore = Float(0.15, min=0.0, help="Seconds before the event peak to mark as bad")
+        windowAfter = Float(0.35, min=0.0, help="Seconds after the event peak to mark as bad")
+
+        ################################
+        # run
+        ################################
+        def _run(self, session: pglSession) -> pglSession:
+            '''
+            Weight the sensors by the chosen topography, find blink peaks, and mark a window around
+            each as BAD_blink in session.mne.raw.annotations (replacing earlier BAD_blink marks).
+            Epochs made earlier are not updated: re-run mneCreateEpochs.
+            '''
+            import mne
+            from scipy.signal import find_peaks
+
+            if session.mne is None or session.mne.raw is None:
+                self.setError("session does not have raw mne loaded")
+                return None
+            ica = getattr(session.mne, "blinkICA", None)
+            if ica is None:
+                self.setError("session does not have a blink ICA: run mneBlinkICA first")
+                return None
+            if self.component >= ica.n_components_:
+                self.setError(f"component {self.component} out of range: 0-{ica.n_components_ - 1}")
+                return None
+
+            raw = session.mne.raw
+            sfreq = raw.info["sfreq"]
+
+            # -- 1. one channel: sensors weighted by the topography (unit gain for that topography)
+            topo = ica.get_components()[:, self.component]
+            blink = (topo / np.sum(topo ** 2)) @ raw.get_data(picks=ica.ch_names)
+            if self.lowCutoff > 0 or self.highCutoff > 0:
+                blink = mne.filter.filter_data(blink, sfreq, self.lowCutoff or None, self.highCutoff or None, verbose=False)
+            center = np.median(blink)
+            z = (blink - center) / (1.4826 * np.median(np.abs(blink - center)))      # robust z-score
+            if np.percentile(z, 99.9) < -np.percentile(z, 0.1):                      # ICA sign is arbitrary: blinks up
+                z = -z
+
+            # -- 2. events = peaks above threshold; peaks within minSeparation of a larger one are dropped
+            peaks, _ = find_peaks(z, height=self.threshold, distance=max(1, int(round(self.minSeparation * sfreq))))
+            times = peaks / sfreq                                                    # s from first sample
+            intervals = np.diff(times)
+            interval_text = f"Between blinks: mean {intervals.mean():.2f} s, min {intervals.min():.2f} s, max {intervals.max():.2f} s" if intervals.size else "Between blinks: N/A (fewer than 2 blinks)"
+            starts = np.clip(times - self.windowBefore, 0, None)
+            stops = np.clip(times + self.windowAfter, None, raw.n_times / sfreq)
+
+            # -- 3. mark as bad, replacing earlier blink marks
+            offset = raw.first_time if raw.info["meas_date"] is not None else 0.0
+            annotations = raw.annotations.copy()
+            annotations.delete(np.flatnonzero(annotations.description == "BAD_blink"))
+            raw.set_annotations(annotations + mne.Annotations(
+                onset=starts + offset, duration=stops - starts,
+                description=["BAD_blink"] * len(peaks), orig_time=raw.info["meas_date"]))
+
+            # -- 4. plots: all events overlaid, then the whole recording with window bars
+            bad = np.zeros(len(z), bool)
+            for start, stop in zip(starts, stops):
+                bad[int(round(start * sfreq)): int(round(stop * sfreq)) + 1] = True
+
+            fig, ax = plt.subplots(figsize=(7, 4.5))
+            rel = np.arange(-int(round((self.windowBefore + 0.25) * sfreq)), int(round((self.windowAfter + 0.25) * sfreq)) + 1)
+            ax.axvspan(-self.windowBefore, self.windowAfter, color="tab:red", alpha=0.12, lw=0)
+            if len(peaks):
+                index = peaks[:, None] + rel
+                stack = np.where((index >= 0) & (index < len(z)), z[np.clip(index, 0, len(z) - 1)], np.nan)
+                ax.plot(rel / sfreq, stack.T, color="0.45", lw=0.6, alpha=0.5)
+                ax.plot(rel / sfreq, np.nanmean(stack, axis=0), color="k", lw=2)
+            ax.axhline(self.threshold, color="tab:red", ls="--", lw=1)
+            #ax.set(xlabel="Time from event peak (s)", ylabel="Blink channel (robust SD)",
+            #       title=f"{len(peaks)} events — component {self.component} (shaded = marked window)")
+            ax.set(xlabel="Time from event peak (s)", ylabel="Blink channel (robust SD)", title=f"{len(peaks)} events — component {self.component} (shaded = marked window)\n{interval_text}")
+            ax.set_ylim(-3 * self.threshold, 4 * self.threshold)
+            fig.tight_layout()
+
+            fig, ax = plt.subplots(figsize=(14, 4))
+            t = np.arange(len(z)) / sfreq
+            ax.fill_between(t, 0, 1, where=bad, transform=ax.get_xaxis_transform(), color="tab:red", alpha=0.25, lw=0)
+            ax.plot(t, z, color="k", lw=0.5)
+            ax.plot(times, z[peaks], "v", color="tab:red", ms=4)
+            ax.axhline(self.threshold, color="tab:red", ls="--", lw=1)
+            ax.set(xlabel="Time (s)", ylabel="Blink channel (robust SD)", xlim=(0, t[-1]),
+                   title=f"Component {self.component}: {len(peaks)} events, {100 * bad.mean():.1f}% of recording marked")
+            ax.set_ylim(-3 * self.threshold, 4 * self.threshold)
+            fig.tight_layout()
+
+            if len(peaks) == 0:
+                pglMessages.warning(f"No blinks above {self.threshold} robust SD; any earlier BAD_blink marks were removed")
+            else:
+                pglMessages.message(f"Marked {len(peaks)} blinks as BAD_blink ({100 * bad.mean():.1f}% of recording). Re-run mneCreateEpochs to apply.")
+            return session
+        
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
     # action stub
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
