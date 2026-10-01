@@ -841,17 +841,6 @@ class pglActions():
         baseline = Tuple(Float, Float, allow_none=True, default_value=None, help="Baseline for epochs, mne uses this tuple to find the beginning and end of the interval to get the average of and subtract that from the interval, set to None for no baselining")
                 
         ################################
-        # configure
-        ################################
-        def configure(self, **kwargs) -> None:
-
-            # set traitlets
-            self.configureTraits(**kwargs)   
-            
-            # we are now configured, so call super to set status
-            super().configure()
-            
-        ################################
         # run
         ################################
         def _run(self, session: pglSession) -> pglSession:
@@ -900,7 +889,94 @@ class pglActions():
 
             # and return
             return session
-        
+    
+    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
+    # make epochs respecting Bads annotations from blinks
+    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
+    class mneCreateEpochsWithBads(pglAction):
+
+        tmin = Float(0.0, help="Time to start triggered epoch in seconds")
+        tmax = Float(1.0, help="Time to end triggered epoch in seconds")
+        baseline = Tuple(Float, Float, allow_none=True, default_value=None, help="Baseline for epochs, mne uses this tuple to find the beginning and end of the interval to get the average of and subtract that from the interval, set to None for no baselining")
+        badSegments = Enum(["nan", "drop"], default_value="nan", help="Samples inside BAD annotations (e.g. blinks). nan: keep the epoch, set those samples to NaN (use nan-aware statistics). drop: drop every epoch overlapping a BAD annotation (MNE default)")
+        maxBadFraction = Float(1.0, min=0.0, max=1.0, help="nan mode: also drop epochs with more than this fraction of bad samples. 1.0 keeps all")
+        resampleFrequency = Float(0.0, help="If > 0, epoch a copy of raw resampled to this rate (replaces mneDownsampleEvoked); 0 for no resampling")
+
+        ################################
+        # configure
+        ################################
+        def configure(self, **kwargs) -> None:
+            self.configureTraits(**kwargs)
+            super().configure()
+
+        ################################
+        # run
+        ################################
+        def _run(self, session: pglSession) -> pglSession:
+            '''
+            Create the epochs. In nan mode samples inside BAD annotations are set to NaN (all channels),
+            the baseline is the nan-mean of the baseline window (so bad samples never enter it), and
+            epochs are dropped if they straddle a file-concatenation boundary (as MNE does), have no
+            usable baseline sample, or exceed maxBadFraction.
+            '''
+            import mne
+
+            if session.mne is None or session.mne.raw is None:
+                self.setError("session does not have raw mne loaded")
+                return None
+
+            raw, events = session.mne.raw, session.mne.events
+            if self.resampleFrequency > 0:
+                raw, events = raw.copy().load_data().resample(sfreq=self.resampleFrequency, npad="auto", events=events, verbose=False)
+            sfreq = raw.info["sfreq"]
+
+            # Every raw trigger code gets an event_id; the DataFrame is the authoritative label store.
+            rawEventId = {f"raw/{int(code)}": int(code) for code in np.unique(events[:, 2].astype(int))}
+            nanMode = self.badSegments == "nan"
+
+            # In nan mode MNE must neither baseline (NaN would spread) nor reject; we do both ourselves.
+            epochs = mne.Epochs(raw, events=events, event_id=rawEventId, tmin=self.tmin, tmax=self.tmax,
+                                baseline=None if nanMode else self.baseline, metadata=session.mne.eventsID,
+                                preload=True, reject_by_annotation=not nanMode, verbose=False)
+
+            if nanMode:
+                # bad[i, j]: is sample j of epoch i inside a BAD annotation (MNE's own definition)?
+                index = (epochs.events[:, 0] - raw.first_samp + int(round(epochs.tmin * sfreq)))[:, None] + np.arange(len(epochs.times))
+                bad = np.isnan(raw.get_data(picks=[0], reject_by_annotation="NaN")[0])[index]
+
+                # concatenation boundaries (zero-duration annotations) as sample indices
+                isBoundary = np.array([d.upper().endswith("BOUNDARY") for d in raw.annotations.description], dtype=bool)
+                offset = raw.first_time if raw.info["meas_date"] is not None else 0.0
+                boundary = np.round((raw.annotations.onset[isBoundary] - offset) * sfreq).astype(int)
+                straddles = ((boundary[None, :] >= index[:, :1]) & (boundary[None, :] <= index[:, -1:])).any(axis=1)
+
+                if self.baseline is not None:
+                    inBase = (epochs.times >= self.baseline[0] - 1e-9) & (epochs.times <= self.baseline[1] + 1e-9)
+                    noBaseline = bad[:, inBase].all(axis=1)
+                else:
+                    noBaseline = np.zeros(len(epochs), bool)
+
+                reasons = np.where(straddles, "BAD_boundary", np.where(bad.mean(axis=1) > self.maxBadFraction, "BAD_fraction",
+                                   np.where(noBaseline, "BAD_baseline", "")))
+                drop = np.flatnonzero(reasons != "")
+                nBefore = len(epochs)
+                if len(drop):
+                    epochs.drop(drop, reason=[str(r) for r in reasons[drop]], verbose=False)
+                bad = bad[reasons == ""]
+
+                data = epochs.get_data(copy=False)                      # view on the preloaded array
+                for iEpoch in range(len(epochs)):
+                    data[iEpoch][:, bad[iEpoch]] = np.nan
+                if self.baseline is not None:
+                    data -= np.nanmean(data[:, :, inBase], axis=2, keepdims=True)
+
+                pglMessages.message(f"Epochs: kept {len(epochs)}/{nBefore}; {100 * bad.mean():.1f}% of samples set to NaN "
+                                    f"({int(bad.any(axis=1).sum())} epochs contain NaN)"
+                                    + (f"; dropped {dict(zip(*np.unique(reasons[drop], return_counts=True)))}" if len(drop) else ""))
+
+            session.mne.epochs = epochs
+            return session
+    
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
     # plot evoked
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
@@ -912,17 +988,6 @@ class pglActions():
         picks = Unicode("mag",help="For topomap plotting type of topomap e.g. eeg, mag, grad - defined by mne - also can be name (or initial part of name of a sensor)")
         minFreq = Float(0.0, help="minimum frequency for display of frequency plot of evoked")
         maxFreq = Float(np.inf, help="minimum frequency for display of frequency plot of evoked")
-        
-        ################################
-        # configure
-        ################################
-        def configure(self, **kwargs) -> None:
-
-            # set traitlets
-            self.configureTraits(**kwargs)   
-            
-            # we are now configured, so call super to set status
-            super().configure()
             
         ################################
         # run
@@ -1026,6 +1091,206 @@ class pglActions():
                     ax.title.set_fontsize(20)
 
             # and return
+            return session
+        
+    class mnePlotEvokedNan(pglAction):
+
+        set = Unicode(allow_none=True, default_value=None, help="Label set; defaults to the first set")
+        label = Unicode(allow_none=True, default_value=None, help="Label to average; defaults to all conditions")
+        picks = Unicode("mag", help="Channel type or sensor name")
+        minFreq = Float(0.0, help="Minimum displayed frequency")
+        maxFreq = Float(float("inf"), help="Maximum displayed frequency")
+
+        @staticmethod
+        def _nanmean(data):
+            """Average across epochs, leaving NaN where all epochs are missing."""
+            import numpy as np
+
+            counts = np.sum(~np.isnan(data), axis=0)
+            totals = np.nansum(data, axis=0)
+            return np.divide(totals, counts, out=np.full(totals.shape, np.nan), where=counts > 0)
+
+        @staticmethod
+        def _valid_segment(data):
+            """Longest contiguous finite segment; never join samples across gaps."""
+            import numpy as np
+
+            edges = np.diff(np.r_[False, np.isfinite(data), False].astype(int))
+            starts = np.flatnonzero(edges == 1)
+            stops = np.flatnonzero(edges == -1)
+
+            if not starts.size:
+                return data[:0]
+
+            index = np.argmax(stops - starts)
+            return data[starts[index]:stops[index]]
+
+        def _run(self, session: pglSession) -> pglSession:
+            import numpy as np
+            import matplotlib.pyplot as plt
+            from scipy.signal import welch
+
+            # Validate inputs.
+            if session.mne is None or session.mne.raw is None:
+                self.setError("Session does not have raw mne loaded")
+                return None
+
+            if session.mne.epochs is None:
+                self.setError("Session does not have epochs created")
+                return None
+
+            self.picks = session.mne.validatePicks(self.picks)
+            is_sensor = session.mne.isSensor(self.picks)
+            epochs = session.mne.epochs
+
+            # Select epochs only when a particular label is requested.
+            if self.label is not None:
+                columns = session.mne.eventsID.columns
+
+                if self.set is None and len(columns) < 4:
+                    pglMessages.warning("No default label set is available")
+                    return session
+
+                label_set = columns[3] if self.set is None else self.set
+
+                if label_set not in columns:
+                    pglMessages.warning(f"Could not find label set: {label_set}")
+                    return session
+
+                labels = session.mne.eventsID[label_set].dropna().unique()
+
+                if self.label not in labels:
+                    pglMessages.warning(f"Unknown label {self.label!r}. Available labels: {list(labels)}")
+                    return session
+
+                epochs = epochs[f"{label_set} == {self.label!r}"]
+
+            if epochs.get_data().shape[0] == 0:
+                pglMessages.warning("No epochs remain for this selection")
+                session.mne.evoked = None
+                return session
+
+            # MNE accepts a callable for averaging across epochs.
+            session.mne.evoked = epochs.average(method=self._nanmean)
+            evoked = session.mne.evoked.copy().pick([self.picks] if is_sensor else self.picks)
+            data = evoked.data
+            sfreq = evoked.info["sfreq"]
+
+            if not np.isfinite(data).any():
+                pglMessages.warning("Selected evoked data contain no finite values; skipping plots")
+                return session
+
+            # Display units.
+            channel_type = evoked.get_channel_types()[0]
+            scale, unit = {"mag": (1e15, "fT"), "grad": (1e13, "fT/cm"), "eeg": (1e6, "µV")}.get(channel_type, (1.0, "SI units"))
+
+            # Finite amplitude limits for the trace plot.
+            finite_values = data[np.isfinite(data)] * scale
+            lower, upper = finite_values.min(), finite_values.max()
+            padding = 0.05 * (upper - lower) if upper > lower else max(abs(lower) * 0.05, 1.0)
+
+            trace_args = dict(spatial_colors=True, scalings={channel_type: scale}, units={channel_type: unit}, ylim={channel_type: (lower - padding, upper + padding)}, gfp=False)
+
+            # Small topomaps require complete spatial snapshots.
+            complete_times = np.flatnonzero(np.isfinite(data).all(axis=0))
+
+            if not is_sensor and complete_times.size:
+                if np.isfinite(data).all():
+                    topo_times = "peaks"
+                else:
+                    # Up to three evenly spaced complete snapshots; no imputation.
+                    indices = np.linspace(0, complete_times.size - 1, min(3, complete_times.size), dtype=int)
+                    topo_times = evoked.times[complete_times[indices]]
+
+                fig = evoked.plot_joint(times=topo_times, picks=self.picks, ts_args=trace_args, show=False)
+            else:
+                fig = evoked.plot(show=False, **trace_args)
+
+                if not is_sensor:
+                    pglMessages.warning("No timepoint has valid data at every selected sensor; omitting the small topomaps")
+
+            fig.set_size_inches(20, 8)
+            fig.suptitle(f"NaN-aware evoked: {self.picks}")
+
+            # FFT / PSD: use contiguous data without changing the sampling interval.
+            fmin = max(0.0, self.minFreq)
+            fmax = min(self.maxFreq, sfreq / 2)
+
+            if fmin < fmax:
+                psds = []
+                n_fft = data.shape[1] if is_sensor else min(2048, data.shape[1])
+
+                for name, series in zip(evoked.ch_names, data):
+                    segment = self._valid_segment(series)
+
+                    if segment.size < 2:
+                        pglMessages.warning(f"{name}: insufficient contiguous data for FFT/PSD")
+                        continue
+
+                    if segment.size < series.size:
+                        pglMessages.warning(f"{name}: FFT/PSD use the longest valid segment ({segment.size}/{series.size} samples)")
+
+                    if is_sensor:
+                        fft_freqs = np.fft.rfftfreq(segment.size, d=1 / sfreq)
+                        magnitude = np.abs(np.fft.rfft(segment * scale))
+                        keep = (fft_freqs >= fmin) & (fft_freqs <= fmax)
+
+                        if keep.any():
+                            fig_fft, ax = plt.subplots(figsize=(12, 6))
+                            ax.stem(fft_freqs[keep], magnitude[keep], linefmt="C0-", markerfmt="C0.", basefmt=" ")
+                            ax.set(xlabel="Frequency (Hz)", ylabel=f"FFT magnitude ({unit}, unnormalized)", title=f"Evoked FFT: {self.picks}", xlim=(fmin, fmax))
+                            fig_fft.tight_layout()
+
+                    freqs, psd = welch(segment, fs=sfreq, window="boxcar" if is_sensor else "hamming", nperseg=min(n_fft, segment.size), noverlap=0, nfft=n_fft, detrend="constant", scaling="density")
+                    psds.append(psd)
+
+                if psds:
+                    mean_psd = self._nanmean(np.asarray(psds)) * scale**2
+                    keep = (freqs >= fmin) & (freqs <= fmax)
+
+                    if is_sensor:
+                        keep &= freqs > 0
+
+                    if keep.any():
+                        fig_psd, ax = plt.subplots(figsize=(12, 6))
+                        ax.stem(freqs[keep], mean_psd[keep], linefmt="C0-", markerfmt="C0.", basefmt=" ")
+                        ax.set(xlabel="Frequency (Hz)", ylabel=f"PSD ({unit}²/Hz)", title=f"Evoked spectrum: {self.picks}", xlim=(fmin, fmax))
+                        fig_psd.tight_layout()
+                    else:
+                        pglMessages.warning("No PSD bins fall within the requested frequency range")
+            else:
+                pglMessages.warning("Invalid frequency range; skipping FFT/PSD")
+
+            # Peak topomap: require finite values at every selected sensor.
+            if not is_sensor:
+                complete_times = np.flatnonzero(np.isfinite(data).all(axis=0))
+
+                if not complete_times.size:
+                    pglMessages.warning("No complete sensor snapshot is available; skipping topomap")
+                else:
+                    channel_index, time_index = np.unravel_index(np.argmax(np.abs(data[:, complete_times])), (data.shape[0], complete_times.size))
+                    peak_time = evoked.times[complete_times[time_index]]
+                    peak_channel = evoked.ch_names[channel_index]
+
+                    # Fix symmetric color limits in the displayed units.
+                    peak_index = np.argmin(np.abs(evoked.times - peak_time))
+                    vmax = float(np.max(np.abs(data[:, peak_index])) * scale)
+                    vmax = vmax if vmax > 0 else 1.0
+
+                    # The False in cmap disables interactive colorbar rescaling.
+                    fig_peak = evoked.plot_topomap(times=[peak_time], ch_type=channel_type, scalings={channel_type: scale}, units={channel_type: unit}, show_names=True, sensors=True, contours=6, time_unit="ms", size=8, vlim=(-vmax, vmax), cmap=("RdBu_r", False), show=False)
+                    fig_peak.set_size_inches(12, 10)
+                    fig_peak.suptitle(f"Peak response: {peak_time * 1000:.1f} ms ({peak_channel})", fontsize=20)
+                    fig_peak.subplots_adjust(top=0.88)
+
+                    # Enlarge electrode labels, timepoint title, and colorbar text.
+                    for ax in fig_peak.axes:
+                        for text in ax.texts:
+                            text.set_fontsize(16)
+                        ax.title.set_fontsize(20)
+                        ax.tick_params(labelsize=14)
+                        ax.xaxis.label.set_fontsize(16)
+                        ax.yaxis.label.set_fontsize(16)
             return session
     
     class mnePlotEvokedEach(pglAction):
@@ -2349,8 +2614,6 @@ class pglActions():
                 ax.plot(rel / sfreq, stack.T, color="0.45", lw=0.6, alpha=0.5)
                 ax.plot(rel / sfreq, np.nanmean(stack, axis=0), color="k", lw=2)
             ax.axhline(self.threshold, color="tab:red", ls="--", lw=1)
-            #ax.set(xlabel="Time from event peak (s)", ylabel="Blink channel (robust SD)",
-            #       title=f"{len(peaks)} events — component {self.component} (shaded = marked window)")
             ax.set(xlabel="Time from event peak (s)", ylabel="Blink channel (robust SD)", title=f"{len(peaks)} events — component {self.component} (shaded = marked window)\n{interval_text}")
             ax.set_ylim(-3 * self.threshold, 4 * self.threshold)
             fig.tight_layout()
