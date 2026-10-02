@@ -2784,7 +2784,7 @@ class pglActions():
             Fit ICA and display the leading topographies (labeled ICA000, ICA001, ...).
             Choose the blink component by eye and pass its number to mneMarkBlinks.
 
-            Stores: session.mne.blinkICA
+            Stores: session.mne.ica
             '''
             import mne
 
@@ -2818,7 +2818,7 @@ class pglActions():
                                         method="fastica", random_state=self.randomState, max_iter="auto")
             ica.fit(fitRaw, picks=picks, decim=self.decim, reject_by_annotation=True, verbose=False)
 
-            session.mne.blinkICA = ica
+            session.mne.ica = ica
             ica.plot_components(picks=list(range(min(self.nShow, ica.n_components_))), show=False)
             return session
 
@@ -2827,7 +2827,7 @@ class pglActions():
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
     class mneMarkBlinks(pglAction):
 
-        component = Int(0, min=0, help="ICA component (from mneBlinkICA) whose topography weights the sensors")
+        component = Int(0, min=0, help="ICA component (from mne.ica) whose topography weights the sensors")
         lowCutoff = Float(1.0, help="Low edge (Hz) of the band-pass on the weighted channel; 0 for none")
         highCutoff = Float(10.0, help="High edge (Hz) of the band-pass on the weighted channel; 0 for none")
         threshold = Float(5.0, help="Event criterion in robust SDs (median/MAD) of the filtered channel")
@@ -2850,9 +2850,9 @@ class pglActions():
             if session.mne is None or session.mne.raw is None:
                 self.setError("session does not have raw mne loaded")
                 return None
-            ica = getattr(session.mne, "blinkICA", None)
+            ica = getattr(session.mne, "ica", None)
             if ica is None:
-                self.setError("session does not have a blink ICA: run mneBlinkICA first")
+                self.setError("session does not have an ICA: run mneBlinkICA first")
                 return None
             if self.component >= ica.n_components_:
                 self.setError(f"component {self.component} out of range: 0-{ica.n_components_ - 1}")
