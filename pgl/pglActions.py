@@ -1093,6 +1093,9 @@ class pglActions():
             # and return
             return session
         
+    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
+    # plot evoked NaN
+    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
     class mnePlotEvokedNan(pglAction):
 
         set = Unicode(allow_none=True, default_value=None, help="Label set; defaults to the first set")
@@ -1293,6 +1296,9 @@ class pglActions():
                         ax.yaxis.label.set_fontsize(16)
             return session
     
+    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
+    # plot evoked Each
+    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
     class mnePlotEvokedEach(pglAction):
 
         # Parameters
@@ -1433,6 +1439,287 @@ class pglActions():
                             progress.update(1)
 
                         # Render and display only this row; no live widget or callbacks
+                        with BytesIO() as buffer:
+                            fig.savefig(buffer, format="png", dpi=100, facecolor="white")
+                            display(Image(data=buffer.getvalue()))
+
+                    finally:
+                        fig.clear()
+
+            return session
+
+    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
+    # plot evoked each NaN
+    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
+    class mnePlotEvokedEachNan(pglAction):
+
+        # Parameters
+        set = Unicode(default_value=None, allow_none=True, help="Label set used to group epochs (defaults to the first set)")
+        picks = Unicode("mag", help="Channel type to plot: mag, grad, or eeg")
+        nCols = Int(4, min=1, help="Number of labels across each row")
+        topoTime = Float(default_value=None, allow_none=True, help="Topomap time in ms for every label; None selects each label's peak")
+        topoMin = Float(-30.0, help="Topomap minimum in displayed units")
+        topoMax = Float(30.0, help="Topomap maximum in displayed units")
+        timeseriesMin = Float(default_value=None, allow_none=True, help="Time series y-axis minimum in displayed units; None uses automatic limits")
+        timeseriesMax = Float(default_value=None, allow_none=True, help="Time series y-axis maximum in displayed units; None uses automatic limits")
+
+        ################################
+        # NaN-aware average
+        ################################
+        @staticmethod
+        def _nanMean(data):
+            """Average across epochs, leaving NaN where all epochs are missing."""
+            import numpy as np
+
+            counts = np.sum(~np.isnan(data), axis=0)
+            totals = np.nansum(data, axis=0)
+            return np.divide(totals, counts, out=np.full(totals.shape, np.nan), where=counts > 0)
+
+        ################################
+        # run
+        ################################
+        def _run(self, session: pglSession) -> pglSession:
+            """
+            Compute NaN-aware label-specific evoked responses.
+
+            Display each completed row as a static image, independent of
+            the notebook's interactive Matplotlib backend.
+            """
+            import mne
+            import numpy as np
+            from io import BytesIO
+            from matplotlib.figure import Figure
+            from matplotlib.backends.backend_agg import FigureCanvasAgg
+            from IPython.display import display, Image
+            from tqdm.auto import tqdm
+
+            # Check session.
+            if session.mne is None or session.mne.raw is None:
+                self.setError("Session does not have raw mne loaded")
+                return None
+
+            if session.mne.epochs is None:
+                self.setError("Session does not have epochs created")
+                return None
+
+            # Validate channel type.
+            self.picks = session.mne.validatePicks(self.picks)
+
+            if self.picks not in ("mag", "grad", "eeg"):
+                self.setError("picks must be a channel type: mag, grad, or eeg")
+                return None
+
+            # Validate configured times and limits.
+            for parameterName in ("topoTime", "topoMin", "topoMax", "timeseriesMin", "timeseriesMax"):
+                parameterValue = getattr(self, parameterName)
+
+                if parameterValue is not None and not np.isfinite(parameterValue):
+                    self.setError(f"{parameterName} must be finite")
+                    return None
+
+            if self.topoMin >= self.topoMax:
+                self.setError("topoMin must be less than topoMax")
+                return None
+
+            if self.timeseriesMin is not None and self.timeseriesMax is not None:
+                if self.timeseriesMin >= self.timeseriesMax:
+                    self.setError("timeseriesMin must be less than timeseriesMax")
+                    return None
+
+            epochs = session.mne.epochs
+            eventsID = session.mne.eventsID
+
+            # Resolve label set.
+            labelSet = self.set
+
+            if labelSet is None:
+                if len(eventsID.columns) <= 3:
+                    self.setError("No label sets found in eventsID")
+                    return None
+
+                labelSet = eventsID.columns[3]
+
+            if labelSet not in eventsID.columns:
+                self.setError(f"Could not find label set: {labelSet}")
+                return None
+
+            if epochs.metadata is None or labelSet not in epochs.metadata.columns:
+                self.setError(f"Epoch metadata does not contain label set: {labelSet}")
+                return None
+
+            # Resolve a shared topomap sample when a fixed time is requested.
+            fixedTimeIndex = None
+
+            if self.topoTime is not None:
+                firstTime = epochs.times[0] * 1000
+                lastTime = epochs.times[-1] * 1000
+
+                if self.topoTime < firstTime or self.topoTime > lastTime:
+                    self.setError(f"topoTime must be within the epoch range: {firstTime:.3f} to {lastTime:.3f} ms")
+                    return None
+
+                fixedTimeIndex = int(np.argmin(np.abs(epochs.times * 1000 - self.topoTime)))
+
+            # Select channels once, excluding channels marked bad.
+            megType = self.picks if self.picks in ("mag", "grad") else False
+            channelIndices = mne.pick_types(epochs.info, meg=megType, eeg=self.picks == "eeg", exclude="bads")
+
+            if len(channelIndices) == 0:
+                self.setError(f"No usable {self.picks!r} channels found")
+                return None
+
+            # Display units.
+            scale, unit = {"mag": (1e15, "fT"), "grad": (1e13, "fT/cm"), "eeg": (1e6, "µV")}[self.picks]
+            scalings = {self.picks: scale}
+            units = {self.picks: unit}
+
+            # Find epochs for each label.
+            labels = eventsID[labelSet].dropna().unique()
+            selections = []
+
+            for label in labels:
+                mask = epochs.metadata[labelSet].eq(label).fillna(False).to_numpy(dtype=bool)
+                epochIndices = np.flatnonzero(mask)
+
+                if len(epochIndices) == 0:
+                    pglMessages.warning(f"No epochs remaining for label {label!r}; skipping")
+                    continue
+
+                selections.append((label, epochIndices))
+
+            if not selections:
+                self.setError(f"No epochs found for labels in {labelSet!r}")
+                return None
+
+            nLabels = len(selections)
+            nCols = min(self.nCols, nLabels)
+            nRows = (nLabels + nCols - 1) // nCols
+
+            with tqdm(total=nLabels, desc="NaN-aware evoked plots", unit="stimulus") as progress:
+
+                for row in range(nRows):
+                    rowSelections = selections[row * nCols:(row + 1) * nCols]
+
+                    # Independent static figure, not a pyplot/widget figure.
+                    fig = Figure(figsize=(5 * nCols, 6), dpi=100, constrained_layout=False)
+                    FigureCanvasAgg(fig)
+
+                    try:
+                        outerGrid = fig.add_gridspec(1, nCols, left=0.055, right=0.97, bottom=0.12, top=0.80, wspace=0.45)
+                        fig.suptitle(f"NaN-aware evoked responses by {labelSet} — {self.picks} — row {row + 1}/{nRows}", fontsize=16)
+
+                        for col, (label, epochIndices) in enumerate(rowSelections):
+                            progress.set_postfix_str(f"Row {row + 1}/{nRows}: {label}", refresh=True)
+
+                            # Average available values independently at each sensor/time.
+                            evoked = epochs[epochIndices].average(picks=channelIndices, method=self._nanMean)
+                            data = evoked.data
+                            finiteMask = np.isfinite(data)
+
+                            # Topomap and colorbar above, butterfly plot below.
+                            innerGrid = outerGrid[0, col].subgridspec(2, 2, height_ratios=[1.25, 1], width_ratios=[1, 0.05], hspace=0.40, wspace=0.08)
+
+                            axTopo = fig.add_subplot(innerGrid[0, 0])
+                            axColorbar = fig.add_subplot(innerGrid[0, 1])
+                            axEvoked = fig.add_subplot(innerGrid[1, :])
+
+                            labelTitle = f"{label}\nn = {len(epochIndices)}"
+
+                            # Keep the label visible even when no plot is possible.
+                            if not finiteMask.any():
+                                pglMessages.warning(f"{label!r}: evoked data contain no finite values; skipping plots")
+
+                                axTopo.set_title(labelTitle, fontsize=11)
+                                axTopo.text(0.5, 0.5, "No finite evoked data", ha="center", va="center", transform=axTopo.transAxes)
+                                axTopo.set_axis_off()
+                                axColorbar.set_axis_off()
+
+                                axEvoked.text(0.5, 0.5, "No finite evoked data", ha="center", va="center", transform=axEvoked.transAxes)
+                                axEvoked.set_axis_off()
+
+                                progress.update(1)
+                                continue
+
+                            # Automatic butterfly limits use only finite values.
+                            finiteValues = data[finiteMask] * scale
+                            lower, upper = finiteValues.min(), finiteValues.max()
+                            padding = 0.05 * (upper - lower) if upper > lower else max(abs(lower) * 0.05, 1.0)
+
+                            traceMin = lower - padding if self.timeseriesMin is None else self.timeseriesMin
+                            traceMax = upper + padding if self.timeseriesMax is None else self.timeseriesMax
+
+                            # Keep a valid range when only one configured bound is
+                            # supplied and it lies beyond the automatic opposite bound.
+                            if traceMin >= traceMax:
+                                if self.timeseriesMax is None:
+                                    traceMax = traceMin + max(2 * padding, abs(traceMin) * 0.05, 1.0)
+                                else:
+                                    traceMin = traceMax - max(2 * padding, abs(traceMax) * 0.05, 1.0)
+
+                            traceLimits = {self.picks: (traceMin, traceMax)}
+
+                            # Select either the shared time or this label's peak.
+                            topoIndex = None
+                            markerTime = None
+                            missingMessage = ""
+
+                            if fixedTimeIndex is not None:
+                                markerTime = evoked.times[fixedTimeIndex]
+                                labelTitle = f"{labelTitle} | time = {markerTime * 1000:.1f} ms"
+
+                                if finiteMask[:, fixedTimeIndex].all():
+                                    topoIndex = fixedTimeIndex
+                                else:
+                                    missingMessage = "Incomplete sensor snapshot\nTopomap omitted"
+                                    pglMessages.warning(f"{label!r}: not every selected sensor has finite data at {markerTime * 1000:.3f} ms; omitting topomap")
+
+                            else:
+                                completeTimes = np.flatnonzero(finiteMask.all(axis=0))
+
+                                if completeTimes.size:
+                                    # Largest absolute response among complete snapshots.
+                                    peakFlatIndex = np.argmax(np.abs(data[:, completeTimes]))
+                                    _, peakTimeIndex = np.unravel_index(peakFlatIndex, (data.shape[0], completeTimes.size))
+                                    topoIndex = int(completeTimes[peakTimeIndex])
+                                    markerTime = evoked.times[topoIndex]
+                                    labelTitle = f"{labelTitle} | peak = {markerTime * 1000:.1f} ms"
+
+                                else:
+                                    missingMessage = "No complete sensor snapshot\nTopomap omitted"
+                                    pglMessages.warning(f"{label!r}: no timepoint has finite data at every selected sensor; omitting topomap")
+
+                            # Plot only complete spatial snapshots; never impute data.
+                            if topoIndex is not None:
+                                topoSampleTime = evoked.times[topoIndex]
+
+                                evoked.plot_topomap(times=[topoSampleTime], ch_type=self.picks, axes=[axTopo, axColorbar], scalings=scalings, units=units, colorbar=True, sensors=True, contours=6, time_unit="ms", cmap=("RdBu_r", False), vlim=(self.topoMin, self.topoMax), show=False)
+                                axTopo.set_title(labelTitle, fontsize=11)
+                                axColorbar.tick_params(labelsize=8)
+
+                            else:
+                                axTopo.set_title(labelTitle, fontsize=11)
+                                axTopo.text(0.5, 0.5, missingMessage, ha="center", va="center", transform=axTopo.transAxes)
+                                axTopo.set_axis_off()
+                                axColorbar.set_axis_off()
+
+                            # Missing values remain gaps in the butterfly plot.
+                            # Convert any infinities to NaN on a plotting copy only.
+                            traceEvoked = evoked.copy()
+                            traceEvoked.data[~finiteMask] = np.nan
+
+                            traceEvoked.plot(axes=axEvoked, spatial_colors=True, scalings=scalings, units=units, ylim=traceLimits, gfp=False, time_unit="ms", show=False)
+
+                            # For fixed times, retain the marker even if the topomap
+                            # was omitted because some sensors were missing.
+                            if markerTime is not None:
+                                axEvoked.axvline(markerTime * 1000, color="black", linestyle="--", linewidth=1)
+
+                            axEvoked.set_title("")
+                            axEvoked.tick_params(labelsize=8)
+
+                            progress.update(1)
+
+                        # Render and display only this row.
                         with BytesIO() as buffer:
                             fig.savefig(buffer, format="png", dpi=100, facecolor="white")
                             display(Image(data=buffer.getvalue()))
