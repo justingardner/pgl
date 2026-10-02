@@ -158,6 +158,9 @@ class pglActions():
                         raw = mne.io.read_raw_fif(fifFile,preload=True,verbose=False)
 
                     mneData.add(raw, filename=fifPath, filesystemPrefix=self.filesystemPrefix)
+                
+                    # and add to the report
+                    mneData.report.add_raw(raw, title=f"Raw: {fifPath}", psd=True)
 
                 except Exception as e:
                     self.setError(f"Could not load FIF file {fifPath}: {e}")
@@ -167,7 +170,7 @@ class pglActions():
             
             # add the mne data to the session
             session.add(mneData)
-            
+                        
             # return the session
             return session
 
@@ -633,6 +636,8 @@ class pglActions():
                 fig.suptitle("Raw events")
 
             fig.tight_layout(rect=(0, 0, 1, 0.96))
+            
+            session.mne.report.add_figure(fig=fig, title="Configure Events")
 
             return session
 
@@ -710,7 +715,8 @@ class pglActions():
             print(f"Nonfinite-power channels: {invalidChannels}")
 
             if plotChannels:
-                spectrum.plot(picks=plotChannels, average=False, amplitude=False)
+                fig = spectrum.plot(picks=plotChannels, average=False, amplitude=False)
+                session.mne.report.add_figure(fig=fig, title="Power spectrum")
             else:
                 pglMessages.warning("No channels with valid nonzero power to plot")
             
@@ -1052,6 +1058,8 @@ class pglActions():
                 fig = session.mne.evoked.plot_joint(times="peaks",picks=self.picks,show=False)
             fig.set_size_inches(20, 8)
             
+            session.mne.report.add_figure(fig=fig, title="evoked", section="Plot Evoked")
+            
             # Spectrum of the evoked response
             if session.mne.isSensor(self.picks):
                 evoked = session.mne.evoked.copy()
@@ -1074,6 +1082,8 @@ class pglActions():
             ax.stem(freqs, psd, linefmt="C0-", markerfmt="C0.", basefmt=" ")
             ax.set(xlabel="Frequency (Hz)", ylabel="Power spectral density (fT²/Hz)", title=f"Evoked response spectrum: {self.picks}")
             figPsd.tight_layout()
+
+            session.mne.report.add_figure(fig=figPsd, title="spectrum", section="Plot Evoked")
             
             # Third figure: single peak response, with sensor labels
             if not session.mne.isSensor(self.picks):
@@ -1089,6 +1099,7 @@ class pglActions():
                     for text in ax.texts:
                         text.set_fontsize(16)
                     ax.title.set_fontsize(20)
+                session.mne.report.add_figure(fig=figPeak, title="Peak topo with labels", section="Plot Evoked")
 
             # and return
             return session
@@ -1214,6 +1225,8 @@ class pglActions():
 
             fig.set_size_inches(20, 8)
             fig.suptitle(f"NaN-aware evoked: {self.picks}")
+            
+            session.mne.report.add_figure(fig=fig, title="evoked", section="Plot Evoked (nan-aware)")
 
             # FFT / PSD: use contiguous data without changing the sampling interval.
             fmin = max(0.0, self.minFreq)
@@ -1259,6 +1272,8 @@ class pglActions():
                         ax.stem(freqs[keep], mean_psd[keep], linefmt="C0-", markerfmt="C0.", basefmt=" ")
                         ax.set(xlabel="Frequency (Hz)", ylabel=f"PSD ({unit}²/Hz)", title=f"Evoked spectrum: {self.picks}", xlim=(fmin, fmax))
                         fig_psd.tight_layout()
+                        
+                        session.mne.report.add_figure(fig=fig_psd, title="spectrum", section="Plot Evoked (nan-aware)")
                     else:
                         pglMessages.warning("No PSD bins fall within the requested frequency range")
             else:
@@ -1294,6 +1309,9 @@ class pglActions():
                         ax.tick_params(labelsize=14)
                         ax.xaxis.label.set_fontsize(16)
                         ax.yaxis.label.set_fontsize(16)
+                        
+                    session.mne.report.add_figure(fig=fig_peak, title="Peak topo", section="Plot Evoked (nan-aware)")
+
             return session
     
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
@@ -1437,6 +1455,9 @@ class pglActions():
                             axEvoked.tick_params(labelsize=8)
 
                             progress.update(1)
+                            
+                        # Add this completed row to the report
+                        session.mne.report.add_figure(fig=fig, title=f"Row {row + 1}/{nRows}", section=f"Evoked set: {labelSet}", caption="Labels: " + ", ".join(str(label) for label, _ in rowSelections), image_format="png")
 
                         # Render and display only this row; no live widget or callbacks
                         with BytesIO() as buffer:
@@ -1718,6 +1739,9 @@ class pglActions():
                             axEvoked.tick_params(labelsize=8)
 
                             progress.update(1)
+
+                        # Add this completed row to the report
+                        session.mne.report.add_figure(fig=fig, title=f"Row {row + 1}/{nRows}", section=f"Evoked set (nan-aware): {labelSet}", caption="Labels: " + ", ".join(str(label) for label, _ in rowSelections), image_format="png")
 
                         # Render and display only this row.
                         with BytesIO() as buffer:
@@ -2742,6 +2766,8 @@ class pglActions():
 
             plt.show()
 
+            session.mne.report.add_figure(fig=plt.gcf(), title="Align segments to triggers")
+
             # All runs and output triggers have validated.
             # Add the channel, then commit corrected run reference times.
             # Add or overwrite the output channel.
@@ -2820,6 +2846,9 @@ class pglActions():
 
             session.mne.ica = ica
             ica.plot_components(picks=list(range(min(self.nShow, ica.n_components_))), show=False)
+            
+            session.mne.report.add_ica(ica=ica, title="ICA", inst=session.mne.raw)
+            
             return session
 
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
@@ -2904,6 +2933,7 @@ class pglActions():
             ax.set(xlabel="Time from event peak (s)", ylabel="Blink channel (robust SD)", title=f"{len(peaks)} events — component {self.component} (shaded = marked window)\n{interval_text}")
             ax.set_ylim(-3 * self.threshold, 4 * self.threshold)
             fig.tight_layout()
+            session.mne.report.add_figure(fig=fig, title="All events", section="Blinks")
 
             fig, ax = plt.subplots(figsize=(14, 4))
             t = np.arange(len(z)) / sfreq
@@ -2916,6 +2946,8 @@ class pglActions():
             ax.set_ylim(-3 * self.threshold, 4 * self.threshold)
             fig.tight_layout()
 
+            session.mne.report.add_figure(fig=fig, title="Timeseries", section="Blinks")
+            
             if len(peaks) == 0:
                 pglMessages.warning(f"No blinks above {self.threshold} robust SD; any earlier BAD_blink marks were removed")
             else:
