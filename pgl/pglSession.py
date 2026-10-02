@@ -353,12 +353,17 @@ class pglMNE(pglActionable):
     eventsID = Instance(pd.DataFrame, default_value=None, allow_none=True, help="Event metadata DataFrame: one row per event and one column per labeling scheme.")
     epochs = Any(default_value=None, allow_none=True, help="MNE Epochs object created from events with eventsID as metadata.")
     evoked = Any(default_value=None, allow_none=True, help="Grand-average MNE Evoked object created from epochs.")
+    ica = Any(default_value=None, allow_none=True, help="ica analysis")
+    report = Any(default_value=None, allow_none=True, help='report of analyses')
     
     def __init__(self):
         super().__init__()
         if mne is None:
             pglMessages.warning("mne library is not available. Need to add to environment")
             return
+        
+        # init reprot
+        self.report = mne.Report(title="MNE analysis report")
         
     def add(self, data, filename: str = None, filesystemPrefix: str = None):
         '''
