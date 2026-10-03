@@ -2934,15 +2934,15 @@ class pglActions():
             return session
         
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
-    # blink ICA: fit and display components
+    # ICA: fit and display components
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
-    class mneBlinkICA(pglAction):
+    class mneICA(pglAction):
 
         chType = Unicode("mag", help="Channel type to fit ICA on: mag, grad or eeg (one type: the component topography is later used as sensor weights)")
         nComponents = Int(20, min=2, help="Number of ICA components")
-        nShow = Int(10, min=1, help="Number of leading components (largest explained variance first) to display")
         fitHighPass = Float(1.0, help="ICA is fit on data high-passed at this frequency (skipped if raw is already high-passed at or above it)")
-        decim = Int(5, min=1, help="Use every nth sample when fitting the ICA")
+        decim = Int(5, min=1, help="Maximum decimation factor for ICA fitting; reduced automatically for lower sampling rates")
+        minFitSfreq = Float(200.0, min=1.0, help="Minimum samples/second retained for ICA fitting; data below this rate are not decimated")
         randomState = Int(42, help="Random seed for FastICA")
 
         ################################
@@ -2982,13 +2982,19 @@ class pglActions():
                 if needsHighPass:
                     fitRaw.filter(l_freq=self.fitHighPass, h_freq=None, picks=picks, verbose=False)
 
-            pglMessages.message(f"Fitting ICA with {self.nComponents} components on {len(picks)} {self.chType} channels")
+            # set decimation (not to exceed. minFitSfreq)
+            sfreq = fitRaw.info["sfreq"]
+            fitDecim = min(self.decim, max(1, int(sfreq / self.minFitSfreq)))
+
+            pglMessages.message(f"Initializing ICA with {self.nComponents} components on {len(picks)} {self.chType} channels")
             ica = mne.preprocessing.ICA(n_components=min(self.nComponents, len(picks) - 1),
                                         method="fastica", random_state=self.randomState, max_iter="auto")
+            
+            pglMessages.message(f"ICA fitting: raw {sfreq:g} Hz, decim={fitDecim}, approximately {sfreq / fitDecim:g} samples/s")
             ica.fit(fitRaw, picks=picks, decim=self.decim, reject_by_annotation=True, verbose=False)
 
             session.mne.ica = ica
-            ica.plot_components(picks=list(range(min(self.nShow, ica.n_components_))), show=False)
+            ica.plot_components(picks=list(range(ica.n_components_)), show=False)
             
             session.mne.report.add_ica(ica=ica, title="ICA", inst=session.mne.raw)
             
