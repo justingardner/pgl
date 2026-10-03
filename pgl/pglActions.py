@@ -851,10 +851,10 @@ class pglActions():
         ################################
         def _run(self, session: pglSession) -> pglSession:
             '''
-            Display the grand average
+            Makes epochs
             
             Returns:
-                pglSession: fitered session
+                pglSession: session with mne raw data that has gone through event creation
             '''
             # import mne
             import mne
@@ -895,7 +895,150 @@ class pglActions():
 
             # and return
             return session
-    
+
+    class mneMarkInterRunsAsBad(pglAction):
+
+        tmin = Float(0.0, help="Start of each epoch window relative to its trigger, in seconds")
+        tmax = Float(1.0, help="End of each epoch window relative to its trigger, in seconds")
+
+        def _run(self, session: pglSession) -> pglSession:
+            """
+            Mark samples outside the union of complete epoch windows as bad,
+            and plot all events with the excluded intervals shaded red.
+
+            Existing annotations are preserved, except annotations previously
+            created by this action, which are replaced.
+            """
+            import mne
+            import numpy as np
+            import matplotlib.pyplot as plt
+            from matplotlib.patches import Patch
+
+            # ---------------------------------------------------------------------
+            # Validate inputs.
+            # ---------------------------------------------------------------------
+            if session.mne is None or session.mne.raw is None:
+                self.setError("session does not have raw mne loaded")
+                return None
+
+            if session.mne.events is None or len(session.mne.events) == 0:
+                self.setError("session does not have events configured")
+                return None
+
+            if not np.isfinite(self.tmin) or not np.isfinite(self.tmax) or self.tmin > self.tmax:
+                self.setError("tmin and tmax must be finite, with tmin <= tmax")
+                return None
+
+            raw = session.mne.raw
+            events = np.asarray(session.mne.events)
+            sfreq = float(raw.info["sfreq"])
+            nSamples = raw.n_times
+            recordingEnd = nSamples / sfreq
+            badDescription = "BAD_inter_run"
+
+            # ---------------------------------------------------------------------
+            # Compute epoch windows in sample coordinates relative to raw start.
+            #
+            # MNE includes both tmin and tmax. Represent each window as [start, stop),
+            # so stop is one sample beyond the final included sample.
+            # ---------------------------------------------------------------------
+            startOffset = int(round(self.tmin * sfreq))
+            endOffset = int(round(self.tmax * sfreq))
+
+            eventSamples = events[:, 0].astype(np.int64) - raw.first_samp
+            starts = eventSamples + startOffset
+            stops = eventSamples + endOffset + 1
+
+            # MNE drops epochs extending outside the recording. Do not reserve
+            # samples for these incomplete epochs.
+            completeMask = (starts >= 0) & (stops <= nSamples)
+            windows = sorted(zip(starts[completeMask].tolist(), stops[completeMask].tolist()))
+
+            # ---------------------------------------------------------------------
+            # Merge overlapping or touching epoch windows.
+            # ---------------------------------------------------------------------
+            keptIntervals = []
+
+            for start, stop in windows:
+                if keptIntervals and start <= keptIntervals[-1][1]:
+                    keptIntervals[-1][1] = max(keptIntervals[-1][1], stop)
+                else:
+                    keptIntervals.append([start, stop])
+
+            # ---------------------------------------------------------------------
+            # Find the complement: samples not covered by any complete epoch.
+            # ---------------------------------------------------------------------
+            badIntervals = []
+            cursor = 0
+
+            for start, stop in keptIntervals:
+                if cursor < start:
+                    badIntervals.append((cursor, start))
+                cursor = stop
+
+            if cursor < nSamples:
+                badIntervals.append((cursor, nSamples))
+
+            badOnsets = np.asarray([start / sfreq for start, stop in badIntervals], dtype=float)
+            badDurations = np.asarray([(stop - start) / sfreq for start, stop in badIntervals], dtype=float)
+
+            # ---------------------------------------------------------------------
+            # Preserve unrelated annotations and replace our previous annotations.
+            #
+            # With orig_time=None, set_annotations() expects onsets relative to the
+            # current raw start and adds raw.first_time internally.
+            #
+            # With an absolute orig_time, stored onsets already include first_time.
+            # ---------------------------------------------------------------------
+            annotations = raw.annotations.copy()
+            annotations.delete(np.flatnonzero(annotations.description == badDescription))
+
+            if annotations.orig_time is None:
+                annotations.onset -= raw.first_time
+                newOnsets = badOnsets
+            else:
+                newOnsets = badOnsets + raw.first_time
+
+            newAnnotations = mne.Annotations(onset=newOnsets, duration=badDurations, description=[badDescription] * len(badIntervals), orig_time=annotations.orig_time)
+            raw.set_annotations(annotations + newAnnotations)
+
+            # ---------------------------------------------------------------------
+            # Plot every event using its canonical raw trigger code.
+            # Both event times and shaded intervals are relative to raw start.
+            # ---------------------------------------------------------------------
+            fig, ax = plt.subplots(figsize=(24, 8))
+
+            rawCodes = events[:, 2].astype(int)
+            plotEventId = {f"raw/{int(code)}": int(code) for code in np.unique(rawCodes)}
+
+            mne.viz.plot_events(events, event_id=plotEventId, sfreq=sfreq, first_samp=raw.first_samp, axes=ax, show=False)
+
+            for start, stop in badIntervals:
+                ax.axvspan(start / sfreq, stop / sfreq, facecolor="red", alpha=0.2, edgecolor="none", zorder=0)
+
+            ax.set_xlim(0, recordingEnd)
+            ax.set_xlabel("Time from recording start (s)")
+            ax.set_title(f"Events and excluded intervals — epoch window [{self.tmin:g}, {self.tmax:g}] s")
+
+            # Keep MNE's event legend and add a separate shading legend.
+            eventLegend = ax.get_legend()
+            if eventLegend is not None:
+                ax.add_artist(eventLegend)
+
+            excludedPatch = Patch(facecolor="red", alpha=0.2, label="Outside complete epoch windows")
+            ax.legend(handles=[excludedPatch], loc="upper left")
+
+            excludedSeconds = float(badDurations.sum())
+            fig.suptitle(f"Excluded: {excludedSeconds:.2f} s / {recordingEnd:.2f} s ({100 * excludedSeconds / recordingEnd:.1f}%)")
+            fig.tight_layout(rect=(0, 0, 1, 0.96))
+
+            if getattr(session.mne, "report", None) is not None:
+                session.mne.report.add_figure(fig=fig, title="Inter-epoch excluded intervals")
+            else:
+                plt.show()
+
+            return session
+        
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
     # make epochs respecting Bads annotations from blinks
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
