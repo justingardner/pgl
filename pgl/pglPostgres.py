@@ -156,7 +156,7 @@ class pglPostgres(pglTraitSettings):
             if existing.toJSONdict() != self.toJSONdict():
                 raise RuntimeError(f"Different configuration already exists at {target}; use overwrite=True only for an intentional change.")
 
-            print(f"Configuration already saved: {target}")
+            pglMessages.message(f"Configuration already saved: {target}")
             return
 
         encoded = self.toJSON()
@@ -180,7 +180,7 @@ class pglPostgres(pglTraitSettings):
             if temporaryPath is not None:
                 temporaryPath.unlink(missing_ok=True)
 
-        print(f"Configuration saved: {target}")
+        pglMessages.message(f"Configuration saved: {target}")
 
     @classmethod
     def load(cls, filename=None):
@@ -201,6 +201,30 @@ class pglPostgres(pglTraitSettings):
             raise ValueError(f"Not a {cls.__name__} configuration: {target}")
 
         return cls.fromJSONdict(data, filename=str(target))
+
+    @classmethod
+    def fromSettings(cls, settings=None, settingsName=None):
+        """Load configured Postgres settings, or warn and return None if not configured."""
+        from .pglSettings import pglSettingsManager
+
+        resolvedSettings = pglSettingsManager.getSettings(settings=settings, settingsName=settingsName)
+
+        if resolvedSettings is None:
+            pglMessages.warning("Could not resolve pgl settings.")
+            return None
+
+        if not resolvedSettings.databasePath.strip():
+            pglMessages.warning("No databasePath is configured in pgl settings.")
+            return None
+
+        directory = Path(resolvedSettings.databasePath).expanduser().resolve()
+        filename = directory / cls.CONFIGURATION_FILENAME
+
+        if not filename.is_file():
+            pglMessages.warning(f"Postgres has not been configured at {directory}. Create a pglPostgres instance with installDirectory pointing there, then call install().")
+            return None
+
+        return cls.load(filename)
 
     # ------------------------------------------------------------
     # Configuration and environment validation
@@ -265,8 +289,7 @@ class pglPostgres(pglTraitSettings):
         self._validateValues()
         brew = self._findBrew()
 
-        print("Postgres configuration")
-        print("=" * 72)
+        pglMessages.printHeader("Postgres configuration")
 
         values = self._configurationValues()
         values.update({
@@ -282,7 +305,7 @@ class pglPostgres(pglTraitSettings):
         })
 
         for name, value in values.items():
-            print(f"{name:<28} {value}")
+            pglMessages.print(f"{name:<28} {value}")
 
     # ------------------------------------------------------------
     # Runtime helpers
@@ -393,9 +416,9 @@ class pglPostgres(pglTraitSettings):
         if not re.search(rf"\b{re.escape(self.postgresVersion)}(?:\.|\s|$)", version):
             raise RuntimeError(f"Expected PostgreSQL {self.postgresVersion}, found: {version}")
 
-        print(f"PostgreSQL available: {version}")
-        print(f"Executable directory: {binaryDirectory}")
-
+        self.save()
+        pglMessages.message(f"PostgreSQL available: {version}")
+        pglMessages.message(f"Executable directory: {binaryDirectory}")
     # ------------------------------------------------------------
     # Initialize PostgreSQL data directory
     # ------------------------------------------------------------
@@ -418,7 +441,7 @@ class pglPostgres(pglTraitSettings):
 
         if versionFile.exists():
             self._checkDataDirectory()
-            print(f"Using existing PostgreSQL data directory: {dataDirectory}")
+            pglMessages.message(f"Using existing PostgreSQL data directory: {dataDirectory}")
             return
 
         if dataDirectory.exists() and any(dataDirectory.iterdir()):
@@ -432,7 +455,7 @@ class pglPostgres(pglTraitSettings):
             passwordFile.flush()
             self._runCommand([initdb, "-D", dataDirectory, "-U", self.adminUser, "--encoding=UTF8", "--auth=scram-sha-256", f"--pwfile={passwordFile.name}"])
 
-        print(f"Initialized PostgreSQL data directory: {dataDirectory}")
+        pglMessages.message(f"Initialized PostgreSQL data directory: {dataDirectory}")
 
     # ------------------------------------------------------------
     # Start PostgreSQL
@@ -451,7 +474,7 @@ class pglPostgres(pglTraitSettings):
         status = self._runCommand([pgCtl, "-D", self.dataDirectory, "status"], capture=True, check=False)
 
         if status.returncode == 0:
-            print("This Postgres instance is already running.")
+            pglMessages.message("This Postgres instance is already running.")
 
         elif status.returncode == 3:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
@@ -467,12 +490,12 @@ class pglPostgres(pglTraitSettings):
             except subprocess.CalledProcessError as error:
                 raise RuntimeError(f"Postgres startup failed or timed out. Check server status and log: {self.logFile}") from error
 
-            print(f"Postgres started at {self.postgresHost}:{self.postgresPort}.")
+            pglMessages.message(f"Postgres started at {self.postgresHost}:{self.postgresPort}.")
 
         else:
             raise RuntimeError(f"Could not inspect Postgres; pg_ctl exited with status {status.returncode}.")
 
-        print(f"Server log: {self.logFile}")
+        pglMessages.message(f"Server log: {self.logFile}")
 
     # ------------------------------------------------------------
     # Verify PostgreSQL server
@@ -490,10 +513,10 @@ class pglPostgres(pglTraitSettings):
             pglMessages.warning(f"Could not verify Postgres at {self.postgresHost}:{self.postgresPort}. Check that it is running and the credentials are correct.\n{error}")
             return False
 
-        print(f"Verified PostgreSQL {serverVersion}")
-        print(f"Verified data directory: {self.dataDirectory}")
-        print(f"Verified endpoint: {self.postgresHost}:{self.postgresPort}")
-        print("Verified local-only networking.")
+        pglMessages.message(f"Verified PostgreSQL {serverVersion}")
+        pglMessages.message(f"Verified data directory: {self.dataDirectory}")
+        pglMessages.message(f"Verified endpoint: {self.postgresHost}:{self.postgresPort}")
+        pglMessages.message("Verified local-only networking.")
 
     # ------------------------------------------------------------
     # Create application role, database, and schema
@@ -585,10 +608,10 @@ class pglPostgres(pglTraitSettings):
         with psycopg.connect(host=self.postgresHost, port=self.postgresPort, dbname=self.databaseName, user=self.databaseUser, password=applicationPassword, connect_timeout=self.connectTimeoutSeconds, autocommit=True) as connection:
             self._verifyApplicationConnection(connection)
 
-        print(f"Application account ready: {self.databaseUser}")
-        print(f"Database ready: {self.databaseName}")
-        print(f"Schema ready: {self.databaseSchema} (owner: {self.adminUser})")
-        print("Application login verified.")
+        pglMessages.message(f"Application account ready: {self.databaseUser}")
+        pglMessages.message(f"Database ready: {self.databaseName}")
+        pglMessages.message(f"Schema ready: {self.databaseSchema} (owner: {self.adminUser})")
+        pglMessages.message("Application login verified.")
 
     # ------------------------------------------------------------
     # Verify application connection
@@ -624,11 +647,11 @@ class pglPostgres(pglTraitSettings):
             pglMessages.warning(f"Could not verify database {self.databaseName!r} at {self.postgresHost}:{self.postgresPort}. Check that Postgres is running and the credentials are correct.\n{error}")
             return False
 
-        print(f"Database: {identity[0]}")
-        print(f"User: {identity[1]}")
-        print(f"Schema: {identity[2]}")
-        print("Application connection, schema selection, and query test passed.")
-        print("Table read/write testing is deferred until schema migrations have run.")
+        pglMessages.message(f"Database: {identity[0]}")
+        pglMessages.message(f"User: {identity[1]}")
+        pglMessages.message(f"Schema: {identity[2]}")
+        pglMessages.message("Application connection, schema selection, and query test passed.")
+        pglMessages.message("Table read/write testing is deferred until schema migrations have run.")
         return True        
     
     def stop(self):
@@ -644,7 +667,7 @@ class pglPostgres(pglTraitSettings):
         status = self._runCommand([pgCtl, "-D", self.dataDirectory, "status"], capture=True, check=False)
 
         if status.returncode == 3:
-            print("This Postgres instance is already stopped.")
+            pglMessages.message("This Postgres instance is already stopped.")
             return
 
         if status.returncode != 0:
@@ -655,4 +678,4 @@ class pglPostgres(pglTraitSettings):
         except subprocess.CalledProcessError as error:
             raise RuntimeError(f"Postgres shutdown failed or timed out. Check server status and log: {self.logFile}") from error
 
-        print("Postgres stopped.")
+        pglMessages.message("Postgres stopped.")
