@@ -313,7 +313,7 @@ class pglPostgres(pglTraitSettings):
         executable = self.binaryDirectory / name
 
         if not executable.is_file() or not os.access(executable, os.X_OK):
-            raise RuntimeError(f"Required executable is missing or not executable: {executable}. Run installPostgres() first.")
+            raise RuntimeError(f"Required executable is missing or not executable: {executable}. Run install() first.")
 
         return executable
 
@@ -322,7 +322,7 @@ class pglPostgres(pglTraitSettings):
         versionFile = self.dataDirectory / "PG_VERSION"
 
         if not versionFile.is_file():
-            raise RuntimeError("Postgres data directory is not initialized. Run initPostgres() first.")
+            raise RuntimeError("Postgres data directory is not initialized. Run init() first.")
 
         actualVersion = versionFile.read_text(encoding="utf-8").strip()
 
@@ -366,7 +366,7 @@ class pglPostgres(pglTraitSettings):
     # Install PostgreSQL software
     # ------------------------------------------------------------
 
-    def installPostgres(self):
+    def install(self):
         """Locate or install PostgreSQL and verify its executables.
 
         Does not initialize the pgl-managed data directory or start its server.
@@ -400,7 +400,7 @@ class pglPostgres(pglTraitSettings):
     # Initialize PostgreSQL data directory
     # ------------------------------------------------------------
 
-    def initPostgres(self):
+    def init(self):
         """Initialize the managed data directory or reuse a compatible one.
 
         Does not start the server, create application tables, or reset passwords.
@@ -438,11 +438,11 @@ class pglPostgres(pglTraitSettings):
     # Start PostgreSQL
     # ------------------------------------------------------------
 
-    def startPostgres(self):
+    def start(self):
         """Start the managed server if it is not already running.
 
         Does not restart or reconfigure an already-running instance.
-        Use verifyPostgres() to check its actual endpoint and configuration.
+        Use verify() to check its actual endpoint and configuration.
         """
         self._validateValues()
         pgCtl = self._requireExecutable("pg_ctl")
@@ -478,13 +478,17 @@ class pglPostgres(pglTraitSettings):
     # Verify PostgreSQL server
     # ------------------------------------------------------------
 
-    def verifyPostgres(self):
+    def verify(self):
         """Verify the running server's identity, version, and networking."""
         self._validateValues()
         adminPassword = self._askPassword(f"PostgreSQL administrator password for {self.adminUser}: ")
 
-        with self._adminConnect(adminPassword) as connection:
-            serverVersion = connection.execute("SHOW server_version").fetchone()[0]
+        try:
+            with self._adminConnect(adminPassword) as connection:
+                serverVersion = connection.execute("SHOW server_version").fetchone()[0]
+        except psycopg.OperationalError as error:
+            pglMessages.warning(f"Could not verify Postgres at {self.postgresHost}:{self.postgresPort}. Check that it is running and the credentials are correct.\n{error}")
+            return False
 
         print(f"Verified PostgreSQL {serverVersion}")
         print(f"Verified data directory: {self.dataDirectory}")
@@ -494,8 +498,17 @@ class pglPostgres(pglTraitSettings):
     # ------------------------------------------------------------
     # Create application role, database, and schema
     # ------------------------------------------------------------
-
     def createDatabase(self, *, resetApplicationPassword=False):
+        """Create the database; warn and return False on connection failures."""
+        try:
+            self._createDatabase(resetApplicationPassword=resetApplicationPassword)
+        except psycopg.OperationalError as error:
+            pglMessages.warning(f"Could not complete database setup at {self.postgresHost}:{self.postgresPort}. Check that Postgres is running and the credentials are correct. Earlier setup steps may have completed; rerun after resolving the issue.\n{error}")
+            return False
+
+        return True
+    
+    def _createDatabase(self, *, resetApplicationPassword=False):
         """Create the application role, database, and administrator-owned schema.
 
         Existing application passwords are preserved unless explicitly reset.
@@ -597,21 +610,49 @@ class pglPostgres(pglTraitSettings):
         return identity
 
     def verifyDatabase(self):
-        """Verify application login, schema selection, and query execution.
-
-        Does not require scientific tables or retain any test data.
-        """
+        """Verify application access; warn and return False if connection fails."""
         self._validateValues()
         applicationPassword = self._askPassword(f"PostgreSQL application password for {self.databaseUser}: ")
 
-        with psycopg.connect(host=self.postgresHost, port=self.postgresPort, dbname=self.databaseName, user=self.databaseUser, password=applicationPassword, connect_timeout=self.connectTimeoutSeconds) as connection:
-            try:
-                identity = self._verifyApplicationConnection(connection)
-            finally:
-                connection.rollback()
+        try:
+            with psycopg.connect(host=self.postgresHost, port=self.postgresPort, dbname=self.databaseName, user=self.databaseUser, password=applicationPassword, connect_timeout=self.connectTimeoutSeconds) as connection:
+                try:
+                    identity = self._verifyApplicationConnection(connection)
+                finally:
+                    connection.rollback()
+        except psycopg.OperationalError as error:
+            pglMessages.warning(f"Could not verify database {self.databaseName!r} at {self.postgresHost}:{self.postgresPort}. Check that Postgres is running and the credentials are correct.\n{error}")
+            return False
 
         print(f"Database: {identity[0]}")
         print(f"User: {identity[1]}")
         print(f"Schema: {identity[2]}")
         print("Application connection, schema selection, and query test passed.")
         print("Table read/write testing is deferred until schema migrations have run.")
+        return True        
+    
+    def stop(self):
+        """Stop the managed server cleanly without deleting any data.
+
+        Disconnects clients and rolls back active transactions before shutdown.
+        Safe to call when the server is already stopped.
+        """
+        self._validateValues()
+        pgCtl = self._requireExecutable("pg_ctl")
+        self._checkDataDirectory()
+
+        status = self._runCommand([pgCtl, "-D", self.dataDirectory, "status"], capture=True, check=False)
+
+        if status.returncode == 3:
+            print("This Postgres instance is already stopped.")
+            return
+
+        if status.returncode != 0:
+            raise RuntimeError(f"Could not inspect Postgres; pg_ctl exited with status {status.returncode}.")
+
+        try:
+            self._runCommand([pgCtl, "-D", self.dataDirectory, "stop", "-m", "fast", "-t", self.startupTimeoutSeconds, "-w"])
+        except subprocess.CalledProcessError as error:
+            raise RuntimeError(f"Postgres shutdown failed or timed out. Check server status and log: {self.logFile}") from error
+
+        print("Postgres stopped.")
