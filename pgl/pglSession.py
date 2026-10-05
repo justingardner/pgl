@@ -348,7 +348,6 @@ class pglMNE(pglActionable):
     rawReferenceTime = Float(allow_none=True, default_value=None, help='reference time for the raw to compare to session reference time')
     rawFilenames = List(Unicode(allow_none=True), help="filenames of raw (if they exist)")
     rawFilesystemPrefix = List(Unicode(allow_none=True), help="filenames of raw (if they exist)", serialize=False)
-    epochs = List(Any(), help='List of all epochs')
     events = Instance(np.ndarray, default_value=None, allow_none=True, help="Canonical MNE events array: [sample, previousValue, rawEventCode].")
     eventsID = Instance(pd.DataFrame, default_value=None, allow_none=True, help="Event metadata DataFrame: one row per event and one column per labeling scheme.")
     epochs = Any(default_value=None, allow_none=True, help="MNE Epochs object created from events with eventsID as metadata.")
@@ -376,8 +375,6 @@ class pglMNE(pglActionable):
             self.rawFilenames.append(filename)
             self.rawFilesystemPrefix.append(filesystemPrefix)
             # this means that our rawAll object is no longer valid
-        elif isinstance(data, mne.BaseEpochs):
-            self.epochs.append(data)
     
     @property
     def raw(self):
