@@ -26,7 +26,7 @@ import psycopg
 from psycopg import sql
 from fsspec import AbstractFileSystem
 from fsspec.core import url_to_fs
-from traitlets import Bool, Int, Unicode
+from traitlets import Bool, Int, Unicode, List
 
 from .pglMessages import pglMessages
 from .pglSettings import pglTraitSettings
@@ -223,6 +223,7 @@ class pglPostgres(pglTraitSettings):
     adminUser = Unicode("pgl_admin", postgresConfiguration=True, help="Administrator role used for local setup and schema migrations.")
 
     installDirectory = Unicode("~/data/pgl", postgresConfiguration=True, help="Local server directory containing configuration, log, and database files. Supports ~.")
+    storageLocations = List(Unicode(), default_value=[], postgresConfiguration=True, help="Ordered payload storage paths or URLs. Plain paths refer to the installation machine. Setup defaults to installDirectory/storage.")
     installPostgresIfMissing = Bool(True, postgresConfiguration=True, help="Allow Homebrew installation when the configured PostgreSQL version is missing.")
 
     # Client connection transport.
@@ -236,7 +237,7 @@ class pglPostgres(pglTraitSettings):
 
     databaseSSLMode = Unicode("prefer", postgresConfiguration=True, help="PostgreSQL TLS mode: disable, allow, prefer, require, verify-ca, or verify-full.")
 
-    CONFIGURATION_VERSION = 2
+    CONFIGURATION_VERSION = 3
     CONFIGURATION_FILENAME = "configuration.json"
     STARTUP_TIMEOUT_SECONDS = 60
     CONNECT_TIMEOUT_SECONDS = 10
@@ -315,7 +316,7 @@ class pglPostgres(pglTraitSettings):
 
     @classmethod
     def fromJSONdict(cls, data, type="all", filename=None):
-        """Restore settings and upgrade version-1 configurations in memory."""
+        """Restore settings and upgrade older configurations in memory."""
         values = dict(data)
         version = values.pop("configurationVersion", None)
 
@@ -332,7 +333,9 @@ class pglPostgres(pglTraitSettings):
         expected = set(cls._configurationNames())
 
         if version == 1:
-            if set(values) != expected - transportFields:
+            legacyFields = expected - transportFields - {"storageLocations"}
+
+            if set(values) != legacyFields:
                 raise ValueError("Invalid version-1 Postgres configuration fields.")
 
             values.update({
@@ -345,7 +348,18 @@ class pglPostgres(pglTraitSettings):
                 "databaseSSLMode": "prefer",
             })
 
-        elif version != cls.CONFIGURATION_VERSION:
+            version = 2
+
+        if version == 2:
+            if set(values) != expected - {"storageLocations"}:
+                raise ValueError("Invalid version-2 Postgres configuration fields.")
+
+            # Do not expand ~ or resolve paths here: the configuration may
+            # describe a remote installation.
+            values["storageLocations"] = [posixpath.join(values["installDirectory"], "storage")]
+            version = 3
+
+        if version != cls.CONFIGURATION_VERSION:
             raise ValueError(f"Unsupported Postgres configuration version: {version!r}")
 
         supplied = set(values)
@@ -461,6 +475,8 @@ class pglPostgres(pglTraitSettings):
         Changed settings require overwrite=True.
         """
         self._requireLocalConfiguration()
+        self.installDirectory = str(self.rootDirectory)
+        self._setDefaultStorageLocations()
         self._validateValues()
 
         filename = self.configurationFile if filename is None else filename
@@ -506,6 +522,13 @@ class pglPostgres(pglTraitSettings):
                 temporaryPath.unlink(missing_ok=True)
 
         pglMessages.message(f"Configuration saved: {target}")
+        
+    def _setDefaultStorageLocations(self):
+        """Set the initial payload location without replacing configured locations."""
+        self._requireLocalConfiguration()
+
+        if not self.storageLocations:
+            self.storageLocations = [str(self.rootDirectory / "storage")]        
 
     # ------------------------------------------------------------
     # Validation and display
@@ -557,6 +580,13 @@ class pglPostgres(pglTraitSettings):
 
         if self.databaseSSLMode not in {"disable", "allow", "prefer", "require", "verify-ca", "verify-full"}:
             raise ValueError("Invalid databaseSSLMode.")
+        
+        for location in self.storageLocations:
+            if not location.strip() or any(character in location for character in ("\x00", "\n", "\r")):
+                raise ValueError("Storage locations must be nonempty paths or URLs without NUL or newline characters.")
+
+        if len(self.storageLocations) != len(set(self.storageLocations)):
+            raise ValueError("Storage locations must not contain duplicate entries.")
 
     def _requireLocalConfiguration(self):
         if getattr(self, "_configurationLoadedRemotely", False):
@@ -787,6 +817,8 @@ class pglPostgres(pglTraitSettings):
     def install(self):
         """Locate/install PostgreSQL, verify executables, and save configuration."""
         self._validateLocalEnvironment()
+        self.installDirectory = str(self.rootDirectory)
+        self._setDefaultStorageLocations()
         binaryDirectory = self.binaryDirectory
 
         # Catch conflicting saved settings before invoking Homebrew.
