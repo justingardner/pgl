@@ -777,6 +777,7 @@ class pglBase:
         # 1. Normalize dataPath and separate any embedded prefix
         # ------------------------------------------------------------
         dataPath = str(dataPath) if dataPath is not None else None
+        originalDataPath = dataPath
         if dataPath is None or dataPath == "":
             dataPath = ""
             dataPathPrefix = ""
@@ -802,14 +803,14 @@ class pglBase:
                 pglMessages.warning(f"Expected an fsspec AbstractFileSystem, got {type(filesystem).__name__}.")
                 return None, dataPath, ""
 
-            filesystem = filesystem
+            dataPath = filesystem._strip_protocol(originalDataPath) if originalDataPath else ""
             filesystemPrefix = filesystemPrefix or dataPathPrefix
-
+                
         elif filesystemPrefix:
 
             filesystemPrefix = str(filesystemPrefix)
             try:
-                filesystem, _ = url_to_fs(f"{filesystemPrefix.rstrip('/')}/{dataPath.lstrip('/')}")
+                filesystem, dataPath = url_to_fs(f"{filesystemPrefix.rstrip('/')}/{dataPath.lstrip('/')}")
             except Exception as e:
                 pglMessages.warning(f"Error accessing filesystem {filesystemPrefix}: {e}")
 
@@ -817,7 +818,7 @@ class pglBase:
 
             filesystemPrefix = dataPathPrefix
             try:
-                filesystem, _ = url_to_fs(f"{filesystemPrefix.rstrip('/')}/{dataPath.lstrip('/')}")
+                filesystem, dataPath = url_to_fs(originalDataPath)
             except Exception as e:
                 pglMessages.warning(f"Error accessing filesystem {filesystemPrefix}: {e}")
             
