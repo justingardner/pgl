@@ -20,6 +20,7 @@ from .pglMessages import pglMessages
 import fsspec
 from fsspec.core import url_to_fs
 from types import SimpleNamespace
+import posixpath
 
 ##########################
 # Recursively collect all subclasses
@@ -102,33 +103,34 @@ class pglSerialize:
     # Save to JSON file
     ##########################
     def save(self, filename, filesystem=None, filesystemPrefix=None):
-        """Save object to JSON file"""
-        try:
-            # Validate/resolve filesystem and normalise the path
-            from .pglBase import pglBase
-            dataPath = Path(filename).parent
-            filesystem, dataPath, _ = pglBase.validateFilesystem(filesystem=filesystem, dataPath=dataPath, filesystemPrefix=filesystemPrefix, create=True)
-            if filesystem is None:
-                pglMessages.warning(f"(pglSerialize) Could not resolve a filesystem for '{filename}'.")
-                return
-            filename = Path(dataPath) / Path(filename).name
+            """Save object to JSON through an fsspec filesystem."""
+            import posixpath
 
-            # Make it json
-            filename = str(Path(filename).with_suffix(".json"))
-            
-            #pglMessages.message(f"Saving {self.__class__.__name__} to '{filename}'")
-            with filesystem.open(filename, 'w') as f:
-                # call toJSON (filename is just for error displays)
-                f.write(self.toJSON(filename=filename))
-        except PermissionError:
-            pglMessages.warning(f"(pglSerialize) No permission to write to '{filename}'")
-        except IsADirectoryError:
-            pglMessages.warning(f"(pglSerialize) '{filename}' is a directory, cannot write file")
-        except OSError as e:
-            pglMessages.warning(f"(pglSerialize) OS error while saving '{filename}': {e}")
-        except Exception as e:
-            pglMessages.warning(f"(pglSerialize) Unknown error ({type(e).__name__}) while saving '{filename}': {e}")
-    
+            try:
+                from .pglBase import pglBase
+
+                filename = str(filename)
+                dataPath = posixpath.dirname(filename) or "."
+                fileName = posixpath.basename(filename)
+
+                filesystem, dataPath, _ = pglBase.validateFilesystem(filesystem=filesystem, dataPath=dataPath, filesystemPrefix=filesystemPrefix, create=True)
+                if filesystem is None:
+                    pglMessages.warning(f"(pglSerialize) Could not resolve a filesystem for '{filename}'.")
+                    return
+
+                filename = posixpath.join(dataPath, posixpath.splitext(fileName)[0] + ".json")
+
+                with filesystem.open(filename, "w", encoding="utf-8") as file:
+                    file.write(self.toJSON(filename=filename))
+
+            except PermissionError:
+                pglMessages.warning(f"(pglSerialize) No permission to write to '{filename}'")
+            except IsADirectoryError:
+                pglMessages.warning(f"(pglSerialize) '{filename}' is a directory, cannot write file")
+            except OSError as e:
+                pglMessages.warning(f"(pglSerialize) OS error while saving '{filename}': {e}")
+            except Exception as e:
+                pglMessages.warning(f"(pglSerialize) Unknown error ({type(e).__name__}) while saving '{filename}': {e}")    
     ##########################
     # Load from JSON file
     ##########################
@@ -148,7 +150,8 @@ class pglSerialize:
             The loaded object, or None if it could not be loaded.
         """
         # Ensure the filename has a .json suffix
-        filename = str(Path(filename).with_suffix(".json"))
+        import posixpath
+        filename = posixpath.splitext(str(filename))[0] + ".json"
 
         # Validate/resolve filesystem and normalise the path
         from .pglBase import pglBase

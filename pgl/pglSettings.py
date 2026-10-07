@@ -1253,9 +1253,9 @@ class pglSettings(pglTraitSettings):
     _devices = List(Instance(pglItem), default_value=[pglItem(name='RESPONSEPixx')], settingsListKey="name", multiSelect=True, style="dropdown", traitDisplayName="devices", help='Select which devices to use for digital IO', visible=True)
     eyetracker = List(Unicode(), default_value=['None', 'Eyelink', 'TRACKPixx'], help="Eyetracker")
     
-    def __init__(self):
+    def __init__(self, refreshDisplays=True):
         super().__init__()
-        self.reloadDisplays()
+        if refreshDisplays: self.reloadDisplays()
     
     @property
     def digitalIO(self):
@@ -1266,28 +1266,27 @@ class pglSettings(pglTraitSettings):
         return [d.name for d in self._devices if d.isSelected]
 
     @classmethod
-    def load(cls, filename, filesystem=None):
-        '''
-        Load pglSettings. 
-    
-        Also loads displays list so that it has up to date display settings
-        '''
-        # call super function to load all fields
-        cls = super().load(filename=filename, filesystem=filesystem)
-        if cls is None:
+    def load(cls, filename, filesystem=None, refresh=True):
+        """Load settings; use refresh=False to preserve recorded values."""
+        obj = super().load(filename=filename, filesystem=filesystem)
+        if obj is None:
             pglMessages.warning(f"Could not load settings from {filename}")
             return None
-        
-        # reload the displays
-        cls.reloadDisplays()
-        
-        # reconcile fields for which defaults might change over time so that they include
-        # any new defaults we add
-        cls.reconcileDefaults('_digitalIO')
-        cls.reconcileDefaults('_devices')
-        cls.reconcileDefaults('eyetracker')
-        
-        return cls
+
+        if refresh:
+            obj.reloadDisplays()
+            obj.reconcileDefaults('_digitalIO')
+            obj.reconcileDefaults('_devices')
+            obj.reconcileDefaults('eyetracker')
+
+        return obj
+    
+    @classmethod
+    def fromJSONdict(cls, data, type="all", filename=None):
+        """Restore saved values without discovering current displays."""
+        obj = cls(refreshDisplays=False)
+        obj.updateTraitsFromDict(data, filename=filename)
+        return obj
     
     #classmethod
     def reconcileDefaults(self, traitName):

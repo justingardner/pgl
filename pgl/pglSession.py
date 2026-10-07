@@ -27,6 +27,7 @@ except ImportError:
 from .pglBase import pglBase
 from pathlib import Path
 from .pglData import pglEpochsDataMatrix
+import posixpath
 
 ##################################
 # pglRun
@@ -54,7 +55,7 @@ class pglRun(pglExperimentBase):
         if self._experimentSettings is None:
             pglMessages.message(f"Loading experiment settings for: {self.filesystemPrefix}/{self.fullDataPath}",messageType='detailed')
             filesystem, fullDataPath, _ = pglBase.validateFilesystem(filesystem=self.filesystem, dataPath=self.fullDataPath, filesystemPrefix=self.filesystemPrefix)
-            self._experimentSettings = pglExperimentSettings.load(filename=Path(fullDataPath) / "experimentSettings", filesystem=filesystem)
+            self._experimentSettings = pglExperimentSettings.load(filename=posixpath.join(fullDataPath, "experimentSettings"), filesystem=filesystem)
         return self._experimentSettings
 
     @experimentSettings.setter
@@ -67,7 +68,7 @@ class pglRun(pglExperimentBase):
         if self._settings is None:
             pglMessages.message(f"Loading settings for: {self.filesystemPrefix}/{self.fullDataPath}",messageType='detailed')
             filesystem, fullDataPath, _ = pglBase.validateFilesystem(filesystem=self.filesystem, dataPath=self.fullDataPath, filesystemPrefix=self.filesystemPrefix)
-            self._settings = pglSettings.load(filename=Path(fullDataPath) / "settings", filesystem=filesystem)
+            self._settings = pglSettings.load(filename=posixpath.join(fullDataPath, "settings"), filesystem=filesystem, refresh=False)
         return self._settings
 
     @settings.setter
@@ -80,7 +81,7 @@ class pglRun(pglExperimentBase):
         if self._data is None:
             pglMessages.message(f"Loading data for: {self.filesystemPrefix}/{self.fullDataPath}",messageType='detailed')
             filesystem, fullDataPath, _ = pglBase.validateFilesystem(filesystem=self.filesystem, dataPath=self.fullDataPath, filesystemPrefix=self.filesystemPrefix)
-            self._data = pglExperimentData.load(filename=Path(fullDataPath) / "data", filesystem=filesystem)
+            self._data = pglExperimentData.load(filename=posixpath.join(fullDataPath, "data"), filesystem=filesystem)
         return self._data
 
     @data.setter
@@ -89,20 +90,15 @@ class pglRun(pglExperimentBase):
 
     @property
     def tasks(self):
-        '''Experiment tasks'''
+        """Load all tasks, reusing any tasks already loaded individually."""
         if self._tasks is None:
-            pglMessages.message(f"Loading tasks for: {self.filesystemPrefix}/{self.fullDataPath}",messageType='detailed')
-            filesystem, fullDataPath, _ = pglBase.validateFilesystem(filesystem=self.filesystem, dataPath=self.fullDataPath, filesystemPrefix=self.filesystemPrefix)
-            taskNames = self.experimentSettings.tasks
-            self._tasks = []
-            for iTask, taskName in enumerate(taskNames):
-                taskDirName = pglTask.getTaskDirectoryName(iTask,taskName)
-                self._tasks.append(pglTaskBase.load(dataPath=f"{fullDataPath}{filesystem.sep}{taskDirName}", filesystem=filesystem))
+            self._tasks = [self.getTaskAt(iTask) for iTask in range(len(self.experimentSettings.tasks))]
         return self._tasks
 
     @tasks.setter
     def tasks(self, value):
         self._tasks = value
+        self._taskCache = {}
         
     def getTask(self, taskName='', taskID=None):
         '''
@@ -172,22 +168,18 @@ class pglRun(pglExperimentBase):
 
         if taskIndex < 0 or taskIndex >= len(taskNames):
             raise IndexError(f"Task index {taskIndex} is outside 0 to {len(taskNames) - 1}")
+        
+        if self._tasks is not None:
+            return self._tasks[taskIndex]
 
         if taskIndex not in self._taskCache:
-            taskName = f"task{taskIndex+1:02d}_{taskNames[taskIndex]}"
+            taskName = pglTaskBase.getTaskDirectoryName(taskID=taskIndex, taskName=taskNames[taskIndex])
 
             pglMessages.message(f"Loading task {taskIndex}: {taskName} for {self.filesystemPrefix}/{self.fullDataPath}",messageType='detailed')
 
-            filesystem, fullDataPath, _ = pglBase.validateFilesystem(
-                filesystem=self.filesystem,
-                dataPath=self.fullDataPath,
-                filesystemPrefix=self.filesystemPrefix,
-            )
+            filesystem, fullDataPath, _ = pglBase.validateFilesystem(filesystem=self.filesystem,dataPath=self.fullDataPath,filesystemPrefix=self.filesystemPrefix)
 
-            self._taskCache[taskIndex] = pglTaskBase.load(
-                dataPath=str(Path(fullDataPath) / taskName),
-                filesystem=filesystem,
-            )
+            self._taskCache[taskIndex] = pglTaskBase.load(dataPath=posixpath.join(fullDataPath, taskName), filesystem=filesystem)
 
         return self._taskCache[taskIndex]
 
