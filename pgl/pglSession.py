@@ -586,6 +586,15 @@ class pglSession(pglActionable):
             pglMessages.warning(f"Unkown data type: {dataName}")
             return None
         
+    def saveRawSession(self, *, settings=None, settingsName=None, backendID=None, storageOptions=None, sslRootCert=None):
+        """Archive saved behavioral acquisition files and return a checkpoint ID.
+
+        Uses the current or supplied settings and configured storage destination.
+        Returns None when configuration is missing or password entry is cancelled.
+        """
+        from .pglStorage import pglStorage
+
+        return pglStorage.saveRawSession(self, settings=settings, settingsName=settingsName, backendID=backendID, storageOptions=storageOptions, sslRootCert=sslRootCert)
 
         
  

@@ -76,7 +76,7 @@ class pglPostgresTransport:
 
         else:
             raise ValueError(f"Unsupported connection transport: {postgres.connectionTransport}")
-
+            
     @staticmethod
     @contextmanager
     def _direct(options):
@@ -670,19 +670,247 @@ class pglPostgres(pglTraitSettings):
 
         return subprocess.run([str(argument) for argument in arguments], check=check, text=True, stdout=subprocess.PIPE if capture else None, env=environment)
 
+    @contextmanager
+    def _localConnect(self, *, user=None, database=None, password=None):
+        """Open a verified local connection, or yield None on cancellation.
+
+        Used by setup and migrations, independently of client transport.
+        An explicitly supplied password is attempted first; otherwise the
+        OS credential store is consulted before prompting.
+
+        Newly entered credentials are saved only after validation succeeds.
+        Caller operations are outside the authentication retry loop.
+        """
+        from contextlib import ExitStack
+
+        self._requireLocalConfiguration()
+        self._validateValues()
+
+        databaseUser = self.adminUser if user is None else user
+        database = self.databaseName if database is None else database
+        self._passwordStoreIdentity(user=databaseUser, local=True)
+
+        fromSavedPassword = False
+
+        if password is None:
+            password = self._readSavedPassword(databaseUser, local=True)
+            fromSavedPassword = password is not None
+
+        with ExitStack() as resources:
+            try:
+                while True:
+                    if password is None:
+                        password = self._askPassword(f"PostgreSQL password for {databaseUser}: ")
+                        fromSavedPassword = False
+
+                    if password is None:
+                        yield None
+                        return
+
+                    try:
+                        if databaseUser == self.adminUser:
+                            connection = self._adminConnect(password, database)
+                        else:
+                            connection = psycopg.connect(host=self.postgresHost, port=self.postgresPort, dbname=database, user=databaseUser, password=password, connect_timeout=self.connectTimeoutSeconds, sslmode="prefer", autocommit=True)
+
+                    except psycopg.OperationalError as error:
+                        passwordRejected = error.sqlstate == "28P01" or "password authentication failed" in str(error).lower()
+
+                        if not passwordRejected:
+                            raise
+
+                        if fromSavedPassword:
+                            self.clearSavedPassword(user=databaseUser, local=True)
+
+                        pglMessages.warning(f"PostgreSQL rejected the password for {databaseUser!r}. Try again, or press Enter without typing to cancel.", level=0)
+                        password = None
+                        fromSavedPassword = False
+                        continue
+
+                    resources.callback(connection.close)
+                    break
+
+                identity = connection.execute("SELECT current_database(), current_user").fetchone()
+
+                if identity != (database, databaseUser):
+                    raise RuntimeError(f"Unexpected connection identity: {identity}")
+
+                # Administrator server identity was checked by _adminConnect.
+                # Application setup validation also checks schema access.
+                if databaseUser != self.adminUser:
+                    connection.execute(sql.SQL("SET search_path TO {}, pg_catalog").format(sql.Identifier(self.databaseSchema)))
+
+                    if connection.execute("SELECT current_schema()").fetchone()[0] != self.databaseSchema:
+                        raise RuntimeError(f"Cannot access configured schema: {self.databaseSchema}")
+
+                    if connection.execute("SELECT 42").fetchone() != (42,):
+                        raise RuntimeError("Application query test failed.")
+
+                if not fromSavedPassword:
+                    self._saveVerifiedPassword(databaseUser, password, local=True)
+
+            finally:
+                password = None
+
+            yield connection
+
     @staticmethod
     def _askPassword(prompt, *, confirm=False):
-        """Always prompt; do not retrieve passwords from environment variables."""
-        pglMessages.message("Enter Password", emphasize=True)
-        password = getpass.getpass(prompt)
+        """Prompt privately; return None on empty input, Ctrl-C, or EOF."""
+        pglMessages.message("Enter password; press Enter without typing to cancel.", emphasize=True)
 
-        if not password or any(character in password for character in ("\n", "\r", "\x00")):
-            raise ValueError("Passwords must be nonempty and contain no newline or NUL characters.")
+        try:
+            while True:
+                password = getpass.getpass(prompt)
 
-        if confirm and password != getpass.getpass("Confirm password: "):
-            raise ValueError("Passwords do not match.")
+                if not password:
+                    pglMessages.warning("Password entry cancelled; operation aborted.", level=0)
+                    return None
 
-        return password
+                if any(character in password for character in ("\n", "\r", "\x00")):
+                    pglMessages.warning("Passwords must contain no newline or NUL characters. Please try again.", level=0)
+                    continue
+
+                if confirm:
+                    confirmation = getpass.getpass("Confirm password (Enter to cancel): ")
+
+                    if not confirmation:
+                        pglMessages.warning("Password entry cancelled; operation aborted.", level=0)
+                        return None
+
+                    if password != confirmation:
+                        pglMessages.warning("Passwords do not match. Please try again.", level=0)
+                        continue
+
+                return password
+
+        except (KeyboardInterrupt, EOFError):
+            pglMessages.warning("Password entry cancelled; operation aborted.", level=0)
+            return None
+
+    @staticmethod
+    def _passwordStore():
+        """Return a supported OS credential store, or None.
+
+        Explicitly reject plaintext, encrypted-file, and unknown backends.
+        Password-store unavailability does not prevent a prompted login.
+        """
+        try:
+            import keyring
+
+            backend = keyring.get_keyring()
+            backendType = (type(backend).__module__, type(backend).__name__)
+
+            supported = {
+                ("keyring.backends.macOS", "Keyring"),
+                ("keyring.backends.Windows", "WinVaultKeyring"),
+                ("keyring.backends.SecretService", "Keyring"),
+            }
+
+            if backendType not in supported:
+                raise RuntimeError(f"Unsupported credential backend: {backendType[0]}.{backendType[1]}")
+
+            return backend
+
+        except Exception as error:
+            pglMessages.oneTimeWarning(f"Secure password storage is unavailable ({type(error).__name__}). Install keyring and configure macOS Keychain, Windows Credential Manager, or Linux Secret Service. Passwords will not be saved.", level=0)
+            return None
+
+    def _passwordStoreIdentity(self, user=None, *, local=False):
+        """Identify a credential without storing it in PGL configuration.
+
+        local=True uses the local administration endpoint rather than
+        the configured client transport. Both use the same identity when
+        the client configuration describes that same local endpoint.
+        """
+        import hashlib
+
+        databaseUser = self.databaseUser if user is None else user
+
+        if not isinstance(databaseUser, str) or not databaseUser.strip() or "\x00" in databaseUser:
+            raise ValueError("Database username must be a nonempty string without NUL.")
+
+        endpoint = {
+            "transport": "direct" if local else self.connectionTransport,
+            "host": self.postgresHost if local else self.connectionHost,
+            "port": self.postgresPort if local else self.connectionPort,
+            "database": self.databaseName,
+            "ssl_mode": "prefer" if local else self.databaseSSLMode,
+        }
+
+        if not local and self.connectionTransport == "ssh":
+            endpoint.update({
+                "ssh_host": self.sshHost,
+                "ssh_port": self.sshPort,
+                "ssh_user": self.sshUser or getpass.getuser(),
+            })
+
+        encoded = json.dumps(endpoint, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        service = "pgl.postgres.v1." + hashlib.sha256(encoded).hexdigest()
+
+        return service, databaseUser
+
+    def _readSavedPassword(self, user, *, local=False):
+        """Read a saved credential, or return None without blocking a prompt."""
+        service, databaseUser = self._passwordStoreIdentity(user=user, local=local)
+        store = self._passwordStore()
+
+        if store is None:
+            return None
+
+        try:
+            return store.get_password(service, databaseUser) or None
+        except Exception as error:
+            pglMessages.warning(f"Could not read the saved password for {databaseUser!r} ({type(error).__name__}). Please enter it instead.", level=0)
+            return None
+
+    def _saveVerifiedPassword(self, user, password, *, local=False):
+        """Save only a credential the caller has already verified or installed."""
+        if not isinstance(password, str) or not password:
+            raise ValueError("Cannot save an empty password.")
+
+        service, databaseUser = self._passwordStoreIdentity(user=user, local=local)
+        store = self._passwordStore()
+
+        if store is None:
+            return False
+
+        try:
+            store.set_password(service, databaseUser, password)
+        except Exception as error:
+            pglMessages.warning(f"Operation succeeded, but the password for {databaseUser!r} could not be saved securely ({type(error).__name__}).", level=0)
+            return False
+
+        pglMessages.message(f"Password saved in the OS credential store for {databaseUser!r}.")
+        return True
+
+    def clearSavedPassword(self, *, user=None, local=False):
+        """Remove a saved credential without changing the PostgreSQL password.
+
+        Defaults to the application user's client credential.
+        Use user=self.adminUser, local=True for local administration.
+        Returns True if removed or already absent, otherwise False.
+        """
+        self._validateValues()
+        service, databaseUser = self._passwordStoreIdentity(user=user, local=local)
+        store = self._passwordStore()
+
+        if store is None:
+            return False
+
+        try:
+            if store.get_password(service, databaseUser) is None:
+                pglMessages.message(f"No saved PostgreSQL password for {databaseUser!r}.")
+                return True
+
+            store.delete_password(service, databaseUser)
+
+        except Exception as error:
+            pglMessages.warning(f"Could not clear the saved PostgreSQL password ({type(error).__name__}).", level=0)
+            return False
+
+        pglMessages.message(f"Cleared the saved PostgreSQL password for {databaseUser!r}.")
+        return True
 
     def _requireExecutable(self, name):
         executable = self.binaryDirectory / name
@@ -708,49 +936,125 @@ class pglPostgres(pglTraitSettings):
     # ------------------------------------------------------------
 
     @contextmanager
-    def connect(self, *, user=None, sslRootCert=None):
-        """Open a client connection and close it, and its tunnel, on exit.
+    def connect(self, *, user=None, sslRootCert=None, rememberPassword=True, useSavedPassword=True):
+        """Open a client connection, or yield None on password-entry cancellation.
 
-        Prompts for the database password.
-        Uses autocommit; wrap related writes in connection.transaction().
-        Never starts or administers a server.
+        Uses the OS credential store when available.
+        Saves a newly entered password only after login and database/schema
+        validation succeed. Rejected saved passwords are removed.
+
+        rememberPassword=False prevents saving a newly entered password.
+        useSavedPassword=False skips looking up an existing saved password.
+
+        Callers must check for None before using the connection.
+        Connections and SSH tunnels close on exit.
+        Non-password connection failures and caller errors propagate.
         """
+        from contextlib import ExitStack
+
         self._validateValues()
+
+        if not isinstance(rememberPassword, bool) or not isinstance(useSavedPassword, bool):
+            raise ValueError("rememberPassword and useSavedPassword must be True or False.")
+
         if self.connectionTransport == "ssh" and not self.sshHost:
             raise RuntimeError("No SSH hostname is available. Load configuration from an ssh:// URL or specify sshHost.")
-        databaseUser = self.databaseUser if user is None else user
 
-        if not isinstance(databaseUser, str) or not databaseUser.strip() or "\x00" in databaseUser:
-            raise ValueError("Database username must be a nonempty string without NUL.")
+        databaseUser = self.databaseUser if user is None else user
+        service, databaseUser = self._passwordStoreIdentity(user=databaseUser)
 
         if getattr(self, "_configurationLoadedRemotely", False):
             if self.connectionTransport == "direct" and self.connectionHost.lower() in {"127.0.0.1", "localhost", "::1"}:
                 raise RuntimeError("Remote configuration points directly to loopback. Configure an SSH transport or a directly reachable database endpoint.")
 
-        password = self._askPassword(f"PostgreSQL password for {databaseUser}: ")
+        store = self._passwordStore() if rememberPassword or useSavedPassword else None
+        password = None
+        fromSavedPassword = False
 
-        with pglPostgresTransport.connect(self, user=databaseUser, password=password, sslRootCert=sslRootCert) as connection:
-            identity = connection.execute("SELECT current_database(), current_user").fetchone()
+        if store is not None and useSavedPassword:
+            try:
+                password = store.get_password(service, databaseUser)
+                fromSavedPassword = bool(password)
+            except Exception as error:
+                pglMessages.warning(f"Could not read the saved PostgreSQL password ({type(error).__name__}). Please enter it instead.", level=0)
+                password = None
 
-            if identity != (self.databaseName, databaseUser):
-                raise RuntimeError(f"Unexpected connection identity: {identity}")
+        with ExitStack() as resources:
+            try:
+                while True:
+                    if not password:
+                        password = self._askPassword(f"PostgreSQL password for {databaseUser}: ")
+                        fromSavedPassword = False
 
-            schemaExists = connection.execute("SELECT 1 FROM pg_namespace WHERE nspname = %s", (self.databaseSchema,)).fetchone()
+                    if password is None:
+                        yield None
+                        return
 
-            if schemaExists is None:
-                raise RuntimeError(f"Database schema does not exist: {self.databaseSchema}")
+                    try:
+                        connection = resources.enter_context(pglPostgresTransport.connect(self, user=databaseUser, password=password, sslRootCert=sslRootCert))
+                    except psycopg.OperationalError as error:
+                        # Connection-time errors do not always expose SQLSTATE.
+                        passwordRejected = error.sqlstate == "28P01" or "password authentication failed" in str(error).lower()
 
-            connection.execute(sql.SQL("SET search_path TO {}, pg_catalog").format(sql.Identifier(self.databaseSchema)))
+                        if not passwordRejected:
+                            raise
 
-            if connection.execute("SELECT current_schema()").fetchone()[0] != self.databaseSchema:
-                raise RuntimeError(f"Cannot access configured schema: {self.databaseSchema}")
+                        if fromSavedPassword:
+                            try:
+                                store.delete_password(service, databaseUser)
+                            except Exception as deleteError:
+                                pglMessages.warning(f"Could not remove the rejected saved password ({type(deleteError).__name__}).", level=0)
 
+                            pglMessages.warning(f"PostgreSQL rejected the saved password for {databaseUser!r}. Enter a replacement, or press Enter without typing to cancel.", level=0)
+                        else:
+                            pglMessages.warning(f"PostgreSQL rejected the password for {databaseUser!r}. Try again, or press Enter without typing to cancel.", level=0)
+
+                        password = None
+                        fromSavedPassword = False
+                        continue
+
+                    break
+
+                identity = connection.execute("SELECT current_database(), current_user").fetchone()
+
+                if identity != (self.databaseName, databaseUser):
+                    raise RuntimeError(f"Unexpected connection identity: {identity}")
+
+                schemaExists = connection.execute("SELECT 1 FROM pg_namespace WHERE nspname = %s", (self.databaseSchema,)).fetchone()
+
+                if schemaExists is None:
+                    raise RuntimeError(f"Database schema does not exist: {self.databaseSchema}")
+
+                connection.execute(sql.SQL("SET search_path TO {}, pg_catalog").format(sql.Identifier(self.databaseSchema)))
+
+                if connection.execute("SELECT current_schema()").fetchone()[0] != self.databaseSchema:
+                    raise RuntimeError(f"Cannot access configured schema: {self.databaseSchema}")
+
+                # Authentication and the configured database/schema checks
+                # have succeeded. Never save a merely attempted password.
+                if rememberPassword and store is not None and not fromSavedPassword:
+                    try:
+                        store.set_password(service, databaseUser, password)
+                    except Exception as error:
+                        pglMessages.warning(f"Connected successfully, but could not save the password securely ({type(error).__name__}).", level=0)
+                    else:
+                        pglMessages.message(f"PostgreSQL password saved in the OS credential store for {databaseUser!r}.")
+
+            finally:
+                # Drop this local reference; this is not a guarantee of
+                # secure memory erasure in Python.
+                password = None
+
+            # Caller errors occur outside the authentication retry loop.
             yield connection
 
     def verifyDatabase(self, *, user=None, sslRootCert=None):
-        """Verify client access; warn and return False on connection failures."""
+        """Verify client access; return False on cancellation or connection failure."""
         try:
             with self.connect(user=user, sslRootCert=sslRootCert) as connection:
+                if connection is None:
+                    return False
+
                 identity = connection.execute("SELECT current_database(), current_user, current_schema()").fetchone()
 
                 if connection.execute("SELECT 42").fetchone() != (42,):
@@ -766,7 +1070,6 @@ class pglPostgres(pglTraitSettings):
         pglMessages.message(f"Transport: {self.connectionTransport}")
         pglMessages.message("Application connection and query test passed.")
         return True
-
     # ------------------------------------------------------------
     # Local administrator connections
     # ------------------------------------------------------------
@@ -855,7 +1158,12 @@ class pglPostgres(pglTraitSettings):
     # ------------------------------------------------------------
 
     def init(self):
-        """Initialize the local data directory without overwriting existing data."""
+        """Initialize local server data without overwriting existing data.
+
+        Reuses a saved administrator password, or asks for a new one.
+        Saves a newly entered password only after initdb succeeds.
+        Returns False on cancellation, otherwise True.
+        """
         self._validateLocalEnvironment()
         initdb = self._requireExecutable("initdb")
         dataDirectory = self.dataDirectory
@@ -869,19 +1177,34 @@ class pglPostgres(pglTraitSettings):
         if versionFile.exists():
             self._checkDataDirectory()
             pglMessages.message(f"Using existing PostgreSQL data directory: {dataDirectory}")
-            return
+            return True
 
         if dataDirectory.exists() and any(dataDirectory.iterdir()):
             raise RuntimeError(f"Refusing to initialize a nonempty directory: {dataDirectory}")
 
-        password = self._askPassword(f"New PostgreSQL administrator password for {self.adminUser}: ", confirm=True)
+        password = self._readSavedPassword(self.adminUser, local=True)
+        fromSavedPassword = password is not None
 
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as passwordFile:
-            passwordFile.write(password + "\n")
-            passwordFile.flush()
-            self._runCommand([initdb, "-D", dataDirectory, "-U", self.adminUser, "--encoding=UTF8", "--auth=scram-sha-256", f"--pwfile={passwordFile.name}"])
+        if password is None:
+            password = self._askPassword(f"Choose PostgreSQL administrator password for {self.adminUser}: ", confirm=True)
+
+        if password is None:
+            return False
+
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as passwordFile:
+                passwordFile.write(password + "\n")
+                passwordFile.flush()
+                self._runCommand([initdb, "-D", dataDirectory, "-U", self.adminUser, "--encoding=UTF8", "--auth=scram-sha-256", f"--pwfile={passwordFile.name}"])
+
+            if not fromSavedPassword:
+                self._saveVerifiedPassword(self.adminUser, password, local=True)
+
+        finally:
+            password = None
 
         pglMessages.message(f"Initialized PostgreSQL data directory: {dataDirectory}")
+        return True
 
     # ------------------------------------------------------------
     # Local server lifecycle
@@ -944,44 +1267,25 @@ class pglPostgres(pglTraitSettings):
 
         pglMessages.message("Postgres stopped.")
 
-    def verify(self):
-        """Verify the locally managed server; warn on connection failure."""
-        self._requireLocalConfiguration()
-        self._validateValues()
-        password = self._askPassword(f"PostgreSQL administrator password for {self.adminUser}: ")
-
-        try:
-            with self._adminConnect(password) as connection:
-                version = connection.execute("SHOW server_version").fetchone()[0]
-        except psycopg.OperationalError as error:
-            pglMessages.warning(f"Could not verify local Postgres. Check that it is running and the credentials are correct.\n{error}")
-            return False
-
-        pglMessages.message(f"Verified PostgreSQL {version}")
-        pglMessages.message(f"Verified data directory: {self.dataDirectory}")
-        pglMessages.message(f"Verified endpoint: {self.postgresHost}:{self.postgresPort}")
-        pglMessages.message("Verified local-only networking.")
-        return True
 
     # ------------------------------------------------------------
     # Local role/database/schema creation
     # ------------------------------------------------------------
 
     def createDatabase(self, *, resetApplicationPassword=False):
-        """Create the local application database; warn on connection failure."""
+        """Create the role/database; return False on cancellation or connection failure."""
         try:
-            self._createDatabase(resetApplicationPassword=resetApplicationPassword)
+            return self._createDatabase(resetApplicationPassword=resetApplicationPassword)
         except psycopg.OperationalError as error:
             pglMessages.warning(f"Could not complete database setup. Check the server and credentials. Earlier setup steps may have completed; rerun after resolving the issue.\n{error}")
             return False
-
-        return True
-
+        
     def _createDatabase(self, *, resetApplicationPassword=False):
-        """Create the role, database, and administrator-owned schema.
+        """Create local role/database/schema and verify application access.
 
-        Does not create scientific tables.
-        CREATE DATABASE cannot be part of a transaction; run sequentially.
+        Reuses saved credentials. Explicit password resets always prompt.
+        New application credentials are saved only after successful login.
+        CREATE DATABASE cannot be transactional; partial setup may persist.
         """
         self._requireLocalConfiguration()
         self._validateValues()
@@ -989,74 +1293,113 @@ class pglPostgres(pglTraitSettings):
         if not isinstance(resetApplicationPassword, bool):
             raise ValueError("resetApplicationPassword must be True or False.")
 
-        adminPassword = self._askPassword(f"PostgreSQL administrator password for {self.adminUser}: ")
+        applicationPassword = None
 
-        with self._adminConnect(adminPassword) as connection:
-            role = connection.execute("SELECT rolsuper, rolcreatedb, rolcreaterole, rolreplication, rolbypassrls, rolcanlogin FROM pg_roles WHERE rolname = %s", (self.databaseUser,)).fetchone()
+        try:
+            with self._localConnect(database="postgres") as connection:
+                if connection is None:
+                    return False
 
-            if role is not None:
-                if any(role[:5]) or not role[5]:
-                    raise RuntimeError("Application role has unexpected privileges or cannot log in.")
+                role = connection.execute("SELECT rolsuper, rolcreatedb, rolcreaterole, rolreplication, rolbypassrls, rolcanlogin FROM pg_roles WHERE rolname = %s", (self.databaseUser,)).fetchone()
 
-                memberships = connection.execute("SELECT parent.rolname FROM pg_auth_members membership JOIN pg_roles member ON member.oid = membership.member JOIN pg_roles parent ON parent.oid = membership.roleid WHERE member.rolname = %s", (self.databaseUser,)).fetchall()
+                if role is not None:
+                    if any(role[:5]) or not role[5]:
+                        raise RuntimeError("Application role has unexpected privileges or cannot log in.")
 
-                if memberships:
-                    raise RuntimeError(f"Application role has memberships requiring review: {memberships}")
+                    memberships = connection.execute("SELECT parent.rolname FROM pg_auth_members membership JOIN pg_roles member ON member.oid = membership.member JOIN pg_roles parent ON parent.oid = membership.roleid WHERE member.rolname = %s", (self.databaseUser,)).fetchall()
 
-            owner = connection.execute("SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = %s", (self.databaseName,)).fetchone()
+                    if memberships:
+                        raise RuntimeError(f"Application role has memberships requiring review: {memberships}")
 
-            if owner is not None and owner[0] != self.adminUser:
-                raise RuntimeError(f"Database is owned by {owner[0]!r}, not {self.adminUser!r}.")
+                owner = connection.execute("SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = %s", (self.databaseName,)).fetchone()
 
-            if owner is not None:
-                with self._adminConnect(adminPassword, self.databaseName) as databaseConnection:
-                    schemaOwner = databaseConnection.execute("SELECT pg_get_userbyid(nspowner) FROM pg_namespace WHERE nspname = %s", (self.databaseSchema,)).fetchone()
+                if owner is not None and owner[0] != self.adminUser:
+                    raise RuntimeError(f"Database is owned by {owner[0]!r}, not {self.adminUser!r}.")
 
-                    if schemaOwner is not None and schemaOwner[0] != self.adminUser:
-                        raise RuntimeError(f"Schema is owned by {schemaOwner[0]!r}, not {self.adminUser!r}.")
+                # Check existing ownership before making changes.
+                if owner is not None:
+                    with self._localConnect(database=self.databaseName) as databaseConnection:
+                        if databaseConnection is None:
+                            return False
 
-            settingPassword = role is None or resetApplicationPassword
-            prompt = "Choose the application password: " if settingPassword else "Existing application password: "
-            applicationPassword = self._askPassword(prompt, confirm=settingPassword)
+                        schemaOwner = databaseConnection.execute("SELECT pg_get_userbyid(nspowner) FROM pg_namespace WHERE nspname = %s", (self.databaseSchema,)).fetchone()
 
-            if role is None:
-                statement = sql.SQL("CREATE ROLE {} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD {}").format(sql.Identifier(self.databaseUser), sql.Literal(applicationPassword))
-                connection.execute(statement)
+                        if schemaOwner is not None and schemaOwner[0] != self.adminUser:
+                            raise RuntimeError(f"Schema is owned by {schemaOwner[0]!r}, not {self.adminUser!r}.")
 
-            elif resetApplicationPassword:
-                statement = sql.SQL("ALTER ROLE {} PASSWORD {}").format(sql.Identifier(self.databaseUser), sql.Literal(applicationPassword))
-                connection.execute(statement)
+                settingPassword = role is None or resetApplicationPassword
 
-            if owner is None:
-                connection.execute(sql.SQL("CREATE DATABASE {} OWNER {}").format(sql.Identifier(self.databaseName), sql.Identifier(self.adminUser)))
+                if settingPassword:
+                    # Rebuilding a missing role may reuse its saved password.
+                    # An explicit reset instead requires a new choice.
+                    if not resetApplicationPassword:
+                        applicationPassword = self._readSavedPassword(self.databaseUser, local=True)
 
-            connection.execute(sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(sql.Identifier(self.databaseName), sql.Identifier(self.databaseUser)))
+                    if applicationPassword is None:
+                        applicationPassword = self._askPassword(f"Choose PostgreSQL application password for {self.databaseUser}: ", confirm=True)
 
-        with self._adminConnect(adminPassword, self.databaseName) as connection:
-            with connection.transaction():
-                owner = connection.execute("SELECT pg_get_userbyid(nspowner) FROM pg_namespace WHERE nspname = %s", (self.databaseSchema,)).fetchone()
+                    if applicationPassword is None:
+                        return False
+
+                if role is None:
+                    statement = sql.SQL("CREATE ROLE {} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD {}").format(sql.Identifier(self.databaseUser), sql.Literal(applicationPassword))
+                    connection.execute(statement)
+
+                elif resetApplicationPassword:
+                    statement = sql.SQL("ALTER ROLE {} PASSWORD {}").format(sql.Identifier(self.databaseUser), sql.Literal(applicationPassword))
+                    connection.execute(statement)
 
                 if owner is None:
-                    connection.execute(sql.SQL("CREATE SCHEMA {} AUTHORIZATION {}").format(sql.Identifier(self.databaseSchema), sql.Identifier(self.adminUser)))
-                elif owner[0] != self.adminUser:
-                    raise RuntimeError(f"Schema is owned by {owner[0]!r}, not {self.adminUser!r}.")
+                    connection.execute(sql.SQL("CREATE DATABASE {} OWNER {}").format(sql.Identifier(self.databaseName), sql.Identifier(self.adminUser)))
 
-                connection.execute(sql.SQL("REVOKE CREATE ON SCHEMA {} FROM PUBLIC").format(sql.Identifier(self.databaseSchema)))
-                connection.execute(sql.SQL("REVOKE CREATE ON SCHEMA {} FROM {}").format(sql.Identifier(self.databaseSchema), sql.Identifier(self.databaseUser)))
-                connection.execute(sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(sql.Identifier(self.databaseSchema), sql.Identifier(self.databaseUser)))
-                connection.execute(sql.SQL("ALTER ROLE {} IN DATABASE {} SET search_path = {}, pg_catalog").format(sql.Identifier(self.databaseUser), sql.Identifier(self.databaseName), sql.Identifier(self.databaseSchema)))
+                connection.execute(sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(sql.Identifier(self.databaseName), sql.Identifier(self.databaseUser)))
 
-        # This is local setup verification, independent of client transport.
-        with psycopg.connect(host=self.postgresHost, port=self.postgresPort, dbname=self.databaseName, user=self.databaseUser, password=applicationPassword, connect_timeout=self.connectTimeoutSeconds, sslmode="prefer", autocommit=True) as connection:
-            identity = connection.execute("SELECT current_database(), current_user, current_schema()").fetchone()
+            with self._localConnect(database=self.databaseName) as connection:
+                if connection is None:
+                    return False
 
-            if identity != (self.databaseName, self.databaseUser, self.databaseSchema):
-                raise RuntimeError(f"Unexpected application connection identity: {identity}")
+                with connection.transaction():
+                    owner = connection.execute("SELECT pg_get_userbyid(nspowner) FROM pg_namespace WHERE nspname = %s", (self.databaseSchema,)).fetchone()
 
-            if connection.execute("SELECT 42").fetchone() != (42,):
-                raise RuntimeError("Application query test failed.")
+                    if owner is None:
+                        connection.execute(sql.SQL("CREATE SCHEMA {} AUTHORIZATION {}").format(sql.Identifier(self.databaseSchema), sql.Identifier(self.adminUser)))
+                    elif owner[0] != self.adminUser:
+                        raise RuntimeError(f"Schema is owned by {owner[0]!r}, not {self.adminUser!r}.")
+
+                    connection.execute(sql.SQL("REVOKE CREATE ON SCHEMA {} FROM PUBLIC").format(sql.Identifier(self.databaseSchema)))
+                    connection.execute(sql.SQL("REVOKE CREATE ON SCHEMA {} FROM {}").format(sql.Identifier(self.databaseSchema), sql.Identifier(self.databaseUser)))
+                    connection.execute(sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(sql.Identifier(self.databaseSchema), sql.Identifier(self.databaseUser)))
+                    connection.execute(sql.SQL("ALTER ROLE {} IN DATABASE {} SET search_path = {}, pg_catalog").format(sql.Identifier(self.databaseUser), sql.Identifier(self.databaseName), sql.Identifier(self.databaseSchema)))
+
+            # Verifies and saves a new password, or retrieves/retries an
+            # existing one. No setup SQL is rerun on authentication failure.
+            with self._localConnect(user=self.databaseUser, database=self.databaseName, password=applicationPassword) as connection:
+                if connection is None:
+                    return False
+
+        finally:
+            applicationPassword = None
 
         pglMessages.message(f"Application account ready: {self.databaseUser}")
         pglMessages.message(f"Database ready: {self.databaseName}")
         pglMessages.message(f"Schema ready: {self.databaseSchema} (owner: {self.adminUser})")
         pglMessages.message("Application login verified.")
+        return True
+
+    def verify(self):
+        """Verify the local server using saved credentials when available."""
+        try:
+            with self._localConnect(database="postgres") as connection:
+                if connection is None:
+                    return False
+
+                version = connection.execute("SHOW server_version").fetchone()[0]
+
+        except psycopg.OperationalError as error:
+            pglMessages.warning(f"Could not verify local PostgreSQL: {error}", level=0)
+            return False
+
+        pglMessages.message(f"Verified PostgreSQL {version}")
+        pglMessages.message(f"Verified data directory: {self.dataDirectory}")
+        pglMessages.message(f"Verified endpoint: {self.postgresHost}:{self.postgresPort}")
+        return True

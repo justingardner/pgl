@@ -27,6 +27,344 @@ class pglStorage:
     MIGRATION_LOCK = 734_291_806_115
 
     @staticmethod
+    def print(details=None, postgres=None, *, settings=None, settingsName=None, sessionID=None, nRows=10, maxWidth=48, sslRootCert=None):
+        """Print a database summary, table details, or one checkpoint.
+
+        Defaults to databasePath in the current PGL settings.
+
+        details:
+            A table name, an iterable of table names, or "all".
+            Suppresses the database summary.
+
+        sessionID:
+            Show session metadata, subjects, and all linked files.
+            Shows one recorded content location per logical file, preferring
+            an eligible readable alias, otherwise a shared content location.
+            Other aliases/copies are counted rather than listed repeatedly.
+            Cannot be combined with details.
+
+        nRows limits table detail views, not the session file listing.
+        Session paths are displayed without truncation.
+        Location status is recorded metadata, not a fresh payload check.
+
+        Returns False for missing configuration, password cancellation,
+        or an unknown session. Other connection and query errors propagate.
+        """
+        from .pglPostgres import pglPostgres
+        from psycopg.rows import tuple_row
+
+        tableOrder = {
+            "session": ("session_id",),
+            "subjects": ("subject_id",),
+            "files": ("file_id",),
+            "storage_backends": ("backend_id",),
+            "storage_locations": ("file_id", "backend_id", "object_key"),
+            "users": ("user_id",),
+            "session_files": ("session_id", "name"),
+        }
+
+        if postgres is not None and (settings is not None or settingsName is not None):
+            raise ValueError("Supply either postgres or PGL settings, not both.")
+
+        if sessionID is not None:
+            if isinstance(sessionID, bool) or not isinstance(sessionID, int) or not 0 <= sessionID <= 9223372036854775807:
+                raise ValueError("sessionID must be a nonnegative PostgreSQL bigint.")
+
+            if details is not None:
+                raise ValueError("Supply either sessionID or details, not both.")
+
+        if isinstance(nRows, bool) or not isinstance(nRows, int) or nRows <= 0:
+            raise ValueError("nRows must be a positive integer.")
+
+        if isinstance(maxWidth, bool) or not isinstance(maxWidth, int) or maxWidth < 8:
+            raise ValueError("maxWidth must be an integer of at least 8.")
+
+        if details is None:
+            requested = []
+        elif isinstance(details, str):
+            requested = list(tableOrder) if details == "all" else [details]
+        else:
+            try:
+                requested = list(details)
+            except TypeError as error:
+                raise ValueError("details must be a table name or an iterable of table names.") from error
+
+        if any(not isinstance(name, str) or name not in tableOrder for name in requested):
+            raise ValueError(f"Supported detail tables: {', '.join(tableOrder)}; or 'all'.")
+
+        requested = list(dict.fromkeys(requested))
+
+        if postgres is None:
+            postgres = pglPostgres.fromSettings(settings=settings, settingsName=settingsName)
+
+            if postgres is None:
+                return False
+
+        if not isinstance(postgres, pglPostgres):
+            raise TypeError("postgres must be a pglPostgres instance.")
+
+        def archiveKey(name):
+            """Return the conventional readable path, used only for preference."""
+            if name == "manifest.json":
+                return f"session{sessionID:06d}/manifest.json"
+
+            parts = name.split("/", 2)
+
+            if len(parts) == 3 and parts[0] == "runs" and parts[1].isascii() and parts[1].isdigit():
+                return f"session{sessionID:06d}/run{int(parts[1]):05d}/{parts[2]}"
+
+            return None
+
+        counts = []
+        checkpointCounts = []
+        detailResults = []
+        sessionRecord = None
+        sessionFiles = {}
+
+        # Gather all report sections from one consistent, read-only snapshot.
+        with postgres.connect(sslRootCert=sslRootCert) as connection:
+            if connection is None:
+                return False
+
+            with connection.transaction():
+                connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+
+                with connection.cursor(row_factory=tuple_row) as cursor:
+                    cursor.execute("SELECT current_database(), current_user, transaction_timestamp()")
+                    databaseName, databaseUser, snapshotTime = cursor.fetchone()
+
+                    if sessionID is not None:
+                        sessionsTable = sql.Identifier(postgres.databaseSchema, "session")
+                        usersTable = sql.Identifier(postgres.databaseSchema, "users")
+                        linksTable = sql.Identifier(postgres.databaseSchema, "session_files")
+                        filesTable = sql.Identifier(postgres.databaseSchema, "files")
+                        locationsTable = sql.Identifier(postgres.databaseSchema, "storage_locations")
+                        backendsTable = sql.Identifier(postgres.databaseSchema, "storage_backends")
+
+                        statement = sql.SQL("""
+                            SELECT checkpoint.*, creator.username AS creator_username,
+                                   creator.display_name AS creator_display_name
+                            FROM {} AS checkpoint
+                            LEFT JOIN {} AS creator
+                              ON creator.user_id = checkpoint.created_by
+                            WHERE checkpoint.session_id = %s
+                        """).format(sessionsTable, usersTable)
+                        cursor.execute(statement, (sessionID,))
+                        row = cursor.fetchone()
+
+                        if row is not None:
+                            sessionRecord = dict(zip((column.name for column in cursor.description), row))
+
+                            statement = sql.SQL("""
+                                SELECT link.name, link.role, link.subject_id,
+                                       content.file_id, content.sha256,
+                                       content.size_bytes
+                                FROM {} AS link
+                                JOIN {} AS content
+                                  ON content.file_id = link.file_id
+                                WHERE link.session_id = %s
+                                ORDER BY link.name
+                            """).format(linksTable, filesTable)
+                            cursor.execute(statement, (sessionID,))
+
+                            for name, role, subjectID, fileID, digest, sizeBytes in cursor.fetchall():
+                                sessionFiles[name] = {
+                                    "role": role,
+                                    "subject_id": subjectID,
+                                    "file_id": fileID,
+                                    "sha256": digest,
+                                    "size_bytes": sizeBytes,
+                                    "expected_key": archiveKey(name),
+                                    "locations": [],
+                                    "other_location_count": 0,
+                                }
+
+                            fileIDs = sorted({record["file_id"] for record in sessionFiles.values()})
+                            locationsByFile = {}
+
+                            if fileIDs:
+                                # Fetch each content location once, rather
+                                # than multiplying it by logical filenames.
+                                statement = sql.SQL("""
+                                    SELECT location.file_id, location.object_key,
+                                           backend.backend_id, backend.name,
+                                           backend.url_prefix, backend.is_active,
+                                           location.status, location.priority,
+                                           location.verified_at
+                                    FROM {} AS location
+                                    JOIN {} AS backend
+                                      ON backend.backend_id = location.backend_id
+                                    WHERE location.file_id = ANY(%s::bigint[])
+                                    ORDER BY location.file_id, location.priority,
+                                             backend.backend_id, location.object_key
+                                """).format(locationsTable, backendsTable)
+                                cursor.execute(statement, (fileIDs,))
+
+                                for fileID, key, backendID, backendName, root, active, status, priority, verifiedAt in cursor.fetchall():
+                                    locationsByFile.setdefault(fileID, []).append({
+                                        "backend_id": backendID,
+                                        "backend_name": backendName,
+                                        "root": root,
+                                        "object_key": key,
+                                        "active": active,
+                                        "status": status,
+                                        "priority": priority,
+                                        "verified_at": verifiedAt,
+                                    })
+
+                            for record in sessionFiles.values():
+                                candidates = locationsByFile.get(record["file_id"], [])
+
+                                def locationOrder(location):
+                                    eligible = location["active"] and location["status"] == "present" and location["verified_at"] is not None
+                                    expectedPath = location["object_key"] == record["expected_key"]
+
+                                    return (
+                                        not eligible,
+                                        not expectedPath,
+                                        location["priority"],
+                                        location["backend_id"],
+                                        location["object_key"],
+                                    )
+
+                                ordered = sorted(candidates, key=locationOrder)
+                                record["locations"] = ordered[:1]
+                                record["other_location_count"] = max(0, len(ordered) - 1)
+
+                    elif requested:
+                        for name in requested:
+                            table = sql.Identifier(postgres.databaseSchema, name)
+                            order = sql.SQL(", ").join(sql.Identifier(column) for column in tableOrder[name])
+                            statement = sql.SQL("SELECT * FROM {} ORDER BY {} LIMIT %s").format(table, order)
+                            cursor.execute(statement, (nRows + 1,))
+
+                            headers = [column.name for column in cursor.description]
+                            rows = cursor.fetchall()
+                            detailResults.append((name, headers, rows[:nRows], len(rows) > nRows))
+
+                    else:
+                        for name in tableOrder:
+                            table = sql.Identifier(postgres.databaseSchema, name)
+                            cursor.execute(sql.SQL("SELECT count(*) FROM {}").format(table))
+                            counts.append((name, cursor.fetchone()[0]))
+
+                        table = sql.Identifier(postgres.databaseSchema, "session")
+                        statement = sql.SQL("SELECT origin, status, count(*) FROM {} GROUP BY origin, status ORDER BY origin, status").format(table)
+                        cursor.execute(statement)
+                        checkpointCounts = cursor.fetchall()
+
+        # Format after the connection and tunnel have closed.
+        def displayValue(value, truncate=False):
+            text = "NULL" if value is None else str(value)
+            text = text.replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t")
+
+            if truncate and len(text) > maxWidth:
+                return text[:maxWidth - 3] + "..."
+
+            return text
+
+        def printTable(headers, rows):
+            displayed = [[displayValue(value, truncate=True) for value in headers]]
+            displayed.extend([displayValue(value, truncate=True) for value in row] for row in rows)
+            widths = [max(len(row[index]) for row in displayed) for index in range(len(headers))]
+
+            def printRow(row):
+                pglMessages.print("  " + " | ".join(value.ljust(width) for value, width in zip(row, widths)))
+
+            printRow(displayed[0])
+            pglMessages.print("  " + "-+-".join("-" * width for width in widths))
+
+            for row in displayed[1:]:
+                printRow(row)
+
+            if not rows:
+                pglMessages.print("  (no rows)")
+
+        if sessionID is not None:
+            if sessionRecord is None:
+                pglMessages.warning(f"No session {sessionID} exists in {databaseName}.{postgres.databaseSchema}.", level=0)
+                return False
+
+            pglMessages.printHeader(f"Session {sessionID}")
+            pglMessages.message(f"Database: {databaseName}.{postgres.databaseSchema}", wrapText=False)
+            pglMessages.message(f"Snapshot transaction started: {snapshotTime}", wrapText=False)
+
+            pglMessages.print()
+            pglMessages.printHeader("Session metadata", fillChar="-")
+            labelWidth = max(len(name) for name in sessionRecord)
+
+            for name, value in sessionRecord.items():
+                pglMessages.print(f"  {name:<{labelWidth}} : {displayValue(value)}")
+
+            subjects = sorted({
+                record["subject_id"]
+                for record in sessionFiles.values()
+                if record["subject_id"] is not None
+            })
+
+            pglMessages.print()
+            pglMessages.printHeader("Subjects", fillChar="-")
+            pglMessages.print("  " + (", ".join(displayValue(subject) for subject in subjects) if subjects else "(none linked)"))
+
+            pglMessages.print()
+            pglMessages.printHeader(f"Files and locations: {len(sessionFiles)} linked files", fillChar="-")
+            pglMessages.print("  One recorded content location per file; shared files may resolve into another run or session.")
+            pglMessages.print("  Status is recorded metadata; payloads have not been checked.")
+            pglMessages.print("  Registered aliases/copies are paths, not necessarily separate physical byte copies.")
+
+            if not sessionFiles:
+                pglMessages.print("  (no linked files)")
+
+            for name, record in sessionFiles.items():
+                pglMessages.print()
+                pglMessages.print(f"  {displayValue(name)}")
+                pglMessages.print(f"    file_id: {record['file_id']} | bytes: {record['size_bytes']} | role: {displayValue(record['role'])}")
+
+                if not record["locations"]:
+                    pglMessages.print("    No registered storage location.")
+                    continue
+
+                location = record["locations"][0]
+                root = location["root"]
+                separator = "" if root.endswith("/") else "/"
+                fullLocation = root + separator + location["object_key"]
+                eligible = location["active"] and location["status"] == "present" and location["verified_at"] is not None
+
+                pglMessages.print(f"    Location: {displayValue(fullLocation)}")
+                pglMessages.print(f"    Backend: {location['backend_id']} | status: {displayValue(location['status'])} | active: {location['active']} | eligible for reads: {eligible}")
+                pglMessages.print(f"    Last verified: {displayValue(location['verified_at'])}")
+
+                if record["other_location_count"]:
+                    pglMessages.print(f"    Other registered aliases/copies: {record['other_location_count']}")
+
+        elif requested:
+            for name, headers, rows, hasMore in detailResults:
+                pglMessages.print()
+                pglMessages.printHeader(name, fillChar="-")
+                pglMessages.print(f"  First {len(rows)} rows, ordered by {', '.join(tableOrder[name])}")
+                printTable(headers, rows)
+
+                if hasMore:
+                    pglMessages.message(f"More rows available; increase nRows above {nRows} to display more.")
+
+        else:
+            pglMessages.printHeader("PGL database snapshot")
+            pglMessages.message(f"Database: {databaseName}.{postgres.databaseSchema}", wrapText=False)
+            pglMessages.message(f"User: {databaseUser} | Transport: {postgres.connectionTransport}", wrapText=False)
+            pglMessages.message(f"Snapshot transaction started: {snapshotTime}", wrapText=False)
+
+            pglMessages.print()
+            pglMessages.printHeader("Table counts", fillChar="-")
+            printTable(("table", "rows"), counts)
+
+            pglMessages.print()
+            pglMessages.printHeader("Checkpoint status", fillChar="-")
+            printTable(("origin", "status", "checkpoints"), checkpointCounts)
+
+        pglMessages.printHeader()
+        return True
+
+    @staticmethod
     def inventoryRawRun(run):
         """List source files and directories without loading or changing their contents.
 
@@ -170,11 +508,11 @@ class pglStorage:
         return inventory
     
     @classmethod
-    def stageRawFile(cls, sourceFilesystem, sourcePath, destinationFilesystem, destinationRoot, expected):
-        """Copy and verify a payload, returning its relative storage key.
+    def stageRawFile(cls, sourceFilesystem, sourcePath, destinationFilesystem, destinationRoot, expected, *, objectKey):
+        """Copy and verify a payload at an explicit relative storage key.
 
-        destinationRoot must be a resolved path for destinationFilesystem.
-        A failed operation may leave an unregistered staging object.
+        Never intentionally overwrites an existing file.
+        Failure may leave an unregistered partial payload.
         """
         expectedHash = expected["sha256"]
         expectedSize = expected["size_bytes"]
@@ -185,7 +523,9 @@ class pglStorage:
         if isinstance(expectedSize, bool) or not isinstance(expectedSize, int) or expectedSize < 0:
             raise ValueError("Expected size must be a nonnegative integer.")
 
-        objectKey = f"staging/{uuid.uuid4().hex}/payload"
+        if not isinstance(objectKey, str) or objectKey.startswith("/") or "\\" in objectKey or "\x00" in objectKey or any(part in {"", ".", ".."} for part in objectKey.split("/")):
+            raise ValueError("objectKey must be a valid relative POSIX path.")
+
         destinationPath = posixpath.join(destinationRoot, objectKey)
         destinationFilesystem.makedirs(posixpath.dirname(destinationPath), exist_ok=True)
 
@@ -193,75 +533,243 @@ class pglStorage:
         sizeBytes = 0
 
         with sourceFilesystem.open(sourcePath, "rb") as source:
-            with destinationFilesystem.open(destinationPath, "wb") as destination:
+            with destinationFilesystem.open(destinationPath, "xb") as destination:
                 while True:
                     chunk = source.read(1024 * 1024)
+
                     if not chunk:
                         break
 
-                    destination.write(chunk)
-                    digest.update(chunk)
                     sizeBytes += len(chunk)
 
+                    if sizeBytes > expectedSize:
+                        raise ValueError(f"Source payload exceeds its manifest size: {objectKey}")
+
+                    destination.write(chunk)
+                    digest.update(chunk)
+
         if digest.hexdigest() != expectedHash or sizeBytes != expectedSize:
-            raise ValueError(f"Source bytes do not match the manifest; staging object was not accepted: {objectKey}")
+            raise ValueError(f"Source bytes do not match the manifest: {objectKey}")
 
         stored = cls.hashFile(destinationFilesystem, destinationPath)
 
         if stored["sha256"] != expectedHash or stored["size_bytes"] != expectedSize:
             raise ValueError(f"Stored payload verification failed: {objectKey}")
 
-        return {"object_key": objectKey, **stored}    
-    
+        return {"object_key": objectKey, **stored}
+
     @classmethod
-    def stageRawSession(cls, session, manifest, destinationFilesystem, destinationRoot):
-        """Stage and verify every file described by a raw session manifest.
+    def stageRawSession(cls, session, manifest, destinationFilesystem, destinationRoot, *, sessionID, connection, postgres, backendID):
+        """Store each distinct payload once on the destination backend.
 
-        destinationRoot must be a resolved path for destinationFilesystem.
-        Returns storage records; does not publish a checkpoint.
-        Failed operations may leave unregistered staging objects.
+        Reuse registered copies only after verifying their bytes.
+        Repeated content within this save reuses the same verified payload.
+
+        Local filesystems get readable hard-link aliases where supported.
+        Other filesystems retain only the canonical copy; logical filenames
+        resolve through the manifest and registered content locations.
+
+        Must run inside the caller's transaction.
+        Never overwrites payloads. Failed saves may leave unregistered files.
         """
-        currentManifest = cls.buildRawManifest(session)
+        import errno
+        import os
+        import stat
 
-        if currentManifest != manifest:
+        if isinstance(sessionID, bool) or not isinstance(sessionID, int) or sessionID < 0:
+            raise ValueError("sessionID must be a nonnegative integer.")
+
+        cls.validateRawManifest(manifest)
+
+        if cls.buildRawManifest(session) != manifest:
             raise ValueError("Source session no longer matches the supplied manifest.")
 
-        sources = {}
+        def isLocal(filesystem):
+            protocols = filesystem.protocol
+            protocols = {protocols} if isinstance(protocols, str) else set(protocols)
+            return bool(protocols.intersection({"file", "local"}))
 
-        for runRecord in manifest["runs"]:
-            run = session.runs[runRecord["index"]]
-            sources[runRecord["path"]] = run
+        localDestination = isLocal(destinationFilesystem)
+        sessionKey = f"session{sessionID:06d}"
+        sessionRoot = posixpath.join(destinationRoot, sessionKey)
 
+        # Check before creating any destination paths.
+        for run in session.runs:
+            if localDestination and isLocal(run.filesystem):
+                destination = Path(sessionRoot).expanduser().resolve()
+                source = Path(run.fullDataPath).expanduser().resolve()
+
+                if destination == source or source in destination.parents:
+                    raise ValueError("Checkpoint destination must be outside source run directories.")
+
+            elif destinationFilesystem == run.filesystem:
+                destination = posixpath.normpath(sessionRoot)
+                source = posixpath.normpath(run.fullDataPath)
+
+                if destination == source or destination.startswith(source.rstrip("/") + "/"):
+                    raise ValueError("Checkpoint destination must be outside source run directories.")
+
+        # Stable lock ordering avoids deadlocks between cooperating saves.
+        # Locks remain held until the outer transaction finishes.
+        for digest in sorted({record["sha256"] for record in manifest["files"]}):
+            lockName = f"pgl.payload:{postgres.databaseSchema}:{backendID}:{digest}"
+            connection.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (lockName,))
+
+        if destinationFilesystem.exists(sessionRoot):
+            raise FileExistsError(f"Checkpoint destination already exists; it will not be overwritten: {sessionRoot}")
+
+        destinationFilesystem.makedirs(destinationRoot, exist_ok=True)
+        destinationFilesystem.makedirs(sessionRoot, exist_ok=False)
+
+        runsByPath = {record["path"]: record for record in manifest["runs"]}
+
+        def physicalKey(logicalName):
+            parts = logicalName.split("/", 2)
+            runRecord = runsByPath["/".join(parts[:2])]
+            runKey = posixpath.join(sessionKey, f"run{runRecord['index']:05d}")
+            return posixpath.join(runKey, parts[2]) if len(parts) == 3 else runKey
+
+        # Physical empty directories are a local browsing convenience.
+        # The manifest preserves logical directories on every backend.
+        if localDestination:
+            for directory in manifest["directories"]:
+                if directory != "runs":
+                    destinationFilesystem.makedirs(posixpath.join(destinationRoot, physicalKey(directory)), exist_ok=True)
+
+        filesTable = sql.Identifier(postgres.databaseSchema, "files")
+        locationsTable = sql.Identifier(postgres.databaseSchema, "storage_locations")
+
+        # Canonical verified payload per hash for this save.
+        # This cache also covers content not yet registered in SQL.
+        verifiedByHash = {}
         staged = []
 
-        for record in manifest["files"]:
-            parts = record["name"].split("/", 2)
-            runPath = "/".join(parts[:2])
-            relativePath = parts[2]
-            run = sources[runPath]
-            sourcePath = posixpath.join(run.fullDataPath, relativePath)
+        unsupportedLinkErrors = {
+            errno.EXDEV,
+            errno.EPERM,
+            errno.EACCES,
+            errno.EMLINK,
+            errno.ENOSYS,
+            getattr(errno, "ENOTSUP", errno.EINVAL),
+            getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+        }
 
-            stored = cls.stageRawFile(run.filesystem, sourcePath, destinationFilesystem, destinationRoot, record)
+        def readableLocation(canonical, targetKey):
+            if not localDestination or canonical["object_key"] == targetKey:
+                return canonical
+
+            sourcePath = posixpath.join(destinationRoot, canonical["object_key"])
+            targetPath = posixpath.join(destinationRoot, targetKey)
+            destinationFilesystem.makedirs(posixpath.dirname(targetPath), exist_ok=True)
+
+            # Hard links are a filesystem metadata operation, not payload I/O.
+            # Do not create an alias to a symlink or special file.
+            sourceStat = os.lstat(sourcePath)
+
+            if not stat.S_ISREG(sourceStat.st_mode):
+                pglMessages.oneTimeWarning("A canonical payload is not a regular local file. Reusing its registered location without creating a hard link.", level=0)
+                return canonical
+
+            try:
+                os.link(sourcePath, targetPath, follow_symlinks=False)
+            except FileExistsError:
+                raise
+            except OSError as error:
+                if error.errno not in unsupportedLinkErrors:
+                    raise
+
+                pglMessages.oneTimeWarning("Hard links are unavailable for this storage location. Reusing verified payload locations without creating duplicate copies.", level=0)
+                return canonical
+
+            targetStat = os.lstat(targetPath)
+
+            if (
+                not stat.S_ISREG(targetStat.st_mode)
+                or targetStat.st_dev != sourceStat.st_dev
+                or targetStat.st_ino != sourceStat.st_ino
+            ):
+                raise OSError(f"Hard-link identity check failed: {targetKey}")
+
+            return {
+                "object_key": targetKey,
+                "sha256": canonical["sha256"],
+                "size_bytes": canonical["size_bytes"],
+            }
+
+        for record in manifest["files"]:
+            digest = record["sha256"]
+            canonical = verifiedByHash.get(digest)
+
+            if canonical is not None and canonical["size_bytes"] != record["size_bytes"]:
+                raise ValueError("Manifest contains conflicting sizes for the same SHA-256.")
+
+            if canonical is None:
+                statement = sql.SQL("""
+                    SELECT location.object_key, content.size_bytes
+                    FROM {} AS content
+                    JOIN {} AS location ON location.file_id = content.file_id
+                    WHERE content.sha256 = %s
+                      AND location.backend_id = %s
+                      AND location.status = 'present'
+                      AND location.verified_at IS NOT NULL
+                    ORDER BY location.priority, location.object_key
+                """).format(filesTable, locationsTable)
+                candidates = connection.execute(statement, (digest, backendID)).fetchall()
+                failures = []
+
+                for key, registeredSize in candidates:
+                    if registeredSize != record["size_bytes"]:
+                        raise ValueError("Registered content size conflicts with the manifest.")
+
+                    if not isinstance(key, str) or key.startswith("/") or "\\" in key or "\x00" in key or any(part in {"", ".", ".."} for part in key.split("/")):
+                        raise ValueError("Database contains an invalid payload object key.")
+
+                    try:
+                        actual = cls.hashFile(destinationFilesystem, posixpath.join(destinationRoot, key))
+
+                        if actual != {"sha256": digest, "size_bytes": record["size_bytes"]}:
+                            raise ValueError("Registered payload integrity check failed.")
+
+                    except (OSError, ValueError) as error:
+                        failures.append(type(error).__name__)
+                        continue
+
+                    canonical = {"object_key": key, **actual}
+                    break
+
+                if candidates and canonical is None:
+                    raise OSError(f"No registered copy could be verified for SHA-256 {digest}: {', '.join(failures)}")
+
+                if canonical is None:
+                    parts = record["name"].split("/", 2)
+                    runRecord = runsByPath["/".join(parts[:2])]
+                    run = session.runs[runRecord["index"]]
+                    sourcePath = posixpath.join(run.fullDataPath, parts[2])
+
+                    canonical = cls.stageRawFile(run.filesystem, sourcePath, destinationFilesystem, destinationRoot, record, objectKey=physicalKey(record["name"]))
+
+                verifiedByHash[digest] = canonical
+
+            stored = readableLocation(canonical, physicalKey(record["name"]))
             staged.append({"name": record["name"], **stored})
 
         return staged
-    
-    @classmethod
-    def stageRawManifest(cls, manifest, destinationFilesystem, destinationRoot):
-        """Store and verify the exact manifest bytes without publishing a checkpoint.
 
-        destinationRoot must be a resolved path for destinationFilesystem.
-        Failed operations may leave an unregistered staging object.
-        """
+    @classmethod
+    def stageRawManifest(cls, manifest, destinationFilesystem, destinationRoot, *, sessionID):
+        """Write and verify sessionNNNNNN/manifest.json without overwriting."""
+        if isinstance(sessionID, bool) or not isinstance(sessionID, int) or sessionID < 0:
+            raise ValueError("sessionID must be a nonnegative integer.")
+
+        cls.validateRawManifest(manifest)
         manifestBytes = cls.encodeRawManifest(manifest)
         expectedHash = hashlib.sha256(manifestBytes).hexdigest()
         expectedSize = len(manifestBytes)
 
-        objectKey = f"staging/{uuid.uuid4().hex}/manifest.json"
+        objectKey = f"session{sessionID:06d}/manifest.json"
         destinationPath = posixpath.join(destinationRoot, objectKey)
-        destinationFilesystem.makedirs(posixpath.dirname(destinationPath), exist_ok=True)
 
-        with destinationFilesystem.open(destinationPath, "wb") as file:
+        with destinationFilesystem.open(destinationPath, "xb") as file:
             file.write(manifestBytes)
 
         stored = cls.hashFile(destinationFilesystem, destinationPath)
@@ -372,14 +880,14 @@ class pglStorage:
     
     @classmethod
     def verifyAndRegisterStorageLocation(cls, connection, postgres, fileID, backendID, objectKey, storageOptions=None):
-        """Verify a payload and register its location in the caller's transaction.
+        """Verify and register an exact payload location.
 
-        Backend roots must be accessible from this client.
-        Runtime storageOptions are passed to fsspec, never stored.
-        Does not commit or overwrite an existing location's object key.
+        Allows multiple copies of identical content on the same backend.
+        A physical path cannot be reassigned to different content.
+
+        Uses the caller's transaction; does not commit.
+        Runtime storage options are never stored.
         """
-        from fsspec.core import url_to_fs
-
         if not isinstance(objectKey, str) or objectKey.startswith("/") or "\\" in objectKey or "\x00" in objectKey or any(part in {"", ".", ".."} for part in objectKey.split("/")):
             raise ValueError("objectKey must be a valid relative POSIX path.")
 
@@ -399,11 +907,11 @@ class pglStorage:
         if backend is None or not backend[1]:
             raise ValueError(f"Storage backend is missing or inactive: {backendID}")
 
-        statement = sql.SQL("SELECT object_key FROM {} WHERE file_id = %s AND backend_id = %s").format(locationsTable)
-        existing = connection.execute(statement, (fileID, backendID)).fetchone()
+        statement = sql.SQL("SELECT file_id FROM {} WHERE backend_id = %s AND object_key = %s").format(locationsTable)
+        existing = connection.execute(statement, (backendID, objectKey)).fetchone()
 
-        if existing is not None and existing[0] != objectKey:
-            raise ValueError("File already has a different object key on this backend.")
+        if existing is not None and existing[0] != fileID:
+            raise ValueError("Storage path is already registered to different content.")
 
         filesystem, root = url_to_fs(backend[0], **(storageOptions or {}))
         actual = cls.hashFile(filesystem, posixpath.join(root, objectKey))
@@ -415,16 +923,16 @@ class pglStorage:
             INSERT INTO {} AS location
                 (file_id, backend_id, object_key, status, verified_at)
             VALUES (%s, %s, %s, 'present', now())
-            ON CONFLICT (file_id, backend_id) DO UPDATE
+            ON CONFLICT (backend_id, object_key) DO UPDATE
             SET status = 'present', verified_at = EXCLUDED.verified_at
-            WHERE location.object_key = EXCLUDED.object_key
+            WHERE location.file_id = EXCLUDED.file_id
             RETURNING object_key
         """).format(locationsTable)
 
         row = connection.execute(statement, (fileID, backendID, objectKey)).fetchone()
 
         if row is None:
-            raise ValueError("File location changed concurrently; retry the transaction.")
+            raise ValueError("Storage path was registered concurrently to different content.")
 
         return row[0]
     
@@ -507,7 +1015,7 @@ class pglStorage:
         return row[0]
     
     @classmethod
-    def registerStagedRawCheckpoint(cls, connection, postgres, createdBy, backendID, manifest, staged, storedManifest, storageOptions=None):
+    def registerStagedRawCheckpoint(cls, connection, postgres, createdBy, backendID, manifest, staged, storedManifest, storageOptions=None, *, sessionID=None):
         """Register a staged behavioral archive without publishing it.
 
         Must be called inside the caller's transaction.
@@ -574,19 +1082,45 @@ class pglStorage:
         for subjectID in set(subjectsByRun.values()):
             cls.getOrCreateSubject(connection, postgres, subjectID)
 
-        checkpointID = cls.createRawCheckpoint(connection, postgres, createdBy)
+        if sessionID is None:
+            # Retain support for low-level tests that register an archive
+            # without allocating the checkpoint beforehand.
+            checkpointID = cls.createRawCheckpoint(connection, postgres, createdBy)
+        else:
+            sessionsTable = sql.Identifier(postgres.databaseSchema, "session")
+            linksTable = sql.Identifier(postgres.databaseSchema, "session_files")
+
+            statement = sql.SQL("""
+                SELECT status, origin, contract_version, created_by
+                FROM {}
+                WHERE session_id = %s
+                FOR UPDATE
+            """).format(sessionsTable)
+            checkpoint = connection.execute(statement, (sessionID,)).fetchone()
+
+            if checkpoint != ("in_progress", "raw", "pgl.raw.behavior.v1", createdBy):
+                raise ValueError("Checkpoint must be an in-progress raw behavioral checkpoint owned by the supplied creator.")
+
+            statement = sql.SQL("SELECT 1 FROM {} WHERE session_id = %s LIMIT 1").format(linksTable)
+
+            if connection.execute(statement, (sessionID,)).fetchone() is not None:
+                raise ValueError("Checkpoint already has file links.")
+
+            checkpointID = sessionID
         locationsTable = sql.Identifier(postgres.databaseSchema, "storage_locations")
 
+        registeredPayloads = {}
+
         def registerPayload(record):
-            fileID = cls.getOrCreateFile(connection, postgres, record["sha256"], record["size_bytes"])
+            identity = (record["sha256"], record["size_bytes"], record["object_key"])
 
-            statement = sql.SQL("SELECT object_key FROM {} WHERE file_id = %s AND backend_id = %s").format(locationsTable)
-            existing = connection.execute(statement, (fileID, backendID)).fetchone()
-            objectKey = record["object_key"] if existing is None else existing[0]
+            if identity not in registeredPayloads:
+                fileID = cls.getOrCreateFile(connection, postgres, record["sha256"], record["size_bytes"])
+                cls.verifyAndRegisterStorageLocation(connection, postgres, fileID, backendID, record["object_key"], storageOptions=storageOptions)
+                registeredPayloads[identity] = fileID
 
-            cls.verifyAndRegisterStorageLocation(connection, postgres, fileID, backendID, objectKey, storageOptions=storageOptions)
-            return fileID
-
+            return registeredPayloads[identity]
+        
         for name in sorted(expectedByName):
             fileID = registerPayload(stagedByName[name])
             cls.attachCheckpointFile(connection, postgres, checkpointID, name, fileID, role="acquisition", subjectID=subjectsByName[name])
@@ -1008,21 +1542,73 @@ class pglStorage:
         return subjectsByRun
     
     @classmethod
-    def saveRawSession(cls, connection, postgres, session, createdBy, backendID, storageOptions=None):
-        """Archive saved behavioral run files and return a completed checkpoint ID.
+    def saveRawSession(cls, session, *, settings=None, settingsName=None, backendID=None, storageOptions=None, sslRootCert=None):
+        """Resolve configuration and archive a session's acquisition files.
 
-        Existing completed checkpoints with the same manifest are reused,
-        without uploading another replica.
+        Resolves databasePath and username from current or supplied PGL
+        settings. Defaults to the first configured storage location;
+        backendID optionally overrides the destination.
 
-        The backend must be persistent, client-accessible, and outside the
-        source run directories. Acquisition must have finished before saving.
+        Returns the completed checkpoint ID, or None when configuration
+        is missing or password entry is cancelled.
 
-        Opens a transaction, or a savepoint if the caller already has one.
-        An outer caller transaction must commit for changes to persist.
-        Payload writes are not rolled back with database changes.
+        Archives original acquisition files, not in-memory modifications.
+        Acquisition must have finished. The destination must be outside
+        source run directories; that requirement is not checked here.
+
+        Identical completed checkpoints are reused without relocation.
+        Database changes are transactional; payload writes are not.
+        Other errors propagate after transaction and connection cleanup.
         """
-        from fsspec.core import url_to_fs
+        from .pglPostgres import pglPostgres
+        from .pglSettings import pglSettingsManager
 
+        resolvedSettings = pglSettingsManager.getSettings(settings=settings, settingsName=settingsName)
+
+        if resolvedSettings is None:
+            pglMessages.warning("Cannot save raw session: could not resolve PGL settings.", level=0)
+            return None
+
+        username = resolvedSettings.username
+
+        if not isinstance(username, str) or not username.strip() or "\x00" in username:
+            pglMessages.warning("Cannot save raw session: set a valid username in PGL settings.", level=0)
+            return None
+
+        postgres = pglPostgres.fromSettings(settings=resolvedSettings)
+
+        if postgres is None:
+            return None
+
+        if backendID is None and not postgres.storageLocations:
+            pglMessages.warning("Cannot save raw session: no storageLocations are configured in the PostgreSQL configuration.", level=0)
+            return None
+
+        with postgres.connect(sslRootCert=sslRootCert) as connection:
+            if connection is None:
+                return None
+
+            with connection.transaction():
+                if backendID is None:
+                    backendID = cls._getConfiguredStorageBackend(connection, postgres, storageOptions=storageOptions)
+
+                createdBy = cls.getOrCreateUser(connection, postgres, username)
+                sessionID = cls._saveRawSession(connection, postgres, session, createdBy, backendID, storageOptions=storageOptions)
+
+        # Report success only after the outer transaction commits.
+        pglMessages.message(f"Raw checkpoint {sessionID} is complete and available in {postgres.databaseName}.{postgres.databaseSchema}.")
+        return sessionID
+
+    @classmethod
+    def _saveRawSession(cls, connection, postgres, session, createdBy, backendID, storageOptions=None):
+        """Archive acquisition files using an already resolved connection.
+
+        New archives use sessionNNNNNN/runNNNNN/original-filename.
+        Identical completed checkpoints are reused without another replica.
+
+        Opens a transaction or savepoint. An outer caller transaction must
+        commit for changes to persist. Payload writes are not rolled back.
+        """
         manifest = cls.buildRawManifest(session)
         cls.validateRawManifest(manifest)
         manifestHash = cls.hashRawManifest(manifest)
@@ -1033,6 +1619,7 @@ class pglStorage:
 
         with connection.transaction():
             statement = sql.SQL("SELECT 1 FROM {} WHERE user_id = %s").format(usersTable)
+
             if connection.execute(statement, (createdBy,)).fetchone() is None:
                 raise ValueError(f"Unknown creator: {createdBy}")
 
@@ -1042,7 +1629,6 @@ class pglStorage:
             if backend is None or not backend[1]:
                 raise ValueError(f"Storage backend is missing or inactive: {backendID}")
 
-            # Coordinate cooperating ingestions of the same manifest.
             connection.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (manifestHash,))
 
             statement = sql.SQL("SELECT session_id, status, contract_version FROM {} WHERE manifest_hash = %s AND origin = 'raw'").format(sessionsTable)
@@ -1052,46 +1638,186 @@ class pglStorage:
                 if existing[1:] != ("complete", "pgl.raw.behavior.v1"):
                     raise ValueError("Matching manifest belongs to an incomplete or unsupported checkpoint.")
 
-                # Verify the existing manifest and check its registered links
-                # and available location metadata before reusing it.
                 optionsByBackend = {backendID: storageOptions or {}}
                 archivedManifest = cls.loadRawManifest(connection, postgres, existing[0], storageOptionsByBackend=optionsByBackend)
 
                 if archivedManifest != manifest:
                     raise ValueError("Existing checkpoint manifest differs from source manifest.")
-
+    
                 cls.getRawFileLocations(connection, postgres, existing[0], archivedManifest)
+                pglMessages.message(f"Found existing completed raw checkpoint {existing[0]}; reusing it without rewriting files.")
+                return existing[0]
+            
                 return existing[0]
 
             filesystem, root = url_to_fs(backend[0], **(storageOptions or {}))
 
-            staged = cls.stageRawSession(session, manifest, filesystem, root)
-            storedManifest = cls.stageRawManifest(manifest, filesystem, root)
+            # Allocate the real database identity before creating paths.
+            sessionID = cls.createRawCheckpoint(connection, postgres, createdBy)
 
-            sessionID = cls.registerStagedRawCheckpoint(connection, postgres, createdBy, backendID, manifest, staged, storedManifest, storageOptions=storageOptions)
+            staged = cls.stageRawSession(session, manifest, filesystem, root, sessionID=sessionID, connection=connection, postgres=postgres, backendID=backendID)
+            storedManifest = cls.stageRawManifest(manifest, filesystem, root, sessionID=sessionID)
+
+            cls.registerStagedRawCheckpoint(connection, postgres, createdBy, backendID, manifest, staged, storedManifest, storageOptions=storageOptions, sessionID=sessionID)
             cls.completeRawCheckpoint(connection, postgres, sessionID, manifest)
 
             return sessionID
     
+    @classmethod
+    def _getConfiguredStorageBackend(cls, connection, postgres, storageOptions=None):
+        """Resolve/register the first configured payload destination.
+
+        Uses the caller's transaction; does not commit or write payloads.
+        Runtime storage options are never stored in the database.
+        """
+        if not postgres.storageLocations:
+            raise ValueError("No payload destination is configured in postgres.storageLocations.")
+
+        configuredRoot = postgres.storageLocations[0]
+
+        if not isinstance(configuredRoot, str) or not configuredRoot.strip() or any(character in configuredRoot for character in ("\x00", "\n", "\r")):
+            raise ValueError("The configured payload destination must be a nonempty path or URL without NUL or newline characters.")
+
+        # Coordinate registration for this configured destination.
+        lockName = f"pgl.storage_backend:{postgres.databaseSchema}:{configuredRoot}"
+        connection.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (lockName,))
+
+        table = sql.Identifier(postgres.databaseSchema, "storage_backends")
+        statement = sql.SQL("""
+            SELECT backend_id, is_active
+            FROM {}
+            WHERE url_prefix = %s
+            ORDER BY is_active DESC, backend_id ASC
+            LIMIT 1
+        """).format(table)
+        existing = connection.execute(statement, (configuredRoot,)).fetchone()
+
+        if existing is not None:
+            backendID, isActive = existing
+
+            if not isActive:
+                raise ValueError("The configured payload destination is registered as inactive.")
+
+            return backendID
+
+        filesystem, _ = url_to_fs(configuredRoot, **(storageOptions or {}))
+        protocols = filesystem.protocol
+        protocols = {protocols} if isinstance(protocols, str) else set(protocols)
+
+        if protocols.intersection({"file", "local"}):
+            kind = "local"
+        elif protocols.intersection({"ssh", "sftp", "smb", "nfs"}):
+            kind = "nas"
+        elif protocols.intersection({"s3", "gs", "gcs", "az", "abfs", "abfss", "adl"}):
+            kind = "cloud"
+        else:
+            raise ValueError("Cannot automatically classify the configured storage protocol. Register the backend explicitly and supply backendID.")
+
+        rootHash = hashlib.sha256(configuredRoot.encode("utf-8")).hexdigest()
+        backendName = f"configured_{rootHash}"
+
+        return cls.getOrCreateStorageBackend(connection, postgres, backendName, kind, configuredRoot)
     # ------------------------------------------------------------
     # Public schema initialization
     # ------------------------------------------------------------
-
     @classmethod
     def initDatabase(cls, postgres=None, *, settings=None, settingsName=None):
-        """Initialize or upgrade the scientific schema.
+        """Set up the locally managed database and initialize its schema.
 
-        Uses the supplied pglPostgres object, or resolves it from pgl settings.
-        Prompts privately for administrator credentials.
-        Never drops tables, resets IDs, or modifies applied migration files.
+        Uses default PGL settings unless settings or settingsName is supplied.
+        An explicit postgres object may be supplied instead.
 
-        Returns True on success, or False for missing configuration or an
+        Loads configuration from databasePath. If missing, creates a local
+        configuration using that directory as installDirectory.
+
+        Ensures PostgreSQL is installed, initializes missing server data,
+        starts the server, creates the database/application access, and
+        applies pending schema migrations.
+
+        Never deletes existing data or resets an existing database.
+        Local server setup currently supports macOS/Homebrew only.
+        Returns False on cancellation or an operational connection failure.
+        """
+        from .pglPostgres import pglPostgres
+        from .pglSettings import pglSettingsManager
+
+        if postgres is not None and (settings is not None or settingsName is not None):
+            raise ValueError("Supply either postgres or PGL settings, not both.")
+
+        if postgres is None:
+            resolvedSettings = pglSettingsManager.getSettings(settings=settings, settingsName=settingsName)
+
+            if resolvedSettings is None:
+                pglMessages.warning("Could not resolve PGL settings.", level=0)
+                return False
+
+            directory = resolvedSettings.databasePath.strip()
+
+            if not directory:
+                pglMessages.warning("Set databasePath in PGL settings before initializing the database.", level=0)
+                return False
+
+            configurationFile = posixpath.join(directory.rstrip("/") + "/", pglPostgres.CONFIGURATION_FILENAME)
+
+            try:
+                postgres = pglPostgres.load(configurationFile)
+            except FileNotFoundError:
+                # Only bootstrap a local installation. Never interpret a
+                # missing remote configuration as a request for local setup.
+                _, localDirectory, isLocal = pglPostgres._resolveConfigurationFile(directory)
+
+                if not isLocal:
+                    pglMessages.warning("Remote PostgreSQL configuration was not found. Initialize the server on its installation machine.", level=0)
+                    return False
+
+                postgres = pglPostgres(installDirectory=localDirectory)
+                pglMessages.message(f"Creating local PostgreSQL configuration in {localDirectory}.")
+
+        if not isinstance(postgres, pglPostgres):
+            raise TypeError("postgres must be a pglPostgres instance.")
+
+        postgres._validateValues()
+
+        # The existing administration and migration implementation manages
+        # a local server only. Do not accidentally administer a local server
+        # when the loaded configuration describes a remote connection.
+        if (
+            getattr(postgres, "_configurationLoadedRemotely", False)
+            or postgres.connectionTransport != "direct"
+            or postgres.connectionHost != postgres.postgresHost
+            or postgres.connectionPort != postgres.postgresPort
+        ):
+            pglMessages.warning("Database initialization currently requires the locally managed server configuration. Run it on the installation machine.", level=0)
+            return False
+
+        try:
+            postgres.install()
+
+            if postgres.init() is False:
+                return False
+
+            postgres.start()
+
+            if not postgres.createDatabase():
+                return False
+
+            return cls._initDatabaseSchema(postgres=postgres)
+
+        except psycopg.OperationalError as error:
+            pglMessages.warning(f"Could not initialize PostgreSQL: {error}", level=0)
+            return False
+    
+    @classmethod
+    def _initDatabaseSchema(cls, postgres=None, *, settings=None, settingsName=None):
+        """Apply schema migrations using saved administrator credentials.
+
+        Returns False on missing configuration, cancellation, or an
         operational connection failure. Schema/ownership errors raise.
         """
         from .pglPostgres import pglPostgres
 
         if postgres is not None and (settings is not None or settingsName is not None):
-            raise ValueError("Supply either postgres or pgl settings, not both.")
+            raise ValueError("Supply either postgres or PGL settings, not both.")
 
         if postgres is None:
             postgres = pglPostgres.fromSettings(settings=settings, settingsName=settingsName)
@@ -1104,12 +1830,12 @@ class pglStorage:
 
         postgres._validateValues()
         migrations = cls._readMigrations()
-        adminPassword = postgres._askPassword(f"PostgreSQL administrator password for {postgres.adminUser}: ")
 
         try:
-            # _adminConnect verifies the actual server directory, version,
-            # and networking before returning the connection.
-            with postgres._adminConnect(adminPassword, postgres.databaseName) as connection:
+            with postgres._localConnect(database=postgres.databaseName) as connection:
+                if connection is None:
+                    return False
+
                 with connection.transaction():
                     connection.execute("SELECT pg_advisory_xact_lock(%s)", (cls.MIGRATION_LOCK,))
                     cls._prepareSchema(connection, postgres)
@@ -1117,7 +1843,7 @@ class pglStorage:
                     cls._grantApplicationAccess(connection, postgres)
 
         except psycopg.OperationalError as error:
-            pglMessages.warning(f"Could not complete schema initialization for {postgres.databaseName!r}. Check the server and credentials. If the connection was lost during commit, rerun initialization to check the recorded migration state.\n{error}")
+            pglMessages.warning(f"Could not complete schema initialization for {postgres.databaseName!r}. If the connection was lost during commit, rerun initialization to check migration state.\n{error}", level=0)
             return False
 
         if applied:
@@ -1127,7 +1853,6 @@ class pglStorage:
 
         pglMessages.message(f"Scientific schema ready: {postgres.databaseName}.{postgres.databaseSchema}")
         return True
-
     # ------------------------------------------------------------
     # Migration files
     # ------------------------------------------------------------
