@@ -284,44 +284,43 @@ class pglExperimentBase(pglStateDataSettings):
             for task in self.tasks:
                 task.display()   
 
-    def print(self):
+    def print(self, verbose=True):
         '''
         Print a summary of the experiment events.
         '''
         from pgl import pglTimestamp
         timestamp = pglTimestamp()
         # print separator
-        pglMessages.printHeader()
+        #pglMessages.printHeader()
         
         # print experiment name, subject ID, and duration
         pglMessages.print(f"Experiment: {self.experimentSettings.experimentName} | Subject ID: {self.experimentSettings.subjectID}")
+        pglMessages.print(f"Session: {self.experimentSettings.sessionName} | Run: {self.experimentSettings.runName}")
+        if self.data.startDateTime:
+            pglMessages.print(f"{self.data.startDateTime}")
         pglMessages.print(f"Duration: {timestamp.formatDuration(self.experimentDuration())}")
         
-        # FIX, FIX, FIX - old way
-        #displayInfo = f"Display: {self.settings.displayName[0] if self.settings.displayName and len(self.settings.displayName) > 0 else 'Unknown'} "
-        #displayInfo += f"{self.pglState.screenWidthPixels}x{self.pglState.screenHeightPixels} @ {self.pglState.frameRate}Hz "
-        #displayInfo += f"{self.pglState.screenWidthDegrees:.2f}x{self.pglState.screenHeightDegrees:.2f} deg "
-        #displayInfo += f"{self.settings.displayWidth:.2f}x{self.settings.displayHeight:.2f} cm at {self.settings.displayDistance:.2f} cm "
-        #print(displayInfo)
-        
         numVols = self.data.getNumEvents(type="volumeTrigger")
-        pglMessages.print(f"Number of volume triggers: {numVols}")
+        if numVols != 0:
+            pglMessages.print(f"Number of volume triggers: {numVols}")
         if numVols > 1:
             triggerStats = self.data.getTriggerStats()
             pglMessages.print(f"Median time between triggers: {triggerStats.median:.3f}s")
             pglMessages.print(f"Mean ± std time between triggers: {triggerStats.mean:.3f} ± {triggerStats.std:.6f}s")
 
         # print task names
-        for taskName in self.experimentSettings.tasks:
-            pglMessages.print(f"taskName: {taskName}")
+        #for taskName in self.experimentSettings.tasks:
+        #    pglMessages.print(f"taskName: {taskName} (nTrials=)")
 
         # print task data
         if hasattr(self, "tasks"):
             for task in self.tasks:
-                # print separtor
-                pglMessages.printHeader()
-                # print task
-                task.print()   
+                pglMessages.print(f"taskName: {task.settings.taskName} (nTrials={task.data.nTrials})")
+                if verbose:
+                    # print separtor
+                    pglMessages.printHeader()
+                    # print task
+                    task.print()   
                 
     def experimentDuration(self,data=None):
         '''

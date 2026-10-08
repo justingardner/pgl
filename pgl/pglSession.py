@@ -597,7 +597,7 @@ class pglSession(pglActionable):
 
         return pglStorage.saveRawSession(self, settings=settings, settingsName=settingsName, backendID=backendID, storageOptions=storageOptions, sslRootCert=sslRootCert)
 
-    def print(self):
+    def print(self, verbose=False):
         """Print a session overview followed by each run."""
         pglMessages.printHeader("Session")
 
@@ -619,7 +619,7 @@ class pglSession(pglActionable):
         for index, run in enumerate(self.runs):
             pglMessages.print()
             pglMessages.printHeader(f"Run {index + 1}", fillChar="-")
-            run.print()
+            run.print(verbose=verbose)
             
     def display(self):
         """Display every run and its tasks, returning the created figures."""
