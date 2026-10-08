@@ -1495,6 +1495,37 @@ class pglStorage:
         return manifest
     
     @classmethod
+    def loadSession(cls, sessionID, *, settings=None, settingsName=None, storageOptionsByBackend=None, sslRootCert=None):
+        """Load a completed raw behavioral checkpoint using PGL settings.
+
+        Returns a lazy session, or None for missing configuration or password
+        cancellation. Other errors propagate after connection cleanup.
+
+        Verifies the manifest immediately and acquisition files when opened.
+        No database connection is retained by the returned session.
+        """
+        from .pglPostgres import pglPostgres
+
+        if isinstance(sessionID, bool) or not isinstance(sessionID, int) or not 0 <= sessionID <= 9223372036854775807:
+            raise ValueError("sessionID must be a nonnegative PostgreSQL bigint.")
+
+        postgres = pglPostgres.fromSettings(settings=settings, settingsName=settingsName)
+
+        if postgres is None:
+            return None
+
+        with postgres.connect(sslRootCert=sslRootCert) as connection:
+            if connection is None:
+                return None
+
+            with connection.transaction():
+                connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+                session = cls.loadRawSession(connection, postgres, sessionID, storageOptionsByBackend=storageOptionsByBackend)
+
+        pglMessages.message(f"Loaded raw checkpoint {sessionID}; acquisition data will load on demand.")
+        return session
+    
+    @classmethod
     def loadRawSession(cls, connection, postgres, sessionID, storageOptionsByBackend=None):
         """Reconstruct a completed raw behavioral checkpoint as a lazy session.
 
