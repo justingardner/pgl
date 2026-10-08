@@ -28,6 +28,7 @@ from .pglBase import pglBase
 from pathlib import Path
 from .pglData import pglEpochsDataMatrix
 import posixpath
+import matplotlib.pyplot as plt
 
 ##################################
 # pglRun
@@ -596,5 +597,50 @@ class pglSession(pglActionable):
 
         return pglStorage.saveRawSession(self, settings=settings, settingsName=settingsName, backendID=backendID, storageOptions=storageOptions, sslRootCert=sslRootCert)
 
-        
+    def print(self):
+        """Print a session overview followed by each run."""
+        pglMessages.printHeader("Session")
+
+        protocol = getattr(self.filesystem, "protocol", None)
+        if isinstance(protocol, (tuple, list)):
+            protocol = ", ".join(protocol)
+
+        information = {
+            "Runs": len(self.runs),
+            "Filesystem": protocol or "Not set",
+            "MEG/EEG data": "Attached" if self.mne is not None else "None",
+        }
+
+        labelWidth = max(len(label) for label in information)
+
+        for label, value in information.items():
+            pglMessages.print(f"  {label:<{labelWidth}} : {value}")
+
+        for index, run in enumerate(self.runs):
+            pglMessages.print()
+            pglMessages.printHeader(f"Run {index + 1}", fillChar="-")
+            run.print()
+            
+    def display(self):
+        """Display every run and its tasks, returning the created figures."""
+        if not self.runs:
+            pglMessages.warning("No runs have been loaded.")
+            return []
+
+        figures = []
+
+        for index, run in enumerate(self.runs):
+            fig = run.display()
+
+            if fig is not None:
+                fig.suptitle(f"Run {index + 1}")
+                figures.append(fig)
+
+        return figures
  
+    @classmethod
+    def loadSession(cls, sessionID, *, settings=None, settingsName=None, storageOptionsByBackend=None, sslRootCert=None):
+        """Load an archived raw checkpoint as a lazy session using PGL settings."""
+        from .pglStorage import pglStorage
+
+        return pglStorage.loadSession(sessionID, settings=settings, settingsName=settingsName, storageOptionsByBackend=storageOptionsByBackend, sslRootCert=sslRootCert)
