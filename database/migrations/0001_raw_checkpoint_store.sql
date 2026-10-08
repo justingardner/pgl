@@ -60,7 +60,7 @@ CREATE TABLE storage_locations (
     status text NOT NULL DEFAULT 'pending',
     created_at timestamptz NOT NULL DEFAULT now(),
     verified_at timestamptz,
-    PRIMARY KEY (file_id, backend_id),
+    PRIMARY KEY (file_id, backend_id, object_key),
     UNIQUE (backend_id, object_key),
     CONSTRAINT storage_locations_status_check CHECK (status IN ('pending', 'present', 'missing')),
     CONSTRAINT storage_locations_verification_check CHECK (status <> 'present' OR verified_at IS NOT NULL)
