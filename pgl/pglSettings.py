@@ -29,6 +29,8 @@ import uuid
 import posixpath
 from os.path import exists, join
 from copy import deepcopy
+import getpass
+from traitlets import default
 
 
 #######################################
@@ -1237,6 +1239,7 @@ class pglSettings(pglTraitSettings):
     calibrateForGamma = List(Float, default_value=[0, 1.0, 2.2], help="What gamma to target calibration for 0.0 = No calibration, 1.0=linear, 2.2 typical for images/movies")
     dataPath = Unicode("~/data",help="Path to data directory").tag(isPath=True)
     databasePath = Unicode("~/data/pgl", isPath=True, help="Directory containing the PostgreSQL configuration, server log, and database files. Supports ~ for the home directory.")
+    username = Unicode(help="Creator username for data-store provenance. Defaults to the OS login username; editable to use a consistent identity across machines.")
     startKey = Unicode("space", allow_none=True, help="Key to start experiment")
     endKey = Unicode("escape", allow_none=True, help="Key to end experiment")
     volumeTriggerKey = Unicode("`", allow_none=True, help="Key press that signals scanner volume acquisition trigger")
@@ -1281,6 +1284,13 @@ class pglSettings(pglTraitSettings):
 
         return obj
     
+    @default("username")
+    def _defaultUsername(self):
+        try:
+            return getpass.getuser()
+        except (ImportError, KeyError, OSError):
+            pglMessages.warning("Could not determine the OS username. Set username in pglSettings before saving to the data store.", level=0)
+            return ""
     @classmethod
     def fromJSONdict(cls, data, type="all", filename=None):
         """Restore saved values without discovering current displays."""
