@@ -27,7 +27,7 @@ class pglStorage:
     MIGRATION_LOCK = 734_291_806_115
 
     @staticmethod
-    def print(details=None, postgres=None, *, settings=None, settingsName=None, sessionID=None, nRows=10, maxWidth=48, sslRootCert=None):
+    def print(details=None, postgres=None, *, settings=None, settingsName=None, sessionID=None, nRows=10, maxWidth=48, sslRootCert=None, includeDeleted=False):
         """Print a database summary, table details, or one checkpoint.
 
         Defaults to databasePath in the current PGL settings.
@@ -43,12 +43,19 @@ class pglStorage:
             Other aliases/copies are counted rather than listed repeatedly.
             Cannot be combined with details.
 
+        includeDeleted:
+            Include deleted sessions, file links, content identities, and
+            locations. Defaults to False. The override permits inspection;
+            it does not restore anything.
+            Subjects, users, and backends are not hidden as a side effect
+            of session deletion.
+
         nRows limits table detail views, not the session file listing.
         Session paths are displayed without truncation.
         Location status is recorded metadata, not a fresh payload check.
 
         Returns False for missing configuration, password cancellation,
-        or an unknown session. Other connection and query errors propagate.
+        or an unknown or hidden session. Other errors propagate.
         """
         from .pglPostgres import pglPostgres
         from psycopg.rows import tuple_row
@@ -62,6 +69,9 @@ class pglStorage:
             "users": ("user_id",),
             "session_files": ("session_id", "name"),
         }
+
+        if type(includeDeleted) is not bool:
+            raise ValueError("includeDeleted must be a boolean.")
 
         if postgres is not None and (settings is not None or settingsName is not None):
             raise ValueError("Supply either postgres or PGL settings, not both.")
@@ -103,6 +113,15 @@ class pglStorage:
         if not isinstance(postgres, pglPostgres):
             raise TypeError("postgres must be a pglPostgres instance.")
 
+        def reportTable(name):
+            """Select visible rows; callers supply the SQL table alias."""
+            table = sql.Identifier(postgres.databaseSchema, name)
+
+            if not includeDeleted and name in {"session", "session_files", "files", "storage_locations"}:
+                return sql.SQL("(SELECT * FROM {} WHERE deleted_at IS NULL)").format(table)
+
+            return table
+
         def archiveKey(name):
             """Return the conventional readable path, used only for preference."""
             if name == "manifest.json":
@@ -134,12 +153,12 @@ class pglStorage:
                     databaseName, databaseUser, snapshotTime = cursor.fetchone()
 
                     if sessionID is not None:
-                        sessionsTable = sql.Identifier(postgres.databaseSchema, "session")
-                        usersTable = sql.Identifier(postgres.databaseSchema, "users")
-                        linksTable = sql.Identifier(postgres.databaseSchema, "session_files")
-                        filesTable = sql.Identifier(postgres.databaseSchema, "files")
-                        locationsTable = sql.Identifier(postgres.databaseSchema, "storage_locations")
-                        backendsTable = sql.Identifier(postgres.databaseSchema, "storage_backends")
+                        sessionsTable = reportTable("session")
+                        usersTable = reportTable("users")
+                        linksTable = reportTable("session_files")
+                        filesTable = reportTable("files")
+                        locationsTable = reportTable("storage_locations")
+                        backendsTable = reportTable("storage_backends")
 
                         statement = sql.SQL("""
                             SELECT checkpoint.*, creator.username AS creator_username,
@@ -158,7 +177,8 @@ class pglStorage:
                             statement = sql.SQL("""
                                 SELECT link.name, link.role, link.subject_id,
                                        content.file_id, content.sha256,
-                                       content.size_bytes
+                                       content.size_bytes, link.deleted_at,
+                                       content.deleted_at
                                 FROM {} AS link
                                 JOIN {} AS content
                                   ON content.file_id = link.file_id
@@ -167,13 +187,15 @@ class pglStorage:
                             """).format(linksTable, filesTable)
                             cursor.execute(statement, (sessionID,))
 
-                            for name, role, subjectID, fileID, digest, sizeBytes in cursor.fetchall():
+                            for name, role, subjectID, fileID, digest, sizeBytes, linkDeletedAt, contentDeletedAt in cursor.fetchall():
                                 sessionFiles[name] = {
                                     "role": role,
                                     "subject_id": subjectID,
                                     "file_id": fileID,
                                     "sha256": digest,
                                     "size_bytes": sizeBytes,
+                                    "link_deleted_at": linkDeletedAt,
+                                    "content_deleted_at": contentDeletedAt,
                                     "expected_key": archiveKey(name),
                                     "locations": [],
                                     "other_location_count": 0,
@@ -183,14 +205,14 @@ class pglStorage:
                             locationsByFile = {}
 
                             if fileIDs:
-                                # Fetch each content location once, rather
+                                # Fetch each content location once rather
                                 # than multiplying it by logical filenames.
                                 statement = sql.SQL("""
                                     SELECT location.file_id, location.object_key,
                                            backend.backend_id, backend.name,
                                            backend.url_prefix, backend.is_active,
                                            location.status, location.priority,
-                                           location.verified_at
+                                           location.verified_at, location.deleted_at
                                     FROM {} AS location
                                     JOIN {} AS backend
                                       ON backend.backend_id = location.backend_id
@@ -200,8 +222,8 @@ class pglStorage:
                                 """).format(locationsTable, backendsTable)
                                 cursor.execute(statement, (fileIDs,))
 
-                                for fileID, key, backendID, backendName, root, active, status, priority, verifiedAt in cursor.fetchall():
-                                    locationsByFile.setdefault(fileID, []).append({
+                                for fileID, key, backendID, backendName, root, active, status, priority, verifiedAt, deletedAt in cursor.fetchall():
+                                    location = {
                                         "backend_id": backendID,
                                         "backend_name": backendName,
                                         "root": root,
@@ -210,7 +232,9 @@ class pglStorage:
                                         "status": status,
                                         "priority": priority,
                                         "verified_at": verifiedAt,
-                                    })
+                                        "deleted_at": deletedAt,
+                                    }
+                                    locationsByFile.setdefault(fileID, []).append(location)
 
                             for record in sessionFiles.values():
                                 candidates = locationsByFile.get(record["file_id"], [])
@@ -218,14 +242,7 @@ class pglStorage:
                                 def locationOrder(location):
                                     eligible = location["active"] and location["status"] == "present" and location["verified_at"] is not None
                                     expectedPath = location["object_key"] == record["expected_key"]
-
-                                    return (
-                                        not eligible,
-                                        not expectedPath,
-                                        location["priority"],
-                                        location["backend_id"],
-                                        location["object_key"],
-                                    )
+                                    return (not eligible, not expectedPath, location["priority"], location["backend_id"], location["object_key"])
 
                                 ordered = sorted(candidates, key=locationOrder)
                                 record["locations"] = ordered[:1]
@@ -233,9 +250,9 @@ class pglStorage:
 
                     elif requested:
                         for name in requested:
-                            table = sql.Identifier(postgres.databaseSchema, name)
+                            table = reportTable(name)
                             order = sql.SQL(", ").join(sql.Identifier(column) for column in tableOrder[name])
-                            statement = sql.SQL("SELECT * FROM {} ORDER BY {} LIMIT %s").format(table, order)
+                            statement = sql.SQL("SELECT * FROM {} AS record ORDER BY {} LIMIT %s").format(table, order)
                             cursor.execute(statement, (nRows + 1,))
 
                             headers = [column.name for column in cursor.description]
@@ -244,12 +261,17 @@ class pglStorage:
 
                     else:
                         for name in tableOrder:
-                            table = sql.Identifier(postgres.databaseSchema, name)
-                            cursor.execute(sql.SQL("SELECT count(*) FROM {}").format(table))
+                            table = reportTable(name)
+                            cursor.execute(sql.SQL("SELECT count(*) FROM {} AS record").format(table))
                             counts.append((name, cursor.fetchone()[0]))
 
-                        table = sql.Identifier(postgres.databaseSchema, "session")
-                        statement = sql.SQL("SELECT origin, status, count(*) FROM {} GROUP BY origin, status ORDER BY origin, status").format(table)
+                        table = reportTable("session")
+
+                        if includeDeleted:
+                            statement = sql.SQL("SELECT origin, status, deleted_at IS NOT NULL AS deleted, count(*) FROM {} AS record GROUP BY origin, status, deleted_at IS NOT NULL ORDER BY origin, status, deleted").format(table)
+                        else:
+                            statement = sql.SQL("SELECT origin, status, count(*) FROM {} AS record GROUP BY origin, status ORDER BY origin, status").format(table)
+
                         cursor.execute(statement)
                         checkpointCounts = cursor.fetchall()
 
@@ -282,10 +304,11 @@ class pglStorage:
 
         if sessionID is not None:
             if sessionRecord is None:
-                pglMessages.warning(f"No session {sessionID} exists in {databaseName}.{postgres.databaseSchema}.", level=0)
+                pglMessages.warning(f"No visible session {sessionID} found in {databaseName}.{postgres.databaseSchema}; it may be absent or excluded by the deletion filter.", level=0)
                 return False
 
-            pglMessages.printHeader(f"Session {sessionID}")
+            deletionLabel = " [DELETED]" if sessionRecord["deleted_at"] is not None else ""
+            pglMessages.printHeader(f"Session {sessionID}{deletionLabel}")
             pglMessages.message(f"Database: {databaseName}.{postgres.databaseSchema}", wrapText=False)
             pglMessages.message(f"Snapshot transaction started: {snapshotTime}", wrapText=False)
 
@@ -296,11 +319,7 @@ class pglStorage:
             for name, value in sessionRecord.items():
                 pglMessages.print(f"  {name:<{labelWidth}} : {displayValue(value)}")
 
-            subjects = sorted({
-                record["subject_id"]
-                for record in sessionFiles.values()
-                if record["subject_id"] is not None
-            })
+            subjects = sorted({record["subject_id"] for record in sessionFiles.values() if record["subject_id"] is not None})
 
             pglMessages.print()
             pglMessages.printHeader("Subjects", fillChar="-")
@@ -312,6 +331,9 @@ class pglStorage:
             pglMessages.print("  Status is recorded metadata; payloads have not been checked.")
             pglMessages.print("  Registered aliases/copies are paths, not necessarily separate physical byte copies.")
 
+            if includeDeleted:
+                pglMessages.print("  Including deleted records. Read eligibility below assumes this inspection override.")
+
             if not sessionFiles:
                 pglMessages.print("  (no linked files)")
 
@@ -320,8 +342,13 @@ class pglStorage:
                 pglMessages.print(f"  {displayValue(name)}")
                 pglMessages.print(f"    file_id: {record['file_id']} | bytes: {record['size_bytes']} | role: {displayValue(record['role'])}")
 
+                if includeDeleted:
+                    linkState = "DELETED" if record["link_deleted_at"] is not None else "active"
+                    contentState = "DELETED" if record["content_deleted_at"] is not None else "active"
+                    pglMessages.print(f"    File link: {linkState} | shared content identity: {contentState}")
+
                 if not record["locations"]:
-                    pglMessages.print("    No registered storage location.")
+                    pglMessages.print("    No visible registered storage location.")
                     continue
 
                 location = record["locations"][0]
@@ -334,13 +361,21 @@ class pglStorage:
                 pglMessages.print(f"    Backend: {location['backend_id']} | status: {displayValue(location['status'])} | active: {location['active']} | eligible for reads: {eligible}")
                 pglMessages.print(f"    Last verified: {displayValue(location['verified_at'])}")
 
+                if includeDeleted:
+                    locationState = "DELETED" if location["deleted_at"] is not None else "active"
+                    pglMessages.print(f"    Location deletion state: {locationState}")
+
                 if record["other_location_count"]:
-                    pglMessages.print(f"    Other registered aliases/copies: {record['other_location_count']}")
+                    pglMessages.print(f"    Other visible registered aliases/copies: {record['other_location_count']}")
 
         elif requested:
             for name, headers, rows, hasMore in detailResults:
                 pglMessages.print()
                 pglMessages.printHeader(name, fillChar="-")
+
+                if includeDeleted:
+                    pglMessages.print("  Including deleted records; deleted_at is the deletion marker where applicable.")
+
                 pglMessages.print(f"  First {len(rows)} rows, ordered by {', '.join(tableOrder[name])}")
                 printTable(headers, rows)
 
@@ -349,6 +384,7 @@ class pglStorage:
 
         else:
             pglMessages.printHeader("PGL database snapshot")
+            pglMessages.print("  Including deleted records." if includeDeleted else "  Deleted records excluded.")
             pglMessages.message(f"Database: {databaseName}.{postgres.databaseSchema}", wrapText=False)
             pglMessages.message(f"User: {databaseUser} | Transport: {postgres.connectionTransport}", wrapText=False)
             pglMessages.message(f"Snapshot transaction started: {snapshotTime}", wrapText=False)
@@ -359,7 +395,8 @@ class pglStorage:
 
             pglMessages.print()
             pglMessages.printHeader("Checkpoint status", fillChar="-")
-            printTable(("origin", "status", "checkpoints"), checkpointCounts)
+            checkpointHeaders = ("origin", "status", "deleted", "checkpoints") if includeDeleted else ("origin", "status", "checkpoints")
+            printTable(checkpointHeaders, checkpointCounts)
 
         pglMessages.printHeader()
         return True
@@ -1208,11 +1245,15 @@ class pglStorage:
         return manifestHash
     
     @classmethod
-    def getRawFileLocations(cls, connection, postgres, sessionID, manifest):
-        """Return acquisition-file identities and candidate storage locations."""
+    def getRawFileLocations(cls, connection, postgres, sessionID, manifest, *, includeDeleted=False):
+        """
+        Return acquisition-file identities and candidate storage locations.
+        Deleted sessions are hidden unless includeDeleted=True.
+        The override permits inspection; it does not undelete the session.
+        """
         cls.validateRawManifest(manifest)
 
-        manifestIdentity = cls.getRawManifestLocations(connection, postgres, sessionID)
+        manifestIdentity = cls.getRawManifestLocations(connection, postgres, sessionID, includeDeleted=includeDeleted)
         manifestBytes = cls.encodeRawManifest(manifest)
 
         if hashlib.sha256(manifestBytes).hexdigest() != manifestIdentity["sha256"] or len(manifestBytes) != manifestIdentity["size_bytes"]:
@@ -1280,20 +1321,26 @@ class pglStorage:
         return result
 
     @staticmethod
-    def getRawManifestLocations(connection, postgres, sessionID):
-        """Return the manifest identity and candidate locations for a completed checkpoint."""
+    def getRawManifestLocations(connection, postgres, sessionID, *, includeDeleted=False):
+        """
+        Return the manifest identity and candidate locations for a completed checkpoint.
+        Deleted sessions are hidden unless includeDeleted=True.
+        The override permits inspection; it does not undelete the session.
+        """
+        if type(includeDeleted) is not bool:
+            raise ValueError("includeDeleted must be a boolean.")
+        
         sessionsTable = sql.Identifier(postgres.databaseSchema, "session")
         linksTable = sql.Identifier(postgres.databaseSchema, "session_files")
         filesTable = sql.Identifier(postgres.databaseSchema, "files")
         locationsTable = sql.Identifier(postgres.databaseSchema, "storage_locations")
         backendsTable = sql.Identifier(postgres.databaseSchema, "storage_backends")
 
-        statement = sql.SQL("SELECT status, origin, contract_version, manifest_hash FROM {} WHERE session_id = %s").format(sessionsTable)
-        checkpoint = connection.execute(statement, (sessionID,)).fetchone()
+        statement = sql.SQL("SELECT status, origin, contract_version, manifest_hash FROM {} WHERE session_id = %s AND (%s OR deleted_at IS NULL)").format(sessionsTable)
+        checkpoint = connection.execute(statement, (sessionID, includeDeleted)).fetchone()
 
         if checkpoint is None:
-            raise ValueError(f"Unknown checkpoint: {sessionID}")
-
+            raise ValueError(f"Unknown or deleted checkpoint: {sessionID}")
         status, origin, contractVersion, manifestHash = checkpoint
 
         if status != "complete":
@@ -1340,18 +1387,21 @@ class pglStorage:
         }
         
     @classmethod
-    def loadRawManifest(cls, connection, postgres, sessionID, storageOptionsByBackend=None, maxBytes=16 * 1024 * 1024):
+    def loadRawManifest(cls, connection, postgres, sessionID, storageOptionsByBackend=None, maxBytes=16 * 1024 * 1024, *, includeDeleted=False):
         """Retrieve and verify a completed checkpoint's manifest.
 
         Runtime storage options are keyed by backend_id and are never saved.
         This checks content identity and contract version, not the full schema.
+        
+        Deleted sessions are hidden unless includeDeleted=True.
+        The override permits inspection; it does not undelete the session.
         """
         from fsspec.core import url_to_fs
 
         if isinstance(maxBytes, bool) or not isinstance(maxBytes, int) or maxBytes <= 0:
             raise ValueError("maxBytes must be a positive integer.")
 
-        located = cls.getRawManifestLocations(connection, postgres, sessionID)
+        located = cls.getRawManifestLocations(connection, postgres, sessionID, includeDeleted=includeDeleted)
 
         if located["size_bytes"] > maxBytes:
             raise ValueError("Manifest exceeds the configured size limit.")
@@ -1495,48 +1545,83 @@ class pglStorage:
         return manifest
     
     @classmethod
-    def loadSession(cls, sessionID, *, settings=None, settingsName=None, storageOptionsByBackend=None, sslRootCert=None):
+    def loadSession(cls, sessionID, *, settings=None, settingsName=None, storageOptionsByBackend=None, sslRootCert=None, includeDeleted=False):
         """Load a completed raw behavioral checkpoint using PGL settings.
 
-        Returns a lazy session, or None for missing configuration or password
-        cancellation. Other errors propagate after connection cleanup.
+        Unknown or hidden sessions warn at level 0 and return None.
+        Invalid arguments warn at level 1 and return None.
+        Database failures warn at level 2 and return None.
+        Missing configuration or connection cancellation returns None.
 
-        Verifies the manifest immediately and acquisition files when opened.
-        No database connection is retained by the returned session.
+        Deleted sessions are hidden unless includeDeleted=True.
+        The override permits inspection; it does not undelete the session.
+
+        Manifest, payload, and contract-validation errors propagate.
+        No SQL connection is retained by the returned session.
         """
         from .pglPostgres import pglPostgres
 
         if isinstance(sessionID, bool) or not isinstance(sessionID, int) or not 0 <= sessionID <= 9223372036854775807:
-            raise ValueError("sessionID must be a nonnegative PostgreSQL bigint.")
-
-        postgres = pglPostgres.fromSettings(settings=settings, settingsName=settingsName)
-
-        if postgres is None:
+            pglMessages.warning("sessionID must be a nonnegative PostgreSQL bigint.", level=1)
             return None
 
-        with postgres.connect(sslRootCert=sslRootCert) as connection:
-            if connection is None:
+        if type(includeDeleted) is not bool:
+            pglMessages.warning("includeDeleted must be a boolean.", level=1)
+            return None
+
+        session = None
+        visible = False
+
+        try:
+            try:
+                postgres = pglPostgres.fromSettings(settings=settings, settingsName=settingsName)
+            except (TypeError, ValueError) as error:
+                pglMessages.warning(f"Cannot load session: invalid settings or configuration: {error}", level=1)
                 return None
 
-            with connection.transaction():
-                connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
-                session = cls.loadRawSession(connection, postgres, sessionID, storageOptionsByBackend=storageOptionsByBackend)
+            if postgres is None:
+                return None
+
+            with postgres.connect(sslRootCert=sslRootCert) as connection:
+                if connection is None:
+                    return None
+
+                with connection.transaction():
+                    connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+
+                    table = sql.Identifier(postgres.databaseSchema, "session")
+                    statement = sql.SQL("SELECT 1 FROM {} WHERE session_id = %s AND (%s OR deleted_at IS NULL)").format(table)
+                    visible = connection.execute(statement, (sessionID, includeDeleted)).fetchone() is not None
+
+                    if visible:
+                        session = cls.loadRawSession(connection, postgres, sessionID, storageOptionsByBackend=storageOptionsByBackend, includeDeleted=includeDeleted)
+
+        except psycopg.Error as error:
+            pglMessages.warning(f"Could not load session {sessionID}: {error}", level=2)
+            return None
+
+        if not visible:
+            reason = "Unknown checkpoint" if includeDeleted else "Unknown or deleted checkpoint"
+            pglMessages.warning(f"{reason}: {sessionID}", level=0)
+            return None
 
         pglMessages.message(f"Loaded raw checkpoint {sessionID}; acquisition data will load on demand.")
         return session
-    
+        
     @classmethod
-    def loadRawSession(cls, connection, postgres, sessionID, storageOptionsByBackend=None):
+    def loadRawSession(cls, connection, postgres, sessionID, storageOptionsByBackend=None, *, includeDeleted=False):
         """Reconstruct a completed raw behavioral checkpoint as a lazy session.
 
         Uses the caller's SQL connection for metadata lookup only.
         Verifies the manifest immediately; acquisition payloads are verified
         when opened through the returned session's filesystem.
+        Deleted sessions are hidden unless includeDeleted=True.
+        The override permits inspection; it does not undelete the session.
         """
         from .pglSession import pglSession
 
-        manifest = cls.loadRawManifest(connection, postgres, sessionID, storageOptionsByBackend=storageOptionsByBackend)
-        fileLocations = cls.getRawFileLocations(connection, postgres, sessionID, manifest)
+        manifest = cls.loadRawManifest(connection, postgres, sessionID, storageOptionsByBackend=storageOptionsByBackend, includeDeleted=includeDeleted)
+        fileLocations = cls.getRawFileLocations(connection, postgres, sessionID, manifest, includeDeleted=includeDeleted)
 
         filesystem = pglCheckpointFilesystem(manifest, fileLocations, storageOptionsByBackend=storageOptionsByBackend)
         runPaths = [record["path"] for record in manifest["runs"]]
@@ -1590,6 +1675,7 @@ class pglStorage:
         Identical completed checkpoints are reused without relocation.
         Database changes are transactional; payload writes are not.
         Other errors propagate after transaction and connection cleanup.
+        Matching deleted checkpoints require explicit undelete.
         """
         from .pglPostgres import pglPostgres
         from .pglSettings import pglSettingsManager
@@ -1639,6 +1725,7 @@ class pglStorage:
 
         Opens a transaction or savepoint. An outer caller transaction must
         commit for changes to persist. Payload writes are not rolled back.
+        Matching deleted checkpoints require explicit undelete.
         """
         manifest = cls.buildRawManifest(session)
         cls.validateRawManifest(manifest)
@@ -1662,24 +1749,53 @@ class pglStorage:
 
             connection.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (manifestHash,))
 
-            statement = sql.SQL("SELECT session_id, status, contract_version FROM {} WHERE manifest_hash = %s AND origin = 'raw'").format(sessionsTable)
-            existing = connection.execute(statement, (manifestHash,)).fetchone()
+            statement = sql.SQL("""
+                SELECT session_id, status, contract_version, deleted_at
+                FROM {}
+                WHERE manifest_hash = %s AND origin = 'raw'
+                FOR SHARE
+            """).format(sessionsTable)
+            existing = connection.execute(
+                statement, (manifestHash,)
+            ).fetchone()
 
             if existing is not None:
-                if existing[1:] != ("complete", "pgl.raw.behavior.v1"):
-                    raise ValueError("Matching manifest belongs to an incomplete or unsupported checkpoint.")
+                existingID, status, contractVersion, deletedAt = existing
+
+                if deletedAt is not None:
+                    raise ValueError(
+                        f"Matching raw checkpoint {existingID} is deleted. "
+                        "Explicitly undelete that session before saving "
+                        "identical acquisition data."
+                    )
+
+                if (status, contractVersion) != (
+                    "complete", "pgl.raw.behavior.v1"
+                ):
+                    raise ValueError(
+                        "Matching manifest belongs to an incomplete "
+                        "or unsupported checkpoint."
+                    )
 
                 optionsByBackend = {backendID: storageOptions or {}}
-                archivedManifest = cls.loadRawManifest(connection, postgres, existing[0], storageOptionsByBackend=optionsByBackend)
+                archivedManifest = cls.loadRawManifest(
+                    connection, postgres, existingID,
+                    storageOptionsByBackend=optionsByBackend,
+                )
 
                 if archivedManifest != manifest:
-                    raise ValueError("Existing checkpoint manifest differs from source manifest.")
-    
-                cls.getRawFileLocations(connection, postgres, existing[0], archivedManifest)
-                pglMessages.message(f"Found existing completed raw checkpoint {existing[0]}; reusing it without rewriting files.")
-                return existing[0]
-            
-                return existing[0]
+                    raise ValueError(
+                        "Existing checkpoint manifest differs from source manifest."
+                    )
+
+                cls.getRawFileLocations(
+                    connection, postgres, existingID, archivedManifest
+                )
+                pglMessages.message(
+                    f"Found existing completed raw checkpoint {existingID}; "
+                    "reusing it without rewriting files."
+                )
+                return existingID            
 
             filesystem, root = url_to_fs(backend[0], **(storageOptions or {}))
 
@@ -1748,6 +1864,352 @@ class pglStorage:
         backendName = f"configured_{rootHash}"
 
         return cls.getOrCreateStorageBackend(connection, postgres, backendName, kind, configuredRoot)
+    
+    @classmethod
+    def deleteSession(cls, sessionID, *, settings=None, settingsName=None, sslRootCert=None):
+        """Soft-delete a session and dependencies not needed by active sessions.
+
+        Returns True after a committed change, False for an unchanged state
+        or unknown session, and None for invalid arguments, missing
+        configuration, cancellation, or a database failure.
+
+        Unknown sessions warn at level 0, invalid arguments at level 1,
+        and database failures at level 2. Unexpected programming errors
+        propagate. Never deletes payloads.
+        """
+        return cls._changeSessionDeletionState(sessionID, deleted=True, settings=settings, settingsName=settingsName, sslRootCert=sslRootCert)
+
+    @classmethod
+    def undeleteSession(cls, sessionID, *, settings=None, settingsName=None, sslRootCert=None):
+        """Restore a soft-deleted session and its dependent records.
+
+        Returns True after a committed change, False for an unchanged state
+        or unknown session, and None for invalid arguments, missing
+        configuration, cancellation, or a database failure.
+
+        Unknown sessions warn at level 0, invalid arguments at level 1,
+        and database failures at level 2. Unexpected programming errors
+        propagate. Does not reread or rewrite payloads.
+        """
+        return cls._changeSessionDeletionState(sessionID, deleted=False, settings=settings, settingsName=settingsName, sslRootCert=sslRootCert)
+
+    @classmethod
+    def _changeSessionDeletionState(cls, sessionID, *, deleted, settings=None, settingsName=None, sslRootCert=None):
+        """Settings-based lifecycle wrapper with warning and commit handling."""
+        from .pglPostgres import pglPostgres
+
+        if isinstance(sessionID, bool) or not isinstance(sessionID, int) or not 0 <= sessionID <= 9223372036854775807:
+            pglMessages.warning("sessionID must be a nonnegative PostgreSQL bigint.", level=1)
+            return None
+
+        if type(deleted) is not bool:
+            pglMessages.warning("deleted must be a boolean.", level=1)
+            return None
+
+        action = "delete" if deleted else "undelete"
+        changed = False
+        found = False
+
+        try:
+            # Handle argument/configuration validation separately from the
+            # database operation. Do not broadly catch programming errors.
+            try:
+                postgres = pglPostgres.fromSettings(settings=settings, settingsName=settingsName)
+            except (TypeError, ValueError) as error:
+                pglMessages.warning(f"Cannot {action} session: invalid settings or configuration: {error}", level=1)
+                return None
+
+            if postgres is None:
+                return None
+
+            with postgres.connect(sslRootCert=sslRootCert) as connection:
+                if connection is None:
+                    return None
+
+                with connection.transaction():
+                    connection.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+
+                    # Existing guards prohibit session hard deletion.
+                    # The cascade obtains its own locks and checks the
+                    # current deletion state before making any changes.
+                    table = sql.Identifier(postgres.databaseSchema, "session")
+                    statement = sql.SQL("SELECT 1 FROM {} WHERE session_id = %s").format(table)
+                    found = connection.execute(statement, (sessionID,)).fetchone() is not None
+
+                    if found:
+                        changed = cls._setSessionDeleted(connection, postgres, sessionID, deleted=deleted)
+
+        except psycopg.Error as error:
+            # Transaction and connection contexts have unwound before
+            # reporting the failure. A lost commit acknowledgement can
+            # leave the client uncertain whether the change committed.
+            pglMessages.warning(f"Could not {action} session {sessionID}: {error}. If the connection failed during commit, the outcome may be uncertain; check the session state before retrying.", level=2)
+            return None
+
+        if not found:
+            pglMessages.warning(f"Unknown session {sessionID} in {postgres.databaseName}.{postgres.databaseSchema}.", level=0)
+            return False
+
+        # Report success only after transaction and connection cleanup.
+        if changed:
+            state = "soft-deleted" if deleted else "restored"
+            pglMessages.message(f"Session {sessionID} {state} in {postgres.databaseName}.{postgres.databaseSchema}.")
+
+        return changed
+    
+    @staticmethod
+    def getSessionDeletionImpact(connection, postgres, sessionID):
+        """Preview which linked content would become eligible for soft deletion.
+
+        Includes deleted sessions. Does not change database rows or payloads.
+
+        Files remain shared when another nondeleted session references them,
+        regardless of that session's publication status.
+
+        This is an informational preview, not a concurrency-safe deletion
+        decision. The actual delete operation must coordinate concurrent
+        changes and recompute eligibility inside its transaction.
+        """
+        if (
+            isinstance(sessionID, bool)
+            or not isinstance(sessionID, int)
+            or not 0 <= sessionID <= 9223372036854775807
+        ):
+            raise ValueError("sessionID must be a nonnegative PostgreSQL bigint.")
+
+        sessions = sql.Identifier(postgres.databaseSchema, "session")
+        links = sql.Identifier(postgres.databaseSchema, "session_files")
+        locations = sql.Identifier(postgres.databaseSchema, "storage_locations")
+
+        # One statement provides a consistent snapshot for this preview.
+        statement = sql.SQL("""
+            SELECT checkpoint.deleted_at,
+                   linked.file_id,
+                   CASE WHEN linked.file_id IS NOT NULL THEN EXISTS (
+                       SELECT 1
+                       FROM {links} AS other_link
+                       JOIN {sessions} AS other_session
+                         ON other_session.session_id = other_link.session_id
+                       WHERE other_link.file_id = linked.file_id
+                         AND other_session.session_id <> checkpoint.session_id
+                         AND other_session.deleted_at IS NULL
+                   ) ELSE false END AS shared_with_active_session,
+                   (
+                       SELECT count(*)
+                       FROM {locations} AS location
+                       WHERE location.file_id = linked.file_id
+                   ) AS location_count
+            FROM {sessions} AS checkpoint
+            LEFT JOIN (
+                SELECT DISTINCT session_id, file_id
+                FROM {links}
+                WHERE session_id = %s
+            ) AS linked
+              ON linked.session_id = checkpoint.session_id
+            WHERE checkpoint.session_id = %s
+            ORDER BY linked.file_id
+        """).format(sessions=sessions, links=links, locations=locations)
+
+        rows = connection.execute(statement, (sessionID, sessionID)).fetchall()
+
+        if not rows:
+            raise ValueError(f"Unknown session: {sessionID}")
+
+        exclusive = []
+        shared = []
+        exclusiveLocationCount = 0
+        sharedLocationCount = 0
+
+        for deletedAt, fileID, sharedWithActiveSession, locationCount in rows:
+            if fileID is None:
+                continue
+
+            if sharedWithActiveSession:
+                shared.append(fileID)
+                sharedLocationCount += locationCount
+            else:
+                exclusive.append(fileID)
+                exclusiveLocationCount += locationCount
+
+        return {
+            "session_id": sessionID,
+            "deleted_at": rows[0][0],
+            "exclusive_file_ids": exclusive,
+            "shared_file_ids": shared,
+            "exclusive_location_count": exclusiveLocationCount,
+            "shared_location_count": sharedLocationCount,
+        }    
+
+    @staticmethod
+    def _setSessionDeleted(connection, postgres, sessionID, *, deleted):
+        """Atomically soft-delete or restore a session and its dependencies.
+
+        Internal lifecycle operation; performs no payload I/O.
+
+        Returns True if the session's state changed, otherwise False.
+        Unknown session IDs raise ValueError.
+
+        Opens a transaction or savepoint. If the caller already has a
+        transaction, that outer transaction must commit for persistence.
+
+        Requires READ COMMITTED isolation. Conservative table locks prevent
+        reference changes during the cascade and last until the outer
+        transaction finishes.
+
+        Dependency rules:
+        - File-link markers exactly follow their owning session.
+        - Content is deleted only if no nondeleted session references it.
+        - All locations follow their content identity's deletion state.
+        - Subjects, users, and backends are unchanged.
+
+        Not yet a public API: print/load/save integration must be completed
+        before using this operation on real checkpoints.
+        """
+        if (
+            isinstance(sessionID, bool)
+            or not isinstance(sessionID, int)
+            or not 0 <= sessionID <= 9223372036854775807
+        ):
+            raise ValueError("sessionID must be a nonnegative PostgreSQL bigint.")
+
+        if type(deleted) is not bool:
+            raise ValueError("deleted must be a boolean.")
+
+        sessions = sql.Identifier(postgres.databaseSchema, "session")
+        links = sql.Identifier(postgres.databaseSchema, "session_files")
+        files = sql.Identifier(postgres.databaseSchema, "files")
+        locations = sql.Identifier(postgres.databaseSchema, "storage_locations")
+
+        with connection.transaction():
+            isolation = connection.execute(
+                "SHOW transaction_isolation"
+            ).fetchone()[0]
+
+            if isolation != "read committed":
+                raise ValueError(
+                    "Session delete/undelete requires READ COMMITTED isolation."
+                )
+
+            # Fixed order for cooperating lifecycle operations.
+            # EXCLUSIVE blocks writes and SELECT FOR UPDATE/SHARE, but
+            # permits ordinary SELECT queries.
+            statement = sql.SQL("""
+                LOCK TABLE {}, {}, {}, {} IN EXCLUSIVE MODE
+            """).format(sessions, links, files, locations)
+            connection.execute(statement)
+
+            # Under READ COMMITTED, this statement sees changes committed
+            # by any writer we waited for when acquiring the locks.
+            row = connection.execute(
+                sql.SQL("""
+                    SELECT deleted_at
+                    FROM {}
+                    WHERE session_id = %s
+                """).format(sessions),
+                (sessionID,),
+            ).fetchone()
+
+            if row is None:
+                raise ValueError(f"Unknown session: {sessionID}")
+
+            currentlyDeleted = row[0] is not None
+
+            if currentlyDeleted == deleted:
+                return False
+
+            # Set the owning session first so its link guard permits the
+            # corresponding marker changes. Nothing becomes externally
+            # visible until the transaction commits.
+            marker = connection.execute(
+                sql.SQL("""
+                    UPDATE {}
+                    SET deleted_at = CASE
+                        WHEN %s THEN statement_timestamp()
+                        ELSE NULL
+                    END
+                    WHERE session_id = %s
+                    RETURNING deleted_at
+                """).format(sessions),
+                (deleted, sessionID),
+            ).fetchone()[0]
+
+            connection.execute(
+                sql.SQL("""
+                    UPDATE {}
+                    SET deleted_at = %s
+                    WHERE session_id = %s
+                      AND deleted_at IS DISTINCT FROM %s::timestamptz
+                """).format(links),
+                (marker, sessionID, marker),
+            )
+
+            # Recompute shared-content state from session ownership,
+            # not directory names or the current file/link markers.
+            #
+            # Preserve an existing deletion timestamp when the content
+            # remains deleted. Clear it whenever an active owner exists.
+            connection.execute(
+                sql.SQL("""
+                    WITH desired AS (
+                        SELECT content.file_id,
+                               CASE WHEN EXISTS (
+                                   SELECT 1
+                                   FROM {links} AS reference
+                                   JOIN {sessions} AS owner
+                                     ON owner.session_id = reference.session_id
+                                   WHERE reference.file_id = content.file_id
+                                     AND owner.deleted_at IS NULL
+                               )
+                               THEN NULL::timestamptz
+                               ELSE COALESCE(
+                                   content.deleted_at,
+                                   %s::timestamptz
+                               )
+                               END AS deleted_at
+                        FROM {files} AS content
+                        WHERE EXISTS (
+                            SELECT 1
+                            FROM {links} AS affected
+                            WHERE affected.session_id = %s
+                              AND affected.file_id = content.file_id
+                        )
+                    )
+                    UPDATE {files} AS content
+                    SET deleted_at = desired.deleted_at
+                    FROM desired
+                    WHERE content.file_id = desired.file_id
+                      AND content.deleted_at
+                          IS DISTINCT FROM desired.deleted_at
+                """).format(
+                    sessions=sessions, links=links, files=files
+                ),
+                (marker, sessionID),
+            )
+
+            # A location is content-level metadata, even when its path
+            # happens to sit under another session's directory.
+            connection.execute(
+                sql.SQL("""
+                    UPDATE {locations} AS location
+                    SET deleted_at = content.deleted_at
+                    FROM {files} AS content
+                    WHERE location.file_id = content.file_id
+                      AND EXISTS (
+                          SELECT 1
+                          FROM {links} AS affected
+                          WHERE affected.session_id = %s
+                            AND affected.file_id = content.file_id
+                      )
+                      AND location.deleted_at
+                          IS DISTINCT FROM content.deleted_at
+                """).format(
+                    locations=locations, files=files, links=links
+                ),
+                (sessionID,),
+            )
+
+            return True
+
     # ------------------------------------------------------------
     # Public schema initialization
     # ------------------------------------------------------------
@@ -2024,7 +2486,7 @@ class pglStorage:
 
     @classmethod
     def _grantApplicationAccess(cls, connection, postgres):
-        """Grant access to pilot tables without granting schema management."""
+        """Grant application table access and read-only reporting-view access."""
         schema = sql.Identifier(postgres.databaseSchema)
         application = sql.Identifier(postgres.databaseUser)
 
@@ -2048,6 +2510,8 @@ class pglStorage:
             "schema_migrations",
             "session_subjects",
             "raw_sessions",
+            "session_subjects_including_deleted",
+            "raw_sessions_including_deleted",
         ]
 
         for name in readOnlyTables:
@@ -2055,8 +2519,7 @@ class pglStorage:
             connection.execute(sql.SQL("REVOKE ALL PRIVILEGES ON TABLE {} FROM {}").format(table, application))
             connection.execute(sql.SQL("GRANT SELECT ON TABLE {} TO {}").format(table, application))
 
-        connection.execute(sql.SQL("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA {} TO {}").format(schema, application))
-        
+        connection.execute(sql.SQL("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA {} TO {}").format(schema, application))        
 ################################################################
 # Read-only logical filesystem for archived checkpoints
 ################################################################

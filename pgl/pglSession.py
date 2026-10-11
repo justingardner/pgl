@@ -639,8 +639,12 @@ class pglSession(pglActionable):
         return figures
  
     @classmethod
-    def loadSession(cls, sessionID, *, settings=None, settingsName=None, storageOptionsByBackend=None, sslRootCert=None):
-        """Load an archived raw checkpoint as a lazy session using PGL settings."""
+    def loadSession(cls, sessionID, *, settings=None, settingsName=None, storageOptionsByBackend=None, sslRootCert=None, includeDeleted=False):
+        """Load an archived raw checkpoint, returning None for handled failures.
+
+        Deleted sessions are hidden unless includeDeleted=True.
+        The override permits inspection without restoring the session.
+        """
         from .pglStorage import pglStorage
 
-        return pglStorage.loadSession(sessionID, settings=settings, settingsName=settingsName, storageOptionsByBackend=storageOptionsByBackend, sslRootCert=sslRootCert)
+        return pglStorage.loadSession(sessionID, settings=settings, settingsName=settingsName, storageOptionsByBackend=storageOptionsByBackend, sslRootCert=sslRootCert, includeDeleted=includeDeleted)
