@@ -287,40 +287,56 @@ class pglExperimentBase(pglStateDataSettings):
     def print(self, verbose=True):
         '''
         Print a summary of the experiment events.
+        Warn and skip summaries whose required contents could not be loaded.
         '''
         from pgl import pglTimestamp
         timestamp = pglTimestamp()
-        # print separator
-        #pglMessages.printHeader()
-        
-        # print experiment name, subject ID, and duration
-        pglMessages.print(f"Experiment: {self.experimentSettings.experimentName} | Subject ID: {self.experimentSettings.subjectID}")
-        pglMessages.print(f"Session: {self.experimentSettings.sessionName} | Run: {self.experimentSettings.runName}")
-        if self.data.startDateTime:
-            pglMessages.print(f"{self.data.startDateTime}")
+        runPath = getattr(self, "fullDataPath", "(unknown run path)")
+
+        # check required experiment contents before accessing their fields
+        experimentSettings = self.experimentSettings
+        if experimentSettings is None:
+            pglMessages.warning(f"Skipping experiment summary for {runPath!r}: experiment settings could not be loaded.")
+            return
+
+        # print experiment identifiers even if the data is missing
+        pglMessages.print(f"Experiment: {experimentSettings.experimentName} | Subject ID: {experimentSettings.subjectID}")
+        pglMessages.print(f"Session: {experimentSettings.sessionName} | Run: {experimentSettings.runName}")
+
+        data = self.data
+        if data is None:
+            pglMessages.warning(f"Skipping remaining experiment summary for {runPath!r}: experiment data could not be loaded.")
+            return
+
+        if data.startDateTime:
+            pglMessages.print(f"{data.startDateTime}")
         pglMessages.print(f"Duration: {timestamp.formatDuration(self.experimentDuration())}")
-        
-        numVols = self.data.getNumEvents(type="volumeTrigger")
+
+        numVols = data.getNumEvents(type="volumeTrigger")
         if numVols != 0:
             pglMessages.print(f"Number of volume triggers: {numVols}")
         if numVols > 1:
-            triggerStats = self.data.getTriggerStats()
+            triggerStats = data.getTriggerStats()
             pglMessages.print(f"Median time between triggers: {triggerStats.median:.3f}s")
             pglMessages.print(f"Mean ± std time between triggers: {triggerStats.mean:.3f} ± {triggerStats.std:.6f}s")
 
-        # print task names
-        #for taskName in self.experimentSettings.tasks:
-        #    pglMessages.print(f"taskName: {taskName} (nTrials=)")
+        # accessing the tasks property may trigger loading
+        try:
+            tasks = getattr(self, "tasks", [])
+        except RuntimeError as error:
+            pglMessages.warning(f"Skipping task summary for {runPath!r}: {error}")
+            return
+
+        if tasks is None:
+            pglMessages.warning(f"Skipping task summary for {runPath!r}: tasks are unavailable.")
+            return
 
         # print task data
-        if hasattr(self, "tasks"):
-            for task in self.tasks:
-                pglMessages.print(f"taskName: {task.settings.taskName} (nTrials={task.data.nTrials})")
-                if verbose:
-                    # print separtor
-                    pglMessages.printHeader()
-                    # print task
-                    task.print()   
+        for task in tasks:
+            pglMessages.print(f"taskName: {task.settings.taskName} (nTrials={task.data.nTrials})")
+            if verbose:
+                pglMessages.printHeader()
+                task.print()
                 
     def experimentDuration(self,data=None):
         '''

@@ -153,11 +153,8 @@ class pglRun(pglExperimentBase):
     def getTaskAt(self, taskIndex):
         """
         Return one task by index without initializing/loading self.tasks.
-        
-        This supports lazy-loadig without loading all the tasks
 
-        Loaded tasks are cached, so repeated calls for the same index return
-        the same object without reading from disk again.
+        Loaded tasks are cached only after a successful load.
         """
         taskNames = self.experimentSettings.tasks
 
@@ -169,18 +166,24 @@ class pglRun(pglExperimentBase):
 
         if taskIndex < 0 or taskIndex >= len(taskNames):
             raise IndexError(f"Task index {taskIndex} is outside 0 to {len(taskNames) - 1}")
-        
+
         if self._tasks is not None:
             return self._tasks[taskIndex]
 
         if taskIndex not in self._taskCache:
-            taskName = pglTaskBase.getTaskDirectoryName(taskID=taskIndex, taskName=taskNames[taskIndex])
+            taskName = taskNames[taskIndex]
+            taskDirectory = pglTaskBase.getTaskDirectoryName(taskID=taskIndex, taskName=taskName)
 
-            pglMessages.message(f"Loading task {taskIndex}: {taskName} for {self.filesystemPrefix}/{self.fullDataPath}",messageType='detailed')
+            pglMessages.message(f"Loading task {taskIndex}: {taskDirectory} for {self.filesystemPrefix}/{self.fullDataPath}", messageType='detailed')
 
-            filesystem, fullDataPath, _ = pglBase.validateFilesystem(filesystem=self.filesystem,dataPath=self.fullDataPath,filesystemPrefix=self.filesystemPrefix)
+            filesystem, fullDataPath, _ = pglBase.validateFilesystem(filesystem=self.filesystem, dataPath=self.fullDataPath, filesystemPrefix=self.filesystemPrefix)
+            taskPath = posixpath.join(fullDataPath, taskDirectory)
+            task = pglTaskBase.load(dataPath=taskPath, filesystem=filesystem)
 
-            self._taskCache[taskIndex] = pglTaskBase.load(dataPath=posixpath.join(fullDataPath, taskName), filesystem=filesystem)
+            if task is None:
+                raise RuntimeError(f"Could not load task at index {taskIndex} (taskName={taskName!r}).\nExpected task directory: {taskPath!r}\npglTaskBase.load() returned None. Check that the saved directory matches the expected name and contains valid task files.")
+
+            self._taskCache[taskIndex] = task
 
         return self._taskCache[taskIndex]
 
