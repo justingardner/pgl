@@ -40,20 +40,18 @@ class pglActionHistory(pglTraitSettings):
     actionVersion = Unicode(help="Version of action")
     actionStatus = Instance(pglActionStatus, help="Status of action")
     actionError = Instance(Exception, allow_none=True, default_value=None, help="Error raised while running this action")
-    actionSettings = Instance(pglTraitSettings, allow_none=True, default_value=None, help="Settings for this action")
+    actionSettings = Dict(default_value={}, help="Snapshot of the action's configuration traits")
     runDateTime = Unicode(help="Date and time when the action was run")
     startTime = Float(help="Start time of the action in seconds")
     endTime = Float(help="End time of the action in seconds")
     runDuration = Float(help="Time taken to run the action in seconds")
-    
+
     def __init__(self, action=None):
         """Create a history entry, or an empty instance for deserialization."""
         super().__init__()
-
         self.actionStatus = pglActionStatus.INITIALIZED
 
         # The serializer restores saved traits after empty construction.
-        # Do not generate new timestamps or settings during loading.
         if action is None:
             return
 
@@ -61,44 +59,36 @@ class pglActionHistory(pglTraitSettings):
         self.actionName = action.name
         self.actionStatus = action.status
         self.actionVersion = action.version
-        self.actionSettings = deepcopy(action.settings)
+
+        # Capture subclass configuration, not framework state or history.
+        frameworkTraits = set(pglAction.class_traits())
+        configurationNames = [name for name, trait in action.traits().items() if name not in frameworkTraits and trait.metadata.get("serialize", True)]
+        self.actionSettings = deepcopy({name: getattr(action, name) for name in sorted(configurationNames)})
 
         self.startTime = pglTimestamp.getSecs()
         self.endTime = self.startTime
-        self.runDuration = self.endTime - self.startTime
-    
-    def update(self, action: "pglAction"):
-        '''
-        update the action history
-        '''
-        # set status and any error
-        self.actionStatus = action.status
-        if action.error is not None:
-            self.actionError = action.error
+        self.runDuration = 0.0
 
-        # get time
+    def update(self, action):
+        """Update execution status and timing without changing the configuration snapshot."""
+        self.actionStatus = action.status
+        self.actionError = action.error
         self.endTime = pglTimestamp.getSecs()
-        self.runDuration = self.endTime-self.startTime
-        
+        self.runDuration = self.endTime - self.startTime
+
     def __repr__(self):
-        '''
-        simple string representation
-        '''
+        """Return a short status description."""
         return f"{self.actionName} status: {self.actionStatus.name}"
-    
+
     def toString(self):
-        '''
-        string representation
-        '''
+        """Return a readable history description."""
         if self.actionStatus.value > pglActionStatus.CONFIGURED.value:
-            return f"{self.actionName} ran at {datetime.fromisoformat(self.runDateTime).strftime("%H:%M:%S %d/%m/%Y")} with status: {self.actionStatus.name} duration: {pglTimestamp.formatDuration(self.runDuration)}"
-        else:
-            return f"{self.actionName} status: {self.actionStatus.name}"
+            runDateTime = datetime.fromisoformat(self.runDateTime).strftime("%H:%M:%S %d/%m/%Y")
+            return f"{self.actionName} ran at {runDateTime} with status: {self.actionStatus.name} duration: {pglTimestamp.formatDuration(self.runDuration)}"
+        return f"{self.actionName} status: {self.actionStatus.name}"
 
     def print(self):
-        '''
-        print action history
-        '''
+        """Print action history."""
         print(self.toString())
            
 
@@ -141,7 +131,7 @@ class pglAction(pglActionable):
     status = Instance(pglActionStatus, help="action status")
     error = Instance(Exception, allow_none=True, default_value=None, help="error")
     # settings for the action, required to be a pglTraitSettings. Subclass should override this
-    settings = Instance(pglTraitSettings, allow_none=True, default_value=None, help='Settings for this action')
+    #settings = Instance(pglTraitSettings, allow_none=True, default_value=None, help='Settings for this action')
     version = Unicode("", help='Verion of pglAction')
     
     # init action
@@ -166,42 +156,28 @@ class pglAction(pglActionable):
 
     @classmethod
     def execute(cls, *args, **kwargs):
-        """Create, configure, and run an action, returning its result."""
-        
+        """Route configuration and run arguments, warning about unsupported names."""
         action = cls()
+
         configureNames = cls._getKeywordNames(action.configure) | set(action.traits())
         runNames = cls._getKeywordNames(action.run) | cls._getKeywordNames(action._run)
-        validText = ", ".join(sorted(configureNames | runNames)) or "(none)"
+        validNames = configureNames | runNames
 
         if args:
-            pglMessages.warning(f"{cls.__name__}.execute() requires keyword arguments, but received {len(args)} positional argument(s). Accepted keyword arguments: {validText}. Pass arguments as name=value.")
-            raise TypeError(f"{cls.__name__}.execute() requires keyword arguments")
+            pglMessages.warning(f"{cls.__name__}.execute() requires keyword arguments, but received {len(args)} positional argument(s). Pass arguments as name=value.", level=2)
+            action.printConfiguration()
+            pglMessages.print(f"Accepted execute arguments: {', '.join(sorted(validNames)) or '(none)'}")
+            return None
 
-        # no positional argument allowed
-        if args:
-            pglMessages.warning(f"Requires keyword arguments, but received {len(args)} positional argument(s). Pass arguments by name—for example: {cls.__name__}.execute(session=session, all=True)")
-
-
-        # Catch misspelled or unsupported arguments.
-        unknownNames = set(kwargs) - (configureNames | runNames)
+        unknownNames = set(kwargs) - validNames
         if unknownNames:
-            unknownText = ", ".join(sorted(unknownNames))
-            raise TypeError(
-                f"{cls.__name__}.execute() got unknown argument(s): "
-                f"{unknownText}"
-            )
+            pglMessages.warning(f"{cls.__name__}.execute() got unknown argument(s): {', '.join(sorted(unknownNames))}. Argument names are case-sensitive.", level=2)
+            action.printConfiguration()
+            pglMessages.print(f"Accepted execute arguments: {', '.join(sorted(validNames)) or '(none)'}")
+            return None
 
-        configureArgs = {
-            name: value
-            for name, value in kwargs.items()
-            if name in configureNames
-        }
-
-        runArgs = {
-            name: value
-            for name, value in kwargs.items()
-            if name in runNames
-        }
+        configureArgs = {name: value for name, value in kwargs.items() if name in configureNames}
+        runArgs = {name: value for name, value in kwargs.items() if name in runNames}
 
         action.configure(**configureArgs)
         return action.run(**runArgs)
@@ -302,10 +278,44 @@ class pglAction(pglActionable):
         pglMessages.warning(f"{self.error}",callerNameDepth=2)
 
     def print(self, verbose=False):
-        '''
-        print the action
-        '''
-        print(f"Action: {self.name} status: {self.status.name}")
+        """Print action status and optionally its configuration parameters."""
+        pglMessages.print(f"Action: {self.name} status: {self.status.name}")
         if verbose:
-            self.settings.print()
+            self.printConfiguration()
    
+    def printConfiguration(self, frameworkTraits=False):
+        """Print configuration traits, explicit configure arguments, and run arguments."""
+        traits = self.traits()
+        baseTraitNames = set(pglAction.class_traits())
+        configureParameters = inspect.signature(self.configure).parameters
+        runNames = self._getKeywordNames(self.run) | self._getKeywordNames(self._run)
+
+        pglMessages.printHeader("Configuration parameters")
+
+        # Show action-specific traits, excluding framework bookkeeping.
+        configurationTraits = {name: trait for name, trait in traits.items() if name not in baseTraitNames}
+        for name, trait in sorted(configurationTraits.items()):
+            pglMessages.print(f"{name} = {getattr(self, name)!r} | {trait.help}")
+
+        # Also show explicitly declared configure arguments.
+        explicitNames = self._getKeywordNames(self.configure)
+        for name in sorted(explicitNames - set(configurationTraits)):
+            parameter = configureParameters[name]
+            valueText = "required" if parameter.default is inspect.Parameter.empty else repr(parameter.default)
+            pglMessages.print(f"{name} = {valueText}")
+
+        if not configurationTraits and not explicitNames:
+            pglMessages.print("(No action-specific configuration parameters)")
+
+        if runNames:
+            pglMessages.printHeader("Run arguments")
+            for name in sorted(runNames):
+                pglMessages.print(name)
+
+        # These remain accepted by the existing configureTraits implementation.
+        if frameworkTraits:
+            frameworkNames = set(traits) & baseTraitNames
+            if frameworkNames:
+                pglMessages.printHeader("Framework traits")
+                for name in sorted(frameworkNames):
+                    pglMessages.print(f"{name}: {traits[name].help}")
