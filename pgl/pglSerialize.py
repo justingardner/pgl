@@ -21,6 +21,8 @@ import fsspec
 from fsspec.core import url_to_fs
 from types import SimpleNamespace
 import posixpath
+from enum import Enum
+import sys
 
 ##########################
 # Recursively collect all subclasses
@@ -62,6 +64,18 @@ def pglGetAllSubclasses(baseClass):
     collect(baseClass)
     return allSubclasses
 
+
+##########################
+#  pglSerializedError
+##########################
+class pglSerializedError(Exception):
+    """Recorded error information, not a reconstructed runtime exception."""
+
+    def __init__(self, originalModule, originalClass, message):
+        super().__init__(message)
+        self.originalModule = originalModule
+        self.originalClass = originalClass
+        
 ##########################
 # Should we read this trait's value right now, or would doing so
 # force an unfired dynamic default (e.g. a lazy/network-backed field)?
@@ -245,6 +259,30 @@ class pglSerialize:
 
             try:
 
+
+                if isinstance(o, Exception):
+                    if isinstance(o, pglSerializedError):
+                        moduleName = o.originalModule
+                        className = o.originalClass
+                    else:
+                        moduleName = o.__class__.__module__
+                        className = o.__class__.__qualname__
+
+                    return {
+                        '__exception__': True,
+                        '__module__': moduleName,
+                        '__qualname__': className,
+                        'message': str(o),
+                    }
+                # Handle enums before primitives, including IntEnum/StrEnum.
+                if isinstance(o, Enum):
+                    return {
+                        '__enum__': True,
+                        '__module__': o.__class__.__module__,
+                        '__qualname__': o.__class__.__qualname__,
+                        'name': o.name,
+                    }
+                    
                 # ------------------------------------------------------
                 # Custom encoding for pglSerialize objects
                 # ------------------------------------------------------
@@ -548,6 +586,79 @@ class pglSerialize:
         
         # Decode each dict, restoring objects by type markers
         def decodeObject(dct):
+            
+            
+            if '__exception__' in dct:
+                expectedFields = {
+                    '__exception__', '__module__', '__qualname__', 'message'
+                }
+
+                if (
+                    set(dct) != expectedFields
+                    or dct['__exception__'] is not True
+                    or any(
+                        not isinstance(dct[key], str)
+                        for key in ('__module__', '__qualname__', 'message')
+                    )
+                    or not dct['__module__']
+                    or not dct['__qualname__']
+                ):
+                    raise ValueError("Invalid serialized exception record.")
+
+                return pglSerializedError(
+                    originalModule=dct['__module__'],
+                    originalClass=dct['__qualname__'],
+                    message=dct['message'],
+                )
+            # Restore enums from already-loaded application modules.
+            # Do not import modules named by the serialized document.
+            if '__enum__' in dct:
+                expectedFields = {
+                    '__enum__', '__module__', '__qualname__', 'name'
+                }
+
+                if (
+                    set(dct) != expectedFields
+                    or dct['__enum__'] is not True
+                    or any(
+                        not isinstance(dct[key], str) or not dct[key]
+                        for key in ('__module__', '__qualname__', 'name')
+                    )
+                ):
+                    raise ValueError("Invalid serialized enum record.")
+
+                moduleName = dct['__module__']
+                className = dct['__qualname__']
+                memberName = dct['name']
+
+                enumClass = sys.modules.get(moduleName)
+
+                if enumClass is None:
+                    raise ValueError(
+                        f"Enum module is not loaded: {moduleName!r}"
+                    )
+
+                for part in className.split('.'):
+                    if not part.isidentifier():
+                        raise ValueError(
+                            f"Invalid enum class name: {className!r}"
+                        )
+
+                    enumClass = getattr(enumClass, part, None)
+
+                if not isinstance(enumClass, type) or not issubclass(enumClass, Enum):
+                    raise ValueError(
+                        f"Unknown enum class: {moduleName}.{className}"
+                    )
+
+                try:
+                    return enumClass[memberName]
+                except KeyError as error:
+                    raise ValueError(
+                        f"Unknown enum member: "
+                        f"{moduleName}.{className}.{memberName}"
+                    ) from error
+                    
             # Restore datetime objects
             if '__datetime__' in dct:
                 return datetime.fromisoformat(dct['value'])

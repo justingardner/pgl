@@ -758,7 +758,7 @@ class pglBase:
     # # validate filesystem: used for fsspec 
     ################################################################
     @staticmethod
-    def validateFilesystem(filesystem=None, dataPath=None, filesystemPrefix="", create=False):
+    def validateFilesystem(filesystem=None, dataPath=None, filesystemPrefix="", create=False, requireExists=True):
         '''
         Return a valid fsspec filesystem and data path.
 
@@ -834,7 +834,7 @@ class pglBase:
             if not filesystem.exists(dataPath):
                 if create:
                     filesystem.makedirs(dataPath, exist_ok=True)
-                else:                    
+                elif requireExists:
                     pglMessages.warning(f"{dataPath} does not exist")
                     filesystem = None
         except Exception as e:
@@ -842,7 +842,7 @@ class pglBase:
                 filesystem = None
             
         return filesystem, dataPath, filesystemPrefix
-  ################################################################
+    ################################################################
     # Clean up open windows (which may be orphaned) and their socket connections
     ################################################################
     def cleanUp(self):

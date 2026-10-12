@@ -18,6 +18,7 @@ from typing import Annotated
 from .pglTimestamp import pglTimestamp
 from datetime import datetime
 import inspect
+from copy import deepcopy
 
 ########################
 # action status
@@ -45,20 +46,26 @@ class pglActionHistory(pglTraitSettings):
     endTime = Float(help="End time of the action in seconds")
     runDuration = Float(help="Time taken to run the action in seconds")
     
-    def __init__(self, action: "pglAction"):
-        '''
-        Init the action history
-        '''
+    def __init__(self, action=None):
+        """Create a history entry, or an empty instance for deserialization."""
+        super().__init__()
+
+        self.actionStatus = pglActionStatus.INITIALIZED
+
+        # The serializer restores saved traits after empty construction.
+        # Do not generate new timestamps or settings during loading.
+        if action is None:
+            return
+
         self.runDateTime = datetime.now().astimezone().isoformat()
         self.actionName = action.name
         self.actionStatus = action.status
         self.actionVersion = action.version
+        self.actionSettings = deepcopy(action.settings)
 
-        # get time
         self.startTime = pglTimestamp.getSecs()
         self.endTime = self.startTime
-        self.runDuration = self.endTime-self.startTime
-
+        self.runDuration = self.endTime - self.startTime
     
     def update(self, action: "pglAction"):
         '''

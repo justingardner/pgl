@@ -1841,32 +1841,48 @@ class pglTaskBase(pglTraitSettings):
     data = Instance(pglTaskData, allow_none=True, help="Data of task")
     parameters = List(Instance(pglParameter), default_value=[], help="parameters of task")
   
-    def save(self, dataPath):
-        '''
-        Save the task settings, state and data.
-        '''
-        try:
-            dataPath = Path(dataPath) / self._getTaskDirectoryName()
-            dataPath.mkdir(parents=True, exist_ok=True)
-        except Exception as e:
-            pglMessages.warning(f"Could not create task data directory {dataPath}: {e}")
-            return
-        
-        # save settings, state and data
-        self.settings.save(dataPath / "settings.json")
-        self.state.save(dataPath / "state.json")
-        self.data.save(dataPath / "data.json")
-        
-        # save parameters
-        try:
-            parameterPath = dataPath / "parameters"
-            parameterPath.mkdir(parents=True, exist_ok=True)
-            for parameter in self.parameters:
-                parameter.save(parameterPath)
-        except Exception as e:
-            pglMessages.warning(f"Could not save task parameters to {dataPath}: {e}")
-        pglMessages.message(f"Saved task {self.settings.taskName} to {dataPath}")
+    def save(self, dataPath, filesystem=None, filesystemPrefix=None):
+        """Save current task contents, including parameters, through fsspec.
 
+        dataPath is the destination run directory.
+        Does not read or copy original acquisition files.
+        """
+        filesystem, dataPath, _ = pglBase.validateFilesystem(
+            filesystem=filesystem,
+            dataPath=dataPath,
+            filesystemPrefix=filesystemPrefix,
+            create=True,
+        )
+
+        if filesystem is None:
+            raise ValueError("Could not resolve the task destination filesystem.")
+
+        taskPath = posixpath.join(dataPath, self._getTaskDirectoryName())
+        filesystem.makedirs(taskPath, exist_ok=True)
+
+        self.settings.save(
+            filename=posixpath.join(taskPath, "settings.json"),
+            filesystem=filesystem,
+        )
+        self.state.save(
+            filename=posixpath.join(taskPath, "state.json"),
+            filesystem=filesystem,
+        )
+        self.data.save(
+            filename=posixpath.join(taskPath, "data.json"),
+            filesystem=filesystem,
+        )
+
+        parameterPath = posixpath.join(taskPath, "parameters")
+        filesystem.makedirs(parameterPath, exist_ok=True)
+
+        for parameter in self.parameters:
+            parameter.save(dataPath=parameterPath, filesystem=filesystem)
+
+        pglMessages.message(
+            f"Saved task {self.settings.taskName} to {taskPath}"
+        )
+    
     def _getTaskDirectoryName(self):
         """Return the directory name used to save this task."""
 

@@ -331,6 +331,96 @@ class pglRun(pglExperimentBase):
             nTrials=nTrials
         )
         
+    def saveDerivedRun(self, dataPath, filesystem=None, filesystemPrefix=None):
+        """Write current behavioral run contents to a new directory.
+
+        Reuses loaded objects, including individually cached tasks.
+        Loads missing behavioral components as needed.
+        Does not copy acquisition files or save runtime hardware objects.
+
+        Session history and checkpoint registration are handled separately.
+        """
+        from .pglSerialize import pglSerialize
+
+        # Access the lazy properties without replacing existing objects.
+        experimentSettings = self.experimentSettings
+        settings = self.settings
+        data = self.data
+
+        if experimentSettings is None or settings is None or data is None:
+            raise ValueError("Cannot save run: required behavioral contents are missing.")
+
+        # Unlike settings/data, state currently has no lazy-loading property.
+        state = self.state
+        if state is None:
+            state = pglSerialize.load(
+                filename=posixpath.join(self.fullDataPath, "state.json"),
+                filesystem=self.filesystem,
+                filesystemPrefix=self.filesystemPrefix,
+            )
+
+        if state is None:
+            raise ValueError("Cannot save run: experiment state is missing.")
+
+        # The tasks property reuses _taskCache, preserving in-memory edits.
+        tasks = list(self.tasks)
+
+        if len(tasks) != len(experimentSettings.tasks):
+            raise ValueError("Task count does not match experiment settings.")
+
+        # Existing task.save() chooses its directory from taskID/taskSaveName.
+        # Check that those names agree with what the run loader will request.
+        for index, task in enumerate(tasks):
+            if task is None:
+                raise ValueError(f"Cannot save run: task {index} failed to load.")
+
+            expected = pglTaskBase.getTaskDirectoryName(
+                taskID=index,
+                taskName=experimentSettings.tasks[index],
+            )
+
+            if task._getTaskDirectoryName() != expected:
+                raise ValueError(
+                    f"Task {index} directory does not match experiment settings: "
+                    f"{task._getTaskDirectoryName()!r} != {expected!r}"
+                )
+
+        filesystem, destination, _ = pglBase.validateFilesystem(
+            filesystem=filesystem,
+            dataPath=dataPath,
+            filesystemPrefix=filesystemPrefix,
+            requireExists=False,
+        )
+
+        if filesystem is None:
+            raise ValueError("Could not resolve the destination filesystem.")
+
+        # Use a fresh directory, never the acquisition directory.
+        if filesystem.exists(destination):
+            raise FileExistsError(
+                f"Derived run destination already exists: {destination}"
+            )
+
+        filesystem.makedirs(destination, exist_ok=False)
+
+        components = {
+            "experimentSettings.json": experimentSettings,
+            "settings.json": settings,
+            "state.json": state,
+            "data.json": data,
+        }
+
+        for filename, component in components.items():
+            component.save(
+                filename=posixpath.join(destination, filename),
+                filesystem=filesystem,
+            )
+
+        for task in tasks:
+            task.save(dataPath=destination, filesystem=filesystem)
+
+        return destination
+        
 ##################################
 # pglMNE
 ##################################
@@ -639,12 +729,66 @@ class pglSession(pglActionable):
         return figures
  
     @classmethod
-    def loadSession(cls, sessionID, *, settings=None, settingsName=None, storageOptionsByBackend=None, sslRootCert=None, includeDeleted=False):
-        """Load an archived raw checkpoint, returning None for handled failures.
+    def loadSession(
+        cls,
+        sessionID,
+        *,
+        settings=None,
+        settingsName=None,
+        storageOptionsByBackend=None,
+        sslRootCert=None,
+        includeDeleted=False,
+    ):
+        """Load an archived raw or derived behavioral checkpoint.
+
+        Returns None for handled configuration, connection, or lookup failures.
+        Payload and contract-validation errors propagate.
 
         Deleted sessions are hidden unless includeDeleted=True.
         The override permits inspection without restoring the session.
         """
         from .pglStorage import pglStorage
 
-        return pglStorage.loadSession(sessionID, settings=settings, settingsName=settingsName, storageOptionsByBackend=storageOptionsByBackend, sslRootCert=sslRootCert, includeDeleted=includeDeleted)
+        return pglStorage.loadSession(
+            sessionID,
+            settings=settings,
+            settingsName=settingsName,
+            storageOptionsByBackend=storageOptionsByBackend,
+            sslRootCert=sslRootCert,
+            includeDeleted=includeDeleted,
+        )
+    def saveSession(
+        self,
+        *,
+        parentSessionID,
+        settings=None,
+        settingsName=None,
+        backendID=None,
+        description=None,
+        ingestMethod="manual",
+        storageOptions=None,
+        sslRootCert=None,
+    ):
+        """Save current session contents and history as a new checkpoint.
+
+        Requires an explicit completed, active parentSessionID.
+        Uses current or supplied settings and the configured storage backend.
+
+        Returns the completed checkpoint ID, or None for unavailable
+        configuration or connection cancellation.
+
+        Unlike saveRawSession(), this saves current contents and cached edits.
+        """
+        from .pglStorage import pglStorage
+
+        return pglStorage.saveSession(
+            self,
+            parentSessionID=parentSessionID,
+            settings=settings,
+            settingsName=settingsName,
+            backendID=backendID,
+            description=description,
+            ingestMethod=ingestMethod,
+            storageOptions=storageOptions,
+            sslRootCert=sslRootCert,
+        )
