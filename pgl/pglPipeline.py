@@ -319,3 +319,84 @@ class pglAction(pglActionable):
                 pglMessages.printHeader("Framework traits")
                 for name in sorted(frameworkNames):
                     pglMessages.print(f"{name}: {traits[name].help}")
+                    
+class pglActionCollection:
+    """Container for nested action classes, with discoverable help."""
+
+    @classmethod
+    def print(cls, verbose=False, alphabetical=False):
+        """Print actions in definition order, or alphabetically when requested."""
+        import inspect
+
+        pglMessages.printHeader(f"Available actions for {cls.__name__}")
+        frameworkTraits = set(pglAction.class_traits())
+
+        # Collect inherited definitions first, then apply subclass overrides.
+        members = {}
+        for base in reversed(cls.__mro__):
+            for name, value in vars(base).items():
+                if name in members:
+                    del members[name]
+                members[name] = value
+
+        actions = [(name, value) for name, value in members.items() if inspect.isclass(value) and issubclass(value, pglAction) and value is not pglAction]
+        if alphabetical:
+            actions.sort(key=lambda item: item[0])
+
+        if not actions:
+            pglMessages.print(f"{cls.__name__}: no actions defined.")
+            return
+
+        for actionIndex, (actionName, actionClass) in enumerate(actions):
+            description = inspect.cleandoc(actionClass.__doc__ or "").split("\n\n", 1)[0]
+            description = " ".join(description.split()) or "No description available."
+
+            if verbose and actionIndex:
+                pglMessages.print()
+
+            pglMessages.print(f"{actionName}: {description}")
+
+            if not verbose:
+                continue
+
+            configurationTraits = {name: trait for name, trait in actionClass.class_traits().items() if name not in frameworkTraits}
+
+            if configurationTraits:
+                pglMessages.print("  Configuration traits:")
+                for name, trait in sorted(configurationTraits.items()):
+                    defaultText = repr(trait.default_value)
+                    helpText = trait.help or "No help available."
+                    pglMessages.print(f"    {name} ({type(trait).__name__}, default={defaultText}): {helpText}")
+
+            hasArguments = False
+            seenRunArguments = set()
+
+            for methodName in ("configure", "run", "_run"):
+                method = getattr(actionClass, methodName)
+                arguments = []
+
+                for name, parameter in inspect.signature(method).parameters.items():
+                    if name in ("self", "cls"):
+                        continue
+                    if parameter.kind not in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY):
+                        continue
+
+                    if methodName in ("run", "_run"):
+                        if name in seenRunArguments:
+                            continue
+                        seenRunArguments.add(name)
+
+                    valueText = "required" if parameter.default is inspect.Parameter.empty else f"default={parameter.default!r}"
+                    annotationText = "" if parameter.annotation is inspect.Parameter.empty else f", type={inspect.formatannotation(parameter.annotation)}"
+                    positionalText = ", positional-only" if parameter.kind is inspect.Parameter.POSITIONAL_ONLY else ""
+                    arguments.append(f"    {name}: {valueText}{annotationText}{positionalText}")
+
+                if arguments:
+                    hasArguments = True
+                    heading = "Configure arguments" if methodName == "configure" else "Run arguments"
+                    pglMessages.print(f"  {heading}:")
+                    for argument in arguments:
+                        pglMessages.print(argument)
+
+            if not configurationTraits and not hasArguments:
+                pglMessages.print("  No action-specific parameters.")
