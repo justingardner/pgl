@@ -26,6 +26,7 @@ class pglActionsFixes:
         """Migrate all runs in a session to taskNN_taskName directories."""
 
         dryRun = Bool(default_value=True, help="Preview without modifying files")
+        verbose = Bool(default_value=False, help="Verbose information printed")
 
         def __init__(self, **kwargs):
             super().__init__(**kwargs)
@@ -150,7 +151,8 @@ class pglActionsFixes:
                 if change["updateTaskID"]:
                     operations.append(f"taskID {change['oldTaskID']!r} -> {change['newTaskID']}")
                 description = "; ".join(operations) if operations else "already migrated"
-                pglMessages.print(f"{change['runPath']} | Task {change['taskIndex'] + 1}: {description}")
+                if operations or self.verbose:
+                    pglMessages.print(f"{change['runPath']} | Task {change['taskIndex'] + 1}: {description}")
 
             if self.dryRun:
                 pglMessages.message("Preview only: no files, directories, or task caches were changed.")
