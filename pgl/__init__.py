@@ -32,6 +32,7 @@ from .pglSession import pglSession
 from .pglStorage import pglStorage, pglCheckpointFilesystem
 from .pglPostgres import pglPostgres
 from .pglActionsFixes import pglActionsFixes
+from .pglActionsMNE import pglActionsMNE
 
 # Device specific imports (eye trackers, etc.)
 from .pglVPixx import pglProPixx, pglDataPixx
