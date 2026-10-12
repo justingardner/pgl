@@ -42,17 +42,44 @@ class pglActions():
         # configure
         ################################
         def configure(self, fullDataPath: str=None, settings: pglSettings=None, settingsName: str=None, experimentName: str=None, subjectID: str=None, sessionName: str=None, runName: str=None, filesystem: AbstractFileSystem=None, filesystemPrefix: str=None, dataPath: str=None) -> None:
+            """Choose runs and exclude directories missing required experiment files."""
+            import posixpath
+            from .pglPipeline import pglActionStatus
 
-            # Choose the runs to load
+            # Clear previous configuration in case this action instance is reused.
+            self.status = pglActionStatus.INITIALIZED
+            self.selectedPaths = []
+
             filesystem, runList, filesystemPrefix = pglChoose.getSessionRuns(fullDataPath=fullDataPath, settings=settings, settingsName=settingsName, experimentName=experimentName, subjectID=subjectID, sessionName=sessionName, runName=runName, filesystem=filesystem, filesystemPrefix=filesystemPrefix, dataPath=dataPath)
             if filesystem is None:
                 return
 
-            # and put into settings
-            self.selectedPaths = runList
-            self.filesystemPrefix = filesystemPrefix
-        
-            # we are now configured, so call super to set status
+            requiredFiles = ("experimentSettings.json", "settings.json", "data.json", "state.json", "pgl.json")
+            validPaths = []
+
+            for runPath in runList:
+                try:
+                    if not filesystem.isdir(runPath):
+                        pglMessages.warning(f"Skipping invalid run {runPath!r}: directory does not exist or is not a directory.", level=1)
+                        continue
+
+                    missingFiles = [filename for filename in requiredFiles if not filesystem.isfile(posixpath.join(runPath, filename))]
+                    if missingFiles:
+                        pglMessages.warning(f"Skipping incomplete run {runPath!r}: missing required files: {', '.join(missingFiles)}.", level=1)
+                        continue
+
+                except OSError as error:
+                    pglMessages.warning(f"Skipping inaccessible run {runPath!r}: {error}", level=1)
+                    continue
+
+                validPaths.append(runPath)
+
+            if not validPaths:
+                pglMessages.warning("No valid run directories remain; session was not loaded.", level=1)
+                return
+
+            self.selectedPaths = validPaths
+            self.filesystemPrefix = filesystemPrefix or ""
             super().configure()
             
         ################################
