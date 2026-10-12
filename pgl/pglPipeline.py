@@ -322,13 +322,20 @@ class pglAction(pglActionable):
                     
 class pglActionCollection:
     """Container for nested action classes, with discoverable help."""
-
     @classmethod
-    def print(cls, verbose=False, alphabetical=False):
-        """Print actions in definition order, or alphabetically when requested."""
+    def help(cls, *args, **kwargs):
+        """Alias for print(), forwarding all arguments unchanged."""
+        return cls.print(*args, **kwargs)
+    
+    @classmethod
+    def print(cls, actionName=None, verbose=False, alphabetical=False):
+        """Print grouped actions, or full information for one named action."""
         import inspect
 
-        pglMessages.printHeader(f"Available actions for {cls.__name__}")
+        if actionName is not None and not isinstance(actionName, str):
+            pglMessages.warning("actionName must be a string or None.", level=2)
+            return
+
         frameworkTraits = set(pglAction.class_traits())
 
         # Collect inherited definitions first, then apply subclass overrides.
@@ -339,64 +346,100 @@ class pglActionCollection:
                     del members[name]
                 members[name] = value
 
-        actions = [(name, value) for name, value in members.items() if inspect.isclass(value) and issubclass(value, pglAction) and value is not pglAction]
-        if alphabetical:
-            actions.sort(key=lambda item: item[0])
+        # Header markers divide subsequent actions into groups.
+        groups = []
+        groupHeader = None
+        groupActions = []
 
-        if not actions:
-            pglMessages.print(f"{cls.__name__}: no actions defined.")
+        for name, value in members.items():
+            if name.startswith("_actionHeader_") and isinstance(value, str):
+                if groupActions:
+                    groups.append((groupHeader, groupActions))
+                groupHeader = value
+                groupActions = []
+            elif inspect.isclass(value) and issubclass(value, pglAction) and value is not pglAction:
+                groupActions.append((name, value))
+
+        if groupActions:
+            groups.append((groupHeader, groupActions))
+
+        # Selecting an action always enables full information.
+        if actionName is not None:
+            availableNames = [name for _, actions in groups for name, _ in actions]
+            if actionName not in availableNames:
+                pglMessages.warning(f"No action named {actionName!r} in {cls.__name__}. Available actions: {', '.join(availableNames) or '(none)'}.", level=2)
+                return
+
+            groups = [(header, [(name, actionClass) for name, actionClass in actions if name == actionName]) for header, actions in groups]
+            groups = [(header, actions) for header, actions in groups if actions]
+            verbose = True
+
+        if not groups:
+            pglMessages.print("No actions defined.")
             return
 
-        for actionIndex, (actionName, actionClass) in enumerate(actions):
-            description = inspect.cleandoc(actionClass.__doc__ or "").split("\n\n", 1)[0]
-            description = " ".join(description.split()) or "No description available."
+        for groupHeader, actions in groups:
+            if groupHeader is not None:
+                pglMessages.printHeader(groupHeader)
 
-            if verbose and actionIndex:
-                pglMessages.print()
+            if alphabetical:
+                actions = sorted(actions, key=lambda item: item[0])
 
-            pglMessages.print(f"{actionName}: {description}")
+            for actionIndex, (name, actionClass) in enumerate(actions):
+                documentation = inspect.cleandoc(actionClass.__doc__ or "")
+                description = " ".join(documentation.split("\n\n", 1)[0].split()) or "No description available."
 
-            if not verbose:
-                continue
+                if verbose and actionIndex:
+                    pglMessages.print()
 
-            configurationTraits = {name: trait for name, trait in actionClass.class_traits().items() if name not in frameworkTraits}
+                if actionName is not None:
+                    pglMessages.print(f"{name}:")
+                    for line in (documentation or "No description available.").splitlines():
+                        pglMessages.print(f"  {line}")
+                else:
+                    pglMessages.print(f"{name}: {description}")
 
-            if configurationTraits:
-                pglMessages.print("  Configuration traits:")
-                for name, trait in sorted(configurationTraits.items()):
-                    defaultText = repr(trait.default_value)
-                    helpText = trait.help or "No help available."
-                    pglMessages.print(f"    {name} ({type(trait).__name__}, default={defaultText}): {helpText}")
+                if not verbose:
+                    continue
 
-            hasArguments = False
-            seenRunArguments = set()
+                configurationTraits = {traitName: trait for traitName, trait in actionClass.class_traits().items() if traitName not in frameworkTraits}
 
-            for methodName in ("configure", "run", "_run"):
-                method = getattr(actionClass, methodName)
-                arguments = []
+                if configurationTraits:
+                    pglMessages.print("  Configuration traits:")
+                    for traitName, trait in sorted(configurationTraits.items()):
+                        defaultText = repr(trait.default_value)
+                        helpText = trait.help or "No help available."
+                        pglMessages.print(f"    {traitName} ({type(trait).__name__}, default={defaultText}): {helpText}")
 
-                for name, parameter in inspect.signature(method).parameters.items():
-                    if name in ("self", "cls"):
-                        continue
-                    if parameter.kind not in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY):
-                        continue
+                hasArguments = False
+                seenRunArguments = set()
 
-                    if methodName in ("run", "_run"):
-                        if name in seenRunArguments:
+                for methodName in ("configure", "run", "_run"):
+                    method = getattr(actionClass, methodName)
+                    arguments = []
+
+                    for parameterName, parameter in inspect.signature(method).parameters.items():
+                        if parameterName in ("self", "cls"):
                             continue
-                        seenRunArguments.add(name)
+                        if parameter.kind not in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY):
+                            continue
 
-                    valueText = "required" if parameter.default is inspect.Parameter.empty else f"default={parameter.default!r}"
-                    annotationText = "" if parameter.annotation is inspect.Parameter.empty else f", type={inspect.formatannotation(parameter.annotation)}"
-                    positionalText = ", positional-only" if parameter.kind is inspect.Parameter.POSITIONAL_ONLY else ""
-                    arguments.append(f"    {name}: {valueText}{annotationText}{positionalText}")
+                        if methodName in ("run", "_run"):
+                            if parameterName in seenRunArguments:
+                                continue
+                            seenRunArguments.add(parameterName)
 
-                if arguments:
-                    hasArguments = True
-                    heading = "Configure arguments" if methodName == "configure" else "Run arguments"
-                    pglMessages.print(f"  {heading}:")
-                    for argument in arguments:
-                        pglMessages.print(argument)
+                        valueText = "required" if parameter.default is inspect.Parameter.empty else f"default={parameter.default!r}"
+                        annotationText = "" if parameter.annotation is inspect.Parameter.empty else f", type={inspect.formatannotation(parameter.annotation)}"
+                        positionalText = ", positional-only" if parameter.kind is inspect.Parameter.POSITIONAL_ONLY else ""
+                        arguments.append(f"    {parameterName}: {valueText}{annotationText}{positionalText}")
 
-            if not configurationTraits and not hasArguments:
-                pglMessages.print("  No action-specific parameters.")
+                    if arguments:
+                        hasArguments = True
+                        heading = "Configure arguments" if methodName == "configure" else "Run arguments"
+                        pglMessages.print(f"  {heading}:")
+                        for argument in arguments:
+                            pglMessages.print(argument)
+
+                if not configurationTraits and not hasArguments:
+                    pglMessages.print("  No action-specific parameters.")
