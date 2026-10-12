@@ -1865,37 +1865,64 @@ class pglStorage:
 
         return cls.getOrCreateStorageBackend(connection, postgres, backendName, kind, configuredRoot)
     
-    @classmethod
-    def deleteSession(cls, sessionID, *, settings=None, settingsName=None, sslRootCert=None):
-        """Soft-delete a session and dependencies not needed by active sessions.
+    class _UnknownLifecycleSession(ValueError):
+        """Requested lifecycle session does not exist."""
 
-        Returns True after a committed change, False for an unchanged state
-        or unknown session, and None for invalid arguments, missing
-        configuration, cancellation, or a database failure.
+    class _SessionLifecycleBlocked(ValueError):
+        """Lifecycle operation was refused without making changes."""
+
+    @classmethod
+    def deleteSession(cls, sessionID, *, deleteDownstreamSessions=False, settings=None, settingsName=None, sslRootCert=None):
+        """Soft-delete a session, optionally including active descendants.
+
+        Without deleteDownstreamSessions, active descendants block deletion.
+
+        With deleteDownstreamSessions=True, print every session to be newly
+        deleted and require an explicit 'yes'. Recheck the exact deletion
+        set under locks after confirmation.
+
+        Every new deletion records a group, even for a single session.
+        Previously deleted descendants are not enrolled in the new group.
+
+        Returns:
+            True: a change committed.
+            False: unchanged, unknown, blocked, or confirmation cancelled.
+            None: invalid arguments, unavailable configuration/connection,
+                  or database failure.
 
         Unknown sessions warn at level 0, invalid arguments at level 1,
-        and database failures at level 2. Unexpected programming errors
-        propagate. Never deletes payloads.
+        and blocked operations/database failures at level 2.
+
+        Never removes or rereads payloads.
         """
-        return cls._changeSessionDeletionState(sessionID, deleted=True, settings=settings, settingsName=settingsName, sslRootCert=sslRootCert)
+        return cls._changeSessionDeletionState(sessionID, deleted=True, deleteDownstreamSessions=deleteDownstreamSessions, settings=settings, settingsName=settingsName, sslRootCert=sslRootCert)
 
     @classmethod
     def undeleteSession(cls, sessionID, *, settings=None, settingsName=None, sslRootCert=None):
-        """Restore a soft-deleted session and its dependent records.
+        """Restore an entire deletion group through its top-level session.
 
-        Returns True after a committed change, False for an unchanged state
-        or unknown session, and None for invalid arguments, missing
-        configuration, cancellation, or a database failure.
+        Calls on other group members are refused. Required parents outside
+        the group must already be active.
+
+        Legacy deleted sessions without group records are restored alone,
+        subject to the same parent requirement.
+
+        Returns:
+            True: restoration committed.
+            False: unchanged, unknown, or blocked.
+            None: invalid arguments, unavailable configuration/connection,
+                  or database failure.
 
         Unknown sessions warn at level 0, invalid arguments at level 1,
-        and database failures at level 2. Unexpected programming errors
-        propagate. Does not reread or rewrite payloads.
+        and blocked operations/database failures at level 2.
+
+        Does not reread or rewrite payloads.
         """
         return cls._changeSessionDeletionState(sessionID, deleted=False, settings=settings, settingsName=settingsName, sslRootCert=sslRootCert)
 
     @classmethod
-    def _changeSessionDeletionState(cls, sessionID, *, deleted, settings=None, settingsName=None, sslRootCert=None):
-        """Settings-based lifecycle wrapper with warning and commit handling."""
+    def _changeSessionDeletionState(cls, sessionID, *, deleted, deleteDownstreamSessions=False, settings=None, settingsName=None, sslRootCert=None):
+        """Settings-based lifecycle wrapper with confirmation and commit handling."""
         from .pglPostgres import pglPostgres
 
         if isinstance(sessionID, bool) or not isinstance(sessionID, int) or not 0 <= sessionID <= 9223372036854775807:
@@ -1906,13 +1933,18 @@ class pglStorage:
             pglMessages.warning("deleted must be a boolean.", level=1)
             return None
 
+        if type(deleteDownstreamSessions) is not bool:
+            pglMessages.warning("deleteDownstreamSessions must be a boolean.", level=1)
+            return None
+
+        if deleteDownstreamSessions and not deleted:
+            pglMessages.warning("deleteDownstreamSessions applies only to deletion.", level=1)
+            return None
+
         action = "delete" if deleted else "undelete"
-        changed = False
-        found = False
+        approvedSessionIDs = None
 
         try:
-            # Handle argument/configuration validation separately from the
-            # database operation. Do not broadly catch programming errors.
             try:
                 postgres = pglPostgres.fromSettings(settings=settings, settingsName=settingsName)
             except (TypeError, ValueError) as error:
@@ -1922,40 +1954,529 @@ class pglStorage:
             if postgres is None:
                 return None
 
+            if deleted and deleteDownstreamSessions:
+                # Finish the preview transaction AND close its connection
+                # before asking the user for confirmation.
+                with postgres.connect(sslRootCert=sslRootCert) as connection:
+                    if connection is None:
+                        return None
+
+                    with connection.transaction():
+                        connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+                        records = cls._getSessionDeletionRecords(connection, postgres, sessionID)
+                        candidates = [record for record in records if record["deleted_at"] is None]
+
+                        target = next(record for record in records if record["session_id"] == sessionID)
+
+                        if target["deleted_at"] is not None and candidates:
+                            raise cls._SessionLifecycleBlocked(f"Session {sessionID} is already deleted but has active descendants. No new deletion group was created; resolve the existing lifecycle inconsistency first.")
+
+                if not candidates:
+                    return False
+
+                databaseLabel = f"{postgres.databaseName}.{postgres.databaseSchema}"
+                confirmed = cls._confirmSessionDeletion(sessionID, candidates, databaseLabel=databaseLabel)
+
+                if confirmed is not True:
+                    return False
+
+                approvedSessionIDs = [record["session_id"] for record in candidates]
+
+            # A fresh transaction performs the authoritative checks.
             with postgres.connect(sslRootCert=sslRootCert) as connection:
                 if connection is None:
                     return None
 
                 with connection.transaction():
                     connection.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                    changed = cls._setSessionDeleted(connection, postgres, sessionID, deleted=deleted, approvedSessionIDs=approvedSessionIDs)
 
-                    # Existing guards prohibit session hard deletion.
-                    # The cascade obtains its own locks and checks the
-                    # current deletion state before making any changes.
-                    table = sql.Identifier(postgres.databaseSchema, "session")
-                    statement = sql.SQL("SELECT 1 FROM {} WHERE session_id = %s").format(table)
-                    found = connection.execute(statement, (sessionID,)).fetchone() is not None
+        except cls._UnknownLifecycleSession as error:
+            pglMessages.warning(str(error), level=0)
+            return False
 
-                    if found:
-                        changed = cls._setSessionDeleted(connection, postgres, sessionID, deleted=deleted)
+        except cls._SessionLifecycleBlocked as error:
+            pglMessages.warning(str(error), level=2)
+            return False
 
         except psycopg.Error as error:
-            # Transaction and connection contexts have unwound before
-            # reporting the failure. A lost commit acknowledgement can
-            # leave the client uncertain whether the change committed.
             pglMessages.warning(f"Could not {action} session {sessionID}: {error}. If the connection failed during commit, the outcome may be uncertain; check the session state before retrying.", level=2)
             return None
 
-        if not found:
-            pglMessages.warning(f"Unknown session {sessionID} in {postgres.databaseName}.{postgres.databaseSchema}.", level=0)
-            return False
-
         # Report success only after transaction and connection cleanup.
         if changed:
-            state = "soft-deleted" if deleted else "restored"
-            pglMessages.message(f"Session {sessionID} {state} in {postgres.databaseName}.{postgres.databaseSchema}.")
+            if deleted:
+                pglMessages.message(f"Soft deletion committed for session {sessionID} and its deletion group in {postgres.databaseName}.{postgres.databaseSchema}.")
+            else:
+                pglMessages.message(f"Restoration committed for session {sessionID} and its deletion group, if any, in {postgres.databaseName}.{postgres.databaseSchema}.")
 
         return changed
+
+    @classmethod
+    def _getSessionDeletionRecords(cls, connection, postgres, sessionID):
+        """Return target and all descendants, including deleted records.
+
+        Uses two queries. Call within a consistent preview snapshot or
+        after acquiring lifecycle locks. Does not write or commit.
+        """
+        from psycopg.rows import dict_row
+
+        sessions = sql.Identifier(postgres.databaseSchema, "session")
+        statement = sql.SQL("""
+            SELECT session_id, parent_session_id, root_session_id,
+                   origin, kind, status, description, created_at, deleted_at
+            FROM {}
+            WHERE session_id = %s
+        """).format(sessions)
+
+        with connection.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(statement, (sessionID,))
+            target = cursor.fetchone()
+
+        if target is None:
+            raise cls._UnknownLifecycleSession(f"Unknown session: {sessionID}")
+
+        descendants = cls.getDownstreamSessions(connection, postgres, sessionID)
+        return sorted([target, *descendants], key=lambda record: record["session_id"])
+
+    @staticmethod
+    def _confirmSessionDeletion(sessionID, sessions, *, databaseLabel):
+        """Print every proposed member and require an explicit 'yes'.
+
+        No database access or payload I/O. Call without database locks.
+        Cancellation or unavailable input never authorizes deletion.
+        """
+        records = sorted(sessions, key=lambda record: record["session_id"])
+
+        if not records:
+            return False
+
+        def display(value):
+            return "NULL" if value is None else repr(value)
+
+        pglMessages.print()
+        pglMessages.printHeader("sessions to be deleted")
+        pglMessages.print(f"Database: {display(databaseLabel)}")
+        pglMessages.print(f"Deletion-group top-level session: {sessionID}")
+        pglMessages.print(f"Sessions to be newly soft-deleted: {len(records)}")
+        pglMessages.print("Previously deleted sessions are not added to this group.")
+        pglMessages.print()
+
+        for record in records:
+            label = "top-level session" if record["session_id"] == sessionID else "downstream session"
+            pglMessages.print(f"  Session {record['session_id']} ({label})")
+            pglMessages.print(f"    Parent: {display(record.get('parent_session_id'))}")
+            pglMessages.print(f"    Origin: {display(record.get('origin'))} | Status: {display(record.get('status'))}")
+            pglMessages.print(f"    Created: {display(record.get('created_at'))}")
+            pglMessages.print(f"    Description: {display(record.get('description'))}")
+            pglMessages.print()
+
+        pglMessages.print("This is soft deletion only. No payload files will be removed.")
+        pglMessages.print(f"Restore this entire deletion group with undeleteSession({sessionID}).")
+        pglMessages.print("Individual group members cannot be restored separately.")
+        pglMessages.print("Restoration requires any parent outside the group to be active.")
+        pglMessages.print("All listed sessions must be included; partial selection is not supported.")
+
+        try:
+            response = input("Type yes to soft-delete ALL listed sessions; anything else cancels: ")
+        except (EOFError, OSError, KeyboardInterrupt, NotImplementedError):
+            pglMessages.print("\nDeletion cancelled: confirmation was interrupted or input was unavailable.")
+            return False
+
+        if response.strip().lower() != "yes":
+            pglMessages.print("Deletion cancelled.")
+            return False
+
+        pglMessages.print("Confirmation received. The deletion set will be rechecked before any changes.")
+        return True
+
+    @staticmethod
+    def _applySessionDeletionMarkers(connection, postgres, sessionIDs, marker):
+        """Apply coordinated markers to an already-validated session set.
+
+        Internal write primitive. Caller must hold all lifecycle locks,
+        own the transaction, and perform group/lineage validation first.
+
+        marker is a timestamp for deletion or None for restoration.
+        Does not commit, inspect payloads, or manage group records.
+        """
+        sessions = sql.Identifier(postgres.databaseSchema, "session")
+        links = sql.Identifier(postgres.databaseSchema, "session_files")
+        files = sql.Identifier(postgres.databaseSchema, "files")
+        locations = sql.Identifier(postgres.databaseSchema, "storage_locations")
+
+        # Update every owner before changing links, so the existing
+        # link guards see the correct session deletion marker.
+        statement = sql.SQL("""
+            UPDATE {}
+            SET deleted_at = %s
+            WHERE session_id = ANY(%s::bigint[])
+              AND deleted_at IS DISTINCT FROM %s::timestamptz
+        """).format(sessions)
+        connection.execute(statement, (marker, sessionIDs, marker))
+
+        statement = sql.SQL("""
+            UPDATE {}
+            SET deleted_at = %s
+            WHERE session_id = ANY(%s::bigint[])
+              AND deleted_at IS DISTINCT FROM %s::timestamptz
+        """).format(links)
+        connection.execute(statement, (marker, sessionIDs, marker))
+
+        # All owners have their final markers before shared-content
+        # eligibility is recomputed.
+        statement = sql.SQL("""
+            WITH desired AS (
+                SELECT content.file_id,
+                       CASE WHEN EXISTS (
+                           SELECT 1
+                           FROM {links} AS reference
+                           JOIN {sessions} AS owner
+                             ON owner.session_id = reference.session_id
+                           WHERE reference.file_id = content.file_id
+                             AND owner.deleted_at IS NULL
+                       )
+                       THEN NULL::timestamptz
+                       ELSE COALESCE(content.deleted_at, %s::timestamptz)
+                       END AS deleted_at
+                FROM {files} AS content
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM {links} AS affected
+                    WHERE affected.session_id = ANY(%s::bigint[])
+                      AND affected.file_id = content.file_id
+                )
+            )
+            UPDATE {files} AS content
+            SET deleted_at = desired.deleted_at
+            FROM desired
+            WHERE content.file_id = desired.file_id
+              AND content.deleted_at IS DISTINCT FROM desired.deleted_at
+        """).format(sessions=sessions, links=links, files=files)
+        connection.execute(statement, (marker, sessionIDs))
+
+        statement = sql.SQL("""
+            UPDATE {locations} AS location
+            SET deleted_at = content.deleted_at
+            FROM {files} AS content
+            WHERE location.file_id = content.file_id
+              AND EXISTS (
+                  SELECT 1
+                  FROM {links} AS affected
+                  WHERE affected.session_id = ANY(%s::bigint[])
+                    AND affected.file_id = content.file_id
+              )
+              AND location.deleted_at IS DISTINCT FROM content.deleted_at
+        """).format(locations=locations, files=files, links=links)
+        connection.execute(statement, (sessionIDs,))
+
+    @classmethod
+    def _setSessionDeleted(cls, connection, postgres, sessionID, *, deleted, approvedSessionIDs=None):
+        """Atomically delete a group or restore an existing deletion group.
+
+        Internal lifecycle operation; no confirmation prompt or payload I/O.
+
+        approvedSessionIDs:
+            None permits deletion only when no active descendants exist.
+            Otherwise, must exactly match all sessions to be newly deleted.
+            The public wrapper supplies this only after user confirmation.
+            Not permitted for restoration.
+
+        Returns True for a change, False for an unchanged state.
+        Unknown sessions and blocked operations raise dedicated ValueError
+        subclasses; the public wrapper translates them into warnings.
+
+        Opens a transaction/savepoint. An outer transaction must commit for
+        persistence. Requires READ COMMITTED isolation.
+
+        Conservative EXCLUSIVE locks last until the outer transaction ends.
+        Ordinary SELECT queries remain allowed; competing writes are blocked.
+        """
+        if isinstance(sessionID, bool) or not isinstance(sessionID, int) or not 0 <= sessionID <= 9223372036854775807:
+            raise ValueError("sessionID must be a nonnegative PostgreSQL bigint.")
+
+        if type(deleted) is not bool:
+            raise ValueError("deleted must be a boolean.")
+
+        if approvedSessionIDs is not None:
+            if not deleted:
+                raise ValueError("approvedSessionIDs applies only to deletion.")
+
+            if not isinstance(approvedSessionIDs, (list, tuple)):
+                raise ValueError("approvedSessionIDs must be a list or tuple.")
+
+            for value in approvedSessionIDs:
+                if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 9223372036854775807:
+                    raise ValueError("approvedSessionIDs must contain nonnegative PostgreSQL bigints.")
+
+            if len(set(approvedSessionIDs)) != len(approvedSessionIDs):
+                raise ValueError("approvedSessionIDs must not contain duplicates.")
+
+            approvedSessionIDs = sorted(approvedSessionIDs)
+
+        sessions = sql.Identifier(postgres.databaseSchema, "session")
+        links = sql.Identifier(postgres.databaseSchema, "session_files")
+        files = sql.Identifier(postgres.databaseSchema, "files")
+        locations = sql.Identifier(postgres.databaseSchema, "storage_locations")
+        groups = sql.Identifier(postgres.databaseSchema, "session_deletion_groups")
+        members = sql.Identifier(postgres.databaseSchema, "session_deletion_group_members")
+
+        from psycopg.rows import tuple_row
+
+        with connection.transaction():
+            with connection.cursor(row_factory=tuple_row) as cursor:
+                cursor.execute("SHOW transaction_isolation")
+
+                if cursor.fetchone()[0] != "read committed":
+                    raise ValueError("Session delete/undelete requires READ COMMITTED isolation.")
+
+                # Parent relationships live on session, so locking session
+                # also protects the authoritative descendant/parent checks.
+                statement = sql.SQL("LOCK TABLE {}, {}, {}, {}, {}, {} IN EXCLUSIVE MODE").format(sessions, links, files, locations, groups, members)
+                cursor.execute(statement)
+
+                cursor.execute(sql.SQL("SELECT deleted_at FROM {} WHERE session_id = %s").format(sessions), (sessionID,))
+                target = cursor.fetchone()
+
+                if target is None:
+                    raise cls._UnknownLifecycleSession(f"Unknown session: {sessionID}")
+
+                if deleted:
+                    records = cls._getSessionDeletionRecords(connection, postgres, sessionID)
+                    candidates = [record for record in records if record["deleted_at"] is None]
+                    affectedIDs = sorted(record["session_id"] for record in candidates)
+
+                    # Never silently expand OR shrink the approved set.
+                    if approvedSessionIDs is not None and affectedIDs != approvedSessionIDs:
+                        raise cls._SessionLifecycleBlocked("The sessions to be deleted changed after confirmation. Nothing was changed; rerun deleteSession() to review the current list.")
+
+                    if target[0] is not None:
+                        if affectedIDs:
+                            raise cls._SessionLifecycleBlocked(f"Session {sessionID} is already deleted but has active descendants. No new deletion group was created; resolve the existing lifecycle inconsistency first.")
+                        return False
+
+                    downstreamIDs = [value for value in affectedIDs if value != sessionID]
+
+                    if downstreamIDs and approvedSessionIDs is None:
+                        listed = ", ".join(str(value) for value in downstreamIDs)
+                        raise cls._SessionLifecycleBlocked(f"Cannot delete session {sessionID}: active downstream sessions exist: {listed}. Use deleteDownstreamSessions=True to preview and explicitly confirm deletion of the complete group.")
+
+                    # Prevent a group from spanning a previously deleted
+                    # intermediate parent. Such a group could otherwise
+                    # become impossible to restore under the parent rule.
+                    recordsByID = {record["session_id"]: record for record in records}
+
+                    for record in candidates:
+                        if record["session_id"] == sessionID:
+                            continue
+
+                        parent = recordsByID.get(record["parent_session_id"])
+
+                        if parent is not None and parent["deleted_at"] is not None:
+                            raise cls._SessionLifecycleBlocked(f"Cannot create deletion group: active session {record['session_id']} has deleted parent {record['parent_session_id']} inside the downstream tree. Resolve this existing lifecycle inconsistency first; nothing was changed.")
+
+                    # Active sessions must not already have outstanding
+                    # group membership or lead an outstanding group.
+                    statement = sql.SQL("""
+                        SELECT session_id
+                        FROM {}
+                        WHERE session_id = ANY(%s::bigint[])
+                          AND restored_at IS NULL
+                        ORDER BY session_id
+                    """).format(members)
+                    cursor.execute(statement, (affectedIDs,))
+                    conflicts = [row[0] for row in cursor.fetchall()]
+
+                    if conflicts:
+                        raise cls._SessionLifecycleBlocked(f"Active sessions already have outstanding deletion-group membership: {conflicts}. Nothing was changed; review lifecycle consistency.")
+
+                    statement = sql.SQL("""
+                        SELECT top_session_id
+                        FROM {}
+                        WHERE top_session_id = ANY(%s::bigint[])
+                          AND restored_at IS NULL
+                        ORDER BY top_session_id
+                    """).format(groups)
+                    cursor.execute(statement, (affectedIDs,))
+                    conflicts = [row[0] for row in cursor.fetchall()]
+
+                    if conflicts:
+                        raise cls._SessionLifecycleBlocked(f"Active sessions already lead outstanding deletion groups: {conflicts}. Nothing was changed; review lifecycle consistency.")
+
+                    statement = sql.SQL("""
+                        INSERT INTO {} (top_session_id)
+                        VALUES (%s)
+                        RETURNING deletion_group_id, created_at
+                    """).format(groups)
+                    cursor.execute(statement, (sessionID,))
+                    groupID, marker = cursor.fetchone()
+
+                    statement = sql.SQL("""
+                        INSERT INTO {} (deletion_group_id, session_id)
+                        SELECT %s, member_id
+                        FROM unnest(%s::bigint[]) AS member_ids(member_id)
+                    """).format(members)
+                    cursor.execute(statement, (groupID, affectedIDs))
+
+                    cls._applySessionDeletionMarkers(connection, postgres, affectedIDs, marker)
+                    return True
+
+                # Restoration: resolve outstanding membership first.
+                statement = sql.SQL("""
+                    SELECT membership.deletion_group_id,
+                           deletion_group.top_session_id,
+                           deletion_group.restored_at
+                    FROM {} AS membership
+                    JOIN {} AS deletion_group
+                      ON deletion_group.deletion_group_id = membership.deletion_group_id
+                    WHERE membership.session_id = %s
+                      AND membership.restored_at IS NULL
+                """).format(members, groups)
+                cursor.execute(statement, (sessionID,))
+                membership = cursor.fetchone()
+
+                statement = sql.SQL("""
+                    SELECT deletion_group_id
+                    FROM {}
+                    WHERE top_session_id = %s
+                      AND restored_at IS NULL
+                """).format(groups)
+                cursor.execute(statement, (sessionID,))
+                ledGroup = cursor.fetchone()
+
+                if membership is None:
+                    if ledGroup is not None:
+                        raise cls._SessionLifecycleBlocked(f"Session {sessionID} leads an outstanding group but lacks its membership record. Nothing was changed; review lifecycle consistency.")
+
+                    if target[0] is None:
+                        return False
+
+                    # Legacy deletion: do not invent historical membership.
+                    groupID = None
+                    affectedIDs = [sessionID]
+
+                else:
+                    groupID, topID, groupRestoredAt = membership
+
+                    if groupRestoredAt is not None:
+                        raise cls._SessionLifecycleBlocked(f"Session {sessionID} has outstanding membership in an already-restored group. Nothing was changed; review lifecycle consistency.")
+
+                    if topID != sessionID:
+                        raise cls._SessionLifecycleBlocked(f"Session {sessionID} belongs to the deletion group led by session {topID}. Restore the entire group with undeleteSession({topID}); individual members cannot be restored separately.")
+
+                    if ledGroup != (groupID,):
+                        raise cls._SessionLifecycleBlocked(f"Session {sessionID} has inconsistent deletion-group ownership. Nothing was changed.")
+
+                    statement = sql.SQL("""
+                        SELECT membership.session_id,
+                               membership.restored_at,
+                               checkpoint.deleted_at
+                        FROM {} AS membership
+                        JOIN {} AS checkpoint
+                          ON checkpoint.session_id = membership.session_id
+                        WHERE membership.deletion_group_id = %s
+                        ORDER BY membership.session_id
+                    """).format(members, sessions)
+                    cursor.execute(statement, (groupID,))
+                    memberRows = cursor.fetchall()
+                    affectedIDs = [row[0] for row in memberRows]
+
+                    if sessionID not in affectedIDs or any(restoredAt is not None or deletedAt is None for _, restoredAt, deletedAt in memberRows):
+                        raise cls._SessionLifecycleBlocked(f"Deletion group {groupID} has inconsistent member states. Nothing was changed; review lifecycle consistency.")
+
+                # Every required parent must either be restored in this
+                # operation or already be active outside the group.
+                statement = sql.SQL("""
+                    SELECT child.session_id, child.parent_session_id
+                    FROM {sessions} AS child
+                    LEFT JOIN {sessions} AS parent
+                      ON parent.session_id = child.parent_session_id
+                    WHERE child.session_id = ANY(%s::bigint[])
+                      AND child.parent_session_id IS NOT NULL
+                      AND NOT (child.parent_session_id = ANY(%s::bigint[]))
+                      AND (parent.session_id IS NULL OR parent.deleted_at IS NOT NULL)
+                    ORDER BY child.session_id
+                """).format(sessions=sessions)
+                cursor.execute(statement, (affectedIDs, affectedIDs))
+                blockedParents = cursor.fetchall()
+
+                if blockedParents:
+                    details = ", ".join(f"session {childID} requires parent {parentID}" for childID, parentID in blockedParents)
+                    raise cls._SessionLifecycleBlocked(f"Cannot restore session {sessionID}: {details}. Restore the required parent or its top-level deletion group first. Nothing was changed.")
+
+                cls._applySessionDeletionMarkers(connection, postgres, affectedIDs, None)
+
+                if groupID is not None:
+                    cursor.execute("SELECT statement_timestamp()")
+                    restoredAt = cursor.fetchone()[0]
+
+                    cursor.execute(sql.SQL("UPDATE {} SET restored_at = %s WHERE deletion_group_id = %s").format(groups), (restoredAt, groupID))
+                    cursor.execute(sql.SQL("UPDATE {} SET restored_at = %s WHERE deletion_group_id = %s").format(members), (restoredAt, groupID))
+
+                return True
+    
+    @staticmethod
+    def getDownstreamSessions(connection, postgres, sessionID):
+        """Return all descendants, including deleted sessions, ordered by ID.
+
+        Follows parent_session_id recursively. The requested session itself
+        is excluded, even if a cycle leads back to it.
+
+        Returns a list of metadata dictionaries. An existing session with
+        no descendants returns an empty list; an unknown session raises
+        ValueError.
+
+        Read-only: does not change rows, access payloads, or commit.
+        One SQL statement provides a consistent snapshot.
+
+        This is an informational lookup, not a concurrency-safe deletion
+        decision. Deletion must repeat it under the required locks.
+        """
+        from psycopg.rows import dict_row
+
+        if isinstance(sessionID, bool) or not isinstance(sessionID, int) or not 0 <= sessionID <= 9223372036854775807:
+            raise ValueError("sessionID must be a nonnegative PostgreSQL bigint.")
+
+        sessions = sql.Identifier(postgres.databaseSchema, "session")
+
+        # Recurse over IDs only. UNION removes previously visited IDs,
+        # including those reached again through a cycle.
+        statement = sql.SQL("""
+            WITH RECURSIVE reachable(session_id) AS (
+                SELECT session_id
+                FROM {sessions}
+                WHERE session_id = %s
+
+                UNION
+
+                SELECT child.session_id
+                FROM {sessions} AS child
+                JOIN reachable AS parent
+                  ON child.parent_session_id = parent.session_id
+            )
+            SELECT checkpoint.session_id,
+                   checkpoint.parent_session_id,
+                   checkpoint.root_session_id,
+                   checkpoint.origin,
+                   checkpoint.kind,
+                   checkpoint.status,
+                   checkpoint.description,
+                   checkpoint.created_at,
+                   checkpoint.deleted_at
+            FROM {sessions} AS checkpoint
+            JOIN reachable
+              ON reachable.session_id = checkpoint.session_id
+            ORDER BY checkpoint.session_id
+        """).format(sessions=sessions)
+
+        with connection.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(statement, (sessionID,))
+            records = cursor.fetchall()
+
+        if not records:
+            raise ValueError(f"Unknown session: {sessionID}")
+
+        return [record for record in records if record["session_id"] != sessionID]
     
     @staticmethod
     def getSessionDeletionImpact(connection, postgres, sessionID):
@@ -2039,176 +2560,6 @@ class pglStorage:
             "exclusive_location_count": exclusiveLocationCount,
             "shared_location_count": sharedLocationCount,
         }    
-
-    @staticmethod
-    def _setSessionDeleted(connection, postgres, sessionID, *, deleted):
-        """Atomically soft-delete or restore a session and its dependencies.
-
-        Internal lifecycle operation; performs no payload I/O.
-
-        Returns True if the session's state changed, otherwise False.
-        Unknown session IDs raise ValueError.
-
-        Opens a transaction or savepoint. If the caller already has a
-        transaction, that outer transaction must commit for persistence.
-
-        Requires READ COMMITTED isolation. Conservative table locks prevent
-        reference changes during the cascade and last until the outer
-        transaction finishes.
-
-        Dependency rules:
-        - File-link markers exactly follow their owning session.
-        - Content is deleted only if no nondeleted session references it.
-        - All locations follow their content identity's deletion state.
-        - Subjects, users, and backends are unchanged.
-
-        Not yet a public API: print/load/save integration must be completed
-        before using this operation on real checkpoints.
-        """
-        if (
-            isinstance(sessionID, bool)
-            or not isinstance(sessionID, int)
-            or not 0 <= sessionID <= 9223372036854775807
-        ):
-            raise ValueError("sessionID must be a nonnegative PostgreSQL bigint.")
-
-        if type(deleted) is not bool:
-            raise ValueError("deleted must be a boolean.")
-
-        sessions = sql.Identifier(postgres.databaseSchema, "session")
-        links = sql.Identifier(postgres.databaseSchema, "session_files")
-        files = sql.Identifier(postgres.databaseSchema, "files")
-        locations = sql.Identifier(postgres.databaseSchema, "storage_locations")
-
-        with connection.transaction():
-            isolation = connection.execute(
-                "SHOW transaction_isolation"
-            ).fetchone()[0]
-
-            if isolation != "read committed":
-                raise ValueError(
-                    "Session delete/undelete requires READ COMMITTED isolation."
-                )
-
-            # Fixed order for cooperating lifecycle operations.
-            # EXCLUSIVE blocks writes and SELECT FOR UPDATE/SHARE, but
-            # permits ordinary SELECT queries.
-            statement = sql.SQL("""
-                LOCK TABLE {}, {}, {}, {} IN EXCLUSIVE MODE
-            """).format(sessions, links, files, locations)
-            connection.execute(statement)
-
-            # Under READ COMMITTED, this statement sees changes committed
-            # by any writer we waited for when acquiring the locks.
-            row = connection.execute(
-                sql.SQL("""
-                    SELECT deleted_at
-                    FROM {}
-                    WHERE session_id = %s
-                """).format(sessions),
-                (sessionID,),
-            ).fetchone()
-
-            if row is None:
-                raise ValueError(f"Unknown session: {sessionID}")
-
-            currentlyDeleted = row[0] is not None
-
-            if currentlyDeleted == deleted:
-                return False
-
-            # Set the owning session first so its link guard permits the
-            # corresponding marker changes. Nothing becomes externally
-            # visible until the transaction commits.
-            marker = connection.execute(
-                sql.SQL("""
-                    UPDATE {}
-                    SET deleted_at = CASE
-                        WHEN %s THEN statement_timestamp()
-                        ELSE NULL
-                    END
-                    WHERE session_id = %s
-                    RETURNING deleted_at
-                """).format(sessions),
-                (deleted, sessionID),
-            ).fetchone()[0]
-
-            connection.execute(
-                sql.SQL("""
-                    UPDATE {}
-                    SET deleted_at = %s
-                    WHERE session_id = %s
-                      AND deleted_at IS DISTINCT FROM %s::timestamptz
-                """).format(links),
-                (marker, sessionID, marker),
-            )
-
-            # Recompute shared-content state from session ownership,
-            # not directory names or the current file/link markers.
-            #
-            # Preserve an existing deletion timestamp when the content
-            # remains deleted. Clear it whenever an active owner exists.
-            connection.execute(
-                sql.SQL("""
-                    WITH desired AS (
-                        SELECT content.file_id,
-                               CASE WHEN EXISTS (
-                                   SELECT 1
-                                   FROM {links} AS reference
-                                   JOIN {sessions} AS owner
-                                     ON owner.session_id = reference.session_id
-                                   WHERE reference.file_id = content.file_id
-                                     AND owner.deleted_at IS NULL
-                               )
-                               THEN NULL::timestamptz
-                               ELSE COALESCE(
-                                   content.deleted_at,
-                                   %s::timestamptz
-                               )
-                               END AS deleted_at
-                        FROM {files} AS content
-                        WHERE EXISTS (
-                            SELECT 1
-                            FROM {links} AS affected
-                            WHERE affected.session_id = %s
-                              AND affected.file_id = content.file_id
-                        )
-                    )
-                    UPDATE {files} AS content
-                    SET deleted_at = desired.deleted_at
-                    FROM desired
-                    WHERE content.file_id = desired.file_id
-                      AND content.deleted_at
-                          IS DISTINCT FROM desired.deleted_at
-                """).format(
-                    sessions=sessions, links=links, files=files
-                ),
-                (marker, sessionID),
-            )
-
-            # A location is content-level metadata, even when its path
-            # happens to sit under another session's directory.
-            connection.execute(
-                sql.SQL("""
-                    UPDATE {locations} AS location
-                    SET deleted_at = content.deleted_at
-                    FROM {files} AS content
-                    WHERE location.file_id = content.file_id
-                      AND EXISTS (
-                          SELECT 1
-                          FROM {links} AS affected
-                          WHERE affected.session_id = %s
-                            AND affected.file_id = content.file_id
-                      )
-                      AND location.deleted_at
-                          IS DISTINCT FROM content.deleted_at
-                """).format(
-                    locations=locations, files=files, links=links
-                ),
-                (sessionID,),
-            )
-
-            return True
 
     # ------------------------------------------------------------
     # Public schema initialization
@@ -2500,6 +2851,8 @@ class pglStorage:
             "storage_locations",
             "session",
             "session_files",
+            "session_deletion_groups",
+            "session_deletion_group_members",
         ]
 
         for name in applicationTables:
@@ -2519,7 +2872,7 @@ class pglStorage:
             connection.execute(sql.SQL("REVOKE ALL PRIVILEGES ON TABLE {} FROM {}").format(table, application))
             connection.execute(sql.SQL("GRANT SELECT ON TABLE {} TO {}").format(table, application))
 
-        connection.execute(sql.SQL("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA {} TO {}").format(schema, application))        
+        connection.execute(sql.SQL("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA {} TO {}").format(schema, application))
 ################################################################
 # Read-only logical filesystem for archived checkpoints
 ################################################################
