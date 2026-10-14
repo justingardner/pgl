@@ -2263,157 +2263,158 @@ class pglStorage:
         return session
     
     @classmethod
-    def _saveDerivedSession(
-        cls,
-        connection,
-        postgres,
-        session,
-        createdBy,
-        backendID,
-        *,
-        parentSessionID,
-        description=None,
-        ingestMethod="manual",
-        storageOptions=None,
-    ):
-        """Save, register, and complete a new derived behavioral checkpoint.
+    def _saveDerivedSession(cls, connection, postgres, session, createdBy, backendID, *, parentSessionID, description=None, ingestMethod="manual", storageOptions=None):
+        """Save current contents as a derived checkpoint, or reuse its parent.
 
-        Requires an explicit completed, active parent.
-        Always creates a new checkpoint; derived deduplication is deferred.
+        Reuses only an active completed derived parent with identical encoded
+        manifest, description, ingest method, creator, and modalities, whose
+        linked files have eligible locations on the requested backend.
 
-        Opens a transaction/savepoint. An outer transaction must commit
-        before the checkpoint is published persistently.
+        A raw parent always produces a new derived checkpoint.
 
-        Payload writes are not transactional. Failure may leave an
-        unregistered bundle, which is not removed automatically.
+        Exports a verified temporary snapshot before deciding whether a new
+        checkpoint is needed. This avoids duplicate permanent writes, but
+        does not avoid serialization and hashing.
 
-        Does not change source run paths or attach the new checkpoint ID
-        to the in-memory session. Returns the new database session ID.
+        Uses the caller's transaction with a nested transaction/savepoint.
+        Temporary staging is removed. Failed destination writes may leave
+        unregistered files.
+
+        Returns the new or reused checkpoint ID. Does not update the
+        in-memory session ID or clear its action history.
         """
-        for label, value in (
-            ("createdBy", createdBy),
-            ("backendID", backendID),
-            ("parentSessionID", parentSessionID),
-        ):
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, int)
-                or not 0 <= value <= 9223372036854775807
-            ):
-                raise ValueError(
-                    f"{label} must be a nonnegative PostgreSQL bigint."
-                )
-
+        from tempfile import TemporaryDirectory
+        from fsspec.implementations.local import LocalFileSystem
         from .pglSession import pglMNE
 
+        for label, value in (("createdBy", createdBy), ("backendID", backendID), ("parentSessionID", parentSessionID)):
+            if type(value) is not int or not 0 <= value <= 9223372036854775807:
+                raise ValueError(f"{label} must be a nonnegative PostgreSQL bigint.")
+
+        if description is not None and (not isinstance(description, str) or "\x00" in description):
+            raise ValueError("description must be a string without NUL, or None.")
+
+        if not isinstance(ingestMethod, str) or ingestMethod not in {"manual", "automated"}:
+            raise ValueError("ingestMethod must be manual or automated.")
+
         hasMNE = session.mne is not None
-        if not session.runs and not hasMNE: raise ValueError("A derived checkpoint must contain behavioral runs or MNE contents.")
-        if hasMNE and type(session.mne) is not pglMNE: raise TypeError("MNE checkpoints currently support pglMNE, not subclasses.")
+
+        if not session.runs and not hasMNE:
+            raise ValueError("A derived checkpoint must contain behavioral runs or MNE contents.")
+
+        if hasMNE and type(session.mne) is not pglMNE:
+            raise TypeError("MNE checkpoints currently support pglMNE, not subclasses.")
 
         contractVersion = "pgl.derived.session.v1" if hasMNE else "pgl.derived.behavior.v1"
         modalities = (["behavior"] if session.runs else []) + (["mne"] if hasMNE else [])
-        
+
+        sessions = sql.Identifier(postgres.databaseSchema, "session")
+        users = sql.Identifier(postgres.databaseSchema, "users")
+        backends = sql.Identifier(postgres.databaseSchema, "storage_backends")
+        links = sql.Identifier(postgres.databaseSchema, "session_files")
+        files = sql.Identifier(postgres.databaseSchema, "files")
+        locations = sql.Identifier(postgres.databaseSchema, "storage_locations")
+
         def isLocal(filesystem):
             protocols = filesystem.protocol
-            protocols = (
-                {protocols} if isinstance(protocols, str) else set(protocols)
-            )
+            protocols = {protocols} if isinstance(protocols, str) else set(protocols)
             return bool(protocols.intersection({"file", "local"}))
 
-        users = sql.Identifier(postgres.databaseSchema, "users")
-        backends = sql.Identifier(
-            postgres.databaseSchema, "storage_backends"
-        )
-
         with connection.transaction():
-            creator = connection.execute(
-                sql.SQL(
-                    "SELECT 1 FROM {} WHERE user_id = %s FOR SHARE"
-                ).format(users),
-                (createdBy,),
-            ).fetchone()
+            creator = connection.execute(sql.SQL("SELECT 1 FROM {} WHERE user_id = %s FOR SHARE").format(users), (createdBy,)).fetchone()
 
             if creator is None:
                 raise ValueError(f"Unknown creator: {createdBy}")
 
-            backend = connection.execute(
-                sql.SQL("""
-                    SELECT url_prefix, is_active
-                    FROM {}
-                    WHERE backend_id = %s
-                    FOR SHARE
-                """).format(backends),
-                (backendID,),
-            ).fetchone()
+            backend = connection.execute(sql.SQL("SELECT url_prefix, is_active FROM {} WHERE backend_id = %s FOR SHARE").format(backends), (backendID,)).fetchone()
 
             if backend is None or not backend[1]:
-                raise ValueError(
-                    f"Storage backend is missing or inactive: {backendID}"
-                )
+                raise ValueError(f"Storage backend is missing or inactive: {backendID}")
 
-            filesystem, root = url_to_fs(
-                backend[0], **(storageOptions or {})
-            )
+            statement = sql.SQL("SELECT origin, status, contract_version, manifest_hash, description, ingest_method, created_by, modalities, deleted_at FROM {} WHERE session_id = %s FOR SHARE").format(sessions)
+            parent = connection.execute(statement, (parentSessionID,)).fetchone()
 
-            sessionID = cls.createDerivedCheckpoint(connection, postgres, createdBy, parentSessionID, description=description, ingestMethod=ingestMethod, contractVersion=contractVersion, modalities=modalities)
+            if parent is None or parent[1] != "complete" or parent[8] is not None:
+                raise ValueError("Parent must be a completed, active checkpoint.")
 
-            objectPrefix = f"session{sessionID:06d}"
-            destination = posixpath.join(root, objectPrefix)
+            destinationFS, destinationRoot = url_to_fs(backend[0], **(storageOptions or {}))
+            stagingFS = LocalFileSystem(skip_instance_cache=True)
 
-            # Refuse to write inside an acquisition/source run directory.
-            # These checks cover local paths and matching filesystem objects.
-            for run in session.runs:
-                if run.filesystem is None:
-                    raise ValueError("Source run has no resolved filesystem.")
+            with TemporaryDirectory(prefix="pgl-derived-session-") as temporary:
+                pglMessages.message("Saving session: exporting current contents to temporary staging...")
+                stagingRoot, manifest = cls.saveDerivedSessionFiles(session, dataPath=Path(temporary) / "bundle", filesystem=stagingFS)
 
-                if isLocal(filesystem) and isLocal(run.filesystem):
-                    target = Path(destination).expanduser().resolve()
-                    source = Path(run.fullDataPath).expanduser().resolve()
+                if manifest["contract_version"] != contractVersion:
+                    raise ValueError("Exported manifest contract differs from the expected checkpoint contract.")
 
-                    if target == source or source in target.parents:
-                        raise ValueError(
-                            "Derived destination must be outside source "
-                            "run directories."
-                        )
+                manifestBytes = cls.encodeRawManifest(manifest)
+                manifestHash = hashlib.sha256(manifestBytes).hexdigest()
 
-                elif filesystem == run.filesystem:
-                    target = posixpath.normpath(destination)
-                    source = posixpath.normpath(run.fullDataPath)
+                pglMessages.message("Saving session: comparing contents with the parent checkpoint...")
+                sameParent = parent[0] == "derived" and parent[2] == contractVersion and parent[3] == manifestHash
+                sameMetadata = parent[4] == description and parent[5] == ingestMethod and parent[6] == createdBy and sorted(parent[7]) == sorted(modalities)
 
-                    if (
-                        target == source
-                        or target.startswith(source.rstrip("/") + "/")
-                    ):
-                        raise ValueError(
-                            "Derived destination must be outside source "
-                            "run directories."
-                        )
+                if sameParent and sameMetadata:
+                    expected = {record["name"]: (record["sha256"], record["size_bytes"], "history" if record["name"] == "history.json" else "derived") for record in manifest["files"]}
+                    expected["manifest.json"] = (manifestHash, len(manifestBytes), "manifest")
 
-            _, manifest = cls.saveDerivedSessionFiles(
-                session,
-                dataPath=destination,
-                filesystem=filesystem,
-            )
-            if manifest["contract_version"] != contractVersion: raise ValueError("Exported manifest contract differs from the allocated checkpoint.")
+                    statement = sql.SQL("SELECT link.name, content.sha256, content.size_bytes, link.role, (link.deleted_at IS NULL AND content.deleted_at IS NULL AND EXISTS (SELECT 1 FROM {} AS location WHERE location.file_id = content.file_id AND location.backend_id = %s AND location.deleted_at IS NULL AND location.status = 'present' AND location.verified_at IS NOT NULL)) AS available FROM {} AS link JOIN {} AS content ON content.file_id = link.file_id WHERE link.session_id = %s ORDER BY link.name").format(locations, links, files)
+                    rows = connection.execute(statement, (backendID, parentSessionID)).fetchall()
+                    actual = {name: (digest, size, role) for name, digest, size, role, available in rows}
 
-            cls.registerDerivedSessionFiles(
-                connection,
-                postgres,
-                sessionID,
-                backendID,
-                manifest,
-                objectPrefix=objectPrefix,
-                storageOptions=storageOptions,
-            )
+                    if actual != expected:
+                        raise ValueError("Parent checkpoint file links do not match its manifest identity; it cannot be reused.")
 
-            cls.completeDerivedCheckpoint(
-                connection,
-                postgres,
-                sessionID,
-                manifest,
-            )
+                    if all(available for name, digest, size, role, available in rows):
+                        pglMessages.warning(f"Session contents and save metadata match checkpoint {parentSessionID}. No new checkpoint was created; returning the existing ID. Make changes before calling saveSession() again.", level=2)
+                        return parentSessionID
 
-        return sessionID    
+                    pglMessages.message("Saving session: matching parent lacks eligible files on the requested backend; creating a new checkpoint.")
+
+                pglMessages.message("Saving session: allocating a new derived checkpoint...")
+                sessionID = cls.createDerivedCheckpoint(connection, postgres, createdBy, parentSessionID, description=description, ingestMethod=ingestMethod, contractVersion=contractVersion, modalities=modalities)
+                objectPrefix = f"session{sessionID:06d}"
+                destination = posixpath.join(destinationRoot, objectPrefix)
+
+                for run in session.runs:
+                    if run.filesystem is None:
+                        raise ValueError("Source run has no resolved filesystem.")
+
+                    if isLocal(destinationFS) and isLocal(run.filesystem):
+                        target = Path(destination).expanduser().resolve()
+                        source = Path(run.fullDataPath).expanduser().resolve()
+
+                        if target == source or source in target.parents:
+                            raise ValueError("Derived destination must be outside source run directories.")
+
+                    elif destinationFS == run.filesystem:
+                        target = posixpath.normpath(destination)
+                        source = posixpath.normpath(run.fullDataPath)
+
+                        if target == source or target.startswith(source.rstrip("/") + "/"):
+                            raise ValueError("Derived destination must be outside source run directories.")
+
+                if destinationFS.exists(destination):
+                    raise FileExistsError(f"Destination already exists: {destination}")
+
+                destinationFS.makedirs(destination, exist_ok=False)
+
+                for directory in manifest["directories"]:
+                    destinationFS.makedirs(posixpath.join(destination, directory), exist_ok=True)
+
+                pglMessages.message("Saving session: writing and verifying checkpoint payloads...")
+                records = [*manifest["files"], {"name": "manifest.json", "sha256": manifestHash, "size_bytes": len(manifestBytes)}]
+
+                for record in records:
+                    cls.stageRawFile(stagingFS, posixpath.join(stagingRoot, record["name"]), destinationFS, destinationRoot, record, objectKey=posixpath.join(objectPrefix, record["name"]))
+
+                pglMessages.message("Saving session: registering checkpoint files...")
+                cls.registerDerivedSessionFiles(connection, postgres, sessionID, backendID, manifest, objectPrefix=objectPrefix, storageOptions=storageOptions)
+
+                pglMessages.message("Saving session: validating checkpoint completion...")
+                cls.completeDerivedCheckpoint(connection, postgres, sessionID, manifest)
+
+                return sessionID
 
     @classmethod
     def saveSession(cls, session, *, parentSessionID, settings=None, settingsName=None, backendID=None, description=None, ingestMethod="manual", storageOptions=None, sslRootCert=None):
