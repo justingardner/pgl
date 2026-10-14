@@ -2119,15 +2119,23 @@ class pglSession(pglActionable):
             return None
         
     def saveRawSession(self, *, settings=None, settingsName=None, backendID=None, storageOptions=None, sslRootCert=None):
-        """Archive saved behavioral acquisition files and return a checkpoint ID.
+        """Save this session as a parentless acquisition/root checkpoint.
 
-        Uses the current or supplied settings and configured storage destination.
-        Returns None when configuration is missing or password entry is cancelled.
+        Supports behavioral-only, MNE-only, and mixed sessions.
+
+        Behavioral runs archive saved acquisition files, not in-memory edits.
+        Attached MNE objects are serialized from their current contents into
+        a portable bundle. Original vendor files are not automatically archived.
+
+        Uses current or supplied settings and the configured storage destination.
+
+        Returns the completed checkpoint ID, or None when configuration is
+        unavailable or connection/password entry is cancelled.
         """
         from .pglStorage import pglStorage
 
         return pglStorage.saveRawSession(self, settings=settings, settingsName=settingsName, backendID=backendID, storageOptions=storageOptions, sslRootCert=sslRootCert)
-
+    
     def print(self, verbose=False):
         """Print a session overview followed by each run."""
         pglMessages.printHeader("Session")
