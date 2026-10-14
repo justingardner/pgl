@@ -1601,7 +1601,11 @@ class pglActionsMNE(pglActionCollection):
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
     # make epochs respecting Bads annotations from blinks
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
-    class mneCreateEpochsWithBads(pglAction):
+    class createEpochsWithBads(pglAction):
+        '''
+        Create epochs respecting where bads have been set (e.g., from eyeblink annotations).
+        '''
+        
 
         tmin = Float(0.0, help="Time to start triggered epoch in seconds")
         tmax = Float(1.0, help="Time to end triggered epoch in seconds")
@@ -1688,7 +1692,11 @@ class pglActionsMNE(pglActionCollection):
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
     # downsample epochs
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
-    class mneDownsampleEpochs(pglAction):
+    class downsampleEpochs(pglAction):
+        '''
+        Downsample the epochs to the specified frequency.
+        '''
+        
 
         # parameters
         downsampleFrequency = Float(200.0, help="Downsample frequency")
@@ -1762,7 +1770,7 @@ class pglActionsMNE(pglActionCollection):
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
     # plot evoked
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
-    class mnePlotEvoked(pglAction):
+    class plotEvoked(pglAction):
 
         # parameters
         set = Unicode(allow_none=True, default_value=True, help="Name of label set passed to configure events from which to compute evoked (defaults to first set)")
@@ -1883,7 +1891,11 @@ class pglActionsMNE(pglActionCollection):
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
     # plot evoked NaN
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
-    class mnePlotEvokedNan(pglAction):
+    class plotEvokedNan(pglAction):
+        '''
+        Plot the evoked response with NaN values handled appropriately (i.e. using nanmean)
+        '''
+        
 
         set = Unicode(allow_none=True, default_value=None, help="Label set; defaults to the first set")
         label = Unicode(allow_none=True, default_value=None, help="Label to average; defaults to all conditions")
@@ -2093,7 +2105,11 @@ class pglActionsMNE(pglActionCollection):
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
     # plot evoked Each
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
-    class mnePlotEvokedEach(pglAction):
+    class plotEvokedEach(pglAction):
+        '''
+        Plot the evoked response for each label set
+        '''
+        
 
         # Parameters
         set = Unicode(default_value=None, allow_none=True, help="Label set used to group epochs (defaults to the first set)")
@@ -2248,7 +2264,10 @@ class pglActionsMNE(pglActionCollection):
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
     # plot evoked each NaN
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
-    class mnePlotEvokedEachNan(pglAction):
+    class plotEvokedEachNan(pglAction):
+        '''
+        Plot the evoked response for each label set, handling NaN values appropriately (ie. using nanmean).
+        '''
 
         # Parameters
         set = Unicode(default_value=None, allow_none=True, help="Label set used to group epochs (defaults to the first set)")
@@ -2531,7 +2550,7 @@ class pglActionsMNE(pglActionCollection):
 
     _actionHeader_ncsnr = "NCSNR computation"
 
-    class mneComputeNCSNR(pglAction):
+    class computeNCSNR(pglAction):
         """
         Compute single-sensor noise-corrected SNR (NCSNR).
 
@@ -2838,6 +2857,10 @@ class pglActionsMNE(pglActionCollection):
     # eyeblink detecion
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
     class mneEyeblinkDetection(pglAction):
+        '''
+        Left-right channel difference used for eyeblink (probably superceded by using ICA components)
+        '''
+        
 
         # parameters
         leftEyeChannel = Unicode('L401', help="Left channel used for detecting eye blink")
@@ -2883,7 +2906,11 @@ class pglActionsMNE(pglActionCollection):
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
     # ICA: fit and display components
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
-    class mneICA(pglAction):
+    class ica(pglAction):
+        '''
+        Compute and display ICA components
+        '''
+        
 
         chType = Unicode("mag", help="Channel type to fit ICA on: mag, grad or eeg (one type: the component topography is later used as sensor weights)")
         nComponents = Int(20, min=2, help="Number of ICA components")
@@ -2941,7 +2968,7 @@ class pglActionsMNE(pglActionCollection):
             ica.fit(fitRaw, picks=picks, decim=self.decim, reject_by_annotation=True, verbose=False)
 
             session.mne.ica = ica
-            ica.plot_components(picks=list(range(ica.n_components_)), show=False)
+            ica.plot_components(picks=list(range(ica.n_components_)), show=True)
             
             session.mne.report.add_ica(ica=ica, title="ICA", inst=session.mne.raw)
             
@@ -2950,7 +2977,10 @@ class pglActionsMNE(pglActionCollection):
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
     # mark blinks as bad segments
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
-    class mneMarkBlinks(pglAction):
+    class markBlinks(pglAction):
+        '''
+        Mark blinks based on ICA components. Must run ICA first and then set the component parameter to the desired ICA component.
+        '''
 
         component = Int(0, min=0, help="ICA component (from mne.ica) whose topography weights the sensors")
         lowCutoff = Float(1.0, help="Low edge (Hz) of the band-pass on the weighted channel; 0 for none")
