@@ -2238,6 +2238,7 @@ class pglSession(pglActionable):
     # filesystem, name and prefix for where the session is loaded from
     filesystem = Instance(AbstractFileSystem, allow_none=True, serialize=False, help="filesystem for serialization")
     filesystemPrefix = Unicode(allow_none=True, default_value="", help="Prefix like ssh:// used for accessing filesystem", visible=False)
+    sessionID = Int(default_value=None, allow_none=True, help="Source database checkpoint ID assigned by loadSession").tag(serialize=False)
     
     # List of all runs
     runs = List(Instance(pglRun), allow_none=True, help="List of all runs")
@@ -2353,10 +2354,12 @@ class pglSession(pglActionable):
  
     @classmethod
     def loadSession(cls, sessionID, *, settings=None, settingsName=None, storageOptionsByBackend=None, sslRootCert=None, includeDeleted=False, cacheDirectory=None, directLocalPolicy="materialize"):
-        """Load a completed checkpoint with deferred backed fields.
+        """Load a completed checkpoint and remember its ID as the default parent.
+
+        The returned session's sessionID identifies the source checkpoint.
+        saveSession() uses this ID unless parentSessionID is explicitly supplied.
 
         For MNE checkpoints, cacheDirectory overrides settings.cacheDir.
-        The default cacheDir is ~/data/pglCache, independent of dataPath.
         Cache directories are created only when materialization is needed;
         successfully materialized files are not automatically deleted.
 
@@ -2365,43 +2368,43 @@ class pglSession(pglActionable):
 
         Cache-path, payload, and contract-validation errors propagate.
         includeDeleted permits inspection without undeleting the checkpoint.
+        Deleted checkpoints cannot be used as parents until restored.
         """
         from .pglStorage import pglStorage
 
-        return pglStorage.loadSession(sessionID, settings=settings, settingsName=settingsName, storageOptionsByBackend=storageOptionsByBackend, sslRootCert=sslRootCert, includeDeleted=includeDeleted, cacheDirectory=cacheDirectory, directLocalPolicy=directLocalPolicy)
+        session = pglStorage.loadSession(sessionID, settings=settings, settingsName=settingsName, storageOptionsByBackend=storageOptionsByBackend, sslRootCert=sslRootCert, includeDeleted=includeDeleted, cacheDirectory=cacheDirectory, directLocalPolicy=directLocalPolicy)
 
-    def saveSession(
-        self,
-        *,
-        parentSessionID,
-        settings=None,
-        settingsName=None,
-        backendID=None,
-        description=None,
-        ingestMethod="manual",
-        storageOptions=None,
-        sslRootCert=None,
-    ):
-        """Save current session contents and history as a new checkpoint.
+        if session is not None:
+            session.sessionID = sessionID
 
-        Requires an explicit completed, active parentSessionID.
-        Uses current or supplied settings and the configured storage backend.
+        return session
+    
+    def saveSession(self, *, parentSessionID=None, settings=None, settingsName=None, backendID=None, description=None, ingestMethod="manual", storageOptions=None, sslRootCert=None):
+        """Save current contents and history as a new derived checkpoint.
 
-        Returns the completed checkpoint ID, or None for unavailable
-        configuration or connection cancellation.
+        Defaults parentSessionID to the source checkpoint recorded by
+        pglSession.loadSession(). An explicit parentSessionID overrides it.
 
-        Unlike saveRawSession(), this saves current contents and cached edits.
+        Sessions created entirely in memory require an explicit parent.
+        Use saveRawSession() to create a parentless acquisition/root checkpoint.
+
+        The parent must be completed and active; storage/database validation
+        enforces this requirement.
+
+        Returns the new checkpoint ID, or None for unavailable configuration
+        or connection cancellation.
+
+        Saving does not change self.sessionID. Repeated saves remain children
+        of the loaded source unless a different parent is explicitly supplied.
         """
         from .pglStorage import pglStorage
 
-        return pglStorage.saveSession(
-            self,
-            parentSessionID=parentSessionID,
-            settings=settings,
-            settingsName=settingsName,
-            backendID=backendID,
-            description=description,
-            ingestMethod=ingestMethod,
-            storageOptions=storageOptions,
-            sslRootCert=sslRootCert,
-        )
+        resolvedParentID = self.sessionID if parentSessionID is None else parentSessionID
+
+        if resolvedParentID is None:
+            raise ValueError("This session has no loaded source checkpoint. Supply parentSessionID, or use saveRawSession() to create a parentless root.")
+
+        if type(resolvedParentID) is not int or not 0 <= resolvedParentID <= 9223372036854775807:
+            raise ValueError("parentSessionID must be a nonnegative PostgreSQL bigint.")
+
+        return pglStorage.saveSession(self, parentSessionID=resolvedParentID, settings=settings, settingsName=settingsName, backendID=backendID, description=description, ingestMethod=ingestMethod, storageOptions=storageOptions, sslRootCert=sslRootCert)
