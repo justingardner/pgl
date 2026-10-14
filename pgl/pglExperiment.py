@@ -82,7 +82,7 @@ class pglExperimentBase(pglStateDataSettings):
         '''
         Check whether the experiment dir has all the correct files
         '''
-        from .pglPipeline import pglChoose
+        from .pglChoose import pglChoose
         filesystem, fullDataPath, _ = pglChoose.getExperimentPath(
             fullDataPath=fullDataPath,
             settings=settings,
@@ -170,7 +170,7 @@ class pglExperimentBase(pglStateDataSettings):
         Load the experiment settings, state and data.         
         '''
         # get the experiment directory
-        from .pglPipeline import pglChoose
+        from .pglChoose import pglChoose
         filesystem, experimentPath, filesystemPrefix = pglChoose.getExperimentPath(settings=settings, dataPath=dataPath, experimentName=experimentName, subjectID=subjectID, sessionName=sessionName, runName=runName, fullDataPath=fullDataPath, filesystem=filesystem, filesystemPrefix=filesystemPrefix)
         if filesystem is None:
             if dataPath is not None:
@@ -1898,7 +1898,49 @@ class pglTaskBase(pglTraitSettings):
         pglMessages.message(
             f"Saved task {self.settings.taskName} to {taskPath}"
         )
-    
+
+    def saveBundleStrict(self, dataPath, filesystem=None, filesystemPrefix=None):
+        """Strictly save current task components and parameter bundles.
+
+        dataPath is the destination run directory.
+        Errors propagate; previously written output may remain.
+        """
+        components = {}
+        for name in ("settings", "state", "data"):
+            component = getattr(self, name, None)
+            if component is None: raise ValueError(f"Cannot save task: missing {name}")
+            if not callable(getattr(component, "saveStrict", None)):
+                raise TypeError(f"Cannot save task {name}: no saveStrict() method")
+            components[name] = component
+
+        parameters = list(self.parameters)
+        for parameter in parameters:
+            if not callable(getattr(parameter, "saveBundleStrict", None)):
+                raise TypeError(f"Cannot save parameter {type(parameter).__name__}: no saveBundleStrict() method")
+
+        taskDirectory = self._getTaskDirectoryName()
+        filesystem, dataPath, _ = pglBase.validateFilesystem(
+            filesystem=filesystem,
+            dataPath=dataPath,
+            filesystemPrefix=filesystemPrefix,
+            create=True,
+        )
+        if filesystem is None: raise ValueError("Could not resolve task destination filesystem")
+
+        taskPath = posixpath.join(dataPath, taskDirectory)
+        filesystem.makedirs(taskPath, exist_ok=True)
+
+        for name, component in components.items():
+            component.saveStrict(filename=posixpath.join(taskPath, f"{name}.json"), filesystem=filesystem)
+
+        parameterPath = posixpath.join(taskPath, "parameters")
+        filesystem.makedirs(parameterPath, exist_ok=True)
+
+        for parameter in parameters:
+            parameter.saveBundleStrict(dataPath=parameterPath, filesystem=filesystem)
+
+        return taskPath
+
     def _getTaskDirectoryName(self):
         """Return the directory name used to save this task."""
 

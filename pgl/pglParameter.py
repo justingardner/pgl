@@ -308,7 +308,7 @@ class pglParameter(pglStateDataSettings):
         self._rng.__setstate__(self.state.randomNumberGeneratorState)
         
         # give user feedback on load
-        pglMessages.message(f"(pglParameter:load) Loaded parameter {self.settings.name} from: {parameterDir}", messageType='parameter')        
+        pglMessages.message(f"Loaded parameter {self.settings.name} from: {parameterDir}", messageType='parameter')        
     
     @classmethod
     def from_settings_state_data(cls, settings, state, data):
@@ -327,6 +327,14 @@ class pglParameter(pglStateDataSettings):
         obj._rng.__setstate__(obj.state.randomNumberGeneratorState)
 
         return(obj)
+    
+    def saveBundleStrict(self, dataPath=".", filesystem=None, filesystemPrefix=None):
+        """Capture current RNG state and strictly save this parameter's bundle."""
+        import posixpath
+
+        self.state.randomNumberGeneratorState = self._rng.bit_generator.state
+        parameterPath = posixpath.join(str(dataPath), self.settings.name)
+        return super().saveBundleStrict(dataPath=parameterPath, filesystem=filesystem, filesystemPrefix=filesystemPrefix)
 ##########################
 # Parameter batch class
 ##########################
@@ -469,6 +477,18 @@ class pglParameterBlock(pglParameter):
         # save each parameter in the block there
         for p in self.settings.parameters:
             p.save(dataPath=dataPath, filesystem=filesystem, filesystemPrefix=filesystemPrefix)
+            
+    def saveBundleStrict(self, dataPath=".", filesystem=None, filesystemPrefix=None):
+        """Strictly save this block and recursively save its child parameters."""
+        import posixpath
+
+        blockPath = super().saveBundleStrict(dataPath=dataPath, filesystem=filesystem, filesystemPrefix=filesystemPrefix)
+        parameterPath = posixpath.join(blockPath, "parameters")
+
+        for parameter in self.settings.parameters:
+            parameter.saveBundleStrict(dataPath=parameterPath, filesystem=filesystem, filesystemPrefix=filesystemPrefix)
+
+        return blockPath
         
     def load(self, parameterDir,filesystem=None):
         '''

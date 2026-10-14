@@ -81,23 +81,18 @@ class pglSerializedError(Exception):
 # force an unfired dynamic default (e.g. a lazy/network-backed field)?
 ##########################
 def pglShouldReadTraitForSerialize(obj, traitName):
-    '''Decide whether a trait should be serialized.
-
-    Default: serialize all declared traits. A trait can explicitly opt out
-    by setting serialize=False in its metadata. 
-    '''
+    """Select persistent traits for serialization without reading their values."""
     trait = obj.traits().get(traitName)
-    if trait is None:
-        return False
+    if trait is None or trait.metadata.get("serialize", True) is False: return False
 
-    # Explicit opt-out wins
-    if trait.metadata.get("serialize", True) is False:
-        return False
-        
+    # Explicit pending backing must be resolved when serializing current contents.
+    if trait.metadata.get("lazyload") is True:
+        lazyIsPending = getattr(obj, "lazyIsPending", None)
+        if callable(lazyIsPending) and lazyIsPending(traitName): return True
+
+    # Preserve existing behavior for uncomputed, unbound dynamic defaults.
     hasDynamicDefault = traitName in type(obj)._trait_default_generators
-    if hasDynamicDefault and not obj.trait_has_value(traitName):
-        # never been computed - reading now would fire the generator
-        return False
+    if hasDynamicDefault and not obj.trait_has_value(traitName): return False
     return True
 
 ##########################
@@ -769,108 +764,56 @@ class pglSerialize:
     # updateTraitsFromDict - For HasTraits objects
     ##########################
     def updateTraitsFromDict(self, data, filename=None, typeConverter=None):
-        """
-        Update traits from a dictionary with validation and error handling.
-        
-        Args:
-            data: Dictionary of trait values
-            filename: Source filename for error messages
-            typeConverter: Optional callable(key, value) -> converted_value for custom type conversions
-        """
-        import traceback
-        import inspect
-        
+        """Restore fields without reading missing/rejected fields for diagnostics."""
         if not isinstance(self, HasTraits):
-            # Fall back to simple dict update for non-HasTraits objects
             self.__dict__.update(data)
             return
-        
-        for key in self.trait_names():
-            if key in data:
-                try:
-                    value = data[key]
-                    
-                    # Apply custom type converter if provided
-                    if typeConverter and callable(typeConverter):
-                        value = typeConverter(key, value)
-                    
-                    # Set the attribute
-                    setattr(self, key, value)
-                    
-                except TraitError as e:
-                    trait = self.traits()[key]
-                    expectedType = trait.__class__
-                    gotValue = data[key]
-                    gotType = type(gotValue)
-                    
-                    # Get more detailed type information
-                    expectedTypeInfo = self._getDetailedTypeInfo(trait)
-                    gotTypeInfo = self._getDetailedTypeInfo(gotValue)
-                    
-                    print(f"\n{'='*80}")
-                    print(f"(pglSerialize) TRAIT TYPE MISMATCH ERROR")
-                    print(f"{'='*80}")
-                    print(f"Trait name:     '{key}'")
-                    print(f"Source:         '{filename}'")
-                    print(f"Object class:   {self.__class__.__name__}")
-                    print(f"Object:         {self}")
-                    print(f"-" * 80)
-                    print(f"Expected type:  {expectedTypeInfo}")
-                    print(f"Got type:       {gotTypeInfo}")
-                    print(f"Got value:      {repr(gotValue)[:200]}")  # Truncate long values
-                    print(f"Using default:  {repr(getattr(self, key))[:200]}")
-                    print(f"-" * 80)
-                    print(f"Original error: {e}")
-                    print(f"-" * 80)
-                    #print("Call stack:")
-                    # Print abbreviated stack trace (skip first 2 frames - this function)
-                    #for frame_info in traceback.extract_stack()[:-2]:
-                    #    print(f"  File '{frame_info.filename}', line {frame_info.lineno}, in {frame_info.name}")
-                    #    if frame_info.line:
-                    #        print(f"    {frame_info.line}")
-                    print(f"{'='*80}\n")
-                    
-                except Exception as e:
-                    print(f"\n{'='*80}")
-                    print(f"(pglSerialize) UNEXPECTED ERROR")
-                    print(f"{'='*80}")
-                    print(f"Trait name:     '{key}'")
-                    print(f"Source:         '{filename}'")
-                    print(f"Object class:   {self.__class__.__name__}")
-                    print(f"Value:          {repr(data[key])[:200]}")
-                    print(f"Error type:     {type(e).__name__}")
-                    print(f"Error message:  {e}")
-                    print(f"Using default:  {repr(getattr(self, key))[:200]}")
-                    print(f"-" * 80)
-                    print("Full traceback:")
-                    traceback.print_exc()
-                    print(f"{'='*80}\n")
-            else:
-                if pglShouldReadTraitForSerialize(self, key):
-                    pglMessages.message(f"'{key}' not found in {filename} using default {getattr(self, key)}", verbose=pglSerialize.verbose)
 
-        # Handle unknown keys
-        traitNames = set(self.trait_names())
-        extraKeys = set(data.keys()) - traitNames
+        traits = self.traits()
 
-        if extraKeys:
-            if self._serializeUnregisteredFields:
-                for key in extraKeys:
-                    try:
-                        setattr(self, key, data[key])
-                    except Exception as e:
-                        pglMessages.warning(
-                            f"Could not restore unregistered "
-                            f"attribute '{key}' from '{filename}': {e}",
-                            level=1
-                        )
-            else:
-                pglMessages.message(
-                    f"unknown keys in {filename} (ignored): "
-                    f"{list(extraKeys)}",
-                    verbose=pglSerialize.verbose
+        for key, trait in traits.items():
+            if key not in data:
+                if pglSerialize.verbose and trait.metadata.get("serialize", True) is not False:
+                    pglMessages.message(
+                        f"'{key}' not found in {filename}; current/default value left uninspected.",
+                        verbose=pglSerialize.verbose,
+                    )
+                continue
+
+            try:
+                value = data[key]
+                if callable(typeConverter): value = typeConverter(key, value)
+                setattr(self, key, value)
+
+            except TraitError as error:
+                expectedType = self._getDetailedTypeInfo(trait)
+                suppliedType = self._getDetailedTypeInfo(data[key])
+                pglMessages.warning(
+                    f"(pglSerialize) Trait mismatch restoring {self.__class__.__name__}.{key} "
+                    f"from '{filename}': expected {expectedType}, received {suppliedType}. "
+                    f"Field not read for diagnostics. Error: {error}",
+                    level=1,
                 )
 
+            except Exception as error:
+                pglMessages.warning(
+                    f"(pglSerialize) Error restoring {self.__class__.__name__}.{key} "
+                    f"from '{filename}': {type(error).__name__}: {error}. "
+                    "Field not read for diagnostics.",
+                    level=1,
+                )
+
+        extraKeys = set(data) - set(traits)
+        if not extraKeys: return
+
+        if self._serializeUnregisteredFields:
+            for key in extraKeys:
+                try:
+                    setattr(self, key, data[key])
+                except Exception as error:
+                    pglMessages.warning(f"Could not restore unregistered attribute '{key}' from '{filename}': {error}", level=1)
+        elif pglSerialize.verbose:
+            pglMessages.message(f"Unknown keys in {filename} (ignored): {sorted(extraKeys)}", verbose=pglSerialize.verbose)
     def _getDetailedTypeInfo(self, obj):
         """
         Helper to get detailed type information for better error messages.
@@ -931,3 +874,31 @@ class pglSerialize:
                     pglMessages.warning(f"Error copying '{key}': {e}", verbose=pglSerialize.verbose)
             else:
                 pglMessages.message(f"Source object missing attribute '{key}'",verbose=pglSerialize.verbose)
+                
+                
+    def saveStrict(self, filename, filesystem=None, filesystemPrefix=None):
+        """Serialize before opening the destination; propagate failures."""
+        from .pglBase import pglBase
+
+        filename = str(filename)
+        dataPath = posixpath.dirname(filename) or "."
+        fileName = posixpath.splitext(posixpath.basename(filename))[0] + ".json"
+
+        filesystem, dataPath, _ = pglBase.validateFilesystem(
+            filesystem=filesystem,
+            dataPath=dataPath,
+            filesystemPrefix=filesystemPrefix,
+            create=True,
+        )
+        if filesystem is None: raise OSError(f"(pglSerialize) Could not resolve filesystem for '{filename}'")
+
+        filename = posixpath.join(dataPath, fileName)
+
+        # Resolve and encode everything before opening/truncating the destination.
+        jsonString = self.toJSON(filename=filename)
+
+        with filesystem.open(filename, "w", encoding="utf-8") as fileHandle:
+            written = fileHandle.write(jsonString)
+            if written != len(jsonString): raise OSError(f"(pglSerialize) Incomplete write to '{filename}'")
+
+        return filename

@@ -963,6 +963,40 @@ class pglStateDataSettings(pglTraitSettings):
         else:
             data.save(filename=posixpath.join(dataPath, "data.json"), filesystem=filesystem)
             
+    def saveBundleStrict(self, dataPath, filesystem=None, filesystemPrefix=None):
+        """Save required components to a directory, propagating failures.
+
+        Preserves the existing traits/settings/state/data layout.
+        Does not provide atomic writes or remove partial output.
+        """
+        from .pglBase import pglBase
+
+        # Resolve required values before creating the destination directory.
+        components = {}
+        for name in ("settings", "state", "data"):
+            component = getattr(self, name, None)
+            if component is None: raise ValueError(f"Cannot save {type(self).__name__}: missing {name}")
+            if not callable(getattr(component, "saveStrict", None)):
+                raise TypeError(f"Cannot save {type(self).__name__}.{name}: no saveStrict() method")
+            components[name] = component
+
+        filesystem, dataPath, _ = pglBase.validateFilesystem(
+            filesystem=filesystem,
+            dataPath=dataPath,
+            filesystemPrefix=filesystemPrefix,
+            create=True,
+        )
+        if filesystem is None: raise ValueError(f"Could not resolve bundle destination: {dataPath!r}")
+
+        # Match the existing bundle layout, including optional traits.json.
+        if set(self.traits()) != set(pglTraitSettings().traits()):
+            super().saveStrict(filename=posixpath.join(dataPath, "traits.json"), filesystem=filesystem)
+
+        for name, component in components.items():
+            component.saveStrict(filename=posixpath.join(dataPath, f"{name}.json"), filesystem=filesystem)
+
+        return dataPath
+            
 ##################################################
 # pglItem
 ##################################################
@@ -1239,6 +1273,7 @@ class pglSettings(pglTraitSettings):
     calibrateForGamma = List(Float, default_value=[0, 1.0, 2.2], help="What gamma to target calibration for 0.0 = No calibration, 1.0=linear, 2.2 typical for images/movies")
     dataPath = Unicode("~/data",help="Path to data directory").tag(isPath=True)
     databasePath = Unicode("~/data/pgl", isPath=True, help="Directory containing the PostgreSQL configuration, server log, and database files. Supports ~ for the home directory.")
+    cacheDir = Unicode("~/data/pgl/cache", help="Local directory for files downloaded from database (e.g. raw mne files). Cached files are not automatically deleted.", isPath=True)
     username = Unicode(help="Creator username for data-store provenance. Defaults to the OS login username; editable to use a consistent identity across machines.")
     startKey = Unicode("space", allow_none=True, help="Key to start experiment")
     endKey = Unicode("escape", allow_none=True, help="Key to end experiment")

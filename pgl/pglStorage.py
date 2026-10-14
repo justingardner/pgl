@@ -1458,17 +1458,126 @@ class pglStorage:
 
     @classmethod
     def validateDerivedManifest(cls, manifest):
-        """Validate a derived behavioral manifest, including session history."""
+        """Validate supported derived contracts without accessing payloads."""
+        if not isinstance(manifest, dict):
+            raise ValueError("Manifest must be a dictionary")
+
+        contract = manifest.get("contract_version")
+
+        if contract == "pgl.derived.session.v1":
+            return cls.validateDerivedSessionManifest(manifest)
+
         cls._validateBehaviorManifest(manifest, "pgl.derived.behavior.v1")
 
-        if "history.json" not in {
-            record["name"] for record in manifest["files"]
-        }:
-            raise ValueError("Derived manifest is missing history.json.")
+        if "history.json" not in {record["name"] for record in manifest["files"]}:
+            raise ValueError("Derived manifest is missing history.json")
 
         return manifest
-        
+    
+    @staticmethod
+    def validateDerivedSessionManifest(manifest):
+        """Validate a derived session inventory containing an MNE bundle."""
 
+        def requireFields(value, names, label):
+            if not isinstance(value, dict) or set(value) != set(names):
+                raise ValueError(f"{label} has missing or unexpected fields")
+
+        def validatePath(path):
+            if (
+                not isinstance(path, str)
+                or not path
+                or path.startswith("/")
+                or "\\" in path
+                or "\x00" in path
+                or any(part in ("", ".", "..") for part in path.split("/"))
+            ):
+                raise ValueError(f"Invalid manifest path: {path!r}")
+
+        requireFields(
+            manifest,
+            {"contract_version", "runs", "mne", "directories", "files"},
+            "Manifest",
+        )
+        if manifest["contract_version"] != "pgl.derived.session.v1":
+            raise ValueError("Unsupported derived session contract")
+
+        for name in ("runs", "directories", "files"):
+            if not isinstance(manifest[name], list):
+                raise ValueError(f"Manifest {name} must be a list")
+
+        requireFields(manifest["mne"], {"path"}, "MNE record")
+        if manifest["mne"]["path"] != "mne":
+            raise ValueError("MNE bundle path must be 'mne'")
+
+        runPaths = set()
+        for index, record in enumerate(manifest["runs"]):
+            requireFields(record, {"index", "path"}, "Run record")
+            if type(record["index"]) is not int or record["index"] != index:
+                raise ValueError("Run indices must be consecutive and ordered")
+
+            expectedPath = f"runs/{index:06d}"
+            if record["path"] != expectedPath:
+                raise ValueError(f"Run path must be {expectedPath!r}")
+            runPaths.add(expectedPath)
+
+        directories = manifest["directories"]
+        for path in directories: validatePath(path)
+        if directories != sorted(set(directories)):
+            raise ValueError("Directories must be unique and sorted")
+
+        directorySet = set(directories)
+        requiredDirectories = {"mne"}
+        if runPaths: requiredDirectories.update({"runs", *runPaths})
+        if not requiredDirectories.issubset(directorySet):
+            raise ValueError("Missing required bundle directories")
+
+        fileNames = []
+        for record in manifest["files"]:
+            requireFields(record, {"name", "sha256", "size_bytes"}, "File record")
+            validatePath(record["name"])
+
+            digest = record["sha256"]
+            size = record["size_bytes"]
+            if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                raise ValueError("File SHA256 must be 64 lowercase hexadecimal characters")
+            if type(size) is not int or not 0 <= size <= 9223372036854775807:
+                raise ValueError("File size must be a nonnegative PostgreSQL bigint")
+
+            fileNames.append(record["name"])
+
+        if fileNames != sorted(set(fileNames)):
+            raise ValueError("File names must be unique and sorted")
+        if directorySet.intersection(fileNames):
+            raise ValueError("A path cannot be both a file and a directory")
+        if not {"history.json", "mne/mne.json"}.issubset(fileNames):
+            raise ValueError("Missing history.json or mne/mne.json")
+
+        for path in directories + fileNames:
+            if path in ("runs", "mne"):
+                if path not in directorySet:
+                    raise ValueError(f"Expected a directory: {path}")
+                continue
+
+            if path == "history.json":
+                if path not in fileNames:
+                    raise ValueError("history.json must be a file")
+                continue
+
+            if posixpath.dirname(path) not in directorySet:
+                raise ValueError(f"Missing parent directory for {path!r}")
+
+            if path.startswith("mne/"): continue
+
+            owningRun = "/".join(path.split("/")[:2])
+            if owningRun not in runPaths:
+                raise ValueError(f"Path lies outside declared bundles: {path!r}")
+
+        for runPath in runPaths:
+            if not any(name.startswith(runPath + "/") for name in fileNames):
+                raise ValueError(f"Run contains no files: {runPath}")
+
+        return manifest
+    
     @staticmethod
     def _validateBehaviorManifest(manifest, contractVersion):
         """Validate the v1 manifest structure without accessing payloads."""
@@ -1598,136 +1707,127 @@ class pglStorage:
                 raise ValueError(f"Run contains no files: {runPath}")
 
         return manifest
-        
-    @classmethod
-    def loadSession(
-        cls,
-        sessionID,
-        *,
-        settings=None,
-        settingsName=None,
-        storageOptionsByBackend=None,
-        sslRootCert=None,
-        includeDeleted=False,
-    ):
-        """Load a completed raw or derived behavioral checkpoint.
+    
+    @staticmethod
+    def _resolveCacheDirectory(cacheDirectory=None, *, settings):
+        """Resolve an explicit cache path or settings.cacheDir without creating it.
 
-        Unknown or hidden sessions warn at level 0 and return None.
-        Invalid arguments warn at level 1 and return None.
+        Accepts ordinary local filesystem paths, not URLs or fsspec chains.
+        An invalid explicit override raises rather than falling back silently.
+        """
+        import os
+        from pathlib import Path
+
+        value = settings.cacheDir if cacheDirectory is None else cacheDirectory
+
+        try: text = os.fspath(value)
+        except TypeError as error: raise ValueError("Cache directory must be a local filesystem path.") from error
+
+        if not isinstance(text, str) or not text.strip(): raise ValueError("Cache directory must be a nonempty local filesystem path.")
+        if any(character in text for character in ("\x00", "\n", "\r")): raise ValueError("Cache directory must not contain NUL or newline characters.")
+        if "://" in text or "::" in text: raise ValueError("Cache directory must be an ordinary local path, not a URL or fsspec chain.")
+
+        return str(Path(text).expanduser().resolve())
+    
+    @staticmethod
+    def _mneCacheContext(postgres, sessionID):
+        """Build a cache namespace from configured database identity."""
+        if type(sessionID) is not int or not 0 <= sessionID <= 9223372036854775807: raise ValueError("Invalid cache session ID.")
+
+        identity = {"host": postgres.postgresHost, "port": postgres.postgresPort, "database": postgres.databaseName, "schema": postgres.databaseSchema}
+        digest = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:16]
+        label = re.sub(r"[^A-Za-z0-9_-]", "_", f"{postgres.databaseName}-{postgres.databaseSchema}")[:64]
+        return {"namespace": f"{label}-{digest}", "sessionID": sessionID}    
+
+    @classmethod
+    def loadSession(cls, sessionID, *, settings=None, settingsName=None, storageOptionsByBackend=None, sslRootCert=None, includeDeleted=False, cacheDirectory=None, directLocalPolicy="materialize"):
+        """Load a completed raw behavioral or derived session checkpoint.
+
+        Resolves database configuration and cache defaults from the same settings.
+        MNE cache precedence: explicit cacheDirectory, otherwise settings.cacheDir.
+        Cache directories are created only if payload materialization is needed.
+
+        Unknown/hidden sessions warn at level 0 and return None.
+        Invalid public arguments/configuration warn at level 1 and return None.
         Database failures warn at level 2 and return None.
         Missing configuration or connection cancellation returns None.
 
-        Deleted sessions are hidden unless includeDeleted=True.
-        The override permits inspection; it does not restore anything.
-
-        Manifest, payload, and contract-validation errors propagate.
+        Cache-path, manifest, payload, and contract-validation errors propagate.
         No SQL connection is retained by the returned session.
+        includeDeleted permits inspection without undeleting anything.
         """
         from .pglPostgres import pglPostgres
+        from .pglSettings import pglSettingsManager
 
-        if (
-            isinstance(sessionID, bool)
-            or not isinstance(sessionID, int)
-            or not 0 <= sessionID <= 9223372036854775807
-        ):
-            pglMessages.warning(
-                "sessionID must be a nonnegative PostgreSQL bigint.",
-                level=1,
-            )
+        if type(sessionID) is not int or not 0 <= sessionID <= 9223372036854775807:
+            pglMessages.warning("sessionID must be a nonnegative PostgreSQL bigint.", level=1)
             return None
 
         if type(includeDeleted) is not bool:
             pglMessages.warning("includeDeleted must be a boolean.", level=1)
             return None
 
-        session = None
-        checkpoint = None
+        if directLocalPolicy not in ("materialize", "immutable"):
+            pglMessages.warning("directLocalPolicy must be 'materialize' or 'immutable'.", level=1)
+            return None
+
+        session, checkpoint = None, None
 
         try:
             try:
-                postgres = pglPostgres.fromSettings(
-                    settings=settings,
-                    settingsName=settingsName,
-                )
-            except (TypeError, ValueError) as error:
-                pglMessages.warning(
-                    f"Cannot load session: invalid settings or configuration: "
-                    f"{error}",
-                    level=1,
-                )
-                return None
-
-            if postgres is None:
-                return None
-
-            with postgres.connect(sslRootCert=sslRootCert) as connection:
-                if connection is None:
+                resolvedSettings = pglSettingsManager.getSettings(settings=settings, settingsName=settingsName)
+                if resolvedSettings is None:
+                    pglMessages.warning("Cannot load session: could not resolve PGL settings.", level=0)
                     return None
 
-                with connection.transaction():
-                    connection.execute(
-                        "SET TRANSACTION ISOLATION LEVEL "
-                        "REPEATABLE READ, READ ONLY"
-                    )
+                postgres = pglPostgres.fromSettings(settings=resolvedSettings)
 
-                    table = sql.Identifier(
-                        postgres.databaseSchema, "session"
-                    )
-                    checkpoint = connection.execute(
-                        sql.SQL("""
-                            SELECT origin, contract_version
-                            FROM {}
-                            WHERE session_id = %s
-                              AND (%s OR deleted_at IS NULL)
-                        """).format(table),
-                        (sessionID, includeDeleted),
-                    ).fetchone()
+            except (TypeError, ValueError) as error:
+                pglMessages.warning(f"Cannot load session: invalid settings or configuration: {error}", level=1)
+                return None
+
+            if postgres is None: return None
+
+            with postgres.connect(sslRootCert=sslRootCert) as connection:
+                if connection is None: return None
+
+                with connection.transaction():
+                    connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+
+                    table = sql.Identifier(postgres.databaseSchema, "session")
+                    checkpoint = connection.execute(sql.SQL("""
+                        SELECT origin, contract_version
+                        FROM {}
+                        WHERE session_id = %s AND (%s OR deleted_at IS NULL)
+                    """).format(table), (sessionID, includeDeleted)).fetchone()
 
                     if checkpoint is not None:
                         origin, contractVersion = checkpoint
+                        loadOptions = {"storageOptionsByBackend": storageOptionsByBackend, "includeDeleted": includeDeleted}
 
-                        if (origin, contractVersion) == (
-                            "raw", "pgl.raw.behavior.v1"
-                        ):
+                        if (origin, contractVersion) == ("raw", "pgl.raw.behavior.v1"):
                             loader = cls.loadRawSession
-                        elif (origin, contractVersion) == (
-                            "derived", "pgl.derived.behavior.v1"
-                        ):
-                            loader = cls.loadDerivedSession
-                        else:
-                            raise ValueError(
-                                "Unsupported checkpoint origin/contract: "
-                                f"{origin!r}, {contractVersion!r}"
-                            )
 
-                        session = loader(
-                            connection,
-                            postgres,
-                            sessionID,
-                            storageOptionsByBackend=storageOptionsByBackend,
-                            includeDeleted=includeDeleted,
-                        )
+                        elif origin == "derived" and contractVersion in ("pgl.derived.behavior.v1", "pgl.derived.session.v1"):
+                            loader = cls.loadDerivedSession
+                            resolvedCache = cls._resolveCacheDirectory(cacheDirectory, settings=resolvedSettings) if contractVersion == "pgl.derived.session.v1" else cacheDirectory
+                            loadOptions.update(cacheDirectory=resolvedCache, directLocalPolicy=directLocalPolicy)
+
+                        else:
+                            raise ValueError(f"Unsupported checkpoint origin/contract: {origin!r}, {contractVersion!r}")
+
+                        session = loader(connection, postgres, sessionID, **loadOptions)
 
         except psycopg.Error as error:
-            pglMessages.warning(
-                f"Could not load session {sessionID}: {error}",
-                level=2,
-            )
+            pglMessages.warning(f"Could not load session {sessionID}: {error}", level=2)
             return None
 
         if checkpoint is None:
-            reason = (
-                "Unknown checkpoint"
-                if includeDeleted
-                else "Unknown or deleted checkpoint"
-            )
+            reason = "Unknown checkpoint" if includeDeleted else "Unknown or deleted checkpoint"
             pglMessages.warning(f"{reason}: {sessionID}", level=0)
             return None
 
-        pglMessages.message(
-            f"Loaded {checkpoint[0]} checkpoint {sessionID}; "
-            "run data will load on demand."
-        )
+        pglMessages.message(f"Loaded {checkpoint[0]} checkpoint {sessionID}; backed fields will load on demand.")
         return session
     
     @classmethod
@@ -1772,15 +1872,15 @@ class pglStorage:
                     f"{label} must be a nonnegative PostgreSQL bigint."
                 )
 
-        if not session.runs:
-            raise ValueError("A derived checkpoint must contain at least one run.")
+        from .pglSession import pglMNE
 
-        if session.mne is not None:
-            raise NotImplementedError(
-                "Saving attached MNE data is not implemented; "
-                "refusing to save an incomplete session."
-            )
+        hasMNE = session.mne is not None
+        if not session.runs and not hasMNE: raise ValueError("A derived checkpoint must contain behavioral runs or MNE contents.")
+        if hasMNE and type(session.mne) is not pglMNE: raise TypeError("MNE checkpoints currently support pglMNE, not subclasses.")
 
+        contractVersion = "pgl.derived.session.v1" if hasMNE else "pgl.derived.behavior.v1"
+        modalities = (["behavior"] if session.runs else []) + (["mne"] if hasMNE else [])
+        
         def isLocal(filesystem):
             protocols = filesystem.protocol
             protocols = (
@@ -1823,14 +1923,7 @@ class pglStorage:
                 backend[0], **(storageOptions or {})
             )
 
-            sessionID = cls.createDerivedCheckpoint(
-                connection,
-                postgres,
-                createdBy,
-                parentSessionID,
-                description=description,
-                ingestMethod=ingestMethod,
-            )
+            sessionID = cls.createDerivedCheckpoint(connection, postgres, createdBy, parentSessionID, description=description, ingestMethod=ingestMethod, contractVersion=contractVersion, modalities=modalities)
 
             objectPrefix = f"session{sessionID:06d}"
             destination = posixpath.join(root, objectPrefix)
@@ -1869,6 +1962,7 @@ class pglStorage:
                 dataPath=destination,
                 filesystem=filesystem,
             )
+            if manifest["contract_version"] != contractVersion: raise ValueError("Exported manifest contract differs from the allocated checkpoint.")
 
             cls.registerDerivedSessionFiles(
                 connection,
@@ -2103,44 +2197,25 @@ class pglStorage:
         return {"object_key": "manifest.json", **stored}
 
     @staticmethod
-    def createDerivedCheckpoint(
-        connection,
-        postgres,
-        createdBy,
-        parentSessionID,
-        description=None,
-        ingestMethod="manual",
-    ):
-        """Create an unpublished derived behavioral checkpoint.
+    def createDerivedCheckpoint(connection, postgres, createdBy, parentSessionID, description=None, ingestMethod="manual", *, contractVersion="pgl.derived.behavior.v1", modalities=None):
+        """Create an unpublished derived checkpoint in the caller's transaction.
 
-        The database requires a completed, nondeleted parent and assigns
-        its root to the new checkpoint.
-
-        Uses the caller's connection and transaction; does not commit.
-        Does not write payloads, attach files, or complete the checkpoint.
+        Database lineage rules require a completed, active parent.
+        modalities describes content categories; 'mne' does not imply EEG/MEG.
         """
-        for label, value in (
-            ("createdBy", createdBy),
-            ("parentSessionID", parentSessionID),
-        ):
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, int)
-                or not 0 <= value <= 9223372036854775807
-            ):
-                raise ValueError(
-                    f"{label} must be a nonnegative PostgreSQL bigint."
-                )
+        for label, value in (("createdBy", createdBy), ("parentSessionID", parentSessionID)):
+            if type(value) is not int or not 0 <= value <= 9223372036854775807: raise ValueError(f"{label} must be a nonnegative PostgreSQL bigint.")
 
-        if description is not None and (
-            not isinstance(description, str) or "\x00" in description
-        ):
-            raise ValueError(
-                "description must be a string without NUL, or None."
-            )
+        if description is not None and (not isinstance(description, str) or "\x00" in description): raise ValueError("description must be a string without NUL, or None.")
+        if ingestMethod not in ("manual", "automated"): raise ValueError("ingestMethod must be manual or automated.")
+        if contractVersion not in ("pgl.derived.behavior.v1", "pgl.derived.session.v1"): raise ValueError("Unsupported derived checkpoint contract.")
 
-        if ingestMethod not in {"manual", "automated"}:
-            raise ValueError("ingestMethod must be manual or automated.")
+        if modalities is None: modalities = ["behavior"] if contractVersion == "pgl.derived.behavior.v1" else ["mne"]
+        if not isinstance(modalities, (list, tuple)) or not modalities: raise ValueError("modalities must be a nonempty list or tuple.")
+        if any(not isinstance(value, str) or value not in ("behavior", "mne") for value in modalities): raise ValueError("Supported content categories are 'behavior' and 'mne'.")
+        if len(set(modalities)) != len(modalities): raise ValueError("Duplicate modalities are not allowed.")
+        if contractVersion == "pgl.derived.behavior.v1" and set(modalities) != {"behavior"}: raise ValueError("Behavioral checkpoints require only the behavior category.")
+        if contractVersion == "pgl.derived.session.v1" and "mne" not in modalities: raise ValueError("MNE session checkpoints require the mne category.")
 
         table = sql.Identifier(postgres.databaseSchema, "session")
         statement = sql.SQL("""
@@ -2149,54 +2224,33 @@ class pglStorage:
                 modalities, status, description, contract_version,
                 created_by, started_at
             )
-            VALUES (
-                'derived', 'processed', %s, %s,
-                ARRAY['behavior']::text[], 'in_progress', %s,
-                'pgl.derived.behavior.v1', %s, now()
-            )
+            VALUES ('derived', 'processed', %s, %s, %s::text[], 'in_progress', %s, %s, %s, now())
             RETURNING session_id
         """).format(table)
 
-        return connection.execute(
-            statement,
-            (parentSessionID, ingestMethod, description, createdBy),
-        ).fetchone()[0]
+        return connection.execute(statement, (parentSessionID, ingestMethod, list(modalities), description, contractVersion, createdBy)).fetchone()[0]
 
     @classmethod
-    def saveDerivedSessionFiles(
-        cls, session, dataPath, filesystem=None, filesystemPrefix=None
-    ):
-        """Serialize current behavioral runs, history, and a verified manifest.
+    def saveDerivedSessionFiles(cls, session, dataPath, filesystem=None, filesystemPrefix=None):
+        """Export current behavioral/MNE contents, history, and verified manifest.
 
-        Returns (destination, manifest).
-        Requires a new destination and leaves source run paths unchanged.
-
-        The history wrapper uses the session's existing UUID so repeated
-        saves do not introduce a new incidental history identity.
-
-        Writes manifest.json last; the manifest does not describe itself.
-        Does not register a database checkpoint.
-        On failure, partial destination files remain.
-
-        Uses the existing serializer, including its warning-and-skip behavior
-        for unsupported objects.
+        Requires a fresh destination. Writes manifest.json last.
+        Errors propagate; partial destination output may remain.
+        Does not register or complete a database checkpoint.
         """
         from .pglBase import pglBase
         from .pglPipeline import pglActionable
+        from .pglSession import pglMNE
 
         runs = list(session.runs)
+        mneData = session.mne
 
-        if not runs:
-            raise ValueError("A derived checkpoint must contain at least one run.")
-
-        if session.mne is not None:
-            raise NotImplementedError(
-                "Saving attached MNE data is not implemented; "
-                "refusing to save an incomplete session."
-            )
-
+        if not runs and mneData is None:
+            raise ValueError("A checkpoint must contain behavioral runs or MNE contents")
+        if mneData is not None and type(mneData) is not pglMNE:
+            raise TypeError("MNE export currently supports pglMNE, not subclasses")
         if dataPath is None or not str(dataPath).strip():
-            raise ValueError("A destination path is required.")
+            raise ValueError("A destination path is required")
 
         filesystem, destination, _ = pglBase.validateFilesystem(
             filesystem=filesystem,
@@ -2204,93 +2258,86 @@ class pglStorage:
             filesystemPrefix=filesystemPrefix,
             requireExists=False,
         )
+        if filesystem is None: raise ValueError("Could not resolve destination filesystem")
+        if filesystem.exists(destination): raise FileExistsError(f"Destination already exists: {destination}")
 
-        if filesystem is None:
-            raise ValueError("Could not resolve the destination filesystem.")
-
-        if filesystem.exists(destination):
-            raise FileExistsError(
-                f"Derived session destination already exists: {destination}"
-            )
-
-        # This is a history-only representation of the existing session,
-        # not a newly identified object on every save.
         history = pglActionable()
         history.uuid = session.uuid
         history.actionHistory = list(session.actionHistory)
         historyBytes = history.toJSON().encode("utf-8")
 
         filesystem.makedirs(destination, exist_ok=False)
-        filesystem.makedirs(
-            posixpath.join(destination, "runs"),
-            exist_ok=False,
-        )
-
-        runRecords = []
-        directories = {"runs"}
+        directories = set()
         files = []
+        runRecords = []
 
-        for index, run in enumerate(runs):
-            runName = f"runs/{index:06d}"
-            runDestination = posixpath.join(destination, runName)
-
-            run.saveDerivedRun(
-                dataPath=runDestination,
-                filesystem=filesystem,
-            )
-
-            runRecords.append({"index": index, "path": runName})
-            directories.add(runName)
+        def inventoryDirectory(relativeRoot):
+            fullRoot = posixpath.join(destination, relativeRoot)
+            directories.add(relativeRoot)
 
             for currentPath, directoryNames, fileNames in filesystem.walk(
-                runDestination,
-                detail=False,
-                on_error="raise",
+                fullRoot, detail=False, on_error="raise"
             ):
-                relativePath = posixpath.relpath(currentPath, runDestination)
-                logicalPath = (
-                    runName
-                    if relativePath == "."
-                    else posixpath.join(runName, relativePath)
-                )
+                logicalPath = posixpath.relpath(currentPath, destination)
 
                 for name in directoryNames:
                     directories.add(posixpath.join(logicalPath, name))
 
                 for name in fileNames:
                     savedPath = posixpath.join(currentPath, name)
-                    identity = cls.hashFile(filesystem, savedPath)
                     files.append({
                         "name": posixpath.join(logicalPath, name),
-                        **identity,
+                        **cls.hashFile(filesystem, savedPath),
                     })
 
-        historyPath = posixpath.join(destination, "history.json")
+        if runs:
+            filesystem.makedirs(posixpath.join(destination, "runs"), exist_ok=False)
+            directories.add("runs")
 
-        with filesystem.open(historyPath, "xb") as file:
-            file.write(historyBytes)
+        for index, run in enumerate(runs):
+            runName = f"runs/{index:06d}"
+            run.saveDerivedRun(dataPath=posixpath.join(destination, runName), filesystem=filesystem)
+            runRecords.append({"index": index, "path": runName})
+            inventoryDirectory(runName)
+
+        if mneData is not None:
+            mneData.saveBundle(posixpath.join(destination, "mne"), filesystem=filesystem)
+            inventoryDirectory("mne")
+
+        historyPath = posixpath.join(destination, "history.json")
+        with filesystem.open(historyPath, "xb") as target:
+            if target.write(historyBytes) != len(historyBytes):
+                raise OSError("Incomplete session history write")
 
         expectedHistory = {
             "sha256": hashlib.sha256(historyBytes).hexdigest(),
             "size_bytes": len(historyBytes),
         }
         storedHistory = cls.hashFile(filesystem, historyPath)
-
         if storedHistory != expectedHistory:
-            raise ValueError("Saved session history verification failed.")
+            raise ValueError("Saved session history verification failed")
 
         files.append({"name": "history.json", **storedHistory})
-
         manifest = {
-            "contract_version": "pgl.derived.behavior.v1",
+            "contract_version": (
+                "pgl.derived.session.v1" if mneData is not None else "pgl.derived.behavior.v1"
+            ),
             "runs": runRecords,
             "directories": sorted(directories),
             "files": sorted(files, key=lambda record: record["name"]),
         }
+        if mneData is not None: manifest["mne"] = {"path": "mne"}
 
         cls.validateDerivedManifest(manifest)
-        cls.stageDerivedManifest(manifest, filesystem, destination)
 
+        if mneData is not None:
+            class destinationView:
+                def open(self, path, mode="rb", **kwargs):
+                    return filesystem.open(posixpath.join(destination, path), mode=mode, **kwargs)
+
+            cls._verifyMNEInventory(manifest, destinationView())
+
+        cls.stageDerivedManifest(manifest, filesystem, destination)
         return destination, manifest
     
     @classmethod
@@ -3198,125 +3245,50 @@ class pglStorage:
         }    
 
     @classmethod
-    def registerDerivedSessionFiles(
-        cls,
-        connection,
-        postgres,
-        sessionID,
-        backendID,
-        manifest,
-        *,
-        objectPrefix,
-        storageOptions=None,
-    ):
-        """Verify and register an existing derived behavioral bundle.
+    def registerDerivedSessionFiles(cls, connection, postgres, sessionID, backendID, manifest, *, objectPrefix, storageOptions=None):
+        """Verify and register a derived behavioral or MNE session bundle.
 
-        objectPrefix is the bundle directory relative to the backend root.
-
-        Requires an active, in-progress derived checkpoint with no file links.
-        Reads subject IDs from verified saved experimentSettings.json files.
-
-        Opens a transaction/savepoint; an outer transaction must commit for
-        persistence. Registration failures roll back this method's SQL changes.
-
+        Requires an active, in-progress checkpoint matching the manifest.
+        Behavioral files receive recorded subject associations; MNE files do not.
+        Opens a transaction/savepoint; the caller must commit for persistence.
         Does not write payloads or complete the checkpoint.
-        Returns sessionID.
         """
-        for label, value in (
-            ("sessionID", sessionID),
-            ("backendID", backendID),
-        ):
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, int)
-                or not 0 <= value <= 9223372036854775807
-            ):
-                raise ValueError(
-                    f"{label} must be a nonnegative PostgreSQL bigint."
-                )
+        for label, value in (("sessionID", sessionID), ("backendID", backendID)):
+            if type(value) is not int or not 0 <= value <= 9223372036854775807: raise ValueError(f"{label} must be a nonnegative PostgreSQL bigint.")
 
-        if (
-            not isinstance(objectPrefix, str)
-            or objectPrefix.startswith("/")
-            or "\\" in objectPrefix
-            or "\x00" in objectPrefix
-            or any(part in {"", ".", ".."} for part in objectPrefix.split("/"))
-        ):
+        if not isinstance(objectPrefix, str) or objectPrefix.startswith("/") or "\\" in objectPrefix or "\x00" in objectPrefix or any(part in {"", ".", ".."} for part in objectPrefix.split("/")):
             raise ValueError("objectPrefix must be a valid relative POSIX path.")
 
         cls.validateDerivedManifest(manifest)
         manifestBytes = cls.encodeRawManifest(manifest)
-        manifestIdentity = {
-            "sha256": hashlib.sha256(manifestBytes).hexdigest(),
-            "size_bytes": len(manifestBytes),
-        }
+        manifestIdentity = {"sha256": hashlib.sha256(manifestBytes).hexdigest(), "size_bytes": len(manifestBytes)}
+        hasMNE = manifest["contract_version"] == "pgl.derived.session.v1"
 
         sessionsTable = sql.Identifier(postgres.databaseSchema, "session")
         linksTable = sql.Identifier(postgres.databaseSchema, "session_files")
-        backendsTable = sql.Identifier(
-            postgres.databaseSchema, "storage_backends"
-        )
+        backendsTable = sql.Identifier(postgres.databaseSchema, "storage_backends")
 
         with connection.transaction():
-            checkpoint = connection.execute(
-                sql.SQL("""
-                    SELECT origin, status, contract_version, deleted_at
-                    FROM {}
-                    WHERE session_id = %s
-                    FOR UPDATE
-                """).format(sessionsTable),
-                (sessionID,),
-            ).fetchone()
+            checkpoint = connection.execute(sql.SQL("""
+                SELECT origin, status, contract_version, deleted_at
+                FROM {}
+                WHERE session_id = %s
+                FOR UPDATE
+            """).format(sessionsTable), (sessionID,)).fetchone()
 
-            if checkpoint != (
-                "derived",
-                "in_progress",
-                "pgl.derived.behavior.v1",
-                None,
-            ):
-                raise ValueError(
-                    "Checkpoint must be an active, in-progress "
-                    "derived behavioral checkpoint."
-                )
+            if checkpoint != ("derived", "in_progress", manifest["contract_version"], None):
+                raise ValueError("Checkpoint must be active, in progress, derived, and match the manifest contract.")
 
-            existingLink = connection.execute(
-                sql.SQL("""
-                    SELECT 1 FROM {}
-                    WHERE session_id = %s
-                    LIMIT 1
-                """).format(linksTable),
-                (sessionID,),
-            ).fetchone()
+            existingLink = connection.execute(sql.SQL("SELECT 1 FROM {} WHERE session_id = %s LIMIT 1").format(linksTable), (sessionID,)).fetchone()
+            if existingLink is not None: raise ValueError("Checkpoint already has file links.")
 
-            if existingLink is not None:
-                raise ValueError("Checkpoint already has file links.")
+            backend = connection.execute(sql.SQL("SELECT url_prefix, is_active FROM {} WHERE backend_id = %s FOR SHARE").format(backendsTable), (backendID,)).fetchone()
+            if backend is None or not backend[1]: raise ValueError("Storage backend is missing or inactive.")
 
-            backend = connection.execute(
-                sql.SQL("""
-                    SELECT url_prefix, is_active
-                    FROM {}
-                    WHERE backend_id = %s
-                    FOR SHARE
-                """).format(backendsTable),
-                (backendID,),
-            ).fetchone()
-
-            if backend is None or not backend[1]:
-                raise ValueError("Storage backend is missing or inactive.")
-
-            filesystem, root = url_to_fs(
-                backend[0], **(storageOptions or {})
-            )
-
+            filesystem, root = url_to_fs(backend[0], **(storageOptions or {}))
             manifestKey = posixpath.join(objectPrefix, "manifest.json")
-            actualManifest = cls.hashFile(
-                filesystem, posixpath.join(root, manifestKey)
-            )
-
-            if actualManifest != manifestIdentity:
-                raise ValueError(
-                    "Saved manifest does not match the supplied manifest."
-                )
+            actualManifest = cls.hashFile(filesystem, posixpath.join(root, manifestKey))
+            if actualManifest != manifestIdentity: raise ValueError("Saved manifest does not match the supplied manifest.")
 
             fileLocations = {
                 record["name"]: {
@@ -3325,145 +3297,70 @@ class pglStorage:
                     "locations": [{
                         "backend_id": backendID,
                         "url_prefix": backend[0],
-                        "object_key": posixpath.join(
-                            objectPrefix, record["name"]
-                        ),
+                        "object_key": posixpath.join(objectPrefix, record["name"]),
                     }],
                 }
                 for record in manifest["files"]
             }
 
-            archive = pglCheckpointFilesystem(
-                manifest,
-                fileLocations,
-                storageOptionsByBackend={
-                    backendID: storageOptions or {}
-                },
-            )
+            archive = pglCheckpointFilesystem(manifest, fileLocations, storageOptionsByBackend={backendID: storageOptions or {}})
+            if hasMNE: cls._verifyMNEInventory(manifest, archive)
 
             subjectsByRun = {}
 
             for runRecord in manifest["runs"]:
                 runPath = runRecord["path"]
-                settingsPath = posixpath.join(
-                    runPath, "experimentSettings.json"
-                )
+                settingsPath = posixpath.join(runPath, "experimentSettings.json")
 
-                with archive.open(settingsPath, "rt", encoding="utf-8") as file:
-                    settings = json.load(file)
+                with archive.open(settingsPath, "rt", encoding="utf-8") as file: settings = json.load(file)
 
-                if not isinstance(settings, dict):
-                    raise ValueError(
-                        f"Experiment settings must be a JSON object: "
-                        f"{settingsPath}"
-                    )
-
+                if not isinstance(settings, dict): raise ValueError(f"Experiment settings must be a JSON object: {settingsPath}")
                 subjectID = settings.get("subjectID")
-
-                if (
-                    not isinstance(subjectID, str)
-                    or not subjectID.strip()
-                    or "\x00" in subjectID
-                ):
-                    raise ValueError(
-                        f"Missing or invalid saved subject ID: {settingsPath}"
-                    )
-
+                if not isinstance(subjectID, str) or not subjectID.strip() or "\x00" in subjectID: raise ValueError(f"Missing or invalid saved subject ID: {settingsPath}")
                 subjectsByRun[runPath] = subjectID
 
-            for subjectID in sorted(set(subjectsByRun.values())):
-                cls.getOrCreateSubject(connection, postgres, subjectID)
+            for subjectID in sorted(set(subjectsByRun.values())): cls.getOrCreateSubject(connection, postgres, subjectID)
 
             def registerPayload(name, identity, role, subjectID=None):
-                fileID = cls.getOrCreateFile(
-                    connection,
-                    postgres,
-                    identity["sha256"],
-                    identity["size_bytes"],
-                )
-
-                cls.verifyAndRegisterStorageLocation(
-                    connection,
-                    postgres,
-                    fileID,
-                    backendID,
-                    posixpath.join(objectPrefix, name),
-                    storageOptions=storageOptions,
-                )
-
-                cls.attachCheckpointFile(
-                    connection,
-                    postgres,
-                    sessionID,
-                    name,
-                    fileID,
-                    role=role,
-                    subjectID=subjectID,
-                )
+                fileID = cls.getOrCreateFile(connection, postgres, identity["sha256"], identity["size_bytes"])
+                cls.verifyAndRegisterStorageLocation(connection, postgres, fileID, backendID, posixpath.join(objectPrefix, name), storageOptions=storageOptions)
+                cls.attachCheckpointFile(connection, postgres, sessionID, name, fileID, role=role, subjectID=subjectID)
 
             for record in manifest["files"]:
                 name = record["name"]
 
                 if name == "history.json":
                     registerPayload(name, record, role="history")
+                elif hasMNE and name.startswith("mne/"):
+                    registerPayload(name, record, role="derived")
                 else:
                     runPath = "/".join(name.split("/")[:2])
-                    registerPayload(
-                        name,
-                        record,
-                        role="derived",
-                        subjectID=subjectsByRun[runPath],
-                    )
+                    registerPayload(name, record, role="derived", subjectID=subjectsByRun[runPath])
 
-            registerPayload(
-                "manifest.json",
-                manifestIdentity,
-                role="manifest",
-            )
+            registerPayload("manifest.json", manifestIdentity, role="manifest")
 
         return sessionID
 
     @classmethod
-    def completeDerivedCheckpoint(
-        cls, connection, postgres, sessionID, manifest
-    ):
-        """Validate registered metadata and publish a derived checkpoint.
+    def completeDerivedCheckpoint(cls, connection, postgres, sessionID, manifest):
+        """Validate registered metadata and complete a derived checkpoint.
 
-        Requires an active, in-progress derived behavioral checkpoint,
-        a completed active parent, exact file identities and roles, and
-        eligible registered storage locations.
-
-        Checks recorded verification metadata, not fresh payload bytes.
-
-        Opens a transaction/savepoint. An outer transaction must commit
-        for publication to persist. Returns the manifest hash.
+        Requires a matching contract, completed active parent, exact file
+        identities/roles, and eligible registered storage locations.
+        Checks verification metadata rather than rereading payload bytes.
+        Opens a transaction/savepoint; publication persists only after commit.
         """
-        if (
-            isinstance(sessionID, bool)
-            or not isinstance(sessionID, int)
-            or not 0 <= sessionID <= 9223372036854775807
-        ):
-            raise ValueError("sessionID must be a nonnegative PostgreSQL bigint.")
+        if type(sessionID) is not int or not 0 <= sessionID <= 9223372036854775807: raise ValueError("sessionID must be a nonnegative PostgreSQL bigint.")
 
         cls.validateDerivedManifest(manifest)
         manifestBytes = cls.encodeRawManifest(manifest)
         manifestHash = hashlib.sha256(manifestBytes).hexdigest()
 
-        expected = {}
-
-        for record in manifest["files"]:
-            role = "history" if record["name"] == "history.json" else "derived"
-            expected[record["name"]] = (
-                record["sha256"],
-                record["size_bytes"],
-                role,
-            )
-
-        expected["manifest.json"] = (
-            manifestHash,
-            len(manifestBytes),
-            "manifest",
-        )
+        expected = {
+            record["name"]: (record["sha256"], record["size_bytes"], "history" if record["name"] == "history.json" else "derived")
+            for record in manifest["files"]
+        }
+        expected["manifest.json"] = (manifestHash, len(manifestBytes), "manifest")
 
         sessions = sql.Identifier(postgres.databaseSchema, "session")
         links = sql.Identifier(postgres.databaseSchema, "session_files")
@@ -3472,209 +3369,119 @@ class pglStorage:
         backends = sql.Identifier(postgres.databaseSchema, "storage_backends")
 
         with connection.transaction():
-            checkpoint = connection.execute(
-                sql.SQL("""
-                    SELECT origin, status, contract_version, deleted_at,
-                           parent_session_id, root_session_id
-                    FROM {}
-                    WHERE session_id = %s
-                    FOR UPDATE
-                """).format(sessions),
-                (sessionID,),
-            ).fetchone()
+            checkpoint = connection.execute(sql.SQL("""
+                SELECT origin, status, contract_version, deleted_at, parent_session_id, root_session_id
+                FROM {}
+                WHERE session_id = %s
+                FOR UPDATE
+            """).format(sessions), (sessionID,)).fetchone()
 
-            if checkpoint is None or checkpoint[:4] != (
-                "derived",
-                "in_progress",
-                "pgl.derived.behavior.v1",
-                None,
-            ):
-                raise ValueError(
-                    "Checkpoint must be an active, in-progress "
-                    "derived behavioral checkpoint."
-                )
+            if checkpoint is None or checkpoint[:4] != ("derived", "in_progress", manifest["contract_version"], None):
+                raise ValueError("Checkpoint must be active, in progress, derived, and match the manifest contract.")
 
             parentID, rootID = checkpoint[4:]
+            parent = connection.execute(sql.SQL("""
+                SELECT status, deleted_at, root_session_id
+                FROM {}
+                WHERE session_id = %s
+                FOR SHARE
+            """).format(sessions), (parentID,)).fetchone()
 
-            parent = connection.execute(
-                sql.SQL("""
-                    SELECT status, deleted_at, root_session_id
-                    FROM {}
-                    WHERE session_id = %s
-                    FOR SHARE
-                """).format(sessions),
-                (parentID,),
-            ).fetchone()
+            if parent != ("complete", None, rootID): raise ValueError("Parent must be complete, active, and have the same root.")
 
-            if parent != ("complete", None, rootID):
-                raise ValueError(
-                    "Parent must be complete, active, and have the same root."
-                )
+            rows = connection.execute(sql.SQL("""
+                SELECT link.name, content.sha256, content.size_bytes, link.role,
+                       (
+                           link.deleted_at IS NULL
+                           AND content.deleted_at IS NULL
+                           AND EXISTS (
+                               SELECT 1
+                               FROM {} AS location
+                               JOIN {} AS backend ON backend.backend_id = location.backend_id
+                               WHERE location.file_id = content.file_id
+                                 AND location.deleted_at IS NULL
+                                 AND location.status = 'present'
+                                 AND location.verified_at IS NOT NULL
+                                 AND backend.is_active
+                           )
+                       ) AS available
+                FROM {} AS link
+                JOIN {} AS content ON content.file_id = link.file_id
+                WHERE link.session_id = %s
+                ORDER BY link.name
+            """).format(locations, backends, links, files), (sessionID,)).fetchall()
 
-            rows = connection.execute(
-                sql.SQL("""
-                    SELECT link.name, content.sha256, content.size_bytes,
-                           link.role,
-                           (
-                               link.deleted_at IS NULL
-                               AND content.deleted_at IS NULL
-                               AND EXISTS (
-                                   SELECT 1
-                                   FROM {} AS location
-                                   JOIN {} AS backend
-                                     ON backend.backend_id = location.backend_id
-                                   WHERE location.file_id = content.file_id
-                                     AND location.deleted_at IS NULL
-                                     AND location.status = 'present'
-                                     AND location.verified_at IS NOT NULL
-                                     AND backend.is_active
-                               )
-                           ) AS available
-                    FROM {} AS link
-                    JOIN {} AS content
-                      ON content.file_id = link.file_id
-                    WHERE link.session_id = %s
-                    ORDER BY link.name
-                """).format(locations, backends, links, files),
-                (sessionID,),
-            ).fetchall()
+            actual = {name: (digest, size, role) for name, digest, size, role, available in rows}
+            if actual != expected: raise ValueError("Checkpoint file links do not exactly match the derived manifest identities and roles.")
 
-            actual = {
-                name: (digest, size, role)
-                for name, digest, size, role, available in rows
-            }
+            unavailable = [name for name, digest, size, role, available in rows if not available]
+            if unavailable: raise ValueError("Files lack active links, content identities, or verified active storage locations: " + ", ".join(unavailable))
 
-            if actual != expected:
-                raise ValueError(
-                    "Checkpoint file links do not exactly match "
-                    "the derived manifest identities and roles."
-                )
-
-            unavailable = [
-                name
-                for name, digest, size, role, available in rows
-                if not available
-            ]
-
-            if unavailable:
-                raise ValueError(
-                    "Files lack active links, content identities, or verified "
-                    "active storage locations: "
-                    + ", ".join(unavailable)
-                )
-
-            connection.execute(
-                sql.SQL("""
-                    UPDATE {}
-                    SET status = 'complete',
-                        manifest_hash = %s,
-                        completed_at = now()
-                    WHERE session_id = %s
-                """).format(sessions),
-                (manifestHash, sessionID),
-            )
+            connection.execute(sql.SQL("""
+                UPDATE {}
+                SET status = 'complete', manifest_hash = %s, completed_at = now()
+                WHERE session_id = %s
+            """).format(sessions), (manifestHash, sessionID))
 
         return manifestHash
 
     @classmethod
-    def reconstructDerivedSession(
-        cls, manifest, fileLocations, storageOptionsByBackend=None
-    ):
-        """Reconstruct a derived session from resolved checkpoint metadata.
+    def reconstructDerivedSession(cls, manifest, fileLocations, storageOptionsByBackend=None, *, cacheDirectory=None, directLocalPolicy="materialize", cacheContext=None):
+        """Restore verified history and deferred behavioral/MNE contents.
 
-        Verifies and restores history immediately.
-        Run payloads remain lazy and are verified when opened.
-
-        Restores the session UUID recorded in the history wrapper.
-        Does not access PostgreSQL or validate checkpoint publication status.
-        The database loader must perform those checks before calling this.
-
-        Returns a pglSession. Validation and deserialization errors propagate.
+        Reads history and the MNE descriptor, not analysis payloads.
+        Optional cacheContext supplies database/session cache organization.
+        No PostgreSQL connection is retained.
         """
         from .pglPipeline import pglActionable
-        from .pglSession import pglSession
+        from .pglSession import pglSession, pglMNE
+
+        if directLocalPolicy not in ("materialize", "immutable"): raise ValueError("directLocalPolicy must be 'materialize' or 'immutable'")
 
         cls.validateDerivedManifest(manifest)
+        hasMNE = manifest["contract_version"] == "pgl.derived.session.v1"
 
-        filesystem = pglCheckpointFilesystem(
-            manifest,
-            fileLocations,
-            storageOptionsByBackend=storageOptionsByBackend,
-        )
+        if hasMNE and (cacheDirectory is None or not str(cacheDirectory).strip()):
+            raise ValueError("MNE restoration requires an explicit cacheDirectory")
 
-        with filesystem.open("history.json", "rt", encoding="utf-8") as file:
-            historyJSON = file.read()
+        filesystem = pglCheckpointFilesystem(manifest, fileLocations, storageOptionsByBackend=storageOptionsByBackend)
+        filesystem.mneCacheContext = deepcopy(cacheContext)
 
-        # Use fromJSON directly so decoding failures are not swallowed
-        # by the file-loading convenience wrapper.
-        history = pglActionable.fromJSON(
-            historyJSON,
-            filename="history.json",
-        )
+        with filesystem.open("history.json", "rt", encoding="utf-8") as source: historyJSON = source.read()
 
-        if type(history) is not pglActionable:
-            raise ValueError(
-                "Derived history must contain a pglActionable wrapper."
-            )
+        history = pglActionable.fromJSON(historyJSON, filename="history.json")
+        if type(history) is not pglActionable: raise ValueError("Derived history must contain a pglActionable wrapper")
+        if json.loads(history.toJSON()) != json.loads(historyJSON): raise ValueError("Derived history could not be reconstructed without changes")
 
-        # Reject missing/defaulted fields or other lossy reconstruction.
-        # Compare decoded JSON so formatting alone does not matter.
-        if json.loads(history.toJSON()) != json.loads(historyJSON):
-            raise ValueError(
-                "Derived history could not be reconstructed without changes."
-            )
+        if hasMNE: cls._verifyMNEInventory(manifest, filesystem)
 
-        session = pglSession(
-            filesystem=filesystem,
-            runList=[record["path"] for record in manifest["runs"]],
-        )
+        session = pglSession(filesystem=filesystem, runList=[record["path"] for record in manifest["runs"]])
         session.uuid = history.uuid
         session.actionHistory = list(history.actionHistory)
+
+        if hasMNE:
+            session.mne = pglMNE.loadBundle(manifest["mne"]["path"], filesystem=filesystem, cacheDirectory=cacheDirectory, directLocalPolicy=directLocalPolicy)
 
         return session
 
     @classmethod
-    def loadDerivedSession(
-        cls,
-        connection,
-        postgres,
-        sessionID,
-        storageOptionsByBackend=None,
-        *,
-        includeDeleted=False,
-        maxManifestBytes=16 * 1024 * 1024,
-    ):
-        """Load a completed derived behavioral checkpoint as a lazy session.
+    def loadDerivedSession(cls, connection, postgres, sessionID, storageOptionsByBackend=None, *, includeDeleted=False, maxManifestBytes=16 * 1024 * 1024, cacheDirectory=None, directLocalPolicy="materialize"):
+        """Load a completed derived behavioral or MNE session checkpoint.
 
-        Uses the caller's transaction for metadata lookup.
-        For consistent metadata across queries, the caller should use a
-        REPEATABLE READ snapshot.
+        Uses the caller's transaction for metadata lookup; REPEATABLE READ
+        provides a consistent snapshot. No SQL connection is retained.
 
-        Verifies the manifest and history immediately. Run payloads are
-        verified when opened. No SQL connection is retained by the session.
+        Verifies manifest/history and MNE descriptor immediately.
+        Analysis and behavioral payloads remain deferred.
 
-        includeDeleted permits inspection of deleted sessions, links,
-        content identities, and locations. It does not restore them.
-        Locations must still be verified, present, and on active backends.
-
-        Validation, storage, and deserialization errors propagate.
+        MNE restoration requires a caller-owned cacheDirectory.
+        Materialized bundles use a database/session-specific cache namespace.
+        includeDeleted permits inspection without undeleting anything.
         """
-        if (
-            isinstance(sessionID, bool)
-            or not isinstance(sessionID, int)
-            or not 0 <= sessionID <= 9223372036854775807
-        ):
-            raise ValueError("sessionID must be a nonnegative PostgreSQL bigint.")
-
-        if type(includeDeleted) is not bool:
-            raise ValueError("includeDeleted must be a boolean.")
-
-        if (
-            isinstance(maxManifestBytes, bool)
-            or not isinstance(maxManifestBytes, int)
-            or maxManifestBytes <= 0
-        ):
-            raise ValueError("maxManifestBytes must be a positive integer.")
+        if type(sessionID) is not int or not 0 <= sessionID <= 9223372036854775807: raise ValueError("sessionID must be a nonnegative PostgreSQL bigint.")
+        if type(includeDeleted) is not bool: raise ValueError("includeDeleted must be a boolean.")
+        if type(maxManifestBytes) is not int or maxManifestBytes <= 0: raise ValueError("maxManifestBytes must be a positive integer.")
+        if directLocalPolicy not in ("materialize", "immutable"): raise ValueError("directLocalPolicy must be 'materialize' or 'immutable'")
 
         sessions = sql.Identifier(postgres.databaseSchema, "session")
         links = sql.Identifier(postgres.databaseSchema, "session_files")
@@ -3682,215 +3489,118 @@ class pglStorage:
         locations = sql.Identifier(postgres.databaseSchema, "storage_locations")
         backends = sql.Identifier(postgres.databaseSchema, "storage_backends")
 
-        checkpoint = connection.execute(
-            sql.SQL("""
-                SELECT origin, status, contract_version, manifest_hash
-                FROM {}
-                WHERE session_id = %s
-                  AND (%s OR deleted_at IS NULL)
-            """).format(sessions),
-            (sessionID, includeDeleted),
-        ).fetchone()
+        checkpoint = connection.execute(sql.SQL("""
+            SELECT origin, status, contract_version, manifest_hash
+            FROM {}
+            WHERE session_id = %s AND (%s OR deleted_at IS NULL)
+        """).format(sessions), (sessionID, includeDeleted)).fetchone()
 
-        if checkpoint is None:
-            raise ValueError(f"Unknown or deleted checkpoint: {sessionID}")
-
+        if checkpoint is None: raise ValueError(f"Unknown or deleted checkpoint: {sessionID}")
         origin, status, contractVersion, manifestHash = checkpoint
 
-        if status != "complete":
-            raise ValueError("Only completed checkpoints can be loaded.")
-
-        if (
-            origin != "derived"
-            or contractVersion != "pgl.derived.behavior.v1"
-        ):
+        if status != "complete": raise ValueError("Only completed checkpoints can be loaded.")
+        if origin != "derived" or contractVersion not in ("pgl.derived.behavior.v1", "pgl.derived.session.v1"):
             raise ValueError("Unsupported derived checkpoint contract.")
 
-        rows = connection.execute(
-            sql.SQL("""
-                SELECT link.name, link.role, content.file_id,
-                       content.sha256, content.size_bytes,
-                       link.deleted_at, content.deleted_at
-                FROM {} AS link
-                JOIN {} AS content
-                  ON content.file_id = link.file_id
-                WHERE link.session_id = %s
-                ORDER BY link.name
-            """).format(links, files),
-            (sessionID,),
-        ).fetchall()
+        if contractVersion == "pgl.derived.session.v1" and (cacheDirectory is None or not str(cacheDirectory).strip()):
+            raise ValueError("MNE restoration requires an explicit cacheDirectory.")
+
+        rows = connection.execute(sql.SQL("""
+            SELECT link.name, link.role, content.file_id, content.sha256, content.size_bytes,
+                   link.deleted_at, content.deleted_at
+            FROM {} AS link
+            JOIN {} AS content ON content.file_id = link.file_id
+            WHERE link.session_id = %s
+            ORDER BY link.name
+        """).format(links, files), (sessionID,)).fetchall()
 
         records = {}
 
         for name, role, fileID, digest, size, linkDeleted, contentDeleted in rows:
-            if not includeDeleted and (
-                linkDeleted is not None or contentDeleted is not None
-            ):
-                raise ValueError(
-                    f"Checkpoint contains a deleted file link or content: {name}"
-                )
+            if not includeDeleted and (linkDeleted is not None or contentDeleted is not None):
+                raise ValueError(f"Checkpoint contains a deleted file link or content: {name}")
 
-            records[name] = {
-                "role": role,
-                "file_id": fileID,
-                "sha256": digest,
-                "size_bytes": size,
-            }
+            records[name] = {"role": role, "file_id": fileID, "sha256": digest, "size_bytes": size}
 
         manifestRecord = records.get("manifest.json")
-
-        if (
-            manifestRecord is None
-            or manifestRecord["role"] != "manifest"
-            or manifestRecord["sha256"] != manifestHash
-        ):
+        if manifestRecord is None or manifestRecord["role"] != "manifest" or manifestRecord["sha256"] != manifestHash:
             raise ValueError("Checkpoint manifest link is missing or inconsistent.")
 
-        if manifestRecord["size_bytes"] > maxManifestBytes:
-            raise ValueError("Manifest exceeds the configured size limit.")
-
+        if manifestRecord["size_bytes"] > maxManifestBytes: raise ValueError("Manifest exceeds the configured size limit.")
         fileIDs = sorted({record["file_id"] for record in records.values()})
 
-        locationRows = connection.execute(
-            sql.SQL("""
-                SELECT location.file_id, backend.backend_id,
-                       backend.url_prefix, location.object_key
-                FROM {} AS location
-                JOIN {} AS backend
-                  ON backend.backend_id = location.backend_id
-                WHERE location.file_id = ANY(%s::bigint[])
-                  AND (%s OR location.deleted_at IS NULL)
-                  AND location.status = 'present'
-                  AND location.verified_at IS NOT NULL
-                  AND backend.is_active
-                ORDER BY location.file_id, location.priority,
-                         backend.backend_id, location.object_key
-            """).format(locations, backends),
-            (fileIDs, includeDeleted),
-        ).fetchall()
+        locationRows = connection.execute(sql.SQL("""
+            SELECT location.file_id, backend.backend_id, backend.url_prefix, location.object_key
+            FROM {} AS location
+            JOIN {} AS backend ON backend.backend_id = location.backend_id
+            WHERE location.file_id = ANY(%s::bigint[])
+              AND (%s OR location.deleted_at IS NULL)
+              AND location.status = 'present'
+              AND location.verified_at IS NOT NULL
+              AND backend.is_active
+            ORDER BY location.file_id, location.priority, backend.backend_id, location.object_key
+        """).format(locations, backends), (fileIDs, includeDeleted)).fetchall()
 
         locationsByFile = {}
 
         for fileID, backendID, root, key in locationRows:
-            if (
-                not isinstance(key, str)
-                or key.startswith("/")
-                or "\\" in key
-                or "\x00" in key
-                or any(part in {"", ".", ".."} for part in key.split("/"))
-            ):
+            if not isinstance(key, str) or key.startswith("/") or "\\" in key or "\x00" in key or any(part in {"", ".", ".."} for part in key.split("/")):
                 raise ValueError("Database contains an invalid payload object key.")
 
-            locationsByFile.setdefault(fileID, []).append({
-                "backend_id": backendID,
-                "url_prefix": root,
-                "object_key": key,
-            })
+            locationsByFile.setdefault(fileID, []).append({"backend_id": backendID, "url_prefix": root, "object_key": key})
 
-        manifestLocations = locationsByFile.get(
-            manifestRecord["file_id"], []
-        )
-
-        if not manifestLocations:
-            raise FileNotFoundError(
-                "Manifest has no eligible verified storage location."
-            )
+        manifestLocations = locationsByFile.get(manifestRecord["file_id"], [])
+        if not manifestLocations: raise FileNotFoundError("Manifest has no eligible verified storage location.")
 
         optionsByBackend = storageOptionsByBackend or {}
-        failures = []
-        manifestContent = None
+        failures, manifestContent = [], None
 
         for location in manifestLocations:
             backendID = location["backend_id"]
 
             try:
-                filesystem, root = url_to_fs(
-                    location["url_prefix"],
-                    **optionsByBackend.get(backendID, {}),
-                )
+                filesystem, root = url_to_fs(location["url_prefix"], **optionsByBackend.get(backendID, {}))
                 path = posixpath.join(root, location["object_key"])
 
-                with filesystem.open(path, "rb") as file:
-                    content = file.read(manifestRecord["size_bytes"] + 1)
+                with filesystem.open(path, "rb") as file: content = file.read(manifestRecord["size_bytes"] + 1)
 
-                if len(content) != manifestRecord["size_bytes"]:
-                    raise ValueError("Manifest size mismatch.")
-
-                if hashlib.sha256(content).hexdigest() != manifestHash:
-                    raise ValueError("Manifest hash mismatch.")
+                if len(content) != manifestRecord["size_bytes"]: raise ValueError("Manifest size mismatch.")
+                if hashlib.sha256(content).hexdigest() != manifestHash: raise ValueError("Manifest hash mismatch.")
 
             except (OSError, ValueError) as error:
-                failures.append(
-                    f"backend {backendID}: {type(error).__name__}"
-                )
+                failures.append(f"backend {backendID}: {type(error).__name__}")
                 continue
 
             manifestContent = content
             break
 
-        if manifestContent is None:
-            raise OSError(
-                "No manifest copy could be verified: " + "; ".join(failures)
-            )
+        if manifestContent is None: raise OSError("No manifest copy could be verified: " + "; ".join(failures))
 
         manifest = json.loads(manifestContent.decode("utf-8"))
         cls.validateDerivedManifest(manifest)
 
-        if cls.encodeRawManifest(manifest) != manifestContent:
-            raise ValueError("Stored manifest is not canonically encoded.")
+        if manifest["contract_version"] != contractVersion: raise ValueError("Manifest contract differs from the database checkpoint contract.")
+        if cls.encodeRawManifest(manifest) != manifestContent: raise ValueError("Stored manifest is not canonically encoded.")
 
         expected = {
-            record["name"]: (
-                record["sha256"],
-                record["size_bytes"],
-                "history" if record["name"] == "history.json" else "derived",
-            )
+            record["name"]: (record["sha256"], record["size_bytes"], "history" if record["name"] == "history.json" else "derived")
             for record in manifest["files"]
         }
-        expected["manifest.json"] = (
-            manifestHash,
-            len(manifestContent),
-            "manifest",
-        )
+        expected["manifest.json"] = (manifestHash, len(manifestContent), "manifest")
 
-        actual = {
-            name: (
-                record["sha256"],
-                record["size_bytes"],
-                record["role"],
-            )
-            for name, record in records.items()
-        }
-
-        if actual != expected:
-            raise ValueError(
-                "Checkpoint file links do not exactly match "
-                "the derived manifest identities and roles."
-            )
+        actual = {name: (record["sha256"], record["size_bytes"], record["role"]) for name, record in records.items()}
+        if actual != expected: raise ValueError("Checkpoint file links do not exactly match the derived manifest identities and roles.")
 
         fileLocations = {}
 
         for record in manifest["files"]:
             name = record["name"]
-            registered = records[name]
-            candidates = locationsByFile.get(registered["file_id"], [])
+            candidates = locationsByFile.get(records[name]["file_id"], [])
+            if not candidates: raise FileNotFoundError(f"File has no eligible verified storage location: {name}")
+            fileLocations[name] = {"sha256": record["sha256"], "size_bytes": record["size_bytes"], "locations": candidates}
 
-            if not candidates:
-                raise FileNotFoundError(
-                    f"File has no eligible verified storage location: {name}"
-                )
-
-            fileLocations[name] = {
-                "sha256": record["sha256"],
-                "size_bytes": record["size_bytes"],
-                "locations": candidates,
-            }
-
-        return cls.reconstructDerivedSession(
-            manifest,
-            fileLocations,
-            storageOptionsByBackend=optionsByBackend,
-        )
+        cacheContext = cls._mneCacheContext(postgres, sessionID) if contractVersion == "pgl.derived.session.v1" else None
+        return cls.reconstructDerivedSession(manifest, fileLocations, storageOptionsByBackend=optionsByBackend, cacheDirectory=cacheDirectory, directLocalPolicy=directLocalPolicy, cacheContext=cacheContext)
 
     # ------------------------------------------------------------
     # Public schema initialization
@@ -4028,6 +3738,50 @@ class pglStorage:
 
         pglMessages.message(f"Scientific schema ready: {postgres.databaseName}.{postgres.databaseSchema}")
         return True
+    
+    @classmethod
+    def _verifyMNEInventory(cls, manifest, filesystem):
+        """Verify MNE descriptor references against the outer file inventory."""
+        from .pglSession import pglMNEBundle
+
+        mneRoot = manifest["mne"]["path"]
+        descriptorPath = posixpath.join(mneRoot, "mne.json")
+        inventory = {record["name"]: record for record in manifest["files"]}
+        descriptorRecord = inventory[descriptorPath]
+
+        maxBytes = 16 * 1024 * 1024
+        if descriptorRecord["size_bytes"] > maxBytes:
+            raise ValueError("MNE descriptor exceeds size limit")
+
+        with filesystem.open(descriptorPath, "rb") as source:
+            content = source.read(descriptorRecord["size_bytes"] + 1)
+
+        if (
+            len(content) != descriptorRecord["size_bytes"]
+            or hashlib.sha256(content).hexdigest() != descriptorRecord["sha256"]
+        ):
+            raise ValueError("MNE descriptor identity mismatch")
+
+        descriptor = json.loads(content)
+        pglMNEBundle._validateDescriptor(descriptor)
+
+        expected = {}
+        for resource in descriptor["resources"].values():
+            for record in resource["files"]:
+                name = posixpath.join(mneRoot, resource["root"], record["name"])
+                if name in expected: raise ValueError(f"Duplicate MNE payload reference: {name}")
+                expected[name] = (record["sha256"], record["size_bytes"])
+
+        actual = {
+            name: (record["sha256"], record["size_bytes"])
+            for name, record in inventory.items()
+            if name.startswith(mneRoot + "/") and name != descriptorPath
+        }
+
+        if actual != expected:
+            raise ValueError("MNE descriptor payloads do not exactly match checkpoint inventory")
+
+        return descriptor
     # ------------------------------------------------------------
     # Migration files
     # ------------------------------------------------------------
@@ -4233,7 +3987,7 @@ class pglCheckpointFilesystem(AbstractFileSystem):
 
         if contractVersion == "pgl.raw.behavior.v1":
             pglStorage.validateRawManifest(manifest)
-        elif contractVersion == "pgl.derived.behavior.v1":
+        elif contractVersion in ("pgl.derived.behavior.v1", "pgl.derived.session.v1"):
             pglStorage.validateDerivedManifest(manifest)
         else:
             raise ValueError(
@@ -4423,3 +4177,114 @@ class pglCheckpointFilesystem(AbstractFileSystem):
             return buffer
 
         raise OSError(f"No verified copy available for {entry['name']!r}: {'; '.join(failures)}")
+    
+    def localBundlePaths(self, resourceRoot, records):
+        """Return a layout-compatible local bundle, or None.
+
+        Called only when resolving a field, never during reconstruction.
+
+        Checks bundle identities against checkpoint identities, then selects
+        registered local locations sharing the required relative layout.
+
+        Does not open, hash, spool, download, or copy payloads.
+        The caller must verify every returned file before opening MNE.
+        """
+        from pathlib import Path
+        from fsspec.implementations.local import LocalFileSystem
+
+        candidatesByName = {}
+
+        for member in records:
+            relativeName = member["name"]
+            logicalName = self._logicalPath(
+                posixpath.join(resourceRoot, relativeName)
+            )
+
+            registered = self._payloads.get(logicalName)
+            if registered is None:
+                raise ValueError(
+                    f"FIF member is absent from checkpoint: {logicalName}"
+                )
+
+            expected = {
+                key: member[key]
+                for key in ("sha256", "size_bytes")
+            }
+            checkpointIdentity = {
+                key: registered[key]
+                for key in ("sha256", "size_bytes")
+            }
+            if checkpointIdentity != expected:
+                raise ValueError(
+                    f"FIF/checkpoint identity mismatch: {logicalName}"
+                )
+
+            # Map possible physical bundle roots to member paths.
+            candidates = {}
+            parts = relativeName.split("/")
+
+            for location in registered["locations"]:
+                options = self._storageOptionsByBackend.get(
+                    location["backend_id"], {}
+                )
+                filesystem, root = url_to_fs(
+                    location["url_prefix"], **options
+                )
+
+                # Do not infer locality from the checkpoint's protocol,
+                # backend label, or a wrapper's apparent filename.
+                if type(filesystem) is not LocalFileSystem:
+                    continue
+
+                source = Path(
+                    filesystem._strip_protocol(
+                        posixpath.join(root, location["object_key"])
+                    )
+                ).expanduser()
+
+                # Leaf symlinks are conservatively ineligible.
+                if source.is_symlink():
+                    continue
+
+                source = source.resolve()
+                bundleRoot = source
+                for _ in parts:
+                    bundleRoot = bundleRoot.parent
+
+                # Content-addressed names generally fail this comparison.
+                if bundleRoot.joinpath(*parts) != source:
+                    continue
+
+                candidates[bundleRoot] = source
+
+            candidatesByName[relativeName] = candidates
+
+        if not candidatesByName:
+            return None
+
+        commonRoots = set.intersection(
+            *(set(candidates) for candidates in candidatesByName.values())
+        )
+
+        # A bundle must be selected together, not one preferred replica
+        # independently for each split member.
+        for root in sorted(commonRoots, key=str):
+            paths = {
+                name: candidates[root]
+                for name, candidates in candidatesByName.items()
+            }
+            if all(path.is_file() for path in paths.values()):
+                return paths
+
+        return None
+    
+    def validateBundleIdentities(self, resourceRoot, records):
+        """Check inner bundle identities against checkpoint metadata without I/O."""
+        for member in records:
+            logicalName = self._logicalPath(posixpath.join(resourceRoot, member["name"]))
+            registered = self._payloads.get(logicalName)
+            if registered is None: raise ValueError(f"FIF member is absent from checkpoint: {logicalName}")
+
+            expected = {key: member[key] for key in ("sha256", "size_bytes")}
+            actual = {key: registered[key] for key in ("sha256", "size_bytes")}
+            if actual != expected: raise ValueError(f"FIF/checkpoint identity mismatch: {logicalName}")
