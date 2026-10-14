@@ -770,6 +770,7 @@ class pglMNE(pglLazyLoad, pglActionable):
     evoked = Any(default_value=None, allow_none=True, help="Current MNE Evoked", lazyload=True, loader="_loadEvoked", writer="_saveEvoked")
     ica = Any(default_value=None, allow_none=True, help="Current MNE ICA", lazyload=True, loader="_loadICA", writer="_saveICA")
     report = Any(default_value=None, allow_none=True, help="Analysis report", lazyload=True, loader="_loadReport", writer="_saveReport")
+    derivedParameters = Dict(default_value={}, help="Derived parameters from the raw data that can be used to pass parameters from one action to another")
     
     def __init__(self):
         super().__init__()
@@ -914,9 +915,9 @@ class pglMNE(pglLazyLoad, pglActionable):
         return pglMNEBundle.save(self, dataPath, filesystem=filesystem)
 
     @classmethod
-    def loadBundle(cls, dataPath, filesystem=None, *, cacheDirectory, directLocalPolicy="materialize"):
-        return pglMNEBundle.load(dataPath, filesystem=filesystem, cacheDirectory=cacheDirectory, directLocalPolicy=directLocalPolicy)
-
+    def loadBundle(cls, dataPath, filesystem=None, *, cacheDirectory, directLocalPolicy="materialize", verbose=False):
+        return pglMNEBundle.load(dataPath, filesystem=filesystem, cacheDirectory=cacheDirectory, directLocalPolicy=directLocalPolicy, verbose=verbose)
+    
     def validatePicks(self, picks):
         """
         Validate a single MNE pick selector.
@@ -1362,74 +1363,103 @@ class pglMNEBundle:
         return destination, descriptor
 
     @classmethod
-    def load(cls, dataPath, filesystem=None, *, cacheDirectory, directLocalPolicy="materialize", maxDescriptorBytes=16 * 1024 * 1024):
-        """Restore metadata/backing without reading analysis payloads."""
-        if directLocalPolicy not in ("materialize", "immutable"): raise ValueError("directLocalPolicy must be 'materialize' or 'immutable'")
-        
+    def load(cls, dataPath, filesystem=None, *, cacheDirectory, directLocalPolicy="materialize", maxDescriptorBytes=16 * 1024 * 1024, verbose=False):
+        """Restore metadata/backing, using current defaults for missing metadata fields."""
+        if directLocalPolicy not in ("materialize", "immutable"):
+            raise ValueError("directLocalPolicy must be 'materialize' or 'immutable'")
+
         if cacheDirectory is None or not str(cacheDirectory).strip():
             raise ValueError("An explicit caller-owned cache directory is required")
+
         if type(maxDescriptorBytes) is not int or maxDescriptorBytes <= 0:
             raise ValueError("Invalid descriptor size limit")
 
-        if filesystem is None: filesystem, root = url_to_fs(str(dataPath))
-        else: root = str(dataPath)
+        if filesystem is None:
+            filesystem, root = url_to_fs(str(dataPath))
+        else:
+            root = str(dataPath)
 
         with filesystem.open(posixpath.join(root, "mne.json"), "rb") as source:
             content = source.read(maxDescriptorBytes + 1)
+
         if len(content) > maxDescriptorBytes:
             raise ValueError("MNE descriptor exceeds size limit")
 
         descriptor = json.loads(content)
         cls._validateDescriptor(descriptor)
 
+        # ------------------------------------------------------------------
+        # Restore and verify the serialized metadata before applying defaults.
+        # ------------------------------------------------------------------
         metadata = pglSerialize.fromJSON(descriptor["metadata"])
+
         if not isinstance(metadata, SimpleNamespace):
             raise ValueError("Invalid metadata namespace")
-        if cls._encodeMetadata(vars(metadata)) != descriptor["metadata"]:
+
+        savedMetadata = vars(metadata)
+
+        if cls._encodeMetadata(savedMetadata) != descriptor["metadata"]:
             raise ValueError("Metadata restoration changed its encoded contents")
 
+        # ------------------------------------------------------------------
+        # Permit missing fields, but reject unknown saved fields.
+        # ------------------------------------------------------------------
         obj = pglMNE()
-        if set(vars(metadata)) != set(cls._metadataNames(obj)):
-            raise ValueError("Metadata fields do not match the supported pglMNE schema")
+
+        supportedNames = set(cls._metadataNames(obj))
+        savedNames = set(savedMetadata)
+
+        missingNames = supportedNames - savedNames
+        unknownNames = savedNames - supportedNames
+
+        if unknownNames:
+            raise ValueError(f"Checkpoint contains unsupported pglMNE metadata fields: {sorted(unknownNames)}. An explicit schema migration is required.")
 
         # Assignment errors propagate rather than being logged and ignored.
-        for name, value in vars(metadata).items():
+        for name, value in savedMetadata.items():
             obj.set_trait(name, value)
 
-        currentMetadata = {name: getattr(obj, name) for name in cls._metadataNames(obj)}
-        if cls._encodeMetadata(currentMetadata) != descriptor["metadata"]:
+        # Access missing fields to initialize any lazy trait defaults.
+        # Do not replace saved values, including explicitly saved None values.
+        for name in sorted(missingNames):
+            getattr(obj, name)
+
+            if verbose:
+                pglMessages.message(f"pglMNE checkpoint is missing metadata field {name!r}; adding it using the current class default.")
+
+        # Verify only saved fields: the newly defaulted fields were not part
+        # of the original serialized metadata.
+        restoredMetadata = {name: getattr(obj, name) for name in savedMetadata}
+
+        if cls._encodeMetadata(restoredMetadata) != descriptor["metadata"]:
             raise ValueError("Metadata assignment changed stored values")
 
+        # ------------------------------------------------------------------
+        # Restore lazy payload backings without reading analysis payloads.
+        # ------------------------------------------------------------------
         obj.raws = []
         obj._raw = None
-        for name in cls.fields: obj.set_trait(name, None)
+
+        for name in cls.fields:
+            obj.set_trait(name, None)
 
         backings = {}
+
         for resourceID, resource in descriptor["resources"].items():
             resourceRoot = posixpath.join(root, resource["root"])
 
             if resource["kind"] in ("raw", "epochs"):
                 backings[resourceID] = pglMNEBundleBacking(filesystem, {**resource, "root": resourceRoot}, cacheDirectory, directLocalPolicy=directLocalPolicy)
             else:
-                backings[resourceID] = pglMNEVerifiedBacking(
-                    filesystem,
-                    posixpath.join(resourceRoot, resource["entrypoint"]),
-                    resource["files"][0],
-                )
+                backings[resourceID] = pglMNEVerifiedBacking(filesystem, posixpath.join(resourceRoot, resource["entrypoint"]), resource["files"][0])
 
         rawReferences = descriptor["raws"]
-        obj.lazyBind(
-            "raws",
-            pglMNERawsBacking([backings[key] for key in rawReferences]),
-            replace=True,
-        )
+        obj.lazyBind("raws", pglMNERawsBacking([backings[key] for key in rawReferences]), replace=True)
 
         current = descriptor["currentRaw"]
+
         if current is not None:
-            backing = (
-                pglMNERawAliasBacking(rawReferences.index(current))
-                if current in rawReferences else backings[current]
-            )
+            backing = pglMNERawAliasBacking(rawReferences.index(current)) if current in rawReferences else backings[current]
             obj.lazyBind("_raw", backing, replace=True)
 
         for name, reference in descriptor["fields"].items():
