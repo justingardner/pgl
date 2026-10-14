@@ -27,40 +27,105 @@ class pglStorage:
     MIGRATION_LOCK = 734_291_806_115
 
     @staticmethod
-    def print(details=None, postgres=None, *, settings=None, settingsName=None, sessionID=None, nRows=10, maxWidth=48, sslRootCert=None, includeDeleted=False):
-        """Print a database summary, table details, or one checkpoint.
+    def print(details=None, postgres=None, *, settings=None, settingsName=None, sessionID=None, summary=False, nRows=10, maxWidth=48, sslRootCert=None, includeDeleted=False, storageOptionsByBackend=None):
+        """Select a session listing, checkpoint detail view, or database report.
 
-        Defaults to databasePath in the current PGL settings.
+        Default:
+            List all visible sessions grouped by root experiment and subject,
+            displaying their actual parent-child relationships.
 
-        details:
-            A table name, an iterable of table names, or "all".
-            Suppresses the database summary.
+        summary=True:
+            Show the previous database summary: table counts and statuses.
 
         sessionID:
-            Show session metadata, subjects, and all linked files.
-            Shows one recorded content location per logical file, preferring
-            an eligible readable alias, otherwise a shared content location.
-            Other aliases/copies are counted rather than listed repeatedly.
-            Cannot be combined with details.
+            Show one checkpoint's metadata, subjects, and linked files.
 
-        includeDeleted:
-            Include deleted sessions, file links, content identities, and
-            locations. Defaults to False. The override permits inspection;
-            it does not restore anything.
-            Subjects, users, and backends are not hidden as a side effect
-            of session deletion.
+        details:
+            Show one table, an iterable of tables, or "all".
 
-        nRows limits table detail views, not the session file listing.
-        Session paths are displayed without truncation.
-        Location status is recorded metadata, not a fresh payload check.
+        summary, sessionID, and details are mutually exclusive.
+        nRows limits table detail views only, not the session listing.
 
-        Returns False for missing configuration, password cancellation,
-        or an unknown or hidden session. Other errors propagate.
+        The grouped listing reads verified root experimentSettings.json files.
+        storageOptionsByBackend supplies runtime payload credentials/options.
+        No runs, tasks, or MNE payloads are reconstructed.
+
+        Returns False for unavailable configuration/connection or an unknown
+        checkpoint in the single-session view. Other errors propagate.
         """
-        from .pglPostgres import pglPostgres
-        from psycopg.rows import tuple_row
+        if type(summary) is not bool:
+            raise ValueError("summary must be a boolean.")
 
-        tableOrder = {
+        if type(includeDeleted) is not bool:
+            raise ValueError("includeDeleted must be a boolean.")
+
+        if type(nRows) is not int or nRows <= 0:
+            raise ValueError("nRows must be a positive integer.")
+
+        if type(maxWidth) is not int or maxWidth < 8:
+            raise ValueError("maxWidth must be an integer of at least 8.")
+
+        if sum((details is not None, sessionID is not None, summary)) > 1:
+            raise ValueError("Supply only one of details, sessionID, or summary=True.")
+
+        if sessionID is not None:
+            return pglStorage.printSession(sessionID, postgres=postgres, settings=settings, settingsName=settingsName, sslRootCert=sslRootCert, includeDeleted=includeDeleted)
+
+        if details is not None or summary:
+            return pglStorage.printTables(details=details, postgres=postgres, settings=settings, settingsName=settingsName, nRows=nRows, maxWidth=maxWidth, sslRootCert=sslRootCert, includeDeleted=includeDeleted)
+
+        return pglStorage.printSessions(postgres=postgres, settings=settings, settingsName=settingsName, sslRootCert=sslRootCert, includeDeleted=includeDeleted, storageOptionsByBackend=storageOptionsByBackend)
+
+    @staticmethod
+    def _printPostgres(postgres=None, *, settings=None, settingsName=None):
+        """Resolve reporting configuration without opening a connection."""
+        from .pglPostgres import pglPostgres
+
+        if postgres is not None and (settings is not None or settingsName is not None):
+            raise ValueError("Supply either postgres or PGL settings, not both.")
+
+        if postgres is None:
+            postgres = pglPostgres.fromSettings(settings=settings, settingsName=settingsName)
+
+        if postgres is not None and not isinstance(postgres, pglPostgres):
+            raise TypeError("postgres must be a pglPostgres instance.")
+
+        return postgres
+
+    @staticmethod
+    def _printValue(value, maxWidth=None):
+        """Produce single-line display text, optionally truncated."""
+        text = "NULL" if value is None else str(value)
+        text = text.replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t")
+
+        if maxWidth is not None and len(text) > maxWidth:
+            return text[:maxWidth - 3] + "..."
+
+        return text
+
+    @staticmethod
+    def _printTable(headers, rows, maxWidth=48):
+        """Print a compact table without accessing storage."""
+        displayed = [[pglStorage._printValue(value, maxWidth) for value in headers]]
+        displayed.extend([pglStorage._printValue(value, maxWidth) for value in row] for row in rows)
+        widths = [max(len(row[index]) for row in displayed) for index in range(len(headers))]
+
+        def printRow(row):
+            pglMessages.print("  " + " | ".join(value.ljust(width) for value, width in zip(row, widths)))
+
+        printRow(displayed[0])
+        pglMessages.print("  " + "-+-".join("-" * width for width in widths))
+
+        for row in displayed[1:]:
+            printRow(row)
+
+        if not rows:
+            pglMessages.print("  (no rows)")
+
+    @staticmethod
+    def _printTableOrder():
+        """Supported database-report tables and their stable ordering."""
+        return {
             "session": ("session_id",),
             "subjects": ("subject_id",),
             "files": ("file_id",),
@@ -69,25 +134,451 @@ class pglStorage:
             "users": ("user_id",),
             "session_files": ("session_id", "name"),
         }
+        
+    @staticmethod
+    def _readPrintExperimentSettings(identity, locations, storageOptionsByBackend=None):
+        """Read one verified behavioral experiment-settings JSON document.
+
+        Reads only the settings document, not a run or MNE object.
+        Tries eligible registered replicas in their supplied order.
+        """
+        maxBytes = 16 * 1024 * 1024
+        expectedSize = identity["size_bytes"]
+        expectedHash = identity["sha256"]
+
+        if type(expectedSize) is not int or not 0 <= expectedSize <= maxBytes:
+            raise ValueError("Experiment settings exceed the reporting size limit or have an invalid size.")
+
+        optionsByBackend = storageOptionsByBackend or {}
+        failures = []
+
+        for location in locations:
+            backendID = location["backend_id"]
+            key = location["object_key"]
+
+            if not isinstance(key, str) or key.startswith("/") or "\\" in key or "\x00" in key or any(part in {"", ".", ".."} for part in key.split("/")):
+                raise ValueError("Database contains an invalid experiment-settings object key.")
+
+            try:
+                filesystem, root = url_to_fs(location["url_prefix"], **optionsByBackend.get(backendID, {}))
+
+                with filesystem.open(posixpath.join(root, key), "rb") as source:
+                    content = source.read(expectedSize + 1)
+
+                if len(content) != expectedSize or hashlib.sha256(content).hexdigest() != expectedHash:
+                    raise ValueError("Experiment-settings integrity mismatch.")
+
+            except (OSError, ValueError) as error:
+                failures.append(f"backend {backendID}: {type(error).__name__}")
+                continue
+
+            settings = json.loads(content.decode("utf-8"))
+
+            if not isinstance(settings, dict):
+                raise ValueError("Saved experiment settings must contain a JSON object.")
+
+            return settings
+
+        raise OSError("No experiment-settings copy could be verified: " + "; ".join(failures))
+
+    @staticmethod
+    def _printGroupingValue(value, fieldName):
+        """Use Unknown for unset labels, while rejecting malformed metadata."""
+        if value is None:
+            return "Unknown"
+
+        if not isinstance(value, str):
+            raise ValueError(f"Saved {fieldName} must be a string or None.")
+
+        if not value.strip():
+            return "Unknown"
+
+        return value
+
+    @staticmethod
+    def _sessionLineageLines(records):
+        """Format a visible forest with arrows aligned to their parent edges.
+
+        records is a mapping from session ID to metadata dictionaries.
+        Hidden/missing parents are not bypassed by artificial arrows.
+        Iterative traversal avoids Python recursion limits.
+        """
+        children = {sessionID: [] for sessionID in records}
+
+        for sessionID, record in records.items():
+            parentID = record["parent_session_id"]
+
+            if parentID in records:
+                children[parentID].append(sessionID)
+
+        for values in children.values():
+            values.sort()
+
+        roots = sorted(sessionID for sessionID, record in records.items() if record["parent_session_id"] not in records)
+        visited = set()
+        lines = []
+
+        def nodeLabel(sessionID):
+            record = records[sessionID]
+            label = str(sessionID)
+
+            if record["deleted_at"] is not None:
+                label += " [deleted]"
+
+            if record["status"] != "complete":
+                label += f" [{pglStorage._printValue(record['status'])}]"
+
+            return label
+
+        def appendTree(startID, prefix):
+            pending = [(startID, prefix)]
+
+            while pending:
+                currentID, currentPrefix = pending.pop()
+                line = currentPrefix
+
+                while True:
+                    if currentID in visited:
+                        raise ValueError("Session lineage contains a cycle or repeated node.")
+
+                    visited.add(currentID)
+                    line += nodeLabel(currentID)
+                    descendants = children[currentID]
+
+                    if not descendants:
+                        lines.append(line)
+                        break
+
+                    # Every sibling's arrow starts at the same character
+                    # position as the first child's arrow.
+                    branchPrefix = " " * (len(line) + 1) + "-> "
+
+                    for childID in reversed(descendants[1:]):
+                        pending.append((childID, branchPrefix))
+
+                    currentID = descendants[0]
+                    line += " -> "
+
+        for sessionID in roots:
+            parentID = records[sessionID]["parent_session_id"]
+
+            if parentID is not None:
+                lines.append(f"    [parent session {parentID} is not visible in this listing]")
+
+            appendTree(sessionID, "    sessionID: ")
+
+        if len(visited) != len(records):
+            raise ValueError("Session lineage contains a cycle with no visible root.")
+
+        return lines
+
+    @staticmethod
+    def printSessions(postgres=None, *, settings=None, settingsName=None, sslRootCert=None, includeDeleted=False, storageOptionsByBackend=None):
+        """Print sessions grouped by root experiment and subject.
+
+        Uses recorded root-session labels when available.
+        Older behavioral roots fall back to verified experimentSettings.json.
+        Descendants inherit their root's grouping.
+
+        Unset labels display as Unknown.
+        Does not reconstruct runs, tasks, or MNE payloads.
+        """
+        from psycopg.rows import tuple_row
 
         if type(includeDeleted) is not bool:
             raise ValueError("includeDeleted must be a boolean.")
 
-        if postgres is not None and (settings is not None or settingsName is not None):
-            raise ValueError("Supply either postgres or PGL settings, not both.")
+        postgres = pglStorage._printPostgres(postgres, settings=settings, settingsName=settingsName)
 
-        if sessionID is not None:
-            if isinstance(sessionID, bool) or not isinstance(sessionID, int) or not 0 <= sessionID <= 9223372036854775807:
-                raise ValueError("sessionID must be a nonnegative PostgreSQL bigint.")
+        if postgres is None:
+            return False
 
-            if details is not None:
-                raise ValueError("Supply either sessionID or details, not both.")
+        sessionsTable = sql.Identifier(postgres.databaseSchema, "session")
+        linksTable = sql.Identifier(postgres.databaseSchema, "session_files")
+        filesTable = sql.Identifier(postgres.databaseSchema, "files")
+        locationsTable = sql.Identifier(postgres.databaseSchema, "storage_locations")
+        backendsTable = sql.Identifier(postgres.databaseSchema, "storage_backends")
 
-        if isinstance(nRows, bool) or not isinstance(nRows, int) or nRows <= 0:
+        records = {}
+        groupsByRoot = {}
+        settingsByRoot = {}
+        identities = {}
+        locationsByFile = {}
+
+        with postgres.connect(sslRootCert=sslRootCert) as connection:
+            if connection is None:
+                return False
+
+            with connection.transaction():
+                connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+
+                with connection.cursor(row_factory=tuple_row) as cursor:
+                    cursor.execute("SELECT current_database(), transaction_timestamp()")
+                    databaseName, snapshotTime = cursor.fetchone()
+
+                    statement = sql.SQL("SELECT session_id, parent_session_id, root_session_id, origin, status, deleted_at, meta FROM {} WHERE (%s OR deleted_at IS NULL) ORDER BY session_id").format(sessionsTable)
+                    cursor.execute(statement, (includeDeleted,))
+
+                    for sessionID, parentID, rootID, origin, status, deletedAt, meta in cursor.fetchall():
+                        records[sessionID] = {"session_id": sessionID, "parent_session_id": parentID, "root_session_id": rootID, "origin": origin, "status": status, "deleted_at": deletedAt, "meta": meta}
+
+                    rootIDs = {record["root_session_id"] for record in records.values()}
+                    fallbackRoots = []
+
+                    for rootID in sorted(rootIDs):
+                        record = records.get(rootID)
+
+                        if record is None:
+                            groupsByRoot[rootID] = {("Unknown", "Unknown")}
+                            continue
+
+                        meta = record["meta"] or {}
+
+                        if "pgl_session_labels" in meta:
+                            metadata = pglStorage._validateSessionLabelMetadata(meta["pgl_session_labels"])
+                            groupsByRoot[rootID] = {(label["experimentName"] if label["experimentName"] is not None else "Unknown", label["subjectID"] if label["subjectID"] is not None else "Unknown") for label in metadata["labels"]}
+                        else:
+                            fallbackRoots.append(rootID)
+
+                    if fallbackRoots:
+                        statement = sql.SQL("SELECT link.session_id, link.name, content.file_id, content.sha256, content.size_bytes FROM {} AS link JOIN {} AS content ON content.file_id = link.file_id WHERE link.session_id = ANY(%s::bigint[]) AND link.name ~ '^runs/[0-9]+/experimentSettings[.]json$' AND (%s OR (link.deleted_at IS NULL AND content.deleted_at IS NULL)) ORDER BY link.session_id, link.name").format(linksTable, filesTable)
+                        cursor.execute(statement, (fallbackRoots, includeDeleted))
+
+                        for rootID, name, fileID, digest, size in cursor.fetchall():
+                            settingsByRoot.setdefault(rootID, []).append((name, fileID))
+                            identities[fileID] = {"sha256": digest, "size_bytes": size}
+
+                    if identities:
+                        statement = sql.SQL("SELECT location.file_id, backend.backend_id, backend.url_prefix, location.object_key FROM {} AS location JOIN {} AS backend ON backend.backend_id = location.backend_id WHERE location.file_id = ANY(%s::bigint[]) AND (%s OR location.deleted_at IS NULL) AND location.status = 'present' AND location.verified_at IS NOT NULL AND backend.is_active ORDER BY location.file_id, location.priority, backend.backend_id, location.object_key").format(locationsTable, backendsTable)
+                        cursor.execute(statement, (sorted(identities), includeDeleted))
+
+                        for fileID, backendID, root, key in cursor.fetchall():
+                            locationsByFile.setdefault(fileID, []).append({"backend_id": backendID, "url_prefix": root, "object_key": key})
+
+        pairByFile = {}
+
+        for fileID, identity in identities.items():
+            locations = locationsByFile.get(fileID, [])
+
+            if not locations:
+                raise FileNotFoundError(f"Experiment-settings file {fileID} has no eligible registered location.")
+
+            savedSettings = pglStorage._readPrintExperimentSettings(identity, locations, storageOptionsByBackend=storageOptionsByBackend)
+            experiment = pglStorage._printGroupingValue(savedSettings.get("experimentName"), "experimentName")
+            subject = pglStorage._printGroupingValue(savedSettings.get("subjectID"), "subjectID")
+            pairByFile[fileID] = (experiment, subject)
+
+        for rootID in {record["root_session_id"] for record in records.values()}:
+            if rootID not in groupsByRoot:
+                pairs = {pairByFile[fileID] for name, fileID in settingsByRoot.get(rootID, [])}
+                groupsByRoot[rootID] = pairs or {("Unknown", "Unknown")}
+
+        grouped = {}
+
+        for sessionID, record in records.items():
+            for experiment, subject in groupsByRoot[record["root_session_id"]]:
+                grouped.setdefault(experiment, {}).setdefault(subject, {})[sessionID] = record
+
+        def groupOrder(value):
+            return (value == "Unknown", value.casefold(), value)
+
+        output = []
+
+        for experiment in sorted(grouped, key=groupOrder):
+            output.append(pglStorage._printValue(experiment))
+
+            for subject in sorted(grouped[experiment], key=groupOrder):
+                output.append("  " + pglStorage._printValue(subject))
+                output.extend(pglStorage._sessionLineageLines(grouped[experiment][subject]))
+
+            output.append("")
+
+        pglMessages.printHeader("Sessions")
+        pglMessages.message(f"Database: {databaseName}.{postgres.databaseSchema}", wrapText=False)
+        pglMessages.message(f"Metadata snapshot: {snapshotTime}", wrapText=False)
+        pglMessages.print("  Including deleted sessions." if includeDeleted else "  Deleted sessions excluded.")
+        pglMessages.print()
+
+        if not records:
+            pglMessages.print("  (no visible sessions)")
+        else:
+            for line in output:
+                pglMessages.print(line)
+
+        pglMessages.printHeader()
+        return True
+    
+    @staticmethod
+    def printSession(sessionID, postgres=None, *, settings=None, settingsName=None, sslRootCert=None, includeDeleted=False):
+        """Print one checkpoint's metadata, subjects, and linked files.
+
+        Shows one preferred registered location per logical file.
+        Other visible locations are counted.
+
+        Does not read or verify payload bytes.
+        Full file paths are printed without truncation.
+        """
+        from psycopg.rows import tuple_row
+
+        if type(sessionID) is not int or not 0 <= sessionID <= 9223372036854775807:
+            raise ValueError("sessionID must be a nonnegative PostgreSQL bigint.")
+
+        if type(includeDeleted) is not bool:
+            raise ValueError("includeDeleted must be a boolean.")
+
+        postgres = pglStorage._printPostgres(postgres, settings=settings, settingsName=settingsName)
+
+        if postgres is None:
+            return False
+
+        sessionsTable = sql.Identifier(postgres.databaseSchema, "session")
+        usersTable = sql.Identifier(postgres.databaseSchema, "users")
+        linksTable = sql.Identifier(postgres.databaseSchema, "session_files")
+        filesTable = sql.Identifier(postgres.databaseSchema, "files")
+        locationsTable = sql.Identifier(postgres.databaseSchema, "storage_locations")
+        backendsTable = sql.Identifier(postgres.databaseSchema, "storage_backends")
+
+        sessionRecord = None
+        sessionFiles = {}
+        locationsByFile = {}
+
+        with postgres.connect(sslRootCert=sslRootCert) as connection:
+            if connection is None:
+                return False
+
+            with connection.transaction():
+                connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+
+                with connection.cursor(row_factory=tuple_row) as cursor:
+                    cursor.execute("SELECT current_database(), transaction_timestamp()")
+                    databaseName, snapshotTime = cursor.fetchone()
+
+                    statement = sql.SQL("SELECT checkpoint.*, creator.username AS creator_username, creator.display_name AS creator_display_name FROM {} AS checkpoint LEFT JOIN {} AS creator ON creator.user_id = checkpoint.created_by WHERE checkpoint.session_id = %s AND (%s OR checkpoint.deleted_at IS NULL)").format(sessionsTable, usersTable)
+                    cursor.execute(statement, (sessionID, includeDeleted))
+                    row = cursor.fetchone()
+
+                    if row is not None:
+                        sessionRecord = dict(zip((column.name for column in cursor.description), row))
+
+                        statement = sql.SQL("SELECT link.name, link.role, link.subject_id, content.file_id, content.sha256, content.size_bytes, link.deleted_at, content.deleted_at FROM {} AS link JOIN {} AS content ON content.file_id = link.file_id WHERE link.session_id = %s AND (%s OR (link.deleted_at IS NULL AND content.deleted_at IS NULL)) ORDER BY link.name").format(linksTable, filesTable)
+                        cursor.execute(statement, (sessionID, includeDeleted))
+
+                        for name, role, subjectID, fileID, digest, size, linkDeleted, contentDeleted in cursor.fetchall():
+                            sessionFiles[name] = {"role": role, "subject_id": subjectID, "file_id": fileID, "sha256": digest, "size_bytes": size, "link_deleted_at": linkDeleted, "content_deleted_at": contentDeleted}
+
+                        fileIDs = sorted({record["file_id"] for record in sessionFiles.values()})
+
+                        if fileIDs:
+                            statement = sql.SQL("SELECT location.file_id, location.object_key, backend.backend_id, backend.name, backend.url_prefix, backend.is_active, location.status, location.priority, location.verified_at, location.deleted_at FROM {} AS location JOIN {} AS backend ON backend.backend_id = location.backend_id WHERE location.file_id = ANY(%s::bigint[]) AND (%s OR location.deleted_at IS NULL) ORDER BY location.file_id, location.priority, backend.backend_id, location.object_key").format(locationsTable, backendsTable)
+                            cursor.execute(statement, (fileIDs, includeDeleted))
+
+                            for fileID, key, backendID, backendName, root, active, status, priority, verifiedAt, deletedAt in cursor.fetchall():
+                                locationsByFile.setdefault(fileID, []).append({"object_key": key, "backend_id": backendID, "backend_name": backendName, "root": root, "active": active, "status": status, "priority": priority, "verified_at": verifiedAt, "deleted_at": deletedAt})
+
+        if sessionRecord is None:
+            pglMessages.warning(f"No visible session {sessionID} found in {databaseName}.{postgres.databaseSchema}; it may be absent or excluded by the deletion filter.", level=0)
+            return False
+
+        def expectedKey(name):
+            if sessionRecord["contract_version"] == "pgl.raw.behavior.v1":
+                parts = name.split("/", 2)
+
+                if len(parts) == 3 and parts[0] == "runs" and parts[1].isascii() and parts[1].isdigit():
+                    return f"session{sessionID:06d}/run{int(parts[1]):05d}/{parts[2]}"
+
+            return f"session{sessionID:06d}/{name}"
+
+        def eligible(location):
+            return location["active"] and location["status"] == "present" and location["verified_at"] is not None and (includeDeleted or location["deleted_at"] is None)
+
+        deletionLabel = " [DELETED]" if sessionRecord["deleted_at"] is not None else ""
+        pglMessages.printHeader(f"Session {sessionID}{deletionLabel}")
+        pglMessages.message(f"Database: {databaseName}.{postgres.databaseSchema}", wrapText=False)
+        pglMessages.message(f"Snapshot transaction started: {snapshotTime}", wrapText=False)
+        pglMessages.print()
+        pglMessages.printHeader("Session metadata", fillChar="-")
+        labelWidth = max(len(name) for name in sessionRecord)
+
+        for name, value in sessionRecord.items():
+            pglMessages.print(f"  {name:<{labelWidth}} : {pglStorage._printValue(value)}")
+
+        subjects = sorted({record["subject_id"] for record in sessionFiles.values() if record["subject_id"] is not None})
+        pglMessages.print()
+        pglMessages.printHeader("Subjects", fillChar="-")
+        pglMessages.print("  " + (", ".join(pglStorage._printValue(subject) for subject in subjects) if subjects else "(none linked)"))
+
+        pglMessages.print()
+        pglMessages.printHeader(f"Files and locations: {len(sessionFiles)} linked files", fillChar="-")
+        pglMessages.print("  One recorded content location per file; shared files may resolve into another run or session.")
+        pglMessages.print("  Status is recorded metadata; payloads have not been checked.")
+        pglMessages.print("  Registered aliases/copies are paths, not necessarily separate physical byte copies.")
+
+        if includeDeleted:
+            pglMessages.print("  Including deleted records. Read eligibility below assumes this inspection override.")
+
+        if not sessionFiles:
+            pglMessages.print("  (no linked files)")
+
+        for name, record in sessionFiles.items():
+            preferredKey = expectedKey(name)
+            candidates = locationsByFile.get(record["file_id"], [])
+            ordered = sorted(candidates, key=lambda location: (not eligible(location), location["object_key"] != preferredKey, location["priority"], location["backend_id"], location["object_key"]))
+
+            pglMessages.print()
+            pglMessages.print(f"  {pglStorage._printValue(name)}")
+            pglMessages.print(f"    file_id: {record['file_id']} | bytes: {record['size_bytes']} | role: {pglStorage._printValue(record['role'])}")
+
+            if includeDeleted:
+                linkState = "DELETED" if record["link_deleted_at"] is not None else "active"
+                contentState = "DELETED" if record["content_deleted_at"] is not None else "active"
+                pglMessages.print(f"    File link: {linkState} | shared content identity: {contentState}")
+
+            if not ordered:
+                pglMessages.print("    No visible registered storage location.")
+                continue
+
+            location = ordered[0]
+            separator = "" if location["root"].endswith("/") else "/"
+            fullLocation = location["root"] + separator + location["object_key"]
+
+            pglMessages.print(f"    Location: {pglStorage._printValue(fullLocation)}")
+            pglMessages.print(f"    Backend: {location['backend_id']} | status: {pglStorage._printValue(location['status'])} | active: {location['active']} | eligible for reads: {eligible(location)}")
+            pglMessages.print(f"    Last verified: {pglStorage._printValue(location['verified_at'])}")
+
+            if includeDeleted:
+                locationState = "DELETED" if location["deleted_at"] is not None else "active"
+                pglMessages.print(f"    Location deletion state: {locationState}")
+
+            if len(ordered) > 1:
+                pglMessages.print(f"    Other visible registered aliases/copies: {len(ordered) - 1}")
+
+        pglMessages.printHeader()
+        return True
+    
+    @staticmethod
+    def printTables(details=None, postgres=None, *, settings=None, settingsName=None, nRows=10, maxWidth=48, sslRootCert=None, includeDeleted=False):
+        """Print database table counts/statuses or selected table contents.
+
+        details=None:
+            Database summary.
+
+        details="session", an iterable of names, or "all":
+            First nRows rows of each requested table.
+
+        Does not access payload storage.
+        """
+        from psycopg.rows import tuple_row
+
+        if type(includeDeleted) is not bool:
+            raise ValueError("includeDeleted must be a boolean.")
+
+        if type(nRows) is not int or nRows <= 0:
             raise ValueError("nRows must be a positive integer.")
 
-        if isinstance(maxWidth, bool) or not isinstance(maxWidth, int) or maxWidth < 8:
+        if type(maxWidth) is not int or maxWidth < 8:
             raise ValueError("maxWidth must be an integer of at least 8.")
+
+        tableOrder = pglStorage._printTableOrder()
 
         if details is None:
             requested = []
@@ -103,18 +594,12 @@ class pglStorage:
             raise ValueError(f"Supported detail tables: {', '.join(tableOrder)}; or 'all'.")
 
         requested = list(dict.fromkeys(requested))
+        postgres = pglStorage._printPostgres(postgres, settings=settings, settingsName=settingsName)
 
         if postgres is None:
-            postgres = pglPostgres.fromSettings(settings=settings, settingsName=settingsName)
-
-            if postgres is None:
-                return False
-
-        if not isinstance(postgres, pglPostgres):
-            raise TypeError("postgres must be a pglPostgres instance.")
+            return False
 
         def reportTable(name):
-            """Select visible rows; callers supply the SQL table alias."""
             table = sql.Identifier(postgres.databaseSchema, name)
 
             if not includeDeleted and name in {"session", "session_files", "files", "storage_locations"}:
@@ -122,25 +607,10 @@ class pglStorage:
 
             return table
 
-        def archiveKey(name):
-            """Return the conventional readable path, used only for preference."""
-            if name == "manifest.json":
-                return f"session{sessionID:06d}/manifest.json"
-
-            parts = name.split("/", 2)
-
-            if len(parts) == 3 and parts[0] == "runs" and parts[1].isascii() and parts[1].isdigit():
-                return f"session{sessionID:06d}/run{int(parts[1]):05d}/{parts[2]}"
-
-            return None
-
         counts = []
         checkpointCounts = []
         detailResults = []
-        sessionRecord = None
-        sessionFiles = {}
 
-        # Gather all report sections from one consistent, read-only snapshot.
         with postgres.connect(sslRootCert=sslRootCert) as connection:
             if connection is None:
                 return False
@@ -152,223 +622,28 @@ class pglStorage:
                     cursor.execute("SELECT current_database(), current_user, transaction_timestamp()")
                     databaseName, databaseUser, snapshotTime = cursor.fetchone()
 
-                    if sessionID is not None:
-                        sessionsTable = reportTable("session")
-                        usersTable = reportTable("users")
-                        linksTable = reportTable("session_files")
-                        filesTable = reportTable("files")
-                        locationsTable = reportTable("storage_locations")
-                        backendsTable = reportTable("storage_backends")
-
-                        statement = sql.SQL("""
-                            SELECT checkpoint.*, creator.username AS creator_username,
-                                   creator.display_name AS creator_display_name
-                            FROM {} AS checkpoint
-                            LEFT JOIN {} AS creator
-                              ON creator.user_id = checkpoint.created_by
-                            WHERE checkpoint.session_id = %s
-                        """).format(sessionsTable, usersTable)
-                        cursor.execute(statement, (sessionID,))
-                        row = cursor.fetchone()
-
-                        if row is not None:
-                            sessionRecord = dict(zip((column.name for column in cursor.description), row))
-
-                            statement = sql.SQL("""
-                                SELECT link.name, link.role, link.subject_id,
-                                       content.file_id, content.sha256,
-                                       content.size_bytes, link.deleted_at,
-                                       content.deleted_at
-                                FROM {} AS link
-                                JOIN {} AS content
-                                  ON content.file_id = link.file_id
-                                WHERE link.session_id = %s
-                                ORDER BY link.name
-                            """).format(linksTable, filesTable)
-                            cursor.execute(statement, (sessionID,))
-
-                            for name, role, subjectID, fileID, digest, sizeBytes, linkDeletedAt, contentDeletedAt in cursor.fetchall():
-                                sessionFiles[name] = {
-                                    "role": role,
-                                    "subject_id": subjectID,
-                                    "file_id": fileID,
-                                    "sha256": digest,
-                                    "size_bytes": sizeBytes,
-                                    "link_deleted_at": linkDeletedAt,
-                                    "content_deleted_at": contentDeletedAt,
-                                    "expected_key": archiveKey(name),
-                                    "locations": [],
-                                    "other_location_count": 0,
-                                }
-
-                            fileIDs = sorted({record["file_id"] for record in sessionFiles.values()})
-                            locationsByFile = {}
-
-                            if fileIDs:
-                                # Fetch each content location once rather
-                                # than multiplying it by logical filenames.
-                                statement = sql.SQL("""
-                                    SELECT location.file_id, location.object_key,
-                                           backend.backend_id, backend.name,
-                                           backend.url_prefix, backend.is_active,
-                                           location.status, location.priority,
-                                           location.verified_at, location.deleted_at
-                                    FROM {} AS location
-                                    JOIN {} AS backend
-                                      ON backend.backend_id = location.backend_id
-                                    WHERE location.file_id = ANY(%s::bigint[])
-                                    ORDER BY location.file_id, location.priority,
-                                             backend.backend_id, location.object_key
-                                """).format(locationsTable, backendsTable)
-                                cursor.execute(statement, (fileIDs,))
-
-                                for fileID, key, backendID, backendName, root, active, status, priority, verifiedAt, deletedAt in cursor.fetchall():
-                                    location = {
-                                        "backend_id": backendID,
-                                        "backend_name": backendName,
-                                        "root": root,
-                                        "object_key": key,
-                                        "active": active,
-                                        "status": status,
-                                        "priority": priority,
-                                        "verified_at": verifiedAt,
-                                        "deleted_at": deletedAt,
-                                    }
-                                    locationsByFile.setdefault(fileID, []).append(location)
-
-                            for record in sessionFiles.values():
-                                candidates = locationsByFile.get(record["file_id"], [])
-
-                                def locationOrder(location):
-                                    eligible = location["active"] and location["status"] == "present" and location["verified_at"] is not None
-                                    expectedPath = location["object_key"] == record["expected_key"]
-                                    return (not eligible, not expectedPath, location["priority"], location["backend_id"], location["object_key"])
-
-                                ordered = sorted(candidates, key=locationOrder)
-                                record["locations"] = ordered[:1]
-                                record["other_location_count"] = max(0, len(ordered) - 1)
-
-                    elif requested:
+                    if requested:
                         for name in requested:
-                            table = reportTable(name)
                             order = sql.SQL(", ").join(sql.Identifier(column) for column in tableOrder[name])
-                            statement = sql.SQL("SELECT * FROM {} AS record ORDER BY {} LIMIT %s").format(table, order)
+                            statement = sql.SQL("SELECT * FROM {} AS record ORDER BY {} LIMIT %s").format(reportTable(name), order)
                             cursor.execute(statement, (nRows + 1,))
-
                             headers = [column.name for column in cursor.description]
                             rows = cursor.fetchall()
                             detailResults.append((name, headers, rows[:nRows], len(rows) > nRows))
-
                     else:
                         for name in tableOrder:
-                            table = reportTable(name)
-                            cursor.execute(sql.SQL("SELECT count(*) FROM {} AS record").format(table))
+                            cursor.execute(sql.SQL("SELECT count(*) FROM {} AS record").format(reportTable(name)))
                             counts.append((name, cursor.fetchone()[0]))
 
-                        table = reportTable("session")
-
                         if includeDeleted:
-                            statement = sql.SQL("SELECT origin, status, deleted_at IS NOT NULL AS deleted, count(*) FROM {} AS record GROUP BY origin, status, deleted_at IS NOT NULL ORDER BY origin, status, deleted").format(table)
+                            statement = sql.SQL("SELECT origin, status, deleted_at IS NOT NULL AS deleted, count(*) FROM {} AS record GROUP BY origin, status, deleted_at IS NOT NULL ORDER BY origin, status, deleted").format(reportTable("session"))
                         else:
-                            statement = sql.SQL("SELECT origin, status, count(*) FROM {} AS record GROUP BY origin, status ORDER BY origin, status").format(table)
+                            statement = sql.SQL("SELECT origin, status, count(*) FROM {} AS record GROUP BY origin, status ORDER BY origin, status").format(reportTable("session"))
 
                         cursor.execute(statement)
                         checkpointCounts = cursor.fetchall()
 
-        # Format after the connection and tunnel have closed.
-        def displayValue(value, truncate=False):
-            text = "NULL" if value is None else str(value)
-            text = text.replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t")
-
-            if truncate and len(text) > maxWidth:
-                return text[:maxWidth - 3] + "..."
-
-            return text
-
-        def printTable(headers, rows):
-            displayed = [[displayValue(value, truncate=True) for value in headers]]
-            displayed.extend([displayValue(value, truncate=True) for value in row] for row in rows)
-            widths = [max(len(row[index]) for row in displayed) for index in range(len(headers))]
-
-            def printRow(row):
-                pglMessages.print("  " + " | ".join(value.ljust(width) for value, width in zip(row, widths)))
-
-            printRow(displayed[0])
-            pglMessages.print("  " + "-+-".join("-" * width for width in widths))
-
-            for row in displayed[1:]:
-                printRow(row)
-
-            if not rows:
-                pglMessages.print("  (no rows)")
-
-        if sessionID is not None:
-            if sessionRecord is None:
-                pglMessages.warning(f"No visible session {sessionID} found in {databaseName}.{postgres.databaseSchema}; it may be absent or excluded by the deletion filter.", level=0)
-                return False
-
-            deletionLabel = " [DELETED]" if sessionRecord["deleted_at"] is not None else ""
-            pglMessages.printHeader(f"Session {sessionID}{deletionLabel}")
-            pglMessages.message(f"Database: {databaseName}.{postgres.databaseSchema}", wrapText=False)
-            pglMessages.message(f"Snapshot transaction started: {snapshotTime}", wrapText=False)
-
-            pglMessages.print()
-            pglMessages.printHeader("Session metadata", fillChar="-")
-            labelWidth = max(len(name) for name in sessionRecord)
-
-            for name, value in sessionRecord.items():
-                pglMessages.print(f"  {name:<{labelWidth}} : {displayValue(value)}")
-
-            subjects = sorted({record["subject_id"] for record in sessionFiles.values() if record["subject_id"] is not None})
-
-            pglMessages.print()
-            pglMessages.printHeader("Subjects", fillChar="-")
-            pglMessages.print("  " + (", ".join(displayValue(subject) for subject in subjects) if subjects else "(none linked)"))
-
-            pglMessages.print()
-            pglMessages.printHeader(f"Files and locations: {len(sessionFiles)} linked files", fillChar="-")
-            pglMessages.print("  One recorded content location per file; shared files may resolve into another run or session.")
-            pglMessages.print("  Status is recorded metadata; payloads have not been checked.")
-            pglMessages.print("  Registered aliases/copies are paths, not necessarily separate physical byte copies.")
-
-            if includeDeleted:
-                pglMessages.print("  Including deleted records. Read eligibility below assumes this inspection override.")
-
-            if not sessionFiles:
-                pglMessages.print("  (no linked files)")
-
-            for name, record in sessionFiles.items():
-                pglMessages.print()
-                pglMessages.print(f"  {displayValue(name)}")
-                pglMessages.print(f"    file_id: {record['file_id']} | bytes: {record['size_bytes']} | role: {displayValue(record['role'])}")
-
-                if includeDeleted:
-                    linkState = "DELETED" if record["link_deleted_at"] is not None else "active"
-                    contentState = "DELETED" if record["content_deleted_at"] is not None else "active"
-                    pglMessages.print(f"    File link: {linkState} | shared content identity: {contentState}")
-
-                if not record["locations"]:
-                    pglMessages.print("    No visible registered storage location.")
-                    continue
-
-                location = record["locations"][0]
-                root = location["root"]
-                separator = "" if root.endswith("/") else "/"
-                fullLocation = root + separator + location["object_key"]
-                eligible = location["active"] and location["status"] == "present" and location["verified_at"] is not None
-
-                pglMessages.print(f"    Location: {displayValue(fullLocation)}")
-                pglMessages.print(f"    Backend: {location['backend_id']} | status: {displayValue(location['status'])} | active: {location['active']} | eligible for reads: {eligible}")
-                pglMessages.print(f"    Last verified: {displayValue(location['verified_at'])}")
-
-                if includeDeleted:
-                    locationState = "DELETED" if location["deleted_at"] is not None else "active"
-                    pglMessages.print(f"    Location deletion state: {locationState}")
-
-                if record["other_location_count"]:
-                    pglMessages.print(f"    Other visible registered aliases/copies: {record['other_location_count']}")
-
-        elif requested:
+        if requested:
             for name, headers, rows, hasMore in detailResults:
                 pglMessages.print()
                 pglMessages.printHeader(name, fillChar="-")
@@ -377,7 +652,7 @@ class pglStorage:
                     pglMessages.print("  Including deleted records; deleted_at is the deletion marker where applicable.")
 
                 pglMessages.print(f"  First {len(rows)} rows, ordered by {', '.join(tableOrder[name])}")
-                printTable(headers, rows)
+                pglStorage._printTable(headers, rows, maxWidth=maxWidth)
 
                 if hasMore:
                     pglMessages.message(f"More rows available; increase nRows above {nRows} to display more.")
@@ -388,18 +663,192 @@ class pglStorage:
             pglMessages.message(f"Database: {databaseName}.{postgres.databaseSchema}", wrapText=False)
             pglMessages.message(f"User: {databaseUser} | Transport: {postgres.connectionTransport}", wrapText=False)
             pglMessages.message(f"Snapshot transaction started: {snapshotTime}", wrapText=False)
-
             pglMessages.print()
             pglMessages.printHeader("Table counts", fillChar="-")
-            printTable(("table", "rows"), counts)
-
+            pglStorage._printTable(("table", "rows"), counts, maxWidth=maxWidth)
             pglMessages.print()
             pglMessages.printHeader("Checkpoint status", fillChar="-")
             checkpointHeaders = ("origin", "status", "deleted", "checkpoints") if includeDeleted else ("origin", "status", "checkpoints")
-            printTable(checkpointHeaders, checkpointCounts)
+            pglStorage._printTable(checkpointHeaders, checkpointCounts, maxWidth=maxWidth)
 
         pglMessages.printHeader()
         return True
+    
+    @staticmethod
+    def _validateSessionLabelMetadata(metadata, runCount=None):
+        """Validate the versioned experiment/subject metadata record."""
+        from .pglSession import pglSession
+
+        if not isinstance(metadata, dict) or set(metadata) != {"version", "labels"}:
+            raise ValueError("Invalid session-label metadata fields.")
+
+        if type(metadata["version"]) is not int or metadata["version"] != 1:
+            raise ValueError("Unsupported session-label metadata version.")
+
+        labels = metadata["labels"]
+
+        if not isinstance(labels, list) or not labels:
+            raise ValueError("Session-label metadata must contain a nonempty labels list.")
+
+        indices = []
+
+        for record in labels:
+            if not isinstance(record, dict) or set(record) != {"runIndex", "experimentName", "subjectID"}:
+                raise ValueError("Invalid session-label record.")
+
+            index = record["runIndex"]
+
+            if index is not None and (type(index) is not int or index < 0):
+                raise ValueError("Invalid session-label run index.")
+
+            indices.append(index)
+
+            for name in ("experimentName", "subjectID"):
+                normalized = pglSession._normalizeSessionLabel(record[name], name)
+
+                if normalized != record[name]:
+                    raise ValueError(f"Session-label {name} must use None for an unset value.")
+
+        if indices != [None] and indices != list(range(len(labels))):
+            raise ValueError("Session-label run indices must be consecutive, or a single None for a session without runs.")
+
+        if runCount is not None:
+            expected = list(range(runCount)) if runCount else [None]
+
+            if indices != expected:
+                raise ValueError("Session-label metadata does not match the behavioral run inventory.")
+
+        return metadata
+
+    @classmethod
+    def _checkRawSessionLabels(cls, session, *, allowMissingMetadata=False):
+        """Warn and reject missing raw-session labels unless explicitly allowed.
+
+        Called by the public raw saver before configuration, SQL, or export.
+        Unreadable/malformed acquisition settings raise even with the override.
+        """
+        if type(allowMissingMetadata) is not bool:
+            raise ValueError("allowMissingMetadata must be a boolean.")
+
+        labels = session.getSessionLabels(acquisition=True)
+        missing = []
+
+        for record in labels:
+            fields = [name for name in ("experimentName", "subjectID") if record[name] is None]
+
+            if fields:
+                owner = "session" if record["runIndex"] is None else f"run {record['runIndex']}"
+                missing.append(f"{owner}: {', '.join(fields)}")
+
+        if not missing:
+            return True
+
+        if session.runs:
+            instructions = "Set experimentName and subjectID in the affected runs' saved acquisition experimentSettings.json. In-memory edits alone are not archived by saveRawSession()."
+        else:
+            instructions = "Set session.experimentName and session.subjectID before saving."
+
+        if allowMissingMetadata:
+            pglMessages.warning("Saving raw session with missing metadata because allowMissingMetadata=True: " + "; ".join(missing) + ". Unset values will display as Unknown.", level=0)
+            return True
+
+        pglMessages.warning("Raw session was not saved. Missing metadata: " + "; ".join(missing) + ". " + instructions + " To intentionally save without these labels, use saveRawSession(allowMissingMetadata=True).", level=0)
+        return False
+
+    @classmethod
+    def _sessionHistoryBytes(cls, session, *, acquisition=False):
+        """Encode history plus labels, making labels part of the payload identity."""
+        from .pglPipeline import pglActionable
+
+        metadata = {"version": 1, "labels": session.getSessionLabels(acquisition=acquisition)}
+        cls._validateSessionLabelMetadata(metadata, runCount=len(session.runs or []))
+
+        history = pglActionable()
+        history.uuid = session.uuid
+        history.actionHistory = list(session.actionHistory)
+        document = json.loads(history.toJSON())
+
+        if "pgl_session_labels" in document:
+            raise ValueError("History wrapper already contains the reserved session-label field.")
+
+        document["pgl_session_labels"] = metadata
+        return json.dumps(document, sort_keys=True, indent=4).encode("utf-8")
+
+    @classmethod
+    def _readSessionHistory(cls, filesystem, runCount):
+        """Restore history and optional labels without loading behavioral fields.
+
+        Supports older history files without session-label metadata.
+        """
+        from .pglPipeline import pglActionable
+
+        with filesystem.open("history.json", "rt", encoding="utf-8") as source:
+            document = json.load(source)
+
+        if not isinstance(document, dict):
+            raise ValueError("Checkpoint history must contain a JSON object.")
+
+        hasMetadata = "pgl_session_labels" in document
+        metadata = document.pop("pgl_session_labels", None)
+
+        if hasMetadata:
+            cls._validateSessionLabelMetadata(metadata, runCount=runCount)
+
+        history = pglActionable.fromJSON(json.dumps(document), filename="history.json")
+
+        if type(history) is not pglActionable:
+            raise ValueError("Checkpoint history must contain a pglActionable wrapper.")
+
+        if json.loads(history.toJSON()) != document:
+            raise ValueError("Checkpoint history could not be reconstructed without changes.")
+
+        return history, metadata
+
+    @classmethod
+    def _behaviorLabelMetadata(cls, manifest, filesystem):
+        """Read label pairs from verified archived behavioral experiment settings."""
+        from .pglSession import pglSession
+
+        labels = []
+
+        for runRecord in manifest["runs"]:
+            path = posixpath.join(runRecord["path"], "experimentSettings.json")
+
+            with filesystem.open(path, "rt", encoding="utf-8") as source:
+                settings = json.load(source)
+
+            if not isinstance(settings, dict):
+                raise ValueError(f"Experiment settings must contain a JSON object: {path}")
+
+            labels.append({
+                "runIndex": runRecord["index"],
+                "experimentName": pglSession._normalizeSessionLabel(settings.get("experimentName"), f"{path}: experimentName"),
+                "subjectID": pglSession._normalizeSessionLabel(settings.get("subjectID"), f"{path}: subjectID"),
+            })
+
+        if not labels:
+            raise ValueError("Behavioral label extraction requires at least one run.")
+
+        metadata = {"version": 1, "labels": labels}
+        return cls._validateSessionLabelMetadata(metadata, runCount=len(manifest["runs"]))
+
+    @classmethod
+    def _recordSessionLabelMetadata(cls, connection, postgres, sessionID, metadata):
+        """Mirror verified payload labels into an active in-progress checkpoint."""
+        from psycopg.types.json import Jsonb
+
+        cls._validateSessionLabelMetadata(metadata)
+        subjects = sorted({record["subjectID"] for record in metadata["labels"] if record["subjectID"] is not None})
+
+        for subjectID in subjects:
+            cls.getOrCreateSubject(connection, postgres, subjectID)
+
+        table = sql.Identifier(postgres.databaseSchema, "session")
+        statement = sql.SQL("UPDATE {} SET meta = COALESCE(meta, '{{}}'::jsonb) || %s::jsonb WHERE session_id = %s AND status = 'in_progress' AND deleted_at IS NULL RETURNING session_id").format(table)
+        row = connection.execute(statement, (Jsonb({"pgl_session_labels": metadata}), sessionID)).fetchone()
+
+        if row is None:
+            raise ValueError("Session labels can only be recorded on an active in-progress checkpoint.")
 
     @staticmethod
     def inventoryRawRun(run):
@@ -1055,9 +1504,11 @@ class pglStorage:
     def registerStagedRawCheckpoint(cls, connection, postgres, createdBy, backendID, manifest, staged, storedManifest, storageOptions=None, *, sessionID=None):
         """Register a staged behavioral archive without publishing it.
 
-        Must be called inside the caller's transaction.
-        Subject associations are read from verified archived settings.
-        Unused duplicate staging objects are not deleted here.
+        Reads labels from verified archived experiment settings.
+        Missing subjects are SQL NULL, not synthetic subject records.
+        The public raw saver controls missing-metadata consent.
+
+        Must run inside the caller's transaction.
         """
         cls.validateRawManifest(manifest)
         expectedByName = {record["name"]: record for record in manifest["files"]}
@@ -1074,78 +1525,52 @@ class pglStorage:
 
         for name, expected in expectedByName.items():
             actual = stagedByName[name]
+
             if actual["sha256"] != expected["sha256"] or actual["size_bytes"] != expected["size_bytes"]:
                 raise ValueError(f"Staged identity differs from manifest: {name}")
 
         manifestBytes = cls.encodeRawManifest(manifest)
+
         if storedManifest["sha256"] != hashlib.sha256(manifestBytes).hexdigest() or storedManifest["size_bytes"] != len(manifestBytes):
             raise ValueError("Stored manifest identity does not match the supplied manifest.")
 
-        if manifest["contract_version"] != "pgl.raw.behavior.v1":
-            raise ValueError("Unsupported raw manifest contract.")
-
         backendsTable = sql.Identifier(postgres.databaseSchema, "storage_backends")
-        statement = sql.SQL("SELECT url_prefix, is_active FROM {} WHERE backend_id = %s").format(backendsTable)
-        backend = connection.execute(statement, (backendID,)).fetchone()
+        backend = connection.execute(sql.SQL("SELECT url_prefix, is_active FROM {} WHERE backend_id = %s").format(backendsTable), (backendID,)).fetchone()
 
         if backend is None or not backend[1]:
             raise ValueError(f"Storage backend is missing or inactive: {backendID}")
 
-        fileLocations = {
-            name: {
-                "sha256": record["sha256"],
-                "size_bytes": record["size_bytes"],
-                "locations": [{
-                    "backend_id": backendID,
-                    "url_prefix": backend[0],
-                    "object_key": record["object_key"],
-                }],
-            }
-            for name, record in stagedByName.items()
-        }
-
-        archiveFilesystem = pglCheckpointFilesystem(manifest, fileLocations, storageOptionsByBackend={backendID: storageOptions or {}})
-        subjectsByRun = cls.readRawSubjects(manifest, archiveFilesystem)
-        runPaths = {record["path"] for record in manifest["runs"]}
+        fileLocations = {name: {"sha256": record["sha256"], "size_bytes": record["size_bytes"], "locations": [{"backend_id": backendID, "url_prefix": backend[0], "object_key": record["object_key"]}]} for name, record in stagedByName.items()}
+        archive = pglCheckpointFilesystem(manifest, fileLocations, storageOptionsByBackend={backendID: storageOptions or {}})
+        metadata = cls._behaviorLabelMetadata(manifest, archive)
+        subjectsByRun = {run["path"]: metadata["labels"][run["index"]]["subjectID"] for run in manifest["runs"]}
 
         subjectsByName = {}
+
         for name in expectedByName:
-            matchingRuns = [path for path in runPaths if name.startswith(path + "/")]
+            matchingRuns = [path for path in subjectsByRun if name.startswith(path + "/")]
+
             if len(matchingRuns) != 1:
                 raise ValueError(f"File does not belong to exactly one run: {name}")
 
             subjectsByName[name] = subjectsByRun[matchingRuns[0]]
 
-        for subjectID in set(subjectsByRun.values()):
-            cls.getOrCreateSubject(connection, postgres, subjectID)
-
         if sessionID is None:
-            # Retain support for low-level tests that register an archive
-            # without allocating the checkpoint beforehand.
             checkpointID = cls.createRawCheckpoint(connection, postgres, createdBy)
         else:
             sessionsTable = sql.Identifier(postgres.databaseSchema, "session")
             linksTable = sql.Identifier(postgres.databaseSchema, "session_files")
+            checkpoint = connection.execute(sql.SQL("SELECT status, origin, contract_version, created_by, deleted_at FROM {} WHERE session_id = %s FOR UPDATE").format(sessionsTable), (sessionID,)).fetchone()
 
-            statement = sql.SQL("""
-                SELECT status, origin, contract_version, created_by
-                FROM {}
-                WHERE session_id = %s
-                FOR UPDATE
-            """).format(sessionsTable)
-            checkpoint = connection.execute(statement, (sessionID,)).fetchone()
+            if checkpoint != ("in_progress", "raw", "pgl.raw.behavior.v1", createdBy, None):
+                raise ValueError("Checkpoint must be an active in-progress raw behavioral checkpoint owned by the supplied creator.")
 
-            if checkpoint != ("in_progress", "raw", "pgl.raw.behavior.v1", createdBy):
-                raise ValueError("Checkpoint must be an in-progress raw behavioral checkpoint owned by the supplied creator.")
-
-            statement = sql.SQL("SELECT 1 FROM {} WHERE session_id = %s LIMIT 1").format(linksTable)
-
-            if connection.execute(statement, (sessionID,)).fetchone() is not None:
+            if connection.execute(sql.SQL("SELECT 1 FROM {} WHERE session_id = %s LIMIT 1").format(linksTable), (sessionID,)).fetchone() is not None:
                 raise ValueError("Checkpoint already has file links.")
 
             checkpointID = sessionID
-        locationsTable = sql.Identifier(postgres.databaseSchema, "storage_locations")
 
+        cls._recordSessionLabelMetadata(connection, postgres, checkpointID, metadata)
         registeredPayloads = {}
 
         def registerPayload(record):
@@ -1157,14 +1582,13 @@ class pglStorage:
                 registeredPayloads[identity] = fileID
 
             return registeredPayloads[identity]
-        
+
         for name in sorted(expectedByName):
             fileID = registerPayload(stagedByName[name])
             cls.attachCheckpointFile(connection, postgres, checkpointID, name, fileID, role="acquisition", subjectID=subjectsByName[name])
 
         manifestFileID = registerPayload(storedManifest)
         cls.attachCheckpointFile(connection, postgres, checkpointID, "manifest.json", manifestFileID, role="manifest")
-
         return checkpointID
 
     @classmethod
@@ -1992,91 +2416,46 @@ class pglStorage:
         return sessionID    
 
     @classmethod
-    def saveSession(
-        cls,
-        session,
-        *,
-        parentSessionID,
-        settings=None,
-        settingsName=None,
-        backendID=None,
-        description=None,
-        ingestMethod="manual",
-        storageOptions=None,
-        sslRootCert=None,
-    ):
-        """Save current session contents as a new checkpoint.
+    def saveSession(cls, session, *, parentSessionID, settings=None, settingsName=None, backendID=None, description=None, ingestMethod="manual", storageOptions=None, sslRootCert=None):
+        """Save current contents and history as a new derived checkpoint.
 
         Requires an explicit completed, active parentSessionID.
-        Resolves username, database, and the default storage destination
-        from current or supplied PGL settings.
+        Resolves username, database, and default payload storage from settings.
 
         Returns the completed checkpoint ID, or None when configuration
         is missing or connection/password entry is cancelled.
 
-        Saves current behavioral contents and history, including cached
-        edits, rather than archiving original acquisition files.
-
-        Each call creates a new derived checkpoint; deduplication is deferred.
+        Each call creates a new derived checkpoint.
         Database changes are transactional; payload writes are not.
         Failed saves may leave unregistered files. Other errors propagate.
         Success is reported only after commit and connection cleanup.
         """
+        from time import perf_counter
         from .pglPostgres import pglPostgres
         from .pglSettings import pglSettingsManager
 
-        for label, value in (
-            ("parentSessionID", parentSessionID),
-            ("backendID", backendID),
-        ):
+        for label, value in (("parentSessionID", parentSessionID), ("backendID", backendID)):
             if label == "backendID" and value is None:
                 continue
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 9223372036854775807:
+                raise ValueError(f"{label} must be a nonnegative PostgreSQL bigint.")
 
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, int)
-                or not 0 <= value <= 9223372036854775807
-            ):
-                raise ValueError(
-                    f"{label} must be a nonnegative PostgreSQL bigint."
-                )
+        if description is not None and (not isinstance(description, str) or "\x00" in description):
+            raise ValueError("description must be a string without NUL, or None.")
 
-        if description is not None and (
-            not isinstance(description, str) or "\x00" in description
-        ):
-            raise ValueError(
-                "description must be a string without NUL, or None."
-            )
-
-        if (
-            not isinstance(ingestMethod, str)
-            or ingestMethod not in {"manual", "automated"}
-        ):
+        if not isinstance(ingestMethod, str) or ingestMethod not in {"manual", "automated"}:
             raise ValueError("ingestMethod must be manual or automated.")
 
-        resolvedSettings = pglSettingsManager.getSettings(
-            settings=settings,
-            settingsName=settingsName,
-        )
+        resolvedSettings = pglSettingsManager.getSettings(settings=settings, settingsName=settingsName)
 
         if resolvedSettings is None:
-            pglMessages.warning(
-                "Cannot save session: could not resolve PGL settings.",
-                level=0,
-            )
+            pglMessages.warning("Cannot save session: could not resolve PGL settings.", level=0)
             return None
 
         username = resolvedSettings.username
 
-        if (
-            not isinstance(username, str)
-            or not username.strip()
-            or "\x00" in username
-        ):
-            pglMessages.warning(
-                "Cannot save session: set a valid username in PGL settings.",
-                level=0,
-            )
+        if not isinstance(username, str) or not username.strip() or "\x00" in username:
+            pglMessages.warning("Cannot save session: set a valid username in PGL settings.", level=0)
             return None
 
         postgres = pglPostgres.fromSettings(settings=resolvedSettings)
@@ -2085,12 +2464,12 @@ class pglStorage:
             return None
 
         if backendID is None and not postgres.storageLocations:
-            pglMessages.warning(
-                "Cannot save session: no storageLocations are configured "
-                "in the PostgreSQL configuration.",
-                level=0,
-            )
+            pglMessages.warning("Cannot save session: no storageLocations are configured in the PostgreSQL configuration.", level=0)
             return None
+
+        databasePath = resolvedSettings.databasePath.strip()
+        saveStarted = perf_counter()
+        pglMessages.message("Saving session: connecting to PostgreSQL...")
 
         with postgres.connect(sslRootCert=sslRootCert) as connection:
             if connection is None:
@@ -2098,32 +2477,19 @@ class pglStorage:
 
             with connection.transaction():
                 if backendID is None:
-                    backendID = cls._getConfiguredStorageBackend(
-                        connection,
-                        postgres,
-                        storageOptions=storageOptions,
-                    )
+                    pglMessages.message("Saving session: resolving storage destination...")
+                    backendID = cls._getConfiguredStorageBackend(connection, postgres, storageOptions=storageOptions)
 
-                createdBy = cls.getOrCreateUser(
-                    connection, postgres, username
-                )
+                pglMessages.message("Saving session: resolving checkpoint owner...")
+                createdBy = cls.getOrCreateUser(connection, postgres, username)
 
-                sessionID = cls._saveDerivedSession(
-                    connection,
-                    postgres,
-                    session,
-                    createdBy,
-                    backendID,
-                    parentSessionID=parentSessionID,
-                    description=description,
-                    ingestMethod=ingestMethod,
-                    storageOptions=storageOptions,
-                )
+                pglMessages.message("Saving session: creating checkpoint and saving contents...")
+                contentsStarted = perf_counter()
+                sessionID = cls._saveDerivedSession(connection, postgres, session, createdBy, backendID, parentSessionID=parentSessionID, description=description, ingestMethod=ingestMethod, storageOptions=storageOptions)
 
-        pglMessages.message(
-            f"Checkpoint {sessionID} is complete and available in "
-            f"{postgres.databaseName}.{postgres.databaseSchema}."
-        )
+                pglMessages.message(f"Saving session: contents saved ({perf_counter() - contentsStarted:.1f} s); committing checkpoint...")
+
+        pglMessages.message(f"Checkpoint {sessionID} is complete. Database configuration: {databasePath} (database={postgres.databaseName}, schema={postgres.databaseSchema}; {perf_counter() - saveStarted:.1f} s total).", wrapText=False)
         return sessionID
     
     @classmethod
@@ -2148,17 +2514,12 @@ class pglStorage:
     
     @classmethod
     def saveRawSessionFiles(cls, session, dataPath, filesystem=None):
-        """Export an MNE-containing raw root into a fresh directory.
+        """Export MNE and optional unchanged behavioral acquisition files.
 
-        Behavioral runs archive their saved acquisition files unchanged.
-        MNE objects are serialized from their current contents.
-        Original vendor acquisition files are not automatically archived.
-
-        Preserves session UUID/history and writes manifest.json last.
-        Does not register a checkpoint.
-        Failed exports may leave partial files.
+        Includes resolved acquisition labels in hashed history.json.
+        Does not register or publish a database checkpoint.
+        Partial files may remain if export fails.
         """
-        from .pglPipeline import pglActionable
         from .pglSession import pglSession, pglMNE
 
         if type(session.mne) is not pglMNE:
@@ -2175,16 +2536,11 @@ class pglStorage:
         if filesystem.exists(destination):
             raise FileExistsError(destination)
 
-        # Inventory saved behavioral acquisition files, not in-memory edits.
         behavior = pglSession()
-        behavior.runs = list(session.runs)
+        behavior.runs = list(session.runs or [])
         behavior.mne = None
         behaviorManifest = cls.buildRawManifest(behavior) if behavior.runs else None
-
-        history = pglActionable()
-        history.uuid = session.uuid
-        history.actionHistory = list(session.actionHistory)
-        historyBytes = history.toJSON().encode("utf-8")
+        historyBytes = cls._sessionHistoryBytes(session, acquisition=True)
 
         filesystem.makedirs(destination, exist_ok=False)
         directories = set()
@@ -2200,8 +2556,7 @@ class pglStorage:
 
             for record in behaviorManifest["files"]:
                 parts = record["name"].split("/", 2)
-                runIndex = int(parts[1])
-                run = behavior.runs[runIndex]
+                run = behavior.runs[int(parts[1])]
                 sourcePath = posixpath.join(run.fullDataPath, parts[2])
                 cls.stageRawFile(run.filesystem, sourcePath, filesystem, destination, record, objectKey=record["name"])
                 files.append(dict(record))
@@ -2235,20 +2590,20 @@ class pglStorage:
             raise ValueError("Raw session history verification failed.")
 
         files.append({"name": "history.json", **historyIdentity})
-        manifest = {
-            "contract_version": "pgl.raw.session.v1",
-            "runs": runs,
-            "mne": {"path": "mne"},
-            "directories": sorted(directories),
-            "files": sorted(files, key=lambda record: record["name"]),
-        }
+        manifest = {"contract_version": "pgl.raw.session.v1", "runs": runs, "mne": {"path": "mne"}, "directories": sorted(directories), "files": sorted(files, key=lambda record: record["name"])}
         cls.validateRawSessionManifest(manifest)
 
         class DestinationView:
             def open(self, path, mode="rb", **kwargs):
                 return filesystem.open(posixpath.join(destination, path), mode=mode, **kwargs)
 
-        cls._verifyMNEInventory(manifest, DestinationView())
+        view = DestinationView()
+        cls._verifyMNEInventory(manifest, view)
+        _, metadata = cls._readSessionHistory(view, len(runs))
+
+        if runs and metadata != cls._behaviorLabelMetadata(manifest, view):
+            raise ValueError("Raw history labels differ from the archived behavioral settings.")
+
         content = cls.encodeRawManifest(manifest)
         manifestPath = posixpath.join(destination, "manifest.json")
 
@@ -2357,40 +2712,36 @@ class pglStorage:
 
     @classmethod
     def saveDerivedSessionFiles(cls, session, dataPath, filesystem=None, filesystemPrefix=None):
-        """Export current behavioral/MNE contents, history, and verified manifest.
+        """Export current behavioral/MNE contents, history, labels, and manifest.
 
-        Requires a fresh destination. Writes manifest.json last.
-        Errors propagate; partial destination output may remain.
+        Labels are included in hashed history.json.
+        Requires a fresh destination and writes manifest.json last.
         Does not register or complete a database checkpoint.
         """
         from .pglBase import pglBase
-        from .pglPipeline import pglActionable
         from .pglSession import pglMNE
 
-        runs = list(session.runs)
+        runs = list(session.runs or [])
         mneData = session.mne
 
         if not runs and mneData is None:
             raise ValueError("A checkpoint must contain behavioral runs or MNE contents")
+
         if mneData is not None and type(mneData) is not pglMNE:
             raise TypeError("MNE export currently supports pglMNE, not subclasses")
+
         if dataPath is None or not str(dataPath).strip():
             raise ValueError("A destination path is required")
 
-        filesystem, destination, _ = pglBase.validateFilesystem(
-            filesystem=filesystem,
-            dataPath=dataPath,
-            filesystemPrefix=filesystemPrefix,
-            requireExists=False,
-        )
-        if filesystem is None: raise ValueError("Could not resolve destination filesystem")
-        if filesystem.exists(destination): raise FileExistsError(f"Destination already exists: {destination}")
+        filesystem, destination, _ = pglBase.validateFilesystem(filesystem=filesystem, dataPath=dataPath, filesystemPrefix=filesystemPrefix, requireExists=False)
 
-        history = pglActionable()
-        history.uuid = session.uuid
-        history.actionHistory = list(session.actionHistory)
-        historyBytes = history.toJSON().encode("utf-8")
+        if filesystem is None:
+            raise ValueError("Could not resolve destination filesystem")
 
+        if filesystem.exists(destination):
+            raise FileExistsError(f"Destination already exists: {destination}")
+
+        historyBytes = cls._sessionHistoryBytes(session, acquisition=False)
         filesystem.makedirs(destination, exist_ok=False)
         directories = set()
         files = []
@@ -2400,9 +2751,7 @@ class pglStorage:
             fullRoot = posixpath.join(destination, relativeRoot)
             directories.add(relativeRoot)
 
-            for currentPath, directoryNames, fileNames in filesystem.walk(
-                fullRoot, detail=False, on_error="raise"
-            ):
+            for currentPath, directoryNames, fileNames in filesystem.walk(fullRoot, detail=False, on_error="raise"):
                 logicalPath = posixpath.relpath(currentPath, destination)
 
                 for name in directoryNames:
@@ -2410,10 +2759,7 @@ class pglStorage:
 
                 for name in fileNames:
                     savedPath = posixpath.join(currentPath, name)
-                    files.append({
-                        "name": posixpath.join(logicalPath, name),
-                        **cls.hashFile(filesystem, savedPath),
-                    })
+                    files.append({"name": posixpath.join(logicalPath, name), **cls.hashFile(filesystem, savedPath)})
 
         if runs:
             filesystem.makedirs(posixpath.join(destination, "runs"), exist_ok=False)
@@ -2430,37 +2776,37 @@ class pglStorage:
             inventoryDirectory("mne")
 
         historyPath = posixpath.join(destination, "history.json")
+
         with filesystem.open(historyPath, "xb") as target:
             if target.write(historyBytes) != len(historyBytes):
                 raise OSError("Incomplete session history write")
 
-        expectedHistory = {
-            "sha256": hashlib.sha256(historyBytes).hexdigest(),
-            "size_bytes": len(historyBytes),
-        }
+        expectedHistory = {"sha256": hashlib.sha256(historyBytes).hexdigest(), "size_bytes": len(historyBytes)}
         storedHistory = cls.hashFile(filesystem, historyPath)
+
         if storedHistory != expectedHistory:
             raise ValueError("Saved session history verification failed")
 
         files.append({"name": "history.json", **storedHistory})
-        manifest = {
-            "contract_version": (
-                "pgl.derived.session.v1" if mneData is not None else "pgl.derived.behavior.v1"
-            ),
-            "runs": runRecords,
-            "directories": sorted(directories),
-            "files": sorted(files, key=lambda record: record["name"]),
-        }
-        if mneData is not None: manifest["mne"] = {"path": "mne"}
+        manifest = {"contract_version": "pgl.derived.session.v1" if mneData is not None else "pgl.derived.behavior.v1", "runs": runRecords, "directories": sorted(directories), "files": sorted(files, key=lambda record: record["name"])}
+
+        if mneData is not None:
+            manifest["mne"] = {"path": "mne"}
 
         cls.validateDerivedManifest(manifest)
 
-        if mneData is not None:
-            class destinationView:
-                def open(self, path, mode="rb", **kwargs):
-                    return filesystem.open(posixpath.join(destination, path), mode=mode, **kwargs)
+        class DestinationView:
+            def open(self, path, mode="rb", **kwargs):
+                return filesystem.open(posixpath.join(destination, path), mode=mode, **kwargs)
 
-            cls._verifyMNEInventory(manifest, destinationView())
+        view = DestinationView()
+        _, metadata = cls._readSessionHistory(view, len(runs))
+
+        if runs and metadata != cls._behaviorLabelMetadata(manifest, view):
+            raise ValueError("Derived history labels differ from the exported behavioral settings.")
+
+        if mneData is not None:
+            cls._verifyMNEInventory(manifest, view)
 
         cls.stageDerivedManifest(manifest, filesystem, destination)
         return destination, manifest
@@ -2473,8 +2819,12 @@ class pglStorage:
         Exports a verified temporary snapshot before allocating destination
         payload paths.
 
-        Exact encoded-manifest matches reuse completed active roots.
-        This is byte-identity deduplication, not semantic MNE equivalence.
+        Exact encoded-manifest matches reuse completed active roots with a
+        warning. This is byte-identity deduplication, not semantic MNE
+        equivalence.
+
+        Matching deleted checkpoints remain unchanged; a new checkpoint
+        is created with a separate checkpoint-specific destination.
 
         Temporary staging is removed. Failed destination writes may leave
         unregistered files.
@@ -2513,22 +2863,26 @@ class pglStorage:
                 manifestBytes = cls.encodeRawManifest(manifest)
                 manifestHash = hashlib.sha256(manifestBytes).hexdigest()
 
-                # Match the existing raw-save advisory-lock protocol.
+                # Serialize saves of identical raw manifests.
                 connection.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (manifestHash,))
-                existing = connection.execute(sql.SQL("SELECT session_id, status, contract_version, deleted_at FROM {} WHERE origin = 'raw' AND manifest_hash = %s FOR SHARE").format(sessions), (manifestHash,)).fetchone()
+                existing = connection.execute(sql.SQL("SELECT session_id, status, contract_version FROM {} WHERE origin = 'raw' AND manifest_hash = %s AND deleted_at IS NULL FOR SHARE").format(sessions), (manifestHash,)).fetchone()
 
                 if existing is not None:
-                    existingID, status, contract, deletedAt = existing
-
-                    if deletedAt is not None:
-                        raise ValueError(f"Matching raw checkpoint {existingID} is deleted. Explicitly undelete it before reusing it.")
+                    existingID, status, contract = existing
 
                     if (status, contract) != ("complete", "pgl.raw.session.v1"):
                         raise ValueError("Matching raw manifest belongs to an unsupported or incomplete checkpoint.")
 
                     # Validate registered inventory and metadata without resolving MNE fields.
                     cls.loadRawSessionBundle(connection, postgres, existingID, storageOptionsByBackend={backendID: storageOptions or {}}, cacheDirectory=Path(temporary) / "unused-cache")
+                    pglMessages.warning(f"This raw session is already saved as active checkpoint {existingID}. No new checkpoint was created; returning the existing ID. To save another raw copy, delete checkpoint {existingID} and call saveRawSession() again. To save further work as a derived checkpoint, use saveSession().", level=2)
                     return existingID
+
+                deletedMatches = connection.execute(sql.SQL("SELECT session_id FROM {} WHERE origin = 'raw' AND manifest_hash = %s AND deleted_at IS NOT NULL ORDER BY session_id FOR SHARE").format(sessions), (manifestHash,)).fetchall()
+
+                if deletedMatches:
+                    deletedIDs = ", ".join(str(row[0]) for row in deletedMatches)
+                    pglMessages.message(f"Found matching deleted raw checkpoint(s) {deletedIDs}; leaving them unchanged and saving a new checkpoint.")
 
                 modalities = (["behavior"] if manifest["runs"] else []) + ["mne"]
                 statement = sql.SQL("INSERT INTO {} (origin, kind, ingest_method, modalities, status, contract_version, created_by, started_at) VALUES ('raw', 'acquired', 'manual', %s::text[], 'in_progress', 'pgl.raw.session.v1', %s, now()) RETURNING session_id").format(sessions)
@@ -2577,30 +2931,36 @@ class pglStorage:
                 return sessionID
     
     @classmethod
-    def saveRawSession(cls, session, *, settings=None, settingsName=None, backendID=None, storageOptions=None, sslRootCert=None):
+    def saveRawSession(cls, session, *, settings=None, settingsName=None, backendID=None, storageOptions=None, sslRootCert=None, allowMissingMetadata=False):
         """Save a parentless acquisition/root checkpoint.
 
-        Supports behavioral-only, MNE-only, and mixed sessions.
+        Behavioral labels/files come from saved acquisition sources.
+        MNE-only labels come from session.experimentName and session.subjectID.
 
-        Behavioral runs archive saved acquisition files, not in-memory edits.
-        Attached MNE objects are serialized from their current contents into
-        a portable bundle. Original vendor files are not automatically archived.
+        Missing labels warn and cancel before SQL or export.
+        allowMissingMetadata=True explicitly permits unset labels.
+        Malformed/unreadable settings are not bypassed by that override.
 
-        Resolves username, database configuration, and the default storage
-        destination from current or supplied PGL settings.
+        Behavioral-only, MNE-only, and mixed sessions are supported.
+        MNE objects are serialized from current contents; original vendor
+        acquisition files are not automatically archived.
 
-        Exact encoded raw-manifest matches may reuse an existing completed,
-        active checkpoint. Semantic MNE equality does not guarantee identical
-        encoded manifests. Matching deleted checkpoints require undelete.
+        Identical active raw checkpoints are reused with a warning.
+        Matching deleted checkpoints are left deleted; a new checkpoint
+        is created, subject to the current schema migration being installed.
+
+        Returns the checkpoint ID, or None for missing-label rejection,
+        unavailable configuration, or connection cancellation.
 
         Database changes are transactional; payload writes are not.
-        Failed saves may leave unregistered destination files.
-
-        Returns None for missing configuration or connection cancellation.
-        Other errors propagate. Success is reported only after commit.
+        Success is reported only after commit and connection cleanup.
         """
+        from time import perf_counter
         from .pglPostgres import pglPostgres
         from .pglSettings import pglSettingsManager
+
+        if not cls._checkRawSessionLabels(session, allowMissingMetadata=allowMissingMetadata):
+            return None
 
         resolvedSettings = pglSettingsManager.getSettings(settings=settings, settingsName=settingsName)
 
@@ -2623,18 +2983,29 @@ class pglStorage:
             pglMessages.warning("Cannot save raw session: no storageLocations are configured in the PostgreSQL configuration.", level=0)
             return None
 
+        databasePath = resolvedSettings.databasePath.strip()
+        saveStarted = perf_counter()
+        pglMessages.message("Saving raw session: connecting to PostgreSQL...")
+
         with postgres.connect(sslRootCert=sslRootCert) as connection:
             if connection is None:
                 return None
 
             with connection.transaction():
                 if backendID is None:
+                    pglMessages.message("Saving raw session: resolving storage destination...")
                     backendID = cls._getConfiguredStorageBackend(connection, postgres, storageOptions=storageOptions)
 
+                pglMessages.message("Saving raw session: resolving checkpoint owner...")
                 createdBy = cls.getOrCreateUser(connection, postgres, username)
+
+                pglMessages.message("Saving raw session: checking for an existing checkpoint or saving new contents...")
+                contentsStarted = perf_counter()
                 sessionID = cls._saveRawSession(connection, postgres, session, createdBy, backendID, storageOptions=storageOptions)
 
-        pglMessages.message(f"Raw checkpoint {sessionID} is complete and available in {postgres.databaseName}.{postgres.databaseSchema}.")
+                pglMessages.message(f"Saving raw session: checkpoint ready ({perf_counter() - contentsStarted:.1f} s); committing transaction...")
+
+        pglMessages.message(f"Raw checkpoint {sessionID} is complete. Database configuration: {databasePath} (database={postgres.databaseName}, schema={postgres.databaseSchema}; {perf_counter() - saveStarted:.1f} s total).", wrapText=False)
         return sessionID
 
     @classmethod
@@ -2650,8 +3021,11 @@ class pglStorage:
         Opens a transaction/savepoint. An outer transaction must commit for
         persistence. Payload writes are not rolled back.
 
-        Exact raw manifest matches reuse completed active checkpoints.
-        Matching deleted checkpoints require explicit undelete.
+        Exact raw manifest matches reuse completed active checkpoints with
+        a warning and return the existing checkpoint ID.
+
+        Matching deleted checkpoints remain unchanged; a new checkpoint
+        is created.
         """
         if session.mne is not None:
             return cls._saveRawMNECheckpoint(connection, postgres, session, createdBy, backendID, storageOptions=storageOptions)
@@ -2677,14 +3051,11 @@ class pglStorage:
                 raise ValueError(f"Storage backend is missing or inactive: {backendID}")
 
             connection.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (manifestHash,))
-            statement = sql.SQL("SELECT session_id, status, contract_version, deleted_at FROM {} WHERE manifest_hash = %s AND origin = 'raw' FOR SHARE").format(sessionsTable)
+            statement = sql.SQL("SELECT session_id, status, contract_version FROM {} WHERE manifest_hash = %s AND origin = 'raw' AND deleted_at IS NULL FOR SHARE").format(sessionsTable)
             existing = connection.execute(statement, (manifestHash,)).fetchone()
 
             if existing is not None:
-                existingID, status, contractVersion, deletedAt = existing
-
-                if deletedAt is not None:
-                    raise ValueError(f"Matching raw checkpoint {existingID} is deleted. Explicitly undelete that session before saving identical acquisition data.")
+                existingID, status, contractVersion = existing
 
                 if (status, contractVersion) != ("complete", "pgl.raw.behavior.v1"):
                     raise ValueError("Matching manifest belongs to an incomplete or unsupported checkpoint.")
@@ -2696,8 +3067,15 @@ class pglStorage:
                     raise ValueError("Existing checkpoint manifest differs from source manifest.")
 
                 cls.getRawFileLocations(connection, postgres, existingID, archivedManifest)
-                pglMessages.message(f"Found existing completed raw checkpoint {existingID}; reusing it without rewriting files.")
+                pglMessages.warning(f"This raw session is already saved as active checkpoint {existingID}. No new checkpoint was created; returning the existing ID. To save another raw copy, delete checkpoint {existingID} and call saveRawSession() again. To save further work as a derived checkpoint, use saveSession().", level=2)
                 return existingID
+
+            statement = sql.SQL("SELECT session_id FROM {} WHERE manifest_hash = %s AND origin = 'raw' AND deleted_at IS NOT NULL ORDER BY session_id FOR SHARE").format(sessionsTable)
+            deletedMatches = connection.execute(statement, (manifestHash,)).fetchall()
+
+            if deletedMatches:
+                deletedIDs = ", ".join(str(row[0]) for row in deletedMatches)
+                pglMessages.message(f"Found matching deleted raw checkpoint(s) {deletedIDs}; leaving them unchanged and saving a new checkpoint.")
 
             filesystem, root = url_to_fs(backend[0], **(storageOptions or {}))
             sessionID = cls.createRawCheckpoint(connection, postgres, createdBy)
@@ -3460,21 +3838,23 @@ class pglStorage:
 
     @classmethod
     def _registerSessionBundleFiles(cls, connection, postgres, sessionID, backendID, manifest, *, objectPrefix, storageOptions=None, origin="derived"):
-        """Verify and register a derived behavioral or MNE session bundle.
+        """Register a raw/derived bundle and mirror its verified session labels.
 
-        Requires an active, in-progress checkpoint matching the manifest.
-        Behavioral files receive recorded subject associations; MNE files do not.
-        Opens a transaction/savepoint; the caller must commit for persistence.
-        Does not write payloads or complete the checkpoint.
+        Behavioral file subjects come from archived experiment settings.
+        MNE-only file subjects come from hashed history metadata.
+        Missing subjects are represented as SQL NULL.
+
+        Uses the caller's transaction; does not publish the checkpoint.
         """
         for label, value in (("sessionID", sessionID), ("backendID", backendID)):
-            if type(value) is not int or not 0 <= value <= 9223372036854775807: raise ValueError(f"{label} must be a nonnegative PostgreSQL bigint.")
+            if type(value) is not int or not 0 <= value <= 9223372036854775807:
+                raise ValueError(f"{label} must be a nonnegative PostgreSQL bigint.")
 
         if not isinstance(objectPrefix, str) or objectPrefix.startswith("/") or "\\" in objectPrefix or "\x00" in objectPrefix or any(part in {"", ".", ".."} for part in objectPrefix.split("/")):
             raise ValueError("objectPrefix must be a valid relative POSIX path.")
 
         cls._validateSessionBundleManifest(manifest, origin=origin)
-        payloadRole = "acquisition" if origin == "raw" else "derived"        
+        payloadRole = "acquisition" if origin == "raw" else "derived"
         manifestBytes = cls.encodeRawManifest(manifest)
         manifestIdentity = {"sha256": hashlib.sha256(manifestBytes).hexdigest(), "size_bytes": len(manifestBytes)}
         hasMNE = manifest["contract_version"] in ("pgl.raw.session.v1", "pgl.derived.session.v1")
@@ -3484,60 +3864,44 @@ class pglStorage:
         backendsTable = sql.Identifier(postgres.databaseSchema, "storage_backends")
 
         with connection.transaction():
-            checkpoint = connection.execute(sql.SQL("""
-                SELECT origin, status, contract_version, deleted_at
-                FROM {}
-                WHERE session_id = %s
-                FOR UPDATE
-            """).format(sessionsTable), (sessionID,)).fetchone()
+            checkpoint = connection.execute(sql.SQL("SELECT origin, status, contract_version, deleted_at FROM {} WHERE session_id = %s FOR UPDATE").format(sessionsTable), (sessionID,)).fetchone()
 
             if checkpoint != (origin, "in_progress", manifest["contract_version"], None):
-                raise ValueError(
-                    "Checkpoint must be active, in progress, and match "
-                    "the manifest origin and contract."
-                )
+                raise ValueError("Checkpoint must be active, in progress, and match the manifest origin and contract.")
 
-            existingLink = connection.execute(sql.SQL("SELECT 1 FROM {} WHERE session_id = %s LIMIT 1").format(linksTable), (sessionID,)).fetchone()
-            if existingLink is not None: raise ValueError("Checkpoint already has file links.")
+            if connection.execute(sql.SQL("SELECT 1 FROM {} WHERE session_id = %s LIMIT 1").format(linksTable), (sessionID,)).fetchone() is not None:
+                raise ValueError("Checkpoint already has file links.")
 
             backend = connection.execute(sql.SQL("SELECT url_prefix, is_active FROM {} WHERE backend_id = %s FOR SHARE").format(backendsTable), (backendID,)).fetchone()
-            if backend is None or not backend[1]: raise ValueError("Storage backend is missing or inactive.")
+
+            if backend is None or not backend[1]:
+                raise ValueError("Storage backend is missing or inactive.")
 
             filesystem, root = url_to_fs(backend[0], **(storageOptions or {}))
             manifestKey = posixpath.join(objectPrefix, "manifest.json")
-            actualManifest = cls.hashFile(filesystem, posixpath.join(root, manifestKey))
-            if actualManifest != manifestIdentity: raise ValueError("Saved manifest does not match the supplied manifest.")
 
-            fileLocations = {
-                record["name"]: {
-                    "sha256": record["sha256"],
-                    "size_bytes": record["size_bytes"],
-                    "locations": [{
-                        "backend_id": backendID,
-                        "url_prefix": backend[0],
-                        "object_key": posixpath.join(objectPrefix, record["name"]),
-                    }],
-                }
-                for record in manifest["files"]
-            }
+            if cls.hashFile(filesystem, posixpath.join(root, manifestKey)) != manifestIdentity:
+                raise ValueError("Saved manifest does not match the supplied manifest.")
 
+            fileLocations = {record["name"]: {"sha256": record["sha256"], "size_bytes": record["size_bytes"], "locations": [{"backend_id": backendID, "url_prefix": backend[0], "object_key": posixpath.join(objectPrefix, record["name"])}]} for record in manifest["files"]}
             archive = pglCheckpointFilesystem(manifest, fileLocations, storageOptionsByBackend={backendID: storageOptions or {}})
-            if hasMNE: cls._verifyMNEInventory(manifest, archive)
 
-            subjectsByRun = {}
+            if hasMNE:
+                cls._verifyMNEInventory(manifest, archive)
 
-            for runRecord in manifest["runs"]:
-                runPath = runRecord["path"]
-                settingsPath = posixpath.join(runPath, "experimentSettings.json")
+            _, historyMetadata = cls._readSessionHistory(archive, len(manifest["runs"]))
 
-                with archive.open(settingsPath, "rt", encoding="utf-8") as file: settings = json.load(file)
+            if manifest["runs"]:
+                metadata = cls._behaviorLabelMetadata(manifest, archive)
 
-                if not isinstance(settings, dict): raise ValueError(f"Experiment settings must be a JSON object: {settingsPath}")
-                subjectID = settings.get("subjectID")
-                if not isinstance(subjectID, str) or not subjectID.strip() or "\x00" in subjectID: raise ValueError(f"Missing or invalid saved subject ID: {settingsPath}")
-                subjectsByRun[runPath] = subjectID
+                if historyMetadata is not None and historyMetadata != metadata:
+                    raise ValueError("History labels differ from archived behavioral experiment settings.")
+            else:
+                metadata = historyMetadata or {"version": 1, "labels": [{"runIndex": None, "experimentName": None, "subjectID": None}]}
 
-            for subjectID in sorted(set(subjectsByRun.values())): cls.getOrCreateSubject(connection, postgres, subjectID)
+            cls._recordSessionLabelMetadata(connection, postgres, sessionID, metadata)
+            subjectsByRun = {run["path"]: metadata["labels"][run["index"]]["subjectID"] for run in manifest["runs"]}
+            mneSubject = metadata["labels"][0]["subjectID"] if not manifest["runs"] else None
 
             def registerPayload(name, identity, role, subjectID=None):
                 fileID = cls.getOrCreateFile(connection, postgres, identity["sha256"], identity["size_bytes"])
@@ -3550,15 +3914,10 @@ class pglStorage:
                 if name == "history.json":
                     registerPayload(name, record, role="history")
                 elif hasMNE and name.startswith("mne/"):
-                    registerPayload(name, record, role=payloadRole)
+                    registerPayload(name, record, role=payloadRole, subjectID=mneSubject)
                 else:
                     runPath = "/".join(name.split("/")[:2])
-                    registerPayload(
-                        name,
-                        record,
-                        role=payloadRole,
-                        subjectID=subjectsByRun[runPath],
-                    )
+                    registerPayload(name, record, role=payloadRole, subjectID=subjectsByRun[runPath])
 
             registerPayload("manifest.json", manifestIdentity, role="manifest")
 
@@ -3633,13 +3992,12 @@ class pglStorage:
 
     @classmethod
     def _reconstructSessionBundle(cls, manifest, fileLocations, storageOptionsByBackend=None, *, cacheDirectory=None, directLocalPolicy="materialize", cacheContext=None, origin="derived"):
-        """Restore a raw or derived bundle with deferred behavioral/MNE fields.
+        """Restore verified history, labels, and deferred behavioral/MNE fields.
 
-        Reads verified history and the MNE descriptor immediately.
-        Behavioral and analysis payloads remain deferred.
-        No PostgreSQL connection is retained.
+        Older histories without label metadata remain supported.
+        Behavioral labels derive from run experiment settings on access.
+        MNE-only labels restore from the hashed history payload.
         """
-        from .pglPipeline import pglActionable
         from .pglSession import pglSession, pglMNE
 
         if directLocalPolicy not in ("materialize", "immutable"):
@@ -3653,17 +4011,7 @@ class pglStorage:
 
         filesystem = pglCheckpointFilesystem(manifest, fileLocations, storageOptionsByBackend=storageOptionsByBackend)
         filesystem.mneCacheContext = deepcopy(cacheContext)
-
-        with filesystem.open("history.json", "rt", encoding="utf-8") as source:
-            historyJSON = source.read()
-
-        history = pglActionable.fromJSON(historyJSON, filename="history.json")
-
-        if type(history) is not pglActionable:
-            raise ValueError("Checkpoint history must contain a pglActionable wrapper")
-
-        if json.loads(history.toJSON()) != json.loads(historyJSON):
-            raise ValueError("Checkpoint history could not be reconstructed without changes")
+        history, metadata = cls._readSessionHistory(filesystem, len(manifest["runs"]))
 
         if hasMNE:
             cls._verifyMNEInventory(manifest, filesystem)
@@ -3671,6 +4019,10 @@ class pglStorage:
         session = pglSession(filesystem=filesystem, runList=[record["path"] for record in manifest["runs"]])
         session.uuid = history.uuid
         session.actionHistory = list(history.actionHistory)
+
+        if not session.runs and metadata is not None:
+            session.experimentName = metadata["labels"][0]["experimentName"]
+            session.subjectID = metadata["labels"][0]["subjectID"]
 
         if hasMNE:
             session.mne = pglMNE.loadBundle(manifest["mne"]["path"], filesystem=filesystem, cacheDirectory=cacheDirectory, directLocalPolicy=directLocalPolicy)

@@ -301,6 +301,12 @@ class pglSerialize:
                             result[key] = encoded
 
                     return result
+                
+                # ------------------------------------------------------
+                # ranges
+                # ------------------------------------------------------
+                elif isinstance(o, range):
+                    return {'__range__': True, 'start': o.start, 'stop': o.stop, 'step': o.step}
 
                 # ------------------------------------------------------
                 # datetime
@@ -665,6 +671,17 @@ class pglSerialize:
             # Restore numpy arrays
             if '__numpy__' in dct:
                 return np.array(dct['data'], dtype=dct['dtype']).reshape(dct['shape'])
+            
+            # Restore ranges without expanding them into lists.
+            if '__range__' in dct:
+                expectedFields = {'__range__', 'start', 'stop', 'step'}
+                if set(dct) != expectedFields or dct['__range__'] is not True:
+                    raise ValueError("Invalid serialized range record.")
+                if any(type(dct[key]) is not int for key in ('start', 'stop', 'step')):
+                    raise ValueError("Serialized range start, stop, and step must be integers.")
+                if dct['step'] == 0:
+                    raise ValueError("Serialized range step must not be zero.")
+                return range(dct['start'], dct['stop'], dct['step'])
             
             # Restore tuples
             if '__tuple__' in dct:

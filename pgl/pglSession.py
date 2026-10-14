@@ -2235,92 +2235,228 @@ class pglMNERawAliasBacking:
 ##################################
 class pglSession(pglActionable):
 
-    # filesystem, name and prefix for where the session is loaded from
-    filesystem = Instance(AbstractFileSystem, allow_none=True, serialize=False, help="filesystem for serialization")
-    filesystemPrefix = Unicode(allow_none=True, default_value="", help="Prefix like ssh:// used for accessing filesystem", visible=False)
+    filesystem = Instance(AbstractFileSystem, allow_none=True, serialize=False, help="Filesystem for serialization")
+    filesystemPrefix = Unicode(allow_none=True, default_value="", help="Filesystem protocol prefix", visible=False)
     sessionID = Int(default_value=None, allow_none=True, help="Source database checkpoint ID assigned by loadSession").tag(serialize=False)
-    
-    # List of all runs
-    runs = List(Instance(pglRun), allow_none=True, help="List of all runs")
-    
-    # mne MEG/EEG data
-    mne = Instance(pglMNE, allow_none=True, help="MEG/EEG data in the form of an MNE variable")
-    
-    def __init__(self, filesystem=None, filesystemPrefix='', runList=[]):
-        '''
-        Init
-        
-        Args:
-            fullDataPath (str): path to data for session
-            filesystem: filesystem where path exists (None for local)
-            filesystemPrefix: Prefix like ssh://
-            runList: List of paths to runs
-        '''
+
+    runs = List(Instance(pglRun), allow_none=True, help="List of behavioral runs")
+    mne = Instance(pglMNE, allow_none=True, help="MEG/EEG data")
+
+    # Explicit labels apply only when there are no behavioral runs.
+    # Checkpoint persistence will handle these explicitly rather than relying
+    # on generic session serialization.
+    _experimentName = Unicode(default_value=None, allow_none=True, help="Explicit experiment name for a session without behavioral runs").tag(serialize=False)
+    _subjectID = Unicode(default_value=None, allow_none=True, help="Explicit subject ID for a session without behavioral runs").tag(serialize=False)
+
+    def __init__(self, filesystem=None, filesystemPrefix="", runList=None):
+        """Initialize a session and optionally attach behavioral run sources."""
         super().__init__()
-        
-        self.filesystem = filesystem                
+
+        self.filesystem = filesystem
         self.filesystemPrefix = filesystemPrefix
-        
-        for runPath in runList:
+
+        for runPath in (() if runList is None else runList):
             self.runs.append(pglRun(fullDataPath=runPath, filesystem=filesystem, filesystemPrefix=filesystemPrefix))
-            
+
+    @staticmethod
+    def _normalizeSessionLabel(value, fieldName):
+        """Normalize unset labels without concealing malformed values.
+
+        None and whitespace-only strings mean unset.
+        Nonempty strings retain their original contents.
+        """
+        if value is None:
+            return None
+
+        if not isinstance(value, str):
+            raise TypeError(f"{fieldName} must be a string or None.")
+
+        if any(character in value for character in ("\x00", "\n", "\r")):
+            raise ValueError(f"{fieldName} must not contain NUL or newline characters.")
+
+        return value if value.strip() else None
+
+    def getSessionLabels(self, *, acquisition=False):
+        """Return experiment/subject labels without discarding run associations.
+
+        Returns a new list of dictionaries:
+            runIndex: behavioral run index, or None for an MNE-only session
+            experimentName: string or None
+            subjectID: string or None
+
+        With behavioral runs:
+            acquisition=False reads current run.experimentSettings.
+            acquisition=True reads each saved experimentSettings.json through
+            the run's filesystem, without replacing cached in-memory settings.
+
+        Without behavioral runs:
+            Reads the explicitly assigned session labels.
+
+        Missing label fields become None. Unreadable/malformed settings and
+        invalid label values raise; they are not treated as merely unset.
+        """
+        import json
+        import posixpath
+
+        if type(acquisition) is not bool:
+            raise ValueError("acquisition must be a boolean.")
+
+        runs = list(self.runs or [])
+
+        if not runs:
+            return [{"runIndex": None, "experimentName": self._normalizeSessionLabel(self._experimentName, "experimentName"), "subjectID": self._normalizeSessionLabel(self._subjectID, "subjectID")}]
+
+        records = []
+
+        for index, run in enumerate(runs):
+            if acquisition:
+                if run.filesystem is None or not run.fullDataPath:
+                    raise ValueError(f"Run {index} has no saved acquisition source from which to read labels.")
+
+                settingsPath = posixpath.join(run.fullDataPath, "experimentSettings.json")
+
+                with run.filesystem.open(settingsPath, "rt", encoding="utf-8") as source:
+                    settings = json.load(source)
+
+                if not isinstance(settings, dict):
+                    raise ValueError(f"Saved experiment settings must contain a JSON object: {settingsPath}")
+
+                experimentName = settings.get("experimentName")
+                subjectID = settings.get("subjectID")
+            else:
+                settings = run.experimentSettings
+
+                if settings is None:
+                    raise ValueError(f"Run {index} has no experimentSettings.")
+
+                experimentName = getattr(settings, "experimentName", None)
+                subjectID = getattr(settings, "subjectID", None)
+
+            records.append({
+                "runIndex": index,
+                "experimentName": self._normalizeSessionLabel(experimentName, f"run {index} experimentName"),
+                "subjectID": self._normalizeSessionLabel(subjectID, f"run {index} subjectID"),
+            })
+
+        return records
+
+    @property
+    def experimentName(self):
+        """Return the shared behavioral experiment name or explicit session name.
+
+        Returns None if unset or if behavioral runs do not all agree.
+        Use getSessionLabels() to inspect individual runs.
+        """
+        if not self.runs:
+            return self._experimentName
+
+        values = {record["experimentName"] for record in self.getSessionLabels()}
+        return next(iter(values)) if len(values) == 1 else None
+
+    @experimentName.setter
+    def experimentName(self, value):
+        if self.runs:
+            raise ValueError("For a behavioral session, experimentName is derived from each run.experimentSettings.experimentName. Set it there instead; saveRawSession() uses the saved acquisition settings.")
+
+        self._experimentName = self._normalizeSessionLabel(value, "experimentName")
+
+    @property
+    def subjectID(self):
+        """Return the shared behavioral subject ID or explicit session subject.
+
+        Returns None if unset or if behavioral runs do not all agree.
+        Use getSessionLabels() to inspect individual runs.
+        """
+        if not self.runs:
+            return self._subjectID
+
+        values = {record["subjectID"] for record in self.getSessionLabels()}
+        return next(iter(values)) if len(values) == 1 else None
+
+    @subjectID.setter
+    def subjectID(self, value):
+        if self.runs:
+            raise ValueError("For a behavioral session, subjectID is derived from each run.experimentSettings.subjectID. Set it there instead; saveRawSession() uses the saved acquisition settings.")
+
+        self._subjectID = self._normalizeSessionLabel(value, "subjectID")
+
     def add(self, data):
-        '''
-        add data to the pglSession, works on known types pglMNE...
-        '''
-        if isinstance(data,pglMNE): self.mne = data
+        """Attach a supported data object to this session."""
+        if isinstance(data, pglMNE):
+            self.mne = data
         else:
             pglMessages.warning(f"Unknown data type: {type(data).__name__}")
-            
+
     def get(self, dataName):
-        '''
-        Gets the called for data
-        '''
-        
-        # MNE RAW
+        """Return attached MNE contents or the current Raw."""
         if dataName.lower() == "mneraw":
-            mne = self.get("mne")
-            if mne: return (mne.raw)
-            else: None
-        # MNE
-        elif dataName.lower() == "mne":
-            if self.mne:
+            contents = self.get("mne")
+            return contents.raw if contents is not None else None
+
+        if dataName.lower() == "mne":
+            if self.mne is not None:
                 return self.mne
-            else:
-                pglMessages.warning(f"No mne data loaded",level=1)
-                return None
-        else:
-            pglMessages.warning(f"Unkown data type: {dataName}")
+
+            pglMessages.warning("No mne data loaded", level=1)
             return None
-        
-    def saveRawSession(self, *, settings=None, settingsName=None, backendID=None, storageOptions=None, sslRootCert=None):
+
+        pglMessages.warning(f"Unknown data type: {dataName}")
+        return None
+
+
+    def saveRawSession(self, *, settings=None, settingsName=None, backendID=None, storageOptions=None, sslRootCert=None, allowMissingMetadata=False):
         """Save this session as a parentless acquisition/root checkpoint.
 
         Supports behavioral-only, MNE-only, and mixed sessions.
 
-        Behavioral runs archive saved acquisition files, not in-memory edits.
-        Attached MNE objects are serialized from their current contents into
-        a portable bundle. Original vendor files are not automatically archived.
+        Behavioral acquisition labels and files come from saved run sources,
+        not in-memory edits. Without behavioral runs, labels come from
+        session.experimentName and session.subjectID.
 
-        Uses current or supplied settings and the configured storage destination.
+        Missing experimentName or subjectID warns and cancels by default.
+        allowMissingMetadata=True explicitly permits unset labels.
 
-        Returns the completed checkpoint ID, or None when configuration is
-        unavailable or connection/password entry is cancelled.
+        Attached MNE objects are serialized from their current contents.
+        Original vendor files are not automatically archived.
+
+        Returns a completed checkpoint ID, or None for rejected missing
+        metadata, unavailable configuration, or connection cancellation.
+
+        After a successful save, self.sessionID becomes the new checkpoint ID,
+        so subsequent saveSession() calls default to this checkpoint as parent.
+        Failure or cancellation leaves self.sessionID unchanged.
+
+        Accumulated action history is retained, not cleared by this wrapper.
+        Each saveRawSession() call creates a parentless root.
         """
         from .pglStorage import pglStorage
 
-        return pglStorage.saveRawSession(self, settings=settings, settingsName=settingsName, backendID=backendID, storageOptions=storageOptions, sslRootCert=sslRootCert)
+        if type(allowMissingMetadata) is not bool:
+            raise ValueError("allowMissingMetadata must be a boolean.")
+
+        sessionID = pglStorage.saveRawSession(self, settings=settings, settingsName=settingsName, backendID=backendID, storageOptions=storageOptions, sslRootCert=sslRootCert, allowMissingMetadata=allowMissingMetadata)
+
+        if sessionID is not None:
+            self.sessionID = sessionID
+
+        return sessionID
     
     def print(self, verbose=False):
-        """Print a session overview followed by each run."""
+        """Print the session overview, experiment/subject pairs, and runs.
+
+        Resolves behavioral experiment settings to display current labels.
+        Does not load MNE payloads.
+        """
         pglMessages.printHeader("Session")
 
         protocol = getattr(self.filesystem, "protocol", None)
+
         if isinstance(protocol, (tuple, list)):
             protocol = ", ".join(protocol)
 
         information = {
-            "Runs": len(self.runs),
+            "Source checkpoint": self.sessionID if self.sessionID is not None else "Not set",
+            "Runs": len(self.runs or []),
             "Filesystem": protocol or "Not set",
             "MEG/EEG data": "Attached" if self.mne is not None else "None",
         }
@@ -2330,13 +2466,22 @@ class pglSession(pglActionable):
         for label, value in information.items():
             pglMessages.print(f"  {label:<{labelWidth}} : {value}")
 
-        for index, run in enumerate(self.runs):
+        labels = self.getSessionLabels()
+        pairs = list(dict.fromkeys((record["experimentName"], record["subjectID"]) for record in labels))
+
+        pglMessages.print()
+        pglMessages.printHeader("Experiment and subject", fillChar="-")
+
+        for experimentName, subjectID in pairs:
+            pglMessages.print(f"  {experimentName if experimentName is not None else 'Unknown'} / {subjectID if subjectID is not None else 'Unknown'}")
+
+        for index, run in enumerate(self.runs or []):
             pglMessages.print()
             pglMessages.printHeader(f"Run {index + 1}", fillChar="-")
             run.print(verbose=verbose)
-            
+
     def display(self):
-        """Display every run and its tasks, returning the created figures."""
+        """Display every behavioral run and its tasks."""
         if not self.runs:
             pglMessages.warning("No runs have been loaded.")
             return []
@@ -2344,31 +2489,26 @@ class pglSession(pglActionable):
         figures = []
 
         for index, run in enumerate(self.runs):
-            fig = run.display()
+            figure = run.display()
 
-            if fig is not None:
-                fig.suptitle(f"Run {index + 1}")
-                figures.append(fig)
+            if figure is not None:
+                figure.suptitle(f"Run {index + 1}")
+                figures.append(figure)
 
         return figures
- 
+
     @classmethod
     def loadSession(cls, sessionID, *, settings=None, settingsName=None, storageOptionsByBackend=None, sslRootCert=None, includeDeleted=False, cacheDirectory=None, directLocalPolicy="materialize"):
-        """Load a completed checkpoint and remember its ID as the default parent.
-
-        The returned session's sessionID identifies the source checkpoint.
-        saveSession() uses this ID unless parentSessionID is explicitly supplied.
+        """Load a checkpoint and remember its ID as the default derived parent.
 
         For MNE checkpoints, cacheDirectory overrides settings.cacheDir.
-        Cache directories are created only when materialization is needed;
-        successfully materialized files are not automatically deleted.
+        Cache directories are created only when materialization is needed.
 
-        directLocalPolicy='immutable' permits verified direct-local access
-        under the caller's source-file immutability/lifetime commitment.
+        directLocalPolicy='immutable' requires source files and resolved paths
+        to remain unchanged and available while readers use them.
 
-        Cache-path, payload, and contract-validation errors propagate.
         includeDeleted permits inspection without undeleting the checkpoint.
-        Deleted checkpoints cannot be used as parents until restored.
+        Deleted checkpoints cannot be parents until restored.
         """
         from .pglStorage import pglStorage
 
@@ -2378,33 +2518,39 @@ class pglSession(pglActionable):
             session.sessionID = sessionID
 
         return session
-    
+
     def saveSession(self, *, parentSessionID=None, settings=None, settingsName=None, backendID=None, description=None, ingestMethod="manual", storageOptions=None, sslRootCert=None):
         """Save current contents and history as a new derived checkpoint.
 
-        Defaults parentSessionID to the source checkpoint recorded by
-        pglSession.loadSession(). An explicit parentSessionID overrides it.
+        Defaults parentSessionID to the most recently loaded or successfully
+        saved checkpoint. An explicit parentSessionID overrides that default.
 
         Sessions created entirely in memory require an explicit parent.
-        Use saveRawSession() to create a parentless acquisition/root checkpoint.
+        Use saveRawSession() to create a parentless root.
 
-        The parent must be completed and active; storage/database validation
-        enforces this requirement.
+        Returns the new checkpoint ID, or None for missing-parent rejection,
+        unavailable configuration, or connection cancellation.
 
-        Returns the new checkpoint ID, or None for unavailable configuration
-        or connection cancellation.
+        After a successful save, self.sessionID becomes the new checkpoint ID,
+        so subsequent saves form a chain rather than sibling checkpoints.
+        Failure or cancellation leaves self.sessionID unchanged.
 
-        Saving does not change self.sessionID. Repeated saves remain children
-        of the loaded source unless a different parent is explicitly supplied.
+        Accumulated action history is retained, not cleared by this wrapper.
         """
         from .pglStorage import pglStorage
 
         resolvedParentID = self.sessionID if parentSessionID is None else parentSessionID
 
         if resolvedParentID is None:
-            raise ValueError("This session has no loaded source checkpoint. Supply parentSessionID, or use saveRawSession() to create a parentless root.")
+            pglMessages.warning("Cannot save session: this session has no loaded or saved source checkpoint. Use saveRawSession() to create a parentless root, or supply parentSessionID.", level=2)
+            return None
 
         if type(resolvedParentID) is not int or not 0 <= resolvedParentID <= 9223372036854775807:
             raise ValueError("parentSessionID must be a nonnegative PostgreSQL bigint.")
 
-        return pglStorage.saveSession(self, parentSessionID=resolvedParentID, settings=settings, settingsName=settingsName, backendID=backendID, description=description, ingestMethod=ingestMethod, storageOptions=storageOptions, sslRootCert=sslRootCert)
+        sessionID = pglStorage.saveSession(self, parentSessionID=resolvedParentID, settings=settings, settingsName=settingsName, backendID=backendID, description=description, ingestMethod=ingestMethod, storageOptions=storageOptions, sslRootCert=sslRootCert)
+
+        if sessionID is not None:
+            self.sessionID = sessionID
+
+        return sessionID
