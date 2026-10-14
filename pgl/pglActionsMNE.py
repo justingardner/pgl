@@ -3080,3 +3080,389 @@ class pglActionsMNE(pglActionCollection):
                 pglMessages.message(f"Marked {len(peaks)} blinks as BAD_blink ({100 * bad.mean():.1f}% of recording). Re-run mneCreateEpochs to apply.")
             return session
    
+   
+    _actionHeader_spatial_filtering = "Spatial filtering"
+    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
+    # multiorigin SSS using Foster's inverse
+    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
+    class mSSSWithFosters(pglAction):
+        '''
+        Spatial filtering using multi-origin SSS with Foster's inverse method (Xan McPherson method)
+        '''
+        center1 = Instance(np.ndarray, default_value=np.zeros(3), help="Center of first expansion sphere returned by FIT_SPHERES_TO_MRI (defaults to zeros / i.e. origin of sensor space)")
+        center2 = Instance(np.ndarray, default_value=np.zeros(3), help="Center of second expansion sphere returned by FIT_SPHERES_TO_MRI (defaults to zeros / i.e. origin of sensor space)")
+        doFosters = Bool(True, help="Whether to apply Foster's inverse method")
+        noiseTmin = Float(0.0, help="Start time (in seconds, relative to start of recording) for computing noise covariance for Foster's inverse method")
+        noiseTmax = Float(1.0, help="End time (in seconds, relative to start of recording) for computing noise covariance for Foster's inverse method") 
+        doMultiOrigin = Bool(False, help="Whether to use multi-origin SSS")
+        Lin = Int(8, help="Vector spherical harmonic inner truncation order (default is 8) - signals inside that will be kept by the method")
+        Lout = Int(3, help="Vector spherical harmonic outer truncation order (default is 3) - signals outside that will be removed by the method")
+        
+        def _run(self, session:pglSession) -> pglSession:
+            import numpy as np
+            import mne
+
+            # check for mne session
+            if session.mne is None or session.mne.raw is None:
+                self.setError("session does not have raw mne loaded")
+                return None
+
+            # function to get channel types from raw needed in multi-origin SSS with Foster's inverse method
+            def getChannelTypes(raw):
+                """Return 1 for magnetometers, 0 for gradiometers, in the order of
+                apply_preprocessing's meg_picks. Returns None (after warning) if the raw
+                can't be used."""
+                megPicks = mne.pick_types(raw.info, meg=True)
+                if len(megPicks) == 0:
+                    pglMessages.warning("No MEG channels found in raw (EEG-only or non-MEG data?)")
+                    return None
+
+                types = np.array(raw.get_channel_types(picks=megPicks))
+                unsupported = set(types) - {"mag", "grad"}
+                if unsupported:
+                    pglMessages.warning(f"Unsupported MEG channel types: {sorted(unsupported)}")
+                    return None
+
+                return (types == "mag").astype(int)
+            
+            # get the channel types from the data
+            channelTypes = getChannelTypes(session.raw)
+            if channelTypes is None:
+                self.setError("Failed to get channel types from raw data")
+                return
+            
+            
+            try:
+                # run xan's apply_preprocessing function with Foster's inverse method
+                self.mne.raw = apply_preprocessing(self.center1, self.center2, self.mne.raw, self.doFosters, self.noiseTmin, self.noiseTmax, self.doMultiOrigin, channelTypes, self.Lin, self.Lout)
+            except Exception as e:
+                self.setError(f"Error running mSSS Foster's inverse method: {str(e)}")
+                return None
+
+            return session
+
+
+    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
+    # set run and noise boundaries for running mSSS with Fosters
+    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
+    class getRunAndNoiseBoundaries(pglAction):
+        '''
+        Get list of tuples representing the beginning and end of runs and noise segments        
+        '''
+        
+        noiseTriggerLabel = Unicode("blank", help="Label for the trigger to identify noise segments")
+        triggerSet = Unicode(allow_none=True, default_value=None, help="Trigger set in which triggerLabel is defineds. See configureEvents. Default will look for the triggerLabel and use the first set that it is defined in")
+        
+        def _run(self, session:pglSession) -> pglSession:
+            # resolve the trigger set
+            try:
+                self.triggerSet = self.resolveTriggerSet(session, self.noiseTriggerLabel, self.triggerSet)
+            except Exception as e:
+                self.setError(f"Error resolving trigger set: {str(e)}")
+                return None
+
+            try:
+                runs, noiseSegments = self.extractRunAndNoiseIntervals(session, noiseTriggerLabel=self.noiseTriggerLabel, triggerSet=self.triggerSet)
+            except Exception as e:
+                self.setError(f"Error extracting or plotting run and noise intervals: {str(e)}")
+                return None
+
+            # display them
+            self.plotRunAndNoiseIntervals(session, runs, noiseSegments)
+
+            # For each run select a noise segment
+            selectedNoiseSegments = self.selectNoiseSegmentsForRuns(runs, noiseSegments)    
+            
+            # package into mne's derivedParameters
+            session.mne.derivedParameters["runAndNoiseIntervals"] = {"runs": runs, "noiseSegments": noiseSegments, "selectedNoiseSegments": selectedNoiseSegments}
+            
+            return session
+    
+        
+        def resolveTriggerSet(self, session, triggerLabel, triggerSet=None):
+            """Find the first trigger set containing triggerLabel, or validate an explicit set."""
+            if session is None or session.mne is None or session.mne.eventsID is None:
+                raise ValueError("Cannot resolve triggerSet: eventsID is missing. Run configureEvents first.")
+            eventsID = session.mne.eventsID
+            
+            reservedColumns = {"sample", "previousValue", "code", "rawLabel"}
+            availableSets = [column for column in eventsID.columns if column not in reservedColumns]
+
+            if triggerSet is not None and triggerSet not in availableSets:
+                raise ValueError(f"Unknown triggerSet {triggerSet!r}. Available trigger sets: {availableSets!r}. Trigger sets searched: none.")
+
+            candidateSets = availableSets if triggerSet is None else [triggerSet]
+            searchedSets = []
+
+            for setName in candidateSets:
+                searchedSets.append(setName)
+
+                if eventsID[setName].eq(triggerLabel).fillna(False).any():
+                    if triggerSet is None:
+                        pglMessages.message(f"No triggerSet specified. Selected {setName!r}, the first trigger set containing label {triggerLabel!r}. Trigger sets searched: {searchedSets!r}.")
+                    else:
+                        pglMessages.message(f"Using specified triggerSet {setName!r}, containing label {triggerLabel!r}.")
+
+                    return setName
+
+            raise ValueError(f"Trigger label {triggerLabel!r} was not found in the recorded event labels. Trigger sets searched: {searchedSets!r}.")
+        
+        def extractRunAndNoiseIntervals(self, session, noiseTriggerLabel, triggerSet):
+            """
+            Calculate proposed run and noise intervals.
+
+            triggerSet must already be resolved.
+
+            Returns
+            -------
+            runs : list of tuples
+                (start, end) times in seconds relative to the current Raw start.
+            noiseSegments : list of tuples
+                (start, end) times in seconds relative to the current Raw start.
+
+            Both endpoints are included, matching Raw.crop(tmin=start, tmax=end).
+
+            Runs are the complement of BAD_inter_run annotations.
+            Noise starts at a matching trigger and ends one sample before the next
+            non-matching trigger, or at recording end. Consecutive matching triggers
+            form one segment. Unlabeled triggers count as non-matching.
+
+            Noise intervals are clipped to runs. A noise label remains active across
+            excluded gaps until a non-matching trigger, but the gaps are not returned.
+            """
+            import numpy as np
+
+            # ------------------------------------------------------------------
+            # Validate session fields.
+            # ------------------------------------------------------------------
+            mneData = getattr(session, "mne", None)
+
+            if mneData is None:
+                raise ValueError("Cannot extract intervals: session.mne is None. Load raw data and run configureEvents first.")
+
+            raw = getattr(mneData, "raw", None)
+            events = getattr(mneData, "events", None)
+            eventsID = getattr(mneData, "eventsID", None)
+
+            if raw is None:
+                raise ValueError("Cannot extract intervals: session.mne.raw is None. Load raw data first.")
+            if events is None:
+                raise ValueError("Cannot extract intervals: session.mne.events is None. Run configureEvents first.")
+            if eventsID is None:
+                raise ValueError("Cannot extract intervals: session.mne.eventsID is None. Run configureEvents first.")
+            if triggerSet is None:
+                raise ValueError("Cannot extract intervals: triggerSet is None. Call resolveTriggerSet first.")
+
+            reservedColumns = {"sample", "previousValue", "code", "rawLabel"}
+            availableSets = [column for column in eventsID.columns if column not in reservedColumns]
+
+            if triggerSet not in availableSets:
+                raise ValueError(f"Cannot extract intervals: unknown triggerSet {triggerSet!r}. Available trigger sets: {availableSets!r}.")
+
+            events = np.asarray(events)
+            sfreq = float(raw.info["sfreq"])
+            nSamples = int(raw.n_times)
+
+            if events.ndim != 2 or events.shape[1] != 3:
+                raise ValueError("session.mne.events must have shape (nEvents, 3).")
+            if len(events) == 0:
+                raise ValueError("Cannot extract intervals: session.mne.events contains no events.")
+            if len(eventsID) != len(events):
+                raise ValueError("session.mne.eventsID must contain one row per event in session.mne.events.")
+
+            for column in ("sample", "code"):
+                if column not in eventsID.columns:
+                    raise ValueError(f"session.mne.eventsID is missing required column {column!r}. Run configureEvents again.")
+
+            if not np.array_equal(eventsID["sample"].to_numpy(), events[:, 0]):
+                raise ValueError("session.mne.eventsID sample positions do not match session.mne.events. Run configureEvents again.")
+
+            if not np.array_equal(eventsID["code"].to_numpy(), events[:, 2]):
+                raise ValueError("session.mne.eventsID trigger codes do not match session.mne.events. Run configureEvents again.")
+
+            eventSamples = events[:, 0].astype(np.int64) - raw.first_samp
+            noiseMatches = eventsID[triggerSet].eq(noiseTriggerLabel).fillna(False).to_numpy(dtype=bool)
+
+            if np.any(np.diff(eventSamples) <= 0):
+                raise ValueError("session.mne.events must have strictly increasing sample positions.")
+
+            if np.any((eventSamples < 0) | (eventSamples >= nSamples)):
+                raise ValueError("Some events are outside session.mne.raw. Update events and their metadata for the current Raw.")
+
+            if not noiseMatches.any():
+                raise ValueError(f"Noise trigger label {noiseTriggerLabel!r} was not found in the specified triggerSet {triggerSet!r}.")
+
+            # ------------------------------------------------------------------
+            # Read excluded intervals.
+            # Attached annotation onsets include raw.first_time.
+            # Internally, stops are exclusive; returned endpoints are inclusive.
+            # ------------------------------------------------------------------
+            badIntervals = []
+
+            for onset, duration, description in zip(raw.annotations.onset, raw.annotations.duration, raw.annotations.description):
+                if description != "BAD_inter_run":
+                    continue
+
+                start = int(round((onset - raw.first_time) * sfreq))
+                stop = int(round((onset + duration - raw.first_time) * sfreq))
+
+                start = max(0, min(nSamples, start))
+                stop = max(0, min(nSamples, stop))
+
+                if start < stop:
+                    badIntervals.append((start, stop))
+
+            # Merge overlapping or touching excluded intervals.
+            mergedBad = []
+
+            for start, stop in sorted(badIntervals):
+                if mergedBad and start <= mergedBad[-1][1]:
+                    mergedBad[-1] = (mergedBad[-1][0], max(mergedBad[-1][1], stop))
+                else:
+                    mergedBad.append((start, stop))
+
+            # ------------------------------------------------------------------
+            # Runs are the complement of the excluded intervals.
+            # Without BAD_inter_run intervals, the entire recording is one run.
+            # ------------------------------------------------------------------
+            runSamples = []
+            cursor = 0
+
+            for start, stop in mergedBad:
+                if cursor < start:
+                    runSamples.append((cursor, start))
+                cursor = stop
+
+            if cursor < nSamples:
+                runSamples.append((cursor, nSamples))
+
+            # ------------------------------------------------------------------
+            # Merge consecutive matching triggers into continuous noise intervals.
+            # ------------------------------------------------------------------
+            noiseSamples = []
+            noiseStart = None
+
+            for sample, isNoise in zip(eventSamples, noiseMatches):
+                if isNoise:
+                    if noiseStart is None:
+                        noiseStart = int(sample)
+                elif noiseStart is not None:
+                    noiseSamples.append((noiseStart, int(sample)))
+                    noiseStart = None
+
+            if noiseStart is not None:
+                noiseSamples.append((noiseStart, nSamples))
+
+            # ------------------------------------------------------------------
+            # Clip noise intervals to runs.
+            # ------------------------------------------------------------------
+            clippedNoise = []
+
+            for runStart, runStop in runSamples:
+                for noiseStart, noiseStop in noiseSamples:
+                    if noiseStop <= runStart:
+                        continue
+                    if noiseStart >= runStop:
+                        break
+
+                    start = max(runStart, noiseStart)
+                    stop = min(runStop, noiseStop)
+
+                    if start < stop:
+                        clippedNoise.append((start, stop))
+
+            # Convert to seconds with inclusive endpoints.
+            runs = [(start / sfreq, (stop - 1) / sfreq) for start, stop in runSamples]
+            noiseSegments = [(start / sfreq, (stop - 1) / sfreq) for start, stop in clippedNoise]
+
+            pglMessages.message(f"Identified {len(runs)} proposed runs and {len(noiseSegments)} noise segments using label {noiseTriggerLabel!r} in triggerSet {triggerSet!r}.")
+
+            return runs, noiseSegments
+
+        def plotRunAndNoiseIntervals(self, session, runs, noiseSegments):
+            """
+            Plot previously calculated run and noise intervals.
+
+            Inputs are lists of (start, end) tuples in seconds relative to Raw start,
+            with both endpoints included.
+
+            Adds the figure to the session report if available; otherwise displays it.
+            Returns the figure.
+            """
+            import matplotlib.pyplot as plt
+            from matplotlib.patches import Patch
+
+            mneData = getattr(session, "mne", None)
+
+            if mneData is None:
+                raise ValueError("Cannot plot intervals: session.mne is None. Load raw data first.")
+
+            raw = getattr(mneData, "raw", None)
+
+            if raw is None:
+                raise ValueError("Cannot plot intervals: session.mne.raw is None. Load raw data first.")
+
+            sfreq = float(raw.info["sfreq"])
+            sampleDuration = 1.0 / sfreq
+            recordingDuration = raw.n_times / sfreq
+
+            # Add one sample to the widths because the endpoints are inclusive.
+            runBars = [(start, end - start + sampleDuration) for start, end in runs]
+            noiseBars = [(start, end - start + sampleDuration) for start, end in noiseSegments]
+
+            fig, ax = plt.subplots(figsize=(18, 4))
+
+            ax.broken_barh(runBars, (1.1, 0.6), facecolors="forestgreen", alpha=0.8)
+            ax.broken_barh(noiseBars, (0.1, 0.6), facecolors="purple", alpha=0.8)
+
+            for runIndex, (start, end) in enumerate(runs, start=1):
+                ax.text((start + end + sampleDuration) / 2, 1.4, str(runIndex), ha="center", va="center", color="white", fontsize=9)
+
+            ax.set_yticks([0.4, 1.4])
+            ax.set_yticklabels(["Noise", "Runs"])
+            ax.set_ylim(-0.2, 2.0)
+            ax.set_xlim(0, recordingDuration)
+            ax.set_xlabel("Time from recording start (s)")
+            ax.set_title("Proposed runs and noise segments")
+            ax.set_axisbelow(True)
+            ax.grid(axis="x", alpha=0.3)
+
+            runPatch = Patch(facecolor="forestgreen", alpha=0.8, label=f"Runs ({len(runs)})")
+            noisePatch = Patch(facecolor="purple", alpha=0.8, label=f"Noise segments ({len(noiseSegments)})")
+            ax.legend(handles=[runPatch, noisePatch], loc="upper right")
+
+            fig.tight_layout()
+
+            if getattr(mneData, "report", None) is not None:
+                mneData.report.add_figure(fig=fig, title="Proposed runs and noise segments")
+                plt.show()
+                plt.close(fig)
+            else:
+                plt.show()
+                
+            return fig
+        
+        def selectNoiseSegmentsForRuns(self, runs, noiseSegments):
+            """Select one noise segment per run, returning an aligned list of tuples or None."""
+            selectedNoiseSegments = []
+
+            for runIndex, (runStart, runEnd) in enumerate(runs, start=1):
+                containedSegments = [(start, end) for start, end in noiseSegments if runStart <= start and end <= runEnd]
+
+                if containedSegments:
+                    selectedSegment = containedSegments[0]
+                    reason = "selected an enclosed noise segment" if len(containedSegments) == 1 else f"selected the first of {len(containedSegments)} enclosed noise segments"
+                elif noiseSegments:
+                    selectedSegment = min(noiseSegments, key=lambda segment: max(runStart - segment[1], segment[0] - runEnd, 0.0))
+                    gap = max(runStart - selectedSegment[1], selectedSegment[0] - runEnd, 0.0)
+                    reason = f"no enclosed noise segment; selected the closest segment (gap {gap:g} s)"
+                else:
+                    selectedSegment = None
+                    reason = "no noise segments available; selected None"
+
+                selectedNoiseSegments.append(selectedSegment)
+
+                segmentText = "None" if selectedSegment is None else f"({selectedSegment[0]:g}, {selectedSegment[1]:g}) s"
+                pglMessages.message(f"Run {runIndex} ({runStart:g}, {runEnd:g}) s: {reason}; noise = {segmentText}.")
+
+            return selectedNoiseSegments
