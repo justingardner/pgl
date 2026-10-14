@@ -1044,6 +1044,36 @@ class pglMNE(pglLazyLoad, pglActionable):
             pglMessages.warning(f"Cannot create data matrix: {error}")
             return None
 
+    def displayReport(self):
+        """Save the current report as temporary HTML and open it in a browser.
+
+        Returns the HTML Path, or None if no report is attached.
+        Resolves a lazily backed report when necessary.
+
+        The temporary directory is retained so the browser can read/reload it.
+        Each call creates a new directory; successful exports are not
+        automatically removed by this method.
+        """
+        import shutil
+        from pathlib import Path
+        from tempfile import mkdtemp
+
+        report = self.report
+
+        if report is None:
+            pglMessages.warning("No MNE report is attached to this session.")
+            return None
+
+        directory = Path(mkdtemp(prefix="pgl-mne-report-"))
+        filename = directory / "report.html"
+
+        try:
+            report.save(str(filename), overwrite=False, open_browser=True)
+        except BaseException:
+            shutil.rmtree(directory, ignore_errors=True)
+            raise
+
+        return filename
 ################################################################
 #   filename: pglMNEBundle.py
 #    purpose: Save and lazily restore a complete pglMNE bundle
@@ -1904,50 +1934,194 @@ class pglMNEIO:
         cls._validateEvents(events)
         return events
 
+    @staticmethod
+    def _eventsIDDtypeRecord(dtype):
+        """Record string/object representation; leave other dtypes to Parquet."""
+        import numpy as np
+        import pandas as pd
+
+        if isinstance(dtype, pd.StringDtype):
+            missingValue = dtype.na_value
+
+            if missingValue is pd.NA:
+                missingKind = "pd.NA"
+            elif isinstance(missingValue, (float, np.floating)) and np.isnan(missingValue):
+                missingKind = "nan"
+            else:
+                raise ValueError("Unsupported eventsID string missing-value representation")
+
+            return {"kind": "string", "storage": dtype.storage, "na_value": missingKind}
+
+        if pd.api.types.is_object_dtype(dtype):
+            return {"kind": "object"}
+
+        return {"kind": "native"}
+
+    @staticmethod
+    def _eventsIDDtypeFromRecord(record):
+        """Decode a restricted dtype record without importing arbitrary types."""
+        import numpy as np
+        import pandas as pd
+
+        if not isinstance(record, dict):
+            raise ValueError("Invalid eventsID dtype metadata")
+
+        if record == {"kind": "native"}:
+            return None
+
+        if record == {"kind": "object"}:
+            return np.dtype("object")
+
+        if set(record) != {"kind", "storage", "na_value"} or record["kind"] != "string":
+            raise ValueError("Unsupported eventsID dtype metadata")
+
+        if not isinstance(record["storage"], str):
+            raise ValueError("Invalid eventsID string storage metadata")
+
+        if record["na_value"] not in ("nan", "pd.NA"):
+            raise ValueError("Unsupported eventsID string missing-value representation")
+
+        missingValue = np.nan if record["na_value"] == "nan" else pd.NA
+        return pd.StringDtype(storage=record["storage"], na_value=missingValue)
+
+    @classmethod
+    def _decodeEventsID(cls, content):
+        """Decode eventsID and restore explicit per-column and axis dtypes.
+
+        New files record object/StringDtype distinctions independently for
+        every data column, the row index, and the column-name index.
+
+        Other dtype representations remain governed by pandas/Parquet and
+        must pass strict save-time roundtrip validation.
+        """
+        import json
+        import pandas as pd
+        import pyarrow.parquet as pq
+        from io import BytesIO
+
+        parquetMetadata = pq.read_schema(BytesIO(content)).metadata or {}
+        encodedSchema = parquetMetadata.get(b"pgl.eventsID.schema.v2")
+
+        if encodedSchema is None:
+            # Compatibility with the earlier column-index-only metadata.
+            legacyMetadata = parquetMetadata.get(b"pgl.eventsID.columns.v1")
+
+            if legacyMetadata is None:
+                return pd.read_parquet(BytesIO(content), engine="pyarrow")
+
+            specification = json.loads(legacyMetadata.decode("utf-8"))
+            columnsDtype = cls._eventsIDDtypeFromRecord(specification)
+
+            if columnsDtype is None:
+                raise ValueError("Invalid legacy eventsID column-index metadata")
+
+            with pd.option_context("future.infer_string", False):
+                restored = pd.read_parquet(BytesIO(content), engine="pyarrow")
+                restored.columns = pd.Index(restored.columns.tolist(), dtype=columnsDtype, name=restored.columns.name)
+
+            return restored
+
+        schema = json.loads(encodedSchema.decode("utf-8"))
+
+        if not isinstance(schema, dict) or set(schema) != {"version", "data", "index", "columns"}:
+            raise ValueError("Invalid eventsID schema metadata")
+
+        if type(schema["version"]) is not int or schema["version"] != 2:
+            raise ValueError("Unsupported eventsID schema version")
+
+        if not isinstance(schema["data"], list):
+            raise ValueError("Invalid eventsID data-column metadata")
+
+        dataDtypes = [cls._eventsIDDtypeFromRecord(record) for record in schema["data"]]
+        indexDtype = cls._eventsIDDtypeFromRecord(schema["index"])
+        columnsDtype = cls._eventsIDDtypeFromRecord(schema["columns"])
+
+        with pd.option_context("future.infer_string", False):
+            restored = pd.read_parquet(BytesIO(content), engine="pyarrow")
+
+            if isinstance(restored.index, pd.MultiIndex) or isinstance(restored.columns, pd.MultiIndex):
+                raise ValueError("eventsID schema v2 does not support MultiIndex axes")
+
+            if len(dataDtypes) != len(restored.columns):
+                raise ValueError("eventsID schema does not match the number of data columns")
+
+            # Positional replacement avoids ambiguity and installs the actual
+            # restored dtype rather than assigning into an existing dtype.
+            for position, dtype in enumerate(dataDtypes):
+                if dtype is not None:
+                    restored.isetitem(position, restored.iloc[:, position].astype(dtype))
+
+            if indexDtype is not None:
+                restored.index = pd.Index(restored.index.tolist(), dtype=indexDtype, name=restored.index.name)
+
+            if columnsDtype is not None:
+                restored.columns = pd.Index(restored.columns.tolist(), dtype=columnsDtype, name=restored.columns.name)
+
+        return restored
+
     @classmethod
     def saveEventsID(cls, eventsID, dataPath, filesystem=None):
-        """Encode a supported DataFrame and check fidelity before writing."""
-        from io import BytesIO
+        """Save eventsID with explicit string/object dtype metadata.
+
+        Records dtype distinctions for data columns and both axes.
+        Does not modify the caller's DataFrame.
+
+        Other representations must survive the native Parquet roundtrip.
+        Rejects unsupported/lossy results before writing the payload bundle.
+        """
+        import json
         import pandas as pd
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from io import BytesIO
 
         if not isinstance(eventsID, pd.DataFrame):
             raise TypeError("eventsID must be a pandas DataFrame")
+
+        if isinstance(eventsID.index, pd.MultiIndex) or isinstance(eventsID.columns, pd.MultiIndex):
+            raise ValueError("eventsID schema v2 does not support MultiIndex axes")
+
         if not eventsID.columns.is_unique or not all(isinstance(name, str) for name in eventsID.columns):
             raise ValueError("eventsID requires unique string column names")
+
         if eventsID.attrs:
             raise ValueError("eventsID.attrs persistence is not implemented; refusing to omit it")
 
-        # Preserve RangeIndex as metadata; store other index types normally.
+        schema = {
+            "version": 2,
+            "data": [cls._eventsIDDtypeRecord(dtype) for dtype in eventsID.dtypes],
+            "index": cls._eventsIDDtypeRecord(eventsID.index.dtype),
+            "columns": cls._eventsIDDtypeRecord(eventsID.columns.dtype),
+        }
+
+        # Keep pandas' metadata for native dtypes and index reconstruction.
+        # Add the explicit string/object distinctions pandas may otherwise infer.
+        table = pa.Table.from_pandas(eventsID, preserve_index=None)
+        metadata = dict(table.schema.metadata or {})
+        metadata[b"pgl.eventsID.schema.v2"] = json.dumps(schema, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        table = table.replace_schema_metadata(metadata)
+
         buffer = BytesIO()
-        eventsID.to_parquet(buffer, engine="pyarrow", index=None)
+        pq.write_table(table, buffer, compression="snappy")
         content = buffer.getvalue()
-        restored = pd.read_parquet(BytesIO(content), engine="pyarrow")
+
+        # Validate using precisely the same decoder as normal loading.
+        restored = cls._decodeEventsID(content)
 
         try:
-            pd.testing.assert_frame_equal(
-                eventsID, restored,
-                check_dtype=True,
-                check_index_type=True,
-                check_column_type=True,
-                check_exact=True,
-                check_categorical=True,
-                check_flags=True,
-            )
+            pd.testing.assert_frame_equal(eventsID, restored, check_dtype=True, check_index_type=True, check_column_type=True, check_exact=True, check_categorical=True, check_flags=True)
         except AssertionError as error:
-            raise ValueError("eventsID cannot be preserved exactly by this Parquet codec") from error
+            raise ValueError(f"eventsID cannot be preserved exactly by this Parquet codec: {error}") from error
 
-        return cls._saveBytesBundle(
-            content, dataPath, filesystem,
-            kind="eventsID", formatName="parquet", entrypoint="eventsID.parquet",
-        )
+        return cls._saveBytesBundle(content, dataPath, filesystem, kind="eventsID", formatName="parquet", entrypoint="eventsID.parquet")
 
-    @staticmethod
-    def loadEventsID(backing):
-        from io import BytesIO
-        import pandas as pd
+    @classmethod
+    def loadEventsID(cls, backing):
+        """Read verified eventsID bytes and restore the recorded schema."""
+        with backing.open("rb") as source:
+            content = source.read()
 
-        with backing.open("rb") as source: content = source.read()
-        return pd.read_parquet(BytesIO(content), engine="pyarrow")
+        return cls._decodeEventsID(content)
     
     @classmethod
     def _saveAnalysisObject(cls, value, dataPath, filesystem, *, kind):
