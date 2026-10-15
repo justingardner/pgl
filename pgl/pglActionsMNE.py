@@ -15,10 +15,11 @@ import numpy as np
 from numbers import Integral
 import matplotlib.pyplot as plt
 from fsspec import AbstractFileSystem
-from traitlets import HasTraits, Enum, Float, Int, List, Tuple, TraitError, Unicode, Dict, default, link, Bool, TraitType, Instance
+from traitlets import HasTraits, Enum, Float, Int, List, Tuple, TraitError, Unicode, Dict, default, link, Bool, TraitType, Instance, Union
 import pandas as pd
 from .pglExperiment import pglEventTrial, pglEventSegment
 from tqdm.auto import tqdm
+from typing import Callable
 
 class pglActionsMNE(pglActionCollection):
     
@@ -3092,13 +3093,84 @@ class pglActionsMNE(pglActionCollection):
         center1 = Instance(np.ndarray, default_value=np.zeros(3), help="Center of first expansion sphere returned by FIT_SPHERES_TO_MRI (defaults to zeros / i.e. origin of sensor space)")
         center2 = Instance(np.ndarray, default_value=np.zeros(3), help="Center of second expansion sphere returned by FIT_SPHERES_TO_MRI (defaults to zeros / i.e. origin of sensor space)")
         doFosters = Bool(True, help="Whether to apply Foster's inverse method")
-        noiseTmin = Float(0.0, help="Start time (in seconds, relative to start of recording) for computing noise covariance for Foster's inverse method")
-        noiseTmax = Float(1.0, help="End time (in seconds, relative to start of recording) for computing noise covariance for Foster's inverse method") 
         doMultiOrigin = Bool(False, help="Whether to use multi-origin SSS")
         Lin = Int(8, help="Vector spherical harmonic inner truncation order (default is 8) - signals inside that will be kept by the method")
         Lout = Int(3, help="Vector spherical harmonic outer truncation order (default is 3) - signals outside that will be removed by the method")
+        runTmin = Union([Float(), List(Float(allow_none=True))], default_value=0.0, allow_none=True, help="Run start time(s) in seconds relative to recording start. None means recording start.")
+        runTmax = Union([Float(), List(Float(allow_none=True))], default_value=None, allow_none=True, help="Run end time(s) in seconds relative to recording start. None means recording end.")
+        noiseTmin = Union([Float(), List(Float(allow_none=True))], default_value=0.0, allow_none=True, help="Noise covariance start time(s) in seconds relative to recording start. None means recording start.")
+        noiseTmax = Union([Float(), List(Float(allow_none=True))], default_value=1.0, allow_none=True, help="Noise covariance end time(s) in seconds relative to recording start. None means recording end.")
+
+        def configure(self, runTmin=None, runTmax=None, noiseTmin=None, noiseTmax=None, **kwargs):
+            """Keep all-None inputs for session discovery; otherwise normalize intervals to lists."""
+            import math
+            from numbers import Real
+
+            parameters = {"runTmin": runTmin, "runTmax": runTmax, "noiseTmin": noiseTmin, "noiseTmax": noiseTmax}
+
+            # All None means interval discovery will happen in _run.
+            if all(value is None for value in parameters.values()):
+                normalizedParameters = parameters.copy()
+            else:
+                # Determine interval count from explicit lists.
+                listLengths = {}
+
+                for parameterName, value in parameters.items():
+                    if isinstance(value, list):
+                        if not value:
+                            self.setError(f"{parameterName} must not be an empty list.")
+                            return
+                        listLengths[parameterName] = len(value)
+
+                if len(set(listLengths.values())) > 1:
+                    lengthSummary = ", ".join(f"{name}={length}" for name, length in listLengths.items())
+                    self.setError(f"All interval parameter lists must have the same length. Received: {lengthSummary}.")
+                    return
+
+                nIntervals = next(iter(listLengths.values()), 1)
+
+                # Broadcast scalars and None; validate and copy explicit lists.
+                normalizedParameters = {}
+
+                for parameterName, value in parameters.items():
+                    values = list(value) if isinstance(value, list) else [value] * nIntervals
+                    normalizedValues = []
+
+                    for intervalIndex, item in enumerate(values, start=1):
+                        if item is not None:
+                            if isinstance(item, bool) or not isinstance(item, Real):
+                                self.setError(f"{parameterName}, interval {intervalIndex}: expected a number or None, received {item!r}.")
+                                return
+
+                            item = float(item)
+
+                            if not math.isfinite(item) or item < 0:
+                                self.setError(f"{parameterName}, interval {intervalIndex}: expected a finite, non-negative time, received {item!r}.")
+                                return
+
+                        normalizedValues.append(item)
+
+                    normalizedParameters[parameterName] = normalizedValues
+
+                # In list mode, None starts mean recording start.
+                # None ends are resolved against the recording during execution.
+                for intervalName, startName, endName in (("run", "runTmin", "runTmax"), ("noise", "noiseTmin", "noiseTmax")):
+                    for intervalIndex, (start, end) in enumerate(zip(normalizedParameters[startName], normalizedParameters[endName]), start=1):
+                        effectiveStart = 0.0 if start is None else start
+
+                        if end is not None and end < effectiveStart:
+                            self.setError(f"Invalid {intervalName} interval {intervalIndex}: {endName} ({end}) must be >= {startName} ({effectiveStart}).")
+                            return
+
+            # Store only after interval validation succeeds.
+            for parameterName, values in normalizedParameters.items(): setattr(self, parameterName, values)
+
+            # Configure any remaining action parameters.
+            self.configureTraits(**kwargs)
+
+            super().configure()
         
-        def _run(self, session:pglSession) -> pglSession:
+        def _run(self, session: pglSession, mSSSFosters: Callable) -> pglSession:
             import numpy as np
             import mne
 
@@ -3126,21 +3198,91 @@ class pglActionsMNE(pglActionCollection):
                 return (types == "mag").astype(int)
             
             # get the channel types from the data
-            channelTypes = getChannelTypes(session.raw)
+            channelTypes = getChannelTypes(session.mne.raw)
             if channelTypes is None:
                 self.setError("Failed to get channel types from raw data")
-                return
+                return None
             
             
+            # get the run and noise boundaries
+            # interval parameters are None.
+            if all(value is None for value in (self.runTmin, self.runTmax, self.noiseTmin, self.noiseTmax)):
+                derivedParameters = session.mne.derivedParameters
+
+                if derivedParameters is None or "runAndNoiseIntervals" not in derivedParameters:
+                    self.setError("Run and noise intervals not found in derived parameters. Run getRunAndNoiseBoundaries first.")
+                    return None
+
+                intervals = derivedParameters["runAndNoiseIntervals"]
+                runs = intervals.get("runs")
+                selectedNoiseSegments = intervals.get("selectedNoiseSegments")
+
+                if runs is None or len(runs) == 0:
+                    self.setError("No run intervals found in derived parameters.")
+                    return None
+
+                if selectedNoiseSegments is None or len(selectedNoiseSegments) != len(runs):
+                    self.setError("Derived parameters must contain one selected noise segment per run.")
+                    return None
+
+                missingNoise = [index for index, segment in enumerate(selectedNoiseSegments, start=1) if segment is None]
+
+                if missingNoise:
+                    self.setError(f"No selected noise segment available for run(s): {missingNoise}.")
+                    return None
+
+                # Build aligned lists: entry i describes run i and its selected noise.
+                self.runTmin = [start for start, end in runs]
+                self.runTmax = [end for start, end in runs]
+                self.noiseTmin = [start for start, end in selectedNoiseSegments]
+                self.noiseTmax = [end for start, end in selectedNoiseSegments]
+                
+                # Run boundaries may default to the beginning/end of the current Raw.
+                lastTime = float(session.mne.raw.times[-1])
+                self.runTmin = [0.0 if value is None else value for value in self.runTmin]
+                self.runTmax = [lastTime if value is None else value for value in self.runTmax]
+
+                # Noise boundaries must both be explicitly available.
+                for intervalIndex, (start, end) in enumerate(zip(self.noiseTmin, self.noiseTmax), start=1):
+                    if start is None or end is None:
+                        self.setError(f"Noise interval {intervalIndex}: noiseTmin and noiseTmax must both be specified; received ({start}, {end}).")
+                        return None
+                    
             try:
-                # run xan's apply_preprocessing function with Foster's inverse method
-                self.mne.raw = apply_preprocessing(self.center1, self.center2, self.mne.raw, self.doFosters, self.noiseTmin, self.noiseTmax, self.doMultiOrigin, channelTypes, self.Lin, self.Lout)
+                # make a copy of the source raw data to avoid modifying the original
+                sourceRaw = session.mne.raw
+                sourceRaw.load_data()
+                outputRaw = sourceRaw.copy()
+                megPicks = mne.pick_types(sourceRaw.info, meg=True)
+
+                for iRun, (runStart, runEnd, noiseStart, noiseEnd) in enumerate(zip(self.runTmin, self.runTmax, self.noiseTmin, self.noiseTmax), start=1):
+                    pglMessages.printHeader(f"Fostering run {iRun}/{len(self.runTmin)}")
+                    pglMessages.print(f"Run {iRun}: {runStart} - {runEnd} (noise {noiseStart} - {noiseEnd})")
+                    processedRaw = mSSSFosters(
+                        center1=self.center1,
+                        center2=self.center2,
+                        raw=sourceRaw,
+                        do_fos=self.doFosters,
+                        Ntmin=noiseStart,
+                        Ntmax=noiseEnd,
+                        do_msss=self.doMultiOrigin,
+                        ch_types=channelTypes,
+                        Lin=self.Lin,
+                        Lout=self.Lout,
+                        run_tmin=runStart,
+                        run_tmax=runEnd,
+                    )
+
+                    start = int(sourceRaw.time_as_index(runStart, use_rounding=True)[0])
+                    stop = int(sourceRaw.time_as_index(runEnd, use_rounding=True)[0]) + 1
+                    outputRaw._data[megPicks, start:stop] = processedRaw._data[megPicks, start:stop]
+
+                session.mne.raw = outputRaw
             except Exception as e:
                 self.setError(f"Error running mSSS Foster's inverse method: {str(e)}")
                 return None
 
             return session
-
 
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
     # set run and noise boundaries for running mSSS with Fosters
