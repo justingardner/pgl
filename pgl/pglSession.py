@@ -2267,8 +2267,8 @@ class pglSession(pglActionable):
 
     filesystem = Instance(AbstractFileSystem, allow_none=True, serialize=False, help="Filesystem for serialization")
     filesystemPrefix = Unicode(allow_none=True, default_value="", help="Filesystem protocol prefix", visible=False)
-    sessionID = Int(default_value=None, allow_none=True, help="Source database checkpoint ID assigned by loadSession").tag(serialize=False)
-
+    sessionID = Int(default_value=None, allow_none=True, help="Most recently loaded or successfully saved database checkpoint ID", serialize=False)
+    description = Unicode(default_value=None, allow_none=True, help="Checkpoint description carried forward by saveSession; an empty string clears it.", serialize=False)
     runs = List(Instance(pglRun), allow_none=True, help="List of behavioral runs")
     mne = Instance(pglMNE, allow_none=True, help="MEG/EEG data")
 
@@ -2472,10 +2472,10 @@ class pglSession(pglActionable):
         return sessionID
     
     def print(self, verbose=False):
-        """Print the session overview, experiment/subject pairs, and runs.
+        """Print the session overview, description, labels, and runs.
 
         Resolves behavioral experiment settings to display current labels.
-        Does not load MNE payloads.
+        Does not load MNE payloads or query the database.
         """
         pglMessages.printHeader("Session")
 
@@ -2486,10 +2486,14 @@ class pglSession(pglActionable):
 
         information = {
             "Source checkpoint": self.sessionID if self.sessionID is not None else "Not set",
-            "Runs": len(self.runs or []),
-            "Filesystem": protocol or "Not set",
-            "MEG/EEG data": "Attached" if self.mne is not None else "None",
         }
+
+        if self.description is not None and self.description.strip():
+            information["Description"] = self.description.replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t")
+
+        information["Runs"] = len(self.runs or [])
+        information["Filesystem"] = protocol or "Not set"
+        information["MEG/EEG data"] = "Attached" if self.mne is not None else "None"
 
         labelWidth = max(len(label) for label in information)
 
@@ -2529,58 +2533,27 @@ class pglSession(pglActionable):
 
     @classmethod
     def loadSession(cls, sessionID, *, settings=None, settingsName=None, storageOptionsByBackend=None, sslRootCert=None, includeDeleted=False, cacheDirectory=None, directLocalPolicy="materialize"):
-        """Load a checkpoint and remember its ID as the default derived parent.
+        """Load through pglStorage, including checkpoint ID and description.
 
-        For MNE checkpoints, cacheDirectory overrides settings.cacheDir.
-        Cache directories are created only when materialization is needed.
-
-        directLocalPolicy='immutable' requires source files and resolved paths
-        to remain unchanged and available while readers use them.
+        cacheDirectory overrides settings.cacheDir for MNE checkpoints.
+        directLocalPolicy='immutable' requires source paths and files to
+        remain unchanged and available while readers use them.
 
         includeDeleted permits inspection without undeleting the checkpoint.
-        Deleted checkpoints cannot be parents until restored.
         """
         from .pglStorage import pglStorage
 
-        session = pglStorage.loadSession(sessionID, settings=settings, settingsName=settingsName, storageOptionsByBackend=storageOptionsByBackend, sslRootCert=sslRootCert, includeDeleted=includeDeleted, cacheDirectory=cacheDirectory, directLocalPolicy=directLocalPolicy)
-
-        if session is not None:
-            session.sessionID = sessionID
-
-        return session
+        return pglStorage.loadSession(sessionID, settings=settings, settingsName=settingsName, storageOptionsByBackend=storageOptionsByBackend, sslRootCert=sslRootCert, includeDeleted=includeDeleted, cacheDirectory=cacheDirectory, directLocalPolicy=directLocalPolicy)
 
     def saveSession(self, *, parentSessionID=None, settings=None, settingsName=None, backendID=None, description=None, ingestMethod="manual", storageOptions=None, sslRootCert=None):
-        """Save current contents and history as a new derived checkpoint.
+            """Save through pglStorage.
 
-        Defaults parentSessionID to the most recently loaded or successfully
-        saved checkpoint. An explicit parentSessionID overrides that default.
+            Defaults to the session's current checkpoint as parent.
+            description=None carries forward the session's description.
+            An explicit blank description clears it.
 
-        Sessions created entirely in memory require an explicit parent.
-        Use saveRawSession() to create a parentless root.
+            Storage updates sessionID and description after successful completion.
+            """
+            from .pglStorage import pglStorage
 
-        Returns the new checkpoint ID, or None for missing-parent rejection,
-        unavailable configuration, or connection cancellation.
-
-        After a successful save, self.sessionID becomes the new checkpoint ID,
-        so subsequent saves form a chain rather than sibling checkpoints.
-        Failure or cancellation leaves self.sessionID unchanged.
-
-        Accumulated action history is retained, not cleared by this wrapper.
-        """
-        from .pglStorage import pglStorage
-
-        resolvedParentID = self.sessionID if parentSessionID is None else parentSessionID
-
-        if resolvedParentID is None:
-            pglMessages.warning("Cannot save session: this session has no loaded or saved source checkpoint. Use saveRawSession() to create a parentless root, or supply parentSessionID.", level=2)
-            return None
-
-        if type(resolvedParentID) is not int or not 0 <= resolvedParentID <= 9223372036854775807:
-            raise ValueError("parentSessionID must be a nonnegative PostgreSQL bigint.")
-
-        sessionID = pglStorage.saveSession(self, parentSessionID=resolvedParentID, settings=settings, settingsName=settingsName, backendID=backendID, description=description, ingestMethod=ingestMethod, storageOptions=storageOptions, sslRootCert=sslRootCert)
-
-        if sessionID is not None:
-            self.sessionID = sessionID
-
-        return sessionID
+            return pglStorage.saveSession(self, parentSessionID=parentSessionID, settings=settings, settingsName=settingsName, backendID=backendID, description=description, ingestMethod=ingestMethod, storageOptions=storageOptions, sslRootCert=sslRootCert)

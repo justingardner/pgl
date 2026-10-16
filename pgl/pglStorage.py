@@ -197,10 +197,10 @@ class pglStorage:
 
     @staticmethod
     def _sessionLineageLines(records):
-        """Format a visible forest with arrows aligned to their parent edges.
+        """Format a visible checkpoint forest with descriptions.
 
-        records is a mapping from session ID to metadata dictionaries.
         Hidden/missing parents are not bypassed by artificial arrows.
+        Descriptions are rendered on one line without truncation.
         Iterative traversal avoids Python recursion limits.
         """
         children = {sessionID: [] for sessionID in records}
@@ -228,6 +228,11 @@ class pglStorage:
             if record["status"] != "complete":
                 label += f" [{pglStorage._printValue(record['status'])}]"
 
+            description = record.get("description")
+
+            if description:
+                label += " (" + pglStorage._printValue(description) + ")"
+
             return label
 
         def appendTree(startID, prefix):
@@ -249,8 +254,6 @@ class pglStorage:
                         lines.append(line)
                         break
 
-                    # Every sibling's arrow starts at the same character
-                    # position as the first child's arrow.
                     branchPrefix = " " * (len(line) + 1) + "-> "
 
                     for childID in reversed(descendants[1:]):
@@ -271,10 +274,98 @@ class pglStorage:
             raise ValueError("Session lineage contains a cycle with no visible root.")
 
         return lines
+    
+    @classmethod
+    def setSessionDescription(cls, sessionID, description, *, settings=None, settingsName=None, sslRootCert=None):
+        """Set or clear an active saved checkpoint's description.
 
+        Accepts raw and derived checkpoints.
+        None or blank text clears the description.
+
+        Updates only database metadata, not payloads, manifest identity,
+        lineage, or saved action history. Previous descriptions are not
+        retained by this method.
+
+        Returns True for a committed change, False for an unchanged,
+        unknown, or deleted checkpoint, and None for invalid arguments,
+        unavailable configuration/connection, or database failure.
+        """
+        from .pglPostgres import pglPostgres
+
+        if type(sessionID) is not int or not 0 <= sessionID <= 9223372036854775807:
+            pglMessages.warning("sessionID must be a nonnegative PostgreSQL bigint.", level=1)
+            return None
+
+        if description is not None and (not isinstance(description, str) or "\x00" in description):
+            pglMessages.warning("description must be a string without NUL, or None.", level=1)
+            return None
+
+        if description is not None:
+            description = description.strip() or None
+
+        try:
+            try:
+                postgres = pglPostgres.fromSettings(settings=settings, settingsName=settingsName)
+            except (TypeError, ValueError) as error:
+                pglMessages.warning(f"Cannot update session description: invalid settings or configuration: {error}", level=1)
+                return None
+
+            if postgres is None:
+                return None
+
+            table = sql.Identifier(postgres.databaseSchema, "session")
+
+            with postgres.connect(sslRootCert=sslRootCert) as connection:
+                if connection is None:
+                    return None
+
+                with connection.transaction():
+                    statement = sql.SQL("SELECT description, deleted_at FROM {} WHERE session_id = %s FOR UPDATE").format(table)
+                    record = connection.execute(statement, (sessionID,)).fetchone()
+
+                    if record is None:
+                        outcome = "unknown"
+                    elif record[1] is not None:
+                        outcome = "deleted"
+                    elif record[0] == description:
+                        outcome = "unchanged"
+                    else:
+                        statement = sql.SQL("UPDATE {} SET description = %s WHERE session_id = %s RETURNING description").format(table)
+                        updated = connection.execute(statement, (description, sessionID)).fetchone()
+
+                        if updated != (description,):
+                            raise RuntimeError("The database did not apply the requested description.")
+
+                        outcome = "updated"
+
+        except psycopg.Error as error:
+            pglMessages.warning(f"Could not update description for session {sessionID}: {error}. If the connection failed during commit, check the saved description before retrying.", level=2)
+            return None
+
+        if outcome == "unknown":
+            pglMessages.warning(f"Unknown session: {sessionID}", level=0)
+            return False
+
+        if outcome == "deleted":
+            pglMessages.warning(f"Cannot change the description of deleted session {sessionID}. Undelete it first.", level=2)
+            return False
+
+        if outcome == "unchanged":
+            pglMessages.message(f"Session {sessionID} already has that description; nothing changed.")
+            return False
+
+        if description is None:
+            pglMessages.message(f"Description cleared for session {sessionID}.")
+        else:
+            pglMessages.message(f"Description updated for session {sessionID}: {cls._printValue(description)}", wrapText=False)
+
+        return True
+    
     @staticmethod
     def printSessions(postgres=None, *, settings=None, settingsName=None, sslRootCert=None, includeDeleted=False, storageOptionsByBackend=None):
         """Print sessions grouped by root experiment and subject.
+
+        Shows checkpoint descriptions alongside IDs and lineage.
 
         Uses recorded root-session labels when available.
         Older behavioral roots fall back to verified experimentSettings.json.
@@ -316,11 +407,11 @@ class pglStorage:
                     cursor.execute("SELECT current_database(), transaction_timestamp()")
                     databaseName, snapshotTime = cursor.fetchone()
 
-                    statement = sql.SQL("SELECT session_id, parent_session_id, root_session_id, origin, status, deleted_at, meta FROM {} WHERE (%s OR deleted_at IS NULL) ORDER BY session_id").format(sessionsTable)
+                    statement = sql.SQL("SELECT session_id, parent_session_id, root_session_id, origin, status, deleted_at, meta, description FROM {} WHERE (%s OR deleted_at IS NULL) ORDER BY session_id").format(sessionsTable)
                     cursor.execute(statement, (includeDeleted,))
 
-                    for sessionID, parentID, rootID, origin, status, deletedAt, meta in cursor.fetchall():
-                        records[sessionID] = {"session_id": sessionID, "parent_session_id": parentID, "root_session_id": rootID, "origin": origin, "status": status, "deleted_at": deletedAt, "meta": meta}
+                    for sessionID, parentID, rootID, origin, status, deletedAt, meta, description in cursor.fetchall():
+                        records[sessionID] = {"session_id": sessionID, "parent_session_id": parentID, "root_session_id": rootID, "origin": origin, "status": status, "deleted_at": deletedAt, "meta": meta, "description": description}
 
                     rootIDs = {record["root_session_id"] for record in records.values()}
                     fallbackRoots = []
@@ -2168,6 +2259,8 @@ class pglStorage:
         """Load a completed raw or derived checkpoint.
 
         Supports behavioral-only, MNE-only, and mixed checkpoints.
+        Restores sessionID and description from database metadata,
+        separately from scientific payloads and action history.
 
         MNE cache precedence: explicit cacheDirectory, otherwise settings.cacheDir.
         Cache directories are created only when materialization is needed.
@@ -2226,10 +2319,10 @@ class pglStorage:
                 with connection.transaction():
                     connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
                     table = sql.Identifier(postgres.databaseSchema, "session")
-                    checkpoint = connection.execute(sql.SQL("SELECT origin, contract_version FROM {} WHERE session_id = %s AND (%s OR deleted_at IS NULL)").format(table), (sessionID, includeDeleted)).fetchone()
+                    checkpoint = connection.execute(sql.SQL("SELECT origin, contract_version, description FROM {} WHERE session_id = %s AND (%s OR deleted_at IS NULL)").format(table), (sessionID, includeDeleted)).fetchone()
 
                     if checkpoint is not None:
-                        origin, contractVersion = checkpoint
+                        origin, contractVersion, description = checkpoint
                         loadOptions = {"storageOptionsByBackend": storageOptionsByBackend, "includeDeleted": includeDeleted}
 
                         if (origin, contractVersion) == ("raw", "pgl.raw.behavior.v1"):
@@ -2258,6 +2351,9 @@ class pglStorage:
             reason = "Unknown checkpoint" if includeDeleted else "Unknown or deleted checkpoint"
             pglMessages.warning(f"{reason}: {sessionID}", level=0)
             return None
+
+        session.sessionID = sessionID
+        session.description = checkpoint[2]
 
         pglMessages.message(f"Loaded {checkpoint[0]} checkpoint {sessionID}; backed fields will load on demand.")
         return session
@@ -2417,32 +2513,51 @@ class pglStorage:
                 return sessionID
 
     @classmethod
-    def saveSession(cls, session, *, parentSessionID, settings=None, settingsName=None, backendID=None, description=None, ingestMethod="manual", storageOptions=None, sslRootCert=None):
-        """Save current contents and history as a new derived checkpoint.
+    def saveSession(cls, session, *, parentSessionID=None, settings=None, settingsName=None, backendID=None, description=None, ingestMethod="manual", storageOptions=None, sslRootCert=None):
+        """Save current contents and history as a derived checkpoint.
 
-        Requires an explicit completed, active parentSessionID.
+        Defaults parentSessionID to session.sessionID.
+        description=None uses session.description.
+        An explicit string overrides it; blank text clears the description.
+        An explicit parent does not replace the in-memory description.
+
         Resolves username, database, and default payload storage from settings.
 
-        Returns the completed checkpoint ID, or None when configuration
-        is missing or connection/password entry is cancelled.
+        Returns the new or reused checkpoint ID, or None for missing-parent
+        rejection, unavailable configuration, or connection cancellation.
 
-        Each call creates a new derived checkpoint.
+        After commit and connection cleanup, updates session.sessionID and
+        session.description. Earlier failure or cancellation leaves those
+        fields unchanged by this method.
+
         Database changes are transactional; payload writes are not.
         Failed saves may leave unregistered files. Other errors propagate.
-        Success is reported only after commit and connection cleanup.
+        Accumulated action history is retained.
         """
         from time import perf_counter
         from .pglPostgres import pglPostgres
         from .pglSettings import pglSettingsManager
 
-        for label, value in (("parentSessionID", parentSessionID), ("backendID", backendID)):
+        resolvedParentID = session.sessionID if parentSessionID is None else parentSessionID
+
+        if resolvedParentID is None:
+            pglMessages.warning("Cannot save session: this session has no loaded or saved source checkpoint. Use saveRawSession() to create a parentless root, or supply parentSessionID.", level=2)
+            return None
+
+        for label, value in (("parentSessionID", resolvedParentID), ("backendID", backendID)):
             if label == "backendID" and value is None:
                 continue
-            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 9223372036854775807:
+            if type(value) is not int or not 0 <= value <= 9223372036854775807:
                 raise ValueError(f"{label} must be a nonnegative PostgreSQL bigint.")
 
-        if description is not None and (not isinstance(description, str) or "\x00" in description):
-            raise ValueError("description must be a string without NUL, or None.")
+        resolvedDescription = session.description if description is None else description
+
+        if resolvedDescription is not None:
+            if not isinstance(resolvedDescription, str) or "\x00" in resolvedDescription:
+                raise ValueError("description must be a string without NUL, or None.")
+
+            if not resolvedDescription.strip():
+                resolvedDescription = None
 
         if not isinstance(ingestMethod, str) or ingestMethod not in {"manual", "automated"}:
             raise ValueError("ingestMethod must be manual or automated.")
@@ -2484,14 +2599,19 @@ class pglStorage:
                 pglMessages.message("Saving session: resolving checkpoint owner...")
                 createdBy = cls.getOrCreateUser(connection, postgres, username)
 
-                pglMessages.message("Saving session: creating checkpoint and saving contents...")
+                pglMessages.message("Saving session: checking current contents and preparing checkpoint...")
                 contentsStarted = perf_counter()
-                sessionID = cls._saveDerivedSession(connection, postgres, session, createdBy, backendID, parentSessionID=parentSessionID, description=description, ingestMethod=ingestMethod, storageOptions=storageOptions)
+                sessionID = cls._saveDerivedSession(connection, postgres, session, createdBy, backendID, parentSessionID=resolvedParentID, description=resolvedDescription, ingestMethod=ingestMethod, storageOptions=storageOptions)
 
-                pglMessages.message(f"Saving session: contents saved ({perf_counter() - contentsStarted:.1f} s); committing checkpoint...")
+                pglMessages.message(f"Saving session: checkpoint ready ({perf_counter() - contentsStarted:.1f} s); committing transaction...")
+
+        # Synchronize only after commit and connection cleanup.
+        session.sessionID = sessionID
+        session.description = resolvedDescription
 
         pglMessages.message(f"Checkpoint {sessionID} is complete. Database configuration: {databasePath} (database={postgres.databaseName}, schema={postgres.databaseSchema}; {perf_counter() - saveStarted:.1f} s total).", wrapText=False)
         return sessionID
+    
     
     @classmethod
     def loadRawSession(cls, connection, postgres, sessionID, storageOptionsByBackend=None, *, includeDeleted=False):
