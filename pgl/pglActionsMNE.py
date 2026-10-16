@@ -2850,6 +2850,9 @@ class pglActionsMNE(pglActionCollection):
                 fig.subplots_adjust(left=0.07, right=0.98, bottom=0.08, top=0.90, hspace=0.35)
 
                 plt.show()
+                
+                session.mne.report.add_figure(fig=fig, title=f"NCSNR: {self.set} = {self.label} | condition IDs from {self.conditionIDColumn}")
+
 
             return session
  
@@ -3258,6 +3261,7 @@ class pglActionsMNE(pglActionCollection):
                 for iRun, (runStart, runEnd, noiseStart, noiseEnd) in enumerate(zip(self.runTmin, self.runTmax, self.noiseTmin, self.noiseTmax), start=1):
                     pglMessages.printHeader(f"Fostering run {iRun}/{len(self.runTmin)}")
                     pglMessages.print(f"Run {iRun}: {runStart} - {runEnd} (noise {noiseStart} - {noiseEnd})")
+                    diagnostics = {}
                     processedRaw = mSSSFosters(
                         center1=self.center1,
                         center2=self.center2,
@@ -3271,8 +3275,11 @@ class pglActionsMNE(pglActionCollection):
                         Lout=self.Lout,
                         run_tmin=runStart,
                         run_tmax=runEnd,
+                        diagnostics=diagnostics,
                     )
-
+                    fig, summary = self.plotMsssDiagnostics(sourceRaw, diagnostics, noiseTmin=noiseStart, noiseTmax=noiseEnd, dataLabel="Before preprocessing")
+                    session.mne.report.add_figure(fig=fig, title="Power spectrum", section="Xan's mSSS with Fosters")
+                    
                     start = int(sourceRaw.time_as_index(runStart, use_rounding=True)[0])
                     stop = int(sourceRaw.time_as_index(runEnd, use_rounding=True)[0]) + 1
                     outputRaw._data[megPicks, start:stop] = processedRaw._data[megPicks, start:stop]
@@ -3283,6 +3290,750 @@ class pglActionsMNE(pglActionCollection):
                 return None
 
             return session
+        
+        def plotMsssDiagnostics(
+                self,
+                raw,
+                diagnostics,
+                *,
+                noiseCov=None,
+                noiseTmin=None,
+                noiseTmax=None,
+                dataLabel="Original recording",
+                nCols=6,
+                chunkSeconds=20.0,
+                spectrumScale="log",
+                basisMagScale=None,
+                whitenRcond=1e-10,
+                pinvRcond=1e-10,
+                topoLogFloor=None,
+                show=True,
+            ):
+                """
+                Plot noise-whitened joint internal/external RMS diagnostics.
+
+                Display conventions
+                -------------------
+                Spectrum:
+                    Coefficient RMS divided by the largest coefficient RMS across
+                    BOTH internal and external modes.
+
+                Topomaps:
+                    Each spatial pattern is normalized to peak absolute magnitude 1,
+                    then multiplied by its relative RMS coefficient.
+
+                    Therefore:
+                        max(abs(displayedMap[:, j])) == relativeRmsWeights[j]
+
+                    Topomap colors are dimensionless, not fT.
+
+                    Positive and negative magnitudes use a symmetric-log scale.
+                    Above topoLogFloor, successive decades are equally spaced on
+                    the colorbar. A small linear region surrounds zero.
+
+                Covariance:
+                    Original magnetometer covariance block in fT², using RdBu_r
+                    and its own symmetric-log normalization, independent of maps.
+
+                Parameters
+                ----------
+                raw : mne.io.BaseRaw
+                    Original recording to inspect input activity, or processed
+                    recording to inspect remaining activity.
+
+                    Must have the same time origin and geometry as the recording
+                    used to produce diagnostics.
+
+                diagnostics : dict
+                    Saved preprocessing diagnostics containing:
+                        basis_internal
+                        basis_external
+                        channel_names
+                        do_msss
+                        Lin
+                        Lout
+
+                    Optional entries:
+                        noise_cov
+                        run_tmin
+                        run_tmax
+
+                noiseCov : mne.Covariance | ndarray | None
+                    Noise covariance in physical SI sensor units.
+
+                    An ndarray must follow diagnostics["channel_names"].
+
+                    If None, use the saved covariance. If unavailable, estimate
+                    covariance using noiseTmin/noiseTmax in the supplied raw.
+
+                noiseTmin, noiseTmax : float | None
+                    Noise interval relative to the beginning of raw.
+                    Used only if no covariance is supplied or saved.
+
+                dataLabel : str
+                    Figure description.
+
+                nCols : int
+                    Number of topomap columns.
+
+                chunkSeconds : float
+                    Chunk duration for accumulating temporal statistics.
+
+                spectrumScale : {"log", "linear"}
+                    Relative RMS spectrum scale.
+
+                basisMagScale : float | None
+                    Magnetometer-row scaling already present in the stored basis.
+
+                    Stored magnetometer rows are divided by this value before
+                    fitting. None defaults to 100 for the custom mSSS code and
+                    1 for the MNE-returned SSS basis.
+
+                    Set explicitly if your basis construction differs.
+
+                whitenRcond : float
+                    Relative eigenvalue cutoff for the standardized noise covariance.
+
+                pinvRcond : float
+                    Relative singular-value cutoff for the whitened real design.
+
+                topoLogFloor : float
+                    Positive magnitude below which topomap colors become linear
+                    around zero. Must lie strictly between 0 and 1.
+
+                    For example, 1e-4 gives logarithmic colors from 0.0001 to 1,
+                    separately for positive and negative values.
+
+                show : bool
+                    Display the figure.
+
+                Returns
+                -------
+                fig : matplotlib.figure.Figure
+                    Diagnostic figure.
+
+                summary : dict
+                    Coefficients, relative weights, displayed maps, physical maps,
+                    covariance, and fitting diagnostics.
+
+                Notes
+                -----
+                This is a joint internal/external diagnostic fit, not a repetition
+                of Foster's inverse or its internal-only coefficient calculation.
+
+                For complex S = u + iv and a = x + iy:
+                    real(S * a) = u*x - v*y.
+
+                Each stored mode therefore has two real design columns:
+                    [real(S), -imag(S)].
+
+                Redundant modes, including conjugate harmonic pairs, receive a
+                minimum-norm coefficient allocation. Their individual weights
+                are basis-dependent and are not percentages of variance explained.
+
+                For a complex mode, the spatial shape summarizes sensor RMS, with
+                signs taken from its dominant real spatial pattern. It need not
+                represent an instantaneous field configuration.
+
+                All samples in the saved processed segment are included, matching
+                the supplied preprocessing implementation.
+
+                Neither raw nor diagnostics is modified.
+                """
+                import warnings
+                import numpy as np
+                import matplotlib.pyplot as plt
+                import mne
+                from matplotlib.colors import SymLogNorm
+
+                # ---------------------------------------------------------------
+                # Helpers.
+                # ---------------------------------------------------------------
+                def alignCovariance(covariance):
+                    """Return dense covariance in the saved basis channel order."""
+                    if isinstance(covariance, mne.Covariance):
+                        covarianceNames = list(covariance.ch_names)
+                        missingNames = [name for name in channelNames if name not in covarianceNames]
+
+                        if missingNames:
+                            raise ValueError(f"Noise covariance is missing channels: {missingNames}")
+
+                        channelOrder = [covarianceNames.index(name) for name in channelNames]
+                        matrix = np.asarray(covariance["data"])
+
+                        if matrix.ndim == 1:
+                            matrix = np.diag(matrix)
+
+                        matrix = matrix[np.ix_(channelOrder, channelOrder)]
+                    else:
+                        matrix = np.asarray(covariance)
+
+                    if matrix.shape != (nChannels, nChannels):
+                        raise ValueError("Noise covariance must match the saved basis channels.")
+
+                    if np.iscomplexobj(matrix):
+                        if np.any(matrix.imag != 0):
+                            raise ValueError("Sensor noise covariance must be real-valued.")
+
+                        matrix = matrix.real
+
+                    matrix = np.asarray(matrix, dtype=float)
+
+                    if not np.isfinite(matrix).all():
+                        raise ValueError("Noise covariance contains NaN or infinite values.")
+
+                    if np.any(np.diag(matrix) <= 0):
+                        raise ValueError("Every fitted channel must have positive noise variance.")
+
+                    channelStd = np.sqrt(np.diag(matrix))
+                    standardized = matrix / channelStd[:, None] / channelStd[None, :]
+
+                    if not np.allclose(standardized, standardized.T, rtol=1e-7, atol=1e-10):
+                        raise ValueError("Noise covariance must be symmetric.")
+
+                    return (matrix + matrix.T) / 2
+
+                def makeSignedRmsMap(spatialVector, coefficientMoment):
+                    """Calculate sensor RMS and assign dominant-pattern spatial signs."""
+                    eigenvalues, eigenvectors = np.linalg.eigh(coefficientMoment)
+                    eigenvalues = np.maximum(eigenvalues, 0.0)
+
+                    spatialParts = np.column_stack([spatialVector.real, -spatialVector.imag])
+                    fieldFactor = spatialParts @ (eigenvectors * np.sqrt(eigenvalues)[None, :])
+                    sensorRms = np.sqrt(np.sum(fieldFactor**2, axis=1))
+
+                    if not np.any(sensorRms):
+                        return sensorRms, 1.0
+
+                    spatialModes, singularValues, _ = np.linalg.svd(fieldFactor, full_matrices=False)
+                    referencePattern = spatialModes[:, 0]
+                    referenceIndex = np.argmax(np.abs(referencePattern))
+
+                    # The global sign is arbitrary; choose it reproducibly.
+                    if referencePattern[referenceIndex] < 0:
+                        referencePattern = -referencePattern
+
+                    spatialSigns = np.where(referencePattern >= 0, 1.0, -1.0)
+                    dominantFraction = singularValues[0]**2 / np.sum(singularValues**2)
+
+                    return spatialSigns * sensorRms, float(dominantFraction)
+
+                # ---------------------------------------------------------------
+                # 1. Validate arguments and align channels.
+                # ---------------------------------------------------------------
+                if not isinstance(nCols, int) or nCols < 1:
+                    raise ValueError("nCols must be a positive integer.")
+
+                if not np.isfinite(chunkSeconds) or chunkSeconds <= 0:
+                    raise ValueError("chunkSeconds must be positive and finite.")
+
+                if spectrumScale not in ("linear", "log"):
+                    raise ValueError("spectrumScale must be 'linear' or 'log'.")
+
+                if not 0 < whitenRcond < 1:
+                    raise ValueError("whitenRcond must lie between zero and one.")
+
+                if not 0 < pinvRcond < 1:
+                    raise ValueError("pinvRcond must lie between zero and one.")
+
+                if topoLogFloor is not None and (not np.isfinite(topoLogFloor) or not 0 < topoLogFloor < 1):
+                    raise ValueError("topoLogFloor must lie strictly between zero and one.")
+
+                channelNames = list(diagnostics["channel_names"])
+                nChannels = len(channelNames)
+                missingNames = [name for name in channelNames if name not in raw.ch_names]
+
+                if missingNames:
+                    raise ValueError(f"Basis channels are missing from raw: {missingNames}")
+
+                channelPicks = np.array([raw.ch_names.index(name) for name in channelNames])
+                basisInfo = mne.pick_info(raw.info, channelPicks, copy=True)
+
+                internalBasis = np.asarray(diagnostics["basis_internal"])
+                externalBasis = np.asarray(diagnostics["basis_external"])
+
+                if internalBasis.ndim != 2 or externalBasis.ndim != 2:
+                    raise ValueError("Both basis matrices must be two-dimensional.")
+
+                if internalBasis.shape[0] != nChannels or externalBasis.shape[0] != nChannels:
+                    raise ValueError("Basis rows must match the saved channel names.")
+
+                if internalBasis.shape[1] == 0:
+                    raise ValueError("The internal basis contains no modes.")
+
+                if not np.isfinite(internalBasis).all() or not np.isfinite(externalBasis).all():
+                    raise ValueError("The basis contains NaN or infinite values.")
+
+                nInternal = internalBasis.shape[1]
+                nExternal = externalBasis.shape[1]
+                nModes = nInternal + nExternal
+
+                magPicks = mne.pick_types(basisInfo, meg="mag", ref_meg=False, exclude=[])
+
+                if len(magPicks) < 4:
+                    raise ValueError("At least four magnetometers with usable positions are required.")
+
+                magInfo = mne.pick_info(basisInfo, magPicks, copy=True)
+                magNames = [channelNames[pick] for pick in magPicks]
+
+                # Match the inclusive run endpoint in the supplied preprocessing code.
+                runTmin = diagnostics.get("run_tmin")
+                runTmax = diagnostics.get("run_tmax")
+                sampleStart = 0 if runTmin is None else int(raw.time_as_index(runTmin, use_rounding=True)[0])
+                sampleStop = raw.n_times if runTmax is None else int(raw.time_as_index(runTmax, use_rounding=True)[0]) + 1
+
+                if not 0 <= sampleStart < sampleStop <= raw.n_times:
+                    raise ValueError("The saved processed segment is outside this recording.")
+
+                # ---------------------------------------------------------------
+                # 2. Obtain physical noise covariance.
+                # ---------------------------------------------------------------
+                covariance = noiseCov if noiseCov is not None else diagnostics.get("noise_cov")
+
+                if covariance is None:
+                    if noiseTmin is None and noiseTmax is None:
+                        raise ValueError("Supply noiseCov or specify a suitable noise interval.")
+
+                    covariance = mne.compute_raw_covariance(raw, tmin=noiseTmin, tmax=noiseTmax, picks=channelPicks, method="empirical", rank="info", verbose=False)
+
+                noiseMatrix = alignCovariance(covariance)
+
+                # ---------------------------------------------------------------
+                # 3. Undo stored magnetometer-row scaling.
+                # ---------------------------------------------------------------
+                if basisMagScale is None:
+                    basisMagScale = 100.0 if diagnostics["do_msss"] else 1.0
+
+                if not np.isfinite(basisMagScale) or basisMagScale <= 0:
+                    raise ValueError("basisMagScale must be positive and finite.")
+
+                physicalBasis = np.array(np.concatenate([internalBasis, externalBasis], axis=1), dtype=complex, copy=True)
+                physicalBasis[magPicks] /= basisMagScale
+
+                # ---------------------------------------------------------------
+                # 4. Noise whitening.
+                #
+                # Standardization makes covariance rank selection independent of
+                # the differing SI magnitudes of magnetometers and gradiometers.
+                # ---------------------------------------------------------------
+                noiseStd = np.sqrt(np.diag(noiseMatrix))
+                standardizedNoise = noiseMatrix / noiseStd[:, None] / noiseStd[None, :]
+                noiseEigenvalues, noiseEigenvectors = np.linalg.eigh(standardizedNoise)
+                largestNoiseEigenvalue = float(noiseEigenvalues[-1])
+
+                if largestNoiseEigenvalue <= 0:
+                    raise ValueError("Noise covariance has no positive eigenvalues.")
+
+                if noiseEigenvalues[0] < -1e-8 * largestNoiseEigenvalue:
+                    raise ValueError("Noise covariance is not positive semidefinite.")
+
+                retainedNoise = noiseEigenvalues > whitenRcond * largestNoiseEigenvalue
+                noiseRank = int(np.sum(retainedNoise))
+                whitener = (noiseEigenvectors[:, retainedNoise] / np.sqrt(noiseEigenvalues[retainedNoise])).T / noiseStd[None, :]
+
+                if noiseRank < nChannels:
+                    warnings.warn(f"Whitening retains {noiseRank} of {nChannels} noise directions; discarded directions are excluded from fitting.", stacklevel=2)
+
+                # ---------------------------------------------------------------
+                # 5. Joint real-valued internal/external fit.
+                #
+                # Columns 2*j and 2*j+1 belong to stored mode j.
+                # ---------------------------------------------------------------
+                realBasis = np.empty((nChannels, 2 * nModes))
+                realBasis[:, 0::2] = physicalBasis.real
+                realBasis[:, 1::2] = -physicalBasis.imag
+                whitenedBasis = whitener @ realBasis
+
+                leftVectors, singularValues, rightVectorsH = np.linalg.svd(whitenedBasis, full_matrices=False)
+
+                if singularValues.size == 0 or singularValues[0] == 0:
+                    raise ValueError("The whitened joint basis has zero rank.")
+
+                singularCutoff = pinvRcond * singularValues[0]
+                retainedBasis = singularValues > singularCutoff
+                jointRank = int(np.sum(retainedBasis))
+                fitDirections = leftVectors[:, retainedBasis]
+                coefficientInverse = (rightVectorsH[retainedBasis].T / singularValues[retainedBasis]) @ fitDirections.T
+                retainedCondition = float(singularValues[0] / singularValues[retainedBasis][-1])
+
+                activeColumnCount = int(np.sum(np.linalg.norm(whitenedBasis, axis=0) > singularCutoff))
+
+                if jointRank < activeColumnCount:
+                    warnings.warn(
+                        "The joint real model contains redundant or truncated directions. "
+                        "Individual coefficients use a minimum-norm allocation and are "
+                        "basis-dependent; conjugate harmonic pairs can be redundant.",
+                        stacklevel=2,
+                    )
+
+                if retainedCondition > 1e6:
+                    warnings.warn(f"The retained whitened design is ill-conditioned ({retainedCondition:.2g}); individual coefficients may be unstable.", stacklevel=2)
+
+                # ---------------------------------------------------------------
+                # 6. Accumulate temporal moments over the processed segment.
+                # ---------------------------------------------------------------
+                chunkSamples = max(1, int(round(chunkSeconds * raw.info["sfreq"])))
+                whiteMean = np.zeros(noiseRank)
+                whiteScatter = np.zeros((noiseRank, noiseRank))
+                sampleCount = 0
+
+                for chunkStart in range(sampleStart, sampleStop, chunkSamples):
+                    chunkStop = min(chunkStart + chunkSamples, sampleStop)
+                    dataChunk = raw.get_data(picks=channelPicks, start=chunkStart, stop=chunkStop)
+
+                    if not np.isfinite(dataChunk).all():
+                        raise ValueError("The selected data contain NaN or infinite values.")
+
+                    whiteChunk = whitener @ dataChunk
+                    chunkCount = whiteChunk.shape[1]
+                    chunkMean = whiteChunk.mean(axis=1)
+                    centeredChunk = whiteChunk - chunkMean[:, None]
+                    chunkScatter = centeredChunk @ centeredChunk.T
+
+                    combinedCount = sampleCount + chunkCount
+                    meanDifference = chunkMean - whiteMean
+
+                    whiteScatter += chunkScatter + np.outer(meanDifference, meanDifference) * (sampleCount * chunkCount / combinedCount)
+                    whiteMean += meanDifference * (chunkCount / combinedCount)
+                    sampleCount = combinedCount
+
+                whiteScatter = (whiteScatter + whiteScatter.T) / 2
+
+                # RMS includes both temporal variance and temporal mean.
+                whiteSecondMoment = whiteScatter / sampleCount + np.outer(whiteMean, whiteMean)
+                coefficientSecondMoment = coefficientInverse @ whiteSecondMoment @ coefficientInverse.T
+                coefficientSecondMoment = (coefficientSecondMoment + coefficientSecondMoment.T) / 2
+
+                if not np.isfinite(coefficientSecondMoment).all():
+                    raise ValueError("Nonfinite coefficient moments were produced; inspect data, covariance, and conditioning.")
+
+                coefficientDiagonal = np.maximum(np.diag(coefficientSecondMoment), 0.0)
+                rmsWeights = np.sqrt(coefficientDiagonal[0::2] + coefficientDiagonal[1::2])
+
+                maxRmsWeight = float(np.max(rmsWeights))
+                relativeRmsWeights = rmsWeights / maxRmsWeight if maxRmsWeight > 0 else np.zeros_like(rmsWeights)
+                rmsLabels = [f"{weight:.3g}" for weight in relativeRmsWeights]
+
+                # ---------------------------------------------------------------
+                # 7. Mode names.
+                # ---------------------------------------------------------------
+                internalOrder = diagnostics["Lin"]
+                externalOrder = diagnostics["Lout"]
+                internalLm = [(ell, order) for ell in range(1, internalOrder + 1) for order in range(-ell, ell + 1)]
+                externalLm = [(ell, order) for ell in range(1, externalOrder + 1) for order in range(-ell, ell + 1)]
+                modeTitles = []
+
+                for modeIndex in range(nInternal):
+                    if diagnostics["do_msss"]:
+                        description = f"Internal SVD mode {modeIndex + 1}"
+                    elif nInternal == len(internalLm):
+                        ell, order = internalLm[modeIndex]
+                        description = rf"Internal: $\ell={ell},\ m={order}$"
+                    else:
+                        description = f"Internal mode {modeIndex + 1}"
+
+                    modeTitles.append(f"#{modeIndex + 1}\n{description}")
+
+                for modeIndex in range(nExternal):
+                    if nExternal == len(externalLm):
+                        ell, order = externalLm[modeIndex]
+                        description = rf"External: $\ell={ell},\ m={order}$"
+                    else:
+                        description = f"External mode {modeIndex + 1}"
+
+                    modeTitles.append(f"#{nInternal + modeIndex + 1}\n{description}")
+
+                # ---------------------------------------------------------------
+                # 8. RMS-weighted maps.
+                #
+                # First normalize each shape to peak magnitude 1.
+                # Then multiply by its relative coefficient RMS.
+                #
+                # Physical maps are preserved separately, but not displayed.
+                # ---------------------------------------------------------------
+                signedRmsMapsFt = np.zeros((len(magPicks), nModes))
+                weightedRmsMaps = np.zeros((len(magPicks), nModes))
+                dominantSpatialFraction = np.zeros(nModes)
+                missingMagPatterns = []
+
+                for modeIndex in range(nModes):
+                    coefficientSlice = slice(2 * modeIndex, 2 * modeIndex + 2)
+                    modeMoment = coefficientSecondMoment[coefficientSlice, coefficientSlice]
+                    signedMap, dominantFraction = makeSignedRmsMap(physicalBasis[magPicks, modeIndex], modeMoment)
+
+                    signedRmsMapsFt[:, modeIndex] = signedMap * 1e15
+                    dominantSpatialFraction[modeIndex] = dominantFraction
+                    peakMagnitude = float(np.max(np.abs(signedMap)))
+
+                    if peakMagnitude > 0:
+                        weightedRmsMaps[:, modeIndex] = (signedMap / peakMagnitude) * relativeRmsWeights[modeIndex]
+                    elif relativeRmsWeights[modeIndex] > 0:
+                        missingMagPatterns.append(modeIndex + 1)
+
+                if not np.isfinite(weightedRmsMaps).all():
+                    raise ValueError("The displayed topomaps contain nonfinite values.")
+
+                displayedMapPeaks = np.max(np.abs(weightedRmsMaps), axis=0)
+                displayedMapRms = np.sqrt(np.mean(weightedRmsMaps**2, axis=0))
+                validMapMask = np.ones(nModes, dtype=bool)
+
+                if missingMagPatterns:
+                    validMapMask[np.asarray(missingMagPatterns) - 1] = False
+                    warnings.warn(f"Modes {missingMagPatterns} have nonzero coefficient RMS but no magnetometer contribution to normalize. Their maps remain zero.", stacklevel=2)
+
+                positiveMapMask = validMapMask & (relativeRmsWeights > 0)
+
+                if not np.allclose(displayedMapPeaks[positiveMapMask] / relativeRmsWeights[positiveMapMask], 1.0, rtol=1e-8, atol=0):
+                    raise RuntimeError("Displayed topomap peaks do not match the relative RMS coefficients.")
+
+                mixedModes = np.flatnonzero(dominantSpatialFraction < 0.95)
+
+                if mixedModes.size:
+                    warnings.warn(
+                        f"{mixedModes.size} modes contain appreciable activity in two real "
+                        "spatial patterns. Their maps summarize sensor RMS, with signs "
+                        "taken from the dominant spatial pattern.",
+                        stacklevel=2,
+                    )
+
+                # Adapt the color scale to the smallest nonzero coefficient that
+                # actually has a displayed magnetometer pattern.
+                visibleWeights = relativeRmsWeights[positiveMapMask]
+
+                if topoLogFloor is None:
+                    smallestVisibleRms = float(np.min(visibleWeights)) if visibleWeights.size else 1.0
+
+                    # Put the white/linear region at least one decade below the
+                    # weakest component's peak, rounded down to a power of ten.
+                    floorExponent = int(np.floor(np.log10(smallestVisibleRms))) - 1
+                    topoLogFloor = max(10.0 ** floorExponent, np.nextafter(0.0, 1.0))
+
+                # Compress the central linear region so it does not consume much
+                # of the colorbar. Above the threshold, decades are equally spaced.
+                mapNorm = SymLogNorm(linthresh=topoLogFloor, linscale=0.1, vmin=-1.0, vmax=1.0, base=10)
+                # ---------------------------------------------------------------
+                # 9. Restore the independent covariance appearance.
+                #
+                # Same RdBu_r colormap and percentile-based symmetric-log scale
+                # used before the topomap color-scale changes.
+                # ---------------------------------------------------------------
+                covarianceFt2 = noiseMatrix[np.ix_(magPicks, magPicks)] * 1e30
+                covarianceLimit = float(np.max(np.abs(covarianceFt2)))
+                covarianceLimit = covarianceLimit if covarianceLimit > 0 else 1.0
+
+                offDiagonalMask = ~np.eye(len(magPicks), dtype=bool)
+                offDiagonalValues = np.abs(covarianceFt2[offDiagonalMask])
+                nonzeroValues = offDiagonalValues[offDiagonalValues > 0]
+                covarianceLinearThreshold = float(np.percentile(nonzeroValues, 25)) if nonzeroValues.size else covarianceLimit * 0.01
+                covarianceLinearThreshold = max(covarianceLinearThreshold, covarianceLimit * 1e-6)
+                covarianceNorm = SymLogNorm(linthresh=covarianceLinearThreshold, vmin=-covarianceLimit, vmax=covarianceLimit, base=10)
+
+                # ---------------------------------------------------------------
+                # 10. Layout.
+                # ---------------------------------------------------------------
+                nInternalRows = int(np.ceil(nInternal / nCols))
+                nExternalRows = int(np.ceil(nExternal / nCols))
+                nMapRows = nInternalRows + nExternalRows
+                mapRowHeights = [1.0] * nInternalRows
+
+                if nExternal:
+                    mapRowHeights += [0.25] + [1.0] * nExternalRows
+
+                mapSectionHeight = 3.2 * nMapRows + (0.8 if nExternal else 0.0)
+
+                fig = plt.figure(figsize=(max(16, 2.7 * nCols), 5.5 + mapSectionHeight), constrained_layout=True)
+                outerGrid = fig.add_gridspec(2, 1, height_ratios=[4.5, mapSectionHeight])
+                topGrid = outerGrid[0].subgridspec(1, 2, width_ratios=[3.2, 1.4])
+                mapGrid = outerGrid[1].subgridspec(len(mapRowHeights), nCols, height_ratios=mapRowHeights)
+
+                spectrumAxis = fig.add_subplot(topGrid[0])
+                covarianceAxis = fig.add_subplot(topGrid[1])
+
+                internalColor = "#4477AA"
+                externalColor = "#DD8844"
+                externalBackground = "#FFF0DC"
+                basisNumbers = np.arange(1, nModes + 1)
+                barColors = np.array([internalColor] * nInternal + [externalColor] * nExternal)
+
+                # ---------------------------------------------------------------
+                # 11. Relative coefficient RMS spectrum.
+                # ---------------------------------------------------------------
+                if nExternal:
+                    spectrumAxis.axvspan(nInternal + 0.5, nModes + 0.5, color=externalBackground, zorder=0)
+                    spectrumAxis.axvline(nInternal + 0.5, color="0.4", linewidth=1)
+
+                actualSpectrumScale = spectrumScale
+                positiveMask = relativeRmsWeights > 0
+                positiveWeights = relativeRmsWeights[positiveMask]
+
+                if spectrumScale == "log" and positiveWeights.size:
+                    lowerLimit = max(float(positiveWeights.min() / 2), np.nextafter(0.0, 1.0))
+                    spectrumAxis.set_yscale("log", nonpositive="mask")
+                    spectrumAxis.bar(basisNumbers[positiveMask], relativeRmsWeights[positiveMask] - lowerLimit, bottom=lowerLimit, color=barColors[positiveMask], width=0.8, zorder=2)
+                    spectrumAxis.set_ylim(lowerLimit, 2.0)
+
+                    zeroCount = int(np.sum(~positiveMask))
+
+                    if zeroCount:
+                        spectrumAxis.text(0.01, 0.02, f"{zeroCount} zero weights omitted on log axis", transform=spectrumAxis.transAxes, ha="left", va="bottom", fontsize=8)
+                else:
+                    if spectrumScale == "log":
+                        actualSpectrumScale = "linear"
+                        warnings.warn("All coefficients have zero RMS; using a linear spectrum.", stacklevel=2)
+
+                    spectrumAxis.bar(basisNumbers, relativeRmsWeights, color=barColors, width=0.8, zorder=2)
+                    spectrumAxis.set_ylim(0, 1.15)
+
+                tickStep = max(1, int(np.ceil(nModes / 25)))
+                spectrumTicks = np.unique(np.r_[basisNumbers[::tickStep], nInternal, nModes])
+
+                spectrumAxis.set_xticks(spectrumTicks)
+                spectrumAxis.set_xlim(0.5, nModes + 0.5)
+                spectrumAxis.set_xlabel("Spatial basis function number (# matches topomap titles)")
+                spectrumAxis.set_ylabel("Relative RMS coefficient (largest = 1)")
+                spectrumAxis.set_title("Noise-whitened joint fit — RMS coefficients", pad=28)
+                spectrumAxis.grid(axis="y", which="major", alpha=0.3)
+                spectrumAxis.grid(axis="y", which="minor", alpha=0.12)
+                spectrumAxis.set_axisbelow(True)
+                spectrumAxis.text((nInternal + 1) / 2, 1.02, "Internal", transform=spectrumAxis.get_xaxis_transform(), ha="center", color=internalColor)
+
+                if nExternal:
+                    spectrumAxis.text(nInternal + (nExternal + 1) / 2, 1.02, "External", transform=spectrumAxis.get_xaxis_transform(), ha="center", color="#A65F22")
+
+                # ---------------------------------------------------------------
+                # 12. Covariance panel: independent normalization and colorbar.
+                # ---------------------------------------------------------------
+                covarianceImage = covarianceAxis.imshow(covarianceFt2, origin="upper", interpolation="nearest", cmap="RdBu_r", norm=covarianceNorm)
+                covarianceTicks = np.unique(np.linspace(0, len(magNames) - 1, min(6, len(magNames))).astype(int))
+                covarianceLabels = [magNames[index] for index in covarianceTicks]
+
+                covarianceAxis.set_xticks(covarianceTicks)
+                covarianceAxis.set_yticks(covarianceTicks)
+                covarianceAxis.set_xticklabels(covarianceLabels, rotation=90, fontsize=7)
+                covarianceAxis.set_yticklabels(covarianceLabels, fontsize=7)
+                covarianceAxis.set_xlabel("Magnetometer channel")
+                covarianceAxis.set_ylabel("Magnetometer channel")
+                covarianceAxis.set_title("Noise covariance: magnetometer block\nIndependent symmetric-log scale")
+
+                covarianceColorbar = fig.colorbar(covarianceImage, ax=covarianceAxis, shrink=0.8, pad=0.03)
+                covarianceColorbar.set_label("Noise covariance (fT²)")
+
+                # ---------------------------------------------------------------
+                # 13. Topomaps, with external modes on a new row.
+                # ---------------------------------------------------------------
+                mapAxes = []
+                dividerAxis = None
+
+                if nExternal:
+                    dividerAxis = fig.add_subplot(mapGrid[nInternalRows, :])
+                    dividerAxis.set_axis_off()
+                    dividerAxis.plot([0.0, 1.0], [0.5, 0.5], transform=dividerAxis.transAxes, color=externalColor, linewidth=1.5)
+                    dividerAxis.text(0.5, 0.5, "External basis functions", transform=dividerAxis.transAxes, ha="center", va="center", fontsize=11, fontweight="bold", color="#A65F22", bbox={"facecolor": fig.get_facecolor(), "edgecolor": "none", "pad": 5})
+
+                for modeIndex in range(nModes):
+                    if modeIndex < nInternal:
+                        mapRow = modeIndex // nCols
+                        mapCol = modeIndex % nCols
+                    else:
+                        externalIndex = modeIndex - nInternal
+                        mapRow = nInternalRows + 1 + externalIndex // nCols
+                        mapCol = externalIndex % nCols
+
+                    mapAxis = fig.add_subplot(mapGrid[mapRow, mapCol])
+
+                    if modeIndex >= nInternal:
+                        mapAxis.set_facecolor(externalBackground)
+
+                    mapImage, _ = mne.viz.plot_topomap(
+                        weightedRmsMaps[:, modeIndex],
+                        magInfo,
+                        ch_type="mag",
+                        axes=mapAxis,
+                        show=False,
+                        cmap="RdBu_r",
+                        cnorm=mapNorm,
+                        contours=0,
+                        sensors=True,
+                        outlines="head",
+                        extrapolate="local",
+                        image_interp="linear",
+                    )
+
+                    mapAxis.set_axis_on()
+                    mapAxis.set_xticks([])
+                    mapAxis.set_yticks([])
+
+                    for spine in mapAxis.spines.values():
+                        spine.set_visible(False)
+
+                    mapAxis.set_xlabel("Left → right", fontsize=8)
+                    mapAxis.set_ylabel("Posterior → anterior", fontsize=8)
+
+                    titleText = f"{modeTitles[modeIndex]}\nRelative RMS = {rmsLabels[modeIndex]}"
+
+                    if modeIndex + 1 in missingMagPatterns:
+                        titleText += "\n(no magnetometer pattern)"
+                    elif dominantSpatialFraction[modeIndex] < 0.95:
+                        titleText += "\n(two-pattern mode)"
+
+                    mapAxis.set_title(titleText, fontsize=9, pad=8)
+                    mapAxes.append(mapAxis)
+
+                # ---------------------------------------------------------------
+                # 14. Shared signed-log topomap colorbar.
+                #
+                # Tick labels are actual relative values, not log10(value).
+                # Their positions are logarithmically spaced above the floor.
+                # ---------------------------------------------------------------
+                colorbarAxes = mapAxes + ([dividerAxis] if dividerAxis is not None else [])
+                mapColorbar = fig.colorbar(mapImage, ax=colorbarAxes, orientation="horizontal", fraction=0.02, pad=0.02, aspect=60)
+
+                lowestExponent = int(np.ceil(np.log10(topoLogFloor)))
+                positiveTicks = 10.0 ** np.arange(lowestExponent, 1)
+                colorTicks = np.r_[-positiveTicks[::-1], 0.0, positiveTicks]
+
+                mapColorbar.set_ticks(colorTicks)
+                mapColorbar.set_ticklabels([f"{value:.3g}" for value in colorTicks])
+                mapColorbar.set_label(f"Relative RMS × peak-normalized spatial pattern (dimensionless)\nSigned logarithmic colors; linear only within ±{topoLogFloor:.3g}")
+
+                segmentText = f"{raw.times[sampleStart]:.2f}–{raw.times[sampleStop - 1]:.2f} s"
+                fig.suptitle(f"{dataLabel} — processed segment: {segmentText}\nEach topomap's peak magnitude equals its relative RMS coefficient\nOne shared signed-log color scale; colors do not represent variance explained", fontsize=12)
+
+                summary = {
+                    "rmsWeights": rmsWeights,
+                    "relativeRmsWeights": relativeRmsWeights,
+                    "rmsLabels": rmsLabels,
+                    "weightedRmsMaps": weightedRmsMaps,
+                    "displayedMapPeaks": displayedMapPeaks,
+                    "displayedMapRms": displayedMapRms,
+                    "signedRmsMapsFt": signedRmsMapsFt,
+                    "dominantSpatialFraction": dominantSpatialFraction,
+                    "missingMagPatterns": missingMagPatterns,
+                    "modeTitles": modeTitles,
+                    "noiseCovarianceSi": noiseMatrix,
+                    "whitener": whitener,
+                    "noiseRank": noiseRank,
+                    "noiseEigenvalues": noiseEigenvalues,
+                    "basisMagScale": basisMagScale,
+                    "channelNames": channelNames,
+                    "magnetometerNames": magNames,
+                    "nInternal": nInternal,
+                    "nExternal": nExternal,
+                    "sampleStart": sampleStart,
+                    "sampleStop": sampleStop,
+                    "jointRank": jointRank,
+                    "retainedCondition": retainedCondition,
+                    "singularValues": singularValues,
+                    "spectrumScale": actualSpectrumScale,
+                    "topoLogFloor": topoLogFloor,
+                    "topomapNormalization": "Peak magnitude equals relative RMS coefficient",
+                    "dataLabel": dataLabel,
+                }
+
+                if show:
+                    plt.show()
+
+                return fig, summary
 
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
     # set run and noise boundaries for running mSSS with Fosters
