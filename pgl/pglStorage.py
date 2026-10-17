@@ -813,13 +813,16 @@ class pglStorage:
 
     @classmethod
     def _checkRawSessionLabels(cls, session, *, allowMissingMetadata=False):
-        """Warn and reject missing raw-session labels unless explicitly allowed.
+        """Check working-session safety and required raw acquisition labels.
 
         Called by the public raw saver before configuration, SQL, or export.
-        Unreadable/malformed acquisition settings raise even with the override.
+        allowMissingMetadata bypasses missing labels only, never failed-action
+        safety or malformed/unreadable acquisition settings.
         """
         if type(allowMissingMetadata) is not bool:
             raise ValueError("allowMissingMetadata must be a boolean.")
+
+        cls._requireSafeCheckpoint(session)
 
         labels = session.getSessionLabels(acquisition=True)
         missing = []
@@ -846,10 +849,98 @@ class pglStorage:
         pglMessages.warning("Raw session was not saved. Missing metadata: " + "; ".join(missing) + ". " + instructions + " To intentionally save without these labels, use saveRawSession(allowMissingMetadata=True).", level=0)
         return False
 
+    @staticmethod
+    def _checkpointDatabaseIdentity(postgres):
+        """Describe the configured database endpoint without credentials.
+
+        This runtime identity distinguishes configured destinations.
+        It is not a globally stable database identity across relocation,
+        aliases, restores, or alternate connection transports.
+        """
+        identity = {
+            "transport": postgres.connectionTransport,
+            "host": postgres.connectionHost,
+            "port": postgres.connectionPort,
+            "database": postgres.databaseName,
+            "schema": postgres.databaseSchema,
+        }
+
+        if postgres.connectionTransport == "ssh":
+            identity["sshHost"] = postgres.sshHost
+            identity["sshPort"] = postgres.sshPort
+            identity["sshUser"] = postgres.sshUser
+
+        return identity
+    
+    @classmethod
+    def _bindCheckpointBaseline(cls, session, sessionID, postgres):
+        """Bind a prepared checkpoint/history boundary to a working object.
+
+        Used after verified loading. Saving prepares its baseline separately
+        before commit and installs it only after successful publication.
+
+        Never clears failed-action safety state.
+        """
+        baseline = cls._prepareCheckpointBaseline(session, sessionID, postgres)
+        session._checkpointBaseline = baseline
+        
+    @classmethod
+    def _getCheckpointHistoryBoundary(cls, session):
+        """Return the verified working-history boundary, or None if unbound.
+
+        Reject shortened or edited baseline history rather than guessing where
+        replay should begin. Appending new history entries is permitted.
+
+        This validates history metadata only, not scientific payload contents.
+        """
+        from .pglPipeline import pglActionable
+
+        if not isinstance(session, pglActionable):
+            raise TypeError("Checkpoint baseline tracking requires a pglActionable object.")
+
+        baseline = session._checkpointBaseline
+
+        if not baseline:
+            return None
+
+        expectedFields = {"version", "sessionID", "databaseIdentity", "historyCount", "historyHashes"}
+
+        if set(baseline) != expectedFields or type(baseline["version"]) is not int or baseline["version"] != 1:
+            raise ValueError("Invalid checkpoint baseline record.")
+
+        count = baseline["historyCount"]
+        hashes = baseline["historyHashes"]
+
+        if type(count) is not int or count < 0 or not isinstance(hashes, list) or len(hashes) != count:
+            raise ValueError("Invalid checkpoint baseline history inventory.")
+
+        if any(not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None for value in hashes):
+            raise ValueError("Invalid checkpoint baseline history fingerprint.")
+
+        if len(session.actionHistory) < count:
+            raise ValueError("Checkpoint history was shortened after loading. Cannot safely determine the replay boundary.")
+
+        for index, expectedHash in enumerate(hashes):
+            document = json.loads(session.actionHistory[index].toJSON())
+            actualHash = hashlib.sha256(cls.encodeRawManifest(document)).hexdigest()
+
+            if actualHash != expectedHash:
+                raise ValueError(f"Checkpoint history entry {index} was changed after loading. Edit an extracted pipeline instead of historical records.")
+
+        return count
+
     @classmethod
     def _sessionHistoryBytes(cls, session, *, acquisition=False):
-        """Encode history plus labels, making labels part of the payload identity."""
+        """Encode history and labels after checking working-session safety.
+
+        Runtime failure state is not serialized into checkpoint metadata.
+        Labels remain part of the payload identity.
+        """
         from .pglPipeline import pglActionable
+
+        # All current derived exports and MNE raw exports pass through here.
+        # Refuse unsafe working state before serializing or writing payloads.
+        cls._requireSafeCheckpoint(session)
 
         metadata = {"version": 1, "labels": session.getSessionLabels(acquisition=acquisition)}
         cls._validateSessionLabelMetadata(metadata, runCount=len(session.runs or []))
@@ -864,7 +955,7 @@ class pglStorage:
 
         document["pgl_session_labels"] = metadata
         return json.dumps(document, sort_keys=True, indent=4).encode("utf-8")
-
+    
     @classmethod
     def _readSessionHistory(cls, filesystem, runCount):
         """Restore history and optional labels without loading behavioral fields.
@@ -2255,26 +2346,60 @@ class pglStorage:
         return {"namespace": f"{label}-{digest}", "sessionID": sessionID}    
 
     @classmethod
+    def _prepareCheckpointBaseline(cls, session, sessionID, postgres):
+        """Build runtime checkpoint metadata without modifying the session.
+
+        Caller must establish that the supplied history corresponds to the
+        checkpoint being loaded or published.
+
+        Preparation can serialize history and fail, so saves must perform it
+        before commit. Assignment to the working object happens afterward.
+
+        Does not inspect scientific payloads or clear failure restrictions.
+        """
+        from .pglPipeline import pglActionable
+
+        if not isinstance(session, pglActionable):
+            raise TypeError("Checkpoint baseline tracking requires a pglActionable object.")
+
+        if type(sessionID) is not int or not 0 <= sessionID <= 9223372036854775807:
+            raise ValueError("sessionID must be a nonnegative PostgreSQL bigint.")
+
+        historyHashes = []
+
+        for entry in session.actionHistory:
+            document = json.loads(entry.toJSON())
+            content = cls.encodeRawManifest(document)
+            historyHashes.append(hashlib.sha256(content).hexdigest())
+
+        return {
+            "version": 1,
+            "sessionID": sessionID,
+            "databaseIdentity": cls._checkpointDatabaseIdentity(postgres),
+            "historyCount": len(historyHashes),
+            "historyHashes": historyHashes,
+        }
+
+    @classmethod
     def loadSession(cls, sessionID, *, settings=None, settingsName=None, storageOptionsByBackend=None, sslRootCert=None, includeDeleted=False, cacheDirectory=None, directLocalPolicy="materialize"):
         """Load a completed raw or derived checkpoint.
 
-        Supports behavioral-only, MNE-only, and mixed checkpoints.
-        Restores sessionID and description from database metadata,
-        separately from scientific payloads and action history.
+        Restores checkpoint ID and description, then binds a runtime history
+        baseline for subsequent pipeline extraction and save bookkeeping.
 
-        MNE cache precedence: explicit cacheDirectory, otherwise settings.cacheDir.
-        Cache directories are created only when materialization is needed.
+        Supports behavioral-only, MNE-only, and mixed checkpoints.
+        MNE cache precedence is explicit cacheDirectory, then settings.cacheDir.
 
         Unknown/hidden sessions warn at level 0 and return None.
         Invalid public arguments/configuration warn at level 1 and return None.
         Database failures warn at level 2 and return None.
         Missing configuration or connection cancellation returns None.
 
-        Cache-path, manifest, payload, and contract-validation errors propagate.
+        Manifest, payload, baseline, and contract-validation errors propagate.
         No SQL connection is retained by the returned session.
 
-        directLocalPolicy='immutable' requires the caller to keep source files
-        and resolved paths immutable and available while readers use them.
+        directLocalPolicy='immutable' requires source files and resolved paths
+        to remain unchanged and available while readers use them.
         includeDeleted permits inspection without undeleting anything.
         """
         from .pglPostgres import pglPostgres
@@ -2352,11 +2477,38 @@ class pglStorage:
             pglMessages.warning(f"{reason}: {sessionID}", level=0)
             return None
 
+        # The loader has established the checkpoint's contents and history.
+        # Runtime metadata is attached without opening scientific payloads.
         session.sessionID = sessionID
         session.description = checkpoint[2]
+        cls._bindCheckpointBaseline(session, sessionID, postgres)
 
         pglMessages.message(f"Loaded {checkpoint[0]} checkpoint {sessionID}; backed fields will load on demand.")
         return session
+    
+    @staticmethod
+    def _requireSafeCheckpoint(session):
+        """Reject working objects affected by failed action attempts.
+
+        This guard checks runtime failure bookkeeping only.
+        It does not perform scientific revalidation or read payloads.
+        A clean guard result is not proof of complete scientific validity.
+        """
+        from .pglPipeline import pglActionable
+
+        if not isinstance(session, pglActionable):
+            raise TypeError("Checkpoint saving requires a pglActionable object.")
+
+        failedIDs = tuple(session._failedActionIDs)
+
+        if not failedIDs:
+            return
+
+        failedIDSet = set(failedIDs)
+        names = list(dict.fromkeys(entry.actionName for entry in session.actionHistory if entry.actionID in failedIDSet))
+        details = ", ".join(names) if names else ", ".join(failedIDs)
+
+        raise ValueError(f"Cannot save checkpoint: this working session may contain partial changes from failed actions: {details}. Reload a saved checkpoint and rerun the corrected analysis. A later successful action does not clear this restriction.")
     
     @classmethod
     def _saveDerivedSession(cls, connection, postgres, session, createdBy, backendID, *, parentSessionID, description=None, ingestMethod="manual", storageOptions=None):
@@ -2517,26 +2669,32 @@ class pglStorage:
         """Save current contents and history as a derived checkpoint.
 
         Defaults parentSessionID to session.sessionID.
-        description=None uses session.description.
-        An explicit string overrides it; blank text clears the description.
-        An explicit parent does not replace the in-memory description.
+        description=None carries forward session.description.
+        An explicit blank description clears it.
 
-        Resolves username, database, and default payload storage from settings.
+        Rejects failed working state and changes to an established baseline's
+        historical prefix before opening a database connection.
 
         Returns the new or reused checkpoint ID, or None for missing-parent
         rejection, unavailable configuration, or connection cancellation.
 
-        After commit and connection cleanup, updates session.sessionID and
-        session.description. Earlier failure or cancellation leaves those
-        fields unchanged by this method.
+        Prepares new baseline metadata before commit. Updates sessionID,
+        description, and baseline only after commit and connection cleanup.
 
         Database changes are transactional; payload writes are not.
         Failed saves may leave unregistered files. Other errors propagate.
         Accumulated action history is retained.
+
+        The working object must not be modified concurrently while saving.
         """
         from time import perf_counter
         from .pglPostgres import pglPostgres
         from .pglSettings import pglSettingsManager
+
+        # These checks inspect provenance bookkeeping, not scientific payloads.
+        # A later successful action must not conceal an earlier failed mutation.
+        cls._requireSafeCheckpoint(session)
+        cls._getCheckpointHistoryBoundary(session)
 
         resolvedParentID = session.sessionID if parentSessionID is None else parentSessionID
 
@@ -2603,15 +2761,22 @@ class pglStorage:
                 contentsStarted = perf_counter()
                 sessionID = cls._saveDerivedSession(connection, postgres, session, createdBy, backendID, parentSessionID=resolvedParentID, description=resolvedDescription, ingestMethod=ingestMethod, storageOptions=storageOptions)
 
+                # Recheck the historical prefix and prepare all new fingerprints
+                # while an error can still roll back database publication.
+                cls._requireSafeCheckpoint(session)
+                cls._getCheckpointHistoryBoundary(session)
+                pendingBaseline = cls._prepareCheckpointBaseline(session, sessionID, postgres)
+
                 pglMessages.message(f"Saving session: checkpoint ready ({perf_counter() - contentsStarted:.1f} s); committing transaction...")
 
-        # Synchronize only after commit and connection cleanup.
+        # Do not serialize history or resolve storage here. Publication and
+        # connection cleanup have succeeded; install the prepared metadata.
         session.sessionID = sessionID
         session.description = resolvedDescription
+        session._checkpointBaseline = pendingBaseline
 
         pglMessages.message(f"Checkpoint {sessionID} is complete. Database configuration: {databasePath} (database={postgres.databaseName}, schema={postgres.databaseSchema}; {perf_counter() - saveStarted:.1f} s total).", wrapText=False)
         return sessionID
-    
     
     @classmethod
     def loadRawSession(cls, connection, postgres, sessionID, storageOptionsByBackend=None, *, includeDeleted=False):
@@ -2738,6 +2903,117 @@ class pglStorage:
             raise ValueError("Raw session manifest verification failed.")
 
         return destination, manifest
+    
+    @classmethod
+    def _loadPipelineInput(cls, sessionID, *, settings=None, settingsName=None, storageOptionsByBackend=None, sslRootCert=None, cacheDirectory=None, directLocalPolicy="materialize"):
+        """Load an active checkpoint and describe it as a pipeline input.
+
+        Reuses the public session loader, including its validation, deferred
+        loading, and connection cleanup. No SQL connection is returned.
+
+        The database identity is the current runtime endpoint descriptor,
+        not a permanent globally unique store identifier.
+        """
+        if type(sessionID) is not int or not 0 <= sessionID <= 9223372036854775807:
+            raise ValueError("sessionID must be a nonnegative PostgreSQL bigint.")
+
+        session = cls.loadSession(sessionID, settings=settings, settingsName=settingsName, storageOptionsByBackend=storageOptionsByBackend, sslRootCert=sslRootCert, includeDeleted=False, cacheDirectory=cacheDirectory, directLocalPolicy=directLocalPolicy)
+
+        if session is None:
+            return None, None
+
+        boundary = cls._getCheckpointHistoryBoundary(session)
+        baseline = session._checkpointBaseline
+
+        if boundary is None or baseline["sessionID"] != sessionID or boundary != len(session.actionHistory):
+            raise ValueError("Loaded pipeline input lacks a matching checkpoint history baseline.")
+
+        inputRecord = {
+            "version": 1,
+            "kind": "checkpoint",
+            "sessionID": sessionID,
+            "databaseIdentity": deepcopy(baseline["databaseIdentity"]),
+            "historyCount": boundary,
+            "historyHashes": list(baseline["historyHashes"]),
+        }
+
+        return session, inputRecord
+    
+    @staticmethod
+    def _validatePipelineReplayInput(record, expected=None):
+        """Validate replay input metadata and optionally compare it to a plan.
+
+        Uses metadata only; does not connect, read payloads, or mutate records.
+
+        Endpoint identity prevents accidental use of a different configured
+        database. It is not a permanent store UUID across relocation/restores.
+        """
+        expectedFields = {"version", "kind", "sessionID", "databaseIdentity", "historyCount", "historyHashes"}
+
+        def validate(value):
+            if not isinstance(value, dict) or set(value) != expectedFields:
+                raise ValueError("Invalid pipeline checkpoint input record.")
+
+            if type(value["version"]) is not int or value["version"] != 1 or value["kind"] != "checkpoint":
+                raise ValueError("Unsupported pipeline checkpoint input version or kind.")
+
+            if type(value["sessionID"]) is not int or not 0 <= value["sessionID"] <= 9223372036854775807:
+                raise ValueError("Invalid replay checkpoint ID.")
+
+            identity = value["databaseIdentity"]
+
+            if not isinstance(identity, dict):
+                raise ValueError("Invalid replay database identity.")
+
+            transport = identity.get("transport")
+            identityFields = {"transport", "host", "port", "database", "schema"}
+
+            if transport == "ssh":
+                identityFields.update({"sshHost", "sshPort", "sshUser"})
+            elif transport != "direct":
+                raise ValueError("Unsupported replay database transport.")
+
+            if set(identity) != identityFields:
+                raise ValueError("Invalid replay database identity fields.")
+
+            for key in ("host", "database", "schema"):
+                if not isinstance(identity[key], str) or not identity[key]:
+                    raise ValueError(f"Invalid replay database identity: {key}.")
+
+            if type(identity["port"]) is not int or not 1 <= identity["port"] <= 65535:
+                raise ValueError("Invalid replay database port.")
+
+            if transport == "ssh":
+                if not isinstance(identity["sshHost"], str) or not identity["sshHost"] or not isinstance(identity["sshUser"], str):
+                    raise ValueError("Invalid replay SSH identity.")
+
+                if type(identity["sshPort"]) is not int or not 1 <= identity["sshPort"] <= 65535:
+                    raise ValueError("Invalid replay SSH port.")
+
+            count = value["historyCount"]
+            hashes = value["historyHashes"]
+
+            if type(count) is not int or count < 0 or not isinstance(hashes, list) or len(hashes) != count:
+                raise ValueError("Invalid replay history boundary.")
+
+            if any(not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None for digest in hashes):
+                raise ValueError("Invalid replay history fingerprint.")
+
+        validate(record)
+
+        if expected is not None:
+            validate(expected)
+
+            if record["databaseIdentity"] != expected["databaseIdentity"]:
+                raise ValueError("The configured database differs from the pipeline's recorded replay database. Select the original settings, or explicitly supply sessionID to choose a different input.")
+
+            if record["sessionID"] != expected["sessionID"]:
+                raise ValueError("Loaded checkpoint differs from the pipeline's recorded replay checkpoint.")
+
+            if record["historyCount"] != expected["historyCount"] or record["historyHashes"] != expected["historyHashes"]:
+                raise ValueError("Loaded checkpoint history differs from the recorded replay input. Execution was not started.")
+
+        return record
     
     @classmethod
     def readRawSubjects(cls, manifest, checkpointFilesystem):
@@ -3050,6 +3326,334 @@ class pglStorage:
                 cls._registerSessionBundleFiles(connection, postgres, sessionID, backendID, manifest, objectPrefix=objectPrefix, storageOptions=storageOptions, origin="raw")
                 cls._completeSessionBundleCheckpoint(connection, postgres, sessionID, manifest, origin="raw")
                 return sessionID
+    
+    @classmethod
+    def _readReplayMetadataFile(cls, connection, postgres, sessionID, name, *, storageOptionsByBackend=None, maxBytes=64 * 1024 * 1024):
+        """Read a verified registered metadata file for replay inspection.
+
+        Caller owns the read-only database snapshot and validates the session.
+        Only manifest.json and history.json are permitted.
+
+        Returns the bytes and registered content identity.
+        """
+        if name not in ("manifest.json", "history.json"):
+            raise ValueError("Replay inspection may read only manifest.json or history.json.")
+
+        if type(maxBytes) is not int or maxBytes <= 0:
+            raise ValueError("maxBytes must be a positive integer.")
+
+        links = sql.Identifier(postgres.databaseSchema, "session_files")
+        files = sql.Identifier(postgres.databaseSchema, "files")
+        locations = sql.Identifier(postgres.databaseSchema, "storage_locations")
+        backends = sql.Identifier(postgres.databaseSchema, "storage_backends")
+
+        statement = sql.SQL("SELECT content.file_id, content.sha256, content.size_bytes, link.role FROM {} AS link JOIN {} AS content ON content.file_id = link.file_id WHERE link.session_id = %s AND link.name = %s AND link.deleted_at IS NULL AND content.deleted_at IS NULL").format(links, files)
+        record = connection.execute(statement, (sessionID, name)).fetchone()
+
+        if record is None:
+            raise ValueError(f"Checkpoint {sessionID} has no active registered {name}.")
+
+        fileID, digest, size, role = record
+        expectedRole = "manifest" if name == "manifest.json" else "history"
+
+        if role != expectedRole:
+            raise ValueError(f"Checkpoint {sessionID}: {name} has an unexpected role.")
+
+        if type(size) is not int or not 0 <= size <= maxBytes:
+            raise ValueError(f"Checkpoint {sessionID}: {name} exceeds the replay metadata size limit.")
+
+        statement = sql.SQL("SELECT backend.backend_id, backend.url_prefix, location.object_key FROM {} AS location JOIN {} AS backend ON backend.backend_id = location.backend_id WHERE location.file_id = %s AND location.deleted_at IS NULL AND location.status = 'present' AND location.verified_at IS NOT NULL AND backend.is_active ORDER BY location.priority, backend.backend_id, location.object_key").format(locations, backends)
+        candidates = connection.execute(statement, (fileID,)).fetchall()
+        failures = []
+        optionsByBackend = storageOptionsByBackend or {}
+
+        for backendID, root, key in candidates:
+            if not isinstance(key, str) or key.startswith("/") or "\\" in key or "\x00" in key or any(part in {"", ".", ".."} for part in key.split("/")):
+                raise ValueError("Database contains an invalid replay metadata object key.")
+
+            try:
+                filesystem, prefix = url_to_fs(root, **optionsByBackend.get(backendID, {}))
+
+                with filesystem.open(posixpath.join(prefix, key), "rb") as source:
+                    content = source.read(size + 1)
+
+                if len(content) != size or hashlib.sha256(content).hexdigest() != digest:
+                    raise ValueError("Metadata content identity mismatch.")
+
+            except (OSError, ValueError) as error:
+                failures.append(f"backend {backendID}: {type(error).__name__}")
+                continue
+
+            return content, {"sha256": digest, "size_bytes": size}
+
+        raise OSError(f"Cannot verify checkpoint {sessionID} {name}: " + ("; ".join(failures) or "no eligible storage locations"))
+    
+    @classmethod
+    def _readReplayCheckpointHistory(cls, connection, postgres, checkpoint, *, storageOptionsByBackend=None):
+        """Read history metadata without constructing runs or MNE objects.
+
+        checkpoint is a validated ancestry record from getSessionPipeline().
+        Reject contracts without a recorded session-history boundary.
+        """
+        from io import BytesIO, TextIOWrapper
+
+        sessionID = checkpoint["sessionID"]
+        origin = checkpoint["origin"]
+        contract = checkpoint["contractVersion"]
+
+        if (origin, contract) == ("raw", "pgl.raw.behavior.v1"):
+            raise ValueError(f"Raw checkpoint {sessionID} uses pgl.raw.behavior.v1 and has no session-level history boundary. Automatic ancestry replay cannot safely distinguish acquisition loading from later processing for this contract.")
+
+        supported = {("raw", "pgl.raw.session.v1"), ("derived", "pgl.derived.session.v1"), ("derived", "pgl.derived.behavior.v1")}
+
+        if (origin, contract) not in supported:
+            raise ValueError(f"Checkpoint {sessionID} has an unsupported replay contract: {origin}, {contract}.")
+
+        manifestBytes, manifestIdentity = cls._readReplayMetadataFile(connection, postgres, sessionID, "manifest.json", storageOptionsByBackend=storageOptionsByBackend, maxBytes=16 * 1024 * 1024)
+
+        if manifestIdentity["sha256"] != checkpoint["manifestHash"]:
+            raise ValueError(f"Checkpoint {sessionID}: manifest link differs from its checkpoint identity.")
+
+        manifest = json.loads(manifestBytes.decode("utf-8"))
+        cls._validateSessionBundleManifest(manifest, origin=origin)
+
+        if manifest["contract_version"] != contract or cls.encodeRawManifest(manifest) != manifestBytes:
+            raise ValueError(f"Checkpoint {sessionID}: manifest contract or canonical encoding differs.")
+
+        historyRecords = [record for record in manifest["files"] if record["name"] == "history.json"]
+
+        if len(historyRecords) != 1:
+            raise ValueError(f"Checkpoint {sessionID}: manifest must contain exactly one history.json.")
+
+        historyBytes, historyIdentity = cls._readReplayMetadataFile(connection, postgres, sessionID, "history.json", storageOptionsByBackend=storageOptionsByBackend)
+        expectedHistory = historyRecords[0]
+
+        if historyIdentity != {"sha256": expectedHistory["sha256"], "size_bytes": expectedHistory["size_bytes"]}:
+            raise ValueError(f"Checkpoint {sessionID}: registered history differs from the manifest.")
+
+        class HistoryView:
+            """Expose only the already-verified history bytes to the reader."""
+
+            def open(self, path, mode="rb", **kwargs):
+                if path != "history.json":
+                    raise ValueError("Replay history reader requested an unexpected file.")
+
+                if mode == "rb":
+                    return BytesIO(historyBytes)
+
+                if mode in ("r", "rt"):
+                    return TextIOWrapper(BytesIO(historyBytes), encoding=kwargs.get("encoding", "utf-8"))
+
+                raise ValueError("Replay history is read-only.")
+
+        # Reuse the existing history/label compatibility checks.
+        history, metadata = cls._readSessionHistory(HistoryView(), len(manifest["runs"]))
+        return history
+    
+    @classmethod
+    def _selectAncestralReplayInput(cls, session, checkpoints, postgres):
+        """Validate root-to-current ancestry histories and choose the raw input.
+
+        checkpoints contains records in root-to-current order, each with
+        verified historyHashes.
+
+        This checks recorded provenance consistency, not scientific equivalence
+        or the absence of unrecorded in-memory mutations.
+        """
+        boundary = cls._getCheckpointHistoryBoundary(session)
+
+        if boundary is None:
+            raise ValueError("This working session has no verified checkpoint baseline. Reload its saved checkpoint before requesting ancestry-based extraction.")
+
+        baseline = session._checkpointBaseline
+        identity = cls._checkpointDatabaseIdentity(postgres)
+
+        if baseline["databaseIdentity"] != identity:
+            raise ValueError("Current PGL settings point to a different database than this session's checkpoint baseline.")
+
+        if not checkpoints:
+            raise ValueError("No checkpoint ancestry was supplied.")
+
+        current = checkpoints[-1]
+
+        if current["sessionID"] != baseline["sessionID"] or session.sessionID != baseline["sessionID"]:
+            raise ValueError("Working session ID, baseline, and checkpoint ancestry do not agree.")
+
+        if current["historyHashes"] != baseline["historyHashes"]:
+            raise ValueError("Saved checkpoint history differs from the working session's baseline.")
+
+        root = checkpoints[0]
+
+        if root["origin"] != "raw" or root["parentSessionID"] is not None or root["rootSessionID"] != root["sessionID"]:
+            raise ValueError("Replay ancestry does not begin with a parentless raw root.")
+
+        if root["contractVersion"] != "pgl.raw.session.v1":
+            raise ValueError("Automatic ancestry replay requires a raw contract with recorded session history.")
+
+        seen = set()
+        previous = None
+
+        for checkpoint in checkpoints:
+            sessionID = checkpoint["sessionID"]
+
+            if sessionID in seen:
+                raise ValueError("Checkpoint ancestry contains a cycle or repeated checkpoint.")
+
+            seen.add(sessionID)
+
+            if checkpoint["status"] != "complete" or checkpoint["deletedAt"] is not None:
+                raise ValueError(f"Replay ancestor {sessionID} is incomplete or deleted.")
+
+            if checkpoint["rootSessionID"] != root["sessionID"]:
+                raise ValueError("Checkpoint ancestry has inconsistent root IDs.")
+
+            if previous is not None:
+                if checkpoint["origin"] != "derived" or checkpoint["parentSessionID"] != previous["sessionID"]:
+                    raise ValueError("Checkpoint ancestry contains a broken parent relationship.")
+
+                prefix = previous["historyHashes"]
+                childHistory = checkpoint["historyHashes"]
+
+                if len(childHistory) < len(prefix) or childHistory[:len(prefix)] != prefix:
+                    raise ValueError(f"Checkpoint {sessionID} does not preserve its parent's recorded history prefix. Refusing to infer a replay sequence.")
+
+            previous = checkpoint
+
+        inputRecord = {
+            "version": 1,
+            "kind": "checkpoint",
+            "sessionID": root["sessionID"],
+            "databaseIdentity": deepcopy(identity),
+            "historyCount": len(root["historyHashes"]),
+            "historyHashes": list(root["historyHashes"]),
+        }
+
+        cls._validatePipelineReplayInput(inputRecord)
+        return inputRecord
+    
+    @classmethod
+    def getSessionPipeline(cls, session, name=None, *, settings=None, settingsName=None, storageOptionsByBackend=None, sslRootCert=None):
+        """Extract recorded analysis from a session using checkpoint ancestry.
+
+        For sessions with a checkpoint baseline, verify active ancestry and
+        saved history metadata, then extract the suffix after the raw boundary.
+
+        Without a baseline, preserve the existing history-only extraction path.
+        That path may have a recorded pipeline input or no default input.
+
+        Returns None for unavailable configuration or connection cancellation.
+        Invalid ancestry and metadata errors propagate.
+
+        Reads manifests/history only. Does not open scientific payloads,
+        change session history, save a recipe, or execute actions.
+        """
+        from .pglPipeline import pglActionable, pglPipeline
+        from .pglPostgres import pglPostgres
+
+        if not isinstance(session, pglActionable):
+            raise TypeError("Pipeline extraction requires a pglActionable object.")
+
+        if name is not None:
+            pglPipeline._validatePipelineName(name)
+
+        boundary = cls._getCheckpointHistoryBoundary(session)
+
+        if boundary is None:
+            return pglPipeline.fromHistory(session, name=name)
+
+        baseline = deepcopy(session._checkpointBaseline)
+
+        if getattr(session, "sessionID", None) != baseline["sessionID"]:
+            raise ValueError("Session ID differs from its checkpoint baseline. Reload the intended checkpoint before ancestry-based extraction.")
+
+        postgres = pglPostgres.fromSettings(settings=settings, settingsName=settingsName)
+
+        if postgres is None:
+            return None
+
+        if cls._checkpointDatabaseIdentity(postgres) != baseline["databaseIdentity"]:
+            raise ValueError("Current PGL settings point to a different database than the session baseline.")
+
+        sessionsTable = sql.Identifier(postgres.databaseSchema, "session")
+        checkpoints = []
+        seen = set()
+        currentID = baseline["sessionID"]
+
+        with postgres.connect(sslRootCert=sslRootCert) as connection:
+            if connection is None:
+                return None
+
+            with connection.transaction():
+                connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+
+                while currentID is not None:
+                    if currentID in seen:
+                        raise ValueError("Checkpoint ancestry contains a cycle.")
+
+                    if len(seen) >= 10000:
+                        raise ValueError("Checkpoint ancestry exceeds the replay inspection limit.")
+
+                    seen.add(currentID)
+                    statement = sql.SQL("SELECT session_id, parent_session_id, root_session_id, origin, status, contract_version, manifest_hash, deleted_at FROM {} WHERE session_id = %s").format(sessionsTable)
+                    row = connection.execute(statement, (currentID,)).fetchone()
+
+                    if row is None:
+                        raise ValueError(f"Replay ancestor {currentID} does not exist.")
+
+                    record = dict(zip(("sessionID", "parentSessionID", "rootSessionID", "origin", "status", "contractVersion", "manifestHash", "deletedAt"), row))
+
+                    if record["status"] != "complete" or record["deletedAt"] is not None:
+                        raise ValueError(f"Replay ancestor {currentID} is incomplete or deleted.")
+
+                    checkpoints.append(record)
+                    currentID = record["parentSessionID"]
+
+                checkpoints.reverse()
+
+                for checkpoint in checkpoints:
+                    history = cls._readReplayCheckpointHistory(connection, postgres, checkpoint, storageOptionsByBackend=storageOptionsByBackend)
+                    checkpoint["historyHashes"] = [hashlib.sha256(cls.encodeRawManifest(json.loads(entry.toJSON()))).hexdigest() for entry in history.actionHistory]
+
+                inputRecord = cls._selectAncestralReplayInput(session, checkpoints, postgres)
+
+        # Recheck the working prefix after metadata reads. Callers must not
+        # concurrently modify the session while extraction is in progress.
+        cls._getCheckpointHistoryBoundary(session)
+
+        if session._checkpointBaseline != baseline:
+            raise ValueError("The working checkpoint baseline changed during pipeline extraction.")
+
+        prefixLength = inputRecord["historyCount"]
+        view = pglActionable()
+        view.actionHistory = list(session.actionHistory[prefixLength:])
+        view._failedActionIDs = list(session._failedActionIDs)
+
+        # Check only the analysis history selected for extraction, not the
+        # acquisition history already excluded by the raw checkpoint boundary.
+        from .pglPipeline import pglActionStatus
+
+        for entry in view.actionHistory:
+            if entry.actionStatus == pglActionStatus.SUCCESS and (not entry.actionCode.get("module") or not entry.actionCode.get("qualname")):
+                pglMessages.warning(f"Cannot extract pipeline: {entry.actionName!r} has old history recorded before action class identities were added. Reloading or resaving will not recover that missing information. The session and its history have not been changed.", level=2)
+                return None
+
+        # The tested execution-tree extractor rejects a boundary that splits
+        # a parent/child execution tree rather than silently flattening it.
+        pipeline = pglPipeline._fromHistoryRecipe(view, name=name)
+
+        def restoreHistoryIndices(recipe):
+            for source in recipe.stepSources.values():
+                source["historyIndex"] += prefixLength
+
+            for action in recipe.actions:
+                if isinstance(action, pglPipeline):
+                    restoreHistoryIndices(action)
+
+        restoreHistoryIndices(pipeline)
+        pipeline.replayInput = inputRecord
+
+        pglMessages.message(f"Pipeline extracted from recorded ancestry: input checkpoint {inputRecord['sessionID']}; excluded {prefixLength} history entries already included in that raw checkpoint.")
+        return pipeline
     
     @classmethod
     def saveRawSession(cls, session, *, settings=None, settingsName=None, backendID=None, storageOptions=None, sslRootCert=None, allowMissingMetadata=False):

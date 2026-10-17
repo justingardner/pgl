@@ -23,6 +23,11 @@ from types import SimpleNamespace
 import posixpath
 from enum import Enum
 import sys
+from contextvars import ContextVar
+
+# Carry strict restoration policy through existing custom fromJSONdict()
+# implementations without adding new keywords to every subclass.
+_pglStrictRestorePath = ContextVar("pglStrictRestorePath", default=None)
 
 ##########################
 # Recursively collect all subclasses
@@ -204,306 +209,201 @@ class pglSerialize:
     ##########################
     # toJSON: determines how to serialize to JSON different data types
     ##########################
-    def toJSON(self, type="all", filename=None):
-        """
-        Serialize this object to JSON.
+    def toJSON(self, type="all", filename=None, *, strict=False):
+        """Serialize metadata using the existing PGL JSON representation.
 
-        Circular references are detected while traversing the object graph.
-        When a circular reference is encountered, that field is omitted and
-        a short warning is issued. Serialization then continues normally.
-        """
+        Default behavior remains permissive: unsupported values and circular
+        references warn and are skipped, or become None inside sequences.
 
-        # Objects currently being traversed.
-        #
-        # This is intentionally an "active" set rather than a global "seen"
-        # set. The same object may legitimately appear in multiple places;
-        # only a reference back into the current traversal is a cycle.
+        strict=True rejects unsupported values, cycles, non-string mapping
+        keys, reserved marker collisions, and nonfinite floating-point values.
+
+        Existing class-specific toJSONdict() methods still select fields.
+        This method does not change lazy-field selection or export payloads.
+        Strict decoding is a separate operation.
+        """
+        import math
+
+        if not isinstance(strict, bool):
+            raise TypeError("strict must be a boolean.")
+
         activeObjects = {}
+        serializationSkip = object()
+        reservedMarkers = {"__class__", "__hastraits__", "__exception__", "__enum__", "__datetime__", "__path__", "__numpy__", "__range__", "__tuple__", "__simplenamespace__"}
 
-        def encodeObject(o, path="root"):
+        def unsupported(value, path, reason):
+            """Raise in strict mode; otherwise retain warning-and-skip behavior."""
+            message = f"(pglSerialize) {reason} at '{path}' ({value.__class__.__name__})"
 
-            # ----------------------------------------------------------
-            # Determine whether this object can participate in a cycle.
-            # ----------------------------------------------------------
-            trackObject = isinstance(
-                o,
-                (pglSerialize, HasTraits, SimpleNamespace, list, dict, tuple)
-            )
+            if filename:
+                message += f" while saving '{filename}'"
 
-            objectId = id(o) if trackObject else None
+            if strict:
+                raise ValueError(message)
 
-            # ----------------------------------------------------------
-            # Circular reference detected.
-            #
-            # Return a private sentinel so the caller can omit the field
-            # rather than writing "null" into the JSON.
-            # ----------------------------------------------------------
-            if trackObject and objectId in activeObjects:
+            pglMessages.warning(message, level=1)
+            return serializationSkip
 
-                pglMessages.warning(
-                    f"(pglSerialize) Circular reference skipped at "
-                    f"'{path}' ({o.__class__.__name__})",
-                    level=1
-                )
+        def encodeFields(values, result, path):
+            """Encode fields while protecting type markers in strict mode."""
+            if strict:
+                for key in values:
+                    if not isinstance(key, str):
+                        raise TypeError(f"{path}: metadata keys must be strings; received {key!r}.")
 
-                return _SERIALIZATION_SKIP
+                    if key in reservedMarkers:
+                        raise ValueError(f"{path}.{key}: field conflicts with a reserved serialization marker.")
 
-            # Mark object as active.
+            for key, value in values.items():
+                encoded = encodeObject(value, f"{path}.{key}")
+
+                if encoded is not serializationSkip:
+                    result[key] = encoded
+
+            return result
+
+        def encodeSequence(values, path):
+            """Preserve positional meaning when permissive encoding skips an item."""
+            result = []
+
+            for index, value in enumerate(values):
+                encoded = encodeObject(value, f"{path}[{index}]")
+                result.append(None if encoded is serializationSkip else encoded)
+
+            return result
+
+        def encodeObject(value, path="root"):
+            """Encode one value, tracking only objects on the current traversal."""
+            trackObject = isinstance(value, (pglSerialize, HasTraits, SimpleNamespace, list, dict, tuple))
+            objectID = id(value) if trackObject else None
+
+            # A shared object appearing twice is allowed. Only a reference back
+            # into the current traversal is a circular reference.
+            if trackObject and objectID in activeObjects:
+                return unsupported(value, path, "Circular reference skipped")
+
             if trackObject:
-                activeObjects[objectId] = o
+                activeObjects[objectID] = value
 
             try:
-
-
-                if isinstance(o, Exception):
-                    if isinstance(o, pglSerializedError):
-                        moduleName = o.originalModule
-                        className = o.originalClass
+                if isinstance(value, Exception):
+                    if isinstance(value, pglSerializedError):
+                        moduleName = value.originalModule
+                        className = value.originalClass
                     else:
-                        moduleName = o.__class__.__module__
-                        className = o.__class__.__qualname__
+                        moduleName = value.__class__.__module__
+                        className = value.__class__.__qualname__
 
-                    return {
-                        '__exception__': True,
-                        '__module__': moduleName,
-                        '__qualname__': className,
-                        'message': str(o),
-                    }
-                # Handle enums before primitives, including IntEnum/StrEnum.
-                if isinstance(o, Enum):
-                    return {
-                        '__enum__': True,
-                        '__module__': o.__class__.__module__,
-                        '__qualname__': o.__class__.__qualname__,
-                        'name': o.name,
-                    }
-                    
-                # ------------------------------------------------------
-                # Custom encoding for pglSerialize objects
-                # ------------------------------------------------------
-                if isinstance(o, pglSerialize):
+                    if strict:
+                        if not isinstance(moduleName, str) or not moduleName or not isinstance(className, str) or not className:
+                            raise ValueError(f"{path}: invalid serialized exception identity.")
 
-                    data = o.toJSONdict(type)
+                    return {"__exception__": True, "__module__": moduleName, "__qualname__": className, "message": str(value)}
 
-                    result = {
-                        '__class__': o.__class__.__name__
-                    }
+                # IntEnum and StrEnum must be handled before ordinary primitives.
+                if isinstance(value, Enum):
+                    if strict and (not isinstance(value.name, str) or not value.name):
+                        raise ValueError(f"{path}: enum value has no restorable member name.")
 
-                    for key, value in data.items():
+                    return {"__enum__": True, "__module__": value.__class__.__module__, "__qualname__": value.__class__.__qualname__, "name": value.name}
 
-                        encoded = encodeObject(
-                            value,
-                            f"{path}.{key}"
-                        )
+                if isinstance(value, pglSerialize):
+                    # Keep each class's field-selection implementation.
+                    # Do not pass a new keyword to existing overrides.
+                    data = value.toJSONdict(type)
 
-                        # Omit fields that would create a cycle.
-                        if encoded is not _SERIALIZATION_SKIP:
-                            result[key] = encoded
+                    if not isinstance(data, dict):
+                        raise TypeError(f"{path}: {value.__class__.__name__}.toJSONdict() must return a dictionary.")
 
-                    return result
-                
-                # ------------------------------------------------------
-                # ranges
-                # ------------------------------------------------------
-                elif isinstance(o, range):
-                    return {'__range__': True, 'start': o.start, 'stop': o.stop, 'step': o.step}
+                    return encodeFields(data, {"__class__": value.__class__.__name__}, path)
 
-                # ------------------------------------------------------
-                # datetime
-                # ------------------------------------------------------
-                elif isinstance(o, datetime):
+                if isinstance(value, range):
+                    return {"__range__": True, "start": value.start, "stop": value.stop, "step": value.step}
 
-                    return {
-                        '__datetime__': True,
-                        'value': o.isoformat()
-                    }
+                if isinstance(value, datetime):
+                    return {"__datetime__": True, "value": value.isoformat()}
 
-                # ------------------------------------------------------
-                # pathlib.Path
-                # ------------------------------------------------------
-                elif isinstance(o, Path):
+                if isinstance(value, Path):
+                    return {"__path__": True, "value": str(value)}
 
-                    return {
-                        '__path__': True,
-                        'value': str(o)
-                    }                # ------------------------------------------------------
-                # numpy arrays
-                # ------------------------------------------------------
-                elif isinstance(o, np.ndarray):
+                if isinstance(value, np.ndarray):
+                    if strict:
+                        # The existing dtype/shape/tolist representation supports
+                        # plain numeric and Unicode metadata arrays. Structured,
+                        # object, complex, and other arrays need explicit codecs.
+                        if value.dtype.fields is not None or value.dtype.kind not in "biufU":
+                            raise TypeError(f"{path}: NumPy dtype {value.dtype} is not supported by strict metadata encoding.")
 
-                    return {
-                        '__numpy__': True,
-                        'dtype': str(o.dtype),
-                        'shape': o.shape,
-                        'data': o.tolist()
-                    }
+                        if value.dtype.kind == "f" and not np.isfinite(value).all():
+                            raise ValueError(f"{path}: array contains nonfinite floating-point values.")
 
-                # ------------------------------------------------------
-                # numpy scalar types
-                # ------------------------------------------------------
-                elif isinstance(o, (np.integer, np.floating)):
+                    data = value.tolist()
 
-                    return o.item()
+                    if strict:
+                        # Validate every converted item as metadata. Extended
+                        # precision types may remain NumPy scalars after tolist().
+                        data = encodeObject(data, f"{path}.data")
 
-                # ------------------------------------------------------
-                # tuples
-                # ------------------------------------------------------
-                elif isinstance(o, tuple):
+                    return {"__numpy__": True, "dtype": str(value.dtype), "shape": value.shape, "data": data}
 
-                    items = []
+                if isinstance(value, (np.integer, np.floating)):
+                    scalar = value.item()
 
-                    for i, item in enumerate(o):
+                    if strict:
+                        if isinstance(scalar, np.generic):
+                            raise TypeError(f"{path}: NumPy scalar {value.dtype} cannot be represented by the existing JSON scalar encoding.")
 
-                        encoded = encodeObject(
-                            item,
-                            f"{path}[{i}]"
-                        )
+                        return encodeObject(scalar, path)
 
-                        # A tuple cannot have an omitted element without
-                        # changing its positional meaning, so preserve
-                        # the existing behavior by using None here.
-                        if encoded is _SERIALIZATION_SKIP:
-                            encoded = None
+                    return scalar
 
-                        items.append(encoded)
+                if isinstance(value, tuple):
+                    return {"__tuple__": True, "items": encodeSequence(value, path)}
 
-                    return {
-                        '__tuple__': True,
-                        'items': items
-                    }
+                if isinstance(value, HasTraits):
+                    result = {"__hastraits__": True, "__class__": value.__class__.__name__, "__module__": value.__class__.__module__}
 
-                # ------------------------------------------------------
-                # HasTraits objects
-                # ------------------------------------------------------
-                elif isinstance(o, HasTraits) and not isinstance(o, pglSerialize):
-
-                    result = {
-                        '__hastraits__': True,
-                        '__class__': o.__class__.__name__,
-                        '__module__': o.__class__.__module__
-                    }
-
-                    for key in o.trait_names():
-
-                        if not pglShouldReadTraitForSerialize(o, key):
+                    # Retain the supplied file's exact trait-selection policy.
+                    # This can resolve pending lazyload traits; strict mode does
+                    # not implement the proposed external-reference protocol.
+                    for key in value.trait_names():
+                        if not pglShouldReadTraitForSerialize(value, key):
                             continue
 
-                        encoded = encodeObject(
-                            getattr(o, key),
-                            f"{path}.{key}"
-                        )
+                        if strict and key in reservedMarkers:
+                            raise ValueError(f"{path}.{key}: trait conflicts with a reserved serialization marker.")
 
-                        # Omit cyclic fields.
-                        if encoded is not _SERIALIZATION_SKIP:
+                        encoded = encodeObject(getattr(value, key), f"{path}.{key}")
+
+                        if encoded is not serializationSkip:
                             result[key] = encoded
 
                     return result
 
-                # ------------------------------------------------------
-                # lists
-                # ------------------------------------------------------
-                elif isinstance(o, list):
+                if isinstance(value, list):
+                    return encodeSequence(value, path)
 
-                    result = []
+                if isinstance(value, dict):
+                    return encodeFields(value, {}, path)
 
-                    for i, item in enumerate(o):
+                if value is None or isinstance(value, (str, int, float, bool)):
+                    if strict and isinstance(value, float) and not math.isfinite(value):
+                        raise ValueError(f"{path}: nonfinite floating-point values are not supported by strict JSON encoding.")
 
-                        encoded = encodeObject(
-                            item,
-                            f"{path}[{i}]"
-                        )
+                    return value
 
-                        # Lists are positional, so preserve the existing
-                        # list behavior by replacing a cyclic element
-                        # with None rather than shifting the remaining
-                        # elements.
-                        if encoded is _SERIALIZATION_SKIP:
-                            encoded = None
+                if isinstance(value, SimpleNamespace):
+                    return encodeFields(vars(value), {"__simplenamespace__": True}, path)
 
-                        result.append(encoded)
-
-                    return result
-
-                # ------------------------------------------------------
-                # dictionaries
-                # ------------------------------------------------------
-                elif isinstance(o, dict):
-
-                    result = {}
-
-                    for key, value in o.items():
-
-                        encoded = encodeObject(
-                            value,
-                            f"{path}.{key}"
-                        )
-
-                        # Omit cyclic dictionary values entirely.
-                        if encoded is not _SERIALIZATION_SKIP:
-                            result[key] = encoded
-
-                    return result
-
-                # ------------------------------------------------------
-                # ------------------------------------------------------
-                # JSON primitive
-                # ------------------------------------------------------
-                elif o is None or isinstance(o, (str, int, float, bool)):
-                    return o
-
-                # ------------------------------------------------------
-                # SimpleNamespace
-                # ------------------------------------------------------
-                elif isinstance(o, SimpleNamespace):
-
-                    result = {
-                        '__simplenamespace__': True
-                    }
-
-                    for key, value in vars(o).items():
-
-                        encoded = encodeObject(
-                            value,
-                            f"{path}.{key}"
-                        )
-
-                        if encoded is not _SERIALIZATION_SKIP:
-                            result[key] = encoded
-
-                    return result
-                
-                # ------------------------------------------------------
-                # Unknown object
-                # ------------------------------------------------------
-                else:
-                    pglMessages.warning(
-                        f"(pglSerialize) Unsupported object skipped at "
-                        f"'{path}' ({o.__class__.__name__})"
-                        + (f" while saving '{filename}'" if filename else ""),
-                        level=1
-                    )
-                    return _SERIALIZATION_SKIP
+                return unsupported(value, path, "Unsupported object skipped")
 
             finally:
-
                 if trackObject:
-                    activeObjects.pop(objectId, None)
+                    activeObjects.pop(objectID, None)
 
-        # Private sentinel used to distinguish "omit this field" from
-        # an actual serialized None.
-        _SERIALIZATION_SKIP = object()
-
-        # IMPORTANT:
-        # Fully encode the object graph before handing anything to
-        # json.dumps(). This prevents json.dumps() from doing its own
-        # traversal and detecting a cycle that we failed to catch.
-        encoded = encodeObject(self, "root")
-
-        return json.dumps(
-            encoded,
-            sort_keys=True,
-            indent=4
-        )
+        # Complete our traversal before handing the result to json.dumps().
+        encoded = encodeObject(self)
+        return json.dumps(encoded, sort_keys=True, indent=4, allow_nan=not strict)
 
    
     ##########################
@@ -576,157 +476,404 @@ class pglSerialize:
             }
 
         return result
+
+
+    ##########################
+    # fromJSONStrict
+    ##########################
+    @classmethod
+    def _fromJSONStrict(cls, jsonString, filename=None, loadAsClass=None, rootPath="root"):
+        """Validate and restore metadata without silent fallback.
+
+        Each reconstructed tagged object must re-encode to the same metadata,
+        allowing canonical class names in place of registered legacy aliases.
+
+        Explicit migrations that intentionally change document contents are
+        separate from this exact-restoration mode.
+        """
+        import math
+
+        if loadAsClass is not None and (not isinstance(loadAsClass, type) or not issubclass(loadAsClass, pglSerialize)):
+            raise TypeError("loadAsClass must be a pglSerialize subclass.")
+
+        classRegistry = pglGetAllSubclasses(pglSerialize)
+        markers = {"__class__", "__hastraits__", "__exception__", "__enum__", "__datetime__", "__path__", "__numpy__", "__range__", "__tuple__", "__simplenamespace__"}
+
+        def rejectConstant(value):
+            raise ValueError(f"{rootPath}: nonstandard JSON constant {value!r} is not permitted.")
+
+        def uniqueObject(pairs):
+            result = {}
+
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError(f"{rootPath}: duplicate JSON key {key!r}.")
+
+                result[key] = value
+
+            return result
+
+        document = json.loads(jsonString, object_pairs_hook=uniqueObject, parse_constant=rejectConstant)
+
+        def resolveLoadedClass(moduleName, qualname, baseClass, path):
+            """Resolve ordinary module/class namespaces without dynamic imports."""
+            if not isinstance(moduleName, str) or not moduleName or not isinstance(qualname, str) or not qualname:
+                raise ValueError(f"{path}: invalid class identity.")
+
+            current = sys.modules.get(moduleName)
+
+            if current is None:
+                raise ValueError(f"{path}: module {moduleName!r} is not loaded.")
+
+            for index, part in enumerate(qualname.split(".")):
+                if not part.isidentifier() or (index and not isinstance(current, type)):
+                    raise ValueError(f"{path}: invalid class name {qualname!r}.")
+
+                current = vars(current).get(part)
+
+                if current is None:
+                    raise ValueError(f"{path}: unknown class {moduleName}.{qualname}.")
+
+            if not isinstance(current, type) or not issubclass(current, baseClass):
+                raise TypeError(f"{path}: {moduleName}.{qualname} is not a {baseClass.__name__} class.")
+
+            return current
+
+        def encodedDocument(value):
+            # Invoke the shared encoder, not a second type-encoding system.
+            return json.loads(pglSerialize.toJSON(value, strict=True))
+
+        def sameDocument(left, right):
+            # Comparing encoded JSON avoids Python treating True, 1, and 1.0
+            # as interchangeable when checking configuration preservation.
+            leftText = json.dumps(left, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            rightText = json.dumps(right, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            return leftText == rightText
+
+        def decode(value, path, isRoot=False):
+            if isinstance(value, list):
+                decoded = []
+                normalized = []
+
+                for index, item in enumerate(value):
+                    result, expected = decode(item, f"{path}[{index}]")
+                    decoded.append(result)
+                    normalized.append(expected)
+
+                return decoded, normalized
+
+            if not isinstance(value, dict):
+                if isinstance(value, float) and not math.isfinite(value):
+                    raise ValueError(f"{path}: nonfinite JSON number.")
+
+                return value, value
+
+            present = set(value).intersection(markers)
+
+            if not present:
+                decoded = {}
+                normalized = {}
+
+                for key, item in value.items():
+                    decoded[key], normalized[key] = decode(item, f"{path}.{key}")
+
+                return decoded, normalized
+
+            # A plain HasTraits record intentionally contains both markers.
+            if present == {"__hastraits__", "__class__"}:
+                marker = "__hastraits__"
+            elif len(present) == 1:
+                marker = next(iter(present))
+            else:
+                raise ValueError(f"{path}: conflicting serialization markers: {sorted(present)}.")
+
+            def requireFields(names):
+                if set(value) != set(names):
+                    raise ValueError(f"{path}: invalid fields for {marker}.")
+
+            if marker != "__class__" and value[marker] is not True:
+                raise ValueError(f"{path}: {marker} must be true.")
+
+            expected = dict(value)
+
+            if marker == "__class__":
+                className = value["__class__"]
+
+                if not isinstance(className, str):
+                    raise ValueError(f"{path}: class name must be a string.")
+
+                objectClass = loadAsClass if isRoot and loadAsClass is not None else classRegistry.get(className)
+
+                if objectClass is None:
+                    raise ValueError(f"{path}: unknown serialization class {className!r}.")
+
+                data = {}
+                expected = {"__class__": objectClass.__name__}
+
+                for key, item in value.items():
+                    if key != "__class__":
+                        data[key], expected[key] = decode(item, f"{path}.{key}")
+
+                token = _pglStrictRestorePath.set(path)
+
+                try:
+                    obj = objectClass.fromJSONdict(data, filename=filename)
+                except Exception as error:
+                    raise ValueError(f"{path}: could not restore {className}: {error}") from error
+                finally:
+                    _pglStrictRestorePath.reset(token)
+
+                if not isinstance(obj, objectClass):
+                    raise TypeError(f"{path}: {className}.fromJSONdict() returned an unexpected object.")
+
+            elif marker == "__hastraits__":
+                if not {"__module__", "__class__"}.issubset(value):
+                    raise ValueError(f"{path}: incomplete HasTraits identity.")
+
+                objectClass = resolveLoadedClass(value["__module__"], value["__class__"], HasTraits, path)
+                obj = objectClass()
+                traits = obj.traits()
+                expected = {key: value[key] for key in ("__hastraits__", "__class__", "__module__")}
+
+                for key, item in value.items():
+                    if key in expected:
+                        continue
+
+                    if key not in traits or traits[key].metadata.get("serialize", True) is False:
+                        raise ValueError(f"{path}.{key}: unknown or nonpersistent trait.")
+
+                    restored, expected[key] = decode(item, f"{path}.{key}")
+
+                    try:
+                        setattr(obj, key, restored)
+                    except Exception as error:
+                        raise ValueError(f"{path}.{key}: trait restoration failed: {error}") from error
+
+            elif marker == "__exception__":
+                requireFields(("__exception__", "__module__", "__qualname__", "message"))
+
+                if any(not isinstance(value[key], str) for key in ("__module__", "__qualname__", "message")) or not value["__module__"] or not value["__qualname__"]:
+                    raise ValueError(f"{path}: invalid exception record.")
+
+                obj = pglSerializedError(value["__module__"], value["__qualname__"], value["message"])
+
+            elif marker == "__enum__":
+                requireFields(("__enum__", "__module__", "__qualname__", "name"))
+                enumClass = resolveLoadedClass(value["__module__"], value["__qualname__"], Enum, path)
+
+                if not isinstance(value["name"], str):
+                    raise ValueError(f"{path}: enum member must be a string.")
+
+                try:
+                    obj = enumClass[value["name"]]
+                except KeyError as error:
+                    raise ValueError(f"{path}: unknown enum member {value['name']!r}.") from error
+
+            elif marker in ("__datetime__", "__path__"):
+                requireFields((marker, "value"))
+
+                if not isinstance(value["value"], str):
+                    raise ValueError(f"{path}: expected a string value.")
+
+                obj = datetime.fromisoformat(value["value"]) if marker == "__datetime__" else Path(value["value"])
+
+            elif marker == "__range__":
+                requireFields(("__range__", "start", "stop", "step"))
+
+                if any(item.__class__ is not int for item in (value["start"], value["stop"], value["step"])) or value["step"] == 0:
+                    raise ValueError(f"{path}: invalid range.")
+
+                obj = range(value["start"], value["stop"], value["step"])
+
+            elif marker == "__tuple__":
+                requireFields(("__tuple__", "items"))
+
+                if not isinstance(value["items"], list):
+                    raise ValueError(f"{path}: tuple items must be a list.")
+
+                items, normalized = decode(value["items"], f"{path}.items")
+                obj = tuple(items)
+                expected = {"__tuple__": True, "items": normalized}
+
+            elif marker == "__simplenamespace__":
+                data = {}
+                expected = {"__simplenamespace__": True}
+
+                for key, item in value.items():
+                    if key != "__simplenamespace__":
+                        data[key], expected[key] = decode(item, f"{path}.{key}")
+
+                obj = SimpleNamespace(**data)
+
+            elif marker == "__numpy__":
+                requireFields(("__numpy__", "dtype", "shape", "data"))
+
+                if not isinstance(value["dtype"], str):
+                    raise ValueError(f"{path}: array dtype must be a string.")
+
+                dtype = np.dtype(value["dtype"])
+                shape = value["shape"]
+
+                if dtype.fields is not None or dtype.kind not in "biufU":
+                    raise ValueError(f"{path}: dtype {dtype} is unsupported in strict metadata.")
+
+                if not isinstance(shape, list) or any(size.__class__ is not int or size < 0 for size in shape):
+                    raise ValueError(f"{path}: invalid array shape.")
+
+                data, normalized = decode(value["data"], f"{path}.data")
+                obj = np.array(data, dtype=dtype).reshape(shape)
+                expected["data"] = normalized
+
+            else:
+                raise ValueError(f"{path}: unsupported serialization marker.")
+
+            # Custom restorers may swallow their own errors or drop fields.
+            # Re-encoding detects a changed persistent representation.
+            try:
+                actual = encodedDocument(obj)
+            except Exception as error:
+                raise ValueError(f"{path}: restored object cannot be strictly encoded: {error}") from error
+
+            if not sameDocument(actual, expected):
+                raise ValueError(f"{path}: restoration changed or discarded serialized metadata.")
+
+            return obj, expected
+
+        result, normalized = decode(document, rootPath, isRoot=True)
+        return result
+    
     ##########################
     # fromJSON
     ##########################
     @classmethod
-    def fromJSON(cls, jsonString, filename=None, loadAsClass=None):
-                
-        # Build registry of all known pglSerialize subclasses
-        CLASS_REGISTRY = pglGetAllSubclasses(pglSerialize)
-        
-        # Decode each dict, restoring objects by type markers
-        def decodeObject(dct):
-            
-            
-            if '__exception__' in dct:
-                expectedFields = {
-                    '__exception__', '__module__', '__qualname__', 'message'
-                }
+    def fromJSON(cls, jsonString, filename=None, loadAsClass=None, *, strict=False):
+        """Restore metadata using the existing PGL JSON representation.
 
-                if (
-                    set(dct) != expectedFields
-                    or dct['__exception__'] is not True
-                    or any(
-                        not isinstance(dct[key], str)
-                        for key in ('__module__', '__qualname__', 'message')
-                    )
-                    or not dct['__module__']
-                    or not dct['__qualname__']
-                ):
+        strict=False preserves legacy decoding behavior.
+
+        strict=True rejects malformed records, unknown classes, duplicate
+        JSON keys, rejected trait values, and changed/dropped metadata.
+        Strictness propagates through nested custom restoration methods.
+
+        In strict mode, loadAsClass overrides only the root PGL object.
+        Constructors and restoration hooks are trusted application code;
+        strict decoding is validation, not a sandbox.
+        """
+        if not isinstance(strict, bool):
+            raise TypeError("strict must be a boolean.")
+
+        # Nested calls made by custom restoration hooks inherit strictness.
+        inheritedPath = _pglStrictRestorePath.get()
+
+        if strict or inheritedPath is not None:
+            return cls._fromJSONStrict(jsonString, filename=filename, loadAsClass=loadAsClass, rootPath=inheritedPath or "root")
+
+        classRegistry = pglGetAllSubclasses(pglSerialize)
+
+        def decodeObject(dct):
+            if "__exception__" in dct:
+                expectedFields = {"__exception__", "__module__", "__qualname__", "message"}
+
+                if set(dct) != expectedFields or dct["__exception__"] is not True or any(not isinstance(dct[key], str) for key in ("__module__", "__qualname__", "message")) or not dct["__module__"] or not dct["__qualname__"]:
                     raise ValueError("Invalid serialized exception record.")
 
-                return pglSerializedError(
-                    originalModule=dct['__module__'],
-                    originalClass=dct['__qualname__'],
-                    message=dct['message'],
-                )
-            # Restore enums from already-loaded application modules.
-            # Do not import modules named by the serialized document.
-            if '__enum__' in dct:
-                expectedFields = {
-                    '__enum__', '__module__', '__qualname__', 'name'
-                }
+                return pglSerializedError(originalModule=dct["__module__"], originalClass=dct["__qualname__"], message=dct["message"])
 
-                if (
-                    set(dct) != expectedFields
-                    or dct['__enum__'] is not True
-                    or any(
-                        not isinstance(dct[key], str) or not dct[key]
-                        for key in ('__module__', '__qualname__', 'name')
-                    )
-                ):
+            if "__enum__" in dct:
+                expectedFields = {"__enum__", "__module__", "__qualname__", "name"}
+
+                if set(dct) != expectedFields or dct["__enum__"] is not True or any(not isinstance(dct[key], str) or not dct[key] for key in ("__module__", "__qualname__", "name")):
                     raise ValueError("Invalid serialized enum record.")
 
-                moduleName = dct['__module__']
-                className = dct['__qualname__']
-                memberName = dct['name']
-
+                moduleName = dct["__module__"]
+                className = dct["__qualname__"]
+                memberName = dct["name"]
                 enumClass = sys.modules.get(moduleName)
 
                 if enumClass is None:
-                    raise ValueError(
-                        f"Enum module is not loaded: {moduleName!r}"
-                    )
+                    raise ValueError(f"Enum module is not loaded: {moduleName!r}")
 
-                for part in className.split('.'):
+                for part in className.split("."):
                     if not part.isidentifier():
-                        raise ValueError(
-                            f"Invalid enum class name: {className!r}"
-                        )
+                        raise ValueError(f"Invalid enum class name: {className!r}")
 
                     enumClass = getattr(enumClass, part, None)
 
                 if not isinstance(enumClass, type) or not issubclass(enumClass, Enum):
-                    raise ValueError(
-                        f"Unknown enum class: {moduleName}.{className}"
-                    )
+                    raise ValueError(f"Unknown enum class: {moduleName}.{className}")
 
                 try:
                     return enumClass[memberName]
                 except KeyError as error:
-                    raise ValueError(
-                        f"Unknown enum member: "
-                        f"{moduleName}.{className}.{memberName}"
-                    ) from error
-                    
-            # Restore datetime objects
-            if '__datetime__' in dct:
-                return datetime.fromisoformat(dct['value'])
-            
-            # Restore pathlib.Path objects
-            if '__path__' in dct:
-                return Path(dct['value'])
+                    raise ValueError(f"Unknown enum member: {moduleName}.{className}.{memberName}") from error
 
-            # Restore numpy arrays
-            if '__numpy__' in dct:
-                return np.array(dct['data'], dtype=dct['dtype']).reshape(dct['shape'])
-            
-            # Restore ranges without expanding them into lists.
-            if '__range__' in dct:
-                expectedFields = {'__range__', 'start', 'stop', 'step'}
-                if set(dct) != expectedFields or dct['__range__'] is not True:
+            if "__datetime__" in dct:
+                return datetime.fromisoformat(dct["value"])
+
+            if "__path__" in dct:
+                return Path(dct["value"])
+
+            if "__numpy__" in dct:
+                return np.array(dct["data"], dtype=dct["dtype"]).reshape(dct["shape"])
+
+            if "__range__" in dct:
+                expectedFields = {"__range__", "start", "stop", "step"}
+
+                if set(dct) != expectedFields or dct["__range__"] is not True:
                     raise ValueError("Invalid serialized range record.")
-                if any(type(dct[key]) is not int for key in ('start', 'stop', 'step')):
-                    raise ValueError("Serialized range start, stop, and step must be integers.")
-                if dct['step'] == 0:
-                    raise ValueError("Serialized range step must not be zero.")
-                return range(dct['start'], dct['stop'], dct['step'])
-            
-            # Restore tuples
-            if '__tuple__' in dct:
-                return tuple(dct['items'])
 
-            # Restore SimpleNamespace objects
-            if '__simplenamespace__' in dct:
-                dct.pop('__simplenamespace__')
-                return SimpleNamespace(**dct)            
-            
-            # Restore HasTraits objects
-            if '__hastraits__' in dct:
-                module_name = dct.pop('__module__')
-                class_name = dct.pop('__class__')
-                dct.pop('__hastraits__')
-                
+                if any(type(dct[key]) is not int for key in ("start", "stop", "step")):
+                    raise ValueError("Serialized range start, stop, and step must be integers.")
+
+                if dct["step"] == 0:
+                    raise ValueError("Serialized range step must not be zero.")
+
+                return range(dct["start"], dct["stop"], dct["step"])
+
+            if "__tuple__" in dct:
+                return tuple(dct["items"])
+
+            if "__simplenamespace__" in dct:
+                dct.pop("__simplenamespace__")
+                return SimpleNamespace(**dct)
+
+            if "__hastraits__" in dct:
+                moduleName = dct.pop("__module__")
+                className = dct.pop("__class__")
+                dct.pop("__hastraits__")
+
                 try:
                     import importlib
-                    module = importlib.import_module(module_name)
-                    trait_class = getattr(module, class_name)
-                    
-                    obj = trait_class()
+                    module = importlib.import_module(moduleName)
+                    traitClass = getattr(module, className)
+                    obj = traitClass()
+
                     for key, value in dct.items():
                         setattr(obj, key, value)
+
                     return obj
-                except (ImportError, AttributeError) as e:
-                    pglMessages.warning(f"(pglSerialize) Could not restore HasTraits object {class_name}: {e}", level=1)
+
+                except (ImportError, AttributeError) as error:
+                    pglMessages.warning(f"(pglSerialize) Could not restore HasTraits object {className}: {error}", level=1)
                     return dct
-            
-            # Restore pglSerialize objects
-            if '__class__' in dct:
-                className = dct.pop('__class__')
+
+            if "__class__" in dct:
+                className = dct.pop("__class__")
+
                 if loadAsClass is not None:
-                    # override setting in json
                     objectClass = loadAsClass
-                elif className in CLASS_REGISTRY:
-                    objectClass = CLASS_REGISTRY[className]
+                elif className in classRegistry:
+                    objectClass = classRegistry[className]
                 else:
-                    availableClasses = sorted(CLASS_REGISTRY.keys())
+                    availableClasses = sorted(classRegistry)
                     pglMessages.warning(f"(pglSerialize) Could not restore object of class '{className}' from '{filename}'.\nKnown classes: {availableClasses}")
                     dct["__class__"] = className
                     return dct
-                obj = objectClass.fromJSONdict(dct, filename=filename)
-                return obj
+
+                return objectClass.fromJSONdict(dct, filename=filename)
+
             return dct
+
         return json.loads(jsonString, object_hook=decodeObject)
 
     ##########################
@@ -781,84 +928,80 @@ class pglSerialize:
     # updateTraitsFromDict - For HasTraits objects
     ##########################
     def updateTraitsFromDict(self, data, filename=None, typeConverter=None):
-        """Restore fields without reading missing/rejected fields for diagnostics."""
+        """Restore metadata with context-aware strict validation.
+
+        Strict restoration rejects unknown/nonpersistent fields and propagates
+        assignment errors. Permissive restoration warns and continues.
+
+        Diagnostics never read the destination field or depend on an optional
+        type-description helper.
+        """
+        strictPath = _pglStrictRestorePath.get()
+
+        if not isinstance(data, dict):
+            raise TypeError("Restoration data must be a dictionary.")
+
         if not isinstance(self, HasTraits):
             self.__dict__.update(data)
             return
 
         traits = self.traits()
+        extraKeys = set(data) - set(traits)
+
+        if strictPath is not None:
+            if extraKeys and not self._serializeUnregisteredFields:
+                raise ValueError(f"{strictPath}: unknown fields: {sorted(extraKeys)}.")
+
+            for key in set(data).intersection(traits):
+                if traits[key].metadata.get("serialize", True) is False:
+                    raise ValueError(f"{strictPath}.{key}: cannot restore a nonpersistent trait.")
 
         for key, trait in traits.items():
             if key not in data:
                 if pglSerialize.verbose and trait.metadata.get("serialize", True) is not False:
-                    pglMessages.message(
-                        f"'{key}' not found in {filename}; current/default value left uninspected.",
-                        verbose=pglSerialize.verbose,
-                    )
+                    pglMessages.message(f"'{key}' not found in {filename}; current/default value left uninspected.", verbose=pglSerialize.verbose)
+
                 continue
 
             try:
                 value = data[key]
-                if callable(typeConverter): value = typeConverter(key, value)
+
+                if callable(typeConverter):
+                    value = typeConverter(key, value)
+
                 setattr(self, key, value)
 
             except TraitError as error:
-                expectedType = self._getDetailedTypeInfo(trait)
-                suppliedType = self._getDetailedTypeInfo(data[key])
-                pglMessages.warning(
-                    f"(pglSerialize) Trait mismatch restoring {self.__class__.__name__}.{key} "
-                    f"from '{filename}': expected {expectedType}, received {suppliedType}. "
-                    f"Field not read for diagnostics. Error: {error}",
-                    level=1,
-                )
+                if strictPath is not None:
+                    raise ValueError(f"{strictPath}.{key}: trait restoration failed: {error}") from error
+
+                # Describe the trait definition and supplied metadata, not the
+                # destination value, whose getter could trigger lazy loading.
+                expectedType = trait.__class__.__name__
+                suppliedType = data[key].__class__.__name__
+                pglMessages.warning(f"(pglSerialize) Trait mismatch restoring {self.__class__.__name__}.{key} from '{filename}': expected trait {expectedType}, received {suppliedType}. Field not read for diagnostics. Error: {error}", level=1)
 
             except Exception as error:
-                pglMessages.warning(
-                    f"(pglSerialize) Error restoring {self.__class__.__name__}.{key} "
-                    f"from '{filename}': {type(error).__name__}: {error}. "
-                    "Field not read for diagnostics.",
-                    level=1,
-                )
+                if strictPath is not None:
+                    raise ValueError(f"{strictPath}.{key}: restoration failed: {error}") from error
 
-        extraKeys = set(data) - set(traits)
-        if not extraKeys: return
+                pglMessages.warning(f"(pglSerialize) Error restoring {self.__class__.__name__}.{key} from '{filename}': {error.__class__.__name__}: {error}. Field not read for diagnostics.", level=1)
+
+        if not extraKeys:
+            return
 
         if self._serializeUnregisteredFields:
             for key in extraKeys:
                 try:
                     setattr(self, key, data[key])
                 except Exception as error:
-                    pglMessages.warning(f"Could not restore unregistered attribute '{key}' from '{filename}': {error}", level=1)
+                    if strictPath is not None:
+                        raise ValueError(f"{strictPath}.{key}: unregistered-field restoration failed: {error}") from error
+
+                    pglMessages.warning(f"Could not restore unregistered attribute '{key}': {error}", level=1)
+
         elif pglSerialize.verbose:
             pglMessages.message(f"Unknown keys in {filename} (ignored): {sorted(extraKeys)}", verbose=pglSerialize.verbose)
-    def _getDetailedTypeInfo(self, obj):
-        """
-        Helper to get detailed type information for better error messages.
-        """
-        if hasattr(obj, '__class__'):
-            typeName = obj.__class__.__name__
-            
-            # For trait types, get additional info
-            if hasattr(obj, 'info'):
-                return f"{typeName} ({obj.info()})"
-            
-            # For list/dict, show element types if possible
-            if isinstance(obj, list):
-                if obj:
-                    elementTypes = set(type(x).__name__ for x in obj[:5])  # Sample first 5
-                    return f"list (contains: {', '.join(elementTypes)})"
-                return "list (empty)"
-            
-            if isinstance(obj, dict):
-                if obj:
-                    keyTypes = set(type(k).__name__ for k in list(obj.keys())[:5])
-                    valueTypes = set(type(v).__name__ for v in list(obj.values())[:5])
-                    return f"dict (keys: {', '.join(keyTypes)}, values: {', '.join(valueTypes)})"
-                return "dict (empty)"
-            
-            return typeName
-        
-        return str(type(obj).__name__)
           
     ##########################
     # copyTraitsFrom - Copy traits from another object

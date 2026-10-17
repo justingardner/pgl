@@ -2557,3 +2557,13 @@ class pglSession(pglActionable):
             from .pglStorage import pglStorage
 
             return pglStorage.saveSession(self, parentSessionID=parentSessionID, settings=settings, settingsName=settingsName, backendID=backendID, description=description, ingestMethod=ingestMethod, storageOptions=storageOptions, sslRootCert=sslRootCert)
+        
+    def getPipeline(self, name=None, *, settings=None, settingsName=None, storageOptionsByBackend=None, sslRootCert=None):
+        """Ask storage to extract a recipe and resolve its replay boundary.
+
+        May read checkpoint manifests and history metadata.
+        Does not open scientific payloads, edit history, or execute actions.
+        """
+        from .pglStorage import pglStorage
+
+        return pglStorage.getSessionPipeline(self, name=name, settings=settings, settingsName=settingsName, storageOptionsByBackend=storageOptionsByBackend, sslRootCert=sslRootCert)
