@@ -1768,35 +1768,35 @@ class pglActionsMNE(pglActionCollection):
     
     _actionHeader_plots = "Make plots"
     
-    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
+    #+ங+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
     # plot evoked
-    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
+    #+ங+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
     class plotEvoked(pglAction):
 
         # parameters
-        set = Unicode(allow_none=True, default_value=True, help="Name of label set passed to configure events from which to compute evoked (defaults to first set)")
-        label = Unicode(allow_none=True, default_value=True, help="Name of label passed in the set to configure events for which to compute the evoked (defaults to average across all event types)")
-        picks = Unicode("mag",help="For topomap plotting type of topomap e.g. eeg, mag, grad - defined by mne - also can be name (or initial part of name of a sensor)")
+        set = Unicode(allow_none=True, default_value=None, help="Name of label set passed to configure events from which to compute evoked (defaults to first set)")
+        label = Unicode(allow_none=True, default_value=None, help="Name of label passed in the set to configure events for which to compute the evoked (defaults to average across all event types)")
+        picks = Unicode("mag", help="For topomap plotting type of topomap e.g. eeg, mag, grad - defined by mne - also can be name (or initial part of name of a sensor)")
         minFreq = Float(0.0, help="minimum frequency for display of frequency plot of evoked")
-        maxFreq = Float(np.inf, help="minimum frequency for display of frequency plot of evoked")
-            
+        maxFreq = Float(np.inf, help="maximum frequency for display of frequency plot of evoked")
+        yMin = Float(default_value=None, allow_none=True, help="Shared minimum for evoked traces and topomap color ranges, in MNE display units. Set together with yMax; None uses automatic scaling.")
+        yMax = Float(default_value=None, allow_none=True, help="Shared maximum for evoked traces and topomap color ranges, in MNE display units. Set together with yMin; None uses automatic scaling.")
+
         ################################
         # run
         ################################
         def _run(self, session: pglSession) -> pglSession:
-            '''
-            Display the evoked
-            
+            """
+            Display the evoked response.
+
+            yMin and yMax control both the evoked trace limits and
+            the color ranges of all topomaps. They do not affect
+            FFT or PSD plots.
+
             Returns:
                 pglSession: session
-            '''
-            # import mne
-            import mne
-
-            # validate picks
-            self.picks = session.mne.validatePicks(self.picks)
-            
-            # check for mne session
+            """
+            # Check for MNE session before accessing its methods.
             if session.mne is None or session.mne.raw is None:
                 self.setError("Session does not have raw mne loaded")
                 return None
@@ -1805,26 +1805,58 @@ class pglActionsMNE(pglActionCollection):
                 self.setError("Session does not have epochs created")
                 return None
 
-            # create the grand average and plot
+            # Validate picks.
+            self.picks = session.mne.validatePicks(self.picks)
+            isSensor = session.mne.isSensor(self.picks)
+
+            # Require both limits for a shared fixed scale.
+            if (self.yMin is None) != (self.yMax is None):
+                self.setError("Set both yMin and yMax, or leave both as None.")
+                return None
+
+            if self.yMin is not None:
+                if not np.isfinite(self.yMin) or not np.isfinite(self.yMax):
+                    self.setError("yMin and yMax must be finite values.")
+                    return None
+
+                if self.yMin >= self.yMax:
+                    self.setError("yMin must be less than yMax.")
+                    return None
+
+            # Create the grand average.
             if self.set is None:
                 self.set = session.mne.eventsID.columns[3]
             elif self.set not in session.mne.eventsID.columns:
                 pglMessages.warning(f"Could not find label set: {self.set}")
-                return
-            
+                return None
+
             if self.label is None:
-                # just get average across all conditions
+                # Average across all conditions.
                 session.mne.evoked = session.mne.epochs.average()
             else:
                 labels = session.mne.eventsID[self.set].dropna().unique()
                 if self.label not in labels:
                     pglMessages.warning(f"Unknown label {self.label!r} in column {self.set!r}. Available labels: {list(labels)}")
-                    return
+                    return None
+
                 session.mne.evoked = session.mne.epochs[f'{self.set} == "{self.label}"'].average()
 
-            if session.mne.isSensor(self.picks):
-                fig = session.mne.evoked.plot(picks=[self.picks],show=False)
+            # Apply the same fixed limits to traces and topomaps.
+            # With no explicit limits, MNE scales each plot automatically.
+            traceKwargs = {}
+            topoKwargs = {}
+
+            if self.yMin is not None:
+                sharedLimits = (self.yMin, self.yMax)
+                channelTypes = set(session.mne.evoked.get_channel_types())
+                traceKwargs["ylim"] = {chType: sharedLimits for chType in channelTypes}
+                topoKwargs["vlim"] = sharedLimits
+                topoKwargs["contours"] = np.linspace(self.yMin, self.yMax, 7)
                 
+            # Plot the evoked response.
+            if isSensor:
+                fig = session.mne.evoked.plot(picks=[self.picks], show=False, **traceKwargs)
+
                 evoked = session.mne.evoked.copy().pick([self.picks])
                 timeSeries = evoked.data[0]
                 sampleRate = evoked.info["sfreq"]
@@ -1833,34 +1865,41 @@ class pglActionsMNE(pglActionCollection):
                 freqs = np.fft.rfftfreq(len(timeSeries), d=1 / sampleRate)
                 magnitude = np.abs(fftValues)
 
+                # Matplotlib requires a finite upper x limit.
+                fftMaxFreq = self.maxFreq if np.isfinite(self.maxFreq) else freqs[-1]
+
                 figFft, ax = plt.subplots(figsize=(12, 6))
                 ax.stem(freqs, magnitude, linefmt="C0-", markerfmt="C0.", basefmt=" ")
-                ax.set(xlabel="Frequency (Hz)", ylabel="FFT magnitude", title=f"Evoked FFT magnitude: {self.picks}", xlim=(self.minFreq, self.maxFreq))
+                ax.set(xlabel="Frequency (Hz)", ylabel="FFT magnitude", title=f"Evoked FFT magnitude: {self.picks}", xlim=(self.minFreq, fftMaxFreq))
                 figFft.tight_layout()
-                
-                
+
             else:
-                fig = session.mne.evoked.plot_joint(times="peaks",picks=self.picks,show=False)
+                fig = session.mne.evoked.plot_joint(times="peaks", picks=self.picks, show=False, ts_args=traceKwargs, topomap_args=topoKwargs)
+
             fig.set_size_inches(20, 8)
-            
             session.mne.report.add_figure(fig=fig, title="evoked", section="Plot Evoked")
-            
-            # Spectrum of the evoked response
-            if session.mne.isSensor(self.picks):
+
+            # Spectrum of the evoked response.
+            if isSensor:
                 evoked = session.mne.evoked.copy()
                 nTimes = evoked.data.shape[1]
                 spectrum = evoked.compute_psd(method="welch", picks=[self.picks], fmin=self.minFreq, fmax=self.maxFreq, n_fft=nTimes, n_per_seg=nTimes, n_overlap=0, window="boxcar", remove_dc=True)
                 psds, freqs = spectrum.get_data(return_freqs=True)
-                # get the first sepctrum and convert to fT^2/Hz
+
+                # Get the first spectrum and convert to fT²/Hz.
                 psd = psds[0] * 1e30
-                # get rid of dc
-                psd = psd[1:]
-                freqs = freqs[1:]
+
+                # Remove DC only if it is present.
+                nonDc = freqs > 0
+                psd = psd[nonDc]
+                freqs = freqs[nonDc]
+
             else:
                 spectrum = session.mne.evoked.compute_psd(method="welch", picks=self.picks, fmin=self.minFreq, fmax=self.maxFreq)
                 psds, freqs = spectrum.get_data(return_freqs=True)
                 psd = psds.mean(axis=0)
-                # convert to fT^2/Hz    
+
+                # Convert to fT²/Hz.
                 psd = psd * 1e30
 
             figPsd, ax = plt.subplots(figsize=(12, 6))
@@ -1869,24 +1908,25 @@ class pglActionsMNE(pglActionCollection):
             figPsd.tight_layout()
 
             session.mne.report.add_figure(fig=figPsd, title="spectrum", section="Plot Evoked")
-            
-            # Third figure: single peak response, with sensor labels
-            if not session.mne.isSensor(self.picks):
+
+            # Third figure: single peak response, with sensor labels.
+            if not isSensor:
                 evokedTopo = session.mne.evoked.copy().pick(self.picks)
                 peakChannel, peakTime = evokedTopo.get_peak(ch_type=self.picks, mode="abs")
-                #figPeak = evokedTopo.plot_topomap(times=[peakTime], ch_type=self.picks, show_names=True, sensors=True, contours=6, time_unit="ms", size=8, show=False)
-                figPeak = evokedTopo.plot_topomap(times=[peakTime], ch_type=self.picks, show_names=True, sensors=True, contours=6, time_unit="ms", size=8, vlim=(-30, 30), cmap=("RdBu_r", False), show=False)
+
+                figPeak = evokedTopo.plot_topomap(times=[peakTime], ch_type=self.picks, show_names=True, sensors=True, time_unit="ms", size=8, cmap=("RdBu_r", False), show=False, **topoKwargs)
                 figPeak.set_size_inches(12, 10)
                 figPeak.suptitle(f"Peak response: {peakTime * 1000:.1f} ms ({peakChannel})", fontsize=18)
                 figPeak.subplots_adjust(top=0.88)
-                # Enlarge sensor labels and the timepoint title
+
+                # Enlarge sensor labels and the timepoint title.
                 for ax in figPeak.axes:
                     for text in ax.texts:
                         text.set_fontsize(16)
                     ax.title.set_fontsize(20)
+
                 session.mne.report.add_figure(fig=figPeak, title="Peak topo with labels", section="Plot Evoked")
 
-            # and return
             return session
         
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
@@ -2553,24 +2593,21 @@ class pglActionsMNE(pglActionCollection):
 
     class computeNCSNR(pglAction):
         """
-        Compute single-sensor noise-corrected SNR (NCSNR).
+        Compute single-sensor NCSNR and a repeat-adjusted noise ceiling.
 
         Example:
+            action.configure(set="grouped", label="things", conditionIDColumn="code", chType="mag", nTrials=3)
 
-            action.configure(
-                set="grouped",
-                label="things",
-                conditionIDColumn="code",
-                chType="mag",
-            )
+        Conditions are identified by conditionIDColumn within the selected metadata
+        group. Repeated trials of each condition estimate single-trial noise.
 
-        This selects all epochs where:
+        nTrials specifies the number of repeats averaged per condition in the
+        responses being evaluated, not the total number of epochs.
 
-            epochs.metadata["grouped"] == "things"
+        Noise ceiling (%) = 100 * NCSNR^2 / (NCSNR^2 + 1 / nTrials).
 
-        It then treats each unique value in `epochs.metadata["code"]` as a
-        separate signal condition. Multiple trials with the same code are treated
-        as repetitions of that same condition.
+        This assumes independent noise across repeats. The ceiling is expressed
+        as percent explainable variance, not correlation.
         """
 
         channelName = Unicode(allow_none=True, default_value=None, help="Full or partial channel name. If None, use the largest absolute Evoked response.")
@@ -2578,10 +2615,8 @@ class pglActionsMNE(pglActionCollection):
         set = Unicode(allow_none=True, default_value=None, help="Metadata column used to select trials, e.g. grouped.")
         label = Unicode(allow_none=True, default_value=None, help="Metadata label used to select trials, e.g. things.")
         conditionIDColumn = Unicode("code", help="Metadata column identifying individual signal conditions.")
+        nTrials = Int(default_value=3, min=1, help="Number of repeats averaged per condition for the noise ceiling. Use 1 for single-trial responses.")
 
-        ################################
-        # run
-        ################################
         def _run(self, session: pglSession):
             # ---------------------------------------------------------------------
             # Validate session data.
@@ -2636,9 +2671,6 @@ class pglActionsMNE(pglActionCollection):
 
             # ---------------------------------------------------------------------
             # Resolve analysis channel.
-            #
-            # If no channel name is configured, use the channel that has the
-            # largest absolute response anywhere in session.mne.evoked.
             # ---------------------------------------------------------------------
             evokedPeakTime = None
             evokedPeakAmplitude = None
@@ -2674,20 +2706,9 @@ class pglActionsMNE(pglActionCollection):
                 channelName = matchingChannels[0]
 
             # ---------------------------------------------------------------------
-            # Identify the individual conditions from the complete events table.
-            #
-            # For example, with:
-            #
-            #     set="grouped"
-            #     label="things"
-            #     conditionIDColumn="code"
-            #
-            # this may yield:
-            #
-            #     [2, 3, 4, ..., 200]
+            # Identify conditions from the complete events table.
             # ---------------------------------------------------------------------
             eventSelectionMask = eventsID[self.set].eq(self.label)
-
             conditionIDs = eventsID.loc[eventSelectionMask, self.conditionIDColumn].dropna().unique().tolist()
 
             try:
@@ -2700,10 +2721,7 @@ class pglActionsMNE(pglActionCollection):
                 return None
 
             # ---------------------------------------------------------------------
-            # Extract trial data for every condition.
-            #
-            # Crucially, extraction uses epochs.metadata rather than eventsID,
-            # because some original events may have been dropped by MNE.
+            # Extract retained trials using epochs.metadata.
             # ---------------------------------------------------------------------
             retainedLabelMask = epochs.metadata[self.set].eq(self.label)
 
@@ -2724,7 +2742,7 @@ class pglActionsMNE(pglActionCollection):
                     missingConditions.append(conditionID)
                     continue
 
-                # data shape: (nRepetitions, nTimes)
+                # Shape: (nRepetitions, nTimes).
                 data = epochs[conditionMask].get_data(picks=[channelName])[:, 0, :]
                 nReps = data.shape[0]
 
@@ -2745,40 +2763,46 @@ class pglActionsMNE(pglActionCollection):
                 self.setError(f"NCSNR requires at least 2 repetitions per condition. Insufficient conditions (ID: nReps): {details}")
                 return None
 
-            # This preserves the order in which usable condition data were stored.
             conditionIDs = list(conditionData)
 
             # ---------------------------------------------------------------------
-            # 1. Estimate typical single-trial noise.
-            #
-            # Within each condition, calculate trial-to-trial variance at every
-            # time point. Average those variance estimates across conditions.
+            # 1. Estimate typical single-trial noise variance.
             # ---------------------------------------------------------------------
             noiseVarByCondition = np.asarray([np.var(conditionData[conditionID], axis=0, ddof=1) for conditionID in conditionIDs])
-
             noiseVar = noiseVarByCondition.mean(axis=0)
             noiseSTD = np.sqrt(noiseVar)
 
             # ---------------------------------------------------------------------
             # 2. Estimate noise-corrected signal variance across condition means.
+            #
+            # Actual repetition counts correct the noise remaining in each mean.
+            # Each condition receives equal weight.
             # ---------------------------------------------------------------------
             conditionMeansArray = np.asarray([conditionMeans[conditionID] for conditionID in conditionIDs])
             repsArray = np.asarray([nRepsPerCondition[conditionID] for conditionID in conditionIDs])
 
             observedVar = np.var(conditionMeansArray, axis=0, ddof=1)
-
             residualNoiseVar = np.mean(noiseVarByCondition / repsArray[:, np.newaxis], axis=0)
 
-            # The estimate can be slightly negative due to finite sampling.
             signalVar = np.maximum(observedVar - residualNoiseVar, 0)
             signalSTD = np.sqrt(signalVar)
 
             # ---------------------------------------------------------------------
             # 3. NCSNR = signal SD / typical single-trial noise SD.
+            #
+            # Preserve NaN where single-trial noise SD is zero.
             # ---------------------------------------------------------------------
             ncsnr = np.divide(signalSTD, noiseSTD, out=np.full_like(signalSTD, np.nan, dtype=float), where=noiseSTD > 0)
 
-            # Each condition receives equal weight, even if repetition counts vary.
+            # ---------------------------------------------------------------------
+            # 4. Convert NCSNR to a repeat-adjusted noise ceiling (%).
+            #
+            # nTrials specifies the target number of averaged repeats. It does not
+            # change the single-trial NCSNR estimate.
+            # ---------------------------------------------------------------------
+            ncsnrSquared = np.square(ncsnr)
+            noiseCeiling = 100.0 * ncsnrSquared / (ncsnrSquared + 1.0 / self.nTrials)
+
             grandMean = conditionMeansArray.mean(axis=0)
             times = epochs.times.copy()
 
@@ -2786,10 +2810,12 @@ class pglActionsMNE(pglActionCollection):
                 peakIndex = None
                 peakTime = np.nan
                 peakNcsnr = np.nan
+                peakNoiseCeiling = np.nan
             else:
                 peakIndex = np.nanargmax(ncsnr)
                 peakTime = times[peakIndex]
                 peakNcsnr = ncsnr[peakIndex]
+                peakNoiseCeiling = noiseCeiling[peakIndex]
 
             # ---------------------------------------------------------------------
             # Store results.
@@ -2803,6 +2829,7 @@ class pglActionsMNE(pglActionCollection):
                 "conditionIDs": conditionIDs,
                 "nConditions": len(conditionIDs),
                 "nRepsPerCondition": nRepsPerCondition,
+                "nTrials": self.nTrials,
                 "times": times,
                 "conditionMeans": conditionMeansArray,
                 "grandMean": grandMean,
@@ -2814,9 +2841,12 @@ class pglActionsMNE(pglActionCollection):
                 "signalVar": signalVar,
                 "signalSTD": signalSTD,
                 "ncsnr": ncsnr,
+                "noiseCeiling": noiseCeiling,
+                "noiseCeilingUnits": "percent",
                 "peakIndex": peakIndex,
                 "peakTime": peakTime,
                 "peakNcsnr": peakNcsnr,
+                "peakNoiseCeiling": peakNoiseCeiling,
                 "evokedPeakTime": evokedPeakTime,
                 "evokedPeakAmplitude": evokedPeakAmplitude,
             }
@@ -2825,7 +2855,7 @@ class pglActionsMNE(pglActionCollection):
             # Plot.
             # ---------------------------------------------------------------------
             with plt.rc_context({"figure.constrained_layout.use": False, "figure.autolayout": False}):
-                fig, axes = plt.subplots(2, 1, figsize=(22, 8), sharex=True, layout=None)
+                fig, axes = plt.subplots(3, 1, figsize=(22, 12), sharex=True, layout=None)
 
                 axes[0].plot(times, grandMean, color="black", linewidth=1.25)
                 axes[0].axvline(0, color="gray", linestyle="--", linewidth=1)
@@ -2841,18 +2871,32 @@ class pglActionsMNE(pglActionCollection):
                     axes[1].plot(peakTime, peakNcsnr, marker="o", color="tab:red")
                     axes[1].annotate(f"Peak: {peakNcsnr:.3f}\n{peakTime * 1000:.1f} ms", xy=(peakTime, peakNcsnr), xytext=(8, 8), textcoords="offset points", color="tab:red")
 
-                axes[1].set_xlabel("Time (s)")
                 axes[1].set_ylabel("Noise-corrected SNR")
-                axes[1].set_title("NCSNR across individual conditions")
+                axes[1].set_title("Single-trial NCSNR across individual conditions")
                 axes[1].grid(alpha=0.25)
 
-                fig.suptitle(f"NCSNR: {self.set} = {self.label} | condition IDs from {self.conditionIDColumn}", fontsize=14)
-                fig.subplots_adjust(left=0.07, right=0.98, bottom=0.08, top=0.90, hspace=0.35)
+                axes[2].plot(times, noiseCeiling, color="tab:green", linewidth=1.25)
+                axes[2].axvline(0, color="gray", linestyle="--", linewidth=1)
+
+                if peakIndex is not None:
+                    axes[2].axvline(peakTime, color="tab:red", linestyle="--", linewidth=1)
+                    axes[2].plot(peakTime, peakNoiseCeiling, marker="o", color="tab:red")
+                    axes[2].annotate(f"Peak: {peakNoiseCeiling:.1f}%\n{peakTime * 1000:.1f} ms", xy=(peakTime, peakNoiseCeiling), xytext=(8, 8), textcoords="offset points", color="tab:red")
+
+                axes[2].set_xlabel("Time (s)")
+                axes[2].set_ylabel("Noise ceiling (%)")
+                axes[2].set_ylim(0, 110)
+                axes[2].set_yticks(np.arange(0, 101, 20))
+                axes[2].set_title(f"Noise ceiling for condition responses averaged over {self.nTrials} repeat(s)")
+                axes[2].grid(alpha=0.25)
+
+                figureTitle = f"NCSNR and noise ceiling: {self.set} = {self.label} | condition IDs from {self.conditionIDColumn} | nTrials={self.nTrials}"
+                fig.suptitle(figureTitle, fontsize=14)
+                fig.subplots_adjust(left=0.07, right=0.98, bottom=0.07, top=0.92, hspace=0.40)
 
                 plt.show()
-                
-                session.mne.report.add_figure(fig=fig, title=f"NCSNR: {self.set} = {self.label} | condition IDs from {self.conditionIDColumn}")
 
+                session.mne.report.add_figure(fig=fig, title=figureTitle)
 
             return session
  
