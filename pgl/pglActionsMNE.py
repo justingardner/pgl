@@ -15,7 +15,7 @@ import numpy as np
 from numbers import Integral
 import matplotlib.pyplot as plt
 from fsspec import AbstractFileSystem
-from traitlets import HasTraits, Enum, Float, Int, List, Tuple, TraitError, Unicode, Dict, default, link, Bool, TraitType, Instance, Union
+from traitlets import HasTraits, Enum, Float, Int, List, Tuple, TraitError, Unicode, Dict, default, link, Bool, TraitType, Instance, Union, Any
 import pandas as pd
 from .pglExperiment import pglEventTrial, pglEventSegment
 from tqdm.auto import tqdm
@@ -843,7 +843,7 @@ class pglActionsMNE(pglActionCollection):
             plt.show()
 
             session.mne.report.add_figure(fig=plt.gcf(), title="Align segments to triggers")
-
+            
             # All runs and output triggers have validated.
             # Add the channel, then commit corrected run reference times.
             # Add or overwrite the output channel.
@@ -1113,6 +1113,7 @@ class pglActionsMNE(pglActionCollection):
     
         tmin = Float(0.0, help="Start of each epoch window relative to its trigger, in seconds")
         tmax = Float(1.0, help="End of each epoch window relative to its trigger, in seconds")
+        exportFig = Unicode(default_value=None, allow_none=True, help="Optional figure export path or fsspec URL for this execution only", serialize=False)
 
         def _run(self, session: pglSession) -> pglSession:
             """
@@ -1247,8 +1248,10 @@ class pglActionsMNE(pglActionCollection):
 
             if getattr(session.mne, "report", None) is not None:
                 session.mne.report.add_figure(fig=fig, title="Inter-epoch excluded intervals")
-            else:
-                plt.show()
+            
+            if self.exportFig: session.exportFig(fig, self.exportFig)
+            
+            plt.show()
 
             return session        
         
@@ -1267,6 +1270,7 @@ class pglActionsMNE(pglActionCollection):
             "'blank': [1022], 'catch': [1023]}}"
             ),
         )
+        exportFig = Unicode(default_value=None, allow_none=True, help="Optional figure export path or fsspec URL for this execution only", serialize=False)
         
         ################################
         # configure
@@ -1534,7 +1538,9 @@ class pglActionsMNE(pglActionCollection):
             fig.tight_layout(rect=(0, 0, 1, 0.96))
             
             session.mne.report.add_figure(fig=fig, title="Configure Events")
-
+            
+            if self.exportFig: session.exportFig(fig, self.exportFig)
+            
             return session
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
     # make epochs
@@ -1767,186 +1773,25 @@ class pglActionsMNE(pglActionCollection):
             return session
     
     _actionHeader_plots = "Make plots"
-    
-    #+ங+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-    # plot evoked
-    #+ங+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+        
     class plotEvoked(pglAction):
+        """Plot NaN-aware evoked responses with optional baseline correction."""
 
-        # parameters
-        set = Unicode(allow_none=True, default_value=None, help="Name of label set passed to configure events from which to compute evoked (defaults to first set)")
-        label = Unicode(allow_none=True, default_value=None, help="Name of label passed in the set to configure events for which to compute the evoked (defaults to average across all event types)")
-        picks = Unicode("mag", help="For topomap plotting type of topomap e.g. eeg, mag, grad - defined by mne - also can be name (or initial part of name of a sensor)")
-        minFreq = Float(0.0, help="minimum frequency for display of frequency plot of evoked")
-        maxFreq = Float(np.inf, help="maximum frequency for display of frequency plot of evoked")
-        yMin = Float(default_value=None, allow_none=True, help="Shared minimum for evoked traces and topomap color ranges, in MNE display units. Set together with yMax; None uses automatic scaling.")
-        yMax = Float(default_value=None, allow_none=True, help="Shared maximum for evoked traces and topomap color ranges, in MNE display units. Set together with yMin; None uses automatic scaling.")
-
-        ################################
-        # run
-        ################################
-        def _run(self, session: pglSession) -> pglSession:
-            """
-            Display the evoked response.
-
-            yMin and yMax control both the evoked trace limits and
-            the color ranges of all topomaps. They do not affect
-            FFT or PSD plots.
-
-            Returns:
-                pglSession: session
-            """
-            # Check for MNE session before accessing its methods.
-            if session.mne is None or session.mne.raw is None:
-                self.setError("Session does not have raw mne loaded")
-                return None
-
-            if session.mne.epochs is None:
-                self.setError("Session does not have epochs created")
-                return None
-
-            # Validate picks.
-            self.picks = session.mne.validatePicks(self.picks)
-            isSensor = session.mne.isSensor(self.picks)
-
-            # Require both limits for a shared fixed scale.
-            if (self.yMin is None) != (self.yMax is None):
-                self.setError("Set both yMin and yMax, or leave both as None.")
-                return None
-
-            if self.yMin is not None:
-                if not np.isfinite(self.yMin) or not np.isfinite(self.yMax):
-                    self.setError("yMin and yMax must be finite values.")
-                    return None
-
-                if self.yMin >= self.yMax:
-                    self.setError("yMin must be less than yMax.")
-                    return None
-
-            # Create the grand average.
-            if self.set is None:
-                self.set = session.mne.eventsID.columns[3]
-            elif self.set not in session.mne.eventsID.columns:
-                pglMessages.warning(f"Could not find label set: {self.set}")
-                return None
-
-            if self.label is None:
-                # Average across all conditions.
-                session.mne.evoked = session.mne.epochs.average()
-            else:
-                labels = session.mne.eventsID[self.set].dropna().unique()
-                if self.label not in labels:
-                    pglMessages.warning(f"Unknown label {self.label!r} in column {self.set!r}. Available labels: {list(labels)}")
-                    return None
-
-                session.mne.evoked = session.mne.epochs[f'{self.set} == "{self.label}"'].average()
-
-            # Apply the same fixed limits to traces and topomaps.
-            # With no explicit limits, MNE scales each plot automatically.
-            traceKwargs = {}
-            topoKwargs = {}
-
-            if self.yMin is not None:
-                sharedLimits = (self.yMin, self.yMax)
-                channelTypes = set(session.mne.evoked.get_channel_types())
-                traceKwargs["ylim"] = {chType: sharedLimits for chType in channelTypes}
-                topoKwargs["vlim"] = sharedLimits
-                topoKwargs["contours"] = np.linspace(self.yMin, self.yMax, 7)
-                
-            # Plot the evoked response.
-            if isSensor:
-                fig = session.mne.evoked.plot(picks=[self.picks], show=False, **traceKwargs)
-
-                evoked = session.mne.evoked.copy().pick([self.picks])
-                timeSeries = evoked.data[0]
-                sampleRate = evoked.info["sfreq"]
-
-                fftValues = np.fft.rfft(timeSeries)
-                freqs = np.fft.rfftfreq(len(timeSeries), d=1 / sampleRate)
-                magnitude = np.abs(fftValues)
-
-                # Matplotlib requires a finite upper x limit.
-                fftMaxFreq = self.maxFreq if np.isfinite(self.maxFreq) else freqs[-1]
-
-                figFft, ax = plt.subplots(figsize=(12, 6))
-                ax.stem(freqs, magnitude, linefmt="C0-", markerfmt="C0.", basefmt=" ")
-                ax.set(xlabel="Frequency (Hz)", ylabel="FFT magnitude", title=f"Evoked FFT magnitude: {self.picks}", xlim=(self.minFreq, fftMaxFreq))
-                figFft.tight_layout()
-
-            else:
-                fig = session.mne.evoked.plot_joint(times="peaks", picks=self.picks, show=False, ts_args=traceKwargs, topomap_args=topoKwargs)
-
-            fig.set_size_inches(20, 8)
-            session.mne.report.add_figure(fig=fig, title="evoked", section="Plot Evoked")
-
-            # Spectrum of the evoked response.
-            if isSensor:
-                evoked = session.mne.evoked.copy()
-                nTimes = evoked.data.shape[1]
-                spectrum = evoked.compute_psd(method="welch", picks=[self.picks], fmin=self.minFreq, fmax=self.maxFreq, n_fft=nTimes, n_per_seg=nTimes, n_overlap=0, window="boxcar", remove_dc=True)
-                psds, freqs = spectrum.get_data(return_freqs=True)
-
-                # Get the first spectrum and convert to fT²/Hz.
-                psd = psds[0] * 1e30
-
-                # Remove DC only if it is present.
-                nonDc = freqs > 0
-                psd = psd[nonDc]
-                freqs = freqs[nonDc]
-
-            else:
-                spectrum = session.mne.evoked.compute_psd(method="welch", picks=self.picks, fmin=self.minFreq, fmax=self.maxFreq)
-                psds, freqs = spectrum.get_data(return_freqs=True)
-                psd = psds.mean(axis=0)
-
-                # Convert to fT²/Hz.
-                psd = psd * 1e30
-
-            figPsd, ax = plt.subplots(figsize=(12, 6))
-            ax.stem(freqs, psd, linefmt="C0-", markerfmt="C0.", basefmt=" ")
-            ax.set(xlabel="Frequency (Hz)", ylabel="Power spectral density (fT²/Hz)", title=f"Evoked response spectrum: {self.picks}")
-            figPsd.tight_layout()
-
-            session.mne.report.add_figure(fig=figPsd, title="spectrum", section="Plot Evoked")
-
-            # Third figure: single peak response, with sensor labels.
-            if not isSensor:
-                evokedTopo = session.mne.evoked.copy().pick(self.picks)
-                peakChannel, peakTime = evokedTopo.get_peak(ch_type=self.picks, mode="abs")
-
-                figPeak = evokedTopo.plot_topomap(times=[peakTime], ch_type=self.picks, show_names=True, sensors=True, time_unit="ms", size=8, cmap=("RdBu_r", False), show=False, **topoKwargs)
-                figPeak.set_size_inches(12, 10)
-                figPeak.suptitle(f"Peak response: {peakTime * 1000:.1f} ms ({peakChannel})", fontsize=18)
-                figPeak.subplots_adjust(top=0.88)
-
-                # Enlarge sensor labels and the timepoint title.
-                for ax in figPeak.axes:
-                    for text in ax.texts:
-                        text.set_fontsize(16)
-                    ax.title.set_fontsize(20)
-
-                session.mne.report.add_figure(fig=figPeak, title="Peak topo with labels", section="Plot Evoked")
-
-            return session
-        
-    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
-    # plot evoked NaN
-    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
-    class plotEvokedNan(pglAction):
-        '''
-        Plot the evoked response with NaN values handled appropriately (i.e. using nanmean)
-        '''
-        
-
-        set = Unicode(allow_none=True, default_value=None, help="Label set; defaults to the first set")
-        label = Unicode(allow_none=True, default_value=None, help="Label to average; defaults to all conditions")
-        picks = Unicode("mag", help="Channel type or sensor name")
+        set = Unicode(default_value=None, allow_none=True, help="Label set; defaults to the first set when selecting a label")
+        label = Unicode(default_value=None, allow_none=True, help="Label to average; None averages all epochs")
+        picks = Unicode(default_value=None, allow_none=True, help="Channel type or sensor name; None automatically selects an available plotting type")
+        highlightChannels = List(Unicode(), help="Sensor names or unique prefixes to highlight in time series; empty uses the normal display")
+        baseline = Any(default_value=None, allow_none=True, help="Baseline interval (start, end) in milliseconds, applied after averaging. None applies no additional correction. An endpoint of None uses the corresponding epoch boundary.")
+        topoTime = Any(default_value=None, allow_none=True, help="Topomap time in milliseconds, or a list of times; None lets MNE select peaks")
         minFreq = Float(0.0, help="Minimum displayed frequency")
-        maxFreq = Float(float("inf"), help="Maximum displayed frequency")
+        maxFreq = Float(default_value=None, allow_none=True, help="Maximum displayed frequency; None uses Nyquist")
+        yMin = Float(default_value=None, allow_none=True, help="Minimum amplitude for traces and topomap colors in displayed units; None uses automatic scaling")
+        yMax = Float(default_value=None, allow_none=True, help="Maximum amplitude for traces and topomap colors in displayed units; None uses automatic scaling")
+        exportFig = Unicode(default_value=None, allow_none=True, help="Optional filename or fsspec URL for the main evoked figure", serialize=False)
 
         @staticmethod
         def _nanmean(data):
-            """Average across epochs, leaving NaN where all epochs are missing."""
+            """Average across epochs, leaving NaN where every epoch is missing."""
             import numpy as np
 
             counts = np.sum(~np.isnan(data), axis=0)
@@ -1955,7 +1800,7 @@ class pglActionsMNE(pglActionCollection):
 
         @staticmethod
         def _valid_segment(data):
-            """Longest contiguous finite segment; never join samples across gaps."""
+            """Return the longest finite segment without joining across gaps."""
             import numpy as np
 
             edges = np.diff(np.r_[False, np.isfinite(data), False].astype(int))
@@ -1968,102 +1813,592 @@ class pglActionsMNE(pglActionCollection):
             index = np.argmax(stops - starts)
             return data[starts[index]:stops[index]]
 
+        @staticmethod
+        def _validateBaseline(value, times):
+            """Validate a millisecond baseline and return endpoints in seconds.
+
+            None disables additional baseline correction.
+            None endpoints resolve to the corresponding epoch boundaries.
+            Endpoints are inclusive; the interval must contain a sample.
+            """
+            import numpy as np
+            from numbers import Real
+
+            if value is None:
+                return None
+
+            if isinstance(value, np.ndarray):
+                if value.ndim != 1:
+                    raise ValueError("baseline must be a two-element interval in milliseconds, or None.")
+
+                value = value.tolist()
+
+            if not isinstance(value, (list, tuple)) or len(value) != 2:
+                raise ValueError("baseline must be a two-element interval in milliseconds, or None.")
+
+            timesMs = np.asarray(times, dtype=float) * 1000
+            firstTime = float(timesMs[0])
+            lastTime = float(timesMs[-1])
+            endpoints = []
+
+            for item, boundary in zip(value, (firstTime, lastTime)):
+                if item is None:
+                    endpoints.append(boundary)
+                elif isinstance(item, (bool, np.bool_)) or not isinstance(item, Real) or not np.isfinite(item):
+                    raise ValueError("Baseline endpoints must be finite numeric values in milliseconds, or None.")
+                else:
+                    endpoints.append(float(item))
+
+            start, stop = endpoints
+
+            if start > stop:
+                raise ValueError("Baseline start must not exceed baseline end.")
+
+            # Permit only negligible rounding differences at epoch endpoints.
+            if start < firstTime - 1e-9 or stop > lastTime + 1e-9:
+                raise ValueError(f"Baseline must lie within the epoch range {firstTime:g} to {lastTime:g} ms.")
+
+            start = max(start, firstTime)
+            stop = min(stop, lastTime)
+            mask = (timesMs >= start - 1e-9) & (timesMs <= stop + 1e-9)
+
+            if not mask.any():
+                raise ValueError("The requested baseline interval contains no samples.")
+
+            return (start / 1000, stop / 1000)
+
+        @staticmethod
+        def _applyEvokedBaseline(evoked, baseline):
+            """Apply a finite-value baseline mean to each averaged channel.
+
+            baseline must already be validated and expressed in seconds.
+            Modifies this Evoked object, not its source epochs.
+
+            Channels with usable data but no finite baseline samples are rejected.
+            Channels that are entirely missing remain missing.
+            """
+            import numpy as np
+
+            if baseline is None:
+                return evoked
+
+            start, stop = baseline
+            mask = (evoked.times >= start - 1e-12) & (evoked.times <= stop + 1e-12)
+
+            if not mask.any():
+                raise ValueError("The requested baseline interval contains no samples.")
+
+            baselineData = evoked.data[:, mask]
+            finite = np.isfinite(baselineData)
+            counts = finite.sum(axis=1)
+            totals = np.where(finite, baselineData, 0.0).sum(axis=1)
+
+            missingBaseline = (counts == 0) & np.isfinite(evoked.data).any(axis=1)
+
+            if missingBaseline.any():
+                names = [name for name, missing in zip(evoked.ch_names, missingBaseline) if missing]
+                raise ValueError(f"No finite baseline samples for channel(s): {', '.join(names)}.")
+
+            offsets = np.divide(totals, counts, out=np.full(totals.shape, np.nan), where=counts > 0)
+            evoked.data -= offsets[:, None]
+
+            # MNE stores baseline metadata in seconds.
+            evoked.baseline = baseline
+            return evoked
+
+        @staticmethod
+        def _validateTopoTimes(value, times):
+            """Validate millisecond requests and return sampled times in seconds.
+
+            None retains MNE's automatic peak selection.
+            Explicit times resolve to the nearest available sample.
+            Requests resolving to the same sample are rejected.
+            """
+            import numpy as np
+            from numbers import Real
+
+            if value is None:
+                return None
+
+            if isinstance(value, Real) and not isinstance(value, (bool, np.bool_)):
+                requested = [value]
+            elif isinstance(value, (list, tuple)):
+                requested = list(value)
+            elif isinstance(value, np.ndarray) and value.ndim == 1:
+                requested = list(value)
+            else:
+                raise ValueError("topoTime must be a finite numeric time in milliseconds, a list of times, or None.")
+
+            if not requested:
+                raise ValueError("topoTime must not be an empty list.")
+
+            firstTime = float(times[0]) * 1000
+            lastTime = float(times[-1]) * 1000
+            indices = []
+
+            for item in requested:
+                if isinstance(item, (bool, np.bool_)) or not isinstance(item, Real) or not np.isfinite(item):
+                    raise ValueError("Every topoTime must be a finite numeric value in milliseconds.")
+
+                milliseconds = float(item)
+
+                # Permit only negligible rounding differences at epoch endpoints.
+                if milliseconds < firstTime - 1e-9 or milliseconds > lastTime + 1e-9:
+                    raise ValueError(f"topoTime {milliseconds:g} ms is outside the epoch range {firstTime:g} to {lastTime:g} ms.")
+
+                index = int(np.argmin(np.abs(times * 1000 - milliseconds)))
+
+                if index in indices:
+                    raise ValueError(f"Multiple topoTime values select the same sample near {float(times[index]) * 1000:g} ms.")
+
+                indices.append(index)
+
+            return np.asarray([times[index] for index in indices], dtype=float)
+
+        @staticmethod
+        def _addHighlightedSensorInset(axTrace, evoked, channelType, highlightColors):
+            """Add a location inset with the same colors as highlighted traces.
+
+            MNE handles sensor-coordinate projection. Only the resulting sensor
+            marker styling is changed. All non-highlighted sensors are gray.
+            """
+            import mne
+            import numpy as np
+            from matplotlib.collections import PathCollection
+            from matplotlib.colors import to_rgba
+
+            # Use a child axis so the main MNE layout remains unchanged.
+            axSensors = axTrace.inset_axes([0.015, 0.66, 0.18, 0.30], zorder=6)
+
+            try:
+                mne.viz.plot_sensors(
+                    evoked.info,
+                    kind="topomap",
+                    ch_type=channelType,
+                    title="",
+                    show_names=False,
+                    axes=axSensors,
+                    show=False,
+                )
+
+                # This Evoked contains only the selected channel type, in the
+                # same order used by plot_sensors.
+                sensorCollections = [
+                    collection
+                    for collection in axSensors.collections
+                    if isinstance(collection, PathCollection)
+                    and len(collection.get_offsets()) == len(evoked.ch_names)
+                ]
+
+                if len(sensorCollections) != 1:
+                    raise RuntimeError("Could not uniquely identify the sensor markers in the location inset.")
+
+                sensorMarkers = sensorCollections[0]
+                colors = np.asarray([to_rgba(highlightColors.get(name, "0.8")) for name in evoked.ch_names])
+                sizes = np.asarray([35.0 if name in highlightColors else 14.0 for name in evoked.ch_names])
+
+                # Draw highlighted markers last so they remain visible where
+                # sensors share a projected location, e.g. paired gradiometers.
+                order = np.asarray(sorted(range(len(evoked.ch_names)), key=lambda index: evoked.ch_names[index] in highlightColors))
+                offsets = sensorMarkers.get_offsets().copy()
+
+                sensorMarkers.set_offsets(offsets[order])
+                sensorMarkers.set_facecolors(colors[order])
+                sensorMarkers.set_edgecolors(colors[order])
+                sensorMarkers.set_sizes(sizes[order])
+                sensorMarkers.set_linewidths(0.5)
+                sensorMarkers.set_alpha(1.0)
+                sensorMarkers.set_zorder(3)
+
+                # Reordering is visual only; disable picking because MNE's
+                # original picking indices no longer match the marker order.
+                sensorMarkers.set_picker(None)
+                axSensors.set_title("Sensor locations", fontsize=9, pad=2)
+                axSensors.set_axis_off()
+
+            except Exception:
+                axSensors.remove()
+                raise
+
+            return axSensors
+
         def _run(self, session: pglSession) -> pglSession:
+            """Plot evoked responses without altering source epoch preload state.
+
+            baseline and topoTime are specified in milliseconds.
+
+            baseline=None leaves the averaged data unchanged. It does not apply
+            filtering or undo baseline correction already applied to the epochs.
+
+            An explicit baseline is applied after NaN-aware averaging, before
+            plotting, peak selection, amplitude scaling, and spectral calculation.
+
+            topoTime=None delegates peak selection to MNE's joint plot.
+
+            Highlighting changes trace and sensor-inset styling only, not
+            averaging, topography, spectral calculations, or amplitude limits.
+            """
+            import mne
             import numpy as np
             import matplotlib.pyplot as plt
+            from matplotlib import colormaps
             from scipy.signal import welch
 
-            # Validate inputs.
             if session.mne is None or session.mne.raw is None:
                 self.setError("Session does not have raw mne loaded")
                 return None
 
-            if session.mne.epochs is None:
+            epochs = session.mne.epochs
+
+            if epochs is None:
                 self.setError("Session does not have epochs created")
                 return None
 
-            self.picks = session.mne.validatePicks(self.picks)
-            is_sensor = session.mne.isSensor(self.picks)
-            epochs = session.mne.epochs
+            picks = session.mne.validatePicks(self.picks)
+            isSensor = picks in session.mne.raw.ch_names
 
-            # Select epochs only when a particular label is requested.
+            if not isSensor and picks not in ("mag", "grad", "eeg"):
+                self.setError("picks must be mag, grad, eeg, or an individual sensor")
+                return None
+
+            for parameterName in ("minFreq", "maxFreq", "yMin", "yMax"):
+                value = getattr(self, parameterName)
+
+                if value is not None and not np.isfinite(value):
+                    self.setError(f"{parameterName} must be finite, or None where permitted")
+                    return None
+
+            if self.yMin is not None and self.yMax is not None and self.yMin >= self.yMax:
+                self.setError("yMin must be less than yMax")
+                return None
+
+            try:
+                baseline = self._validateBaseline(self.baseline, epochs.times)
+                topoTimes = self._validateTopoTimes(self.topoTime, epochs.times)
+            except ValueError as error:
+                self.setError(str(error))
+                return None
+
+            if isSensor and topoTimes is not None:
+                self.setError("topoTime requires a channel-type selection such as mag, grad, or eeg; a single sensor has no spatial topomap")
+                return None
+
+            if isSensor:
+                selectedNames = session.mne.validateSensors([picks], checkEpochs=True, excludeBads=True)
+                channelIndices = [epochs.ch_names.index(selectedNames[0])]
+                channelType = epochs.get_channel_types(picks=channelIndices)[0]
+
+                if channelType not in ("mag", "grad", "eeg"):
+                    self.setError("The selected sensor must be a mag, grad, or eeg channel")
+                    return None
+
+            else:
+                channelType = picks
+                megType = picks if picks in ("mag", "grad") else False
+                channelIndices = mne.pick_types(epochs.info, meg=megType, eeg=picks == "eeg", exclude="bads")
+
+                if not len(channelIndices):
+                    self.setError(f"No usable {picks!r} channels found in epochs")
+                    return None
+
+                selectedNames = [epochs.ch_names[index] for index in channelIndices]
+
+            highlightNames = session.mne.validateSensors(self.highlightChannels, checkEpochs=True, picks=channelType, excludeBads=True)
+            outsideSelection = [name for name in highlightNames if name not in selectedNames]
+
+            if outsideSelection:
+                self.setError(f"Highlighted sensors are outside the plotted selection: {', '.join(outsideSelection)}")
+                return None
+
+            # Select directly from metadata, avoiding query-string quoting issues.
             if self.label is not None:
-                columns = session.mne.eventsID.columns
+                eventsID = session.mne.eventsID
 
-                if self.set is None and len(columns) < 4:
-                    pglMessages.warning("No default label set is available")
-                    return session
+                if eventsID is None:
+                    self.setError("Session does not have event labels")
+                    return None
 
-                label_set = columns[3] if self.set is None else self.set
+                labelSet = self.set
 
-                if label_set not in columns:
-                    pglMessages.warning(f"Could not find label set: {label_set}")
-                    return session
+                if labelSet is None:
+                    if len(eventsID.columns) <= 3:
+                        self.setError("No default label set is available")
+                        return None
 
-                labels = session.mne.eventsID[label_set].dropna().unique()
+                    labelSet = eventsID.columns[3]
+
+                if labelSet not in eventsID.columns:
+                    self.setError(f"Could not find label set: {labelSet}")
+                    return None
+
+                if epochs.metadata is None or labelSet not in epochs.metadata.columns:
+                    self.setError(f"Epoch metadata does not contain label set: {labelSet}")
+                    return None
+
+                labels = eventsID[labelSet].dropna().unique()
 
                 if self.label not in labels:
-                    pglMessages.warning(f"Unknown label {self.label!r}. Available labels: {list(labels)}")
+                    self.setError(f"Unknown label {self.label!r}. Available labels: {list(labels)}")
+                    return None
+
+                mask = epochs.metadata[labelSet].eq(self.label).fillna(False).to_numpy(dtype=bool)
+                epochIndices = np.flatnonzero(mask)
+
+                if not epochIndices.size:
+                    pglMessages.warning("No epochs remain for this label; skipping plots", level=0)
+                    session.mne.evoked = None
                     return session
 
-                epochs = epochs[f"{label_set} == {self.label!r}"]
+                epochs = epochs[epochIndices]
 
-            if epochs.get_data().shape[0] == 0:
-                pglMessages.warning("No epochs remain for this selection")
+            if not len(epochs.events):
+                pglMessages.warning("No epochs remain; skipping plots", level=0)
                 session.mne.evoked = None
                 return session
 
-            # MNE accepts a callable for averaging across epochs.
-            session.mne.evoked = epochs.average(method=self._nanmean)
-            evoked = session.mne.evoked.copy().pick([self.picks] if is_sensor else self.picks)
-            data = evoked.data
-            sfreq = evoked.info["sfreq"]
+            # Custom averaging requires preloading. Work on a copy so the source
+            # Epochs object remains unchanged.
+            if not epochs.preload:
+                pglMessages.message("Loading selected epochs for NaN-aware averaging...")
+                epochs = epochs.copy().load_data()
 
-            if not np.isfinite(data).any():
-                pglMessages.warning("Selected evoked data contain no finite values; skipping plots")
+            if not len(epochs.events):
+                pglMessages.warning("No epochs remain after loading; skipping plots", level=0)
+                session.mne.evoked = None
                 return session
 
-            # Display units.
-            channel_type = evoked.get_channel_types()[0]
-            scale, unit = {"mag": (1e15, "fT"), "grad": (1e13, "fT/cm"), "eeg": (1e6, "µV")}.get(channel_type, (1.0, "SI units"))
+            nEpochs = len(epochs.events)
+            averaged = epochs.average(method=self._nanmean)
 
-            # Finite amplitude limits for the trace plot.
-            finite_values = data[np.isfinite(data)] * scale
-            lower, upper = finite_values.min(), finite_values.max()
+            # Correct only the new average, never the source epochs.
+            try:
+                averaged = self._applyEvokedBaseline(averaged, baseline)
+            except ValueError as error:
+                self.setError(str(error))
+                return None
+
+            session.mne.evoked = averaged
+            evoked = averaged.copy().pick(selectedNames)
+            data = evoked.data
+            finiteMask = np.isfinite(data)
+            sampleRate = evoked.info["sfreq"]
+
+            if not finiteMask.any():
+                pglMessages.warning("Selected evoked data contain no finite values; skipping plots", level=0)
+                return session
+
+            scale, unit = {"mag": (1e15, "fT"), "grad": (1e13, "fT/cm"), "eeg": (1e6, "µV")}[channelType]
+            scalings = {channelType: scale}
+            units = {channelType: unit}
+
+            finiteValues = data[finiteMask] * scale
+            lower, upper = finiteValues.min(), finiteValues.max()
             padding = 0.05 * (upper - lower) if upper > lower else max(abs(lower) * 0.05, 1.0)
 
-            trace_args = dict(spatial_colors=True, scalings={channel_type: scale}, units={channel_type: unit}, ylim={channel_type: (lower - padding, upper + padding)}, gfp=False)
+            amplitudeMin = lower - padding if self.yMin is None else self.yMin
+            amplitudeMax = upper + padding if self.yMax is None else self.yMax
 
-            # Small topomaps require complete spatial snapshots.
-            complete_times = np.flatnonzero(np.isfinite(data).all(axis=0))
-
-            if not is_sensor and complete_times.size:
-                if np.isfinite(data).all():
-                    topo_times = "peaks"
+            if amplitudeMin >= amplitudeMax:
+                if self.yMax is None:
+                    amplitudeMax = amplitudeMin + max(2 * padding, abs(amplitudeMin) * 0.05, 1.0)
                 else:
-                    # Up to three evenly spaced complete snapshots; no imputation.
-                    indices = np.linspace(0, complete_times.size - 1, min(3, complete_times.size), dtype=int)
-                    topo_times = evoked.times[complete_times[indices]]
+                    amplitudeMin = amplitudeMax - max(2 * padding, abs(amplitudeMax) * 0.05, 1.0)
 
-                fig = evoked.plot_joint(times=topo_times, picks=self.picks, ts_args=trace_args, show=False)
+            amplitudeLimits = (amplitudeMin, amplitudeMax)
+            traceLimits = {channelType: amplitudeLimits}
+            completeTimes = np.flatnonzero(finiteMask.all(axis=0))
+            drawTopomaps = not isSensor and bool(completeTimes.size)
+
+            if not isSensor:
+                if topoTimes is not None:
+                    requestedIndices = [int(np.argmin(np.abs(evoked.times - time))) for time in topoTimes]
+
+                    if any(not finiteMask[:, index].all() for index in requestedIndices):
+                        self.setError("A requested topoTime contains missing or nonfinite sensor values. Choose complete snapshots; missing sensors will not be imputed.")
+                        return None
+
+                elif not finiteMask.all():
+                    # MNE's automatic peak finder is not NaN-aware. Do not
+                    # silently replace its peak rule with evenly spaced times.
+                    drawTopomaps = False
+                    pglMessages.warning("Automatic MNE peak topomaps require finite evoked data. Showing traces only; supply topoTime at complete sensor snapshots to include topomaps without imputing missing values.", level=0)
+
+            plotEvoked = evoked.copy()
+            plotEvoked.data[~finiteMask] = np.nan
+
+            # When not highlighting, retain MNE's normal spatial trace colors
+            # and its matching sensor-location inset.
+            traceArgs = {
+                "spatial_colors": not isSensor and not highlightNames,
+                "scalings": scalings,
+                "units": units,
+                "ylim": traceLimits,
+                "gfp": False,
+                "time_unit": "ms",
+            }
+
+            if drawTopomaps:
+                # Joint-plot input times are seconds, regardless of label units.
+                requestedTimes = "peaks" if topoTimes is None else topoTimes
+                topoArgs = {
+                    "scalings": scalings,
+                    "units": units,
+                    "vlim": amplitudeLimits,
+                    "contours": 6,
+                    "cmap": ("RdBu_r", False),
+                    "time_unit": "ms",
+                }
+                fig = plotEvoked.plot_joint(times=requestedTimes, picks=channelType, ts_args=traceArgs, topomap_args=topoArgs, show=False)
             else:
-                fig = evoked.plot(show=False, **trace_args)
+                fig = plotEvoked.plot(show=False, **traceArgs)
 
-                if not is_sensor:
-                    pglMessages.warning("No timepoint has valid data at every selected sensor; omitting the small topomaps")
+            def publishFigure(figure, title, *, export=False):
+                """Format, export/show, insert into the report, and close."""
+                from matplotlib import font_manager
+                from matplotlib.axes import Axes
+                from matplotlib.text import Text
 
-            fig.set_size_inches(20, 8)
-            fig.suptitle(f"NaN-aware evoked: {self.picks}")
-            
-            session.mne.report.add_figure(fig=fig, title="evoked", section="Plot Evoked (nan-aware)")
+                # Prefer Helvetica Oblique; fall back if unavailable.
+                preferredFont = font_manager.FontProperties(family="Helvetica", style="oblique")
 
-            # FFT / PSD: use contiguous data without changing the sampling interval.
-            fmin = max(0.0, self.minFreq)
-            fmax = min(self.maxFreq, sfreq / 2)
+                try:
+                    fontPath = font_manager.findfont(preferredFont, fallback_to_default=False)
+                except ValueError:
+                    preferredFont = font_manager.FontProperties(family="DejaVu Sans", style="oblique")
+                    fontPath = font_manager.findfont(preferredFont)
 
-            if fmin < fmax:
-                psds = []
-                n_fft = data.shape[1] if is_sensor else min(2048, data.shape[1])
+                def styleText(text, size):
+                    text.set_fontproperties(font_manager.FontProperties(fname=fontPath, size=size))
+
+                try:
+                    # Includes annotations, sensor names, legends, and inset text.
+                    # Preserve text that was already larger.
+                    for text in figure.findobj(match=Text):
+                        styleText(text, max(text.get_fontsize(), 16))
+
+                    # Includes main axes, colorbars, and child/inset axes.
+                    for axis in figure.findobj(match=Axes):
+                        axis.tick_params(axis="both", which="both", labelsize=16)
+
+                        styleText(axis.xaxis.label, 20)
+                        styleText(axis.yaxis.label, 20)
+                        styleText(axis.xaxis.get_offset_text(), 16)
+                        styleText(axis.yaxis.get_offset_text(), 16)
+
+                        # Include left-, center-, and right-aligned titles.
+                        for location in ("left", "center", "right"):
+                            axis.set_title(axis.get_title(loc=location), loc=location, fontproperties=font_manager.FontProperties(fname=fontPath, size=20))
+
+                        axis.xaxis.labelpad = 12
+                        axis.yaxis.labelpad = 12
+
+                        # Set the evoked trace labels without changing spectral
+                        # axes or topomap/colorbar labels.
+                        if title == "evoked" and axis.get_xlabel().strip() == "Time (ms)":
+                            axis.set_xlabel("Time (ms)", fontproperties=font_manager.FontProperties(fname=fontPath, size=20))
+                            axis.set_ylabel(f"Sensor Response ({unit})", fontproperties=font_manager.FontProperties(fname=fontPath, size=20))
+
+                    # Figure-level titles and labels.
+                    for text in figure.texts:
+                        styleText(text, max(text.get_fontsize(), 24))
+
+                    if export and self.exportFig is not None:
+                        session.exportFig(figure, self.exportFig)
+
+                    plt.show()
+                    session.mne.report.add_figure(fig=figure, title=title, section="Plot Evoked")
+                finally:
+                    plt.close(figure)
+
+            try:
+                if highlightNames:
+                    # Locate the trace axis by its explicit time-unit label.
+                    traceAxes = [axis for axis in fig.axes if axis.get_xlabel().strip() == "Time (ms)"]
+
+                    if len(traceAxes) != 1:
+                        raise RuntimeError("Could not uniquely locate the MNE time-series axis for highlighting.")
+
+                    axTrace = traceAxes[0]
+
+                    # Preserve MNE's layout, marker lines, and topomap connections.
+                    # Hide only the channel traces, identified by their complete
+                    # time vector, before adding our styled replacements.
+                    timesMs = evoked.times * 1000
+
+                    for line in list(axTrace.lines):
+                        xValues = np.asarray(line.get_xdata())
+
+                        if xValues.shape == timesMs.shape and np.allclose(xValues, timesMs):
+                            line.set_visible(False)
+
+                    traceData = data.copy() * scale
+                    traceData[~finiteMask] = np.nan
+                    highlightSet = set(highlightNames)
+                    indexByName = {name: index for index, name in enumerate(evoked.ch_names)}
+
+                    for name, index in indexByName.items():
+                        if name not in highlightSet:
+                            axTrace.plot(timesMs, traceData[index], color="0.8", linewidth=0.6, alpha=0.65, zorder=2)
+
+                    if len(highlightNames) <= 10:
+                        colors = [colormaps["tab10"](index) for index in range(len(highlightNames))]
+                    elif len(highlightNames) <= 20:
+                        colors = [colormaps["tab20"](index) for index in range(len(highlightNames))]
+                    else:
+                        colors = [colormaps["turbo"](position) for position in np.linspace(0.05, 0.95, len(highlightNames))]
+
+                    highlightColors = dict(zip(highlightNames, colors))
+
+                    for name, color in highlightColors.items():
+                        axTrace.plot(timesMs, traceData[indexByName[name]], color=color, linewidth=1.6, label=name, zorder=4)
+
+                    axTrace.set_ylim(amplitudeLimits)
+                    axTrace.legend(loc="upper right", fontsize=9, ncol=1 if len(highlightNames) <= 6 else 2)
+
+                    if not isSensor:
+                        # spatial_colors=False suppresses MNE's usual location
+                        # inset. Restore one using our actual trace colors.
+                        try:
+                            self._addHighlightedSensorInset(axTrace, evoked, channelType, highlightColors)
+                        except (ValueError, RuntimeError) as error:
+                            pglMessages.warning(f"Could not draw the highlighted sensor-location inset: {error}", level=0)
+
+                from matplotlib import font_manager
+
+                # Prefer Helvetica Oblique; fall back to DejaVu Sans Oblique.
+                labelFont = font_manager.FontProperties(family="Helvetica", style="oblique", size=18)
+
+                try:
+                    fontPath = font_manager.findfont(labelFont, fallback_to_default=False)
+                except ValueError:
+                    labelFont = font_manager.FontProperties(family="DejaVu Sans", style="oblique", size=18)
+                    fontPath = font_manager.findfont(labelFont)
+
+                labelFont = font_manager.FontProperties(fname=fontPath, size=18)
+
+                traceAxes = [axis for axis in fig.axes if axis.get_xlabel().strip() == "Time (ms)"]
+
+                for axTrace in traceAxes:
+                    axTrace.set_ylabel(f"Sensor Response ({unit})", fontproperties=labelFont, labelpad=12)
+                    axTrace.set_xlabel("Time (ms)", fontproperties=labelFont, labelpad=10)
+                    axTrace.tick_params(axis="both", labelsize=14)
+                fig.set_size_inches(20, 8)
+                fig.suptitle(f"Evoked response: {picks} — n = {nEpochs}", fontsize=18)
+
+            except BaseException:
+                plt.close(fig)
+                raise
+
+            publishFigure(fig, "evoked", export=True)
+
+            # Highlight selection does not change FFT/PSD calculations.
+            # These use the evoked data after any requested baseline correction.
+            minFrequency = max(0.0, self.minFreq)
+            maxFrequency = sampleRate / 2 if self.maxFreq is None else min(self.maxFreq, sampleRate / 2)
+
+            if minFrequency < maxFrequency:
+                spectra = []
+                nFft = data.shape[1] if isSensor else min(2048, data.shape[1])
 
                 for name, series in zip(evoked.ch_names, data):
                     segment = self._valid_segment(series)
@@ -2075,254 +2410,89 @@ class pglActionsMNE(pglActionCollection):
                     if segment.size < series.size:
                         pglMessages.warning(f"{name}: FFT/PSD use the longest valid segment ({segment.size}/{series.size} samples)")
 
-                    if is_sensor:
-                        fft_freqs = np.fft.rfftfreq(segment.size, d=1 / sfreq)
+                    if isSensor:
+                        fftFrequencies = np.fft.rfftfreq(segment.size, d=1 / sampleRate)
                         magnitude = np.abs(np.fft.rfft(segment * scale))
-                        keep = (fft_freqs >= fmin) & (fft_freqs <= fmax)
+                        keep = (fftFrequencies >= minFrequency) & (fftFrequencies <= maxFrequency)
 
                         if keep.any():
-                            fig_fft, ax = plt.subplots(figsize=(12, 6))
-                            ax.stem(fft_freqs[keep], magnitude[keep], linefmt="C0-", markerfmt="C0.", basefmt=" ")
-                            ax.set(xlabel="Frequency (Hz)", ylabel=f"FFT magnitude ({unit}, unnormalized)", title=f"Evoked FFT: {self.picks}", xlim=(fmin, fmax))
-                            fig_fft.tight_layout()
+                            figFft, ax = plt.subplots(figsize=(12, 6))
+                            ax.stem(fftFrequencies[keep], magnitude[keep], linefmt="C0-", markerfmt="C0.", basefmt=" ")
+                            ax.set(xlabel="Frequency (Hz)", ylabel=f"FFT magnitude ({unit}, unnormalized)", title=f"Evoked FFT: {picks}", xlim=(minFrequency, maxFrequency))
+                            figFft.tight_layout()
+                            publishFigure(figFft, "FFT")
 
-                    freqs, psd = welch(segment, fs=sfreq, window="boxcar" if is_sensor else "hamming", nperseg=min(n_fft, segment.size), noverlap=0, nfft=n_fft, detrend="constant", scaling="density")
-                    psds.append(psd)
+                    frequencies, spectrum = welch(segment, fs=sampleRate, window="boxcar" if isSensor else "hamming", nperseg=min(nFft, segment.size), noverlap=0, nfft=nFft, detrend="constant", scaling="density")
+                    spectra.append(spectrum)
 
-                if psds:
-                    mean_psd = self._nanmean(np.asarray(psds)) * scale**2
-                    keep = (freqs >= fmin) & (freqs <= fmax)
+                if spectra:
+                    meanSpectrum = self._nanmean(np.asarray(spectra)) * scale**2
+                    keep = (frequencies >= minFrequency) & (frequencies <= maxFrequency)
 
-                    if is_sensor:
-                        keep &= freqs > 0
+                    if isSensor:
+                        keep &= frequencies > 0
 
                     if keep.any():
-                        fig_psd, ax = plt.subplots(figsize=(12, 6))
-                        ax.stem(freqs[keep], mean_psd[keep], linefmt="C0-", markerfmt="C0.", basefmt=" ")
-                        ax.set(xlabel="Frequency (Hz)", ylabel=f"PSD ({unit}²/Hz)", title=f"Evoked spectrum: {self.picks}", xlim=(fmin, fmax))
-                        fig_psd.tight_layout()
-                        
-                        session.mne.report.add_figure(fig=fig_psd, title="spectrum", section="Plot Evoked (nan-aware)")
+                        figPsd, ax = plt.subplots(figsize=(12, 6))
+                        ax.stem(frequencies[keep], meanSpectrum[keep], linefmt="C0-", markerfmt="C0.", basefmt=" ")
+                        ax.set(xlabel="Frequency (Hz)", ylabel=f"PSD ({unit}²/Hz)", title=f"Evoked spectrum: {picks}", xlim=(minFrequency, maxFrequency))
+                        figPsd.tight_layout()
+                        publishFigure(figPsd, "spectrum")
                     else:
                         pglMessages.warning("No PSD bins fall within the requested frequency range")
             else:
                 pglMessages.warning("Invalid frequency range; skipping FFT/PSD")
 
-            # Peak topomap: require finite values at every selected sensor.
-            if not is_sensor:
-                complete_times = np.flatnonzero(np.isfinite(data).all(axis=0))
-
-                if not complete_times.size:
-                    pglMessages.warning("No complete sensor snapshot is available; skipping topomap")
+            # Retain the separate large, labeled peak topomap. topoTime controls
+            # the small topomaps in the main figure; this one is always a peak.
+            if not isSensor:
+                if not completeTimes.size:
+                    pglMessages.warning("No complete sensor snapshot is available; skipping peak topomap")
                 else:
-                    channel_index, time_index = np.unravel_index(np.argmax(np.abs(data[:, complete_times])), (data.shape[0], complete_times.size))
-                    peak_time = evoked.times[complete_times[time_index]]
-                    peak_channel = evoked.ch_names[channel_index]
+                    channelIndex, timeIndex = np.unravel_index(np.argmax(np.abs(data[:, completeTimes])), (data.shape[0], completeTimes.size))
+                    peakTime = evoked.times[completeTimes[timeIndex]]
+                    peakChannel = evoked.ch_names[channelIndex]
 
-                    # Fix symmetric color limits in the displayed units.
-                    peak_index = np.argmin(np.abs(evoked.times - peak_time))
-                    vmax = float(np.max(np.abs(data[:, peak_index])) * scale)
-                    vmax = vmax if vmax > 0 else 1.0
-
-                    # The False in cmap disables interactive colorbar rescaling.
-                    fig_peak = evoked.plot_topomap(times=[peak_time], ch_type=channel_type, scalings={channel_type: scale}, units={channel_type: unit}, show_names=True, sensors=True, contours=6, time_unit="ms", size=8, vlim=(-vmax, vmax), cmap=("RdBu_r", False), show=False)
-                    fig_peak.set_size_inches(12, 10)
-                    fig_peak.suptitle(f"Peak response: {peak_time * 1000:.1f} ms ({peak_channel})", fontsize=20)
-                    fig_peak.subplots_adjust(top=0.88)
-
-                    # Enlarge electrode labels, timepoint title, and colorbar text.
-                    for ax in fig_peak.axes:
-                        for text in ax.texts:
-                            text.set_fontsize(16)
-                        ax.title.set_fontsize(20)
-                        ax.tick_params(labelsize=14)
-                        ax.xaxis.label.set_fontsize(16)
-                        ax.yaxis.label.set_fontsize(16)
-                        
-                    session.mne.report.add_figure(fig=fig_peak, title="Peak topo", section="Plot Evoked (nan-aware)")
-
-            return session
-    
-    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
-    # plot evoked Each
-    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
-    class plotEvokedEach(pglAction):
-        '''
-        Plot the evoked response for each label set
-        '''
-        
-
-        # Parameters
-        set = Unicode(default_value=None, allow_none=True, help="Label set used to group epochs (defaults to the first set)")
-        picks = Unicode("mag", help="Channel type to plot: mag, grad, or eeg")
-        nCols = Int(4, min=1, help="Number of labels across each row")
-
-        ################################
-        # configure
-        ################################
-        def configure(self, **kwargs) -> None:
-            self.configureTraits(**kwargs)
-            super().configure()
-
-        ################################
-        # run
-        ################################
-        def _run(self, session: pglSession) -> pglSession:
-            """
-            Compute label-specific evoked responses with a progress bar.
-            Display each completed row as a static image, independent of
-            the notebook's interactive Matplotlib backend.
-            """
-
-            import mne
-            import numpy as np
-            from io import BytesIO
-            from matplotlib.figure import Figure
-            from matplotlib.backends.backend_agg import FigureCanvasAgg
-            from IPython.display import display, Image
-            from tqdm.auto import tqdm
-
-            # Check session
-            if session.mne is None or session.mne.raw is None:
-                self.setError("Session does not have raw mne loaded")
-                return None
-
-            if session.mne.epochs is None:
-                self.setError("Session does not have epochs created")
-                return None
-
-            # Validate channel type
-            self.picks = session.mne.validatePicks(self.picks)
-
-            if self.picks not in ("mag", "grad", "eeg"):
-                self.setError("picks must be a channel type: mag, grad, or eeg")
-                return None
-
-            epochs = session.mne.epochs
-            eventsID = session.mne.eventsID
-
-            # Resolve label set
-            labelSet = self.set
-
-            if labelSet is None:
-                if len(eventsID.columns) <= 3:
-                    self.setError("No label sets found in eventsID")
-                    return None
-
-                labelSet = eventsID.columns[3]
-
-            if labelSet not in eventsID.columns:
-                self.setError(f"Could not find label set: {labelSet}")
-                return None
-
-            if epochs.metadata is None or labelSet not in epochs.metadata.columns:
-                self.setError(f"Epoch metadata does not contain label set: {labelSet}")
-                return None
-
-            # Select channels once
-            megType = self.picks if self.picks in ("mag", "grad") else False
-            channelIndices = mne.pick_types(epochs.info, meg=megType, eeg=self.picks == "eeg", exclude="bads")
-
-            if len(channelIndices) == 0:
-                self.setError(f"No usable {self.picks!r} channels found")
-                return None
-
-            # Find epochs for each label
-            labels = eventsID[labelSet].dropna().unique()
-            selections = []
-
-            for label in labels:
-                mask = epochs.metadata[labelSet].eq(label).fillna(False).to_numpy(dtype=bool)
-                epochIndices = np.flatnonzero(mask)
-
-                if len(epochIndices) == 0:
-                    pglMessages.warning(f"No epochs remaining for label {label!r}; skipping")
-                    continue
-
-                selections.append((label, epochIndices))
-
-            if not selections:
-                self.setError(f"No epochs found for labels in {labelSet!r}")
-                return None
-
-            nLabels = len(selections)
-            nCols = min(self.nCols, nLabels)
-            nRows = (nLabels + nCols - 1) // nCols
-
-            with tqdm(total=nLabels, desc="Evoked plots", unit="stimulus") as progress:
-
-                for row in range(nRows):
-                    rowSelections = selections[row * nCols:(row + 1) * nCols]
-
-                    # Create an independent static figure, not a pyplot/widget figure
-                    fig = Figure(figsize=(5 * nCols, 6), dpi=100, constrained_layout=False)
-                    FigureCanvasAgg(fig)
+                    figPeak = evoked.plot_topomap(times=[peakTime], ch_type=channelType, scalings=scalings, units=units, show_names=lambda name: name.split("_", 1)[0].split()[0], sensors=True, contours=6, time_unit="ms", size=8, vlim=amplitudeLimits, cmap=("RdBu_r", False), show=False)
 
                     try:
-                        outerGrid = fig.add_gridspec(1, nCols, left=0.055, right=0.97, bottom=0.12, top=0.80, wspace=0.45)
-                        fig.suptitle(f"Evoked responses by {labelSet} — {self.picks} — row {row + 1}/{nRows}", fontsize=16)
+                        figPeak.set_size_inches(12, 10)
+                        figPeak.suptitle(f"Peak response: {peakTime * 1000:.1f} ms ({peakChannel})", fontsize=20)
+                        figPeak.subplots_adjust(top=0.88)
 
-                        for col, (label, epochIndices) in enumerate(rowSelections):
-                            progress.set_postfix_str(f"Row {row + 1}/{nRows}: {label}", refresh=True)
+                        for ax in figPeak.axes:
+                            for text in ax.texts:
+                                text.set_fontsize(9)
+                                text.set_color("black")
+                                text.set_fontweight("bold")
+                                text.set_bbox(dict(facecolor="white", edgecolor="none", alpha=0.85, boxstyle="round,pad=0.15"))
+                                text.set_zorder(10)
 
-                            # Compute this stimulus immediately before plotting
-                            evoked = epochs[epochIndices].average(picks=channelIndices)
-                            _, peakTime = evoked.get_peak(ch_type=self.picks, mode="abs")
+                            ax.title.set_fontsize(20)
+                            ax.tick_params(labelsize=14)
+                            ax.xaxis.label.set_fontsize(16)
+                            ax.yaxis.label.set_fontsize(16)
 
-                            # Topomap and colorbar above, evoked below
-                            innerGrid = outerGrid[0, col].subgridspec(2, 2, height_ratios=[1.25, 1], width_ratios=[1, 0.05], hspace=0.40, wspace=0.08)
+                    except BaseException:
+                        plt.close(figPeak)
+                        raise
 
-                            axTopo = fig.add_subplot(innerGrid[0, 0])
-                            axColorbar = fig.add_subplot(innerGrid[0, 1])
-                            axEvoked = fig.add_subplot(innerGrid[1, :])
-
-                            # Fixed color limits and no interactive colorbar
-                            evoked.plot_topomap(times=[peakTime], ch_type=self.picks, axes=[axTopo, axColorbar], colorbar=True, sensors=True, contours=6, time_unit="ms", cmap=("RdBu_r", False), vlim=(-30, 30), show=False)
-                            axTopo.set_title(f"{label}\nn = {len(epochIndices)} | peak = {peakTime * 1000:.1f} ms", fontsize=11)
-                            axColorbar.tick_params(labelsize=8)
-
-                            # Butterfly plot explicitly attached to this row's axes
-                            evoked.plot(axes=axEvoked, spatial_colors=True, gfp=False, time_unit="ms", show=False)
-                            axEvoked.axvline(peakTime * 1000, color="black", linestyle="--", linewidth=1)
-                            axEvoked.set_title("")
-                            axEvoked.tick_params(labelsize=8)
-
-                            progress.update(1)
-                            
-                        # Add this completed row to the report
-                        session.mne.report.add_figure(fig=fig, title=f"Row {row + 1}/{nRows}", section=f"Evoked set: {labelSet}", caption="Labels: " + ", ".join(str(label) for label, _ in rowSelections), image_format="png")
-
-                        # Render and display only this row; no live widget or callbacks
-                        with BytesIO() as buffer:
-                            fig.savefig(buffer, format="png", dpi=100, facecolor="white")
-                            display(Image(data=buffer.getvalue()))
-
-                    finally:
-                        fig.clear()
+                    publishFigure(figPeak, "Peak topo")
 
             return session
 
-    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
-    # plot evoked each NaN
-    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
-    class plotEvokedEachNan(pglAction):
-        '''
-        Plot the evoked response for each label set, handling NaN values appropriately (ie. using nanmean).
-        '''
+    class plotEvokedEach(pglAction):
+        """Plot NaN-aware label averages with optional highlighted sensor traces."""
 
-        # Parameters
         set = Unicode(default_value=None, allow_none=True, help="Label set used to group epochs (defaults to the first set)")
-        picks = Unicode("mag", help="Channel type to plot: mag, grad, or eeg")
+        picks = Unicode(default_value=None, allow_none=True, help="Channel type: mag, grad, or eeg; None automatically selects an available type")
+        highlightChannels = List(Unicode(), help="Sensor names to highlight in time-series plots; empty uses the normal all-channel display")
         nCols = Int(4, min=1, help="Number of labels across each row")
         topoTime = Float(default_value=None, allow_none=True, help="Topomap time in ms for every label; None selects each label's peak")
-        topoMin = Float(-30.0, help="Topomap minimum in displayed units")
-        topoMax = Float(30.0, help="Topomap maximum in displayed units")
-        timeseriesMin = Float(default_value=None, allow_none=True, help="Time series y-axis minimum in displayed units; None uses automatic limits")
-        timeseriesMax = Float(default_value=None, allow_none=True, help="Time series y-axis maximum in displayed units; None uses automatic limits")
+        yMin = Float(default_value=None, allow_none=True, help="Minimum amplitude for both time series and topomap in displayed units; None uses automatic limits per label")
+        yMax = Float(default_value=None, allow_none=True, help="Maximum amplitude for both time series and topomap in displayed units; None uses automatic limits per label")
+        exportFig = Unicode(default_value=None, allow_none=True, help="Optional figure export path or fsspec URL for this execution only", serialize=False)
 
-        ################################
-        # NaN-aware average
-        ################################
         @staticmethod
         def _nanMean(data):
             """Average across epochs, leaving NaN where all epochs are missing."""
@@ -2332,25 +2502,25 @@ class pglActionsMNE(pglActionCollection):
             totals = np.nansum(data, axis=0)
             return np.divide(totals, counts, out=np.full(totals.shape, np.nan), where=counts > 0)
 
-        ################################
-        # run
-        ################################
         def _run(self, session: pglSession) -> pglSession:
-            """
-            Compute NaN-aware label-specific evoked responses.
+            """Plot each label using shared time-series and topomap limits.
 
-            Display each completed row as a static image, independent of
-            the notebook's interactive Matplotlib backend.
+            Highlighting changes only the trace display. Averaging, topomap
+            channels, peak selection, and automatic limits use all usable
+            channels of the selected type.
+
+            Selected epochs are preloaded one label at a time for callable
+            averaging, leaving the source epochs' preload state unchanged.
             """
             import mne
             import numpy as np
             from io import BytesIO
+            from matplotlib import colormaps
             from matplotlib.figure import Figure
             from matplotlib.backends.backend_agg import FigureCanvasAgg
             from IPython.display import display, Image
             from tqdm.auto import tqdm
 
-            # Check session.
             if session.mne is None or session.mne.raw is None:
                 self.setError("Session does not have raw mne loaded")
                 return None
@@ -2359,35 +2529,33 @@ class pglActionsMNE(pglActionCollection):
                 self.setError("Session does not have epochs created")
                 return None
 
-            # Validate channel type.
-            self.picks = session.mne.validatePicks(self.picks)
+            # Normalize locally rather than changing configuration after the
+            # action framework has recorded its settings snapshot.
+            picks = session.mne.validatePicks(self.picks)
 
-            if self.picks not in ("mag", "grad", "eeg"):
+            if picks not in ("mag", "grad", "eeg"):
                 self.setError("picks must be a channel type: mag, grad, or eeg")
                 return None
 
-            # Validate configured times and limits.
-            for parameterName in ("topoTime", "topoMin", "topoMax", "timeseriesMin", "timeseriesMax"):
+            for parameterName in ("topoTime", "yMin", "yMax"):
                 parameterValue = getattr(self, parameterName)
 
                 if parameterValue is not None and not np.isfinite(parameterValue):
                     self.setError(f"{parameterName} must be finite")
                     return None
 
-            if self.topoMin >= self.topoMax:
-                self.setError("topoMin must be less than topoMax")
-                return None
-
-            if self.timeseriesMin is not None and self.timeseriesMax is not None:
-                if self.timeseriesMin >= self.timeseriesMax:
-                    self.setError("timeseriesMin must be less than timeseriesMax")
+            if self.yMin is not None and self.yMax is not None:
+                if self.yMin >= self.yMax:
+                    self.setError("yMin must be less than yMax")
                     return None
 
             epochs = session.mne.epochs
             eventsID = session.mne.eventsID
-
-            # Resolve label set.
             labelSet = self.set
+
+            if eventsID is None:
+                self.setError("Session does not have event labels")
+                return None
 
             if labelSet is None:
                 if len(eventsID.columns) <= 3:
@@ -2404,7 +2572,7 @@ class pglActionsMNE(pglActionCollection):
                 self.setError(f"Epoch metadata does not contain label set: {labelSet}")
                 return None
 
-            # Resolve a shared topomap sample when a fixed time is requested.
+            # A fixed topomap time uses the same sample across all labels.
             fixedTimeIndex = None
 
             if self.topoTime is not None:
@@ -2417,20 +2585,40 @@ class pglActionsMNE(pglActionCollection):
 
                 fixedTimeIndex = int(np.argmin(np.abs(epochs.times * 1000 - self.topoTime)))
 
-            # Select channels once, excluding channels marked bad.
-            megType = self.picks if self.picks in ("mag", "grad") else False
-            channelIndices = mne.pick_types(epochs.info, meg=megType, eeg=self.picks == "eeg", exclude="bads")
+            # Highlighting must not narrow the channels used for averaging
+            # or topography. Exclude channels marked bad as before.
+            megType = picks if picks in ("mag", "grad") else False
+            channelIndices = mne.pick_types(epochs.info, meg=megType, eeg=picks == "eeg", exclude="bads")
 
             if len(channelIndices) == 0:
-                self.setError(f"No usable {self.picks!r} channels found")
+                self.setError(f"No usable {picks!r} channels found")
                 return None
 
-            # Display units.
-            scale, unit = {"mag": (1e15, "fT"), "grad": (1e13, "fT/cm"), "eeg": (1e6, "µV")}[self.picks]
-            scalings = {self.picks: scale}
-            units = {self.picks: unit}
+            usableNames = [epochs.ch_names[index] for index in channelIndices]
+            usableNameSet = set(usableNames)
+            allNameSet = set(epochs.ch_names)
+            badNames = set(epochs.info["bads"])
 
-            # Find epochs for each label.
+            # Resolve partial sensor names and validate against plotted epochs.
+            highlightNames = session.mne.validateSensors(self.highlightChannels, checkEpochs=True, picks=picks, excludeBads=True)
+            highlightNameSet = set(highlightNames)
+
+            # Keep highlight colors consistent across every label and row.
+            if len(highlightNames) <= 10:
+                colorMap = colormaps["tab10"]
+                highlightColors = [colorMap(index) for index in range(len(highlightNames))]
+            elif len(highlightNames) <= 20:
+                colorMap = colormaps["tab20"]
+                highlightColors = [colorMap(index) for index in range(len(highlightNames))]
+            else:
+                colorMap = colormaps["turbo"]
+                highlightColors = [colorMap(position) for position in np.linspace(0.05, 0.95, len(highlightNames))]
+
+            scale, unit = {"mag": (1e15, "fT"), "grad": (1e13, "fT/cm"), "eeg": (1e6, "µV")}[picks]
+            scalings = {picks: scale}
+            units = {picks: unit}
+
+            # Resolve selections against the unchanged source epoch metadata.
             labels = eventsID[labelSet].dropna().unique()
             selections = []
 
@@ -2452,140 +2640,191 @@ class pglActionsMNE(pglActionCollection):
             nCols = min(self.nCols, nLabels)
             nRows = (nLabels + nCols - 1) // nCols
 
-            with tqdm(total=nLabels, desc="NaN-aware evoked plots", unit="stimulus") as progress:
+            if not epochs.preload:
+                pglMessages.message("Loading epochs one label at a time for NaN-aware averaging...")
+            
+            with session.exportFigRows(self.exportFig) as figExport:
+                with tqdm(total=nLabels, desc="NaN-aware evoked plots", unit="stimulus") as progress:
+                    for row in range(nRows):
+                        rowSelections = selections[row * nCols:(row + 1) * nCols]
 
-                for row in range(nRows):
-                    rowSelections = selections[row * nCols:(row + 1) * nCols]
+                        # Use a static figure independent of the notebook backend.
+                        fig = Figure(figsize=(5 * nCols, 6), dpi=100, constrained_layout=False)
+                        FigureCanvasAgg(fig)
 
-                    # Independent static figure, not a pyplot/widget figure.
-                    fig = Figure(figsize=(5 * nCols, 6), dpi=100, constrained_layout=False)
-                    FigureCanvasAgg(fig)
+                        try:
+                            outerGrid = fig.add_gridspec(1, nCols, left=0.055, right=0.97, bottom=0.12, top=0.80, wspace=0.45)
+                            fig.suptitle(f"NaN-aware evoked responses by {labelSet} — {picks} — row {row + 1}/{nRows}", fontsize=16)
 
-                    try:
-                        outerGrid = fig.add_gridspec(1, nCols, left=0.055, right=0.97, bottom=0.12, top=0.80, wspace=0.45)
-                        fig.suptitle(f"NaN-aware evoked responses by {labelSet} — {self.picks} — row {row + 1}/{nRows}", fontsize=16)
+                            for col, (label, epochIndices) in enumerate(rowSelections):
+                                progress.set_postfix_str(f"Row {row + 1}/{nRows}: {label}", refresh=True)
 
-                        for col, (label, epochIndices) in enumerate(rowSelections):
-                            progress.set_postfix_str(f"Row {row + 1}/{nRows}: {label}", refresh=True)
+                                # get_data() does not set preload=True. Load the
+                                # selected copy explicitly for callable averaging.
+                                selectedEpochs = epochs[epochIndices]
 
-                            # Average available values independently at each sensor/time.
-                            evoked = epochs[epochIndices].average(picks=channelIndices, method=self._nanMean)
-                            data = evoked.data
-                            finiteMask = np.isfinite(data)
+                                try:
+                                    if not selectedEpochs.preload:
+                                        selectedEpochs.load_data()
 
-                            # Topomap and colorbar above, butterfly plot below.
-                            innerGrid = outerGrid[0, col].subgridspec(2, 2, height_ratios=[1.25, 1], width_ratios=[1, 0.05], hspace=0.40, wspace=0.08)
+                                    # Loading may drop invalid epochs.
+                                    nEpochs = len(selectedEpochs.events)
+                                    evoked = selectedEpochs.average(picks=channelIndices, method=self._nanMean) if nEpochs else None
 
-                            axTopo = fig.add_subplot(innerGrid[0, 0])
-                            axColorbar = fig.add_subplot(innerGrid[0, 1])
-                            axEvoked = fig.add_subplot(innerGrid[1, :])
+                                finally:
+                                    del selectedEpochs
 
-                            labelTitle = f"{label}\nn = {len(epochIndices)}"
+                                innerGrid = outerGrid[0, col].subgridspec(2, 2, height_ratios=[1.25, 1], width_ratios=[1, 0.05], hspace=0.40, wspace=0.08)
+                                axTopo = fig.add_subplot(innerGrid[0, 0])
+                                axColorbar = fig.add_subplot(innerGrid[0, 1])
+                                axEvoked = fig.add_subplot(innerGrid[1, :])
+                                labelTitle = f"{label}\nn = {nEpochs}"
 
-                            # Keep the label visible even when no plot is possible.
-                            if not finiteMask.any():
-                                pglMessages.warning(f"{label!r}: evoked data contain no finite values; skipping plots")
+                                if evoked is None:
+                                    pglMessages.warning(f"{label!r}: no epochs remain after loading; skipping plots")
+                                    axTopo.set_title(labelTitle, fontsize=11)
+                                    axTopo.text(0.5, 0.5, "No epochs remain", ha="center", va="center", transform=axTopo.transAxes)
+                                    axTopo.set_axis_off()
+                                    axColorbar.set_axis_off()
+                                    axEvoked.set_axis_off()
+                                    progress.update(1)
+                                    continue
 
-                                axTopo.set_title(labelTitle, fontsize=11)
-                                axTopo.text(0.5, 0.5, "No finite evoked data", ha="center", va="center", transform=axTopo.transAxes)
-                                axTopo.set_axis_off()
-                                axColorbar.set_axis_off()
+                                data = evoked.data
+                                finiteMask = np.isfinite(data)
 
-                                axEvoked.text(0.5, 0.5, "No finite evoked data", ha="center", va="center", transform=axEvoked.transAxes)
-                                axEvoked.set_axis_off()
+                                if not finiteMask.any():
+                                    pglMessages.warning(f"{label!r}: evoked data contain no finite values; skipping plots")
+                                    axTopo.set_title(labelTitle, fontsize=11)
+                                    axTopo.text(0.5, 0.5, "No finite evoked data", ha="center", va="center", transform=axTopo.transAxes)
+                                    axTopo.set_axis_off()
+                                    axColorbar.set_axis_off()
+                                    axEvoked.text(0.5, 0.5, "No finite evoked data", ha="center", va="center", transform=axEvoked.transAxes)
+                                    axEvoked.set_axis_off()
+                                    progress.update(1)
+                                    continue
 
+                                # Compute one amplitude interval for both plots.
+                                # Automatic limits include all usable channels.
+                                finiteValues = data[finiteMask] * scale
+                                lower, upper = finiteValues.min(), finiteValues.max()
+                                padding = 0.05 * (upper - lower) if upper > lower else max(abs(lower) * 0.05, 1.0)
+
+                                amplitudeMin = lower - padding if self.yMin is None else self.yMin
+                                amplitudeMax = upper + padding if self.yMax is None else self.yMax
+
+                                # If only one bound is explicit, adjust the automatic
+                                # opposite bound when needed to maintain a valid range.
+                                if amplitudeMin >= amplitudeMax:
+                                    if self.yMax is None:
+                                        amplitudeMax = amplitudeMin + max(2 * padding, abs(amplitudeMin) * 0.05, 1.0)
+                                    else:
+                                        amplitudeMin = amplitudeMax - max(2 * padding, abs(amplitudeMax) * 0.05, 1.0)
+
+                                amplitudeLimits = (amplitudeMin, amplitudeMax)
+                                traceLimits = {picks: amplitudeLimits}
+                                topoIndex = None
+                                markerTime = None
+                                missingMessage = ""
+
+                                # Topomap selection still considers all usable sensors,
+                                # not just highlighted time-series channels.
+                                if fixedTimeIndex is not None:
+                                    markerTime = evoked.times[fixedTimeIndex]
+                                    labelTitle = f"{labelTitle} | time = {markerTime * 1000:.1f} ms"
+
+                                    if finiteMask[:, fixedTimeIndex].all():
+                                        topoIndex = fixedTimeIndex
+                                    else:
+                                        missingMessage = "Incomplete sensor snapshot\nTopomap omitted"
+                                        pglMessages.warning(f"{label!r}: not every selected sensor has finite data at {markerTime * 1000:.3f} ms; omitting topomap")
+
+                                else:
+                                    completeTimes = np.flatnonzero(finiteMask.all(axis=0))
+
+                                    if completeTimes.size:
+                                        peakFlatIndex = np.argmax(np.abs(data[:, completeTimes]))
+                                        _, peakTimeIndex = np.unravel_index(peakFlatIndex, (data.shape[0], completeTimes.size))
+                                        topoIndex = int(completeTimes[peakTimeIndex])
+                                        markerTime = evoked.times[topoIndex]
+                                        labelTitle = f"{labelTitle} | peak = {markerTime * 1000:.1f} ms"
+                                    else:
+                                        missingMessage = "No complete sensor snapshot\nTopomap omitted"
+                                        pglMessages.warning(f"{label!r}: no timepoint has finite data at every selected sensor; omitting topomap")
+
+                                # Do not impute missing sensor values for topography.
+                                if topoIndex is not None:
+                                    topoSampleTime = evoked.times[topoIndex]
+                                    evoked.plot_topomap(times=[topoSampleTime], ch_type=picks, axes=[axTopo, axColorbar], scalings=scalings, units=units, colorbar=True, sensors=True, contours=6, time_unit="ms", cmap=("RdBu_r", False), vlim=amplitudeLimits, show=False)
+                                    axTopo.set_title(labelTitle, fontsize=11)
+                                    axColorbar.tick_params(labelsize=8)
+                                else:
+                                    axTopo.set_title(labelTitle, fontsize=11)
+                                    axTopo.text(0.5, 0.5, missingMessage, ha="center", va="center", transform=axTopo.transAxes)
+                                    axTopo.set_axis_off()
+                                    axColorbar.set_axis_off()
+
+                                if highlightNames:
+                                    # Background traces remain visible in grey.
+                                    # Selected traces are overlaid with stable colors.
+                                    timesMs = evoked.times * 1000
+                                    traceData = data.copy() * scale
+                                    traceData[~finiteMask] = np.nan
+                                    indexByName = {channelName: index for index, channelName in enumerate(evoked.ch_names)}
+
+                                    for channelName, channelIndex in indexByName.items():
+                                        if channelName not in highlightNameSet:
+                                            axEvoked.plot(timesMs, traceData[channelIndex], color="0.8", linewidth=0.6, alpha=0.65, zorder=1)
+
+                                    for channelName, color in zip(highlightNames, highlightColors):
+                                        channelIndex = indexByName[channelName]
+                                        axEvoked.plot(timesMs, traceData[channelIndex], color=color, linewidth=1.6, label=channelName, zorder=3)
+
+                                    axEvoked.axhline(0, color="0.5", linewidth=0.6, linestyle=":", zorder=0)
+
+                                    if timesMs[0] <= 0 <= timesMs[-1]:
+                                        axEvoked.axvline(0, color="0.5", linewidth=0.6, linestyle=":", zorder=0)
+
+                                    axEvoked.set(xlabel="Time (ms)", ylabel=f"Amplitude ({unit})", ylim=amplitudeLimits)
+
+                                    if timesMs[-1] > timesMs[0]:
+                                        axEvoked.set_xlim(timesMs[0], timesMs[-1])
+
+                                    axEvoked.legend(loc="upper right", fontsize=7, framealpha=0.85, ncol=1 if len(highlightNames) <= 6 else 2)
+
+                                else:
+                                    # Preserve spatial coloring when no highlights
+                                    # were requested. Missing values remain gaps.
+                                    traceEvoked = evoked.copy()
+                                    traceEvoked.data[~finiteMask] = np.nan
+                                    traceEvoked.plot(axes=axEvoked, spatial_colors=True, scalings=scalings, units=units, ylim=traceLimits, gfp=False, time_unit="ms", show=False)
+
+                                if markerTime is not None:
+                                    axEvoked.axvline(markerTime * 1000, color="black", linestyle="--", linewidth=1, zorder=4)
+
+                                axEvoked.set_title("")
+                                axEvoked.tick_params(labelsize=8)
                                 progress.update(1)
-                                continue
 
-                            # Automatic butterfly limits use only finite values.
-                            finiteValues = data[finiteMask] * scale
-                            lower, upper = finiteValues.min(), finiteValues.max()
-                            padding = 0.05 * (upper - lower) if upper > lower else max(abs(lower) * 0.05, 1.0)
+                            caption = "Labels: " + ", ".join(str(label) for label, _ in rowSelections)
 
-                            traceMin = lower - padding if self.timeseriesMin is None else self.timeseriesMin
-                            traceMax = upper + padding if self.timeseriesMax is None else self.timeseriesMax
+                            if highlightNames:
+                                caption += ". Highlighted channels: " + ", ".join(highlightNames)
 
-                            # Keep a valid range when only one configured bound is
-                            # supplied and it lies beyond the automatic opposite bound.
-                            if traceMin >= traceMax:
-                                if self.timeseriesMax is None:
-                                    traceMax = traceMin + max(2 * padding, abs(traceMin) * 0.05, 1.0)
-                                else:
-                                    traceMin = traceMax - max(2 * padding, abs(traceMax) * 0.05, 1.0)
+                            session.mne.report.add_figure(fig=fig, title=f"Row {row + 1}/{nRows}", section=f"Evoked set (nan-aware): {labelSet}", caption=caption, image_format="png")
 
-                            traceLimits = {self.picks: (traceMin, traceMax)}
+                            # Render this row now (note that if exportFig is None, this is a no-op)
+                            figExport.add(fig)
+                                
+                            with BytesIO() as buffer:
+                                fig.savefig(buffer, format="png", dpi=100, facecolor="white")
+                                display(Image(data=buffer.getvalue()))
 
-                            # Select either the shared time or this label's peak.
-                            topoIndex = None
-                            markerTime = None
-                            missingMessage = ""
-
-                            if fixedTimeIndex is not None:
-                                markerTime = evoked.times[fixedTimeIndex]
-                                labelTitle = f"{labelTitle} | time = {markerTime * 1000:.1f} ms"
-
-                                if finiteMask[:, fixedTimeIndex].all():
-                                    topoIndex = fixedTimeIndex
-                                else:
-                                    missingMessage = "Incomplete sensor snapshot\nTopomap omitted"
-                                    pglMessages.warning(f"{label!r}: not every selected sensor has finite data at {markerTime * 1000:.3f} ms; omitting topomap")
-
-                            else:
-                                completeTimes = np.flatnonzero(finiteMask.all(axis=0))
-
-                                if completeTimes.size:
-                                    # Largest absolute response among complete snapshots.
-                                    peakFlatIndex = np.argmax(np.abs(data[:, completeTimes]))
-                                    _, peakTimeIndex = np.unravel_index(peakFlatIndex, (data.shape[0], completeTimes.size))
-                                    topoIndex = int(completeTimes[peakTimeIndex])
-                                    markerTime = evoked.times[topoIndex]
-                                    labelTitle = f"{labelTitle} | peak = {markerTime * 1000:.1f} ms"
-
-                                else:
-                                    missingMessage = "No complete sensor snapshot\nTopomap omitted"
-                                    pglMessages.warning(f"{label!r}: no timepoint has finite data at every selected sensor; omitting topomap")
-
-                            # Plot only complete spatial snapshots; never impute data.
-                            if topoIndex is not None:
-                                topoSampleTime = evoked.times[topoIndex]
-
-                                evoked.plot_topomap(times=[topoSampleTime], ch_type=self.picks, axes=[axTopo, axColorbar], scalings=scalings, units=units, colorbar=True, sensors=True, contours=6, time_unit="ms", cmap=("RdBu_r", False), vlim=(self.topoMin, self.topoMax), show=False)
-                                axTopo.set_title(labelTitle, fontsize=11)
-                                axColorbar.tick_params(labelsize=8)
-
-                            else:
-                                axTopo.set_title(labelTitle, fontsize=11)
-                                axTopo.text(0.5, 0.5, missingMessage, ha="center", va="center", transform=axTopo.transAxes)
-                                axTopo.set_axis_off()
-                                axColorbar.set_axis_off()
-
-                            # Missing values remain gaps in the butterfly plot.
-                            # Convert any infinities to NaN on a plotting copy only.
-                            traceEvoked = evoked.copy()
-                            traceEvoked.data[~finiteMask] = np.nan
-
-                            traceEvoked.plot(axes=axEvoked, spatial_colors=True, scalings=scalings, units=units, ylim=traceLimits, gfp=False, time_unit="ms", show=False)
-
-                            # For fixed times, retain the marker even if the topomap
-                            # was omitted because some sensors were missing.
-                            if markerTime is not None:
-                                axEvoked.axvline(markerTime * 1000, color="black", linestyle="--", linewidth=1)
-
-                            axEvoked.set_title("")
-                            axEvoked.tick_params(labelsize=8)
-
-                            progress.update(1)
-
-                        # Add this completed row to the report
-                        session.mne.report.add_figure(fig=fig, title=f"Row {row + 1}/{nRows}", section=f"Evoked set (nan-aware): {labelSet}", caption="Labels: " + ", ".join(str(label) for label, _ in rowSelections), image_format="png")
-
-                        # Render and display only this row.
-                        with BytesIO() as buffer:
-                            fig.savefig(buffer, format="png", dpi=100, facecolor="white")
-                            display(Image(data=buffer.getvalue()))
-
-                    finally:
-                        fig.clear()
+                        finally:
+                            fig.clear()
+                
+                # export figure (no-op if exportFig is None)
+                figExport.finish()
 
             return session
 
