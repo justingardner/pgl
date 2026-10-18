@@ -166,7 +166,7 @@ class pglActionHistory(pglTraitSettings):
     def toString(self):
         """Return a readable execution description."""
         if self.actionStatus.value > pglActionStatus.CONFIGURED.value:
-            runDateTime = datetime.fromisoformat(self.runDateTime).strftime("%H:%M:%S %d/%m/%Y")
+            runDateTime = datetime.fromisoformat(self.runDateTime).strftime("%H:%M:%S %m/%d/%Y")
             return f"{self.actionName} ran at {runDateTime} with status: {self.actionStatus.name} duration: {pglTimestamp.formatDuration(self.runDuration)}"
 
         return f"{self.actionName} status: {self.actionStatus.name}"
