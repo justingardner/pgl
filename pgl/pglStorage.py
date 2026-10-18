@@ -3655,6 +3655,188 @@ class pglStorage:
         pglMessages.message(f"Pipeline extracted from recorded ancestry: input checkpoint {inputRecord['sessionID']}; excluded {prefixLength} history entries already included in that raw checkpoint.")
         return pipeline
     
+    @staticmethod
+    def exportFigRows(filename=None, *, filesystem=None, storageOptions=None, dpi=100, overwrite=True, maxPixels=100_000_000):
+        """Create a collector for exporting figure rows as one PNG.
+
+        None creates a no-op collector. No browser or inline display is opened.
+        Use add(fig), finish(), and close(), or a with block for cleanup.
+        """
+        return pglFigureRowExport(filename, filesystem=filesystem, storageOptions=storageOptions, dpi=dpi, overwrite=overwrite, maxPixels=maxPixels)
+    
+    @staticmethod
+    def exportFig(fig, filename=None, *, filesystem=None, storageOptions=None, dpi=100, overwrite=True):
+        """Export a Matplotlib figure through fsspec or open it in a browser.
+
+        Without a filename, render a temporary PNG and request a browser tab.
+        No inline Jupyter display is produced. Temporary browser files remain
+        available after this method returns.
+
+        Supported formats: PNG, SVG, PDF, JPEG, and WebP.
+        Missing or unsupported filename extensions become .png.
+
+        Plain local paths expand ~. Remote paths use backend semantics.
+        Existing output is protected unless overwrite=True.
+
+        Render before opening the output file. Writes are not transactional;
+        a failed write may leave partial output.
+
+        Returns a resolved filesystem path or temporary browser-image path.
+        Failures warn and return None. Browser-launch failure warns but returns
+        the successfully rendered temporary path.
+
+        Does not close or clear the supplied figure.
+        """
+        import os
+        import tempfile
+        import webbrowser
+        from io import BytesIO
+        from pathlib import Path
+        from matplotlib.figure import Figure
+        from fsspec import AbstractFileSystem
+        from fsspec.core import url_to_fs
+
+        try:
+            if not isinstance(fig, Figure):
+                raise TypeError("fig must be a Matplotlib Figure.")
+
+            if type(dpi) is not int or dpi <= 0:
+                raise ValueError("dpi must be a positive integer.")
+
+            if type(overwrite) is not bool:
+                raise ValueError("overwrite must be a boolean.")
+
+            if filesystem is not None and storageOptions:
+                raise ValueError("Supply filesystem or storageOptions, not both.")
+
+            if filesystem is not None and not isinstance(filesystem, AbstractFileSystem):
+                raise TypeError("filesystem must be an fsspec AbstractFileSystem.")
+
+            displayOnly = filename is None
+            outputFormat = "png"
+            destination = None
+            destinationFS = None
+
+            if displayOnly:
+                if filesystem is not None or storageOptions:
+                    raise ValueError("Filesystem options require an export filename.")
+
+            else:
+                location = os.fspath(filename)
+
+                if not isinstance(location, str) or not location.strip():
+                    raise ValueError("filename must be a nonempty path or URL.")
+
+                if any(character in location for character in ("\x00", "\n", "\r")):
+                    raise ValueError("filename must not contain NUL or newline characters.")
+
+                if location.endswith(("/", "\\")):
+                    raise ValueError("Supply a figure filename, not only a directory.")
+
+                if filesystem is None:
+                    # Expand local home paths only. Remote ~ belongs to the
+                    # remote filesystem and must not use this client's home.
+                    if "://" not in location and "::" not in location:
+                        location = str(Path(location).expanduser())
+
+                    destinationFS, destination = url_to_fs(location, **(storageOptions or {}))
+                else:
+                    destinationFS = filesystem
+                    destination = destinationFS._strip_protocol(location)
+
+                protocols = destinationFS.protocol
+                protocols = {protocols} if isinstance(protocols, str) else set(protocols)
+
+                if protocols.intersection({"file", "local"}):
+                    destination = str(Path(destination).expanduser().resolve())
+
+                if not destination or destination.endswith("/"):
+                    raise ValueError("Supply a figure filename.")
+
+                if destinationFS.isdir(destination):
+                    raise IsADirectoryError("The requested figure destination is a directory.")
+
+                stem, extension = posixpath.splitext(destination)
+                extension = extension.lower()
+                formats = {".png": "png", ".svg": "svg", ".pdf": "pdf", ".jpg": "jpeg", ".jpeg": "jpeg", ".webp": "webp"}
+
+                if extension not in formats:
+                    destination = stem + ".png"
+
+                    if extension:
+                        pglMessages.warning(f"Unsupported figure extension {extension!r}; exporting as PNG instead.", level=0)
+                else:
+                    destination = stem + extension
+                    outputFormat = formats[extension]
+
+                # Check the normalized output path, not just the requested path.
+                if destinationFS.exists(destination):
+                    if destinationFS.isdir(destination):
+                        raise IsADirectoryError("The normalized figure destination is a directory.")
+
+                    if not overwrite:
+                        raise FileExistsError("The figure already exists; use overwrite=True to replace it.")
+
+            # Complete rendering before creating or truncating the destination.
+            with BytesIO() as buffer:
+                fig.savefig(buffer, format=outputFormat, dpi=dpi, facecolor="white", transparent=False)
+                content = buffer.getvalue()
+
+            if displayOnly:
+                # Browser-only display in notebooks and ordinary Python alike.
+                # Do not delete immediately: browsers may read asynchronously.
+                with tempfile.NamedTemporaryFile(prefix="pgl-figure-", suffix=".png", delete=False) as temporary:
+                    written = temporary.write(content)
+
+                    if written != len(content):
+                        raise OSError("Incomplete temporary figure write.")
+
+                    displayPath = Path(temporary.name).resolve()
+
+                try:
+                    opened = webbrowser.open(displayPath.as_uri(), new=2)
+                except Exception:
+                    opened = False
+
+                if opened:
+                    pglMessages.message(f"Requested browser display: {displayPath}")
+                else:
+                    pglMessages.warning(f"Could not open a browser. The figure is available at {displayPath}.", level=1)
+
+                return str(displayPath)
+
+            parent = posixpath.dirname(destination)
+
+            if parent:
+                destinationFS.makedirs(parent, exist_ok=True)
+
+            # Use exclusive creation where the backend supports it. Do not
+            # silently fall back to overwriting an existing destination.
+            mode = "wb" if overwrite else "xb"
+
+            with destinationFS.open(destination, mode) as target:
+                written = target.write(content)
+
+                if written != len(content):
+                    raise OSError("Incomplete figure write.")
+
+            pglMessages.message(f"Figure exported as {outputFormat.upper()}: {posixpath.basename(destination)}")
+            return destination
+
+        except FileExistsError:
+            pglMessages.warning("Figure export skipped: the output file already exists. Use overwrite=True to replace it.", level=1)
+            return None
+
+        except IsADirectoryError:
+            pglMessages.warning("Figure export skipped: the destination is a directory. Supply a filename such as evoked.png.", level=1)
+            return None
+
+        except Exception as error:
+            # Do not print backend exception text or full URLs: they may expose
+            # credentials. KeyboardInterrupt and SystemExit still propagate.
+            pglMessages.warning(f"Could not export/display figure ({type(error).__name__}). Check the figure, filename, format support, storage options, and permissions. Processing will continue.", level=1)
+            return None
+    
     @classmethod
     def saveRawSession(cls, session, *, settings=None, settingsName=None, backendID=None, storageOptions=None, sslRootCert=None, allowMissingMetadata=False):
         """Save a parentless acquisition/root checkpoint.
@@ -5311,6 +5493,307 @@ class pglStorage:
             connection.execute(sql.SQL("GRANT SELECT ON TABLE {} TO {}").format(table, application))
 
         connection.execute(sql.SQL("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA {} TO {}").format(schema, application))
+
+class pglFigureRowExport:
+    """Collect rendered figure rows and export one vertically stacked PNG.
+
+    Row figures are rendered immediately to temporary files; figure handles
+    are not retained. The completed image is written through fsspec.
+
+    Export errors warn and disable this collector without failing analysis.
+    Only finish() publishes output. close() discards unfinished output.
+
+    maxPixels limits the final image area, not total process memory.
+    """
+
+    def __init__(self, filename, *, filesystem=None, storageOptions=None, dpi=200, overwrite=False, maxPixels=40_000_000):
+        """Prepare an export destination without creating its output file."""
+        import os
+        from tempfile import TemporaryDirectory
+        from fsspec import AbstractFileSystem
+
+        self._temporary = None
+        self._rows = []
+        self._width = 0
+        self._height = 0
+        self._filesystem = None
+        self._destination = None
+        self._result = None
+        self._closed = False
+        self._finished = False
+        self._disabled = filename is None
+        self._dpi = dpi
+        self._overwrite = overwrite
+        self._maxPixels = maxPixels
+        self._exportRequested = filename is not None
+
+        # None means no optional export, not browser display.
+        if self._disabled:
+            return
+
+        try:
+            if type(dpi) is not int or dpi <= 0:
+                raise ValueError("dpi must be a positive integer.")
+
+            if type(overwrite) is not bool:
+                raise ValueError("overwrite must be a boolean.")
+
+            if type(maxPixels) is not int or maxPixels <= 0:
+                raise ValueError("maxPixels must be a positive integer.")
+
+            if filesystem is not None and storageOptions:
+                raise ValueError("Supply filesystem or storageOptions, not both.")
+
+            if filesystem is not None and not isinstance(filesystem, AbstractFileSystem):
+                raise TypeError("filesystem must be an fsspec AbstractFileSystem.")
+
+            location = os.fspath(filename)
+
+            if not isinstance(location, str) or not location.strip():
+                raise ValueError("filename must be a nonempty path or URL.")
+
+            if any(character in location for character in ("\x00", "\n", "\r")):
+                raise ValueError("filename must not contain NUL or newline characters.")
+
+            if location.endswith(("/", "\\")):
+                raise ValueError("Supply a filename, not only a directory.")
+
+            if filesystem is None:
+                # Expand client-local ~ only. Remote paths use their backend's
+                # conventions rather than the client's home directory.
+                if "://" not in location and "::" not in location:
+                    location = str(Path(location).expanduser())
+
+                filesystem, destination = url_to_fs(location, **(storageOptions or {}))
+            else:
+                destination = filesystem._strip_protocol(location)
+
+            protocols = filesystem.protocol
+            protocols = {protocols} if isinstance(protocols, str) else set(protocols)
+
+            if protocols.intersection({"file", "local"}):
+                destination = str(Path(destination).expanduser().resolve())
+
+            if not destination or destination.endswith("/") or filesystem.isdir(destination):
+                raise ValueError("Supply a figure filename rather than a directory.")
+
+            stem, extension = posixpath.splitext(destination)
+            destination = stem + ".png"
+
+            if extension and extension.lower() != ".png":
+                pglMessages.warning("Combined figure export uses PNG; the filename extension was changed to .png.", level=0)
+
+            if filesystem.exists(destination):
+                if filesystem.isdir(destination):
+                    raise IsADirectoryError("The normalized destination is a directory.")
+
+                if not overwrite:
+                    raise FileExistsError("The output already exists.")
+
+            self._filesystem = filesystem
+            self._destination = destination
+            self._temporary = TemporaryDirectory(prefix="pgl-figure-rows-")
+
+        except Exception as error:
+            self._fail("prepare figure export", error)
+
+    def _fail(self, operation, error):
+        """Disable optional export and release temporary files."""
+        self._disabled = True
+
+        if isinstance(error, FileExistsError):
+            pglMessages.warning("Combined figure export skipped: the output already exists. Use overwrite=True to replace it.", level=2)
+        elif isinstance(error, MemoryError):
+            pglMessages.warning("Combined figure export stopped: insufficient memory. Reduce dpi or export fewer rows. Analysis and notebook display will continue.", level=2)
+        else:
+            # Backend exception messages can contain URLs or credentials.
+            # Report the failure category without exposing those details.
+            pglMessages.warning(f"Could not {operation} ({type(error).__name__}); combined export was disabled. Analysis and notebook display will continue.", level=2)
+
+        self.close()
+
+    def add(self, fig):
+        """Render one completed row without retaining its Matplotlib figure.
+
+        Returns True when collected, otherwise False.
+        Does not display, clear, or close the supplied figure.
+        """
+        if self._disabled or self._closed or self._finished:
+            # A None filename stays silent. A failed export warns for each
+            # subsequent row so the failure remains visible during plotting.
+            if self._exportRequested and not self._finished:
+                pglMessages.warning("This figure row was NOT collected: combined PNG export was cancelled earlier. Notebook display and report generation are continuing, but no combined PNG will be saved.", level=1)
+
+            return False
+        try:
+            import math
+            from matplotlib.figure import Figure
+            from PIL import Image
+
+            if not isinstance(fig, Figure):
+                raise TypeError("fig must be a Matplotlib Figure.")
+
+            # Check approximate dimensions before allocating the render buffer.
+            widthInches, heightInches = fig.get_size_inches()
+            estimatedWidth = math.ceil(float(widthInches) * self._dpi)
+            estimatedHeight = math.ceil(float(heightInches) * self._dpi)
+
+            if estimatedWidth <= 0 or estimatedHeight <= 0:
+                raise ValueError("Figure dimensions must be positive.")
+
+            estimatedPixels = max(self._width, estimatedWidth) * (self._height + estimatedHeight)
+
+            if estimatedPixels > self._maxPixels:
+                pglMessages.warning(f"Combined figure export would exceed maxPixels={self._maxPixels:,}. Reduce dpi, reduce the number of rows, or explicitly increase maxPixels.", level=1)
+                self._disabled = True
+                self.close()
+                return False
+
+            rowPath = Path(self._temporary.name) / f"row{len(self._rows):06d}.png"
+
+            # No tight bounding box: preserve each row's designed canvas size.
+            # Explicitly override a possible savefig.bbox='tight' global setting.
+            import matplotlib
+
+            with matplotlib.rc_context({"savefig.bbox": None}):
+                fig.savefig(rowPath, format="png", dpi=self._dpi, facecolor="white", transparent=False, bbox_inches=None)
+
+            with Image.open(rowPath) as image:
+                width, height = image.size
+
+            combinedWidth = max(self._width, width)
+            combinedHeight = self._height + height
+
+            if combinedWidth * combinedHeight > self._maxPixels:
+                pglMessages.warning(f"Rendered rows exceed maxPixels={self._maxPixels:,}; combined figure export was cancelled.", level=1)
+                self._disabled = True
+                self.close()
+                return False
+
+            self._rows.append((rowPath, width, height))
+            self._width = combinedWidth
+            self._height = combinedHeight
+            return True
+
+        except Exception as error:
+            self._fail("render figure row", error)
+            return False
+
+    def finish(self):
+        """Stack collected rows vertically and save one PNG.
+
+        Narrower rows are centered on a white background without resizing.
+        Returns the resolved destination on success, otherwise None.
+
+        Repeated finish() after success returns the same result.
+        A failed remote write may leave a partial output file.
+        """
+        if self._finished:
+            return self._result
+
+        if self._disabled or self._closed:
+            return None
+
+        try:
+            from PIL import Image
+
+            if not self._rows:
+                pglMessages.warning("No figure rows were collected; no PNG was exported.", level=1)
+                self.close()
+                return None
+
+            if self._width * self._height > self._maxPixels:
+                raise ValueError("Combined image exceeds maxPixels.")
+
+            # Recheck before assembling or writing. Exclusive creation below
+            # provides another safeguard where supported by the backend.
+            if self._filesystem.exists(self._destination):
+                if self._filesystem.isdir(self._destination):
+                    raise IsADirectoryError("Figure destination is a directory.")
+
+                if not self._overwrite:
+                    raise FileExistsError("Figure destination already exists.")
+
+            pglMessages.message(f"Assembling {len(self._rows)} figure rows into one PNG ({self._width} × {self._height} pixels)...")
+            combinedPath = Path(self._temporary.name) / "combined.png"
+            canvas = Image.new("RGB", (self._width, self._height), color="white")
+
+            try:
+                top = 0
+
+                for rowPath, width, height in self._rows:
+                    with Image.open(rowPath) as source:
+                        rowImage = source.convert("RGBA")
+
+                        try:
+                            left = (self._width - width) // 2
+                            canvas.paste(rowImage, (left, top), rowImage)
+                        finally:
+                            rowImage.close()
+
+                    top += height
+
+                # Write the complete local PNG before opening remote output.
+                canvas.save(combinedPath, format="PNG", dpi=(self._dpi, self._dpi))
+
+            finally:
+                canvas.close()
+
+            parent = posixpath.dirname(self._destination)
+
+            if parent:
+                self._filesystem.makedirs(parent, exist_ok=True)
+
+            mode = "wb" if self._overwrite else "xb"
+
+            with combinedPath.open("rb") as source:
+                with self._filesystem.open(self._destination, mode) as target:
+                    while True:
+                        chunk = source.read(1024 * 1024)
+
+                        if not chunk:
+                            break
+
+                        if target.write(chunk) != len(chunk):
+                            raise OSError("Incomplete combined figure write.")
+
+            self._result = self._destination
+            self._finished = True
+            pglMessages.message(f"Combined figure exported: {posixpath.basename(self._destination)}")
+            return self._result
+
+        except Exception as error:
+            self._fail("save combined figure", error)
+            return None
+
+        finally:
+            self.close()
+
+    def close(self):
+        """Remove temporary files without publishing unfinished output.
+
+        Safe to call repeatedly, including after finish() or an export error.
+        """
+        self._closed = True
+        temporary = self._temporary
+        self._temporary = None
+        self._rows = []
+
+        if temporary is not None:
+            try:
+                temporary.cleanup()
+            except Exception as error:
+                pglMessages.warning(f"Could not remove temporary figure-export files ({type(error).__name__}).", level=1)
+
+    def __enter__(self):
+        """Allow deterministic cleanup with a with block."""
+        return self
+
+    def __exit__(self, exceptionType, exception, traceback):
+        """Clean up without suppressing scientific errors or auto-publishing."""
+        self.close()
+        return False
+
 ################################################################
 # Read-only logical filesystem for archived checkpoints
 ################################################################

@@ -918,55 +918,63 @@ class pglMNE(pglLazyLoad, pglActionable):
     def loadBundle(cls, dataPath, filesystem=None, *, cacheDirectory, directLocalPolicy="materialize", verbose=False):
         return pglMNEBundle.load(dataPath, filesystem=filesystem, cacheDirectory=cacheDirectory, directLocalPolicy=directLocalPolicy, verbose=verbose)
     
-    def validatePicks(self, picks):
+    def validatePicks(self, picks=None):
+        """Validate a single MNE selector or choose a plotting type automatically.
+
+        None selects the first usable channel type in this order:
+        mag, grad, eeg. Automatic selection excludes channels marked bad.
+
+        Explicit strings retain the existing behavior:
+        - Exact channel names take precedence over channel-type selectors.
+        - Available channel-type selectors are accepted.
+        - Partial sensor names are resolved through lookupSensor().
+
+        Uses Raw channel metadata, without requesting numerical data.
+        Resolving a deferred Raw field may still invoke its storage loader.
+
+        Returns the resolved selector. Raises ValueError when unavailable.
         """
-        Validate a single MNE pick selector.
+        import mne
 
-        Returns either:
+        if picks is not None and (not isinstance(picks, str) or not picks.strip()):
+            raise ValueError("picks must be a non-empty string, or None for automatic selection.")
 
-        - An available channel-type selector, such as ``"mag"``, ``"grad"``,
-        ``"eeg"``, or ``"eog"``.
-        - An exact channel name.
-        - The full channel name resolved from a partial sensor name via
-        :meth:`lookupSensor`.
+        raw = self.raw
 
-        Raises
-        ------
-        ValueError
-            If ``picks`` is empty, is not an available channel type, and cannot
-            be resolved to a sensor/channel name.
-        """
-        if not isinstance(picks, str) or not picks.strip():
-            raise ValueError("picks must be a non-empty string")
+        if raw is None:
+            raise ValueError("Cannot validate picks: no Raw object is available.")
+
+        availableTypes = raw.get_channel_types(unique=True, only_data_chs=False)
+
+        if picks is None:
+            # Prefer magnetometers for the OPM workflow, then gradiometers,
+            # then EEG. Do not automatically select auxiliary channels.
+            for channelType in ("mag", "grad", "eeg"):
+                megType = channelType if channelType in ("mag", "grad") else False
+                channelIndices = mne.pick_types(raw.info, meg=megType, eeg=channelType == "eeg", exclude="bads")
+
+                if len(channelIndices):
+                    pglMessages.message(f"Automatically selected {channelType!r} channels.")
+                    return channelType
+
+            raise ValueError(f"No usable mag, grad, or eeg channels are available for automatic selection. Channels marked bad are excluded. Recorded channel types: {', '.join(availableTypes) or '(none)'}.")
 
         picks = picks.strip()
 
-        # First allow an exact channel name, including names which happen to
-        # overlap with a possible MNE selector.
-        if picks in self.raw.ch_names:
+        # Preserve exact-name precedence, even if a channel's name happens to
+        # overlap with a selector such as "mag" or "eeg".
+        if picks in raw.ch_names:
             return picks
-
-        # These are the actual direct channel types available in this recording,
-        # e.g. "mag", "grad", "eeg", "eog", "stim", etc.
-        availableTypes = self.raw.get_channel_types(
-                unique=True,
-                only_data_chs=False,
-            )
 
         if picks.lower() in availableTypes:
             return picks.lower()
 
-        # Resolve a partial sensor/channel name using lookupSensor
         sensorName = self.lookupSensor(picks)
 
         if sensorName is not None:
             return sensorName
 
-        raise ValueError(
-            f"Invalid picks value {picks!r}. "
-            f"Available channel types: {', '.join(availableTypes)}. "
-            f"Use a full channel name or a resolvable partial sensor name."
-        )
+        raise ValueError(f"Invalid picks value {picks!r}. Available channel types: {', '.join(availableTypes)}. Use a full channel name, a resolvable partial sensor name, or None for automatic selection.")
     
     def isSensor(self, name):
         '''
@@ -976,6 +984,110 @@ class pglMNE(pglLazyLoad, pglActionable):
             return True
         return False
         
+    def validateSensors(self, names, *, checkEpochs=False, picks=None, excludeBads=True):
+        """Resolve sensor names and validate their availability.
+
+        names accepts a string, a list/tuple of strings, or None.
+        None and an empty collection return an empty list.
+
+        Exact Raw channel names take precedence. Other names are resolved
+        through lookupSensor(), using unique case-insensitive prefixes.
+
+        checkEpochs=False validates against Raw.
+        checkEpochs=True additionally requires each resolved sensor in Epochs.
+
+        picks optionally restricts sensors to a channel type, such as mag,
+        grad, or eeg. None means no channel-type restriction.
+        excludeBads=True rejects sensors marked bad in the validation object.
+
+        Returns unique full channel names in requested order.
+        Raises ValueError for invalid selections.
+
+        Reads channel metadata only, although resolving a deferred Raw or
+        Epochs object may invoke its existing storage loader.
+        """
+        if type(checkEpochs) is not bool or type(excludeBads) is not bool:
+            raise ValueError("checkEpochs and excludeBads must be booleans.")
+
+        if picks is not None:
+            if not isinstance(picks, str) or not picks.strip():
+                raise ValueError("picks must be a channel-type string or None.")
+
+            picks = picks.strip().lower()
+
+        if names is None:
+            return []
+
+        if isinstance(names, str):
+            requestedNames = [names]
+        elif isinstance(names, (list, tuple)):
+            requestedNames = list(names)
+        else:
+            raise ValueError("Sensor names must be a string, a list/tuple of strings, or None.")
+
+        if not requestedNames:
+            return []
+
+        raw = self.raw
+
+        if raw is None:
+            raise ValueError("Cannot validate sensors: no Raw object is available.")
+
+        # Resolve Epochs only when explicitly requested.
+        target = self.epochs if checkEpochs else raw
+        targetName = "epochs" if checkEpochs else "raw"
+
+        if target is None:
+            raise ValueError(f"Cannot validate sensors: no {targetName} object is available.")
+
+        rawNames = set(raw.ch_names)
+        targetNames = set(target.ch_names)
+        channelTypes = dict(zip(target.ch_names, target.get_channel_types()))
+        availableTypes = sorted(set(channelTypes.values()))
+        badNames = set(target.info["bads"])
+
+        if picks is not None and picks not in availableTypes:
+            raise ValueError(f"Channel type {picks!r} is not available in {targetName}. Available types: {', '.join(availableTypes) or '(none)'}.")
+
+        resolvedNames = []
+        invalidNames = []
+
+        for name in requestedNames:
+            if not isinstance(name, str) or not name.strip():
+                invalidNames.append(f"{name!r}: expected a nonempty sensor name")
+                continue
+
+            requestedName = name.strip()
+
+            # Preserve exact-name precedence. Prefix matching and ambiguity
+            # handling remain centralized in lookupSensor().
+            resolvedName = requestedName if requestedName in rawNames else self.lookupSensor(requestedName, verbose=False)
+
+            if resolvedName is None:
+                invalidNames.append(f"{requestedName!r}: no unique matching sensor")
+                continue
+
+            if resolvedName not in targetNames:
+                invalidNames.append(f"{requestedName!r}: resolves to {resolvedName!r}, which is absent from {targetName}")
+                continue
+
+            if excludeBads and resolvedName in badNames:
+                invalidNames.append(f"{resolvedName!r}: marked bad in {targetName}")
+                continue
+
+            if picks is not None and channelTypes[resolvedName] != picks:
+                invalidNames.append(f"{resolvedName!r}: channel type is {channelTypes[resolvedName]!r}, not {picks!r}")
+                continue
+
+            # Deduplicate resolved names, not the original requests.
+            if resolvedName not in resolvedNames:
+                resolvedNames.append(resolvedName)
+
+        if invalidNames:
+            raise ValueError("Invalid sensor selection: " + "; ".join(invalidNames))
+
+        return resolvedNames
+    
     def lookupSensor(self, name, verbose=True):
         '''
         helper function to lookup the full sensor name from a parital match
@@ -1075,6 +1187,7 @@ class pglMNE(pglLazyLoad, pglActionable):
             raise
 
         return filename
+    
 ################################################################
 #   filename: pglMNEBundle.py
 #    purpose: Save and lazily restore a complete pglMNE bundle
@@ -2567,3 +2680,31 @@ class pglSession(pglActionable):
         from .pglStorage import pglStorage
 
         return pglStorage.getSessionPipeline(self, name=name, settings=settings, settingsName=settingsName, storageOptionsByBackend=storageOptionsByBackend, sslRootCert=sslRootCert)
+    
+    def exportFig(self, fig, filename=None, *, filesystem=None, storageOptions=None, dpi=100, overwrite=True):
+        """Export a figure or open it in the browser.
+
+        With no filename, render a temporary PNG and open it in the browser,
+        including when called from Jupyter. No inline image is displayed.
+
+        Filenames support local paths, ~, and fsspec URLs.
+        Failures warn and return None rather than failing the analysis.
+
+        Filesystem and rendering operations are delegated to pglStorage.
+        """
+        from .pglStorage import pglStorage
+
+        return pglStorage.exportFig(fig, filename, filesystem=filesystem, storageOptions=storageOptions, dpi=dpi, overwrite=overwrite)
+    
+    def exportFigRows(self, filename=None, *, filesystem=None, storageOptions=None, dpi=100, overwrite=True, maxPixels=100_000_000):
+        """Collect figure rows for a single PNG through pglStorage.
+
+        add(fig) renders a row without retaining the figure.
+        finish() explicitly saves the combined image.
+        close() removes temporary files without saving unfinished output.
+
+        None disables export. Export errors warn without failing analysis.
+        """
+        from .pglStorage import pglStorage
+
+        return pglStorage.exportFigRows(filename, filesystem=filesystem, storageOptions=storageOptions, dpi=dpi, overwrite=overwrite, maxPixels=maxPixels)
