@@ -1774,24 +1774,28 @@ class pglActionsMNE(pglActionCollection):
     
     _actionHeader_plots = "Make plots"
         
+    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
+    # plot evoked
+    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
     class plotEvoked(pglAction):
-        """Plot NaN-aware evoked responses with optional baseline correction."""
+        """Plot NaN-aware evoked responses, SNR, spectra, and topomaps."""
 
         set = Unicode(default_value=None, allow_none=True, help="Label set; defaults to the first set when selecting a label")
         label = Unicode(default_value=None, allow_none=True, help="Label to average; None averages all epochs")
         picks = Unicode(default_value=None, allow_none=True, help="Channel type or sensor name; None automatically selects an available plotting type")
-        highlightChannels = List(Unicode(), help="Sensor names or unique prefixes to highlight in time series; empty uses the normal display")
-        baseline = Any(default_value=None, allow_none=True, help="Baseline interval (start, end) in milliseconds, applied after averaging. None applies no additional correction. An endpoint of None uses the corresponding epoch boundary.")
+        highlightChannels = List(Unicode(), help="Sensor names or unique prefixes to highlight in response and SNR plots")
+        baseline = Any(default_value=None, allow_none=True, help="Baseline interval (start, end) in milliseconds; 'average' or (None, None) uses the entire epoch. None applies no additional correction. A None endpoint uses the corresponding epoch boundary. Applied after averaging for evoked plots and per trial for SNR.")
         topoTime = Any(default_value=None, allow_none=True, help="Topomap time in milliseconds, or a list of times; None lets MNE select peaks")
         minFreq = Float(0.0, help="Minimum displayed frequency")
         maxFreq = Float(default_value=None, allow_none=True, help="Maximum displayed frequency; None uses Nyquist")
-        yMin = Float(default_value=None, allow_none=True, help="Minimum amplitude for traces and topomap colors in displayed units; None uses automatic scaling")
-        yMax = Float(default_value=None, allow_none=True, help="Maximum amplitude for traces and topomap colors in displayed units; None uses automatic scaling")
-        exportFig = Unicode(default_value=None, allow_none=True, help="Optional filename or fsspec URL for the main evoked figure", serialize=False)
+        yMin = Float(default_value=None, allow_none=True, help="Minimum response amplitude and topomap color limit in displayed units; None uses automatic scaling. Does not constrain SNR.")
+        yMax = Float(default_value=None, allow_none=True, help="Maximum response amplitude and topomap color limit in displayed units; None uses automatic scaling. Does not constrain SNR.")
+        exportFig = Unicode(default_value=None, allow_none=True, help="Optional filename or fsspec URL for only the main evoked sensor-response figure", serialize=False)
+        exportFigAll = Unicode(default_value=None, allow_none=True, help="Optional filename or fsspec URL for one PNG containing all generated figures as rows", serialize=False)
 
         @staticmethod
         def _nanmean(data):
-            """Average across epochs, leaving NaN where every epoch is missing."""
+            """Average across epochs, leaving NaN where all epochs are missing."""
             import numpy as np
 
             counts = np.sum(~np.isnan(data), axis=0)
@@ -1815,11 +1819,12 @@ class pglActionsMNE(pglActionCollection):
 
         @staticmethod
         def _validateBaseline(value, times):
-            """Validate a millisecond baseline and return endpoints in seconds.
+            """Validate a baseline and return its endpoints in seconds.
 
-            None disables additional baseline correction.
+            None disables additional correction.
+            'average' and (None, None) use the entire epoch.
+            Numeric endpoints are milliseconds.
             None endpoints resolve to the corresponding epoch boundaries.
-            Endpoints are inclusive; the interval must contain a sample.
             """
             import numpy as np
             from numbers import Real
@@ -1827,14 +1832,20 @@ class pglActionsMNE(pglActionCollection):
             if value is None:
                 return None
 
+            if isinstance(value, str):
+                if value.strip().lower() != "average":
+                    raise ValueError("baseline must be None, 'average', or a two-element interval in milliseconds.")
+
+                value = (None, None)
+
             if isinstance(value, np.ndarray):
                 if value.ndim != 1:
-                    raise ValueError("baseline must be a two-element interval in milliseconds, or None.")
+                    raise ValueError("baseline must be None, 'average', or a two-element interval in milliseconds.")
 
                 value = value.tolist()
 
             if not isinstance(value, (list, tuple)) or len(value) != 2:
-                raise ValueError("baseline must be a two-element interval in milliseconds, or None.")
+                raise ValueError("baseline must be None, 'average', or a two-element interval in milliseconds.")
 
             timesMs = np.asarray(times, dtype=float) * 1000
             firstTime = float(timesMs[0])
@@ -1854,7 +1865,6 @@ class pglActionsMNE(pglActionCollection):
             if start > stop:
                 raise ValueError("Baseline start must not exceed baseline end.")
 
-            # Permit only negligible rounding differences at epoch endpoints.
             if start < firstTime - 1e-9 or stop > lastTime + 1e-9:
                 raise ValueError(f"Baseline must lie within the epoch range {firstTime:g} to {lastTime:g} ms.")
 
@@ -1868,14 +1878,26 @@ class pglActionsMNE(pglActionCollection):
             return (start / 1000, stop / 1000)
 
         @staticmethod
+        def _baselineDescription(value, validatedBaseline):
+            """Describe the requested baseline using resolved endpoints."""
+            if validatedBaseline is None:
+                return "None"
+
+            if isinstance(value, str):
+                return "average"
+
+            if all(endpoint is None for endpoint in value):
+                return "average"
+
+            start, stop = validatedBaseline
+            return f"{start * 1000:g}-{stop * 1000:g}ms"
+
+        @staticmethod
         def _applyEvokedBaseline(evoked, baseline):
             """Apply a finite-value baseline mean to each averaged channel.
 
+            Modifies only the supplied Evoked object.
             baseline must already be validated and expressed in seconds.
-            Modifies this Evoked object, not its source epochs.
-
-            Channels with usable data but no finite baseline samples are rejected.
-            Channels that are entirely missing remain missing.
             """
             import numpy as np
 
@@ -1892,7 +1914,6 @@ class pglActionsMNE(pglActionCollection):
             finite = np.isfinite(baselineData)
             counts = finite.sum(axis=1)
             totals = np.where(finite, baselineData, 0.0).sum(axis=1)
-
             missingBaseline = (counts == 0) & np.isfinite(evoked.data).any(axis=1)
 
             if missingBaseline.any():
@@ -1901,19 +1922,73 @@ class pglActionsMNE(pglActionCollection):
 
             offsets = np.divide(totals, counts, out=np.full(totals.shape, np.nan), where=counts > 0)
             evoked.data -= offsets[:, None]
-
-            # MNE stores baseline metadata in seconds.
             evoked.baseline = baseline
+
             return evoked
 
         @staticmethod
-        def _validateTopoTimes(value, times):
-            """Validate millisecond requests and return sampled times in seconds.
+        def _timeResolvedSnr(epochs, selectedNames, baseline):
+            """Return single-trial SNR, averaged-response SNR, and valid counts.
 
-            None retains MNE's automatic peak selection.
-            Explicit times resolve to the nearest available sample.
-            Requests resolving to the same sample are rejected.
+            Outputs have shape channels × times.
+
+            Single-trial SNR = trial mean / trial sample SD.
+            Average SNR = trial mean / SEM = single-trial SNR * sqrt(n).
+
+            An explicit baseline is applied separately to each trial/channel.
+            Missing baseline data excludes that trial/channel.
+
+            Source epochs are never modified. Fewer than two valid trials or
+            zero trial variance produces NaN.
+
+            With varying missingness, the trial-baseline-corrected mean can differ
+            from the evoked mean corrected after averaging.
+
+            Average SNR assumes independent trials. Mean/SEM is also a pointwise
+            t-statistic, not a multiple-comparison-corrected significance measure.
             """
+            import numpy as np
+
+            trialData = np.array(epochs.get_data(picks=selectedNames), dtype=float, copy=True)
+            trialData[~np.isfinite(trialData)] = np.nan
+
+            if baseline is not None:
+                start, stop = baseline
+                baselineMask = (epochs.times >= start - 1e-12) & (epochs.times <= stop + 1e-12)
+
+                if not baselineMask.any():
+                    raise ValueError("The requested baseline interval contains no samples.")
+
+                baselineData = trialData[:, :, baselineMask]
+                baselineCounts = np.isfinite(baselineData).sum(axis=2)
+                baselineTotals = np.nansum(baselineData, axis=2)
+                offsets = np.divide(baselineTotals, baselineCounts, out=np.full(baselineTotals.shape, np.nan), where=baselineCounts > 0)
+
+                trialData -= offsets[:, :, None]
+
+                del baselineData, baselineCounts, baselineTotals, offsets
+
+            validCounts = np.isfinite(trialData).sum(axis=0)
+            totals = np.nansum(trialData, axis=0)
+            meanResponse = np.divide(totals, validCounts, out=np.full(totals.shape, np.nan), where=validCounts > 0)
+
+            # Reuse the local array to avoid another full residual allocation.
+            trialData -= meanResponse[None, :, :]
+            np.square(trialData, out=trialData)
+            sumSquares = np.nansum(trialData, axis=0)
+
+            variance = np.divide(sumSquares, validCounts - 1, out=np.full(meanResponse.shape, np.nan), where=validCounts > 1)
+            trialStd = np.sqrt(variance)
+
+            usable = (validCounts > 1) & np.isfinite(meanResponse) & np.isfinite(trialStd) & (trialStd > 0)
+            singleTrialSnr = np.divide(meanResponse, trialStd, out=np.full(meanResponse.shape, np.nan), where=usable)
+            averageSnr = singleTrialSnr * np.sqrt(validCounts)
+
+            return singleTrialSnr, averageSnr, validCounts
+
+        @staticmethod
+        def _validateTopoTimes(value, times):
+            """Validate millisecond requests and return sampled times in seconds."""
             import numpy as np
             from numbers import Real
 
@@ -1932,8 +2007,10 @@ class pglActionsMNE(pglActionCollection):
             if not requested:
                 raise ValueError("topoTime must not be an empty list.")
 
-            firstTime = float(times[0]) * 1000
-            lastTime = float(times[-1]) * 1000
+            times = np.asarray(times, dtype=float)
+            timesMs = times * 1000
+            firstTime = float(timesMs[0])
+            lastTime = float(timesMs[-1])
             indices = []
 
             for item in requested:
@@ -1942,47 +2019,36 @@ class pglActionsMNE(pglActionCollection):
 
                 milliseconds = float(item)
 
-                # Permit only negligible rounding differences at epoch endpoints.
                 if milliseconds < firstTime - 1e-9 or milliseconds > lastTime + 1e-9:
                     raise ValueError(f"topoTime {milliseconds:g} ms is outside the epoch range {firstTime:g} to {lastTime:g} ms.")
 
-                index = int(np.argmin(np.abs(times * 1000 - milliseconds)))
+                index = int(np.argmin(np.abs(timesMs - milliseconds)))
 
                 if index in indices:
-                    raise ValueError(f"Multiple topoTime values select the same sample near {float(times[index]) * 1000:g} ms.")
+                    raise ValueError(f"Multiple topoTime values select the same sample near {float(timesMs[index]):g} ms.")
 
                 indices.append(index)
 
             return np.asarray([times[index] for index in indices], dtype=float)
 
         @staticmethod
-        def _addHighlightedSensorInset(axTrace, evoked, channelType, highlightColors):
-            """Add a location inset with the same colors as highlighted traces.
+        def _addHighlightedSensorInset(axTrace, evoked, channelType, highlightColors, normalColor="0.8"):
+            """Add a sensor-location inset matching the trace colors.
 
-            MNE handles sensor-coordinate projection. Only the resulting sensor
-            marker styling is changed. All non-highlighted sensors are gray.
+            This is a location map, not an interpolated SNR/amplitude map.
             """
             import mne
             import numpy as np
             from matplotlib.collections import PathCollection
             from matplotlib.colors import to_rgba
 
-            # Use a child axis so the main MNE layout remains unchanged.
-            axSensors = axTrace.inset_axes([0.015, 0.66, 0.18, 0.30], zorder=6)
+            # Bounds are [left, bottom, width, height] in parent-axis coordinates.
+            axSensors = axTrace.inset_axes([-0.05, 1.0, 0.18, 0.30], zorder=6)
+            axSensors.set_gid("sensor-location-inset")
 
             try:
-                mne.viz.plot_sensors(
-                    evoked.info,
-                    kind="topomap",
-                    ch_type=channelType,
-                    title="",
-                    show_names=False,
-                    axes=axSensors,
-                    show=False,
-                )
+                mne.viz.plot_sensors(evoked.info, kind="topomap", ch_type=channelType, title="", show_names=False, axes=axSensors, show=False)
 
-                # This Evoked contains only the selected channel type, in the
-                # same order used by plot_sensors.
                 sensorCollections = [
                     collection
                     for collection in axSensors.collections
@@ -1994,11 +2060,10 @@ class pglActionsMNE(pglActionCollection):
                     raise RuntimeError("Could not uniquely identify the sensor markers in the location inset.")
 
                 sensorMarkers = sensorCollections[0]
-                colors = np.asarray([to_rgba(highlightColors.get(name, "0.8")) for name in evoked.ch_names])
+                colors = np.asarray([to_rgba(highlightColors.get(name, normalColor)) for name in evoked.ch_names])
                 sizes = np.asarray([35.0 if name in highlightColors else 14.0 for name in evoked.ch_names])
 
-                # Draw highlighted markers last so they remain visible where
-                # sensors share a projected location, e.g. paired gradiometers.
+                # Draw highlighted sensors last where projected locations overlap.
                 order = np.asarray(sorted(range(len(evoked.ch_names)), key=lambda index: evoked.ch_names[index] in highlightColors))
                 offsets = sensorMarkers.get_offsets().copy()
 
@@ -2010,8 +2075,7 @@ class pglActionsMNE(pglActionCollection):
                 sensorMarkers.set_alpha(1.0)
                 sensorMarkers.set_zorder(3)
 
-                # Reordering is visual only; disable picking because MNE's
-                # original picking indices no longer match the marker order.
+                # Original MNE picking indices no longer match the visual order.
                 sensorMarkers.set_picker(None)
                 axSensors.set_title("Sensor locations", fontsize=9, pad=2)
                 axSensors.set_axis_off()
@@ -2023,26 +2087,46 @@ class pglActionsMNE(pglActionCollection):
             return axSensors
 
         def _run(self, session: pglSession) -> pglSession:
-            """Plot evoked responses without altering source epoch preload state.
+            """Manage the optional combined PNG export."""
+            if self.exportFig is not None and self.exportFig == self.exportFigAll:
+                self.setError("exportFig and exportFigAll must use different filenames")
+                return None
 
-            baseline and topoTime are specified in milliseconds.
+            figureRows = session.exportFigRows(self.exportFigAll)
 
-            baseline=None leaves the averaged data unchanged. It does not apply
-            filtering or undo baseline correction already applied to the epochs.
+            try:
+                result = self._runPlots(session, figureRows)
 
-            An explicit baseline is applied after NaN-aware averaging, before
-            plotting, peak selection, amplitude scaling, and spectral calculation.
+                if result is not None:
+                    figureRows.finish()
 
-            topoTime=None delegates peak selection to MNE's joint plot.
+                return result
+            finally:
+                figureRows.close()
 
-            Highlighting changes trace and sensor-inset styling only, not
-            averaging, topography, spectral calculations, or amplitude limits.
+        def _runPlots(self, session: pglSession, figureRows) -> pglSession:
+            """Plot without modifying source epoch data or preload state.
+
+            baseline=None means no additional correction; it does not undo
+            correction already applied to the source epochs.
+
+            Explicit baselines are applied after averaging for response plots,
+            topomaps, amplitude limits, and spectra, and per trial for SNR.
+
+            All figures use the same canvas width. exportFig saves only the main
+            response figure; exportFigAll collects every figure as a PNG row.
             """
             import mne
             import numpy as np
             import matplotlib.pyplot as plt
-            from matplotlib import colormaps
+            from matplotlib import colormaps, font_manager
+            from matplotlib.axes import Axes
+            from matplotlib.axis import Axis
+            from matplotlib.lines import Line2D
+            from matplotlib.text import Text
             from scipy.signal import welch
+
+            figureWidth = 20.0
 
             if session.mne is None or session.mne.raw is None:
                 self.setError("Session does not have raw mne loaded")
@@ -2085,6 +2169,11 @@ class pglActionsMNE(pglActionCollection):
 
             if isSensor:
                 selectedNames = session.mne.validateSensors([picks], checkEpochs=True, excludeBads=True)
+
+                if not selectedNames:
+                    self.setError("No usable selected sensor found in epochs")
+                    return None
+
                 channelIndices = [epochs.ch_names.index(selectedNames[0])]
                 channelType = epochs.get_channel_types(picks=channelIndices)[0]
 
@@ -2109,6 +2198,8 @@ class pglActionsMNE(pglActionCollection):
             if outsideSelection:
                 self.setError(f"Highlighted sensors are outside the plotted selection: {', '.join(outsideSelection)}")
                 return None
+
+            labelSet = None
 
             # Select directly from metadata, avoiding query-string quoting issues.
             if self.label is not None:
@@ -2156,8 +2247,6 @@ class pglActionsMNE(pglActionCollection):
                 session.mne.evoked = None
                 return session
 
-            # Custom averaging requires preloading. Work on a copy so the source
-            # Epochs object remains unchanged.
             if not epochs.preload:
                 pglMessages.message("Loading selected epochs for NaN-aware averaging...")
                 epochs = epochs.copy().load_data()
@@ -2170,7 +2259,6 @@ class pglActionsMNE(pglActionCollection):
             nEpochs = len(epochs.events)
             averaged = epochs.average(method=self._nanmean)
 
-            # Correct only the new average, never the source epochs.
             try:
                 averaged = self._applyEvokedBaseline(averaged, baseline)
             except ValueError as error:
@@ -2218,16 +2306,150 @@ class pglActionsMNE(pglActionCollection):
                         return None
 
                 elif not finiteMask.all():
-                    # MNE's automatic peak finder is not NaN-aware. Do not
-                    # silently replace its peak rule with evenly spaced times.
                     drawTopomaps = False
                     pglMessages.warning("Automatic MNE peak topomaps require finite evoked data. Showing traces only; supply topoTime at complete sensor snapshots to include topomaps without imputing missing values.", level=0)
 
+            try:
+                singleTrialSnr, averageSnr, snrCounts = self._timeResolvedSnr(epochs, evoked.ch_names, baseline)
+            except ValueError as error:
+                self.setError(str(error))
+                return None
+
+            if len(highlightNames) <= 10:
+                colors = [colormaps["tab10"](index) for index in range(len(highlightNames))]
+            elif len(highlightNames) <= 20:
+                colors = [colormaps["tab20"](index) for index in range(len(highlightNames))]
+            else:
+                colors = [colormaps["turbo"](position) for position in np.linspace(0.05, 0.95, len(highlightNames))]
+
+            highlightColors = dict(zip(highlightNames, colors))
+
+            preferredFont = font_manager.FontProperties(family="Helvetica", style="oblique")
+
+            try:
+                fontPath = font_manager.findfont(preferredFont, fallback_to_default=False)
+            except ValueError:
+                preferredFont = font_manager.FontProperties(family="DejaVu Sans", style="oblique")
+                fontPath = font_manager.findfont(preferredFont)
+
+            # --------------------------------------------------------------
+            # Consistent titles and interpreted parameter descriptions.
+            # --------------------------------------------------------------
+            selectionDescription = f"sensor {evoked.ch_names[0]}" if isSensor else f"{channelType} sensors"
+            baselineDescription = self._baselineDescription(self.baseline, baseline)
+            commonParameters = [f"baseline={baselineDescription}"]
+
+            if self.label is None:
+                commonParameters.append("label=all")
+            else:
+                commonParameters.extend([f"set={labelSet!r}", f"label={self.label!r}"])
+
+            def formatParameters(*extra):
+                return "(" + ", ".join(commonParameters + list(extra)) + ")"
+
+            def responseParameters():
+                parameters = []
+                return formatParameters(*parameters)
+
+            def setFigureHeading(figure, heading, parameters, *, top=0.82):
+                """Place a main title and a smaller parameter line underneath."""
+                figure.suptitle(f"{heading} for {selectionDescription} (n={nEpochs})", x=0.5, y=0.98, fontsize=24)
+                subtitle = figure.text(0.5, 0.925, parameters, ha="center", va="top", fontsize=16)
+                figure.subplots_adjust(top=top)
+                return subtitle
+
+            def styleText(text, size):
+                text.set_fontproperties(font_manager.FontProperties(fname=fontPath, size=size))
+
+            def publishFigure(figure, title, *, subtitle=None, exportMain=False):
+                """Format, export, show, add to report, and close."""
+                try:
+                    figure.set_size_inches(figureWidth, figure.get_figheight(), forward=True)
+
+                    for text in figure.findobj(match=Text):
+                        styleText(text, max(text.get_fontsize(), 16))
+
+                    # Includes secondary-axis labels and ticks.
+                    for axis in figure.findobj(match=Axis):
+                        axis.set_tick_params(which="both", labelsize=16)
+                        styleText(axis.label, 20)
+                        styleText(axis.get_offset_text(), 16)
+                        axis.labelpad = 12
+
+                    for axis in figure.findobj(match=Axes):
+                        for location in ("left", "center", "right"):
+                            axis.set_title(axis.get_title(loc=location), loc=location, fontproperties=font_manager.FontProperties(fname=fontPath, size=20))
+
+                        if title == "evoked" and axis.get_xlabel().strip() == "Time (ms)":
+                            axis.set_xlabel("Time (ms)", fontproperties=font_manager.FontProperties(fname=fontPath, size=20))
+                            axis.set_ylabel(f"Sensor Response ({unit})", fontproperties=font_manager.FontProperties(fname=fontPath, size=20))
+
+                    for text in figure.texts:
+                        styleText(text, 16 if text is subtitle else max(text.get_fontsize(), 24))
+
+                    # Simple figures can be laid out after final font sizing.
+                    # Reserve the top region for the title and parameter line.
+                    if title in ("SNR", "FFT", "spectrum"):
+                        figure.tight_layout(rect=(0, 0, 1, 0.86), pad=2.0)
+
+                    # MNE joint plots can use explicitly positioned axes, for which
+                    # subplots_adjust(top=...) alone does not reserve header space.
+                    if title == "evoked" and drawTopomaps:
+                        from matplotlib.transforms import Affine2D
+
+                        # Prevent a layout engine from undoing the explicit positions.
+                        figure.set_layout_engine(None)
+                        figure.canvas.draw()
+
+                        # Capture the full allocated positions, not the aspect-adjusted boxes.
+                        # Child sensor insets follow their parent axes automatically.
+                        axesPositions = [(axis, axis.get_position(original=True).frozen()) for axis in figure.axes]
+
+                        oldBottom = min(position.y0 for axis, position in axesPositions)
+                        oldTop = max(position.y1 for axis, position in axesPositions)
+
+                        # Reserve the upper part of the canvas for the title and subtitle.
+                        targetTop = 0.78
+                        verticalScale = min(1.0, (targetTop - oldBottom) / (oldTop - oldBottom))
+                        verticalOffset = oldBottom * (1.0 - verticalScale)
+
+                        for axis, position in axesPositions:
+                            newBottom = verticalScale * position.y0 + verticalOffset
+                            axis.set_position([position.x0, newBottom, position.width, position.height * verticalScale])
+
+                        # MNE versions that store topomap connector lines in figure
+                        # coordinates need the same transformation applied to those lines.
+                        layoutTransform = Affine2D().scale(1.0, verticalScale).translate(0.0, verticalOffset)
+
+                        for line in figure.lines:
+                            if line.get_transform() is figure.transFigure:
+                                line.set_transform(layoutTransform + figure.transFigure)
+
+                        figure.suptitle(f"Evoked response for {selectionDescription} (n={nEpochs})", x=0.5, y=0.985, va="top", fontproperties=font_manager.FontProperties(fname=fontPath, size=24))
+
+                        if subtitle is not None:
+                            subtitle.set_position((0.5, 0.93))
+                            subtitle.set_verticalalignment("top")
+
+                        figure.canvas.draw()
+
+                    if exportMain and self.exportFig is not None:
+                        session.exportFig(figure, self.exportFig)
+
+                    figureRows.add(figure)
+
+                    plt.show()
+                    session.mne.report.add_figure(fig=figure, title=title, section="Plot Evoked")
+
+                finally:
+                    plt.close(figure)
+
+            # --------------------------------------------------------------
+            # Main evoked sensor-response figure.
+            # --------------------------------------------------------------
             plotEvoked = evoked.copy()
             plotEvoked.data[~finiteMask] = np.nan
 
-            # When not highlighting, retain MNE's normal spatial trace colors
-            # and its matching sensor-location inset.
             traceArgs = {
                 "spatial_colors": not isSensor and not highlightNames,
                 "scalings": scalings,
@@ -2238,7 +2460,6 @@ class pglActionsMNE(pglActionCollection):
             }
 
             if drawTopomaps:
-                # Joint-plot input times are seconds, regardless of label units.
                 requestedTimes = "peaks" if topoTimes is None else topoTimes
                 topoArgs = {
                     "scalings": scalings,
@@ -2252,77 +2473,18 @@ class pglActionsMNE(pglActionCollection):
             else:
                 fig = plotEvoked.plot(show=False, **traceArgs)
 
-            def publishFigure(figure, title, *, export=False):
-                """Format, export/show, insert into the report, and close."""
-                from matplotlib import font_manager
-                from matplotlib.axes import Axes
-                from matplotlib.text import Text
-
-                # Prefer Helvetica Oblique; fall back if unavailable.
-                preferredFont = font_manager.FontProperties(family="Helvetica", style="oblique")
-
-                try:
-                    fontPath = font_manager.findfont(preferredFont, fallback_to_default=False)
-                except ValueError:
-                    preferredFont = font_manager.FontProperties(family="DejaVu Sans", style="oblique")
-                    fontPath = font_manager.findfont(preferredFont)
-
-                def styleText(text, size):
-                    text.set_fontproperties(font_manager.FontProperties(fname=fontPath, size=size))
-
-                try:
-                    # Includes annotations, sensor names, legends, and inset text.
-                    # Preserve text that was already larger.
-                    for text in figure.findobj(match=Text):
-                        styleText(text, max(text.get_fontsize(), 16))
-
-                    # Includes main axes, colorbars, and child/inset axes.
-                    for axis in figure.findobj(match=Axes):
-                        axis.tick_params(axis="both", which="both", labelsize=16)
-
-                        styleText(axis.xaxis.label, 20)
-                        styleText(axis.yaxis.label, 20)
-                        styleText(axis.xaxis.get_offset_text(), 16)
-                        styleText(axis.yaxis.get_offset_text(), 16)
-
-                        # Include left-, center-, and right-aligned titles.
-                        for location in ("left", "center", "right"):
-                            axis.set_title(axis.get_title(loc=location), loc=location, fontproperties=font_manager.FontProperties(fname=fontPath, size=20))
-
-                        axis.xaxis.labelpad = 12
-                        axis.yaxis.labelpad = 12
-
-                        # Set the evoked trace labels without changing spectral
-                        # axes or topomap/colorbar labels.
-                        if title == "evoked" and axis.get_xlabel().strip() == "Time (ms)":
-                            axis.set_xlabel("Time (ms)", fontproperties=font_manager.FontProperties(fname=fontPath, size=20))
-                            axis.set_ylabel(f"Sensor Response ({unit})", fontproperties=font_manager.FontProperties(fname=fontPath, size=20))
-
-                    # Figure-level titles and labels.
-                    for text in figure.texts:
-                        styleText(text, max(text.get_fontsize(), 24))
-
-                    if export and self.exportFig is not None:
-                        session.exportFig(figure, self.exportFig)
-
-                    plt.show()
-                    session.mne.report.add_figure(fig=figure, title=title, section="Plot Evoked")
-                finally:
-                    plt.close(figure)
-
             try:
-                if highlightNames:
-                    # Locate the trace axis by its explicit time-unit label.
-                    traceAxes = [axis for axis in fig.axes if axis.get_xlabel().strip() == "Time (ms)"]
+                traceAxes = [axis for axis in fig.axes if axis.get_xlabel().strip() == "Time (ms)"]
 
+                # Replace the generic MNE channel-type title with our heading.
+                for axTrace in traceAxes:
+                    axTrace.set_title("")
+
+                if highlightNames:
                     if len(traceAxes) != 1:
                         raise RuntimeError("Could not uniquely locate the MNE time-series axis for highlighting.")
 
                     axTrace = traceAxes[0]
-
-                    # Preserve MNE's layout, marker lines, and topomap connections.
-                    # Hide only the channel traces, identified by their complete
-                    # time vector, before adding our styled replacements.
                     timesMs = evoked.times * 1000
 
                     for line in list(axTrace.lines):
@@ -2340,65 +2502,150 @@ class pglActionsMNE(pglActionCollection):
                         if name not in highlightSet:
                             axTrace.plot(timesMs, traceData[index], color="0.8", linewidth=0.6, alpha=0.65, zorder=2)
 
-                    if len(highlightNames) <= 10:
-                        colors = [colormaps["tab10"](index) for index in range(len(highlightNames))]
-                    elif len(highlightNames) <= 20:
-                        colors = [colormaps["tab20"](index) for index in range(len(highlightNames))]
-                    else:
-                        colors = [colormaps["turbo"](position) for position in np.linspace(0.05, 0.95, len(highlightNames))]
-
-                    highlightColors = dict(zip(highlightNames, colors))
-
                     for name, color in highlightColors.items():
                         axTrace.plot(timesMs, traceData[indexByName[name]], color=color, linewidth=1.6, label=name, zorder=4)
 
                     axTrace.set_ylim(amplitudeLimits)
-                    axTrace.legend(loc="upper right", fontsize=9, ncol=1 if len(highlightNames) <= 6 else 2)
+                    axTrace.legend(loc="upper right", ncol=1 if len(highlightNames) <= 6 else 2)
 
                     if not isSensor:
-                        # spatial_colors=False suppresses MNE's usual location
-                        # inset. Restore one using our actual trace colors.
                         try:
                             self._addHighlightedSensorInset(axTrace, evoked, channelType, highlightColors)
                         except (ValueError, RuntimeError) as error:
                             pglMessages.warning(f"Could not draw the highlighted sensor-location inset: {error}", level=0)
 
-                from matplotlib import font_manager
-
-                # Prefer Helvetica Oblique; fall back to DejaVu Sans Oblique.
-                labelFont = font_manager.FontProperties(family="Helvetica", style="oblique", size=18)
-
-                try:
-                    fontPath = font_manager.findfont(labelFont, fallback_to_default=False)
-                except ValueError:
-                    labelFont = font_manager.FontProperties(family="DejaVu Sans", style="oblique", size=18)
-                    fontPath = font_manager.findfont(labelFont)
-
-                labelFont = font_manager.FontProperties(fname=fontPath, size=18)
-
-                traceAxes = [axis for axis in fig.axes if axis.get_xlabel().strip() == "Time (ms)"]
-
-                for axTrace in traceAxes:
-                    axTrace.set_ylabel(f"Sensor Response ({unit})", fontproperties=labelFont, labelpad=12)
-                    axTrace.set_xlabel("Time (ms)", fontproperties=labelFont, labelpad=10)
-                    axTrace.tick_params(axis="both", labelsize=14)
-                fig.set_size_inches(20, 8)
-                fig.suptitle(f"Evoked response: {picks} — n = {nEpochs}", fontsize=18)
+                fig.set_size_inches(figureWidth, 9 if drawTopomaps else 8)
+                subtitle = setFigureHeading(fig, "Evoked response", responseParameters())
 
             except BaseException:
                 plt.close(fig)
                 raise
 
-            publishFigure(fig, "evoked", export=True)
+            publishFigure(fig, "evoked", subtitle=subtitle, exportMain=True)
 
-            # Highlight selection does not change FFT/PSD calculations.
-            # These use the evoked data after any requested baseline correction.
+            # --------------------------------------------------------------
+            # Separate SNR figure with sensor-location inset.
+            # --------------------------------------------------------------
+            finiteSnr = np.isfinite(singleTrialSnr) & np.isfinite(averageSnr)
+
+            if finiteSnr.any():
+                figSnr, axSingle = plt.subplots(figsize=(figureWidth, 7))
+
+                try:
+                    timesMs = evoked.times * 1000
+                    plottedCounts = snrCounts[finiteSnr]
+                    minCount = int(plottedCounts.min())
+                    maxCount = int(plottedCounts.max())
+                    constantCount = minCount == maxCount
+                    countText = str(minCount) if constantCount else f"{minCount}-{maxCount}"
+
+                    if constantCount:
+                        snrFactor = np.sqrt(float(minCount))
+                        axAverage = axSingle.secondary_yaxis("right", functions=(lambda value: value * snrFactor, lambda value: value / snrFactor))
+                        axSingle.set_ylabel("Single-trial SNR (mean / SD)")
+                        axAverage.set_ylabel("Average SNR (mean / SEM)")
+                    else:
+                        # No fixed conversion exists when valid counts vary.
+                        axAverage = axSingle.twinx()
+                        axAverage.patch.set_visible(False)
+                        axAverage.grid(False)
+                        axSingle.set_ylabel("Single-trial SNR (mean / SD; solid)")
+                        axAverage.set_ylabel("Average SNR (mean / SEM; dashed)")
+
+                    drawOrder = sorted(range(len(evoked.ch_names)), key=lambda index: evoked.ch_names[index] in highlightColors)
+
+                    for index in drawOrder:
+                        name = evoked.ch_names[index]
+
+                        if highlightNames:
+                            highlighted = name in highlightColors
+                            color = highlightColors.get(name, "0.8")
+                            linewidth = 1.6 if highlighted else 0.6
+                            alpha = 0.95 if highlighted else 0.45
+                            zorder = 4 if highlighted else 2
+                            lineLabel = name if highlighted else "_nolegend_"
+                        elif isSensor:
+                            color = "C0"
+                            linewidth = 1.5
+                            alpha = 1.0
+                            zorder = 3
+                            lineLabel = name
+                        else:
+                            color = "0.45"
+                            linewidth = 0.7
+                            alpha = 0.65
+                            zorder = 2
+                            lineLabel = "_nolegend_"
+
+                        singleValues = np.where(finiteSnr[index], singleTrialSnr[index], np.nan)
+                        axSingle.plot(timesMs, singleValues, color=color, linestyle="-", linewidth=linewidth, alpha=alpha, zorder=zorder, label=lineLabel)
+
+                        if not constantCount:
+                            averageValues = np.where(finiteSnr[index], averageSnr[index], np.nan)
+                            axAverage.plot(timesMs, averageValues, color=color, linestyle="--", linewidth=linewidth, alpha=alpha, zorder=zorder)
+
+                    axSingle.axhline(0, color="black", linewidth=0.8, zorder=1)
+
+                    if timesMs[0] < 0 < timesMs[-1]:
+                        axSingle.axvline(0, color="black", linestyle=":", linewidth=0.8, alpha=0.6, zorder=1)
+
+                    if timesMs[-1] > timesMs[0]:
+                        axSingle.set_xlim(timesMs[0], timesMs[-1])
+
+                    if not constantCount:
+                        # Align zeros while retaining independent scales.
+                        singleBound = max(float(np.max(np.abs(singleTrialSnr[finiteSnr]))) * 1.05, 1e-12)
+                        averageBound = max(float(np.max(np.abs(averageSnr[finiteSnr]))) * 1.05, 1e-12)
+                        axSingle.set_ylim(-singleBound, singleBound)
+                        axAverage.set_ylim(-averageBound, averageBound)
+
+                    if not isSensor:
+                        try:
+                            # Attach to the upper twin axis when present so its
+                            # dashed curves do not draw over the location inset.
+                            insetParent = axSingle if constantCount else axAverage
+                            normalColor = "0.8" if highlightNames else "0.45"
+                            self._addHighlightedSensorInset(insetParent, evoked, channelType, highlightColors, normalColor=normalColor)
+                        except (ValueError, RuntimeError) as error:
+                            pglMessages.warning(f"Could not draw the SNR sensor-location inset: {error}", level=0)
+
+                    handles, legendLabels = axSingle.get_legend_handles_labels()
+
+                    if not constantCount:
+                        handles.extend([
+                            Line2D([0], [0], color="black", linestyle="-"),
+                            Line2D([0], [0], color="black", linestyle="--"),
+                        ])
+                        legendLabels.extend(["Single trial — left axis", "Average — right axis"])
+
+                    if handles:
+                        legendAxis = axSingle if constantCount else axAverage
+                        legendAxis.legend(handles, legendLabels, loc="upper right", ncol=1 if len(handles) <= 6 else 2)
+
+                    axSingle.set_xlabel("Time (ms)")
+                    axSingle.grid(axis="y", alpha=0.2)
+
+                    snrMode = "same curves, two scales" if constantCount else "solid=single trial, dashed=average"
+                    subtitle = setFigureHeading(figSnr, "Evoked response SNR", formatParameters(f"valid n={countText}", snrMode))
+
+                except BaseException:
+                    plt.close(figSnr)
+                    raise
+
+                publishFigure(figSnr, "SNR", subtitle=subtitle)
+            else:
+                pglMessages.warning("No finite SNR values: at least two valid trials and nonzero trial variance are required at each sample.", level=0)
+
+            # --------------------------------------------------------------
+            # FFT / PSD of the evoked response.
+            # --------------------------------------------------------------
             minFrequency = max(0.0, self.minFreq)
             maxFrequency = sampleRate / 2 if self.maxFreq is None else min(self.maxFreq, sampleRate / 2)
 
             if minFrequency < maxFrequency:
                 spectra = []
                 nFft = data.shape[1] if isSensor else min(2048, data.shape[1])
+                frequencyDescription = f"display={minFrequency:g}-{maxFrequency:g}Hz"
 
                 for name, series in zip(evoked.ch_names, data):
                     segment = self._valid_segment(series)
@@ -2416,11 +2663,17 @@ class pglActionsMNE(pglActionCollection):
                         keep = (fftFrequencies >= minFrequency) & (fftFrequencies <= maxFrequency)
 
                         if keep.any():
-                            figFft, ax = plt.subplots(figsize=(12, 6))
-                            ax.stem(fftFrequencies[keep], magnitude[keep], linefmt="C0-", markerfmt="C0.", basefmt=" ")
-                            ax.set(xlabel="Frequency (Hz)", ylabel=f"FFT magnitude ({unit}, unnormalized)", title=f"Evoked FFT: {picks}", xlim=(minFrequency, maxFrequency))
-                            figFft.tight_layout()
-                            publishFigure(figFft, "FFT")
+                            figFft, ax = plt.subplots(figsize=(figureWidth, 6))
+
+                            try:
+                                ax.stem(fftFrequencies[keep], magnitude[keep], linefmt="C0-", markerfmt="C0.", basefmt=" ")
+                                ax.set(xlabel="Frequency (Hz)", ylabel=f"FFT magnitude ({unit}, unnormalized)", xlim=(minFrequency, maxFrequency))
+                                subtitle = setFigureHeading(figFft, "Evoked response FFT", formatParameters(frequencyDescription))
+                            except BaseException:
+                                plt.close(figFft)
+                                raise
+
+                            publishFigure(figFft, "FFT", subtitle=subtitle)
 
                     frequencies, spectrum = welch(segment, fs=sampleRate, window="boxcar" if isSensor else "hamming", nperseg=min(nFft, segment.size), noverlap=0, nfft=nFft, detrend="constant", scaling="density")
                     spectra.append(spectrum)
@@ -2433,18 +2686,26 @@ class pglActionsMNE(pglActionCollection):
                         keep &= frequencies > 0
 
                     if keep.any():
-                        figPsd, ax = plt.subplots(figsize=(12, 6))
-                        ax.stem(frequencies[keep], meanSpectrum[keep], linefmt="C0-", markerfmt="C0.", basefmt=" ")
-                        ax.set(xlabel="Frequency (Hz)", ylabel=f"PSD ({unit}²/Hz)", title=f"Evoked spectrum: {picks}", xlim=(minFrequency, maxFrequency))
-                        figPsd.tight_layout()
-                        publishFigure(figPsd, "spectrum")
+                        figPsd, ax = plt.subplots(figsize=(figureWidth, 6))
+
+                        try:
+                            ax.stem(frequencies[keep], meanSpectrum[keep], linefmt="C0-", markerfmt="C0.", basefmt=" ")
+                            ax.set(xlabel="Frequency (Hz)", ylabel=f"PSD ({unit}²/Hz)", xlim=(minFrequency, maxFrequency))
+                            subtitle = setFigureHeading(figPsd, "Evoked response spectrum", formatParameters(frequencyDescription))
+                        except BaseException:
+                            plt.close(figPsd)
+                            raise
+
+                        publishFigure(figPsd, "spectrum", subtitle=subtitle)
                     else:
                         pglMessages.warning("No PSD bins fall within the requested frequency range")
             else:
                 pglMessages.warning("Invalid frequency range; skipping FFT/PSD")
 
-            # Retain the separate large, labeled peak topomap. topoTime controls
-            # the small topomaps in the main figure; this one is always a peak.
+            # --------------------------------------------------------------
+            # Large, labeled peak topomap.
+            # topoTime controls only the main figure's small topomaps.
+            # --------------------------------------------------------------
             if not isSensor:
                 if not completeTimes.size:
                     pglMessages.warning("No complete sensor snapshot is available; skipping peak topomap")
@@ -2456,31 +2717,27 @@ class pglActionsMNE(pglActionCollection):
                     figPeak = evoked.plot_topomap(times=[peakTime], ch_type=channelType, scalings=scalings, units=units, show_names=lambda name: name.split("_", 1)[0].split()[0], sensors=True, contours=6, time_unit="ms", size=8, vlim=amplitudeLimits, cmap=("RdBu_r", False), show=False)
 
                     try:
-                        figPeak.set_size_inches(12, 10)
-                        figPeak.suptitle(f"Peak response: {peakTime * 1000:.1f} ms ({peakChannel})", fontsize=20)
-                        figPeak.subplots_adjust(top=0.88)
+                        figPeak.set_size_inches(figureWidth, 10)
+                        subtitle = setFigureHeading(figPeak, "Evoked response peak topomap", formatParameters(f"peak={peakTime * 1000:g}ms", f"sensor={peakChannel}"), top=0.84)
 
                         for ax in figPeak.axes:
                             for text in ax.texts:
-                                text.set_fontsize(9)
+                                text.set_fontsize(16)
                                 text.set_color("black")
-                                text.set_fontweight("bold")
                                 text.set_bbox(dict(facecolor="white", edgecolor="none", alpha=0.85, boxstyle="round,pad=0.15"))
                                 text.set_zorder(10)
-
-                            ax.title.set_fontsize(20)
-                            ax.tick_params(labelsize=14)
-                            ax.xaxis.label.set_fontsize(16)
-                            ax.yaxis.label.set_fontsize(16)
 
                     except BaseException:
                         plt.close(figPeak)
                         raise
 
-                    publishFigure(figPeak, "Peak topo")
+                    publishFigure(figPeak, "Peak topo", subtitle=subtitle)
 
             return session
-
+ 
+    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
+    # plotEvokedEach
+    #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
     class plotEvokedEach(pglAction):
         """Plot NaN-aware label averages with optional highlighted sensor traces."""
 
