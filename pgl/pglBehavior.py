@@ -988,31 +988,62 @@ class pglBehavior:
         return trialData
 
     @classmethod
-    def getBehaviorTable(cls, matrix, **options):
-        """Convert the shared trial projection to an independent pandas table.
+    def getBehaviorTable(cls, matrix, *, includeAllColumns=False, columns=None, **options):
+        """Return an independent pandas table for selected trials.
 
-        Materializes selected trial arrays in memory. Masks become pandas
-        missing values; vectors become numbered component columns.
+        Automatically returned parameter columns must be present in at least
+        one selected trial. Parameters belonging only to other tasks are not
+        returned, even with includeAllColumns=True.
 
-        Column order is explicit and independent of xarray/Zarr variable
-        enumeration order. Does not modify source arrays or publish anything.
+        Explicit columns requests can retrieve otherwise absent parameters.
+
+        Default presentation hides internal indices, taskSaveName, event
+        references, and unsupported fields. includeAllColumns=True exposes
+        these available fields and enables numbered responses.
+
+        Presence is determined from source masks, not pandas isna(), so a
+        recorded floating NaN does not make a parameter absent.
+
+        Reads matrix arrays as needed. Does not modify sources or publish.
         """
         from copy import deepcopy
 
         import pandas as pd
 
-        trialData = cls.getTrialData(matrix, **options)
-        columns = {}
-        columnMetadata = {}
+        if type(includeAllColumns) is not bool:
+            raise TypeError("includeAllColumns must be a Boolean.")
 
-        # Reserve scalar names before generating vector-component names.
+        if columns is not None:
+            if not isinstance(columns, (list, tuple)):
+                raise TypeError("columns must be a list or tuple of column names, or None.")
+
+            if any(not isinstance(name, str) or not name for name in columns):
+                raise ValueError("Requested column names must be nonempty strings.")
+
+            if len(columns) != len(set(columns)):
+                raise ValueError("Requested column names must be unique.")
+
+            columns = list(columns)
+
+        numberedResponsePattern = r"(responseEventIndex|responseTime|responseType|response)([1-9][0-9]*)"
+        projectionOptions = dict(options)
+        requestsNumberedResponses = columns is not None and any(re.fullmatch(numberedResponsePattern, name) is not None for name in columns)
+
+        if includeAllColumns or requestsNumberedResponses:
+            projectionOptions["includeAllResponses"] = True
+
+        trialData = cls.getTrialData(matrix, **projectionOptions)
+        columnValues = {}
+        columnMetadata = {}
+        excludedParameterFields = []
+
         scalarNames = {
             name for name, variable in trialData.data_vars.items()
             if variable.dims == ("trial",) and variable.attrs.get("role") not in ("presenceMask", "structuredPresence")
         }
 
         def addColumn(columnName, values, present, logicalType, metadata):
-            if columnName in columns:
+            if columnName in columnValues:
                 raise ValueError(f"Pandas projection column collision: {columnName!r}.")
 
             values = np.array(values, copy=True)
@@ -1033,7 +1064,7 @@ class pglBehavior:
             else:
                 raise TypeError(f"{columnName}: unsupported logical type {logicalType!r}.")
 
-            columns[columnName] = result
+            columnValues[columnName] = result
             columnMetadata[columnName] = deepcopy(metadata)
 
         for variableName, variable in trialData.data_vars.items():
@@ -1044,6 +1075,21 @@ class pglBehavior:
             present = np.ones(trialData.sizes["trial"], dtype=bool) if maskName is None else trialData[maskName].values.astype(bool, copy=True)
             logicalType = variable.attrs.get("logicalType")
             metadata = {**variable.attrs, "sourceVariable": variableName}
+
+            if variable.attrs.get("sourceGroup") == "params":
+                # Adapted structured parameters have parent-object presence.
+                # Keep their components when the parent parameter is present,
+                # even if a particular component is missing on every row.
+                parentMaskName = variable.attrs.get("parentPresenceVariable")
+                parameterPresent = present if parentMaskName is None else trialData[parentMaskName].values.astype(bool, copy=True)
+
+                if not parameterPresent.any():
+                    excludedParameterFields.append(variableName)
+
+                    # Explicit column requests can inspect absent fields.
+                    # Automatic tables, including all-columns tables, omit them.
+                    if columns is None:
+                        continue
 
             if variable.dims == ("trial",):
                 addColumn(variableName, variable.values, present, logicalType, metadata)
@@ -1101,7 +1147,7 @@ class pglBehavior:
                 if columnName in responseOrder:
                     return (3, 1, responseOrder[columnName])
 
-                match = re.fullmatch(r"(responseEventIndex|responseTime|responseType|response)([1-9][0-9]*)", columnName)
+                match = re.fullmatch(numberedResponsePattern, columnName)
 
                 if match is not None:
                     return (3, 2, int(match.group(2)), responseOrder[match.group(1)])
@@ -1110,17 +1156,59 @@ class pglBehavior:
 
             return (4, sourceVariable, componentIndex, columnName)
 
-        orderedNames = sorted(columns, key=columnOrder)
-        orderedColumns = {name: columns[name] for name in orderedNames}
+        defaultHiddenFields = {
+            "taskSaveName", "runIndex", "taskIndex",
+            "trialStartEventIndex", "responseEventIndex",
+        }
 
-        table = pd.DataFrame(orderedColumns, index=pd.Index(trialData.coords["trial"].values.copy(), name="trial"))
+        def hiddenByDefault(columnName):
+            metadata = columnMetadata[columnName]
+
+            if columnName in defaultHiddenFields:
+                return True
+
+            if metadata.get("extractionStatus") == "unsupported":
+                return True
+
+            if metadata.get("sourceGroup") == "responseProjection" and re.fullmatch(r"responseEventIndex[1-9][0-9]*", columnName):
+                return True
+
+            return False
+
+        availableNames = sorted(columnValues, key=columnOrder)
+
+        if columns is not None:
+            missingNames = [name for name in columns if name not in columnValues]
+
+            if missingNames:
+                raise ValueError(f"Requested columns are not available in this projection: {missingNames}. Available columns: {availableNames}")
+
+            selectedNames = columns
+        elif includeAllColumns:
+            selectedNames = availableNames
+        else:
+            selectedNames = [name for name in availableNames if not hiddenByDefault(name)]
+
+        table = pd.DataFrame(
+            {name: columnValues[name] for name in selectedNames},
+            index=pd.Index(trialData.coords["trial"].values.copy(), name="trial"),
+        )
+
         table.attrs = deepcopy(trialData.attrs)
-        table.attrs["columnMetadata"] = {name: columnMetadata[name] for name in orderedNames}
+        table.attrs["columnMetadata"] = {name: columnMetadata[name] for name in selectedNames}
+        table.attrs["tableSpecification"] = {
+            "includeAllColumns": includeAllColumns,
+            "columns": None if columns is None else list(columns),
+            "defaultHiddenColumns": [name for name in availableNames if hiddenByDefault(name)],
+            "returnedColumns": list(selectedNames),
+            "parameterSelection": "Present in at least one selected trial; explicit column requests override",
+            "absentParameterVariables": sorted(excludedParameterFields),
+        }
         table.attrs["pandasEncoding"] = {
             "vectorColumns": "Zero-based ComponentN suffix; see columnMetadata",
             "missingValues": "Nullable integer/Boolean/string; NaN for floating columns",
             "floatingNaN": "Recorded NaN and absent floating values both display as NaN; consult xarray presence masks to distinguish",
-            "columnOrdering": "Context; alphabetical parameters; alphabetical trial variables; response summaries and numerically ordered responses; alphabetical remaining fields",
+            "columnOrdering": "Explicit requested order, otherwise context; alphabetical parameters; alphabetical trial variables; response summaries and numerically ordered responses; alphabetical remaining fields",
         }
 
-        return table
+        return table    
