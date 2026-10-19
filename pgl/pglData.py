@@ -11,83 +11,198 @@
 import re
 import numpy as np
 import pandas as pd
-import xarray as xr
-from traitlets import Any, validate
 from .pglMessages import pglMessages
 from .pglPipeline import pglActionable
+import xarray as xr
+from traitlets import Any, Dict, Unicode, validate
 
 ##################################
 # pglDataMatrix
 ##################################
 class pglDataMatrix(pglActionable):
+    """A named scientific product backed by an xarray object.
+
+    Use DataArray for homogeneous tensors and Dataset for typed collections
+    of variables, such as behavioral measurements.
+
+    PGL owns product identity, provenance, and action history.
+    Xarray owns dimensions, coordinates, variables, and scientific operations.
+    pglStorage owns persistence.
+
+    No operation performed by this wrapper automatically computes array values.
     """
-    Generic wrapper around an xarray DataArray or Dataset.
 
-    Makes no assumptions about dimensions, coordinates, or data sources.
-    Missing public attributes and indexing delegate to the underlying xarray.
-    Delegated operations return native xarray objects.
+    data = Any(default_value=None, allow_none=True, help="Scientific xarray contents").tag(serialize=False)
 
-    Use .data for arithmetic or functions requiring an actual xarray object.
-    Attributes defined by pglActionable or this wrapper take precedence.
-    """
+    matrixRevisionID = Unicode(default_value=None, allow_none=True, help="Identity of the published artifact from which this object was restored")
+    provenance = Dict(default_value={}, help="Recorded construction inputs, parameters, code, and environment")
 
-    data = Any(default_value=None, allow_none=True, serialize=False, help="Underlying xarray DataArray or Dataset")
+    contentHash = Unicode(default_value=None, allow_none=True, help="Optional canonical scientific-content hash")
+    hashAlgorithm = Unicode(default_value=None, allow_none=True, help="Content-hash algorithm")
+    hashSchemaVersion = Unicode(default_value=None, allow_none=True, help="Version of the canonical content-hashing specification")
 
-    def __init__(self, data=None):
+    _payloadReference = Dict(default_value={}, help="Storage-managed runtime payload reference").tag(serialize=False)
+
+    def __init__(self, data=None, *, name=None):
+        """Create a working product without accessing storage.
+
+        Empty construction supports metadata restoration. Published identity
+        and construction provenance are assigned explicitly, not fabricated
+        during restoration.
+        """
         super().__init__()
+
+        if name is not None:
+            self.name = name
+
         self.data = data
 
     @validate("data")
-    def validateData(self, proposal):
-        data = proposal["value"]
-        if data is not None and not isinstance(data, (xr.DataArray, xr.Dataset)):
-            raise TypeError("data must be an xarray.DataArray, xarray.Dataset, or None")
-        return data
+    def _validateData(self, proposal):
+        """Validate only the container type, not scientific values."""
+        value = proposal["value"]
+
+        if value is not None and not isinstance(value, (xr.DataArray, xr.Dataset)):
+            raise TypeError("data must be an xarray.DataArray, xarray.Dataset, or None.")
+
+        return value
 
     def requireData(self):
-        """Return the underlying xarray object, or raise if empty."""
+        """Return scientific contents without computing them."""
         if self.data is None:
-            raise ValueError("No data have been assigned")
+            raise ValueError("This matrix has no attached scientific data.")
+
         return self.data
 
-    def __getattr__(self, attrName):
-        """Delegate missing public attributes to xarray."""
-        if attrName.startswith("_"):
-            raise AttributeError(f"{type(self).__name__!r} has no attribute {attrName!r}")
-
-        try:
-            data = object.__getattribute__(self, "data")
-        except AttributeError:
-            data = None
-
-        if data is not None:
-            try:
-                return getattr(data, attrName)
-            except AttributeError:
-                pass
-
-        raise AttributeError(f"{type(self).__name__!r} has no attribute {attrName!r}")
-
     def __getitem__(self, key):
+        """Delegate lookup to xarray and return its native result.
+
+        This does not create a new tracked PGL product or copy provenance
+        onto a transformed result.
+        """
         return self.requireData()[key]
 
-    def __setitem__(self, key, value):
-        self.requireData()[key] = value
+    def describe(self):
+        """Return a lightweight structural summary without reading values.
 
-    def __len__(self):
-        return len(self.requireData())
+        Coordinate values, numerical summaries, and quality checks are
+        deliberately excluded.
+        """
+        data = self.data
 
-    def __iter__(self):
-        return iter(self.requireData())
+        summary = {
+            "name": self.name,
+            "matrixClass": type(self).__name__,
+            "matrixRevisionID": self.matrixRevisionID,
+            "kind": None,
+            "dimensions": {},
+            "variables": [],
+            "coordinates": [],
+        }
 
-    def __contains__(self, key):
-        return key in self.requireData()
+        if data is None:
+            return summary
+
+        summary["kind"] = "Dataset" if isinstance(data, xr.Dataset) else "DataArray"
+        summary["dimensions"] = dict(data.sizes)
+
+        def describeVariable(variableName, variable):
+            chunks = variable.chunks
+
+            return {
+                "name": variableName,
+                "dimensions": tuple(variable.dims),
+                "shape": tuple(variable.shape),
+                "dtype": str(variable.dtype),
+                "chunked": chunks is not None,
+            }
+
+        variables = data.data_vars.items() if isinstance(data, xr.Dataset) else [(data.name, data)]
+        summary["variables"] = [describeVariable(variableName, variable) for variableName, variable in variables]
+        summary["coordinates"] = [describeVariable(coordName, coordinate) for coordName, coordinate in data.coords.items()]
+
+        return summary
+
+    def print(self, verbose=False):
+        """Print structural metadata without displaying array values."""
+        summary = self.describe()
+        pglMessages.print(repr(self))
+
+        if summary["kind"] is None:
+            return
+
+        for variable in summary["variables"]:
+            backing = "chunked" if variable["chunked"] else "unchunked"
+            pglMessages.print(f"  {variable['name']!r}: dims={variable['dimensions']}, shape={variable['shape']}, dtype={variable['dtype']}, {backing}")
+
+        if verbose:
+            for coordinate in summary["coordinates"]:
+                pglMessages.print(f"  Coordinate {coordinate['name']!r}: dims={coordinate['dimensions']}, dtype={coordinate['dtype']}")
+
+            pglMessages.print(f"  Recorded actions: {len(self.actionHistory)}")
+            pglMessages.print(f"  Construction provenance: {'recorded' if self.provenance else 'not recorded'}")
 
     def __repr__(self):
+        """Return a compact description without rendering xarray values."""
         if self.data is None:
-            return f"{type(self).__name__}(empty)"
-        return f"{type(self).__name__}\n{self.data!r}"
+            return f"{type(self).__name__}(name={self.name!r}, empty)"
 
+        dimensions = ", ".join(f"{dimension}={size}" for dimension, size in self.data.sizes.items())
+        kind = "Dataset" if isinstance(self.data, xr.Dataset) else "DataArray"
+        revision = self.matrixRevisionID or "unpublished"
+
+        return f"{type(self).__name__}(name={self.name!r}, kind={kind}, dimensions=[{dimensions}], revision={revision})"
+
+    def close(self):
+        """Release backing resources without computing or deleting data.
+
+        A closed matrix should no longer be used for deferred reads.
+        """
+        if self.data is not None:
+            self.data.close()
+
+    def __enter__(self):
+        """Allow deterministic cleanup of a loaded matrix."""
+        return self
+
+    def __exit__(self, exceptionType, exceptionValue, traceback):
+        self.close()
+        return False
+
+
+from dataclasses import dataclass
+from uuid import UUID
+
+
+@dataclass(frozen=True)
+class pglDataMatrixReference:
+    """Immutable runtime reference to a registered matrix revision.
+
+    Database identity prevents resolving a database-local reference against
+    another configured database. No credentials or payload arrays are stored.
+
+    References are persisted through dataset_products, not generic JSON.
+    """
+
+    matrixRevisionID: str
+    databaseIdentityJSON: str
+
+    def __post_init__(self):
+        import json
+
+        if not isinstance(self.matrixRevisionID, str):
+            raise TypeError("matrixRevisionID must be a UUID string.")
+
+        if str(UUID(self.matrixRevisionID)) != self.matrixRevisionID:
+            raise ValueError("matrixRevisionID must use canonical UUID formatting.")
+
+        if not isinstance(self.databaseIdentityJSON, str):
+            raise TypeError("databaseIdentityJSON must be a string.")
+
+        identity = json.loads(self.databaseIdentityJSON)
+
+        if not isinstance(identity, dict) or not identity:
+            raise ValueError("A matrix reference requires a database identity.")
 
 ##################################
 # pglEpochsDataMatrix

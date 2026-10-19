@@ -1,0 +1,305 @@
+################################################################
+#   filename: pglDataset.py
+#    purpose: Provides dataset class for managing dataset membership and metadata.
+#         by: JLG
+#       date: Oct 18, 2026
+################################################################ 
+"""Dataset membership and lightweight checkpoint metadata.
+
+Session payloads remain owned by their saved session checkpoints.
+Dataset scientific-product persistence is added separately.
+"""
+
+from copy import deepcopy
+import json
+import math
+
+from traitlets import Dict, Int, List, Unicode
+
+from .pglMessages import pglMessages
+from .pglPipeline import pglActionable
+
+
+class pglDataset(pglActionable):
+    """A working dataset referencing exact saved session checkpoints.
+
+    Membership is independent of cached working sessions.
+    Editing or saving a cached session never repoints membership.
+
+    Persistence and database access are delegated to pglStorage.
+    """
+
+    datasetID = Int(default_value=None, allow_none=True, help="Most recently loaded or saved dataset checkpoint ID").tag(serialize=False)
+    checkpointName = Unicode(default_value=None, allow_none=True, help="Editable checkpoint label").tag(serialize=False)
+    description = Unicode(default_value=None, allow_none=True, help="Editable checkpoint description").tag(serialize=False)
+
+    derivedParameters = Dict(default_value={}, help="Small derived results stored as strict PGL metadata")
+    data = Dict(default_value={}, help="Attached scientific products; persisted separately from metadata").tag(serialize=False)
+
+    _members = List(default_value=[], help="Ordered exact checkpoint membership").tag(serialize=False)
+    _sessionCache = Dict(default_value={}, help="Working session objects cached by original member ID").tag(serialize=False)
+    _datasetDatabaseIdentity = Dict(default_value={}, help="Bound runtime database endpoint").tag(serialize=False)
+    _datasetBaseline = Dict(default_value={}, help="Storage-managed immutable history boundary").tag(serialize=False)
+
+    def __init__(self, name=None, *, settings=None, settingsName=None):
+        """Create a working dataset without connecting or loading sessions.
+
+        Empty construction is also used by strict metadata restoration.
+        Database binding occurs when membership is resolved or saved.
+        """
+        super().__init__()
+
+        if settings is not None and settingsName is not None:
+            raise ValueError("Supply settings or settingsName, not both.")
+
+        if name is not None:
+            self.name = self._validateName(name)
+
+        # Runtime configuration is deliberately excluded from serialization.
+        self._datasetSettings = settings
+        self._datasetSettingsName = settingsName
+        self._datasetLoadOptions = {}
+
+    @staticmethod
+    def _validateName(value):
+        """Require a meaningful name without silently normalizing it."""
+        if not isinstance(value, str) or not value.strip() or "\x00" in value:
+            raise ValueError("Dataset name must be a nonblank string without NUL.")
+
+        return value
+
+    @staticmethod
+    def _validateSessionID(value):
+        """Validate an exact database checkpoint ID, excluding booleans."""
+        if type(value) is not int or not 0 <= value <= 9223372036854775807:
+            raise ValueError("sessionID must be a nonnegative PostgreSQL bigint.")
+
+        return value
+
+    @staticmethod
+    def _validateEntryName(value):
+        """Preserve case and whitespace in supplied nonblank aliases."""
+        if value is not None and (not isinstance(value, str) or not value.strip() or "\x00" in value):
+            raise ValueError("entryName must be a nonblank string without NUL, or None.")
+
+        return value
+
+    @staticmethod
+    def _validateLabels(value):
+        """Copy structured labels with a portable, plain-JSON representation.
+
+        Labels permit string-keyed objects, lists, finite numbers, booleans,
+        strings, and None. Scientific arrays belong in data products.
+        """
+        if value is None:
+            value = {}
+
+        if not isinstance(value, dict):
+            raise TypeError("labels must be a dictionary or None.")
+
+        active = set()
+
+        def check(item, path):
+            if item is None or type(item) in (bool, int):
+                return
+
+            if isinstance(item, str):
+                if "\x00" in item:
+                    raise ValueError(f"{path}: strings must not contain NUL.")
+                return
+
+            if type(item) is float:
+                if not math.isfinite(item):
+                    raise ValueError(f"{path}: numbers must be finite.")
+                return
+
+            if not isinstance(item, (dict, list)):
+                raise TypeError(f"{path}: unsupported label value {type(item).__name__}.")
+
+            identity = id(item)
+
+            if identity in active:
+                raise ValueError(f"{path}: circular labels are not supported.")
+
+            active.add(identity)
+
+            try:
+                if isinstance(item, dict):
+                    for key, child in item.items():
+                        if not isinstance(key, str) or "\x00" in key:
+                            raise ValueError(f"{path}: label keys must be strings without NUL.")
+
+                        check(child, f"{path}.{key}")
+                else:
+                    for index, child in enumerate(item):
+                        check(child, f"{path}[{index}]")
+            finally:
+                active.remove(identity)
+
+        check(value, "labels")
+
+        # This also returns an independent copy with ordinary JSON types.
+        return json.loads(json.dumps(value, allow_nan=False))
+
+    @classmethod
+    def _validateMembers(cls, records):
+        """Validate and copy the authoritative ordered membership list."""
+        if not isinstance(records, list):
+            raise TypeError("Dataset membership must be a list.")
+
+        sessionIDs = set()
+        entryNames = set()
+        result = []
+
+        for record in records:
+            if not isinstance(record, dict) or set(record) != {"sessionID", "entryName", "labels"}:
+                raise ValueError("Invalid dataset membership fields.")
+
+            sessionID = cls._validateSessionID(record["sessionID"])
+            entryName = cls._validateEntryName(record["entryName"])
+            labels = cls._validateLabels(record["labels"])
+
+            if sessionID in sessionIDs:
+                raise ValueError(f"Duplicate member checkpoint: {sessionID}")
+
+            if entryName is not None and entryName in entryNames:
+                raise ValueError(f"Duplicate entryName: {entryName!r}")
+
+            sessionIDs.add(sessionID)
+
+            if entryName is not None:
+                entryNames.add(entryName)
+
+            result.append({"sessionID": sessionID, "entryName": entryName, "labels": labels})
+
+        return result
+
+    @property
+    def members(self):
+        """Return an independent membership snapshot, not a mutable registry."""
+        return deepcopy(self._members)
+
+    def _findMember(self, *, sessionID=None, entryName=None):
+        """Resolve exactly one selector without reading a session."""
+        if (sessionID is None) == (entryName is None):
+            raise ValueError("Supply exactly one of sessionID or entryName.")
+
+        if sessionID is not None:
+            self._validateSessionID(sessionID)
+        else:
+            self._validateEntryName(entryName)
+
+        for record in self._members:
+            if sessionID is not None and record["sessionID"] == sessionID:
+                return record
+
+            if entryName is not None and record["entryName"] == entryName:
+                return record
+
+        selector = f"sessionID={sessionID}" if sessionID is not None else f"entryName={entryName!r}"
+        raise KeyError(f"No dataset member with {selector}.")
+
+    def addSession(self, sessionID, entryName=None, labels=None, *, settings=None, settingsName=None, sslRootCert=None):
+        """Add an active completed checkpoint without loading its payloads.
+
+        Returns True on addition or False when configuration/connection
+        resolution is cancelled. Invalid membership raises.
+        """
+        from .pglStorage import pglStorage
+
+        record = {"sessionID": sessionID, "entryName": entryName, "labels": labels}
+        proposed = self._validateMembers([*self._members, record])
+
+        summaries = pglStorage.getDatasetMemberSummaries(self, sessionIDs=[sessionID], settings=settings, settingsName=settingsName, sslRootCert=sslRootCert)
+
+        if summaries is None:
+            return False
+
+        summary = summaries.get(sessionID)
+
+        if summary is None:
+            raise ValueError(f"Unknown session checkpoint: {sessionID}")
+
+        if summary["status"] != "complete" or summary["deletedAt"] is not None:
+            raise ValueError(f"Member session {sessionID} must be complete and active.")
+
+        # Persisted members and all ancestors are checked again at save time.
+        self._members = proposed
+        return True
+
+    def removeSession(self, sessionID=None, *, entryName=None):
+        """Remove working membership without changing saved dataset versions."""
+        member = self._findMember(sessionID=sessionID, entryName=entryName)
+        originalID = member["sessionID"]
+
+        self._members = [record for record in self._members if record["sessionID"] != originalID]
+        self._sessionCache.pop(originalID, None)
+        return True
+
+    def setEntryMetadata(self, sessionID=None, *, entryName=None, labels=None):
+        """Replace a member's alias and labels in this working dataset.
+
+        Supply both desired values. None clears the alias or labels.
+        Does not edit the referenced session or any saved dataset version.
+        """
+        self._validateSessionID(sessionID)
+        self._findMember(sessionID=sessionID)
+
+        records = self.members
+
+        for record in records:
+            if record["sessionID"] == sessionID:
+                record["entryName"] = entryName
+                record["labels"] = labels
+                break
+
+        self._members = self._validateMembers(records)
+
+    def getSession(self, sessionID=None, *, entryName=None, settings=None, settingsName=None, storageOptionsByBackend=None, sslRootCert=None, cacheDirectory=None, directLocalPolicy=None):
+        """Return the cached working session, loading it on first access.
+
+        The cache key remains the original member checkpoint ID even if the
+        returned session is subsequently saved as a different checkpoint.
+        """
+        from .pglStorage import pglStorage
+
+        member = self._findMember(sessionID=sessionID, entryName=entryName)
+
+        return pglStorage.getDatasetSession(self, member["sessionID"], settings=settings, settingsName=settingsName, storageOptionsByBackend=storageOptionsByBackend, sslRootCert=sslRootCert, cacheDirectory=cacheDirectory, directLocalPolicy=directLocalPolicy)
+
+    def print(self, verbose=False, *, settings=None, settingsName=None, sslRootCert=None):
+        """Print member metadata without constructing sessions or matrices."""
+        from .pglStorage import pglStorage
+
+        return pglStorage.printDataset(self, verbose=verbose, settings=settings, settingsName=settingsName, sslRootCert=sslRootCert)
+
+    def save(self, *, settings=None, settingsName=None, backendID=None, storageOptions=None, sslRootCert=None):
+        """Publish a new dataset checkpoint, including attached products.
+
+        Saved references reuse their registered payloads.
+        Attached mutable matrices publish new revisions.
+        Does not construct missing products or rerun analyses.
+        """
+        from .pglStorage import pglStorage
+
+        return pglStorage.saveDataset(self, settings=settings, settingsName=settingsName, backendID=backendID, storageOptions=storageOptions, sslRootCert=sslRootCert)
+
+    def getData(self, productName, *, settings=None, settingsName=None, storageOptionsByBackend=None, sslRootCert=None):
+        """Return an attached product, opening a saved reference on demand.
+
+        The opened matrix replaces its reference in dataset.data and is cached.
+        Subsequent saves conservatively publish that mutable matrix anew.
+
+        This persistence-stage implementation does not yet extract missing
+        products or evaluate input freshness.
+        """
+        from .pglStorage import pglStorage
+
+        return pglStorage.getDatasetData(self, productName, settings=settings, settingsName=settingsName, storageOptionsByBackend=storageOptionsByBackend, sslRootCert=sslRootCert)
+    
+    @classmethod
+    def load(cls, datasetID, *, settings=None, settingsName=None, sslRootCert=None, includeDeleted=False, storageOptionsByBackend=None, cacheDirectory=None, directLocalPolicy="materialize"):
+        """Restore membership and metadata without loading member sessions."""
+        from .pglStorage import pglStorage
+
+        return pglStorage.loadDataset(datasetID, settings=settings, settingsName=settingsName, sslRootCert=sslRootCert, includeDeleted=includeDeleted, storageOptionsByBackend=storageOptionsByBackend, cacheDirectory=cacheDirectory, directLocalPolicy=directLocalPolicy)

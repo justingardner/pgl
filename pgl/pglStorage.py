@@ -19,6 +19,7 @@ import json
 import uuid
 from fsspec.core import url_to_fs
 from copy import deepcopy
+from .pglData import pglDataMatrix
 
 class pglStorage:
     """Manage scientific storage, checkpoint metadata, and schema migrations."""
@@ -127,6 +128,10 @@ class pglStorage:
         """Supported database-report tables and their stable ordering."""
         return {
             "session": ("session_id",),
+            "dataset": ("dataset_id",),
+            "dataset_members": ("dataset_id", "member_index"),
+            "dataset_products": ("dataset_id", "product_name"),
+            "matrix_revisions": ("matrix_revision_id",),
             "subjects": ("subject_id",),
             "files": ("file_id",),
             "storage_backends": ("backend_id",),
@@ -4196,12 +4201,21 @@ class pglStorage:
 
     @classmethod
     def _getSessionDeletionRecords(cls, connection, postgres, sessionID):
-        """Return target and all descendants, including deleted records.
+        """Return target/descendants and reject dataset-protected deletion.
 
-        Uses two queries. Call within a consistent preview snapshot or
-        after acquiring lifecycle locks. Does not write or commit.
+        Includes deleted records in the returned inventory, but checks
+        protection only for sessions that would be newly deleted.
+
+        Used in a consistent preview snapshot and again under lifecycle
+        locks before authoritative deletion. A preview alone does not
+        authorize any database changes.
+
+        Does not write, commit, reconstruct sessions, or read payloads.
         """
         from psycopg.rows import dict_row
+
+        if type(sessionID) is not int or not 0 <= sessionID <= 9223372036854775807:
+            raise ValueError("sessionID must be a nonnegative PostgreSQL bigint.")
 
         sessions = sql.Identifier(postgres.databaseSchema, "session")
         statement = sql.SQL("""
@@ -4219,7 +4233,11 @@ class pglStorage:
             raise cls._UnknownLifecycleSession(f"Unknown session: {sessionID}")
 
         descendants = cls.getDownstreamSessions(connection, postgres, sessionID)
-        return sorted([target, *descendants], key=lambda record: record["session_id"])
+        records = sorted([target, *descendants], key=lambda record: record["session_id"])
+        proposedIDs = [record["session_id"] for record in records if record["deleted_at"] is None]
+
+        cls._requireNoDatasetSessionBlockers(connection, postgres, proposedIDs)
+        return records
 
     @staticmethod
     def _confirmSessionDeletion(sessionID, sessions, *, databaseLabel):
@@ -5454,10 +5472,14 @@ class pglStorage:
     # ------------------------------------------------------------
     # Application permissions
     # ------------------------------------------------------------
-
     @classmethod
     def _grantApplicationAccess(cls, connection, postgres):
-        """Grant application table access and read-only reporting-view access."""
+        """Grant application access after pending migrations are applied.
+
+        Dataset products and membership are protected by publication guards.
+        Matrix revision records permit registration and reads, not mutation.
+        Reporting views and migration history remain read-only.
+        """
         schema = sql.Identifier(postgres.databaseSchema)
         application = sql.Identifier(postgres.databaseUser)
 
@@ -5473,11 +5495,20 @@ class pglStorage:
             "session_files",
             "session_deletion_groups",
             "session_deletion_group_members",
+            "dataset",
+            "dataset_members",
+            "dataset_products",
         ]
 
         for name in applicationTables:
             table = sql.Identifier(postgres.databaseSchema, name)
             connection.execute(sql.SQL("GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE {} TO {}").format(table, application))
+
+        # Published matrix records are append-only. Triggers additionally
+        # reject mutation by callers with broader table permissions.
+        matrixTable = sql.Identifier(postgres.databaseSchema, "matrix_revisions")
+        connection.execute(sql.SQL("REVOKE ALL PRIVILEGES ON TABLE {} FROM {}").format(matrixTable, application))
+        connection.execute(sql.SQL("GRANT SELECT, INSERT ON TABLE {} TO {}").format(matrixTable, application))
 
         readOnlyTables = [
             "schema_migrations",
@@ -5493,6 +5524,1503 @@ class pglStorage:
             connection.execute(sql.SQL("GRANT SELECT ON TABLE {} TO {}").format(table, application))
 
         connection.execute(sql.SQL("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA {} TO {}").format(schema, application))
+
+    @staticmethod
+    def _datasetDatabaseIdentityJSON(identity):
+        """Canonical runtime database identity for reference comparisons."""
+        return json.dumps(identity, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+    @staticmethod
+    def _validateDatasetProducts(dataset):
+        """Validate product names/types without opening references or arrays."""
+        from .pglData import pglDataMatrix, pglDataMatrixReference
+
+        products = dict(dataset.data)
+
+        for name, product in products.items():
+            if not isinstance(name, str) or not name.strip() or "\x00" in name:
+                raise ValueError("Dataset product names must be nonblank strings without NUL.")
+
+            if not isinstance(product, (pglDataMatrix, pglDataMatrixReference)):
+                raise TypeError(f"Product {name!r} must be a pglDataMatrix or pglDataMatrixReference.")
+
+        return products
+
+    @classmethod
+    def _requireDatasetProductsUnchanged(cls, dataset, products):
+        """Check product attachment identity without comparing array contents.
+
+        This does not detect all mutations through exposed xarray objects.
+        Concurrent mutation during saving is unsupported.
+        """
+        if set(dataset.data) != set(products):
+            raise ValueError("Dataset product names changed during saving.")
+
+        for name, product in products.items():
+            if dataset.data[name] is not product:
+                raise ValueError(f"Dataset product {name!r} was replaced during saving.")
+
+    @classmethod
+    def getDatasetData(cls, dataset, productName, *, settings=None, settingsName=None, storageOptionsByBackend=None, sslRootCert=None):
+        """Open a registered product on demand and cache its working matrix.
+
+        Does not extract missing data or evaluate construction freshness.
+        Database access and payload opening belong here, not in the wrapper.
+        """
+        from psycopg.rows import tuple_row
+        from .pglData import pglDataMatrix, pglDataMatrixReference
+
+        if not isinstance(productName, str) or not productName.strip():
+            raise ValueError("productName must be a nonblank string.")
+
+        if productName not in dataset.data:
+            raise KeyError(f"No attached dataset product: {productName!r}")
+
+        resolvedSettings, postgres = cls._resolveDatasetStorage(dataset, settings=settings, settingsName=settingsName)
+
+        if postgres is None:
+            return None
+
+        product = dataset.data[productName]
+
+        if isinstance(product, pglDataMatrix):
+            return product
+
+        if not isinstance(product, pglDataMatrixReference):
+            raise TypeError(f"Unsupported dataset product: {productName!r}")
+
+        identityJSON = cls._datasetDatabaseIdentityJSON(cls._checkpointDatabaseIdentity(postgres))
+
+        if product.databaseIdentityJSON != identityJSON:
+            raise ValueError("Matrix reference belongs to a different configured database.")
+
+        options = dataset._datasetLoadOptions
+
+        if sslRootCert is None:
+            sslRootCert = options.get("sslRootCert")
+
+        if storageOptionsByBackend is None:
+            storageOptionsByBackend = options.get("storageOptionsByBackend")
+
+        revisions = sql.Identifier(postgres.databaseSchema, "matrix_revisions")
+        backends = sql.Identifier(postgres.databaseSchema, "storage_backends")
+
+        with postgres.connect(sslRootCert=sslRootCert) as connection:
+            if connection is None:
+                return None
+
+            with connection.transaction():
+                connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+
+                with connection.cursor(row_factory=tuple_row) as cursor:
+                    statement = sql.SQL("""
+                        SELECT revision.backend_id, revision.object_key,
+                               revision.contract_version, revision.descriptor,
+                               backend.url_prefix, backend.is_active
+                        FROM {} AS revision
+                        JOIN {} AS backend
+                          ON backend.backend_id = revision.backend_id
+                        WHERE revision.matrix_revision_id = %s::uuid
+                    """).format(revisions, backends)
+
+                    cursor.execute(statement, (product.matrixRevisionID,))
+                    record = cursor.fetchone()
+
+        if record is None:
+            raise ValueError(f"Unknown registered matrix revision: {product.matrixRevisionID}")
+
+        backendID, objectKey, contractVersion, descriptor, rootURL, isActive = record
+
+        if not isActive:
+            raise ValueError(f"Matrix backend {backendID} is inactive.")
+
+        if contractVersion != "pgl.matrix.zarr.v1":
+            raise ValueError(f"Unsupported matrix contract: {contractVersion!r}")
+
+        if not isinstance(objectKey, str) or objectKey.startswith("/") or "\\" in objectKey or "\x00" in objectKey or any(part in {"", ".", ".."} for part in objectKey.split("/")):
+            raise ValueError("Registered matrix has an invalid relative object key.")
+
+        from fsspec.core import url_to_fs
+
+        backendOptions = (storageOptionsByBackend or {}).get(backendID, {})
+        filesystem, root = url_to_fs(rootURL, **backendOptions)
+        bundlePath = posixpath.join(root, objectKey)
+
+        # Compare the published descriptor with its registered metadata.
+        # This is a small metadata read, not a scientific-data verification.
+        with filesystem.open(posixpath.join(bundlePath, "matrix.json"), "rb") as source:
+            descriptorBytes = source.read(16 * 1024 * 1024 + 1)
+
+        if len(descriptorBytes) > 16 * 1024 * 1024:
+            raise ValueError("Matrix descriptor exceeds the metadata size limit.")
+
+        storedDescriptor = json.loads(descriptorBytes)
+
+        if cls.encodeRawManifest(storedDescriptor) != cls.encodeRawManifest(descriptor):
+            raise ValueError("Matrix descriptor differs from its registered metadata.")
+
+        matrix = cls.loadDataMatrix(bundlePath, filesystem=filesystem)
+
+        if matrix.matrixRevisionID != product.matrixRevisionID:
+            matrix.close()
+            raise ValueError("Loaded matrix revision differs from the dataset product reference.")
+
+        if dataset.data.get(productName) is not product:
+            matrix.close()
+            raise ValueError("Dataset product changed while it was being opened.")
+
+        cls._bindDatasetStorage(dataset, resolvedSettings, postgres)
+        dataset.data[productName] = matrix
+        return matrix
+
+    @staticmethod
+    def _getDatasetSessionBlockers(connection, postgres, sessionIDs):
+        """Find active datasets protecting any proposed session deletion.
+
+        A dataset protects its exact members and every upstream ancestor.
+        Historical matrix/action provenance does not create protection.
+
+        Read-only metadata query. For an authoritative decision, the caller
+        must hold the session lifecycle lock through transaction completion.
+        """
+        proposedIDs = list(sessionIDs)
+
+        if any(type(value) is not int or not 0 <= value <= 9223372036854775807 for value in proposedIDs):
+            raise ValueError("sessionIDs must contain nonnegative PostgreSQL bigints.")
+
+        proposedIDs = sorted(set(proposedIDs))
+
+        if not proposedIDs:
+            return []
+
+        sessions = sql.Identifier(postgres.databaseSchema, "session")
+        datasets = sql.Identifier(postgres.databaseSchema, "dataset")
+        members = sql.Identifier(postgres.databaseSchema, "dataset_members")
+
+        # Carry the proposed deletion ID through its descendants so each
+        # result identifies both the protected ancestor and exact member.
+        # UNION terminates traversal even if malformed lineage contains a cycle.
+        statement = sql.SQL("""
+            WITH RECURSIVE descendants(target_id, session_id) AS (
+                SELECT checkpoint.session_id, checkpoint.session_id
+                FROM {sessions} AS checkpoint
+                WHERE checkpoint.session_id = ANY(%s::bigint[])
+
+                UNION
+
+                SELECT descendants.target_id, child.session_id
+                FROM descendants
+                JOIN {sessions} AS child
+                  ON child.parent_session_id = descendants.session_id
+            )
+            SELECT descendants.target_id,
+                   owner.dataset_id,
+                   owner.name,
+                   owner.checkpoint_name,
+                   membership.session_id,
+                   membership.entry_name
+            FROM descendants
+            JOIN {members} AS membership
+              ON membership.session_id = descendants.session_id
+            JOIN {datasets} AS owner
+              ON owner.dataset_id = membership.dataset_id
+            WHERE owner.status = 'complete'
+              AND owner.deleted_at IS NULL
+            ORDER BY owner.dataset_id,
+                     membership.session_id,
+                     descendants.target_id
+        """).format(sessions=sessions, datasets=datasets, members=members)
+
+        from psycopg.rows import tuple_row
+
+        with connection.cursor(row_factory=tuple_row) as cursor:
+            cursor.execute(statement, (proposedIDs,))
+            rows = cursor.fetchall()
+
+        names = ("protectedSessionID", "datasetID", "datasetName", "checkpointName", "memberSessionID", "entryName")
+        return [dict(zip(names, row)) for row in rows]
+
+    @classmethod
+    def _requireNoDatasetSessionBlockers(cls, connection, postgres, sessionIDs):
+        """Refuse a complete proposed deletion set if any member is protected.
+
+        Raises the existing lifecycle exception, which the public session
+        deletion wrapper translates into pglMessages.warning.
+
+        Does not modify database records or open scientific payloads.
+        """
+        blockers = cls._getDatasetSessionBlockers(connection, postgres, sessionIDs)
+
+        if not blockers:
+            return
+
+        # One concrete blocker is sufficient to explain refusal. Report how
+        # many additional protection relationships were found without printing
+        # an unbounded list for large datasets.
+        blocker = blockers[0]
+        datasetName = cls._printValue(blocker["datasetName"])
+        checkpointName = blocker["checkpointName"]
+        entryName = blocker["entryName"]
+
+        datasetLabel = f"dataset {blocker['datasetID']} ({datasetName!r})"
+
+        if checkpointName:
+            datasetLabel += f", checkpoint {cls._printValue(checkpointName)!r}"
+
+        memberLabel = f"member session {blocker['memberSessionID']}"
+
+        if entryName is not None:
+            memberLabel += f", entryName={cls._printValue(entryName)!r}"
+
+        extra = f" There are {len(blockers) - 1} additional blocking relationships." if len(blockers) > 1 else ""
+
+        raise cls._SessionLifecycleBlocked(f"Cannot delete session {blocker['protectedSessionID']}: active {datasetLabel} protects {memberLabel} and its ancestors.{extra} Nothing was changed. deleteDownstreamSessions=True cannot bypass dataset protection. Removing a member in a newer dataset version does not release protection held by older active versions.")
+
+    @staticmethod
+    def _getDatasetSourceProblems(connection, postgres, datasetID):
+        """List members/ancestors that prevent dataset restoration.
+
+        Returns metadata only. The caller must validate the dataset's
+        existence and hold the session dependency lock when using this
+        result to authorize restoration.
+        """
+        if type(datasetID) is not int or not 0 <= datasetID <= 9223372036854775807:
+            raise ValueError("datasetID must be a nonnegative PostgreSQL bigint.")
+
+        sessions = sql.Identifier(postgres.databaseSchema, "session")
+        members = sql.Identifier(postgres.databaseSchema, "dataset_members")
+
+        statement = sql.SQL("""
+            WITH RECURSIVE ancestry(member_id, source_id) AS (
+                SELECT membership.session_id, membership.session_id
+                FROM {members} AS membership
+                WHERE membership.dataset_id = %s
+
+                UNION
+
+                SELECT ancestry.member_id, checkpoint.parent_session_id
+                FROM ancestry
+                JOIN {sessions} AS checkpoint
+                  ON checkpoint.session_id = ancestry.source_id
+                WHERE checkpoint.parent_session_id IS NOT NULL
+            )
+            SELECT ancestry.member_id,
+                   membership.entry_name,
+                   ancestry.source_id,
+                   checkpoint.status,
+                   checkpoint.deleted_at
+            FROM ancestry
+            JOIN {members} AS membership
+              ON membership.dataset_id = %s
+             AND membership.session_id = ancestry.member_id
+            LEFT JOIN {sessions} AS checkpoint
+              ON checkpoint.session_id = ancestry.source_id
+            WHERE checkpoint.session_id IS NULL
+               OR checkpoint.status <> 'complete'
+               OR checkpoint.deleted_at IS NOT NULL
+            ORDER BY ancestry.member_id, ancestry.source_id
+        """).format(sessions=sessions, members=members)
+
+        from psycopg.rows import tuple_row
+
+        with connection.cursor(row_factory=tuple_row) as cursor:
+            cursor.execute(statement, (datasetID, datasetID))
+            rows = cursor.fetchall()
+
+        names = ("memberSessionID", "entryName", "sourceSessionID", "status", "deletedAt")
+        return [dict(zip(names, row)) for row in rows]
+
+    @classmethod
+    def deleteDataset(cls, datasetID, *, settings=None, settingsName=None, sslRootCert=None):
+        """Soft-delete one completed dataset checkpoint.
+
+        Releases this checkpoint's session protection. Other active dataset
+        versions continue protecting their own members and ancestors.
+
+        Preserves membership, history, scientific products, and sessions.
+        Does not inspect, delete, or rewrite payloads.
+
+        Returns True for a committed change, False for an unchanged,
+        unknown, or blocked operation, and None for invalid arguments,
+        unavailable configuration/connection, or database failure.
+        """
+        return cls._changeDatasetDeletionState(datasetID, deleted=True, settings=settings, settingsName=settingsName, sslRootCert=sslRootCert)
+
+    @classmethod
+    def undeleteDataset(cls, datasetID, *, settings=None, settingsName=None, sslRootCert=None):
+        """Restore one completed dataset checkpoint.
+
+        Every member and required ancestor must be complete and active.
+        Refusal warns and leaves the dataset deleted.
+
+        Does not restore sessions automatically or inspect payloads.
+
+        Returns True for a committed change, False for an unchanged,
+        unknown, or blocked operation, and None for invalid arguments,
+        unavailable configuration/connection, or database failure.
+        """
+        return cls._changeDatasetDeletionState(datasetID, deleted=False, settings=settings, settingsName=settingsName, sslRootCert=sslRootCert)
+
+    @classmethod
+    def _changeDatasetDeletionState(cls, datasetID, *, deleted, settings=None, settingsName=None, sslRootCert=None):
+        """Coordinate a dataset lifecycle change with session lifecycle writes.
+
+        Acquire the session dependency lock before locking the dataset row.
+        This matches the protocol required for future dataset publication.
+
+        Session deletion takes an EXCLUSIVE session-table lock, conflicting
+        with this SHARE lock. Member/ancestor validation therefore remains
+        valid until commit.
+
+        Scientific payloads and membership records are never modified here.
+        """
+        from .pglPostgres import pglPostgres
+        from psycopg.rows import tuple_row
+
+        if type(datasetID) is not int or not 0 <= datasetID <= 9223372036854775807:
+            pglMessages.warning("datasetID must be a nonnegative PostgreSQL bigint.", level=1)
+            return None
+
+        if type(deleted) is not bool:
+            pglMessages.warning("deleted must be a boolean.", level=1)
+            return None
+
+        operation = "delete" if deleted else "undelete"
+        outcome = None
+        warning = None
+
+        try:
+            try:
+                postgres = pglPostgres.fromSettings(settings=settings, settingsName=settingsName)
+            except (TypeError, ValueError) as error:
+                pglMessages.warning(f"Cannot {operation} dataset: invalid settings or configuration: {error}", level=1)
+                return None
+
+            if postgres is None:
+                return None
+
+            sessions = sql.Identifier(postgres.databaseSchema, "session")
+            datasets = sql.Identifier(postgres.databaseSchema, "dataset")
+
+            with postgres.connect(sslRootCert=sslRootCert) as connection:
+                if connection is None:
+                    return None
+
+                with connection.transaction():
+                    connection.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+
+                    # Take this before dataset row locks and before any writes.
+                    connection.execute(sql.SQL("LOCK TABLE {} IN SHARE MODE").format(sessions))
+
+                    with connection.cursor(row_factory=tuple_row) as cursor:
+                        statement = sql.SQL("SELECT status, deleted_at FROM {} WHERE dataset_id = %s FOR UPDATE").format(datasets)
+                        cursor.execute(statement, (datasetID,))
+                        record = cursor.fetchone()
+
+                        if record is None:
+                            outcome = "unknown"
+
+                        elif record[0] != "complete":
+                            outcome = "blocked"
+                            warning = f"Cannot {operation} dataset {datasetID}: only completed dataset checkpoints support this lifecycle operation."
+
+                        elif (record[1] is not None) == deleted:
+                            outcome = "unchanged"
+
+                        else:
+                            problems = cls._getDatasetSourceProblems(connection, postgres, datasetID) if not deleted else []
+
+                            if problems:
+                                problem = problems[0]
+                                sourceID = problem["sourceSessionID"]
+                                memberID = problem["memberSessionID"]
+                                entryName = problem["entryName"]
+                                memberLabel = f"member session {memberID}"
+
+                                if entryName is not None:
+                                    memberLabel += f" (entryName={cls._printValue(entryName)!r})"
+
+                                if problem["status"] is None:
+                                    reason = "missing"
+                                elif problem["deletedAt"] is not None:
+                                    reason = "deleted"
+                                else:
+                                    reason = f"not complete (status={cls._printValue(problem['status'])!r})"
+
+                                extra = f" There are {len(problems) - 1} additional unavailable source relationships." if len(problems) > 1 else ""
+                                warning = f"Cannot undelete dataset {datasetID}: {memberLabel} requires session {sourceID}, which is {reason}.{extra} Restore the required sessions or their deletion groups first. Nothing was changed."
+                                outcome = "blocked"
+
+                            else:
+                                marker = sql.SQL("statement_timestamp()") if deleted else sql.SQL("NULL")
+                                statement = sql.SQL("UPDATE {} SET deleted_at = {} WHERE dataset_id = %s RETURNING dataset_id").format(datasets, marker)
+                                cursor.execute(statement, (datasetID,))
+
+                                if cursor.fetchone() != (datasetID,):
+                                    raise RuntimeError("Dataset lifecycle update did not return the requested checkpoint.")
+
+                                outcome = "changed"
+
+        except psycopg.Error as error:
+            pglMessages.warning(f"Could not {operation} dataset {datasetID}: {error}. If the connection failed during commit, check the dataset state before retrying.", level=2)
+            return None
+
+        # Report only after transaction and connection cleanup.
+        if outcome == "unknown":
+            pglMessages.warning(f"Unknown dataset checkpoint: {datasetID}", level=0)
+            return False
+
+        if outcome == "blocked":
+            pglMessages.warning(warning, level=2)
+            return False
+
+        if outcome == "unchanged":
+            return False
+
+        if outcome != "changed":
+            raise RuntimeError("Dataset lifecycle operation finished without a recognized outcome.")
+
+        if deleted:
+            pglMessages.message(f"Dataset {datasetID} soft-deleted in {postgres.databaseName}.{postgres.databaseSchema}. Its session protection is released; sessions and saved outputs are unchanged.")
+        else:
+            pglMessages.message(f"Dataset {datasetID} restored in {postgres.databaseName}.{postgres.databaseSchema}. Its members and ancestors are protected again.")
+
+        return True
+    
+    @classmethod
+    def _resolveDatasetStorage(cls, dataset, *, settings=None, settingsName=None):
+        """Resolve configuration and reject a different bound database.
+
+        The binding is a runtime endpoint descriptor, not a globally portable
+        database UUID. Credentials and settings are never serialized.
+        """
+        from .pglDataset import pglDataset
+        from .pglPostgres import pglPostgres
+        from .pglSettings import pglSettingsManager
+
+        if not isinstance(dataset, pglDataset):
+            raise TypeError("Expected a pglDataset.")
+
+        if settings is not None and settingsName is not None:
+            raise ValueError("Supply settings or settingsName, not both.")
+
+        if settings is None and settingsName is None:
+            settings = dataset._datasetSettings
+            settingsName = dataset._datasetSettingsName if settings is None else None
+
+        resolvedSettings = pglSettingsManager.getSettings(settings=settings, settingsName=settingsName)
+
+        if resolvedSettings is None:
+            return None, None
+
+        postgres = pglPostgres.fromSettings(settings=resolvedSettings)
+
+        if postgres is None:
+            return None, None
+
+        identity = cls._checkpointDatabaseIdentity(postgres)
+
+        if dataset._datasetDatabaseIdentity and dataset._datasetDatabaseIdentity != identity:
+            raise ValueError("The selected database differs from this dataset's bound database. Dataset membership cannot be resolved against another database.")
+
+        return resolvedSettings, postgres
+
+    @classmethod
+    def _bindDatasetStorage(cls, dataset, resolvedSettings, postgres):
+        """Install runtime configuration after successful metadata access."""
+        dataset._datasetDatabaseIdentity = deepcopy(cls._checkpointDatabaseIdentity(postgres))
+        dataset._datasetSettings = resolvedSettings
+        dataset._datasetSettingsName = None
+
+    @staticmethod
+    def _datasetHistoryHashes(dataset):
+        """Fingerprint history metadata without touching scientific products."""
+        return [hashlib.sha256(entry.toJSON(strict=True).encode("utf-8")).hexdigest() for entry in dataset.actionHistory]
+
+    @classmethod
+    def _requireSafeDatasetCheckpoint(cls, dataset):
+        """Validate failure bookkeeping, history prefix, and family identity."""
+        from .pglDataset import pglDataset
+
+        if not isinstance(dataset, pglDataset):
+            raise TypeError("Expected a pglDataset.")
+
+        cls._requireSafeCheckpoint(dataset)
+
+        baseline = dataset._datasetBaseline
+
+        if not baseline:
+            return
+
+        expectedFields = {"version", "datasetID", "familyUUID", "databaseIdentity", "historyHashes"}
+
+        if set(baseline) != expectedFields or type(baseline["version"]) is not int or baseline["version"] != 1:
+            raise ValueError("Invalid dataset checkpoint baseline.")
+
+        if dataset.datasetID != baseline["datasetID"]:
+            raise ValueError("Dataset ID differs from its saved baseline.")
+
+        if dataset.uuid != baseline["familyUUID"]:
+            raise ValueError("Dataset family UUID differs from its saved baseline.")
+
+        if dataset._datasetDatabaseIdentity != baseline["databaseIdentity"]:
+            raise ValueError("Dataset database binding differs from its saved baseline.")
+
+        expectedHashes = baseline["historyHashes"]
+
+        if not isinstance(expectedHashes, list):
+            raise ValueError("Invalid dataset history baseline.")
+
+        actualHashes = cls._datasetHistoryHashes(dataset)
+
+        if len(actualHashes) < len(expectedHashes) or actualHashes[:len(expectedHashes)] != expectedHashes:
+            raise ValueError("Saved dataset history was shortened or edited. Historical entries must remain unchanged; append new analyses instead.")
+
+    @staticmethod
+    def _datasetAnnotation(value, fieldName):
+        """Normalize blank annotations without imposing a character limit."""
+        if value is None:
+            return None
+
+        if not isinstance(value, str) or "\x00" in value:
+            raise ValueError(f"{fieldName} must be a string without NUL, or None.")
+
+        return value if value.strip() else None
+
+    @classmethod
+    def _prepareDatasetMetadata(cls, dataset):
+        """Strictly encode lightweight metadata without embedding products.
+
+        Membership lives in dataset_members.
+        Product links live in dataset_products.
+        Editable annotations live in dataset columns.
+        """
+        from uuid import UUID
+        from .pglDataset import pglDataset
+        from .pglSerialize import pglSerialize
+
+        cls._requireSafeDatasetCheckpoint(dataset)
+        dataset._validateName(dataset.name)
+        dataset._validateMembers(dataset.members)
+        cls._validateDatasetProducts(dataset)
+
+        familyUUID = dataset.uuid
+        _ = dataset.pglVersion
+        _ = dataset.github
+
+        try:
+            parsedUUID = UUID(familyUUID)
+        except (TypeError, ValueError, AttributeError) as error:
+            raise ValueError("Dataset uuid must be a valid UUID string.") from error
+
+        if str(parsedUUID) != familyUUID:
+            raise ValueError("Dataset uuid must use canonical lowercase UUID formatting.")
+
+        text = dataset.toJSON(strict=True)
+        restored = pglSerialize.fromJSON(text, strict=True)
+
+        if type(restored) is not pglDataset:
+            raise TypeError("Dataset metadata must restore as an exact pglDataset.")
+
+        if restored.data:
+            raise ValueError("Dataset metadata must not embed scientific products.")
+
+        if restored.toJSON(strict=True) != text:
+            raise ValueError("Dataset metadata did not round-trip exactly.")
+
+        return json.loads(text)
+    
+    @classmethod
+    def getDatasetMemberSummaries(cls, dataset, *, sessionIDs=None, settings=None, settingsName=None, sslRootCert=None):
+        """Read lightweight member metadata without constructing sessions.
+
+        Acquisition time falls back to the root acquisition checkpoint.
+        Subject labels use checkpoint metadata, then root metadata.
+        Older records without mirrored labels display Unknown; this function
+        does not read experiment files or scientific payloads.
+
+        Includes deleted source rows so historical datasets can be inspected.
+        Returns None for unavailable configuration or connection cancellation.
+        """
+        from psycopg.rows import tuple_row
+
+        requested = [record["sessionID"] for record in dataset.members] if sessionIDs is None else list(sessionIDs)
+
+        for sessionID in requested:
+            dataset._validateSessionID(sessionID)
+
+        requested = sorted(set(requested))
+
+        if not requested:
+            return {}
+
+        resolvedSettings, postgres = cls._resolveDatasetStorage(dataset, settings=settings, settingsName=settingsName)
+
+        if postgres is None:
+            return None
+
+        sessions = sql.Identifier(postgres.databaseSchema, "session")
+        statement = sql.SQL("""
+            SELECT checkpoint.session_id,
+                   checkpoint.status,
+                   checkpoint.deleted_at,
+                   checkpoint.checkpoint_name,
+                   checkpoint.created_at,
+                   COALESCE(checkpoint.acquired_at, root.acquired_at),
+                   checkpoint.meta,
+                   root.meta
+            FROM {sessions} AS checkpoint
+            LEFT JOIN {sessions} AS root
+              ON root.session_id = checkpoint.root_session_id
+            WHERE checkpoint.session_id = ANY(%s::bigint[])
+            ORDER BY checkpoint.session_id
+        """).format(sessions=sessions)
+
+        with postgres.connect(sslRootCert=sslRootCert) as connection:
+            if connection is None:
+                return None
+
+            with connection.transaction():
+                connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+
+                with connection.cursor(row_factory=tuple_row) as cursor:
+                    cursor.execute(statement, (requested,))
+                    rows = cursor.fetchall()
+
+        summaries = {}
+
+        for sessionID, status, deletedAt, checkpointName, createdAt, acquiredAt, checkpointMeta, rootMeta in rows:
+            labelMetadata = None
+
+            for metadata in (checkpointMeta, rootMeta):
+                if isinstance(metadata, dict) and "pgl_session_labels" in metadata:
+                    labelMetadata = cls._validateSessionLabelMetadata(metadata["pgl_session_labels"])
+                    break
+
+            subjectIDs = []
+
+            if labelMetadata is not None:
+                subjectIDs = sorted({record["subjectID"] for record in labelMetadata["labels"] if record["subjectID"] is not None})
+
+            summaries[sessionID] = {
+                "sessionID": sessionID,
+                "status": status,
+                "deletedAt": deletedAt,
+                "checkpointName": checkpointName,
+                "createdAt": createdAt,
+                "acquiredAt": acquiredAt,
+                "subjectIDs": subjectIDs,
+            }
+
+        cls._bindDatasetStorage(dataset, resolvedSettings, postgres)
+        return summaries
+
+    @classmethod
+    def getDatasetSession(cls, dataset, sessionID, *, settings=None, settingsName=None, storageOptionsByBackend=None, sslRootCert=None, cacheDirectory=None, directLocalPolicy=None):
+        """Resolve an exact member checkpoint and cache its working object.
+
+        Explicit database overrides are checked even for a cache hit.
+        Cached session mutation does not alter the membership record.
+        """
+        dataset._findMember(sessionID=sessionID)
+        resolvedSettings, postgres = cls._resolveDatasetStorage(dataset, settings=settings, settingsName=settingsName)
+
+        if postgres is None:
+            return None
+
+        if sessionID in dataset._sessionCache:
+            return dataset._sessionCache[sessionID]
+
+        options = dict(dataset._datasetLoadOptions)
+
+        if storageOptionsByBackend is not None:
+            options["storageOptionsByBackend"] = storageOptionsByBackend
+
+        if sslRootCert is not None:
+            options["sslRootCert"] = sslRootCert
+
+        if cacheDirectory is not None:
+            options["cacheDirectory"] = cacheDirectory
+
+        if directLocalPolicy is not None:
+            options["directLocalPolicy"] = directLocalPolicy
+
+        session = cls.loadSession(sessionID, settings=resolvedSettings, **options)
+
+        if session is None:
+            return None
+
+        cls._bindDatasetStorage(dataset, resolvedSettings, postgres)
+        dataset._sessionCache[sessionID] = session
+        return session
+    
+    @classmethod
+    def saveDataMatrix(cls, matrix, dataPath, *, filesystem=None, storageOptions=None, chunks=None):
+        """Publish a new standalone Zarr matrix bundle.
+
+        Writes a fresh UUID-named directory and writes matrix.json last.
+        Existing bundles are never intentionally overwritten or reused.
+
+        Does not change the input matrix's revision or register database rows.
+        Caller must not mutate the input while publication is in progress.
+
+        Failure may leave an incomplete directory. A missing or invalid
+        matrix.json prevents it from being opened as a published matrix.
+        """
+        import json
+        import posixpath
+        from pathlib import Path
+        from uuid import uuid4
+
+        import xarray as xr
+        from fsspec import AbstractFileSystem
+        from fsspec.core import url_to_fs
+
+        from .pglData import pglDataMatrix
+        from .pglSerialize import pglSerialize
+
+        if not isinstance(matrix, pglDataMatrix):
+            raise TypeError("matrix must be a pglDataMatrix.")
+
+        cls._requireSafeCheckpoint(matrix)
+        data = matrix.requireData()
+        cls._validateDataMatrixEncoding(data)
+
+        if filesystem is not None and storageOptions:
+            raise ValueError("Supply filesystem or storageOptions, not both.")
+
+        if dataPath is None:
+            raise ValueError("dataPath is required.")
+
+        location = str(dataPath)
+
+        if not location.strip() or any(character in location for character in ("\x00", "\n", "\r")):
+            raise ValueError("dataPath must be nonblank and contain no NUL or newline characters.")
+
+        if filesystem is None:
+            if "://" not in location and "::" not in location:
+                location = str(Path(location).expanduser())
+
+            filesystem, root = url_to_fs(location, **(storageOptions or {}))
+        else:
+            if not isinstance(filesystem, AbstractFileSystem):
+                raise TypeError("filesystem must be an fsspec filesystem.")
+
+            root = filesystem._strip_protocol(location)
+
+        revisionID = str(uuid4())
+        bundlePath = posixpath.join(root, f"matrix-{revisionID}")
+        zarrPath = posixpath.join(bundlePath, "data.zarr")
+
+        # Materialize lightweight identity defaults before strict encoding.
+        # Do not manufacture new construction provenance during saving.
+        _ = matrix.uuid
+        _ = matrix.pglVersion
+        _ = matrix.github
+
+        sourceMetadataText = matrix.toJSON(strict=True)
+        metadataObject = pglSerialize.fromJSON(sourceMetadataText, strict=True)
+
+        if type(metadataObject) is not type(matrix):
+            raise TypeError("Matrix metadata restored as a different class.")
+
+        if metadataObject.data is not None:
+            raise ValueError("Matrix restoration must not construct scientific data.")
+
+        metadataObject.matrixRevisionID = revisionID
+
+        # A new artifact must not inherit a potentially stale content hash.
+        metadataObject.contentHash = None
+        metadataObject.hashAlgorithm = None
+        metadataObject.hashSchemaVersion = None
+
+        publishedMetadataText = metadataObject.toJSON(strict=True)
+        restoredMetadata = pglSerialize.fromJSON(publishedMetadataText, strict=True)
+
+        if restoredMetadata.toJSON(strict=True) != publishedMetadataText:
+            raise ValueError("Published matrix metadata did not round-trip exactly.")
+
+        if isinstance(data, xr.DataArray):
+            valueName = "__pgl_matrix_values__"
+
+            while valueName in data.coords or valueName in data.sizes:
+                valueName += "_"
+
+            persisted = data.to_dataset(name=valueName)
+            kind = "DataArray"
+            arrayName = data.name
+        else:
+            persisted = data
+            kind = "Dataset"
+            valueName = None
+            arrayName = None
+
+        # Remove inherited backend-specific encoding without editing the source.
+        persisted = persisted.drop_encoding()
+
+        if chunks is not None:
+            persisted = persisted.chunk(chunks)
+
+        descriptor = {
+            "contractVersion": "pgl.matrix.zarr.v1",
+            "zarrFormat": 2,
+            "matrixRevisionID": revisionID,
+            "kind": kind,
+            "valueName": valueName,
+            "arrayName": arrayName,
+            "metadata": json.loads(publishedMetadataText),
+        }
+
+        descriptorBytes = json.dumps(descriptor, sort_keys=True, ensure_ascii=False, allow_nan=False).encode("utf-8")
+
+        if len(descriptorBytes) > 16 * 1024 * 1024:
+            raise ValueError("Matrix descriptor exceeds the metadata size limit.")
+
+        if filesystem.exists(bundlePath):
+            raise FileExistsError(bundlePath)
+
+        filesystem.makedirs(bundlePath, exist_ok=False)
+        mapper = filesystem.get_mapper(zarrPath)
+
+        # Preserve numeric zeros and Boolean False as actual values, not
+        # missing-data sentinels. Floating-point NaNs remain array values.
+        encoding = {name: {"_FillValue": None} for name in persisted.variables}
+        persisted.to_zarr(mapper, mode="w-", consolidated=True, zarr_format=2, encoding=encoding)
+
+        # Check bookkeeping again before publishing the completion descriptor.
+        # This does not detect every possible mutation of exposed array values.
+        cls._requireSafeCheckpoint(matrix)
+
+        if matrix.data is not data or matrix.toJSON(strict=True) != sourceMetadataText:
+            raise ValueError("Matrix attachment or metadata changed during publication.")
+
+        descriptorPath = posixpath.join(bundlePath, "matrix.json")
+
+        with filesystem.open(descriptorPath, "xb") as target:
+            if target.write(descriptorBytes) != len(descriptorBytes):
+                raise OSError("Incomplete matrix publication descriptor write.")
+
+        return filesystem.unstrip_protocol(bundlePath)
+    
+    @classmethod
+    def loadDataMatrix(cls, dataPath, *, filesystem=None, storageOptions=None):
+        """Open a standalone matrix with lazy Zarr-backed scientific variables.
+
+        Reads the publication descriptor and consolidated Zarr metadata.
+        Does not calculate hashes or scan scientific values.
+
+        Dimension indexes are not created automatically, avoiding eager
+        coordinate reads. Label-based selection may require set_xindex().
+
+        The wrapper class must already be imported for strict restoration.
+        Runtime credentials are not placed in serialized matrix metadata.
+        """
+        import json
+        import posixpath
+        from pathlib import Path
+        from uuid import UUID
+
+        import xarray as xr
+        from fsspec import AbstractFileSystem
+        from fsspec.core import url_to_fs
+
+        from .pglData import pglDataMatrix
+        from .pglSerialize import pglSerialize
+
+        if filesystem is not None and storageOptions:
+            raise ValueError("Supply filesystem or storageOptions, not both.")
+
+        if dataPath is None:
+            raise ValueError("dataPath is required.")
+
+        location = str(dataPath)
+
+        if not location.strip() or any(character in location for character in ("\x00", "\n", "\r")):
+            raise ValueError("dataPath must be nonblank and contain no NUL or newline characters.")
+
+        if filesystem is None:
+            if "://" not in location and "::" not in location:
+                location = str(Path(location).expanduser())
+
+            filesystem, root = url_to_fs(location, **(storageOptions or {}))
+        else:
+            if not isinstance(filesystem, AbstractFileSystem):
+                raise TypeError("filesystem must be an fsspec filesystem.")
+
+            root = filesystem._strip_protocol(location)
+
+        maxBytes = 16 * 1024 * 1024
+
+        with filesystem.open(posixpath.join(root, "matrix.json"), "rb") as source:
+            content = source.read(maxBytes + 1)
+
+        if len(content) > maxBytes:
+            raise ValueError("Matrix descriptor exceeds the metadata size limit.")
+
+        def uniqueObject(pairs):
+            result = {}
+
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError(f"Duplicate matrix descriptor key: {key!r}")
+
+                result[key] = value
+
+            return result
+
+        def rejectConstant(value):
+            raise ValueError(f"Invalid JSON constant in matrix descriptor: {value}")
+
+        descriptor = json.loads(content, object_pairs_hook=uniqueObject, parse_constant=rejectConstant)
+        expectedFields = {"contractVersion", "zarrFormat", "matrixRevisionID", "kind", "valueName", "arrayName", "metadata"}
+
+        if not isinstance(descriptor, dict) or set(descriptor) != expectedFields:
+            raise ValueError("Invalid matrix descriptor fields.")
+
+        if descriptor["contractVersion"] != "pgl.matrix.zarr.v1":
+            raise ValueError("Unsupported matrix persistence contract.")
+
+        if type(descriptor["zarrFormat"]) is not int or descriptor["zarrFormat"] != 2:
+            raise ValueError("Unsupported matrix Zarr format.")
+
+        revisionID = descriptor["matrixRevisionID"]
+
+        try:
+            canonicalRevision = str(UUID(revisionID))
+        except (TypeError, ValueError, AttributeError) as error:
+            raise ValueError("Invalid matrix revision UUID.") from error
+
+        if revisionID != canonicalRevision:
+            raise ValueError("Matrix revision must use canonical UUID formatting.")
+
+        if descriptor["kind"] not in ("DataArray", "Dataset"):
+            raise ValueError("Unsupported matrix container kind.")
+
+        if not isinstance(descriptor["metadata"], dict):
+            raise ValueError("Matrix metadata must contain a serialized object.")
+
+        if descriptor["kind"] == "Dataset":
+            if descriptor["valueName"] is not None or descriptor["arrayName"] is not None:
+                raise ValueError("Dataset descriptor contains DataArray-only fields.")
+        else:
+            valueName = descriptor["valueName"]
+            arrayName = descriptor["arrayName"]
+
+            if not isinstance(valueName, str) or not valueName:
+                raise ValueError("DataArray descriptor lacks a stored variable name.")
+
+            if arrayName is not None and not isinstance(arrayName, str):
+                raise ValueError("Invalid original DataArray name.")
+
+        matrix = pglSerialize.fromJSON(json.dumps(descriptor["metadata"], allow_nan=False), strict=True)
+
+        if not isinstance(matrix, pglDataMatrix):
+            raise TypeError("Descriptor metadata did not restore a pglDataMatrix.")
+
+        if matrix.data is not None:
+            raise ValueError("Metadata restoration unexpectedly attached scientific data.")
+
+        if matrix.matrixRevisionID != revisionID:
+            raise ValueError("Matrix revision disagrees with its descriptor.")
+
+        mapper = filesystem.get_mapper(posixpath.join(root, "data.zarr"))
+        opened = xr.open_zarr(mapper, consolidated=True, chunks={}, mask_and_scale=False, decode_times=False, decode_timedelta=False, create_default_indexes=False)
+
+        try:
+            if descriptor["kind"] == "DataArray":
+                valueName = descriptor["valueName"]
+
+                if set(opened.data_vars) != {valueName}:
+                    raise ValueError("DataArray payload has unexpected scientific variables.")
+
+                data = opened[valueName].rename(descriptor["arrayName"])
+                data.set_close(opened.close)
+            else:
+                data = opened
+
+            cls._validateDataMatrixEncoding(data)
+            matrix.data = data
+
+            # Runtime reference only. This is not proof that the exposed
+            # Python arrays remain unchanged after loading.
+            matrix._payloadReference = {
+                "contractVersion": descriptor["contractVersion"],
+                "matrixRevisionID": revisionID,
+                "path": filesystem.unstrip_protocol(root),
+            }
+
+            return matrix
+
+        except BaseException:
+            opened.close()
+            raise
+    
+    @staticmethod
+    def _validateDataMatrixEncoding(data):
+        """Check the initial portable Zarr schema without scanning arrays.
+
+        Supports real numeric, Boolean, and fixed-width Unicode variables.
+        Attributes use plain JSON types and are preserved without coercion.
+        """
+        import math
+        import xarray as xr
+
+        if not isinstance(data, (xr.DataArray, xr.Dataset)):
+            raise TypeError("Expected an xarray DataArray or Dataset.")
+
+        def validateName(value, label):
+            if not isinstance(value, str) or not value or value in (".", "..") or any(character in value for character in ("/", "\\", "\x00")):
+                raise ValueError(f"{label} must be a nonempty string without path separators or NUL.")
+
+        def validateAttribute(value, path, active):
+            if value is None or type(value) in (str, bool, int):
+                if isinstance(value, str) and "\x00" in value:
+                    raise ValueError(f"{path}: attribute strings must not contain NUL.")
+                return
+
+            if type(value) is float:
+                if not math.isfinite(value):
+                    raise ValueError(f"{path}: attribute numbers must be finite.")
+                return
+
+            if type(value) not in (list, dict):
+                raise TypeError(f"{path}: attributes must use plain JSON types, not {type(value).__name__}.")
+
+            identity = id(value)
+
+            if identity in active:
+                raise ValueError(f"{path}: circular attributes are not supported.")
+
+            active.add(identity)
+
+            try:
+                if isinstance(value, dict):
+                    for key, child in value.items():
+                        if not isinstance(key, str) or "\x00" in key:
+                            raise ValueError(f"{path}: attribute keys must be strings without NUL.")
+
+                        validateAttribute(child, f"{path}.{key}", active)
+                else:
+                    for index, child in enumerate(value):
+                        validateAttribute(child, f"{path}[{index}]", active)
+            finally:
+                active.remove(identity)
+
+        for name in data.sizes:
+            validateName(name, "Dimension name")
+
+        validateAttribute(dict(data.attrs), "attrs", set())
+
+        if isinstance(data, xr.Dataset):
+            variables = list(data.variables.items())
+        else:
+            if data.name is not None:
+                validateName(data.name, "DataArray name")
+
+            variables = [*data.coords.items(), ("<values>", data)]
+
+        for name, variable in variables:
+            if name != "<values>":
+                validateName(name, "Variable name")
+
+            if variable.dtype.fields is not None or variable.dtype.kind not in "biufU":
+                raise TypeError(f"Variable {name!r} has unsupported dtype {variable.dtype}. Provide an explicit portable encoding before publishing.")
+
+            if variable.dtype.kind == "f" and variable.dtype.itemsize not in (2, 4, 8):
+                raise TypeError(f"Variable {name!r} uses unsupported floating-point precision.")
+
+            # These names influence xarray's persistence/decoding machinery.
+            reserved = {"_ARRAY_DIMENSIONS", "_FillValue", "missing_value", "scale_factor", "add_offset", "coordinates"}
+            conflicts = reserved.intersection(variable.attrs)
+
+            if conflicts:
+                raise ValueError(f"Variable {name!r} has reserved encoding attributes: {sorted(conflicts)}.")
+
+            validateAttribute(dict(variable.attrs), f"variable[{name!r}].attrs", set())
+    
+    @classmethod
+    def saveDataset(cls, dataset, *, settings=None, settingsName=None, backendID=None, storageOptions=None, sslRootCert=None):
+        """Publish a dataset checkpoint with named scientific products.
+
+        Existing immutable references reuse catalog revisions.
+        Attached mutable matrices publish new standalone bundles.
+
+        Payload writes are not rolled back by PostgreSQL. Failed saves may
+        leave unregistered bundles, but no completed dataset is published.
+
+        Saving does not rebuild managed data or rerun analyses.
+        Concurrent working-object mutation is unsupported.
+        """
+        from fsspec.core import url_to_fs
+        from psycopg.types.json import Jsonb
+        from .pglData import pglDataMatrix, pglDataMatrixReference
+
+        metadata = cls._prepareDatasetMetadata(dataset)
+        members = dataset._validateMembers(dataset.members)
+        products = cls._validateDatasetProducts(dataset)
+        checkpointName = cls._datasetAnnotation(dataset.checkpointName, "checkpointName")
+        description = cls._datasetAnnotation(dataset.description, "description")
+        historyHashes = cls._datasetHistoryHashes(dataset)
+
+        if backendID is not None and (type(backendID) is not int or not 0 <= backendID <= 9223372036854775807):
+            raise ValueError("backendID must be a nonnegative PostgreSQL bigint.")
+
+        # Fail structural errors before allocating permanent payload paths.
+        for product in products.values():
+            if isinstance(product, pglDataMatrix):
+                cls._requireSafeCheckpoint(product)
+                cls._validateDataMatrixEncoding(product.requireData())
+
+        resolvedSettings, postgres = cls._resolveDatasetStorage(dataset, settings=settings, settingsName=settingsName)
+
+        if postgres is None:
+            return None
+
+        username = resolvedSettings.username
+
+        if not isinstance(username, str) or not username.strip() or "\x00" in username:
+            pglMessages.warning("Cannot save dataset: set a valid username in PGL settings.", level=0)
+            return None
+
+        databaseIdentity = deepcopy(cls._checkpointDatabaseIdentity(postgres))
+        identityJSON = cls._datasetDatabaseIdentityJSON(databaseIdentity)
+
+        for name, product in products.items():
+            if isinstance(product, pglDataMatrixReference) and product.databaseIdentityJSON != identityJSON:
+                raise ValueError(f"Product {name!r} references a different configured database.")
+
+        sessionsTable = sql.Identifier(postgres.databaseSchema, "session")
+        datasetsTable = sql.Identifier(postgres.databaseSchema, "dataset")
+        membersTable = sql.Identifier(postgres.databaseSchema, "dataset_members")
+        productsTable = sql.Identifier(postgres.databaseSchema, "dataset_products")
+        revisionsTable = sql.Identifier(postgres.databaseSchema, "matrix_revisions")
+        backendsTable = sql.Identifier(postgres.databaseSchema, "storage_backends")
+
+        hasWorkingProducts = any(isinstance(product, pglDataMatrix) for product in products.values())
+
+        with postgres.connect(sslRootCert=sslRootCert) as connection:
+            if connection is None:
+                return None
+
+            with connection.transaction():
+                connection.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                connection.execute(sql.SQL("LOCK TABLE {} IN SHARE MODE").format(sessionsTable))
+
+                createdBy = cls.getOrCreateUser(connection, postgres, username)
+                destinationFS = None
+                destinationRoot = None
+
+                if hasWorkingProducts:
+                    if backendID is None:
+                        backendID = cls._getConfiguredStorageBackend(connection, postgres, storageOptions=storageOptions)
+
+                    statement = sql.SQL("SELECT url_prefix, is_active FROM {} WHERE backend_id = %s FOR SHARE").format(backendsTable)
+                    backend = connection.execute(statement, (backendID,)).fetchone()
+
+                    if backend is None or not backend[1]:
+                        raise ValueError("Matrix destination backend is missing or inactive.")
+
+                    destinationFS, destinationRoot = url_to_fs(backend[0], **(storageOptions or {}))
+
+                statement = sql.SQL("""
+                    INSERT INTO {} (
+                        family_uuid, name, checkpoint_name, description,
+                        metadata, created_by
+                    )
+                    VALUES (%s::uuid, %s, %s, %s, %s, %s)
+                    RETURNING dataset_id
+                """).format(datasetsTable)
+
+                datasetID = connection.execute(statement, (dataset.uuid, dataset.name, checkpointName, description, Jsonb(metadata), createdBy)).fetchone()[0]
+
+                statement = sql.SQL("""
+                    INSERT INTO {} (
+                        dataset_id, session_id, member_index, entry_name, labels
+                    )
+                    VALUES (%s, %s, %s, %s, %s)
+                """).format(membersTable)
+
+                for index, member in enumerate(members):
+                    connection.execute(statement, (datasetID, member["sessionID"], index, member["entryName"], Jsonb(member["labels"])))
+
+                problems = cls._getDatasetSourceProblems(connection, postgres, datasetID)
+
+                if problems:
+                    problem = problems[0]
+                    raise ValueError(f"Cannot save dataset: member session {problem['memberSessionID']} requires active completed source checkpoint {problem['sourceSessionID']}.")
+
+                for productName, product in products.items():
+                    if isinstance(product, pglDataMatrixReference):
+                        revisionID = product.matrixRevisionID
+
+                        statement = sql.SQL("SELECT contract_version FROM {} WHERE matrix_revision_id = %s::uuid").format(revisionsTable)
+                        registered = connection.execute(statement, (revisionID,)).fetchone()
+
+                        if registered != ("pgl.matrix.zarr.v1",):
+                            raise ValueError(f"Product {productName!r} references an unknown or unsupported matrix revision.")
+
+                    else:
+                        # A working matrix always receives a new payload.
+                        productRoot = posixpath.join(destinationRoot, "matrices")
+                        savedURL = cls.saveDataMatrix(product, productRoot, filesystem=destinationFS)
+                        savedPath = destinationFS._strip_protocol(savedURL)
+
+                        with destinationFS.open(posixpath.join(savedPath, "matrix.json"), "rb") as source:
+                            descriptorBytes = source.read(16 * 1024 * 1024 + 1)
+
+                        if len(descriptorBytes) > 16 * 1024 * 1024:
+                            raise ValueError("Published matrix descriptor exceeds the size limit.")
+
+                        descriptor = json.loads(descriptorBytes)
+                        revisionID = descriptor["matrixRevisionID"]
+                        objectKey = f"matrices/matrix-{revisionID}"
+                        expectedPath = posixpath.join(destinationRoot, objectKey)
+
+                        if posixpath.normpath(savedPath) != posixpath.normpath(expectedPath):
+                            raise ValueError("Published matrix path differs from its expected backend-relative location.")
+
+                        statement = sql.SQL("""
+                            INSERT INTO {} (
+                                matrix_revision_id, backend_id, object_key,
+                                contract_version, descriptor, created_by
+                            )
+                            VALUES (%s::uuid, %s, %s, %s, %s, %s)
+                        """).format(revisionsTable)
+
+                        connection.execute(statement, (revisionID, backendID, objectKey, "pgl.matrix.zarr.v1", Jsonb(descriptor), createdBy))
+
+                    statement = sql.SQL("INSERT INTO {} (dataset_id, product_name, matrix_revision_id) VALUES (%s, %s, %s::uuid)").format(productsTable)
+                    connection.execute(statement, (datasetID, productName, revisionID))
+
+                cls._requireSafeDatasetCheckpoint(dataset)
+                cls._requireDatasetProductsUnchanged(dataset, products)
+
+                if dataset.members != members or cls._prepareDatasetMetadata(dataset) != metadata:
+                    raise ValueError("Dataset changed while saving. No checkpoint was published.")
+
+                if cls._datasetAnnotation(dataset.checkpointName, "checkpointName") != checkpointName or cls._datasetAnnotation(dataset.description, "description") != description:
+                    raise ValueError("Dataset annotations changed while saving. No checkpoint was published.")
+
+                statement = sql.SQL("UPDATE {} SET status = 'complete', completed_at = statement_timestamp() WHERE dataset_id = %s RETURNING dataset_id").format(datasetsTable)
+
+                if connection.execute(statement, (datasetID,)).fetchone() != (datasetID,):
+                    raise RuntimeError("Dataset checkpoint completion failed.")
+
+                pendingBaseline = {
+                    "version": 1,
+                    "datasetID": datasetID,
+                    "familyUUID": dataset.uuid,
+                    "databaseIdentity": databaseIdentity,
+                    "historyHashes": historyHashes,
+                }
+
+        dataset.datasetID = datasetID
+        dataset.checkpointName = checkpointName
+        dataset.description = description
+        dataset._datasetDatabaseIdentity = databaseIdentity
+        dataset._datasetSettings = resolvedSettings
+        dataset._datasetSettingsName = None
+        dataset._datasetBaseline = pendingBaseline
+
+        # Keep working matrices attached. Do not relabel them as immutable
+        # references merely because a snapshot was successfully published.
+        pglMessages.message(f"Dataset checkpoint {datasetID} saved with {len(members)} members and {len(products)} products in {postgres.databaseName}.{postgres.databaseSchema}.")
+        return datasetID
+
+    @classmethod
+    def loadDataset(cls, datasetID, *, settings=None, settingsName=None, sslRootCert=None, includeDeleted=False, storageOptionsByBackend=None, cacheDirectory=None, directLocalPolicy="materialize"):
+        """Restore metadata, membership, and unopened product references.
+
+        Does not construct sessions, open Zarr stores, or rebuild products.
+        includeDeleted permits inspection without restoring protection.
+        """
+        from psycopg.rows import tuple_row
+        from .pglData import pglDataMatrixReference
+        from .pglDataset import pglDataset
+        from .pglSerialize import pglSerialize
+
+        if type(datasetID) is not int or not 0 <= datasetID <= 9223372036854775807:
+            raise ValueError("datasetID must be a nonnegative PostgreSQL bigint.")
+
+        if type(includeDeleted) is not bool:
+            raise ValueError("includeDeleted must be a boolean.")
+
+        if directLocalPolicy not in ("materialize", "immutable"):
+            raise ValueError("directLocalPolicy must be 'materialize' or 'immutable'.")
+
+        shell = pglDataset(settings=settings, settingsName=settingsName)
+        resolvedSettings, postgres = cls._resolveDatasetStorage(shell)
+
+        if postgres is None:
+            return None
+
+        datasetsTable = sql.Identifier(postgres.databaseSchema, "dataset")
+        membersTable = sql.Identifier(postgres.databaseSchema, "dataset_members")
+        productsTable = sql.Identifier(postgres.databaseSchema, "dataset_products")
+        checkpoint = None
+        memberRows = []
+        productRows = []
+
+        with postgres.connect(sslRootCert=sslRootCert) as connection:
+            if connection is None:
+                return None
+
+            with connection.transaction():
+                connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+
+                with connection.cursor(row_factory=tuple_row) as cursor:
+                    statement = sql.SQL("""
+                        SELECT family_uuid, name, checkpoint_name, description,
+                               status, contract_version, metadata
+                        FROM {}
+                        WHERE dataset_id = %s
+                          AND (%s OR deleted_at IS NULL)
+                    """).format(datasetsTable)
+
+                    cursor.execute(statement, (datasetID, includeDeleted))
+                    checkpoint = cursor.fetchone()
+
+                    if checkpoint is not None:
+                        statement = sql.SQL("SELECT member_index, session_id, entry_name, labels FROM {} WHERE dataset_id = %s ORDER BY member_index").format(membersTable)
+                        cursor.execute(statement, (datasetID,))
+                        memberRows = cursor.fetchall()
+
+                        statement = sql.SQL("SELECT product_name, matrix_revision_id FROM {} WHERE dataset_id = %s ORDER BY product_name").format(productsTable)
+                        cursor.execute(statement, (datasetID,))
+                        productRows = cursor.fetchall()
+
+        if checkpoint is None:
+            pglMessages.warning(f"Unknown or hidden dataset checkpoint: {datasetID}", level=0)
+            return None
+
+        familyUUID, name, checkpointName, description, status, contractVersion, document = checkpoint
+
+        if status != "complete":
+            raise ValueError("Only completed dataset checkpoints can be loaded.")
+
+        if contractVersion != "pgl.dataset.v1":
+            raise ValueError(f"Unsupported dataset contract: {contractVersion!r}")
+
+        if not isinstance(document, dict):
+            raise ValueError("Dataset metadata must contain a serialized JSON object.")
+
+        dataset = pglSerialize.fromJSON(json.dumps(document, allow_nan=False), strict=True)
+
+        if type(dataset) is not pglDataset:
+            raise TypeError("Saved dataset metadata did not restore as pglDataset.")
+
+        if dataset.name != name or dataset.uuid != str(familyUUID):
+            raise ValueError("Dataset metadata disagrees with its database identity or name.")
+
+        if dataset.data:
+            raise ValueError("Dataset metadata unexpectedly embedded products.")
+
+        if [row[0] for row in memberRows] != list(range(len(memberRows))):
+            raise ValueError("Dataset membership order is invalid.")
+
+        records = [{"sessionID": sessionID, "entryName": entryName, "labels": labels} for _, sessionID, entryName, labels in memberRows]
+        dataset._members = dataset._validateMembers(records)
+        dataset.datasetID = datasetID
+        dataset.checkpointName = checkpointName
+        dataset.description = description
+
+        cls._bindDatasetStorage(dataset, resolvedSettings, postgres)
+        identityJSON = cls._datasetDatabaseIdentityJSON(dataset._datasetDatabaseIdentity)
+
+        dataset.data = {productName: pglDataMatrixReference(str(revisionID), identityJSON) for productName, revisionID in productRows}
+        cls._validateDatasetProducts(dataset)
+
+        dataset._datasetLoadOptions = {
+            "sslRootCert": sslRootCert,
+            "storageOptionsByBackend": storageOptionsByBackend,
+            "cacheDirectory": cacheDirectory,
+            "directLocalPolicy": directLocalPolicy,
+        }
+
+        dataset._datasetBaseline = {
+            "version": 1,
+            "datasetID": datasetID,
+            "familyUUID": dataset.uuid,
+            "databaseIdentity": deepcopy(dataset._datasetDatabaseIdentity),
+            "historyHashes": cls._datasetHistoryHashes(dataset),
+        }
+
+        pglMessages.message(f"Loaded dataset checkpoint {datasetID} with {len(records)} members and {len(productRows)} unopened products; sessions have not been loaded.")
+        return dataset
+    
+    @classmethod
+    def printDataset(cls, dataset, *, verbose=False, settings=None, settingsName=None, sslRootCert=None):
+        """Print membership and product references without opening payloads."""
+        from .pglData import pglDataMatrixReference
+
+        members = dataset._validateMembers(dataset.members)
+        products = cls._validateDatasetProducts(dataset)
+        summaries = cls.getDatasetMemberSummaries(dataset, settings=settings, settingsName=settingsName, sslRootCert=sslRootCert)
+
+        if summaries is None:
+            pglMessages.warning("Cannot print dataset members: database configuration or connection is unavailable.", level=0)
+            return False
+
+        pglMessages.printHeader(f"Dataset: {cls._printValue(dataset.name)}")
+        pglMessages.print(f"  Source checkpoint: {dataset.datasetID if dataset.datasetID is not None else 'Unsaved'}")
+        pglMessages.print(f"  Working members: {len(members)}")
+
+        if dataset.checkpointName:
+            pglMessages.print(f"  Checkpoint name: {cls._printValue(dataset.checkpointName)}")
+
+        if dataset.description:
+            pglMessages.print(f"  Description: {cls._printValue(dataset.description)}")
+
+        pglMessages.print("  Acquisition dates below are not checkpoint creation dates.")
+        pglMessages.print()
+
+        rows = []
+
+        for member in members:
+            sessionID = member["sessionID"]
+            summary = summaries.get(sessionID)
+
+            if summary is None:
+                subjectLabel = "Unknown"
+                acquiredLabel = "Unknown"
+                checkpointLabel = "Unavailable"
+                state = "missing"
+            else:
+                subjectLabel = " + ".join(summary["subjectIDs"]) or "Unknown"
+                acquiredAt = summary["acquiredAt"]
+                acquiredLabel = acquiredAt.isoformat() if acquiredAt is not None else "Unknown"
+                checkpointLabel = summary["checkpointName"] or ""
+                state = "deleted" if summary["deletedAt"] is not None else summary["status"]
+
+            rows.append((subjectLabel, member["entryName"] or "", acquiredLabel, sessionID, checkpointLabel, state))
+
+        rows.sort(key=lambda row: (row[0] == "Unknown", row[0], row[3]))
+        cls._printTable(("Subject", "Entry name", "Acquired", "Session ID", "Checkpoint name", "Source state"), rows, maxWidth=None)
+
+        if products:
+            pglMessages.print()
+            pglMessages.printHeader("Scientific products", fillChar="-")
+            productRows = []
+
+            for name, product in sorted(products.items()):
+                state = "Saved reference; unopened" if isinstance(product, pglDataMatrixReference) else "Working matrix"
+                revisionID = product.matrixRevisionID or "Unpublished"
+                productRows.append((name, state, revisionID))
+
+            cls._printTable(("Product", "Attachment state", "Source revision"), productRows, maxWidth=None)
+            pglMessages.print("  Attachment state does not yet report construction freshness.")
+
+        if verbose:
+            for member in members:
+                if member["labels"]:
+                    pglMessages.print(f"  Session {member['sessionID']} labels: {cls._printValue(member['labels'])}")
+
+            parameterNames = sorted(str(key) for key in dataset.derivedParameters)
+            pglMessages.print(f"  Derived parameter keys: {', '.join(parameterNames) or '(none)'}")
+            pglMessages.print(f"  Recorded actions: {len(dataset.actionHistory)}")
+
+        pglMessages.printHeader()
+        return True
 
 class pglFigureRowExport:
     """Collect rendered figure rows and export one vertically stacked PNG.
