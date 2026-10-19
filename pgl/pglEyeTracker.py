@@ -176,6 +176,26 @@ class pglEyePositionSample(pglTraitSettings):
             units=units,
         )
     
+    @classmethod
+    def fromJSONdict(cls, data, type="all", filename=None):
+        """Restore recorded coordinates without rerunning coordinate conversion.
+
+        Requires stored x and y rather than inventing default coordinates.
+        Uses the existing field-restoration machinery for remaining fields.
+        """
+        if not isinstance(data, dict):
+            raise TypeError(f"Expected an eye-position dictionary in {filename or '<dict>'}.")
+
+        missingFields = [name for name in ("x", "y") if name not in data]
+
+        if missingFields:
+            raise ValueError(f"Eye-position sample is missing {missingFields} in {filename or '<dict>'}.")
+
+        # These coordinates are already in the recorded units. Never apply
+        # pix2deg again while restoring a saved sample.
+        obj = cls(x=data["x"], y=data["y"], pupilSize=data.get("pupilSize"), whichEye=data.get("whichEye", "unknown"), units=data.get("units", "device"))
+        obj.updateTraitsFromDict(data, filename=filename)
+        return obj
 #################################################################
 # Parent class for eye tracker devices
 #################################################################
@@ -286,6 +306,7 @@ class pglEyeTracker(pglDevice):
             eyePositions['either'] = None
 
         return eyePositions
+
 
 
 #################################################################

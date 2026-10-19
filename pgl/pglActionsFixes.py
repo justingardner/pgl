@@ -22,7 +22,7 @@ import posixpath
 
 class pglActionsFixes:
 
-    class pglMigrateTaskDirectories(pglAction):
+    class migrateTaskDirectories(pglAction):
         """Migrate all runs in a session to taskNN_taskName directories."""
 
         dryRun = Bool(default_value=True, help="Preview without modifying files")
@@ -33,32 +33,63 @@ class pglActionsFixes:
             self.version = "1.0"
 
         def _run(self, session=None):
-            """Validate every run, then optionally migrate directories and task IDs."""
+            """Validate every run, then optionally migrate directories and task IDs.
 
+            Inspects resolved lazy fields without loading legacy task directories.
 
+            dryRun=True:
+                Reads source files and reports the plan.
+                Does not modify source files or task caches.
+
+            dryRun=False:
+                Renames task directories, backs up/replaces task settings, and
+                synchronizes taskID on already loaded task objects.
+
+            Only for writable legacy acquisition directories, not immutable
+            database checkpoint sources. Execution is not transactional.
+            """
             if session is None:
                 raise ValueError("No session was supplied.")
 
             plan = []
 
-            # Read from disk directly: legacy directories cannot yet be lazy-loaded.
-            # Finish validation for every run before making any changes.
-            for runIndex, run in enumerate(session.runs):
+            # Read disk directly: legacy task directories cannot yet be loaded
+            # through the current task-directory convention.
+            for runIndex, run in enumerate(session.runs or []):
                 filesystem, runPath, _ = pglBase.validateFilesystem(filesystem=run.filesystem, dataPath=run.fullDataPath, filesystemPrefix=run.filesystemPrefix)
+
                 if filesystem is None:
                     raise ValueError(f"Could not resolve filesystem for run {runIndex + 1}: {run.fullDataPath!r}")
 
                 experimentPath = posixpath.join(runPath, "experimentSettings.json")
+
                 with filesystem.open(experimentPath, "r") as stream:
                     experimentSettings = json.load(stream)
 
                 taskNames = experimentSettings.get("tasks")
+
                 if not isinstance(taskNames, list) or not all(isinstance(name, str) and name for name in taskNames):
                     raise ValueError(f"Expected a list of nonempty task names in {experimentPath!r}")
 
-                # Do not migrate against a different in-memory task ordering.
-                if run._experimentSettings is not None and list(run._experimentSettings.tasks) != taskNames:
+                # Read only resolved settings. Pending fields may still have
+                # initialization values in _trait_values; those are not authoritative.
+                loadedExperimentSettings = None
+
+                if not run.lazyIsPending("experimentSettings"):
+                    loadedExperimentSettings = run._trait_values.get("experimentSettings")
+
+                if loadedExperimentSettings is not None and list(loadedExperimentSettings.tasks) != taskNames:
                     raise ValueError(f"In-memory task names differ from disk for {runPath!r}. Resolve those edits before migration.")
+
+                # Inspect the authoritative full list only when it is resolved.
+                # Individually loaded tasks remain available through _taskCache.
+                loadedTasks = None
+
+                if not run.lazyIsPending("tasks"):
+                    loadedTasks = run._trait_values.get("tasks")
+
+                if loadedTasks is not None and len(loadedTasks) != len(taskNames):
+                    raise ValueError(f"Cached task count differs from disk for {runPath!r}")
 
                 usedSources = set()
 
@@ -80,16 +111,19 @@ class pglActionsFixes:
                         raise FileNotFoundError(f"Neither {legacyPath!r} nor {targetPath!r} exists. Nothing was changed.")
 
                     sourcePath = legacyPath if legacyExists else targetPath
+
                     if not filesystem.isdir(sourcePath):
                         raise ValueError(f"Expected a task directory: {sourcePath!r}")
 
                     if sourcePath in usedSources:
                         raise ValueError(f"Multiple tasks map to {sourcePath!r}")
-                    usedSources.add(sourcePath)
 
+                    usedSources.add(sourcePath)
                     settingsPath = posixpath.join(sourcePath, "settings.json")
+
                     with filesystem.open(settingsPath, "rb") as stream:
                         originalBytes = stream.read()
+
                     taskSettings = json.loads(originalBytes)
 
                     if taskSettings.get("taskSaveName") != taskName:
@@ -104,23 +138,27 @@ class pglActionsFixes:
                     if updateTaskID and filesystem.exists(backupPath):
                         with filesystem.open(backupPath, "rb") as stream:
                             backupBytes = stream.read()
+
                         if backupBytes != originalBytes:
                             raise ValueError(f"Existing backup differs from current settings: {backupPath!r}. Inspect before retrying.")
 
                     updatedBytes = None
+
                     if updateTaskID:
                         taskSettings["taskID"] = expectedTaskID
                         updatedBytes = (json.dumps(taskSettings, indent=4, ensure_ascii=False, allow_nan=True) + "\n").encode("utf-8")
 
-                    # Inspect caches without triggering task loading.
+                    # Preserve individually loaded and fully resolved task objects.
+                    # No access to run.tasks occurs here.
                     cachedTasks = []
                     cachedTask = run._taskCache.get(taskIndex)
+
                     if cachedTask is not None:
                         cachedTasks.append(cachedTask)
-                    if run._tasks is not None:
-                        if len(run._tasks) != len(taskNames):
-                            raise ValueError(f"Cached task count differs from disk for {runPath!r}")
-                        loadedTask = run._tasks[taskIndex]
+
+                    if loadedTasks is not None:
+                        loadedTask = loadedTasks[taskIndex]
+
                         if loadedTask is not None and all(loadedTask is not task for task in cachedTasks):
                             cachedTasks.append(loadedTask)
 
@@ -140,17 +178,22 @@ class pglActionsFixes:
                         "newTaskID": expectedTaskID,
                         "updateTaskID": updateTaskID,
                     }
+
                     plan.append((run, filesystem, change, originalBytes, updatedBytes, backupName, cachedTasks))
 
             self.changes = [entry[2] for entry in plan]
 
             for _, _, change, _, _, _, _ in plan:
                 operations = []
+
                 if change["rename"]:
                     operations.append(f"rename {posixpath.basename(change['source'])} -> {posixpath.basename(change['destination'])}")
+
                 if change["updateTaskID"]:
                     operations.append(f"taskID {change['oldTaskID']!r} -> {change['newTaskID']}")
+
                 description = "; ".join(operations) if operations else "already migrated"
+
                 if operations or self.verbose:
                     pglMessages.print(f"{change['runPath']} | Task {change['taskIndex'] + 1}: {description}")
 
@@ -162,7 +205,7 @@ class pglActionsFixes:
                 sourcePath = change["source"]
                 targetPath = change["destination"]
 
-                # Detect settings changes since preflight before touching this task.
+                # Recheck the settings immediately before modifying this task.
                 with filesystem.open(posixpath.join(sourcePath, "settings.json"), "rb") as stream:
                     if stream.read() != originalBytes:
                         raise ValueError(f"Settings changed after validation: {sourcePath!r}")
@@ -170,6 +213,7 @@ class pglActionsFixes:
                 if change["rename"]:
                     if filesystem.exists(targetPath):
                         raise FileExistsError(f"Destination appeared after validation: {targetPath!r}")
+
                     filesystem.mv(sourcePath, targetPath, recursive=True)
 
                 if change["updateTaskID"]:
@@ -183,17 +227,211 @@ class pglActionsFixes:
                     with filesystem.open(settingsPath, "wb") as stream:
                         stream.write(updatedBytes)
 
-                # Preserve loaded objects and edits; synchronize only taskID.
+                # Preserve loaded objects and other edits; synchronize only taskID.
                 for task in cachedTasks:
                     task.settings.taskID = change["newTaskID"]
 
-                # Remove failed-load entries left by older versions of getTaskAt().
+                # Remove failed-load entries left by older getTaskAt versions.
                 if change["taskIndex"] in run._taskCache and run._taskCache[change["taskIndex"]] is None:
                     del run._taskCache[change["taskIndex"]]
 
             pglMessages.message("Task directory migration complete for all runs in the session.")
             return session
     
+    
+    class migrateParameterDirectories(pglAction):
+        """Move flat task parameter bundles into their named subdirectories.
+
+        Preview may inspect checkpoint-backed sessions.
+
+        Execution supports ordinary local acquisition directories only. The
+        caller must own these writable sources; registered checkpoint payloads
+        must never be passed through a different filesystem to bypass protection.
+
+        No JSON contents are rewritten. Execution is not transactional.
+        """
+
+        dryRun = Bool(default_value=True, help="Preview without modifying files")
+        verbose = Bool(default_value=False, help="Print tasks without legacy parameter bundles")
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.version = "1.0"
+
+        def _run(self, session=None):
+            """Validate all candidate bundles, then optionally relocate their files."""
+            import json
+            import posixpath
+            from fsspec.implementations.local import LocalFileSystem
+
+            if session is None:
+                raise ValueError("No session was supplied.")
+
+            if not self.dryRun and session.sessionID is not None:
+                raise ValueError("Do not modify saved checkpoint sources. Create a separate session over writable acquisition directories or exported copies.")
+
+            componentNames = ("settings.json", "state.json", "data.json")
+            plan = []
+            seenSources = set()
+
+            for runIndex, run in enumerate(session.runs or []):
+                filesystem = run.filesystem
+                runPath = run.fullDataPath
+
+                if filesystem is None or not runPath:
+                    raise ValueError(f"Run {runIndex}: no explicit filesystem/source path.")
+
+                if not self.dryRun:
+                    # Deliberately exclude checkpoint wrappers and remote filesystems.
+                    if type(filesystem) is not LocalFileSystem:
+                        raise ValueError(f"Run {runIndex}: execution currently requires an ordinary LocalFileSystem.")
+
+                    # Use a freshly constructed acquisition session. Do not silently
+                    # discard loaded task objects or their possible working edits.
+                    loadedTasks = None if run.lazyIsPending("tasks") else run._trait_values.get("tasks")
+
+                    if loadedTasks is not None or run._taskCache:
+                        raise ValueError(f"Run {runIndex}: tasks are already resolved/cached. Create a fresh session over the acquisition directories before migration.")
+
+                experimentPath = posixpath.join(runPath, "experimentSettings.json")
+
+                with filesystem.open(experimentPath, "rb") as stream:
+                    experimentSettings = json.loads(stream.read())
+
+                if not isinstance(experimentSettings, dict):
+                    raise ValueError(f"Expected an object in {experimentPath!r}.")
+
+                taskNames = experimentSettings.get("tasks")
+
+                if not isinstance(taskNames, list) or not all(isinstance(name, str) and name for name in taskNames):
+                    raise ValueError(f"Expected nonempty task names in {experimentPath!r}.")
+
+                for taskIndex, taskName in enumerate(taskNames):
+                    if taskName in (".", "..") or any(character in taskName for character in ("/", "\\", "\x00")):
+                        raise ValueError(f"Unsafe task name: {taskName!r}")
+
+                    # Accept either directory convention, but never guess between
+                    # two existing copies of the task.
+                    currentName = pglTaskBase.getTaskDirectoryName(taskID=taskIndex, taskName=taskName)
+                    legacyName = taskName if taskIndex == 0 else f"{taskName}Phase{taskIndex:02d}"
+                    candidatePaths = list(dict.fromkeys(posixpath.join(runPath, name) for name in (currentName, legacyName)))
+                    existingPaths = [path for path in candidatePaths if filesystem.exists(path)]
+
+                    if len(existingPaths) != 1:
+                        raise ValueError(f"Run {runIndex}, task {taskIndex}: expected exactly one task directory; found {existingPaths!r}.")
+
+                    taskPath = existingPaths[0]
+
+                    if not filesystem.isdir(taskPath):
+                        raise ValueError(f"Expected a task directory: {taskPath!r}")
+
+                    parameterRoot = posixpath.join(taskPath, "parameters")
+
+                    if not filesystem.isdir(parameterRoot):
+                        raise ValueError(f"Missing parameter directory: {parameterRoot!r}")
+
+                    componentPaths = {name: posixpath.join(parameterRoot, name) for name in componentNames}
+                    existingComponents = [name for name, path in componentPaths.items() if filesystem.exists(path)]
+
+                    if not existingComponents:
+                        if self.verbose:
+                            pglMessages.print(f"{taskPath}: no flat parameter bundle")
+                        continue
+
+                    if len(existingComponents) != len(componentNames):
+                        raise ValueError(f"Incomplete flat parameter bundle at {parameterRoot!r}: found {existingComponents!r}.")
+
+                    contents = {}
+
+                    for componentName, componentPath in componentPaths.items():
+                        if not filesystem.isfile(componentPath):
+                            raise ValueError(f"Expected a component file: {componentPath!r}")
+
+                        with filesystem.open(componentPath, "rb") as stream:
+                            contents[componentName] = stream.read()
+
+                        # Validate JSON structure without instantiating saved classes.
+                        decoded = json.loads(contents[componentName])
+
+                        if not isinstance(decoded, dict):
+                            raise ValueError(f"Expected a JSON object in {componentPath!r}.")
+
+                    parameterSettings = json.loads(contents["settings.json"])
+
+                    if parameterSettings.get("__class__") != "pglParameterSettings":
+                        raise ValueError(f"Unrecognized flat settings record at {parameterRoot!r}; refusing to infer a parameter bundle.")
+
+                    parameterName = parameterSettings.get("name")
+
+                    if not isinstance(parameterName, str) or not parameterName.strip():
+                        raise ValueError(f"Missing parameter name at {parameterRoot!r}.")
+
+                    if parameterName in (".", "..") or any(character in parameterName for character in ("/", "\\", "\x00")):
+                        raise ValueError(f"Unsafe parameter name: {parameterName!r}")
+
+                    destination = posixpath.join(parameterRoot, parameterName)
+
+                    if filesystem.exists(destination):
+                        raise FileExistsError(f"Parameter destination already exists: {destination!r}. Inspect rather than merge automatically.")
+
+                    # Avoid planning the same source twice when runs are duplicated.
+                    sourceKey = (id(filesystem), parameterRoot)
+
+                    if sourceKey in seenSources:
+                        raise ValueError(f"Duplicate migration source: {parameterRoot!r}")
+
+                    seenSources.add(sourceKey)
+
+                    change = {
+                        "runIndex": runIndex,
+                        "taskIndex": taskIndex,
+                        "taskName": taskName,
+                        "parameterName": parameterName,
+                        "source": parameterRoot,
+                        "destination": destination,
+                        "files": list(componentNames),
+                    }
+
+                    plan.append((filesystem, change, contents))
+
+            self.changes = [change for _, change, _ in plan]
+
+            for _, change, _ in plan:
+                pglMessages.print(f"{change['source']} -> {change['destination']} ({', '.join(componentNames)})")
+
+            if self.dryRun:
+                pglMessages.message(f"Preview only: {len(plan)} flat parameter bundle(s); no source files or task caches changed.")
+                return session
+
+            # Recheck all planned sources before beginning any filesystem changes.
+            for filesystem, change, contents in plan:
+                if filesystem.exists(change["destination"]):
+                    raise FileExistsError(f"Destination appeared after validation: {change['destination']!r}")
+
+                for componentName, expectedBytes in contents.items():
+                    sourcePath = posixpath.join(change["source"], componentName)
+
+                    with filesystem.open(sourcePath, "rb") as stream:
+                        if stream.read() != expectedBytes:
+                            raise ValueError(f"Source changed after validation: {sourcePath!r}")
+
+            for filesystem, change, contents in plan:
+                destination = change["destination"]
+                filesystem.makedirs(destination, exist_ok=False)
+
+                # Preserve exact bytes. A failure may leave a partially moved
+                # bundle; subsequent preflight refuses to merge it silently.
+                for componentName, expectedBytes in contents.items():
+                    sourcePath = posixpath.join(change["source"], componentName)
+                    targetPath = posixpath.join(destination, componentName)
+                    filesystem.mv(sourcePath, targetPath)
+
+                    with filesystem.open(targetPath, "rb") as stream:
+                        if stream.read() != expectedBytes:
+                            raise ValueError(f"Migration verification failed: {targetPath!r}")
+
+            pglMessages.message(f"Parameter-directory migration complete: {len(plan)} bundle(s).")
+            return session
     ##################################################################
     # class pglActionRecreateExperimentDataFromTasks
     ##################################################################

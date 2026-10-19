@@ -308,7 +308,7 @@ class pglParameter(pglStateDataSettings):
         self._rng.__setstate__(self.state.randomNumberGeneratorState)
         
         # give user feedback on load
-        pglMessages.message(f"Loaded parameter {self.settings.name} from: {parameterDir}", messageType='parameter')        
+        #pglMessages.message(f"Loaded parameter {self.settings.name} from: {parameterDir}", messageType='parameter')        
     
     @classmethod
     def from_settings_state_data(cls, settings, state, data):

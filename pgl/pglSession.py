@@ -2382,8 +2382,10 @@ class pglSession(pglActionable):
     filesystemPrefix = Unicode(allow_none=True, default_value="", help="Filesystem protocol prefix", visible=False)
     sessionID = Int(default_value=None, allow_none=True, help="Most recently loaded or successfully saved database checkpoint ID", serialize=False)
     description = Unicode(default_value=None, allow_none=True, help="Checkpoint description carried forward by saveSession; an empty string clears it.", serialize=False)
+    checkpointName = Unicode(default_value=None, allow_none=True, help="Short checkpoint label carried forward by saveSession; an empty string clears it.", serialize=False)
     runs = List(Instance(pglRun), allow_none=True, help="List of behavioral runs")
     mne = Instance(pglMNE, allow_none=True, help="MEG/EEG data")
+    dataMatrices = Dict(default_value={}, help="Named scientific matrices owned by this working session; persisted explicitly through session checkpoint integration", serialize=False)
 
     # Explicit labels apply only when there are no behavioral runs.
     # Checkpoint persistence will handle these explicitly rather than relying
@@ -2658,19 +2660,22 @@ class pglSession(pglActionable):
 
         return pglStorage.loadSession(sessionID, settings=settings, settingsName=settingsName, storageOptionsByBackend=storageOptionsByBackend, sslRootCert=sslRootCert, includeDeleted=includeDeleted, cacheDirectory=cacheDirectory, directLocalPolicy=directLocalPolicy)
 
-    def saveSession(self, *, parentSessionID=None, settings=None, settingsName=None, backendID=None, description=None, ingestMethod="manual", storageOptions=None, sslRootCert=None):
-            """Save through pglStorage.
+    def saveSession(self, *, parentSessionID=None, settings=None, settingsName=None, backendID=None, checkpointName=None, description=None, ingestMethod="manual", storageOptions=None, sslRootCert=None):
+        """Save current contents through pglStorage.
 
-            Defaults to the session's current checkpoint as parent.
-            description=None carries forward the session's description.
-            An explicit blank description clears it.
+        Defaults to the session's current checkpoint as parent.
 
-            Storage updates sessionID and description after successful completion.
-            """
-            from .pglStorage import pglStorage
+        checkpointName=None carries forward self.checkpointName.
+        description=None carries forward self.description.
+        Explicit blank strings clear the corresponding annotation.
 
-            return pglStorage.saveSession(self, parentSessionID=parentSessionID, settings=settings, settingsName=settingsName, backendID=backendID, description=description, ingestMethod=ingestMethod, storageOptions=storageOptions, sslRootCert=sslRootCert)
-        
+        Storage updates checkpoint identity, annotations, and the history
+        baseline only after successful commit and connection cleanup.
+        """
+        from .pglStorage import pglStorage
+
+        return pglStorage.saveSession(self, parentSessionID=parentSessionID, settings=settings, settingsName=settingsName, backendID=backendID, checkpointName=checkpointName, description=description, ingestMethod=ingestMethod, storageOptions=storageOptions, sslRootCert=sslRootCert)        
+    
     def getPipeline(self, name=None, *, settings=None, settingsName=None, storageOptionsByBackend=None, sslRootCert=None):
         """Ask storage to extract a recipe and resolve its replay boundary.
 
@@ -2708,3 +2713,61 @@ class pglSession(pglActionable):
         from .pglStorage import pglStorage
 
         return pglStorage.exportFigRows(filename, filesystem=filesystem, storageOptions=storageOptions, dpi=dpi, overwrite=overwrite, maxPixels=maxPixels)
+    
+    def getBehaviorData(self):
+        """Return the session-owned comprehensive behavioral matrix.
+
+        First access reads behavioral sources, constructs a pglDataMatrix,
+        and attaches it under dataMatrices["behavior"].
+
+        Subsequent access returns the same attached object. Recorded session
+        sources are assumed immutable; this accessor does not perform source
+        freshness checks or automatically reconstruct existing matrices.
+
+        Does not access MNE payloads or publish database/Zarr records.
+
+        Persistence note:
+            Session matrix save/load integration is a separate implementation
+            step. This method currently provides lazy construction and reuse
+            within the working session.
+        """
+        from .pglBehavior import pglBehavior
+        from .pglData import pglDataMatrix
+
+        matrixName = "behavior"
+
+        if matrixName in self.dataMatrices:
+            matrix = self.dataMatrices[matrixName]
+
+            if not isinstance(matrix, pglDataMatrix):
+                raise TypeError(f"dataMatrices[{matrixName!r}] must be a pglDataMatrix.")
+
+            # Validate the behavioral contract without computing arrays.
+            # An invalid attachment must not be silently replaced.
+            pglBehavior._requireBehaviorData(matrix)
+            return matrix
+
+        # Construct completely before attaching. Extraction failure leaves
+        # the session's matrix collection unchanged.
+        matrix = pglBehavior.extractSession(self, name=matrixName)
+        pglBehavior._requireBehaviorData(matrix)
+
+        # Assign a new dictionary so trait observers can see the attachment.
+        # The matrix itself is not copied.
+        self.dataMatrices = {**self.dataMatrices, matrixName: matrix}
+
+        return matrix
+
+    def getBehaviorTable(self, **options):
+        """Return an independent pandas trial table for this session.
+
+        Obtains or constructs the session-owned behavioral matrix internally.
+        Options configure only this table projection, not matrix extraction.
+
+        May read behavioral sources on first access and materialize matrix
+        arrays for projection. Does not publish database/Zarr records.
+        Editing the returned DataFrame does not modify the source matrix.
+        """
+        from .pglBehavior import pglBehavior
+
+        return pglBehavior.getBehaviorTable(self.getBehaviorData(), **options)

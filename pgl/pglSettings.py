@@ -1,3 +1,4 @@
+
 ################################################################
 #   filename: pglSettings.py
 #    purpose: Provides settings management for pgl
@@ -860,6 +861,17 @@ class pglTraitSettings(HasTraits, pglSerialize):
 
         # fallback
         return a == b
+    
+    def extractAsDataFrameColumn(self):
+        """Return named scalar components for behavioral extraction.
+
+        Subclasses may return a dictionary whose keys are camelCaps component
+        names and whose values are numeric, Boolean, string, or None.
+
+        The default explicitly marks this object as unsupported.
+        This is an analysis projection, not a serialization method.
+        """
+        return "unsupported"
 
 class pglStateDataSettings(pglTraitSettings):
     '''
@@ -1455,7 +1467,7 @@ class pglSettings(pglTraitSettings):
                 self.displays.insert(0, selected)
             else:
                 self.displays.insert(0, selected)
-        
+                        
 class pglSettingsList(pglTraitSettings):
 
     settingsList = List(Instance(pglSettings), buttons=True, setDefault=True, settingsListKey="name", traitDisplayName="Choose settings", help="List of settings")

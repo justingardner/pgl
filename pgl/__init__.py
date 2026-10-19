@@ -35,6 +35,7 @@ from .pglActionsFixes import pglActionsFixes
 from .pglActionsMNE import pglActionsMNE
 from .pglDataset import pglDataset
 from .pglData import pglDataMatrix, pglDataMatrixReference
+from .pglBehavior import pglBehavior
 
 # Device specific imports (eye trackers, etc.)
 from .pglVPixx import pglProPixx, pglDataPixx
