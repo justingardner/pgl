@@ -28,34 +28,41 @@ class pglStorage:
     MIGRATION_LOCK = 734_291_806_115
 
     @staticmethod
-    def print(details=None, postgres=None, *, settings=None, settingsName=None, sessionID=None, summary=False, nRows=10, maxWidth=48, sslRootCert=None, includeDeleted=False, storageOptionsByBackend=None):
-        """Select a session listing, checkpoint detail view, or database report.
+    def print(details=None, postgres=None, *, settings=None, settingsName=None, sessionID=None, summary=False, datasets=False, nRows=10, maxWidth=48, sslRootCert=None, includeDeleted=False, storageOptionsByBackend=None):
+        """Select a session listing, dataset listing, or database report.
 
         Default:
-            List all visible sessions grouped by root experiment and subject,
-            displaying their actual parent-child relationships.
+            List visible sessions grouped by root experiment and subject,
+            displaying actual parent-child relationships.
+
+        datasets=True:
+            List visible dataset checkpoints grouped by dataset name.
+            Show checkpoint names, member counts, and scientific product names.
+            Does not load datasets, sessions, or scientific payloads.
 
         summary=True:
-            Show the previous database summary: table counts and statuses.
+            Show database table counts and session statuses.
 
         sessionID:
-            Show one checkpoint's metadata, subjects, and linked files.
+            Show one session checkpoint's metadata, subjects, and linked files.
 
         details:
             Show one table, an iterable of tables, or "all".
 
-        summary, sessionID, and details are mutually exclusive.
-        nRows limits table detail views only, not the session listing.
+        datasets, summary, sessionID, and details are mutually exclusive.
+        nRows limits table detail views only, not readable listings.
 
-        The grouped listing reads verified root experimentSettings.json files.
-        storageOptionsByBackend supplies runtime payload credentials/options.
-        No runs, tasks, or MNE payloads are reconstructed.
+        includeDeleted includes soft-deleted checkpoints.
+        storageOptionsByBackend applies to the session listing's verified
+        acquisition-settings reads.
 
-        Returns False for unavailable configuration/connection or an unknown
-        checkpoint in the single-session view. Other errors propagate.
+        Read-only; does not publish or modify records.
         """
         if type(summary) is not bool:
             raise ValueError("summary must be a boolean.")
+
+        if type(datasets) is not bool:
+            raise ValueError("datasets must be a boolean.")
 
         if type(includeDeleted) is not bool:
             raise ValueError("includeDeleted must be a boolean.")
@@ -66,8 +73,11 @@ class pglStorage:
         if type(maxWidth) is not int or maxWidth < 8:
             raise ValueError("maxWidth must be an integer of at least 8.")
 
-        if sum((details is not None, sessionID is not None, summary)) > 1:
-            raise ValueError("Supply only one of details, sessionID, or summary=True.")
+        if sum((details is not None, sessionID is not None, summary, datasets)) > 1:
+            raise ValueError("Supply only one of details, sessionID, summary=True, or datasets=True.")
+
+        if datasets:
+            return pglStorage.printDatasets(postgres=postgres, settings=settings, settingsName=settingsName, sslRootCert=sslRootCert, includeDeleted=includeDeleted)
 
         if sessionID is not None:
             return pglStorage.printSession(sessionID, postgres=postgres, settings=settings, settingsName=settingsName, sslRootCert=sslRootCert, includeDeleted=includeDeleted)
@@ -77,6 +87,146 @@ class pglStorage:
 
         return pglStorage.printSessions(postgres=postgres, settings=settings, settingsName=settingsName, sslRootCert=sslRootCert, includeDeleted=includeDeleted, storageOptionsByBackend=storageOptionsByBackend)
 
+    @staticmethod
+    def printDatasets(postgres=None, *, settings=None, settingsName=None, sslRootCert=None, includeDeleted=False):
+        """Print saved dataset checkpoints grouped by name.
+
+        Shows:
+            Dataset ID.
+            Optional checkpoint name.
+            Deleted/incomplete state markers.
+            Saved member count.
+            Scientific product names.
+
+        Distinct families sharing a name are labeled by family UUID.
+        No parent-child lineage is inferred between dataset checkpoints.
+        Descriptions are omitted; names are not truncated.
+
+        Counts describe recorded membership, not current source availability.
+        Product names do not establish construction freshness.
+
+        Reads database metadata in one consistent snapshot.
+        Does not reconstruct datasets/sessions, open matrix payloads,
+        or modify database records.
+
+        Returns False for unavailable configuration/connection.
+        Other errors propagate.
+        """
+        from psycopg.rows import tuple_row
+
+        if type(includeDeleted) is not bool:
+            raise ValueError("includeDeleted must be a boolean.")
+
+        postgres = pglStorage._printPostgres(postgres, settings=settings, settingsName=settingsName)
+
+        if postgres is None:
+            return False
+
+        datasetsTable = sql.Identifier(postgres.databaseSchema, "dataset")
+        membersTable = sql.Identifier(postgres.databaseSchema, "dataset_members")
+        productsTable = sql.Identifier(postgres.databaseSchema, "dataset_products")
+
+        with postgres.connect(sslRootCert=sslRootCert) as connection:
+            if connection is None:
+                return False
+
+            with connection.transaction():
+                connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+
+                with connection.cursor(row_factory=tuple_row) as cursor:
+                    cursor.execute("SELECT current_database(), transaction_timestamp()")
+                    databaseName, snapshotTime = cursor.fetchone()
+
+                    # Separate correlated queries avoid multiplying membership
+                    # rows by product rows when calculating counts.
+                    statement = sql.SQL("""
+                        SELECT checkpoint.dataset_id,
+                               checkpoint.family_uuid::text,
+                               checkpoint.name,
+                               checkpoint.checkpoint_name,
+                               checkpoint.status,
+                               checkpoint.deleted_at,
+                               (
+                                   SELECT count(*)
+                                   FROM {members} AS membership
+                                   WHERE membership.dataset_id = checkpoint.dataset_id
+                               ) AS member_count,
+                               ARRAY(
+                                   SELECT product.product_name
+                                   FROM {products} AS product
+                                   WHERE product.dataset_id = checkpoint.dataset_id
+                                   ORDER BY product.product_name
+                               ) AS product_names
+                        FROM {datasets} AS checkpoint
+                        WHERE (%s OR checkpoint.deleted_at IS NULL)
+                        ORDER BY checkpoint.dataset_id
+                    """).format(datasets=datasetsTable, members=membersTable, products=productsTable)
+
+                    cursor.execute(statement, (includeDeleted,))
+                    rows = cursor.fetchall()
+
+        grouped = {}
+
+        for datasetID, familyUUID, name, checkpointName, status, deletedAt, memberCount, productNames in rows:
+            record = {
+                "datasetID": datasetID,
+                "checkpointName": checkpointName,
+                "status": status,
+                "deletedAt": deletedAt,
+                "memberCount": memberCount,
+                "productNames": productNames,
+            }
+            grouped.setdefault(name, {}).setdefault(familyUUID, []).append(record)
+
+        def nameOrder(value):
+            return (value is None, "" if value is None else value.casefold(), "" if value is None else value)
+
+        def checkpointLine(record, prefix):
+            label = f"{prefix}datasetID: {record['datasetID']}"
+
+            if record["checkpointName"]:
+                label += f" ({pglStorage._printValue(record['checkpointName'])})"
+
+            if record["deletedAt"] is not None:
+                label += " [deleted]"
+
+            if record["status"] != "complete":
+                label += f" [{pglStorage._printValue(record['status'])}]"
+
+            products = ", ".join(pglStorage._printValue(name) for name in record["productNames"]) or "(none)"
+            return f"{label} | members: {record['memberCount']} | products: {products}"
+
+        pglMessages.printHeader("Datasets")
+        pglMessages.message(f"Database: {databaseName}.{postgres.databaseSchema}", wrapText=False)
+        pglMessages.message(f"Metadata snapshot: {snapshotTime}", wrapText=False)
+        pglMessages.print("  Including deleted datasets." if includeDeleted else "  Deleted datasets excluded.")
+        pglMessages.print()
+
+        if not rows:
+            pglMessages.print("  (no visible datasets)")
+        else:
+            for name in sorted(grouped, key=nameOrder):
+                pglMessages.print(pglStorage._printValue(name))
+                families = grouped[name]
+                showFamilies = len(families) > 1
+
+                # Order families by their first visible checkpoint ID.
+                familyOrder = sorted(families, key=lambda family: min(record["datasetID"] for record in families[family]))
+
+                for familyUUID in familyOrder:
+                    if showFamilies:
+                        pglMessages.print(f"  family: {familyUUID}")
+
+                    prefix = "    " if showFamilies else "  "
+
+                    for record in sorted(families[familyUUID], key=lambda record: record["datasetID"]):
+                        pglMessages.print(checkpointLine(record, prefix))
+
+                pglMessages.print()
+
+        pglMessages.printHeader()
+        return True
+    
     @staticmethod
     def _printPostgres(postgres=None, *, settings=None, settingsName=None):
         """Resolve reporting configuration without opening a connection."""
