@@ -404,27 +404,66 @@ class pglDataset(pglActionable):
     def getBehaviorTable(self, *, settings=None, settingsName=None, storageOptionsByBackend=None, sslRootCert=None, cacheDirectory=None, directLocalPolicy=None, **options):
         """Return an independent pandas trial table from dataset behavior.
 
-        Obtains the dataset-owned comprehensive matrix through getBehaviorData,
-        then delegates task selection, timing, and conversion to pglBehavior.
-
-        Examples:
-            dataset.getBehaviorTable(taskName="memoryDescriptionTask")
-            dataset.getBehaviorTable(taskSelection="all")
-            dataset.getBehaviorTable(taskName="memoryDescriptionTask", responseReference="segment", segmentNum=1)
-
-        Task selection resolves independently within each member's runs.
-        Table options do not create separate comprehensive attachments.
-
-        First access may construct and attach behavior.
-        Projection may materialize scientific arrays.
-        Editing the returned DataFrame does not modify the source matrix.
+        Obtains or constructs the dataset-owned comprehensive matrix.
         Does not publish database records or payloads.
+
+        Missing, ambiguous, or invalid task selections produce a warning
+        and return None. Other construction/projection errors propagate.
+
+        Without explicit selection, each run must contain exactly one task.
+        Automatic main-task resolution is not yet implemented.
         """
         from .pglBehavior import pglBehavior
 
         matrix = self.getBehaviorData(settings=settings, settingsName=settingsName, storageOptionsByBackend=storageOptionsByBackend, sslRootCert=sslRootCert, cacheDirectory=cacheDirectory, directLocalPolicy=directLocalPolicy)
 
         if matrix is None:
+            return None
+
+        data = pglBehavior._requireBehaviorData(matrix)
+        taskName = options.get("taskName")
+        taskIndex = options.get("taskIndex")
+        taskSelection = options.get("taskSelection")
+
+        # Check selection before projection so ordinary selection problems
+        # can produce guidance without concealing unrelated scientific errors.
+        try:
+            pglBehavior._selectBehaviorTrials(data, taskName=taskName, taskIndex=taskIndex, taskSelection=taskSelection)
+        except (TypeError, ValueError) as error:
+            noSelection = all(value is None for value in (taskName, taskIndex, taskSelection))
+
+            if noSelection:
+                heading = (
+                    "Cannot choose a behavioral task automatically. "
+                    "Each run must contain exactly one task when no selection is supplied; "
+                    "automatic main-task selection is not implemented yet."
+                )
+            else:
+                heading = "The requested behavioral task selection could not be resolved."
+
+            # List recorded names without guessing which is the main task.
+            taskSources = data.attrs.get("taskSources", [])
+            availableNames = sorted({
+                source["taskSaveName"]
+                for source in taskSources
+                if isinstance(source, dict) and isinstance(source.get("taskSaveName"), str) and source["taskSaveName"]
+            }) if isinstance(taskSources, list) else []
+
+            message = heading + "\n\n" + str(error)
+
+            if availableNames:
+                message += "\n\nRecorded taskSaveName values: " + ", ".join(repr(name) for name in availableNames)
+
+            message += (
+                "\n\nChoose a task by its exact saved name:"
+                "\n  trials = dataset.getBehaviorTable(taskName=\"yourTaskSaveName\")"
+                "\n\nOr include all tasks:"
+                "\n  trials = dataset.getBehaviorTable(taskSelection=\"all\", includeTriggers=False)"
+                "\n\nRepeated task names require a taskIndex selection."
+                "\nNo table was returned. The behavioral matrix has not been discarded; no save is needed."
+            )
+
+            pglMessages.warning(message)
             return None
 
         return pglBehavior.getBehaviorTable(matrix, **options)
