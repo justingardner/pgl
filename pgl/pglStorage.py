@@ -611,6 +611,170 @@ class pglStorage:
         return validated
 
     @classmethod
+    def getDatasetBehaviorData(cls, dataset, *, settings=None, settingsName=None, storageOptionsByBackend=None, sslRootCert=None, cacheDirectory=None, directLocalPolicy=None):
+        """Return or construct the dataset-owned comprehensive behavior matrix.
+
+        Existing products:
+            Resolve through the existing dataset product loader.
+            Validate the behavioral schema; never silently replace an invalid
+            product. Do not automatically rebuild after membership/code changes.
+
+        Missing products:
+            Load each exact member checkpoint afresh, bypassing _sessionCache.
+            Extract behavioral sources rather than reuse session attachments.
+            Combine in membership order and attach only after success.
+
+        Reads database metadata and behavioral payloads.
+        The general session loader may also inspect matrix/MNE metadata.
+        Does not publish database records or payloads.
+
+        Initial construction is in-memory, not bounded-memory streaming.
+        Concurrent mutation of membership/products during construction is
+        unsupported; detectable changes prevent attachment.
+        """
+        from .pglBehavior import pglBehavior
+
+        productName = "behavior"
+
+        # Preserve existing reference resolution and database-binding checks.
+        if productName in dataset.data:
+            matrix = cls.getDatasetData(dataset, productName, settings=settings, settingsName=settingsName, storageOptionsByBackend=storageOptionsByBackend, sslRootCert=sslRootCert)
+
+            if matrix is None:
+                return None
+
+            pglBehavior._requireBehaviorData(matrix)
+            return matrix
+
+        cls._requireSafeDatasetCheckpoint(dataset)
+        members = dataset._validateMembers(dataset.members)
+
+        if not members:
+            raise ValueError("Cannot construct behavioral data from an empty dataset.")
+
+        resolvedSettings, postgres = cls._resolveDatasetStorage(dataset, settings=settings, settingsName=settingsName)
+
+        if postgres is None:
+            return None
+
+        databaseIdentity = deepcopy(cls._checkpointDatabaseIdentity(postgres))
+        originalBinding = deepcopy(dataset._datasetDatabaseIdentity)
+        originalDatasetID = dataset.datasetID
+
+        options = dict(dataset._datasetLoadOptions)
+
+        if storageOptionsByBackend is not None:
+            options["storageOptionsByBackend"] = storageOptionsByBackend
+
+        if sslRootCert is not None:
+            options["sslRootCert"] = sslRootCert
+
+        if cacheDirectory is not None:
+            options["cacheDirectory"] = cacheDirectory
+
+        if directLocalPolicy is not None:
+            options["directLocalPolicy"] = directLocalPolicy
+
+        # Inspection of an old/deleted dataset does not implicitly authorize
+        # construction from deleted source checkpoints.
+        options["includeDeleted"] = False
+
+        matrices = []
+        combined = None
+
+        try:
+            for memberIndex, member in enumerate(members):
+                sessionID = member["sessionID"]
+                pglMessages.message(f"Constructing dataset behavior: member {memberIndex + 1}/{len(members)}, checkpoint {sessionID}...")
+
+                # Deliberately bypass getDatasetSession(): its cache contains
+                # editable working objects, not authoritative saved sources.
+                session = cls.loadSession(sessionID, settings=resolvedSettings, **options)
+
+                if session is None:
+                    raise RuntimeError(f"Cannot construct dataset behavior: member checkpoint {sessionID} could not be loaded.")
+
+                try:
+                    if session.sessionID != sessionID:
+                        raise ValueError("Loaded session identity differs from the requested member.")
+
+                    baseline = session._checkpointBaseline
+
+                    if baseline.get("databaseIdentity") != databaseIdentity:
+                        raise ValueError("Loaded member belongs to a different configured database.")
+
+                    if not session.runs:
+                        raise ValueError(f"Member checkpoint {sessionID} has no behavioral runs. Nonbehavioral members are not silently skipped.")
+
+                    # Always extract saved behavioral sources. A previously
+                    # attached behavior product may describe an earlier working
+                    # state and is not assumed equivalent to this checkpoint.
+                    matrix = pglBehavior.extractSession(session, name=productName)
+                    matrices.append(matrix)
+
+                finally:
+                    # These are privately loaded objects, not cached user
+                    # sessions. Their attached matrices are not used downstream.
+                    for attachment in session.dataMatrices.values():
+                        try:
+                            attachment.close()
+                        except Exception as error:
+                            pglMessages.warning(f"Could not close an unused member matrix ({type(error).__name__}).", level=1)
+
+            combined = pglBehavior.combineSessionData(matrices, members=members, databaseIdentity=databaseIdentity, name=productName)
+
+            # Supplement, rather than overwrite, the assembler/input provenance.
+            combined.provenance = {
+                **deepcopy(combined.provenance),
+                "orchestration": "pglStorage.getDatasetBehaviorData",
+                "sourceState": "freshlyLoadedCheckpointBehavior",
+                "datasetCheckpointIDAtConstruction": originalDatasetID,
+                "sourceReadPolicy": "Exact member checkpoints loaded afresh; working session cache and saved session matrix attachments not reused",
+                "membershipSnapshot": deepcopy(members),
+            }
+
+            # This records how sources were obtained. It does not assert that
+            # unsupported scientific values were losslessly encoded, or change
+            # the extractSession checkpoint-equivalence qualification.
+            cls._requireSafeDatasetCheckpoint(dataset)
+
+            if dataset.members != members:
+                raise ValueError("Dataset membership changed during behavioral construction; no product was attached.")
+
+            if dataset.datasetID != originalDatasetID or dataset._datasetDatabaseIdentity != originalBinding:
+                raise ValueError("Dataset identity/binding changed during behavioral construction; no product was attached.")
+
+            if productName in dataset.data:
+                raise ValueError("A behavior product was attached during construction; it was not replaced.")
+
+            pglBehavior._requireBehaviorData(combined)
+            cls._validateDataMatrixEncoding(combined.requireData())
+
+            cls._bindDatasetStorage(dataset, resolvedSettings, postgres)
+            dataset.data = {**dataset.data, productName: combined}
+
+            pglMessages.message(f"Constructed dataset behavior from {len(members)} member checkpoints. Attached as data['behavior']; not saved.")
+            return combined
+
+        except BaseException:
+            if combined is not None:
+                try:
+                    combined.close()
+                except Exception:
+                    pass
+
+            raise
+
+        finally:
+            # combineSessionData creates independent arrays, so its result
+            # does not depend on the temporary extracted member matrices.
+            for matrix in matrices:
+                try:
+                    matrix.close()
+                except Exception as error:
+                    pglMessages.warning(f"Could not close a temporary behavioral matrix ({type(error).__name__}).", level=1)
+
+    @classmethod
     def _verifySessionProducts(cls, connection, postgres, sessionID, records):
         """Verify exact session product links and registered matrix availability.
 

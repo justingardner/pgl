@@ -303,3 +303,51 @@ class pglDataset(pglActionable):
         from .pglStorage import pglStorage
 
         return pglStorage.loadDataset(datasetID, settings=settings, settingsName=settingsName, sslRootCert=sslRootCert, includeDeleted=includeDeleted, storageOptionsByBackend=storageOptionsByBackend, cacheDirectory=cacheDirectory, directLocalPolicy=directLocalPolicy)
+    
+    def getBehaviorData(self, *, settings=None, settingsName=None, storageOptionsByBackend=None, sslRootCert=None, cacheDirectory=None, directLocalPolicy=None):
+        """Return the dataset-owned comprehensive behavioral matrix.
+
+        Reuses data["behavior"] when present, resolving a saved reference
+        through the normal product loader and validating its behavioral schema.
+
+        Otherwise constructs from exact saved member checkpoints, in membership
+        order, without using editable sessions in _sessionCache.
+
+        Successful construction attaches a working pglDataMatrix.
+        Does not automatically rebuild after membership or code changes.
+        Existing products remain construction snapshots.
+
+        Reads sources as needed; does not publish.
+        Use save() to persist the attached product explicitly.
+        """
+        from .pglStorage import pglStorage
+
+        return pglStorage.getDatasetBehaviorData(self, settings=settings, settingsName=settingsName, storageOptionsByBackend=storageOptionsByBackend, sslRootCert=sslRootCert, cacheDirectory=cacheDirectory, directLocalPolicy=directLocalPolicy)
+    
+    def getBehaviorTable(self, *, settings=None, settingsName=None, storageOptionsByBackend=None, sslRootCert=None, cacheDirectory=None, directLocalPolicy=None, **options):
+        """Return an independent pandas trial table from dataset behavior.
+
+        Obtains the dataset-owned comprehensive matrix through getBehaviorData,
+        then delegates task selection, timing, and conversion to pglBehavior.
+
+        Examples:
+            dataset.getBehaviorTable(taskName="memoryDescriptionTask")
+            dataset.getBehaviorTable(taskSelection="all")
+            dataset.getBehaviorTable(taskName="memoryDescriptionTask", responseReference="segment", segmentNum=1)
+
+        Task selection resolves independently within each member's runs.
+        Table options do not create separate comprehensive attachments.
+
+        First access may construct and attach behavior.
+        Projection may materialize scientific arrays.
+        Editing the returned DataFrame does not modify the source matrix.
+        Does not publish database records or payloads.
+        """
+        from .pglBehavior import pglBehavior
+
+        matrix = self.getBehaviorData(settings=settings, settingsName=settingsName, storageOptionsByBackend=storageOptionsByBackend, sslRootCert=sslRootCert, cacheDirectory=cacheDirectory, directLocalPolicy=directLocalPolicy)
+
+        if matrix is None:
+            return None
+
+        return pglBehavior.getBehaviorTable(matrix, **options)

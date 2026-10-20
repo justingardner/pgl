@@ -1519,3 +1519,404 @@ class pglBehavior:
         }
 
         return table    
+    
+    @classmethod
+    def combineSessionData(cls, matrices, *, members, databaseIdentity, name="behavior"):
+        """Combine session behavioral matrices in dataset membership order.
+
+        Reads scientific arrays and returns an independent in-memory matrix.
+        Does not mutate inputs, attach products, access a database, or publish.
+
+        matrices:
+            One comprehensive session behavioral matrix per member.
+        members:
+            Ordered dataset membership records.
+        databaseIdentity:
+            Database-scoped identity for the referenced checkpoint IDs.
+
+        Global indices:
+            trial, event, runIndex, eventRunIndex.
+
+        Preserved local indices:
+            sourceTrialIndex, eventSourceEventIndex,
+            sourceRunIndex, eventSourceRunIndex.
+            taskIndex/eventTaskIndex remain local to their source run.
+
+        Input provenance is retained without asserting that a working input
+        matrix is equivalent to its referenced saved checkpoint.
+
+        Initial implementation materializes arrays. It is not a bounded-memory
+        construction path for large datasets.
+        """
+        from copy import deepcopy
+        import json
+
+        from .pglDataset import pglDataset
+
+        members = pglDataset._validateMembers(members)
+        matrices = list(matrices)
+
+        if not members:
+            raise ValueError("Behavioral construction requires at least one member.")
+
+        if len(matrices) != len(members):
+            raise ValueError("Supply exactly one behavioral matrix per member.")
+
+        if not isinstance(databaseIdentity, dict) or not databaseIdentity:
+            raise ValueError("A nonempty databaseIdentity is required.")
+
+        # Validate/copy portable metadata. Do not include runtime credentials.
+        databaseIdentity = json.loads(json.dumps(databaseIdentity, allow_nan=False))
+
+        prepared = []
+        runSources = []
+        taskSources = []
+        sessionSources = []
+        fieldMappings = {
+            "parameterFieldNames": {},
+            "trialVariableFieldNames": {},
+            "eventFieldNames": {},
+        }
+
+        trialOffset = 0
+        eventOffset = 0
+        runOffset = 0
+
+        trialContextNames = {
+            "sessionIndex", "sourceCheckpointID", "entryName",
+            "sourceRunIndex", "sourceTrialIndex",
+        }
+        eventContextNames = {
+            "eventSessionIndex", "eventSourceCheckpointID", "eventEntryName",
+            "eventSourceRunIndex", "eventSourceEventIndex",
+        }
+        addedNames = trialContextNames | eventContextNames
+        reservedAddedNames = addedNames | {field + "Present" for field in addedNames}
+
+        for sessionIndex, (matrix, member) in enumerate(zip(matrices, members)):
+            if not isinstance(matrix, pglDataMatrix):
+                raise TypeError(f"Member {sessionIndex}: expected a pglDataMatrix.")
+
+            data = cls._requireBehaviorData(matrix)
+
+            if data.attrs.get("behaviorView") is not None:
+                raise ValueError("Supply comprehensive matrices, not trial projections.")
+
+            if "sessionSources" in data.attrs:
+                raise ValueError("Nested dataset behavioral assembly is not supported.")
+
+            collisions = reservedAddedNames.intersection(set(data.variables) | set(data.dims))
+
+            if collisions:
+                raise ValueError(f"Member {sessionIndex}: reserved context names collide: {sorted(collisions)}.")
+
+            if data.attrs.get("configurationIncluded") is not False:
+                raise ValueError("This assembler requires configurationIncluded=False.")
+
+            # The current session extractor uses contiguous zero-based IDs.
+            # Enforce this before applying offsets rather than guessing whether
+            # relationships refer to coordinate labels or array positions.
+            for dimension in ("trial", "event"):
+                if dimension not in data.coords:
+                    raise ValueError(f"Member {sessionIndex}: missing {dimension} coordinates.")
+
+                coordinate = data.coords[dimension]
+
+                if coordinate.dims != (dimension,) or coordinate.dtype.kind not in "iu":
+                    raise ValueError(f"Member {sessionIndex}: invalid {dimension} coordinates.")
+
+                if not np.array_equal(coordinate.values, np.arange(data.sizes[dimension])):
+                    raise ValueError(f"Member {sessionIndex}: {dimension} coordinates must be contiguous from zero.")
+
+            localRuns = deepcopy(data.attrs.get("runSources"))
+            localTasks = deepcopy(data.attrs.get("taskSources"))
+
+            if not isinstance(localRuns, list) or not localRuns:
+                raise ValueError(f"Member {sessionIndex}: no behavioral run metadata.")
+
+            if not isinstance(localTasks, list):
+                raise ValueError(f"Member {sessionIndex}: missing task metadata.")
+
+            if [record["runIndex"] for record in localRuns] != list(range(len(localRuns))):
+                raise ValueError(f"Member {sessionIndex}: run metadata must be consecutive and ordered.")
+
+            taskIdentities = set()
+
+            for record in localTasks:
+                runIndex = record["runIndex"]
+                taskIndex = record["taskIndex"]
+
+                if type(runIndex) is not int or not 0 <= runIndex < len(localRuns):
+                    raise ValueError(f"Member {sessionIndex}: invalid task run index.")
+
+                if type(taskIndex) is not int or taskIndex < 0 or (runIndex, taskIndex) in taskIdentities:
+                    raise ValueError(f"Member {sessionIndex}: invalid or duplicate task identity.")
+
+                taskIdentities.add((runIndex, taskIndex))
+
+            # Work on an independent copy; no source index or metadata changes.
+            part = data.copy(deep=True)
+
+            def integerValues(field, dimension, *, minimum, maximum):
+                variable = data[field]
+
+                if variable.dims != (dimension,):
+                    raise ValueError(f"Member {sessionIndex}: invalid dimensions for {field}.")
+
+                values = cls._behaviorValues(data, field)
+
+                if any(isinstance(value, bool) or not isinstance(value, Integral) or not minimum <= value < maximum for value in values):
+                    raise ValueError(f"Member {sessionIndex}: invalid relationship/index in {field}.")
+
+                return np.asarray(values, dtype=np.int64)
+
+            localTrialRuns = integerValues("runIndex", "trial", minimum=0, maximum=len(localRuns))
+            localEventRuns = integerValues("eventRunIndex", "event", minimum=0, maximum=len(localRuns))
+            localTrialTasks = integerValues("taskIndex", "trial", minimum=0, maximum=np.iinfo(np.int64).max)
+            localEventTasks = integerValues("eventTaskIndex", "event", minimum=-1, maximum=np.iinfo(np.int64).max)
+            localEventTrials = integerValues("eventTrialIndex", "event", minimum=-1, maximum=data.sizes["trial"])
+            localStartEvents = integerValues("trialStartEventIndex", "trial", minimum=0, maximum=data.sizes["event"])
+
+            if any((int(run), int(task)) not in taskIdentities for run, task in zip(localTrialRuns, localTrialTasks)):
+                raise ValueError(f"Member {sessionIndex}: trial references an unknown task.")
+
+            if any(task != -1 and (int(run), int(task)) not in taskIdentities for run, task in zip(localEventRuns, localEventTasks)):
+                raise ValueError(f"Member {sessionIndex}: event references an unknown task.")
+
+            # Check both directions of the recorded START relationship.
+            for trialIndex, eventIndex in enumerate(localStartEvents):
+                if localEventTrials[eventIndex] != trialIndex:
+                    raise ValueError(f"Member {sessionIndex}: trial START relationship does not point back to its trial.")
+
+            associated = localEventTrials >= 0
+
+            if np.any(localEventRuns[associated] != localTrialRuns[localEventTrials[associated]]) or np.any(localEventTasks[associated] != localTrialTasks[localEventTrials[associated]]):
+                raise ValueError(f"Member {sessionIndex}: associated event and trial have different run/task identities.")
+
+            def replaceIndex(field, values):
+                attributes = deepcopy(part[field].attrs)
+                part[field] = xr.DataArray(values, dims=part[field].dims, attrs=attributes)
+
+            replaceIndex("runIndex", localTrialRuns + runOffset)
+            replaceIndex("eventRunIndex", localEventRuns + runOffset)
+            replaceIndex("eventTrialIndex", np.where(associated, localEventTrials + trialOffset, -1))
+            replaceIndex("trialStartEventIndex", localStartEvents + eventOffset)
+
+            trialContexts = [
+                {
+                    "sessionIndex": sessionIndex,
+                    "sourceCheckpointID": member["sessionID"],
+                    "entryName": member["entryName"],
+                    "sourceRunIndex": int(runIndex),
+                    "sourceTrialIndex": trialIndex,
+                }
+                for trialIndex, runIndex in enumerate(localTrialRuns)
+            ]
+            eventContexts = [
+                {
+                    "eventSessionIndex": sessionIndex,
+                    "eventSourceCheckpointID": member["sessionID"],
+                    "eventEntryName": member["entryName"],
+                    "eventSourceRunIndex": int(runIndex),
+                    "eventSourceEventIndex": eventIndex,
+                }
+                for eventIndex, runIndex in enumerate(localEventRuns)
+            ]
+
+            cls._addColumns(part, "trial", trialContexts, {field: field for field in sorted(trialContextNames)}, sourceGroup="datasetContext")
+            cls._addColumns(part, "event", eventContexts, {field: field for field in sorted(eventContextNames)}, sourceGroup="datasetContext")
+
+            for record in localRuns:
+                record["sourceRunIndex"] = record["runIndex"]
+                record["runIndex"] += runOffset
+                record["sessionIndex"] = sessionIndex
+                record["sourceCheckpointID"] = member["sessionID"]
+                runSources.append(record)
+
+            for record in localTasks:
+                record["sourceRunIndex"] = record["runIndex"]
+                record["runIndex"] += runOffset
+                record["sessionIndex"] = sessionIndex
+                taskSources.append(record)
+
+            for mappingName, combinedMapping in fieldMappings.items():
+                localMapping = data.attrs.get(mappingName)
+
+                if not isinstance(localMapping, dict):
+                    raise ValueError(f"Member {sessionIndex}: missing {mappingName}.")
+
+                for sourceField, targetField in localMapping.items():
+                    if sourceField in combinedMapping and combinedMapping[sourceField] != targetField:
+                        raise ValueError(f"Inconsistent source-field mapping for {sourceField!r}.")
+
+                    if any(existingSource != sourceField and existingTarget == targetField for existingSource, existingTarget in combinedMapping.items()):
+                        raise ValueError(f"Different source fields map to {targetField!r}.")
+
+                    combinedMapping[sourceField] = targetField
+
+            sessionSources.append({
+                "sessionIndex": sessionIndex,
+                "member": deepcopy(member),
+                "trialOffset": trialOffset,
+                "trialCount": data.sizes["trial"],
+                "eventOffset": eventOffset,
+                "eventCount": data.sizes["event"],
+                "runOffset": runOffset,
+                "runCount": len(localRuns),
+                "matrixRevisionID": matrix.matrixRevisionID,
+                "provenance": deepcopy(matrix.provenance),
+                "sourceMetadata": deepcopy(data.attrs),
+            })
+
+            prepared.append(part)
+            trialOffset += data.sizes["trial"]
+            eventOffset += data.sizes["event"]
+            runOffset += len(localRuns)
+
+        combined = xr.Dataset(coords={"trial": np.arange(trialOffset, dtype=np.int64), "event": np.arange(eventOffset, dtype=np.int64)})
+
+        # Presence masks are rebuilt from semantic values. Structured-object
+        # parent masks remain scientific metadata and are combined explicitly.
+        fields = sorted({
+            field
+            for part in prepared
+            for field, variable in part.data_vars.items()
+            if variable.attrs.get("role") != "presenceMask"
+        })
+        fieldSet = set(fields)
+
+        for field in fields:
+            available = [part[field] for part in prepared if field in part]
+            concrete = [variable for variable in available if variable.attrs.get("logicalType") != "unknown"]
+            template = concrete[0] if concrete else available[0]
+            attributes = deepcopy(template.attrs)
+            attributes.pop("presenceVariable", None)
+
+            dimension = template.dims[0] if template.dims else None
+
+            if dimension not in ("trial", "event"):
+                raise ValueError(f"{field}: expected a trial- or event-aligned field.")
+
+            structuredPresence = attributes.get("role") == "structuredPresence"
+            isVector = attributes.get("logicalType") == "vector"
+            componentDimension = attributes.get("componentDimension")
+            vectorLength = template.sizes[componentDimension] if isVector else None
+            comparisonKeys = {"logicalType", "elementLogicalType", "presenceVariable"}
+
+            def semanticAttributes(variable):
+                return {key: value for key, value in variable.attrs.items() if key not in comparisonKeys}
+
+            values = []
+
+            for part in prepared:
+                rowCount = part.sizes[dimension]
+
+                if field not in part:
+                    values.extend([False if structuredPresence else None] * rowCount)
+                    continue
+
+                variable = part[field]
+
+                if variable.dims[0] != dimension:
+                    raise ValueError(f"{field}: dimension differs between sessions.")
+
+                maskName = variable.attrs.get("presenceVariable")
+
+                if maskName is None:
+                    present = np.ones(rowCount, dtype=bool)
+                else:
+                    if maskName not in part or part[maskName].dims != (dimension,) or part[maskName].dtype.kind != "b":
+                        raise ValueError(f"{field}: invalid presence mask.")
+
+                    present = part[maskName].values
+
+                # A wholly absent unknown column carries no scalar/vector type.
+                # It can adopt the concrete encoding supplied by another member.
+                if variable.attrs.get("logicalType") == "unknown":
+                    if present.any():
+                        raise ValueError(f"{field}: unknown encoding contains present values.")
+
+                    values.extend([None] * rowCount)
+                    continue
+
+                if semanticAttributes(variable) != semanticAttributes(template):
+                    raise ValueError(f"{field}: incompatible field metadata/representations across sessions.")
+
+                if isVector:
+                    if variable.dims != (dimension, componentDimension) or variable.sizes[componentDimension] != vectorLength:
+                        raise ValueError(f"{field}: incompatible vector dimensions or lengths.")
+
+                    if not np.array_equal(part.coords[componentDimension].values, np.arange(vectorLength)):
+                        raise ValueError(f"{field}: vector coordinates must be zero-based positions.")
+
+                    rows = variable.values.tolist()
+                else:
+                    if variable.dims != (dimension,):
+                        raise ValueError(f"{field}: incompatible scalar/vector representations.")
+
+                    rows = variable.values.tolist()
+
+                values.extend(value if bool(isPresent) else None for value, isPresent in zip(rows, present))
+
+            if isVector:
+                flattened = [component for value in values for component in ([None] * vectorLength if value is None else value)]
+                array, _, elementType = cls._encodeColumn(flattened, field)
+                array = array.reshape(len(values), vectorLength)
+                present = np.asarray([value is not None for value in values], dtype=bool)
+                dimensions = (dimension, componentDimension)
+                attributes["elementLogicalType"] = elementType
+
+                if componentDimension in fieldSet or componentDimension in ("trial", "event"):
+                    raise ValueError(f"{field}: component coordinate collides with a field.")
+
+                if componentDimension in combined.coords and combined.sizes[componentDimension] != vectorLength:
+                    raise ValueError(f"{field}: incompatible shared component dimension.")
+
+                combined.coords[componentDimension] = np.arange(vectorLength, dtype=np.int64)
+            else:
+                array, present, logicalType = cls._encodeColumn(values, field)
+                dimensions = (dimension,)
+
+                if not structuredPresence:
+                    attributes["logicalType"] = logicalType
+
+            if not present.all():
+                maskName = field + "Present"
+
+                if maskName in fieldSet or maskName in combined.variables:
+                    raise ValueError(f"{field}: generated presence mask collides with a field.")
+
+                combined[maskName] = xr.DataArray(present, dims=(dimension,), attrs={"role": "presenceMask", "forVariable": field})
+                attributes["presenceVariable"] = maskName
+
+            combined[field] = xr.DataArray(array, dims=dimensions, attrs=attributes)
+
+        combined["runIndex"].attrs["indexScope"] = "combined dataset"
+        combined["eventRunIndex"].attrs["indexScope"] = "combined dataset"
+
+        combined.attrs.update({
+            "behaviorContract": cls.sourceContract,
+            "runSources": runSources,
+            "taskSources": taskSources,
+            "sessionSources": sessionSources,
+            **fieldMappings,
+            "sourceDatabaseIdentity": databaseIdentity,
+            "configurationIncluded": False,
+            "eventOrdering": "dataset member order; original session event order",
+            "trialOrdering": "dataset member order; original session trial order",
+            "relationshipIndexScope": "Combined comprehensive matrix",
+        })
+
+        result = pglDataMatrix(combined, name=name)
+        result.provenance = {
+            "construction": "pglBehavior.combineSessionData",
+            "behaviorContract": cls.sourceContract,
+            "sourceState": "suppliedBehaviorMatrices",
+            "sourceDatabaseIdentity": databaseIdentity,
+            "members": deepcopy(members),
+            "inputProvenance": [deepcopy(matrix.provenance) for matrix in matrices],
+            "checkpointEquivalenceVerified": False,
+        }
+
+        cls._requireBehaviorData(result)
+        return result
