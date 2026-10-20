@@ -2759,14 +2759,142 @@ class pglSession(pglActionable):
         return matrix
 
     def getBehaviorTable(self, **options):
-        """Return an independent pandas trial table for this session.
+        """Return behavioral trials as an independent pandas DataFrame.
 
-        Obtains or constructs the session-owned behavioral matrix internally.
-        Options configure only this table projection, not matrix extraction.
+        Obtains the session-owned behavioral matrix internally. If absent,
+        constructs and attaches it; otherwise reuses the existing matrix.
+        Users do not need to call getBehaviorData() first.
 
-        May read behavioral sources on first access and materialize matrix
-        arrays for projection. Does not publish database/Zarr records.
-        Editing the returned DataFrame does not modify the source matrix.
+        Each row represents a selected recorded trial START. Unanswered and
+        incomplete trials are retained. The DataFrame index preserves source
+        matrix trial IDs; sourceTrialNum contains the recorded trial number.
+
+        Task selection
+        --------------
+        taskName : str, optional
+            Exact match against recorded taskSaveName, not the human-readable
+            taskName. Example: "memoryDescriptionTask".
+        taskIndex : int, optional
+            Zero-based task index, resolved independently within each run.
+        taskSelection : "all", optional
+            Include trials from all tasks.
+
+        Specify at most one task-selection option. Without one, each run
+        must contain exactly one task. Missing or ambiguous matches raise;
+        automatic main-task resolution is not yet implemented.
+
+        Response summaries
+        ------------------
+        responsePolicy : {"first", "last"}, default "first"
+            Select the summary response by RECORDED EVENT ORDER, not sorted
+            timestamp order. responseCount always counts all accepted
+            response events associated with the trial, not physical keys.
+        includeAllResponses : bool, default False
+            Add response1, responseType1, responseTime1, etc., while retaining
+            the ordinary summary columns. All times use the same reference.
+
+        Response timing
+        ---------------
+        responseReference : {"trial", "segment", "trigger"}, default "trial"
+            responseTime = response timestamp - reference timestamp, seconds.
+
+            "trial":
+                Use the recorded trial START timestamp.
+            "segment":
+                Require exactly one associated task-scoped segment boundary.
+            "trigger":
+                Require exactly one eligible associated task-scoped event
+                with the requested recorded trigger name.
+
+        segmentNum : int, required for segment timing
+            Recorder's ZERO-BASED segment number. segmentNum=1 means the
+            second segment; segmentNum=2 means the third.
+        segmentBoundary : {"start", "end"}, default "start"
+            Use an actually recorded boundary. Segment END events are not
+            inferred from the next boundary.
+        triggerName : str, required for trigger timing
+            Exact recorded trigger name.
+        requireTriggerSent : bool, default True
+            Trigger timing requires recorded triggerSent=True.
+            With False, failed or unspecified attempts also become eligible;
+            multiple eligible attempts make the reference ambiguous.
+
+        Missing or ambiguous references produce missing responseTime, not
+        missing responses. Nonfinite/missing timestamps also produce missing
+        latency. Negative offsets are preserved and diagnosed, never clipped.
+
+        Recorded order and timestamp order can differ: a response may be
+        appended after a segment transition while carrying an earlier input
+        timestamp. A segment START is not automatically verified stimulus
+        onset. Timestamps are compared only within the associated trial;
+        no run-level temporal trigger association is performed.
+
+        Timing details are available in:
+            trials.attrs["viewSpecification"]
+            trials.attrs["responseTimingDiagnostics"]
+            trials.attrs["responseTimingReferences"]
+
+        Display and column selection
+        ----------------------------
+        includeAllColumns : bool, default False
+            Show internal indices, taskSaveName, and unsupported field markers.
+            Also enables numbered response expansion, even if
+            includeAllResponses=False was supplied.
+
+            Defaults hide runIndex, taskIndex, taskSaveName,
+            trialStartEventIndex, responseEventIndex and numbered variants,
+            and fields marked extractionStatus="unsupported".
+
+            This means all available TRIAL TABLE columns, not raw event rows,
+            configuration export, or unimplemented trigger expansion.
+        columns : list[str] or tuple[str], optional
+            Return exactly these columns in the requested order. Explicit
+            selection can expose otherwise hidden or absent parameter fields.
+            Unknown or duplicate column names raise. Requesting numbered
+            response columns enables response expansion.
+
+        Automatically returned parameters must be present in at least one
+        selected trial. Parameters belonging only to other tasks are omitted,
+        even with includeAllColumns=True. Current encoding treats recorded
+        None and absence alike; recorded floating NaNs remain present.
+
+        Fixed-length vectors become zero-based ComponentN columns. Missing
+        integer/Boolean/string values use pandas nullable representations.
+        Unsupported markers identify an encoding limitation, not preserved
+        original scientific values. Column metadata is stored in:
+            trials.attrs["columnMetadata"]
+
+        Current feature limits
+        ----------------------
+        includeTriggers : bool, default True
+            Wide trigger-column expansion is not implemented. If triggers
+            are detected, use includeTriggers=False to generate a table.
+            Trigger timing references STILL WORK with includeTriggers=False;
+            source trigger records are not removed.
+        includeConfiguration : bool, default False
+            Configuration projection is not implemented; True raises.
+
+        Examples
+        --------
+        trials = session.getBehaviorTable(taskName="memoryDescriptionTask")
+
+        # Relative to recorded segment 1 START, not verified visual onset.
+        trials = session.getBehaviorTable(taskName="memoryDescriptionTask", responseReference="segment", segmentNum=1)
+
+        # Trigger reference without the unimplemented wide trigger columns.
+        trials = session.getBehaviorTable(taskName="memoryDescriptionTask", responseReference="trigger", triggerName="stimulusOnset", includeTriggers=False)
+
+        trials = session.getBehaviorTable(taskName="memoryDescriptionTask", includeAllColumns=True)
+        trials = session.getBehaviorTable(taskName="memoryDescriptionTask", columns=["runName", "sourceTrialNum", "responseTime"])
+
+        Side effects and persistence
+        ----------------------------
+        First access may read behavioral sources and attach a working matrix.
+        Projection may materialize matrix arrays. Editing the returned
+        DataFrame does not modify the source matrix.
+
+        Does not automatically save database records or Zarr payloads.
+        Use session.saveSession() to persist attached matrices explicitly.
         """
         from .pglBehavior import pglBehavior
 

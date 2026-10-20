@@ -202,10 +202,15 @@ class pglStorage:
 
     @staticmethod
     def _sessionLineageLines(records):
-        """Format a visible checkpoint forest with descriptions.
+        """Format visible session lineage without descriptions.
+
+        Parentless roots use behavioral acquisition session names:
+            sessionID: 92 [day1]
+
+        Descendants use database checkpoint names:
+            95 (checkpointName)
 
         Hidden/missing parents are not bypassed by artificial arrows.
-        Descriptions are rendered on one line without truncation.
         Iterative traversal avoids Python recursion limits.
         """
         children = {sessionID: [] for sessionID in records}
@@ -225,18 +230,25 @@ class pglStorage:
 
         def nodeLabel(sessionID):
             record = records[sessionID]
-            label = str(sessionID)
+
+            if record["parent_session_id"] is None:
+                label = f"sessionID: {sessionID}"
+                sessionNames = record["session_names"]
+
+                if sessionNames:
+                    label += " [" + ", ".join(pglStorage._printValue(name) for name in sessionNames) + "]"
+            else:
+                label = str(sessionID)
+                checkpointName = record["checkpoint_name"]
+
+                if checkpointName:
+                    label += f" ({pglStorage._printValue(checkpointName)})"
 
             if record["deleted_at"] is not None:
                 label += " [deleted]"
 
             if record["status"] != "complete":
                 label += f" [{pglStorage._printValue(record['status'])}]"
-
-            description = record.get("description")
-
-            if description:
-                label += " (" + pglStorage._printValue(description) + ")"
 
             return label
 
@@ -273,7 +285,7 @@ class pglStorage:
             if parentID is not None:
                 lines.append(f"    [parent session {parentID} is not visible in this listing]")
 
-            appendTree(sessionID, "    sessionID: ")
+            appendTree(sessionID, "    ")
 
         if len(visited) != len(records):
             raise ValueError("Session lineage contains a cycle with no visible root.")
@@ -370,13 +382,20 @@ class pglStorage:
     def printSessions(postgres=None, *, settings=None, settingsName=None, sslRootCert=None, includeDeleted=False, storageOptionsByBackend=None):
         """Print sessions grouped by root experiment and subject.
 
-        Shows checkpoint descriptions alongside IDs and lineage.
+        Parentless roots display behavioral sessionName values from verified
+        archived experimentSettings.json files, in brackets.
+        Descendants display database checkpoint_name values in parentheses.
+        Descriptions are omitted.
 
-        Uses recorded root-session labels when available.
-        Older behavioral roots fall back to verified experimentSettings.json.
+        Uses mirrored root experiment/subject labels when available.
+        Older behavioral roots fall back to archived experiment settings.
         Descendants inherit their root's grouping.
 
-        Unset labels display as Unknown.
+        Reads root behavioral settings even when grouping labels are mirrored,
+        because sessionName is not included in that mirrored metadata.
+        Distinct nonblank session names retain their first-run order.
+
+        Unset grouping labels display as Unknown.
         Does not reconstruct runs, tasks, or MNE payloads.
         """
         from psycopg.rows import tuple_row
@@ -412,14 +431,24 @@ class pglStorage:
                     cursor.execute("SELECT current_database(), transaction_timestamp()")
                     databaseName, snapshotTime = cursor.fetchone()
 
-                    statement = sql.SQL("SELECT session_id, parent_session_id, root_session_id, origin, status, deleted_at, meta, description FROM {} WHERE (%s OR deleted_at IS NULL) ORDER BY session_id").format(sessionsTable)
+                    statement = sql.SQL("SELECT session_id, parent_session_id, root_session_id, origin, status, deleted_at, meta, checkpoint_name FROM {} WHERE (%s OR deleted_at IS NULL) ORDER BY session_id").format(sessionsTable)
                     cursor.execute(statement, (includeDeleted,))
 
-                    for sessionID, parentID, rootID, origin, status, deletedAt, meta, description in cursor.fetchall():
-                        records[sessionID] = {"session_id": sessionID, "parent_session_id": parentID, "root_session_id": rootID, "origin": origin, "status": status, "deleted_at": deletedAt, "meta": meta, "description": description}
+                    for sessionID, parentID, rootID, origin, status, deletedAt, meta, checkpointName in cursor.fetchall():
+                        records[sessionID] = {
+                            "session_id": sessionID,
+                            "parent_session_id": parentID,
+                            "root_session_id": rootID,
+                            "origin": origin,
+                            "status": status,
+                            "deleted_at": deletedAt,
+                            "meta": meta,
+                            "checkpoint_name": checkpointName,
+                            "session_names": [],
+                        }
 
                     rootIDs = {record["root_session_id"] for record in records.values()}
-                    fallbackRoots = []
+                    visibleRootIDs = []
 
                     for rootID in sorted(rootIDs):
                         record = records.get(rootID)
@@ -428,17 +457,19 @@ class pglStorage:
                             groupsByRoot[rootID] = {("Unknown", "Unknown")}
                             continue
 
+                        visibleRootIDs.append(rootID)
                         meta = record["meta"] or {}
 
                         if "pgl_session_labels" in meta:
                             metadata = pglStorage._validateSessionLabelMetadata(meta["pgl_session_labels"])
                             groupsByRoot[rootID] = {(label["experimentName"] if label["experimentName"] is not None else "Unknown", label["subjectID"] if label["subjectID"] is not None else "Unknown") for label in metadata["labels"]}
-                        else:
-                            fallbackRoots.append(rootID)
 
-                    if fallbackRoots:
+                    # Query all visible roots, not only grouping fallbacks:
+                    # sessionName exists in behavioral settings, not mirrored labels.
+                    # MNE-only roots have no matching behavioral settings links.
+                    if visibleRootIDs:
                         statement = sql.SQL("SELECT link.session_id, link.name, content.file_id, content.sha256, content.size_bytes FROM {} AS link JOIN {} AS content ON content.file_id = link.file_id WHERE link.session_id = ANY(%s::bigint[]) AND link.name ~ '^runs/[0-9]+/experimentSettings[.]json$' AND (%s OR (link.deleted_at IS NULL AND content.deleted_at IS NULL)) ORDER BY link.session_id, link.name").format(linksTable, filesTable)
-                        cursor.execute(statement, (fallbackRoots, includeDeleted))
+                        cursor.execute(statement, (visibleRootIDs, includeDeleted))
 
                         for rootID, name, fileID, digest, size in cursor.fetchall():
                             settingsByRoot.setdefault(rootID, []).append((name, fileID))
@@ -451,7 +482,7 @@ class pglStorage:
                         for fileID, backendID, root, key in cursor.fetchall():
                             locationsByFile.setdefault(fileID, []).append({"backend_id": backendID, "url_prefix": root, "object_key": key})
 
-        pairByFile = {}
+        settingsByFile = {}
 
         for fileID, identity in identities.items():
             locations = locationsByFile.get(fileID, [])
@@ -459,14 +490,38 @@ class pglStorage:
             if not locations:
                 raise FileNotFoundError(f"Experiment-settings file {fileID} has no eligible registered location.")
 
-            savedSettings = pglStorage._readPrintExperimentSettings(identity, locations, storageOptionsByBackend=storageOptionsByBackend)
-            experiment = pglStorage._printGroupingValue(savedSettings.get("experimentName"), "experimentName")
-            subject = pglStorage._printGroupingValue(savedSettings.get("subjectID"), "subjectID")
-            pairByFile[fileID] = (experiment, subject)
+            settingsByFile[fileID] = pglStorage._readPrintExperimentSettings(identity, locations, storageOptionsByBackend=storageOptionsByBackend)
 
-        for rootID in {record["root_session_id"] for record in records.values()}:
-            if rootID not in groupsByRoot:
-                pairs = {pairByFile[fileID] for name, fileID in settingsByRoot.get(rootID, [])}
+        for rootID in sorted(rootIDs):
+            record = records.get(rootID)
+
+            if record is None:
+                continue
+
+            sessionNames = []
+            pairs = set()
+            needsGrouping = rootID not in groupsByRoot
+            runSettings = sorted(settingsByRoot.get(rootID, []), key=lambda item: int(item[0].split("/")[1]))
+
+            for name, fileID in runSettings:
+                savedSettings = settingsByFile[fileID]
+                sessionName = savedSettings.get("sessionName")
+
+                if sessionName is not None:
+                    if not isinstance(sessionName, str):
+                        raise ValueError(f"Saved sessionName must be a string or None: root {rootID}, {name}")
+
+                    if sessionName.strip() and sessionName not in sessionNames:
+                        sessionNames.append(sessionName)
+
+                if needsGrouping:
+                    experiment = pglStorage._printGroupingValue(savedSettings.get("experimentName"), "experimentName")
+                    subject = pglStorage._printGroupingValue(savedSettings.get("subjectID"), "subjectID")
+                    pairs.add((experiment, subject))
+
+            record["session_names"] = sessionNames
+
+            if needsGrouping:
                 groupsByRoot[rootID] = pairs or {("Unknown", "Unknown")}
 
         grouped = {}
