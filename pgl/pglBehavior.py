@@ -427,7 +427,7 @@ class pglBehavior:
             if len(unsupportedReports) > 8:
                 details += f"; plus {len(unsupportedReports) - 8} additional field(s)"
 
-            pglMessages.warning(f"{sourceGroup}: {len(unsupportedReports)} field(s) marked 'unsupported'. {details}",level=1)
+            #pglMessages.warning(f"{sourceGroup}: {len(unsupportedReports)} field(s) marked 'unsupported'. {details}",level=1)
 
     @staticmethod
     def _dictionaryFields(records, context):
@@ -812,14 +812,25 @@ class pglBehavior:
         return latency, "negativeLatency" if latency < 0 else "ok"
 
     @classmethod
-    def getTrialData(cls, matrix, *, taskName=None, taskIndex=None, taskSelection=None, responsePolicy="first", responseReference="trial", includeAllResponses=False, includeTriggers=True, includeConfiguration=False):
-        """Return an independent trial-only xarray projection.
+    def getTrialData(cls, matrix, *, taskName=None, taskIndex=None, taskSelection=None, responsePolicy="first", responseReference="trial", segmentNum=None, segmentBoundary="start", triggerName=None, requireTriggerSent=True, includeAllResponses=False, includeTriggers=True, includeConfiguration=False):
+        """Return an independent trial-only behavioral xarray projection.
 
-        Reads matrix arrays as needed. Does not mutate the source matrix or
-        publish records/payloads.
+        Timing references:
+            trial: recorded trial START timestamp.
+            segment: exactly one recorded boundary for segmentNum.
+            trigger: exactly one eligible event with the recorded triggerName.
 
-        Initial timing support is trial-relative only. Trigger expansion and
-        configuration projection are explicitly deferred.
+        Only associated task-scoped events are eligible segment/trigger
+        references. Run-scoped temporal association is not implemented.
+
+        Trigger timing requires triggerSent=True by default. Setting
+        requireTriggerSent=False explicitly allows other recorded attempts.
+
+        Missing/ambiguous references yield missing latency and diagnostics.
+        Recorded timestamps and negative offsets are preserved. Segment ends
+        are never inferred.
+
+        Reads arrays as needed. Does not modify sources or publish anything.
         """
         from copy import deepcopy
 
@@ -828,16 +839,60 @@ class pglBehavior:
         if responsePolicy not in ("first", "last"):
             raise ValueError("responsePolicy must be 'first' or 'last'.")
 
-        if responseReference != "trial":
-            raise NotImplementedError("This increment supports responseReference='trial' only.")
+        if responseReference not in ("trial", "segment", "trigger"):
+            raise ValueError("responseReference must be 'trial', 'segment', or 'trigger'.")
+
+        for optionName, optionValue in (
+            ("requireTriggerSent", requireTriggerSent),
+            ("includeAllResponses", includeAllResponses),
+            ("includeTriggers", includeTriggers),
+            ("includeConfiguration", includeConfiguration),
+        ):
+            if type(optionValue) is not bool:
+                raise TypeError(f"{optionName} must be a Boolean.")
 
         if includeConfiguration:
             raise NotImplementedError("Configuration projection is not implemented.")
 
+        if segmentBoundary not in ("start", "end"):
+            raise ValueError("segmentBoundary must be 'start' or 'end'.")
+
+        if responseReference == "segment":
+            if isinstance(segmentNum, (bool, np.bool_)) or not isinstance(segmentNum, Integral) or segmentNum < 0:
+                raise ValueError("Segment timing requires a nonnegative integer segmentNum.")
+
+            segmentNum = int(segmentNum)
+        elif segmentNum is not None or segmentBoundary != "start":
+            raise ValueError("segmentNum and nondefault segmentBoundary require responseReference='segment'.")
+
+        if responseReference == "trigger":
+            if not isinstance(triggerName, str) or not triggerName:
+                raise ValueError("Trigger timing requires a nonempty triggerName.")
+        elif triggerName is not None:
+            raise ValueError("triggerName requires responseReference='trigger'.")
+
+        if responseReference != "trigger" and not requireTriggerSent:
+            raise ValueError("requireTriggerSent=False requires responseReference='trigger'.")
+
+        requiredTimingFields = ["eventResponse", "eventResponseType", "eventTime"]
+
+        if responseReference == "segment":
+            requiredTimingFields.extend(["eventSubtype", "eventSegmentNum"])
+        elif responseReference == "trigger":
+            requiredTimingFields.append("eventTriggerName")
+
+            if requireTriggerSent:
+                requiredTimingFields.append("eventTriggerSent")
+
+        for variableName in requiredTimingFields:
+            if variableName not in data:
+                raise ValueError(f"Timing projection requires {variableName!r}.")
+
+            if data[variableName].attrs.get("extractionStatus") != "supported":
+                raise ValueError(f"{variableName}: timing projection requires a supported encoding.")
+
         positions = cls._selectBehaviorTrials(data, taskName=taskName, taskIndex=taskIndex, taskSelection=taskSelection)
 
-        # Retain all trial-aligned fields, including presence masks and vectors.
-        # Never include the independent event dimension in the trial projection.
         trialFields = []
 
         for variableName, variable in data.data_vars.items():
@@ -849,7 +904,6 @@ class pglBehavior:
 
         trialData = data[trialFields].isel(trial=positions).copy(deep=True)
         trialData.attrs = deepcopy(data.attrs)
-
         trialIDs = trialData.coords["trial"].values.tolist()
 
         if len(trialIDs) != len(set(trialIDs)):
@@ -857,6 +911,7 @@ class pglBehavior:
 
         trialPositions = {trialID: position for position, trialID in enumerate(trialIDs)}
         trialStarts = cls._behaviorValues(trialData, "trialStartTime")
+        trialStartEventIDs = cls._behaviorValues(trialData, "trialStartEventIndex")
 
         eventTypes = cls._behaviorValues(data, "eventType")
         eventScopes = cls._behaviorValues(data, "eventScope")
@@ -864,28 +919,29 @@ class pglBehavior:
         eventTimes = cls._behaviorValues(data, "eventTime")
         eventIDs = data.coords["event"].values.tolist()
 
-        # Refuse to imply that requested trigger expansion has been performed.
-        # This conservative guard also recognizes named triggers of unfamiliar
-        # event types. Trigger semantics will receive their own implementation.
+        responses = cls._behaviorValues(data, "eventResponse")
+        responseTypes = cls._behaviorValues(data, "eventResponseType")
+
+        triggerNames = cls._behaviorValues(data, "eventTriggerName") if "eventTriggerName" in data else [None] * len(eventTypes)
+
+        # Trigger timing and wide trigger expansion are separate features.
         if includeTriggers:
-            triggerNames = cls._behaviorValues(data, "eventTriggerName") if "eventTriggerName" in data else [None] * len(eventTypes)
             hasTriggers = any(name is not None or "trigger" in str(eventType).lower() for name, eventType in zip(triggerNames, eventTypes))
 
             if hasTriggers:
-                raise NotImplementedError("Trigger expansion is not implemented yet. Use includeTriggers=False for a response-only projection; all trigger records remain in the source matrix.")
+                raise NotImplementedError("Trigger-column expansion is not implemented. Use includeTriggers=False; trigger timing references still work and source records remain intact.")
 
-        for variableName in ("eventResponse", "eventResponseType", "eventTime"):
-            if data[variableName].attrs.get("extractionStatus") != "supported":
-                raise ValueError(f"{variableName}: response projection requires a supported encoding.")
+        eventSubtypes = cls._behaviorValues(data, "eventSubtype") if responseReference == "segment" else None
+        eventSegments = cls._behaviorValues(data, "eventSegmentNum") if responseReference == "segment" else None
+        triggerSent = cls._behaviorValues(data, "eventTriggerSent") if responseReference == "trigger" and requireTriggerSent else None
 
-        responses = cls._behaviorValues(data, "eventResponse")
-        responseTypes = cls._behaviorValues(data, "eventResponseType")
-        responseGroups = [[] for _ in trialIDs]
-        timingDiagnostics = []
+        responsePositions = [[] for _ in trialIDs]
+        referencePositions = [[] for _ in trialIDs]
+        rejectedTriggerPositions = [[] for _ in trialIDs]
 
-        # Iteration preserves recorded event order. No timestamp sorting.
+        # Single source-order pass. No timestamp sorting or run-level matching.
         for eventPosition, eventType in enumerate(eventTypes):
-            if eventType != "subjectResponse" or eventScopes[eventPosition] != "task":
+            if eventScopes[eventPosition] != "task":
                 continue
 
             trialPosition = trialPositions.get(eventTrials[eventPosition])
@@ -893,21 +949,82 @@ class pglBehavior:
             if trialPosition is None:
                 continue
 
-            latency, status = cls._behaviorTrialLatency(eventTimes[eventPosition], trialStarts[trialPosition])
+            if eventType == "subjectResponse":
+                responsePositions[trialPosition].append(eventPosition)
 
-            responseGroups[trialPosition].append({
-                "response": responses[eventPosition],
-                "responseType": responseTypes[eventPosition],
-                "responseTime": latency,
-                "responseEventIndex": eventIDs[eventPosition],
-            })
+            if responseReference == "segment":
+                if eventType == "segment" and eventSubtypes[eventPosition] == segmentBoundary and eventSegments[eventPosition] == segmentNum:
+                    referencePositions[trialPosition].append(eventPosition)
 
-            if status != "ok":
+            elif responseReference == "trigger":
+                # Match the explicitly recorded trigger name, not a guessed
+                # whitelist of trigger event-type spellings.
+                if triggerNames[eventPosition] != triggerName:
+                    continue
+
+                if requireTriggerSent:
+                    sent = triggerSent[eventPosition]
+
+                    if sent is not True:
+                        rejectedTriggerPositions[trialPosition].append(eventPosition)
+                        continue
+
+                referencePositions[trialPosition].append(eventPosition)
+
+        responseGroups = [[] for _ in trialIDs]
+        timingDiagnostics = []
+        timingReferences = []
+
+        for trialPosition, trialID in enumerate(trialIDs):
+            candidates = referencePositions[trialPosition]
+            referenceTime, referenceEventIndex, referenceStatus = cls._resolveBehaviorReference(
+                trialStarts[trialPosition],
+                candidates,
+                eventTimes,
+                eventIDs,
+                responseReference=responseReference,
+            )
+
+            if responseReference == "trial":
+                referenceEventIndex = trialStartEventIDs[trialPosition]
+
+            referenceRecord = {
+                "trialIndex": trialID,
+                "referenceEventIndex": referenceEventIndex,
+                "referenceTime": referenceTime,
+                "status": referenceStatus,
+                "candidateEventIndices": [eventIDs[position] for position in candidates],
+                "excludedTriggerEventIndices": [eventIDs[position] for position in rejectedTriggerPositions[trialPosition]],
+            }
+            timingReferences.append(referenceRecord)
+
+            # Diagnose reference problems even on unanswered trials.
+            if referenceStatus != "ok":
                 timingDiagnostics.append({
-                    "trialIndex": trialIDs[trialPosition],
-                    "eventIndex": eventIDs[eventPosition],
-                    "status": status,
+                    "trialIndex": trialID,
+                    "eventIndex": referenceEventIndex,
+                    "status": referenceStatus,
+                    "candidateEventIndices": referenceRecord["candidateEventIndices"],
+                    "excludedTriggerEventIndices": referenceRecord["excludedTriggerEventIndices"],
                 })
+
+            for eventPosition in responsePositions[trialPosition]:
+                latency, status = cls._behaviorLatency(eventTimes[eventPosition], referenceTime)
+
+                responseGroups[trialPosition].append({
+                    "response": responses[eventPosition],
+                    "responseType": responseTypes[eventPosition],
+                    "responseTime": latency,
+                    "responseEventIndex": eventIDs[eventPosition],
+                })
+
+                # Reference failures are already diagnosed once per trial.
+                if referenceStatus == "ok" and status != "ok":
+                    timingDiagnostics.append({
+                        "trialIndex": trialID,
+                        "eventIndex": eventIDs[eventPosition],
+                        "status": status,
+                    })
 
         responseFields = ("response", "responseType", "responseTime", "responseEventIndex")
         maximumResponses = max((len(group) for group in responseGroups), default=0)
@@ -933,8 +1050,6 @@ class pglBehavior:
 
             responseRecords.append(record)
 
-        # Encode summaries directly: incompatible values must raise, not become
-        # unsupported markers silently introduced by the projection.
         reserved = set(trialData.variables) | set(trialData.dims)
 
         for field in projectedFields:
@@ -947,7 +1062,11 @@ class pglBehavior:
             reserved.update(generatedNames)
             values = [record.get(field) for record in responseRecords]
             array, present, logicalType = cls._encodeColumn(values, f"responseProjection.{field}")
-            attributes = {"sourceGroup": "responseProjection", "logicalType": logicalType, "extractionStatus": "supported"}
+            attributes = {
+                "sourceGroup": "responseProjection",
+                "logicalType": logicalType,
+                "extractionStatus": "supported",
+            }
 
             if not present.all():
                 maskName = field + "Present"
@@ -955,15 +1074,18 @@ class pglBehavior:
                 attributes["presenceVariable"] = maskName
 
             if field.startswith("responseTime"):
-                attributes.update({"units": "seconds", "reference": "trialStartTime"})
+                attributes.update({
+                    "units": "seconds",
+                    "reference": "trialStartTime" if responseReference == "trial" else responseReference,
+                    "referenceDetails": "See viewSpecification and responseTimingReferences",
+                    "inferenceRules": "none",
+                })
 
             if field.startswith("responseEventIndex"):
                 attributes.update({"referencesDimension": "event", "referenceScope": "sourceMatrix"})
 
             trialData[field] = xr.DataArray(array, dims=("trial",), attrs=attributes)
 
-        # These indices still identify events in the comprehensive source,
-        # not rows in a nonexistent event dimension of this trial-only result.
         trialData["trialStartEventIndex"].attrs["referenceScope"] = "sourceMatrix"
 
         trialData.attrs.update({
@@ -974,37 +1096,222 @@ class pglBehavior:
                 "taskSelection": taskSelection,
                 "responsePolicy": responsePolicy,
                 "responseReference": responseReference,
+                "segmentNum": segmentNum,
+                "segmentBoundary": segmentBoundary if responseReference == "segment" else None,
+                "triggerName": triggerName,
+                "requireTriggerSent": requireTriggerSent if responseReference == "trigger" else None,
                 "responseUnits": "seconds",
-                "includeAllResponses": bool(includeAllResponses),
-                "includeTriggers": bool(includeTriggers),
+                "includeAllResponses": includeAllResponses,
+                "includeTriggers": includeTriggers,
                 "includeConfiguration": False,
+                "referenceAssociation": "Same trial, task-scoped recorded events only",
+                "referenceMatching": "Exactly one eligible recorded reference",
                 "inferenceRules": "none",
             },
             "responseTimingDiagnostics": timingDiagnostics,
+            "responseTimingReferences": timingReferences,
             "relationshipIndexScope": "Original comprehensive source matrix; trial coordinates retained",
             "triggerProjectionStatus": "noTriggerRecords" if includeTriggers else "excludedByView",
         })
 
         return trialData
 
+    @staticmethod
+    def _resolveBehaviorReference(trialStartTime, candidatePositions, eventTimes, eventIDs, *, responseReference):
+        """Resolve one recorded timing reference without timestamp sorting.
+
+        Returns:
+            referenceTime, referenceEventIndex, status
+
+        Trial START uses the trial-aligned timestamp.
+        Segment/trigger references require exactly one eligible source event.
+        """
+        referenceEventIndex = None
+
+        if responseReference == "trial":
+            referenceTime = trialStartTime
+        else:
+            if not candidatePositions:
+                return None, None, "missingReference"
+
+            if len(candidatePositions) != 1:
+                return None, None, "ambiguousReference"
+
+            eventPosition = candidatePositions[0]
+            referenceTime = eventTimes[eventPosition]
+            referenceEventIndex = eventIDs[eventPosition]
+
+        if referenceTime is None:
+            return None, referenceEventIndex, "missingReferenceTimestamp"
+
+        if isinstance(referenceTime, (bool, np.bool_)) or not isinstance(referenceTime, Real):
+            return None, referenceEventIndex, "invalidReferenceTimestamp"
+
+        if not math.isfinite(float(referenceTime)):
+            return None, referenceEventIndex, "nonfiniteReferenceTimestamp"
+
+        return float(referenceTime), referenceEventIndex, "ok"
+
+    @staticmethod
+    def _behaviorLatency(responseTimestamp, referenceTimestamp):
+        """Calculate seconds relative to a resolved reference.
+
+        Preserves negative latency. Missing/nonfinite timestamps yield a
+        missing result and a diagnostic rather than fabricated timing.
+        """
+        if referenceTimestamp is None:
+            return None, "unresolvedReference"
+
+        if responseTimestamp is None:
+            return None, "missingResponseTimestamp"
+
+        if isinstance(responseTimestamp, (bool, np.bool_)) or not isinstance(responseTimestamp, Real):
+            return None, "invalidResponseTimestamp"
+
+        if not math.isfinite(float(responseTimestamp)):
+            return None, "nonfiniteTimestamp"
+
+        latency = float(responseTimestamp) - float(referenceTimestamp)
+        return latency, "negativeLatency" if latency < 0 else "ok"
+
     @classmethod
     def getBehaviorTable(cls, matrix, *, includeAllColumns=False, columns=None, **options):
-        """Return an independent pandas table for selected trials.
+        """Return behavioral trials as an independent pandas DataFrame.
 
-        Automatically returned parameter columns must be present in at least
-        one selected trial. Parameters belonging only to other tasks are not
-        returned, even with includeAllColumns=True.
+        Obtains the session-owned behavioral matrix internally. If absent,
+        constructs and attaches it; otherwise reuses the existing matrix.
+        Users do not need to call getBehaviorData() first.
 
-        Explicit columns requests can retrieve otherwise absent parameters.
+        Each row represents a selected recorded trial START. Unanswered and
+        incomplete trials are retained. The DataFrame index preserves source
+        matrix trial IDs; sourceTrialNum contains the recorded trial number.
 
-        Default presentation hides internal indices, taskSaveName, event
-        references, and unsupported fields. includeAllColumns=True exposes
-        these available fields and enables numbered responses.
+        Task selection
+        --------------
+        taskName : str, optional
+            Exact match against recorded taskSaveName, not the human-readable
+            taskName. Example: "memoryDescriptionTask".
+        taskIndex : int, optional
+            Zero-based task index, resolved independently within each run.
+        taskSelection : "all", optional
+            Include trials from all tasks.
 
-        Presence is determined from source masks, not pandas isna(), so a
-        recorded floating NaN does not make a parameter absent.
+        Specify at most one task-selection option. Without one, each run
+        must contain exactly one task. Missing or ambiguous matches raise;
+        automatic main-task resolution is not yet implemented.
 
-        Reads matrix arrays as needed. Does not modify sources or publish.
+        Response summaries
+        ------------------
+        responsePolicy : {"first", "last"}, default "first"
+            Select the summary response by RECORDED EVENT ORDER, not sorted
+            timestamp order. responseCount always counts all accepted
+            response events associated with the trial, not physical keys.
+        includeAllResponses : bool, default False
+            Add response1, responseType1, responseTime1, etc., while retaining
+            the ordinary summary columns. All times use the same reference.
+
+        Response timing
+        ---------------
+        responseReference : {"trial", "segment", "trigger"}, default "trial"
+            responseTime = response timestamp - reference timestamp, seconds.
+
+            "trial":
+                Use the recorded trial START timestamp.
+            "segment":
+                Require exactly one associated task-scoped segment boundary.
+            "trigger":
+                Require exactly one eligible associated task-scoped event
+                with the requested recorded trigger name.
+
+        segmentNum : int, required for segment timing
+            Recorder's ZERO-BASED segment number. segmentNum=1 means the
+            second segment; segmentNum=2 means the third.
+        segmentBoundary : {"start", "end"}, default "start"
+            Use an actually recorded boundary. Segment END events are not
+            inferred from the next boundary.
+        triggerName : str, required for trigger timing
+            Exact recorded trigger name.
+        requireTriggerSent : bool, default True
+            Trigger timing requires recorded triggerSent=True.
+            With False, failed or unspecified attempts also become eligible;
+            multiple eligible attempts make the reference ambiguous.
+
+        Missing or ambiguous references produce missing responseTime, not
+        missing responses. Nonfinite/missing timestamps also produce missing
+        latency. Negative offsets are preserved and diagnosed, never clipped.
+
+        Recorded order and timestamp order can differ: a response may be
+        appended after a segment transition while carrying an earlier input
+        timestamp. A segment START is not automatically verified stimulus
+        onset. Timestamps are compared only within the associated trial;
+        no run-level temporal trigger association is performed.
+
+        Timing details are available in:
+            trials.attrs["viewSpecification"]
+            trials.attrs["responseTimingDiagnostics"]
+            trials.attrs["responseTimingReferences"]
+
+        Display and column selection
+        ----------------------------
+        includeAllColumns : bool, default False
+            Show internal indices, taskSaveName, and unsupported field markers.
+            Also enables numbered response expansion, even if
+            includeAllResponses=False was supplied.
+
+            Defaults hide runIndex, taskIndex, taskSaveName,
+            trialStartEventIndex, responseEventIndex and numbered variants,
+            and fields marked extractionStatus="unsupported".
+
+            This means all available TRIAL TABLE columns, not raw event rows,
+            configuration export, or unimplemented trigger expansion.
+        columns : list[str] or tuple[str], optional
+            Return exactly these columns in the requested order. Explicit
+            selection can expose otherwise hidden or absent parameter fields.
+            Unknown or duplicate column names raise. Requesting numbered
+            response columns enables response expansion.
+
+        Automatically returned parameters must be present in at least one
+        selected trial. Parameters belonging only to other tasks are omitted,
+        even with includeAllColumns=True. Current encoding treats recorded
+        None and absence alike; recorded floating NaNs remain present.
+
+        Fixed-length vectors become zero-based ComponentN columns. Missing
+        integer/Boolean/string values use pandas nullable representations.
+        Unsupported markers identify an encoding limitation, not preserved
+        original scientific values. Column metadata is stored in:
+            trials.attrs["columnMetadata"]
+
+        Current feature limits
+        ----------------------
+        includeTriggers : bool, default True
+            Wide trigger-column expansion is not implemented. If triggers
+            are detected, use includeTriggers=False to generate a table.
+            Trigger timing references STILL WORK with includeTriggers=False;
+            source trigger records are not removed.
+        includeConfiguration : bool, default False
+            Configuration projection is not implemented; True raises.
+
+        Examples
+        --------
+        trials = session.getBehaviorTable(taskName="memoryDescriptionTask")
+
+        # Relative to recorded segment 1 START, not verified visual onset.
+        trials = session.getBehaviorTable(taskName="memoryDescriptionTask", responseReference="segment", segmentNum=1)
+
+        # Trigger reference without the unimplemented wide trigger columns.
+        trials = session.getBehaviorTable(taskName="memoryDescriptionTask", responseReference="trigger", triggerName="stimulusOnset", includeTriggers=False)
+
+        trials = session.getBehaviorTable(taskName="memoryDescriptionTask", includeAllColumns=True)
+        trials = session.getBehaviorTable(taskName="memoryDescriptionTask", columns=["runName", "sourceTrialNum", "responseTime"])
+
+        Side effects and persistence
+        ----------------------------
+        First access may read behavioral sources and attach a working matrix.
+        Projection may materialize matrix arrays. Editing the returned
+        DataFrame does not modify the source matrix.
+
+        Does not automatically save database records or Zarr payloads.
+        Use session.saveSession() to persist attached matrices explicitly.
         """
         from copy import deepcopy
 
