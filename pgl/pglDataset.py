@@ -200,30 +200,107 @@ class pglDataset(pglActionable):
         raise KeyError(f"No dataset member with {selector}.")
 
     def addSession(self, sessionID, entryName=None, labels=None, *, settings=None, settingsName=None, sslRootCert=None):
-        """Add an active completed checkpoint without loading its payloads.
+        """Add one or several active completed checkpoints.
 
-        Returns True on addition or False when configuration/connection
-        resolution is cancelled. Invalid membership raises.
+        sessionID:
+            One checkpoint ID, or a list/tuple of checkpoint IDs.
+
+        Existing members and repeated IDs in the supplied collection warn
+        and are skipped. Existing aliases and labels remain unchanged.
+
+        New members preserve their supplied order.
+        labels applies independently to each new member.
+        entryName is permitted only when exactly one ID is supplied.
+
+        Validates all new members before changing membership. If any new
+        checkpoint is missing, deleted, or incomplete, none are added.
+
+        Reads database metadata only. Does not load session payloads,
+        populate the session cache, or publish a dataset checkpoint.
+
+        Returns True if members were added, otherwise False.
+        Invalid arguments and unavailable source checkpoints raise.
+        Configuration/connection cancellation returns False.
         """
         from .pglStorage import pglStorage
 
-        record = {"sessionID": sessionID, "entryName": entryName, "labels": labels}
-        proposed = self._validateMembers([*self._members, record])
+        requestedIDs = list(sessionID) if isinstance(sessionID, (list, tuple)) else [sessionID]
 
-        summaries = pglStorage.getDatasetMemberSummaries(self, sessionIDs=[sessionID], settings=settings, settingsName=settingsName, sslRootCert=sslRootCert)
+        # Validate arguments before database access or membership changes.
+        for requestedID in requestedIDs:
+            self._validateSessionID(requestedID)
+
+        self._validateEntryName(entryName)
+        normalizedLabels = self._validateLabels(labels)
+
+        if entryName is not None and len(requestedIDs) != 1:
+            raise ValueError("entryName requires exactly one session ID. Add separately named members with individual addSession() calls.")
+
+        currentMembers = self.members
+        existingIDs = {record["sessionID"] for record in currentMembers}
+        seenIDs = set()
+        newIDs = []
+        existingDuplicates = []
+        repeatedIDs = []
+
+        for requestedID in requestedIDs:
+            if requestedID in seenIDs:
+                if requestedID not in repeatedIDs:
+                    repeatedIDs.append(requestedID)
+                continue
+
+            seenIDs.add(requestedID)
+
+            if requestedID in existingIDs:
+                existingDuplicates.append(requestedID)
+            else:
+                newIDs.append(requestedID)
+
+        if existingDuplicates:
+            listed = ", ".join(str(value) for value in existingDuplicates)
+            pglMessages.warning(f"Session checkpoint(s) already in this dataset; skipped: {listed}. Existing entry names and labels were not changed.", level=0)
+
+        if repeatedIDs:
+            listed = ", ".join(str(value) for value in repeatedIDs)
+            pglMessages.warning(f"Repeated session checkpoint ID(s) in the supplied list; duplicate occurrences skipped: {listed}.", level=0)
+
+        if not newIDs:
+            return False
+
+        newMembers = [
+            {"sessionID": requestedID, "entryName": entryName, "labels": normalizedLabels}
+            for requestedID in newIDs
+        ]
+
+        # Validates alias uniqueness and creates independent label copies.
+        proposed = self._validateMembers([*currentMembers, *newMembers])
+
+        # Resolve all candidate checkpoints in one metadata query.
+        summaries = pglStorage.getDatasetMemberSummaries(self, sessionIDs=newIDs, settings=settings, settingsName=settingsName, sslRootCert=sslRootCert)
 
         if summaries is None:
             return False
 
-        summary = summaries.get(sessionID)
+        problems = []
 
-        if summary is None:
-            raise ValueError(f"Unknown session checkpoint: {sessionID}")
+        for requestedID in newIDs:
+            summary = summaries.get(requestedID)
 
-        if summary["status"] != "complete" or summary["deletedAt"] is not None:
-            raise ValueError(f"Member session {sessionID} must be complete and active.")
+            if summary is None:
+                problems.append(f"{requestedID}: unknown checkpoint")
+            elif summary["deletedAt"] is not None:
+                problems.append(f"{requestedID}: deleted checkpoint")
+            elif summary["status"] != "complete":
+                problems.append(f"{requestedID}: status={summary['status']!r}")
 
-        # Persisted members and all ancestors are checked again at save time.
+        if problems:
+            raise ValueError("No members were added. Every new member must be complete and active: " + "; ".join(problems))
+
+        if self.members != currentMembers:
+            raise RuntimeError("Dataset membership changed during validation. No members were added by this call; retry with the current membership.")
+
+        # One assignment after every new checkpoint has passed validation.
+        # Existing behavior products remain unchanged construction snapshots.
         self._members = proposed
         return True
 
