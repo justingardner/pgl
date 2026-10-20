@@ -7102,18 +7102,29 @@ class pglStorage:
         return json.loads(text)
     
     @classmethod
-    def getDatasetMemberSummaries(cls, dataset, *, sessionIDs=None, settings=None, settingsName=None, sslRootCert=None):
-        """Read lightweight member metadata without constructing sessions.
+    def getDatasetMemberSummaries(cls, dataset, *, sessionIDs=None, settings=None, settingsName=None, sslRootCert=None, includeBehaviorLabels=False):
+        """Read member metadata without constructing sessions.
 
         Acquisition time falls back to the root acquisition checkpoint.
-        Subject labels use checkpoint metadata, then root metadata.
-        Older records without mirrored labels display Unknown; this function
-        does not read experiment files or scientific payloads.
+        Experiment/subject labels use checkpoint metadata, then root metadata.
 
-        Includes deleted source rows so historical datasets can be inspected.
+        includeBehaviorLabels=True:
+            Read verified root behavioral experimentSettings.json files to
+            obtain acquisition sessionName values. Also supplies fallback
+            experiment/subject labels when mirrored metadata is absent.
+
+        Default calls remain database-metadata-only, including addSession().
+        Behavioral label reads use dataset runtime storage options.
+
+        Includes deleted source rows for historical dataset inspection.
+        Does not reconstruct sessions, open scientific arrays, or publish.
+
         Returns None for unavailable configuration or connection cancellation.
         """
         from psycopg.rows import tuple_row
+
+        if type(includeBehaviorLabels) is not bool:
+            raise ValueError("includeBehaviorLabels must be a boolean.")
 
         requested = [record["sessionID"] for record in dataset.members] if sessionIDs is None else list(sessionIDs)
 
@@ -7130,22 +7141,18 @@ class pglStorage:
         if postgres is None:
             return None
 
+        if sslRootCert is None:
+            sslRootCert = dataset._datasetLoadOptions.get("sslRootCert")
+
         sessions = sql.Identifier(postgres.databaseSchema, "session")
-        statement = sql.SQL("""
-            SELECT checkpoint.session_id,
-                   checkpoint.status,
-                   checkpoint.deleted_at,
-                   checkpoint.checkpoint_name,
-                   checkpoint.created_at,
-                   COALESCE(checkpoint.acquired_at, root.acquired_at),
-                   checkpoint.meta,
-                   root.meta
-            FROM {sessions} AS checkpoint
-            LEFT JOIN {sessions} AS root
-              ON root.session_id = checkpoint.root_session_id
-            WHERE checkpoint.session_id = ANY(%s::bigint[])
-            ORDER BY checkpoint.session_id
-        """).format(sessions=sessions)
+        links = sql.Identifier(postgres.databaseSchema, "session_files")
+        files = sql.Identifier(postgres.databaseSchema, "files")
+        locations = sql.Identifier(postgres.databaseSchema, "storage_locations")
+        backends = sql.Identifier(postgres.databaseSchema, "storage_backends")
+
+        settingsByRoot = {}
+        identities = {}
+        locationsByFile = {}
 
         with postgres.connect(sslRootCert=sslRootCert) as connection:
             if connection is None:
@@ -7155,12 +7162,119 @@ class pglStorage:
                 connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
 
                 with connection.cursor(row_factory=tuple_row) as cursor:
+                    statement = sql.SQL("""
+                        SELECT checkpoint.session_id,
+                               checkpoint.status,
+                               checkpoint.deleted_at,
+                               checkpoint.checkpoint_name,
+                               checkpoint.created_at,
+                               COALESCE(checkpoint.acquired_at, root.acquired_at),
+                               checkpoint.meta,
+                               root.meta,
+                               checkpoint.root_session_id
+                        FROM {sessions} AS checkpoint
+                        LEFT JOIN {sessions} AS root
+                          ON root.session_id = checkpoint.root_session_id
+                        WHERE checkpoint.session_id = ANY(%s::bigint[])
+                        ORDER BY checkpoint.session_id
+                    """).format(sessions=sessions)
+
                     cursor.execute(statement, (requested,))
                     rows = cursor.fetchall()
 
+                    rootIDs = sorted({row[8] for row in rows if row[8] is not None})
+
+                    if includeBehaviorLabels and rootIDs:
+                        # Historical inspection includes soft-deleted links and
+                        # content. Reading them does not restore their state.
+                        statement = sql.SQL("""
+                            SELECT link.session_id,
+                                   link.name,
+                                   content.file_id,
+                                   content.sha256,
+                                   content.size_bytes
+                            FROM {} AS link
+                            JOIN {} AS content
+                              ON content.file_id = link.file_id
+                            WHERE link.session_id = ANY(%s::bigint[])
+                              AND link.name ~ '^runs/[0-9]+/experimentSettings[.]json$'
+                            ORDER BY link.session_id, link.name
+                        """).format(links, files)
+
+                        cursor.execute(statement, (rootIDs,))
+
+                        for rootID, name, fileID, digest, size in cursor.fetchall():
+                            settingsByRoot.setdefault(rootID, []).append((name, fileID))
+                            identities[fileID] = {"sha256": digest, "size_bytes": size}
+
+                    if identities:
+                        statement = sql.SQL("""
+                            SELECT location.file_id,
+                                   backend.backend_id,
+                                   backend.url_prefix,
+                                   location.object_key
+                            FROM {} AS location
+                            JOIN {} AS backend
+                              ON backend.backend_id = location.backend_id
+                            WHERE location.file_id = ANY(%s::bigint[])
+                              AND location.status = 'present'
+                              AND location.verified_at IS NOT NULL
+                              AND backend.is_active
+                            ORDER BY location.file_id,
+                                     location.priority,
+                                     backend.backend_id,
+                                     location.object_key
+                        """).format(locations, backends)
+
+                        cursor.execute(statement, (sorted(identities),))
+
+                        for fileID, backendID, root, key in cursor.fetchall():
+                            locationsByFile.setdefault(fileID, []).append({
+                                "backend_id": backendID,
+                                "url_prefix": root,
+                                "object_key": key,
+                            })
+
+        # Read each distinct settings file once, even when several members
+        # share the same acquisition root.
+        settingsByFile = {}
+        storageOptionsByBackend = dataset._datasetLoadOptions.get("storageOptionsByBackend")
+
+        for fileID, identity in identities.items():
+            candidates = locationsByFile.get(fileID, [])
+
+            if not candidates:
+                raise FileNotFoundError(f"Experiment-settings file {fileID} has no eligible registered location.")
+
+            settingsByFile[fileID] = cls._readPrintExperimentSettings(identity, candidates, storageOptionsByBackend=storageOptionsByBackend)
+
+        labelsByRoot = {}
+
+        def addLabel(values, value, fieldName):
+            if value is None:
+                return
+
+            if not isinstance(value, str):
+                raise ValueError(f"Saved {fieldName} must be a string or None.")
+
+            if value.strip() and value not in values:
+                values.append(value)
+
+        for rootID, records in settingsByRoot.items():
+            labels = {"experimentNames": [], "subjectIDs": [], "sessionNames": []}
+
+            # Preserve numeric run order when collecting distinct names.
+            for name, fileID in sorted(records, key=lambda item: int(item[0].split("/")[1])):
+                savedSettings = settingsByFile[fileID]
+                addLabel(labels["experimentNames"], savedSettings.get("experimentName"), "experimentName")
+                addLabel(labels["subjectIDs"], savedSettings.get("subjectID"), "subjectID")
+                addLabel(labels["sessionNames"], savedSettings.get("sessionName"), "sessionName")
+
+            labelsByRoot[rootID] = labels
+
         summaries = {}
 
-        for sessionID, status, deletedAt, checkpointName, createdAt, acquiredAt, checkpointMeta, rootMeta in rows:
+        for sessionID, status, deletedAt, checkpointName, createdAt, acquiredAt, checkpointMeta, rootMeta, rootID in rows:
             labelMetadata = None
 
             for metadata in (checkpointMeta, rootMeta):
@@ -7168,10 +7282,14 @@ class pglStorage:
                     labelMetadata = cls._validateSessionLabelMetadata(metadata["pgl_session_labels"])
                     break
 
-            subjectIDs = []
+            rootLabels = labelsByRoot.get(rootID, {"experimentNames": [], "subjectIDs": [], "sessionNames": []})
 
             if labelMetadata is not None:
+                experimentNames = sorted({record["experimentName"] for record in labelMetadata["labels"] if record["experimentName"] is not None})
                 subjectIDs = sorted({record["subjectID"] for record in labelMetadata["labels"] if record["subjectID"] is not None})
+            else:
+                experimentNames = list(rootLabels["experimentNames"])
+                subjectIDs = sorted(rootLabels["subjectIDs"])
 
             summaries[sessionID] = {
                 "sessionID": sessionID,
@@ -7180,7 +7298,9 @@ class pglStorage:
                 "checkpointName": checkpointName,
                 "createdAt": createdAt,
                 "acquiredAt": acquiredAt,
+                "experimentNames": experimentNames,
                 "subjectIDs": subjectIDs,
+                "sessionNames": list(rootLabels["sessionNames"]),
             }
 
         cls._bindDatasetStorage(dataset, resolvedSettings, postgres)
@@ -8059,12 +8179,24 @@ class pglStorage:
     
     @classmethod
     def printDataset(cls, dataset, *, verbose=False, settings=None, settingsName=None, sslRootCert=None):
-        """Print membership and product references without opening payloads."""
+        """Print membership labels and product references.
+
+        Displays experiment, subject, and behavioral acquisition session names.
+        Reads verified root experiment-settings files for session names.
+        Does not construct member sessions or open scientific matrix arrays.
+
+        Entry name is the dataset-local alias.
+        Session name is the behavioral acquisition's sessionName.
+        Checkpoint name is the saved checkpoint annotation.
+
+        Multiple distinct labels are joined with ' + '; these are summaries,
+        not an assertion that every experiment/subject/name combination exists.
+        """
         from .pglData import pglDataMatrixReference
 
         members = dataset._validateMembers(dataset.members)
         products = cls._validateDatasetProducts(dataset)
-        summaries = cls.getDatasetMemberSummaries(dataset, settings=settings, settingsName=settingsName, sslRootCert=sslRootCert)
+        summaries = cls.getDatasetMemberSummaries(dataset, settings=settings, settingsName=settingsName, sslRootCert=sslRootCert, includeBehaviorLabels=True)
 
         if summaries is None:
             pglMessages.warning("Cannot print dataset members: database configuration or connection is unavailable.", level=0)
@@ -8090,21 +8222,36 @@ class pglStorage:
             summary = summaries.get(sessionID)
 
             if summary is None:
+                experimentLabel = "Unknown"
                 subjectLabel = "Unknown"
+                sessionLabel = ""
                 acquiredLabel = "Unknown"
                 checkpointLabel = "Unavailable"
                 state = "missing"
             else:
+                experimentLabel = " + ".join(summary["experimentNames"]) or "Unknown"
                 subjectLabel = " + ".join(summary["subjectIDs"]) or "Unknown"
+                sessionLabel = " + ".join(summary["sessionNames"])
                 acquiredAt = summary["acquiredAt"]
                 acquiredLabel = acquiredAt.isoformat() if acquiredAt is not None else "Unknown"
                 checkpointLabel = summary["checkpointName"] or ""
                 state = "deleted" if summary["deletedAt"] is not None else summary["status"]
 
-            rows.append((subjectLabel, member["entryName"] or "", acquiredLabel, sessionID, checkpointLabel, state))
+            rows.append((
+                experimentLabel,
+                subjectLabel,
+                sessionLabel,
+                member["entryName"] or "",
+                acquiredLabel,
+                sessionID,
+                checkpointLabel,
+                state,
+            ))
 
-        rows.sort(key=lambda row: (row[0] == "Unknown", row[0], row[3]))
-        cls._printTable(("Subject", "Entry name", "Acquired", "Session ID", "Checkpoint name", "Source state"), rows, maxWidth=None)
+        # Preserve the existing subject-first display order.
+        # This does not change authoritative dataset membership order.
+        rows.sort(key=lambda row: (row[1] == "Unknown", row[1], row[5]))
+        cls._printTable(("Experiment", "Subject", "Session name", "Entry name", "Acquired", "Session ID", "Checkpoint name", "Source state"), rows, maxWidth=None)
 
         if products:
             pglMessages.print()
