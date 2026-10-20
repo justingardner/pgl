@@ -2758,12 +2758,19 @@ class pglSession(pglActionable):
 
         return matrix
 
-    def getBehaviorTable(self, **options):
+    def getBehaviorTable(self, taskName=None,**options):
         """Return behavioral trials as an independent pandas DataFrame.
 
         Obtains the session-owned behavioral matrix internally. If absent,
         constructs and attaches it; otherwise reuses the existing matrix.
         Users do not need to call getBehaviorData() first.
+
+        Returns None with a pglMessages.warning for invalid table requests,
+        missing/ambiguous task selections, unavailable requested columns,
+        and unimplemented projection features.
+
+        Source-extraction failures, malformed scientific data, and unexpected
+        implementation errors still propagate.
 
         Each row represents a selected recorded trial START. Unanswered and
         incomplete trials are retained. The DataFrame index preserves source
@@ -2780,8 +2787,9 @@ class pglSession(pglActionable):
             Include trials from all tasks.
 
         Specify at most one task-selection option. Without one, each run
-        must contain exactly one task. Missing or ambiguous matches raise;
-        automatic main-task resolution is not yet implemented.
+        must contain exactly one task. Missing or ambiguous matches produce
+        a warning and return None; no partial table is returned.
+        Automatic main-task resolution is not yet implemented.
 
         Response summaries
         ------------------
@@ -2819,9 +2827,14 @@ class pglSession(pglActionable):
             With False, failed or unspecified attempts also become eligible;
             multiple eligible attempts make the reference ambiguous.
 
-        Missing or ambiguous references produce missing responseTime, not
-        missing responses. Nonfinite/missing timestamps also produce missing
-        latency. Negative offsets are preserved and diagnosed, never clipped.
+        segmentNum and a nondefault segmentBoundary require segment timing.
+        triggerName and requireTriggerSent=False require trigger timing.
+        Invalid combinations warn and return None.
+
+        Missing or ambiguous recorded references produce missing responseTime,
+        not missing responses. The table is still returned with diagnostics.
+        Nonfinite/missing timestamps also produce missing latency.
+        Negative offsets are preserved and diagnosed, never clipped.
 
         Recorded order and timestamp order can differ: a response may be
         appended after a segment transition while carrying an earlier input
@@ -2850,8 +2863,10 @@ class pglSession(pglActionable):
         columns : list[str] or tuple[str], optional
             Return exactly these columns in the requested order. Explicit
             selection can expose otherwise hidden or absent parameter fields.
-            Unknown or duplicate column names raise. Requesting numbered
-            response columns enables response expansion.
+            Unknown or duplicate column names warn and return None.
+            Requesting numbered response columns enables response expansion.
+            Numbered columns exist only up to the maximum recorded response
+            count among the selected trials.
 
         Automatically returned parameters must be present in at least one
         selected trial. Parameters belonging only to other tasks are omitted,
@@ -2860,6 +2875,10 @@ class pglSession(pglActionable):
 
         Fixed-length vectors become zero-based ComponentN columns. Missing
         integer/Boolean/string values use pandas nullable representations.
+        Absent floating values appear as NaN; ordinary pandas float columns
+        do not distinguish them from recorded NaNs. The comprehensive matrix's
+        presence masks preserve that distinction.
+
         Unsupported markers identify an encoding limitation, not preserved
         original scientific values. Column metadata is stored in:
             trials.attrs["columnMetadata"]
@@ -2867,12 +2886,16 @@ class pglSession(pglActionable):
         Current feature limits
         ----------------------
         includeTriggers : bool, default True
-            Wide trigger-column expansion is not implemented. If triggers
-            are detected, use includeTriggers=False to generate a table.
-            Trigger timing references STILL WORK with includeTriggers=False;
-            source trigger records are not removed.
+            Wide trigger-column expansion is not implemented. If trigger
+            records are detected anywhere in the comprehensive matrix,
+            this request warns and returns None.
+
+            Use includeTriggers=False to generate a table without wide
+            trigger columns. Trigger timing references STILL WORK with
+            includeTriggers=False; source trigger records are not removed.
         includeConfiguration : bool, default False
-            Configuration projection is not implemented; True raises.
+            Configuration projection is not implemented.
+            True produces a warning and returns None.
 
         Examples
         --------
@@ -2887,9 +2910,17 @@ class pglSession(pglActionable):
         trials = session.getBehaviorTable(taskName="memoryDescriptionTask", includeAllColumns=True)
         trials = session.getBehaviorTable(taskName="memoryDescriptionTask", columns=["runName", "sourceTrialNum", "responseTime"])
 
+        # Check for a rejected request before using the result.
+        if trials is not None:
+            print(trials.head())
+
         Side effects and persistence
         ----------------------------
-        First access may read behavioral sources and attach a working matrix.
+        First access may read behavioral sources and attach a working matrix,
+        even if subsequent table-option validation rejects the request.
+        Existing attachments are validated rather than silently replaced.
+        They are not automatically rebuilt after source or code changes.
+
         Projection may materialize matrix arrays. Editing the returned
         DataFrame does not modify the source matrix.
 
@@ -2898,4 +2929,4 @@ class pglSession(pglActionable):
         """
         from .pglBehavior import pglBehavior
 
-        return pglBehavior.getBehaviorTable(self.getBehaviorData(), **options)
+        return pglBehavior.getBehaviorTable(self.getBehaviorData(), taskName=taskName, **options)

@@ -1176,6 +1176,221 @@ class pglBehavior:
 
     @classmethod
     def getBehaviorTable(cls, matrix, *, includeAllColumns=False, columns=None, **options):
+        """Return an independent pandas table, warning for invalid requests.
+
+        Public entry point used directly and by session/dataset accessors.
+
+        Invalid options, ambiguous task selections, unavailable requested
+        columns, and unimplemented projection features warn and return None.
+
+        Malformed source schemas, incompatible scientific encodings, and
+        unexpected implementation errors still propagate.
+
+        Reads matrix arrays as needed. Does not attach/rebuild a matrix,
+        modify scientific values, or publish database records.
+        """
+        from .pglMessages import pglMessages
+
+        def warn(message):
+            pglMessages.warning(f"Could not create the behavioral table:\n{message}\n\nNo table was returned. The source matrix was not changed or discarded.")
+            return None
+
+        if matrix is None:
+            return warn("No behavioral matrix is available.")
+
+        # Validate the source outside request-error handling. A malformed
+        # scientific product must not be disguised as an invalid user option.
+        data = cls._requireBehaviorData(matrix)
+
+        allowedOptions = {
+            "taskName", "taskIndex", "taskSelection",
+            "responsePolicy", "responseReference",
+            "segmentNum", "segmentBoundary",
+            "triggerName", "requireTriggerSent",
+            "includeAllResponses", "includeTriggers",
+            "includeConfiguration",
+        }
+        unknownOptions = sorted(set(options) - allowedOptions)
+
+        if unknownOptions:
+            return warn(f"Unknown option(s): {', '.join(unknownOptions)}.\nSupported options: {', '.join(sorted(allowedOptions | {'includeAllColumns', 'columns'}))}.")
+
+        if type(includeAllColumns) is not bool:
+            return warn("includeAllColumns must be a Boolean.")
+
+        if columns is not None:
+            if not isinstance(columns, (list, tuple)):
+                return warn("columns must be a list or tuple of column names.")
+
+            if any(not isinstance(name, str) or not name for name in columns):
+                return warn("Requested column names must be nonempty strings.")
+
+            if len(columns) != len(set(columns)):
+                return warn("Requested column names must be unique.")
+
+            columns = list(columns)
+
+        for optionName in ("requireTriggerSent", "includeAllResponses", "includeTriggers", "includeConfiguration"):
+            if optionName in options and type(options[optionName]) is not bool:
+                return warn(f"{optionName} must be a Boolean.")
+
+        responsePolicy = options.get("responsePolicy", "first")
+        responseReference = options.get("responseReference", "trial")
+        segmentNum = options.get("segmentNum")
+        segmentBoundary = options.get("segmentBoundary", "start")
+        triggerName = options.get("triggerName")
+        requireTriggerSent = options.get("requireTriggerSent", True)
+
+        if responsePolicy not in ("first", "last"):
+            return warn("responsePolicy must be 'first' or 'last'.")
+
+        if responseReference not in ("trial", "segment", "trigger"):
+            return warn("responseReference must be 'trial', 'segment', or 'trigger'.")
+
+        if segmentBoundary not in ("start", "end"):
+            return warn("segmentBoundary must be 'start' or 'end'.")
+
+        if responseReference == "segment":
+            if isinstance(segmentNum, (bool, np.bool_)) or not isinstance(segmentNum, Integral) or segmentNum < 0:
+                return warn("Segment timing requires a nonnegative integer segmentNum. Segment numbering is zero-based.")
+        elif segmentNum is not None or segmentBoundary != "start":
+            return warn("segmentNum and nondefault segmentBoundary require responseReference='segment'.")
+
+        if responseReference == "trigger":
+            if not isinstance(triggerName, str) or not triggerName:
+                return warn("Trigger timing requires a nonempty triggerName.")
+        elif triggerName is not None:
+            return warn("triggerName requires responseReference='trigger'.")
+
+        if responseReference != "trigger" and not requireTriggerSent:
+            return warn("requireTriggerSent=False requires responseReference='trigger'.")
+
+        if options.get("includeConfiguration", False):
+            return warn("Configuration projection is not implemented. Use includeConfiguration=False.")
+
+        runSources = data.attrs.get("runSources")
+        taskSources = data.attrs.get("taskSources")
+
+        # Keep source metadata failures separate from ordinary task-selection
+        # problems handled below.
+        if not isinstance(runSources, list) or not isinstance(taskSources, list):
+            raise ValueError("Behavioral source metadata must include runSources and taskSources.")
+
+        if any(not isinstance(source, dict) or "runIndex" not in source for source in runSources):
+            raise ValueError("Invalid behavioral runSources metadata.")
+
+        if any(not isinstance(source, dict) or not {"runIndex", "taskIndex"}.issubset(source) for source in taskSources):
+            raise ValueError("Invalid behavioral taskSources metadata.")
+
+        taskName = options.get("taskName")
+        taskIndex = options.get("taskIndex")
+        taskSelection = options.get("taskSelection")
+
+        # A selection-only view avoids materializing scientific context arrays
+        # twice. Task resolution uses the full run/task metadata; empty trial
+        # arrays suffice for this preliminary request validation.
+        selectionData = data[["runIndex", "taskIndex"]].isel(trial=slice(0, 0)).copy(deep=False)
+        selectionData.attrs = dict(data.attrs)
+
+        # Presence masks, if referenced, are needed by the selection helper.
+        for field in ("runIndex", "taskIndex"):
+            maskName = data[field].attrs.get("presenceVariable")
+
+            if maskName is not None:
+                selectionData[maskName] = data[maskName].isel(trial=slice(0, 0))
+
+        try:
+            cls._selectBehaviorTrials(selectionData, taskName=taskName, taskIndex=taskIndex, taskSelection=taskSelection)
+        except (TypeError, ValueError) as error:
+            message = str(error)
+
+            if all(value is None for value in (taskName, taskIndex, taskSelection)):
+                message = (
+                    "This behavioral matrix needs an explicit task selection. "
+                    "Automatic main-task selection is not implemented yet.\n\n"
+                    + message
+                )
+
+            names = sorted({
+                source["taskSaveName"]
+                for source in taskSources
+                if isinstance(source.get("taskSaveName"), str) and source["taskSaveName"]
+            })
+            uniqueNames = [
+                name
+                for name in names
+                if runSources and all(
+                    sum(source["runIndex"] == run["runIndex"] and source.get("taskSaveName") == name for source in taskSources) == 1
+                    for run in runSources
+                )
+            ]
+
+            if uniqueNames:
+                message += "\n\nTask names occurring exactly once in every run:"
+
+                for name in uniqueNames[:8]:
+                    message += f"\n  getBehaviorTable(taskName={name!r})"
+
+                if len(uniqueNames) > 8:
+                    message += f"\n  ... and {len(uniqueNames) - 8} more."
+            elif names:
+                message += "\n\nRecorded taskSaveName values: " + ", ".join(repr(name) for name in names)
+                message += "\nRepeated names require a zero-based taskIndex that resolves in every run."
+
+            message += "\n\nFor all tasks:\n  getBehaviorTable(taskSelection='all', includeTriggers=False)"
+            return warn(message)
+
+        # Column availability depends on the actual projection. Build the
+        # complete candidate table once, retaining absent parameters so an
+        # explicit request can still select them.
+        projectionColumns = [] if columns is not None else None
+
+        projectionOptions = dict(options)
+
+        if columns is not None and any(re.fullmatch(r"(responseEventIndex|responseTime|responseType|response)([1-9][0-9]*)", name) for name in columns):
+            projectionOptions["includeAllResponses"] = True
+
+        if columns is None:
+            try:
+                return cls._getBehaviorTable(matrix, includeAllColumns=includeAllColumns, **projectionOptions)
+            except NotImplementedError as error:
+                return warn(str(error))
+
+        # Preserve the existing converter's explicit-column behavior without
+        # catching scientific ValueErrors indiscriminately. A private exception
+        # type is unnecessary: discover available columns through its existing
+        # tableSpecification metadata on an all-columns conversion below.
+        #
+        # Explicit columns=[] causes the converter to encode absent parameters,
+        # but returns no columns. Its selection metadata lists available names
+        # only indirectly, so use a trial projection to derive all scalar/vector
+        # output names before invoking the converter with the actual request.
+        try:
+            trialData = cls.getTrialData(matrix, **{**projectionOptions, "includeAllResponses": includeAllColumns or projectionOptions.get("includeAllResponses", False)})
+        except NotImplementedError as error:
+            return warn(str(error))
+
+        availableNames = set()
+
+        for variableName, variable in trialData.data_vars.items():
+            if variable.attrs.get("role") in ("presenceMask", "structuredPresence"):
+                continue
+
+            if variable.dims == ("trial",):
+                availableNames.add(variableName)
+            elif variable.attrs.get("logicalType") == "vector":
+                componentDimension = variable.attrs["componentDimension"]
+                availableNames.update(f"{variableName}Component{index}" for index in range(variable.sizes[componentDimension]))
+
+        missingNames = [name for name in columns if name not in availableNames]
+
+        if missingNames:
+            return warn(f"Requested columns are unavailable: {missingNames}.\nAvailable columns: {sorted(availableNames)}")
+
+        return cls._getBehaviorTable(matrix, includeAllColumns=includeAllColumns, columns=columns, **projectionOptions)
+
+    @classmethod
+    def _getBehaviorTable(cls, matrix, *, includeAllColumns=False, columns=None, **options):
         """Return behavioral trials as an independent pandas DataFrame.
 
         Obtains the session-owned behavioral matrix internally. If absent,

@@ -401,69 +401,253 @@ class pglDataset(pglActionable):
 
         return pglStorage.getDatasetBehaviorData(self, settings=settings, settingsName=settingsName, storageOptionsByBackend=storageOptionsByBackend, sslRootCert=sslRootCert, cacheDirectory=cacheDirectory, directLocalPolicy=directLocalPolicy)
     
-    def getBehaviorTable(self, *, settings=None, settingsName=None, storageOptionsByBackend=None, sslRootCert=None, cacheDirectory=None, directLocalPolicy=None, **options):
-        """Return an independent pandas trial table from dataset behavior.
+    def getBehaviorTable(self, taskName=None, *, settings=None, settingsName=None, storageOptionsByBackend=None, sslRootCert=None, cacheDirectory=None, directLocalPolicy=None, **options):
+        """Return dataset behavioral trials as an independent pandas DataFrame.
 
-        Obtains or constructs the dataset-owned comprehensive matrix.
-        Does not publish database records or payloads.
+        Obtains the dataset-owned comprehensive matrix through getBehaviorData().
 
-        Missing, ambiguous, or invalid task selections produce a warning
-        and return None. Other construction/projection errors propagate.
+        If data["behavior"] exists:
+            Opens a saved product reference when necessary, validates the
+            behavioral schema, and reuses the resulting matrix.
 
-        Without explicit selection, each run must contain exactly one task.
+        Otherwise:
+            Constructs behavior from exact saved member checkpoints in
+            membership order. Does not use editable sessions in _sessionCache.
+            Attaches the comprehensive matrix only after successful construction.
+
+        Users do not need to call getBehaviorData() first.
+
+        Returns None with a pglMessages.warning for invalid table requests,
+        missing/ambiguous task selections, unavailable requested columns,
+        and unimplemented projection features. Configuration/connection
+        cancellation may also return None.
+
+        Source-construction failures, malformed scientific data, and unexpected
+        implementation errors still propagate.
+
+        Each row represents a selected recorded trial START. Unanswered and
+        incomplete trials are retained. The DataFrame index preserves combined
+        source-matrix trial IDs; sourceTrialNum is the recorded task-local
+        trial number, not a dataset-wide identifier.
+
+        Dataset source identity
+        -----------------------
+        Combined matrices preserve:
+            sessionIndex:
+                Zero-based member position at construction.
+            sourceCheckpointID:
+                Referenced member checkpoint ID, scoped to the source database.
+            entryName:
+                Dataset-local alias captured at construction.
+            sourceRunIndex:
+                Original run index within the member session.
+            sourceTrialIndex:
+                Original trial coordinate within the member's extracted matrix.
+
+        runIndex is unique across the combined dataset.
+        taskIndex remains local to its source run.
+        These fields describe the product's construction snapshot, not
+        necessarily the dataset's current working membership.
+
+        Task selection
+        --------------
+        taskName : str, optional
+            Exact match against recorded taskSaveName, not the human-readable
+            taskName. Example: "memoryDescriptionTask".
+        taskIndex : int, optional
+            Zero-based task index, resolved independently within every run
+            of every member represented in the matrix.
+        taskSelection : "all", optional
+            Include trials from all tasks.
+
+        Specify at most one task-selection option. Without one, every run
+        must contain exactly one task. Missing or ambiguous matches produce
+        a warning and return None; no partial table is returned.
         Automatic main-task resolution is not yet implemented.
+
+        A requested task missing from even one run does not cause that run
+        to be silently skipped. Repeated taskSaveName values within a run
+        require an unambiguous taskIndex selection.
+
+        Response summaries
+        ------------------
+        responsePolicy : {"first", "last"}, default "first"
+            Select the summary response by RECORDED EVENT ORDER, not sorted
+            timestamp order. responseCount counts all accepted response
+            events associated with the trial, not physical keypresses.
+        includeAllResponses : bool, default False
+            Add response1, responseType1, responseTime1, etc., while retaining
+            the ordinary summary columns. All times use the same reference.
+
+        Response timing
+        ---------------
+        responseReference : {"trial", "segment", "trigger"}, default "trial"
+            responseTime = response timestamp - reference timestamp, seconds.
+
+            "trial":
+                Use the recorded trial START timestamp.
+            "segment":
+                Require exactly one associated task-scoped segment boundary.
+            "trigger":
+                Require exactly one eligible associated task-scoped event
+                with the requested recorded trigger name.
+
+        segmentNum : int, required for segment timing
+            Recorder's ZERO-BASED segment number. segmentNum=1 means the
+            second segment; segmentNum=2 means the third.
+        segmentBoundary : {"start", "end"}, default "start"
+            Use an actually recorded boundary. Segment END events are not
+            inferred from the next boundary.
+        triggerName : str, required for trigger timing
+            Exact recorded trigger name.
+        requireTriggerSent : bool, default True
+            Trigger timing requires recorded triggerSent=True.
+            With False, failed or unspecified attempts also become eligible;
+            multiple eligible attempts make the reference ambiguous.
+
+        segmentNum and a nondefault segmentBoundary require segment timing.
+        triggerName and requireTriggerSent=False require trigger timing.
+        Invalid combinations warn and return None.
+
+        Missing or ambiguous recorded references produce missing responseTime,
+        not missing responses. The table is still returned with diagnostics.
+        Nonfinite/missing timestamps also produce missing latency.
+        Negative offsets are preserved and diagnosed, never clipped.
+
+        Recorded order and timestamp order can differ. A segment START is
+        not automatically verified stimulus onset. Timestamp comparisons are
+        restricted to the associated trial; clocks are not assumed comparable
+        across independent runs or members.
+
+        Run-scoped temporal trigger association is not performed.
+
+        Timing details are available in:
+            trials.attrs["viewSpecification"]
+            trials.attrs["responseTimingDiagnostics"]
+            trials.attrs["responseTimingReferences"]
+
+        Display and column selection
+        ----------------------------
+        includeAllColumns : bool, default False
+            Show internal indices, taskSaveName, and unsupported field markers.
+            Also enables numbered response expansion, even if
+            includeAllResponses=False was supplied.
+
+            Defaults hide runIndex, taskIndex, taskSaveName,
+            trialStartEventIndex, responseEventIndex and numbered variants,
+            and fields marked extractionStatus="unsupported".
+
+            Dataset identity fields such as sessionIndex, sourceCheckpointID,
+            entryName, sourceRunIndex, and sourceTrialIndex are not hidden by
+            that default policy.
+
+            This means all available TRIAL TABLE columns, not raw event rows,
+            configuration export, or unimplemented trigger expansion.
+        columns : list[str] or tuple[str], optional
+            Return exactly these columns in the requested order. Explicit
+            selection can expose otherwise hidden or absent parameter fields.
+            Unknown or duplicate column names warn and return None.
+            Requesting numbered response columns enables response expansion.
+            Numbered columns exist only up to the maximum recorded response
+            count among the selected trials.
+
+        Automatically returned parameters must be present in at least one
+        selected trial. Parameters belonging only to unselected tasks are
+        omitted, even with includeAllColumns=True.
+
+        Fields absent from some members use the combined matrix's presence
+        masks. Current encoding treats recorded None and absence alike;
+        recorded floating NaNs remain present.
+
+        Fixed-length vectors become zero-based ComponentN columns. Missing
+        integer/Boolean/string values use pandas nullable representations.
+        Absent floating values appear as NaN; ordinary pandas float columns
+        do not distinguish them from recorded NaNs. The comprehensive matrix's
+        presence masks preserve that distinction.
+
+        Unsupported markers identify an encoding limitation, not preserved
+        original scientific values. Column metadata is stored in:
+            trials.attrs["columnMetadata"]
+
+        Current feature limits
+        ----------------------
+        includeTriggers : bool, default True
+            Wide trigger-column expansion is not implemented. If trigger
+            records are detected anywhere in the comprehensive matrix,
+            this request warns and returns None.
+
+            Use includeTriggers=False to generate a table without wide
+            trigger columns. Trigger timing references STILL WORK with
+            includeTriggers=False; source trigger records are not removed.
+        includeConfiguration : bool, default False
+            Configuration projection is not implemented.
+            True produces a warning and returns None.
+
+        Construction rejects empty datasets and nonbehavioral members rather
+        than silently skipping them. Incompatible cross-member encodings
+        also raise rather than silently coercing scientific values.
+
+        Storage options
+        ---------------
+        settings, settingsName:
+            Select PGL configuration. Supply at most one.
+            Without an override, use the dataset's bound runtime settings.
+            A conflicting database identity is rejected.
+        storageOptionsByBackend:
+            Runtime payload-access options keyed by backend ID.
+            Uses the dataset's loaded runtime options when omitted.
+        sslRootCert:
+            Optional database TLS certificate configuration.
+        cacheDirectory:
+            Cache directory override when member-session loading requires it.
+        directLocalPolicy:
+            Member loading policy: "materialize" or "immutable".
+            None retains the dataset's configured load policy or the loader
+            default. "immutable" requires source paths/files to remain unchanged.
+
+        cacheDirectory and directLocalPolicy apply to missing-product
+        construction, not to opening an existing behavior matrix product.
+
+        Examples
+        --------
+        trials = dataset.getBehaviorTable(taskName="memoryDescriptionTask")
+
+        # All tasks, without unimplemented wide trigger expansion.
+        trials = dataset.getBehaviorTable(taskSelection="all", includeTriggers=False)
+
+        # Relative to recorded segment 1 START, not verified visual onset.
+        trials = dataset.getBehaviorTable(taskName="memoryDescriptionTask", responseReference="segment", segmentNum=1)
+
+        # Trigger timing without wide trigger columns.
+        trials = dataset.getBehaviorTable(taskName="memoryDescriptionTask", responseReference="trigger", triggerName="stimulusOnset", includeTriggers=False)
+
+        trials = dataset.getBehaviorTable(taskName="memoryDescriptionTask", includeAllColumns=True)
+        trials = dataset.getBehaviorTable(taskName="memoryDescriptionTask", columns=["sourceCheckpointID", "subjectID", "sessionName", "runName", "sourceTrialNum", "responseTime"])
+
+        if trials is not None:
+            print(trials.head())
+
+        Side effects, freshness, and persistence
+        ----------------------------------------
+        First access may read saved member sources and attach a working matrix,
+        even if subsequent table-option validation rejects the request.
+        Opening a saved product reference replaces it with a cached working
+        matrix in dataset.data.
+
+        Existing products are construction snapshots. Adding/removing members,
+        changing aliases or labels, or changing construction code does not
+        automatically rebuild an attached behavior product.
+
+        Construction currently retains extracted member matrices in memory
+        until assembly completes; it is not bounded-memory streaming.
+        Projection may materialize arrays, and pandas results are in memory.
+
+        Editing the returned DataFrame does not modify the source matrix.
+        Does not automatically save database records or Zarr payloads.
+        Use dataset.save() to persist attached products explicitly.
         """
         from .pglBehavior import pglBehavior
 
         matrix = self.getBehaviorData(settings=settings, settingsName=settingsName, storageOptionsByBackend=storageOptionsByBackend, sslRootCert=sslRootCert, cacheDirectory=cacheDirectory, directLocalPolicy=directLocalPolicy)
 
-        if matrix is None:
-            return None
-
-        data = pglBehavior._requireBehaviorData(matrix)
-        taskName = options.get("taskName")
-        taskIndex = options.get("taskIndex")
-        taskSelection = options.get("taskSelection")
-
-        # Check selection before projection so ordinary selection problems
-        # can produce guidance without concealing unrelated scientific errors.
-        try:
-            pglBehavior._selectBehaviorTrials(data, taskName=taskName, taskIndex=taskIndex, taskSelection=taskSelection)
-        except (TypeError, ValueError) as error:
-            noSelection = all(value is None for value in (taskName, taskIndex, taskSelection))
-
-            if noSelection:
-                heading = (
-                    "Cannot choose a behavioral task automatically. "
-                    "Each run must contain exactly one task when no selection is supplied; "
-                    "automatic main-task selection is not implemented yet."
-                )
-            else:
-                heading = "The requested behavioral task selection could not be resolved."
-
-            # List recorded names without guessing which is the main task.
-            taskSources = data.attrs.get("taskSources", [])
-            availableNames = sorted({
-                source["taskSaveName"]
-                for source in taskSources
-                if isinstance(source, dict) and isinstance(source.get("taskSaveName"), str) and source["taskSaveName"]
-            }) if isinstance(taskSources, list) else []
-
-            message = heading + "\n\n" + str(error)
-
-            if availableNames:
-                message += "\n\nRecorded taskSaveName values: " + ", ".join(repr(name) for name in availableNames)
-
-            message += (
-                "\n\nChoose a task by its exact saved name:"
-                "\n  trials = dataset.getBehaviorTable(taskName=\"yourTaskSaveName\")"
-                "\n\nOr include all tasks:"
-                "\n  trials = dataset.getBehaviorTable(taskSelection=\"all\", includeTriggers=False)"
-                "\n\nRepeated task names require a taskIndex selection."
-                "\nNo table was returned. The behavioral matrix has not been discarded; no save is needed."
-            )
-
-            pglMessages.warning(message)
-            return None
-
-        return pglBehavior.getBehaviorTable(matrix, **options)
+        return pglBehavior.getBehaviorTable(matrix, taskName=taskName,**options)
