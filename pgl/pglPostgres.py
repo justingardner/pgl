@@ -464,6 +464,119 @@ class pglPostgres(pglTraitSettings):
             pglMessages.warning("No PostgreSQL configuration was found in the configured databasePath.")
             return None
 
+    # ++++++++++++++++++++++++ saveClientConfiguration ++++++++++++++++++++++
+    def saveClientConfiguration(self, filename, *, overwrite=False):
+        """Write an explicit caller-local PostgreSQL client configuration.
+
+        Used when configuring analysis clients for an existing installation.
+        Unlike save(), this method performs no installation-path normalization,
+        default storage-location assignment, or local-server administration.
+
+        Preserves:
+            installDirectory as the installation machine's path.
+            storageLocations as registered/configured server roots or URLs.
+            Caller-specific direct/SSH connection settings.
+
+        Writes only the existing password-free PostgreSQL configuration
+        fields. Does not include agent contents, passwords, or runtime handles.
+
+        filename must be an ordinary local path, preferably a dedicated file
+        under ~/.pgl/database-clients/<profile>/configuration.json.
+
+        Existing identical configuration is left unchanged.
+        A different existing file requires overwrite=True.
+        Publication uses a same-directory temporary file and owner-only mode.
+
+        Returns:
+            Absolute path of the saved configuration.
+
+        Does not modify this object or connect to PostgreSQL/SFTP.
+        Errors propagate. Parent directories may remain after a failed save.
+
+        Usage:
+            postgres.saveClientConfiguration("~/.pgl/database-clients/desktop/configuration.json")
+        """
+        import json
+        import os
+        import tempfile
+        from pathlib import Path
+
+        if type(overwrite) is not bool:
+            raise ValueError("overwrite must be a boolean.")
+
+        try:
+            location = os.fspath(filename)
+        except TypeError as error:
+            raise ValueError("filename must be an ordinary local path.") from error
+
+        if not isinstance(location, str) or not location.strip():
+            raise ValueError("filename must be a nonempty local path.")
+
+        if any(character in location for character in ("\x00", "\n", "\r")):
+            raise ValueError("filename must not contain NUL or newline characters.")
+
+        if "://" in location or "::" in location:
+            raise ValueError("Client configuration publication requires an ordinary local path, not a URL.")
+
+        if location.endswith(("/", "\\")):
+            raise ValueError("Supply a configuration filename, not only a directory.")
+
+        self._validateValues()
+
+        if self.connectionTransport == "ssh" and not self.sshHost:
+            raise ValueError("A locally saved SSH client configuration requires an explicit sshHost.")
+
+        # Construct the exact configuration wrapper expected by load().
+        # Do not serialize arbitrary runtime attributes.
+        document = {"__class__": type(self).__name__, **self.toJSONdict()}
+        content = json.dumps(document, sort_keys=True, indent=4, ensure_ascii=False, allow_nan=False).encode("utf-8")
+
+        target = Path(location).expanduser().absolute()
+
+        if target.is_symlink():
+            raise ValueError("Client configuration destination must not be a symlink.")
+
+        if target.exists():
+            if not target.is_file():
+                raise IsADirectoryError("Client configuration destination is not a regular file.")
+
+            with target.open("rt", encoding="utf-8") as source:
+                existing = json.load(source)
+
+            if existing == document:
+                pglMessages.message(f"Client configuration is already current: {target}")
+                return str(target)
+
+            if not overwrite:
+                raise FileExistsError(f"Different client configuration exists at {target}; use overwrite=True only for an intentional replacement.")
+
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        temporaryPath = None
+
+        try:
+            with tempfile.NamedTemporaryFile(mode="wb", dir=target.parent, prefix=".pgl-client-", delete=False) as temporary:
+                temporaryPath = Path(temporary.name)
+                os.chmod(temporaryPath, 0o600)
+
+                if temporary.write(content) != len(content):
+                    raise OSError("Incomplete client configuration write.")
+
+                temporary.flush()
+                os.fsync(temporary.fileno())
+
+            if overwrite:
+                os.replace(temporaryPath, target)
+            else:
+                # Publish without overwriting a concurrently created file.
+                os.link(temporaryPath, target)
+
+        finally:
+            if temporaryPath is not None:
+                temporaryPath.unlink(missing_ok=True)
+
+        pglMessages.message(f"Client configuration saved: {target}")
+        return str(target)
+
     def save(self, filename=None, *, overwrite=False):
         """Atomically save local configuration with owner-only permissions.
 
@@ -934,6 +1047,239 @@ class pglPostgres(pglTraitSettings):
     # ------------------------------------------------------------
     # Application connections: local or remote
     # ------------------------------------------------------------
+    # ++++++++++++++++++++++++ getSSHAccessConfiguration +++++++++++++++++++++
+    def getSSHAccessConfiguration(self):
+        """Resolve caller-side SSH settings for database payload access.
+
+        Called by pglDatabase when a server-local storage root must be
+        accessed through the same installation machine as the SQL tunnel.
+
+        Uses OpenSSH's configuration evaluation rather than independently
+        interpreting aliases with Paramiko. The explicit SSH port and optional
+        username match those supplied by pglPostgresTransport._ssh().
+
+        Returns:
+            A new runtime dictionary containing the resolved endpoint,
+            identity-file paths, known-hosts-file paths, and relevant
+            authentication/security settings.
+
+        Does not:
+            Open an SSH or PostgreSQL connection.
+            Read private-key contents.
+            Save configuration or credentials.
+            Verify that authentication or SFTP access will succeed.
+
+        OpenSSH may read its configuration files and evaluate trusted local
+        configuration directives such as Match exec.
+
+        First implementation restrictions:
+            No ProxyJump or ProxyCommand.
+            No HostKeyAlias.
+            No custom IdentityAgent socket.
+            No explicitly configured SSH certificate files.
+            Standard user/global known_hosts files are supported.
+
+        These restrictions prevent the payload client from silently ignoring
+        routing or identity settings used by the SQL tunnel.
+
+        Host-key verification must still be enforced by the filesystem
+        connection implementation. Resolving this dictionary alone does
+        not authenticate the server.
+
+        Raises:
+            ValueError for invalid configuration.
+            NotImplementedError for unsupported SSH arrangements.
+            RuntimeError for unavailable OpenSSH or failed resolution.
+        """
+        import os
+        import shlex
+        import shutil
+        import subprocess
+        from pathlib import Path
+
+        self._validateValues()
+
+        if self.connectionTransport != "ssh":
+            raise ValueError("SSH access configuration requires connectionTransport='ssh'.")
+
+        if not self.sshHost:
+            raise ValueError("SSH access configuration requires sshHost.")
+
+        executable = shutil.which("ssh")
+
+        if executable is None:
+            raise RuntimeError("OpenSSH was not found.")
+
+        # Match the SQL tunnel's explicit endpoint selection. In particular,
+        # sshPort overrides a Port directive in the user's SSH configuration.
+        arguments = [
+            executable,
+            "-G",
+            "-T",
+            "-p", str(self.sshPort),
+            "-o", "BatchMode=yes",
+            "-o", "StrictHostKeyChecking=yes",
+            "-o", f"ConnectTimeout={self.connectTimeoutSeconds}",
+        ]
+
+        if self.sshUser:
+            arguments.extend(["-l", self.sshUser])
+
+        arguments.append(self.sshHost)
+
+        try:
+            result = subprocess.run(arguments, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=self.connectTimeoutSeconds, check=False)
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError("Timed out resolving OpenSSH access configuration.") from error
+
+        if result.returncode != 0:
+            # Configuration diagnostics can expose local command arguments
+            # or other private configuration details.
+            raise RuntimeError(f"OpenSSH configuration resolution failed with exit status {result.returncode}.")
+
+        values = {}
+
+        for line in result.stdout.splitlines():
+            parts = line.split(None, 1)
+
+            if len(parts) != 2:
+                continue
+
+            name, value = parts
+            values.setdefault(name.lower(), []).append(value.strip())
+
+        # ++++++++++++++++++++++++++++ single +++++++++++++++++++++++++++++++
+        def single(name, default=None):
+            """Read one resolved setting, rejecting conflicting duplicates."""
+            entries = values.get(name, [])
+
+            if not entries:
+                return default
+
+            if len(set(entries)) != 1:
+                raise ValueError(f"OpenSSH returned conflicting values for {name}.")
+
+            return entries[0]
+
+        # ++++++++++++++++++++++++++++ enabled ++++++++++++++++++++++++++++++
+        def enabled(name, default):
+            """Decode OpenSSH's Boolean output without permissive coercion."""
+            value = single(name, default).lower()
+
+            if value in {"yes", "true"}:
+                return True
+
+            if value in {"no", "false"}:
+                return False
+
+            raise ValueError(f"Unsupported resolved SSH Boolean setting: {name}.")
+
+        # ++++++++++++++++++++++++++ configured +++++++++++++++++++++++++++++
+        def configured(name):
+            """Identify an explicitly effective nonempty setting."""
+            value = single(name)
+            return value is not None and value.lower() not in {"", "none"}
+
+        host = single("hostname")
+        username = single("user")
+        portText = single("port")
+
+        if not host or any(character.isspace() for character in host) or "\x00" in host:
+            raise ValueError("OpenSSH did not resolve a valid SSH hostname.")
+
+        if not username or "\x00" in username or any(character.isspace() for character in username):
+            raise ValueError("OpenSSH did not resolve a valid SSH username.")
+
+        try:
+            port = int(portText)
+        except (TypeError, ValueError) as error:
+            raise ValueError("OpenSSH did not resolve a valid SSH port.") from error
+
+        if not 1 <= port <= 65535:
+            raise ValueError("Resolved SSH port is outside 1–65535.")
+
+        unsupported = []
+
+        for name in ("proxyjump", "proxycommand", "hostkeyalias", "knownhostscommand"):
+            if configured(name):
+                unsupported.append(name)
+
+        certificateFiles = [value for value in values.get("certificatefile", []) if value.lower() != "none"]
+
+        if certificateFiles:
+            unsupported.append("certificatefile")
+
+        identityAgent = single("identityagent")
+
+        if identityAgent is not None and identityAgent.lower() not in {"none", "ssh_auth_sock", "$ssh_auth_sock"}:
+            unsupported.append("identityagent")
+
+        if unsupported:
+            raise NotImplementedError("Automatic database payload access does not yet support these SSH settings: " + ", ".join(sorted(unsupported)) + ". SQL tunneling and payload access must not silently use different connection policies.")
+
+        # +++++++++++++++++++++++++++ localPath +++++++++++++++++++++++++++++
+        def localPath(value, settingName):
+            """Expand an already-resolved local SSH configuration path.
+
+            Unsupported token expressions are rejected rather than guessed.
+            Paths identify caller-local files, not server storage roots.
+            """
+            if not value or any(character in value for character in ("\x00", "\n", "\r")):
+                raise ValueError(f"Invalid path in SSH setting {settingName}.")
+
+            if "%" in value or "${" in value or value.startswith("$"):
+                raise NotImplementedError(f"Unresolved path tokens in SSH setting {settingName} are not supported.")
+
+            return str(Path(value).expanduser().resolve())
+
+        identityFiles = []
+
+        for value in values.get("identityfile", []):
+            if value.lower() == "none":
+                continue
+
+            # IdentityFile output is one path per line. Do not split it:
+            # a legitimate local filename can contain spaces.
+            path = localPath(value, "identityfile")
+
+            if path not in identityFiles:
+                identityFiles.append(path)
+
+        knownHostsFiles = []
+
+        for settingName in ("userknownhostsfile", "globalknownhostsfile"):
+            for value in values.get(settingName, []):
+                # These settings can contain multiple quoted paths.
+                for item in shlex.split(value):
+                    if item.lower() == "none":
+                        continue
+
+                    path = localPath(item, settingName)
+
+                    if path not in knownHostsFiles:
+                        knownHostsFiles.append(path)
+
+        if not knownHostsFiles:
+            raise ValueError("No known_hosts files are configured for strict SSH payload verification.")
+
+        # Do not copy agent credentials. Only report whether the caller's
+        # current process has an agent available and the SSH policy permits it.
+        agentPermitted = identityAgent is None or identityAgent.lower() != "none"
+        agentAvailable = agentPermitted and bool(os.environ.get("SSH_AUTH_SOCK"))
+
+        return {
+            "version": 1,
+            "host": host,
+            "port": port,
+            "username": username,
+            "connectTimeoutSeconds": self.connectTimeoutSeconds,
+            "identityFiles": identityFiles,
+            "knownHostsFiles": knownHostsFiles,
+            "identitiesOnly": enabled("identitiesonly", "no"),
+            "publicKeyAuthentication": enabled("pubkeyauthentication", "yes"),
+            "agentAvailable": agentAvailable,
+            "strictHostKeyChecking": True,
+        }
 
     @contextmanager
     def connect(self, *, user=None, sslRootCert=None, rememberPassword=True, useSavedPassword=True):
