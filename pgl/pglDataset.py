@@ -199,30 +199,42 @@ class pglDataset(pglActionable):
         selector = f"sessionID={sessionID}" if sessionID is not None else f"entryName={entryName!r}"
         raise KeyError(f"No dataset member with {selector}.")
 
+    # +++++++++++++++++++++++++++ addSession ++++++++++++++++++++++++++++++++
     def addSession(self, sessionID, entryName=None, labels=None, *, settings=None, settingsName=None, sslRootCert=None):
-        """Add one or several active completed checkpoints.
+        """Add one or several active completed checkpoints to working membership.
 
-        sessionID:
-            One checkpoint ID, or a list/tuple of checkpoint IDs.
+        Called by users constructing or extending a dataset.
+        Uses pglDatabase.getDatasetMemberSummaries() to validate source
+        checkpoint metadata without constructing member sessions.
 
-        Existing members and repeated IDs in the supplied collection warn
-        and are skipped. Existing aliases and labels remain unchanged.
-
+        sessionID accepts one integer or a list/tuple of integers.
         New members preserve their supplied order.
-        labels applies independently to each new member.
+        labels is copied independently for each new member.
         entryName is permitted only when exactly one ID is supplied.
 
-        Validates all new members before changing membership. If any new
-        checkpoint is missing, deleted, or incomplete, none are added.
+        Existing members and repeated requested IDs warn and are skipped.
+        Existing aliases and labels are not changed.
 
-        Reads database metadata only. Does not load session payloads,
-        populate the session cache, or publish a dataset checkpoint.
+        Validates every proposed new member before assigning membership.
+        If any new checkpoint is missing, deleted, or incomplete, none are
+        added. Successful metadata resolution may still bind the dataset's
+        runtime database configuration before membership is accepted.
 
-        Returns True if members were added, otherwise False.
-        Invalid arguments and unavailable source checkpoints raise.
-        Configuration/connection cancellation returns False.
+        Returns:
+            True if members were added; False if there are no new members or
+            configuration/connection resolution returns no result.
+
+        Invalid arguments, unavailable source checkpoints, and other database
+        or connection errors propagate.
+
+        Reads SQL metadata only. Does not load scientific payloads, populate
+        the session cache, publish a checkpoint, or rebuild existing products.
+
+        Usage:
+            dataset.addSession([12, 15, 18])
+            dataset.addSession(21, entryName="subjectA", labels={"group": "control"})
         """
-        from .pglStorage import pglStorage
+        from .pglDatabase import pglDatabase
 
         requestedIDs = list(sessionID) if isinstance(sessionID, (list, tuple)) else [sessionID]
 
@@ -267,16 +279,13 @@ class pglDataset(pglActionable):
         if not newIDs:
             return False
 
-        newMembers = [
-            {"sessionID": requestedID, "entryName": entryName, "labels": normalizedLabels}
-            for requestedID in newIDs
-        ]
+        newMembers = [{"sessionID": requestedID, "entryName": entryName, "labels": normalizedLabels} for requestedID in newIDs]
 
-        # Validates alias uniqueness and creates independent label copies.
+        # Validate alias uniqueness and create independent label copies.
         proposed = self._validateMembers([*currentMembers, *newMembers])
 
-        # Resolve all candidate checkpoints in one metadata query.
-        summaries = pglStorage.getDatasetMemberSummaries(self, sessionIDs=newIDs, settings=settings, settingsName=settingsName, sslRootCert=sslRootCert)
+        # Resolve all candidates in one database metadata query.
+        summaries = pglDatabase.getDatasetMemberSummaries(self, sessionIDs=newIDs, settings=settings, settingsName=settingsName, sslRootCert=sslRootCert)
 
         if summaries is None:
             return False
@@ -299,8 +308,8 @@ class pglDataset(pglActionable):
         if self.members != currentMembers:
             raise RuntimeError("Dataset membership changed during validation. No members were added by this call; retry with the current membership.")
 
-        # One assignment after every new checkpoint has passed validation.
-        # Existing behavior products remain unchanged construction snapshots.
+        # Assign only after every new checkpoint passes validation.
+        # Existing products remain unchanged construction snapshots.
         self._members = proposed
         return True
 
@@ -332,74 +341,216 @@ class pglDataset(pglActionable):
 
         self._members = self._validateMembers(records)
 
+    # +++++++++++++++++++++++++++ getSession ++++++++++++++++++++++++++++++++
     def getSession(self, sessionID=None, *, entryName=None, settings=None, settingsName=None, storageOptionsByBackend=None, sslRootCert=None, cacheDirectory=None, directLocalPolicy=None):
-        """Return the cached working session, loading it on first access.
+        """Return a member's cached working session, loading it when needed.
+
+        User-facing wrapper for pglDatabase.getDatasetSession().
+        Supply exactly one of sessionID or entryName to select membership.
+
+        The database layer validates configuration binding even on cache hits.
+        On first access, it loads the exact member checkpoint and caches the
+        resulting working session. Scientific contents remain deferred where
+        supported by the session loader.
 
         The cache key remains the original member checkpoint ID even if the
-        returned session is subsequently saved as a different checkpoint.
+        returned working session is later saved as a different checkpoint.
+        Editing or saving that session does not repoint dataset membership.
+
+        Explicit load options override the dataset's retained runtime options.
+        On a cache hit, those options do not reload or replace the cached object.
+
+        Returns:
+            A working pglSession, or None when configuration or loading returns
+            no session. Invalid selectors and other loading errors propagate.
+
+        Does not publish a session or dataset checkpoint.
+
+        Usage:
+            session = dataset.getSession(entryName="subjectA")
         """
-        from .pglStorage import pglStorage
+        from .pglDatabase import pglDatabase
 
         member = self._findMember(sessionID=sessionID, entryName=entryName)
 
-        return pglStorage.getDatasetSession(self, member["sessionID"], settings=settings, settingsName=settingsName, storageOptionsByBackend=storageOptionsByBackend, sslRootCert=sslRootCert, cacheDirectory=cacheDirectory, directLocalPolicy=directLocalPolicy)
+        return pglDatabase.getDatasetSession(self, member["sessionID"], settings=settings, settingsName=settingsName, storageOptionsByBackend=storageOptionsByBackend, sslRootCert=sslRootCert, cacheDirectory=cacheDirectory, directLocalPolicy=directLocalPolicy)
 
+    # ++++++++++++++++++++++++++++++ print ++++++++++++++++++++++++++++++++++
     def print(self, verbose=False, *, settings=None, settingsName=None, sslRootCert=None):
-        """Print member metadata without constructing sessions or matrices."""
-        from .pglStorage import pglStorage
+        """Print working membership labels and scientific product references.
 
-        return pglStorage.printDataset(self, verbose=verbose, settings=settings, settingsName=settingsName, sslRootCert=sslRootCert)
+        User-facing wrapper for pglDatabase.printDataset().
 
-    def save(self, *, settings=None, settingsName=None, backendID=None, storageOptions=None, sslRootCert=None):
-        """Publish a new dataset checkpoint, including attached products.
+        Reads member metadata from PostgreSQL and verified root behavioral
+        experiment-settings files for acquisition session names.
+        Does not construct member sessions or open scientific matrix arrays.
 
-        Saved references reuse their registered payloads.
-        Attached mutable matrices publish new revisions.
-        Does not construct missing products or rerun analyses.
+        Displays current working membership and attachment state; it does not
+        assert that attached products match current membership or source code.
+
+        verbose=True additionally displays member labels, derived-parameter
+        keys, and the recorded action count.
+
+        Returns:
+            True after reporting; False when configuration/connection
+            resolution returns no result. Other errors propagate.
+
+        Does not publish records or modify membership. Successful metadata
+        resolution may bind the dataset's runtime database configuration.
         """
-        from .pglStorage import pglStorage
+        from .pglDatabase import pglDatabase
 
-        return pglStorage.saveDataset(self, settings=settings, settingsName=settingsName, backendID=backendID, storageOptions=storageOptions, sslRootCert=sslRootCert)
-
-    def getData(self, productName, *, settings=None, settingsName=None, storageOptionsByBackend=None, sslRootCert=None):
-        """Return an attached product, opening a saved reference on demand.
-
-        The opened matrix replaces its reference in dataset.data and is cached.
-        Subsequent saves conservatively publish that mutable matrix anew.
-
-        This persistence-stage implementation does not yet extract missing
-        products or evaluate input freshness.
-        """
-        from .pglStorage import pglStorage
-
-        return pglStorage.getDatasetData(self, productName, settings=settings, settingsName=settingsName, storageOptionsByBackend=storageOptionsByBackend, sslRootCert=sslRootCert)
+        return pglDatabase.printDataset(self, verbose=verbose, settings=settings, settingsName=settingsName, sslRootCert=sslRootCert)
     
+    # +++++++++++++++++++++++++++++++ save ++++++++++++++++++++++++++++++++++
+    def save(self, *, settings=None, settingsName=None, backendID=None, storageOptions=None, sslRootCert=None):
+        """Publish a new dataset checkpoint with its attached products.
+
+        User-facing wrapper for pglDatabase.saveDataset().
+        The database layer validates membership and history, publishes working
+        matrices, registers product links, and completes the checkpoint.
+
+        Unopened saved references reuse registered matrix revisions.
+        Attached mutable matrices publish new revisions.
+        Cached working sessions are not saved by this operation.
+
+        Does not construct missing products, rebuild existing products after
+        membership changes, or rerun analyses.
+
+        Returns:
+            New dataset checkpoint ID, or None for unavailable configuration,
+            invalid/missing creator configuration, or connection cancellation.
+            Other errors propagate.
+
+        Dataset identity, annotations, binding, and history baseline are updated
+        only after successful commit and connection cleanup.
+        Working matrix attachments remain attached.
+
+        Database writes are transactional; payload writes are not.
+        Failed saves may leave unregistered bundles.
+        Concurrent mutation of the dataset or its products is unsupported.
+
+        Usage:
+            datasetID = dataset.save(settingsName="desktop")
+        """
+        from .pglDatabase import pglDatabase
+
+        return pglDatabase.saveDataset(self, settings=settings, settingsName=settingsName, backendID=backendID, storageOptions=storageOptions, sslRootCert=sslRootCert)
+    
+    # +++++++++++++++++++++++++++++ getData +++++++++++++++++++++++++++++++++
+    def getData(self, productName, *, settings=None, settingsName=None, storageOptionsByBackend=None, sslRootCert=None):
+        """Return an attached matrix, opening a saved reference when necessary.
+
+        User-facing wrapper for pglDatabase.getDatasetData().
+        Database configuration and binding are checked even when the product
+        is already attached as a working matrix.
+
+        For an unopened saved reference, the database layer resolves its
+        registered revision and checks the published descriptor against the
+        catalog before loading it through pglStorage.
+
+        The opened working matrix replaces the reference in self.data.
+        Scientific arrays remain lazy; opening reads descriptor/Zarr metadata.
+        Subsequent saves publish that mutable matrix as a fresh revision.
+
+        Returns:
+            The attached pglDataMatrix, or None when configuration/connection
+            resolution returns no result.
+
+        Missing products raise KeyError. Binding, catalog, descriptor, and
+        loading failures propagate.
+
+        Does not construct missing products, evaluate construction freshness,
+        or publish database records or payloads.
+
+        Usage:
+            matrix = dataset.getData("behavior")
+        """
+        from .pglDatabase import pglDatabase
+
+        return pglDatabase.getDatasetData(self, productName, settings=settings, settingsName=settingsName, storageOptionsByBackend=storageOptionsByBackend, sslRootCert=sslRootCert)
+        
+    # +++++++++++++++++++++++++++++++ load ++++++++++++++++++++++++++++++++++
     @classmethod
     def load(cls, datasetID, *, settings=None, settingsName=None, sslRootCert=None, includeDeleted=False, storageOptionsByBackend=None, cacheDirectory=None, directLocalPolicy="materialize"):
-        """Restore membership and metadata without loading member sessions."""
-        from .pglStorage import pglStorage
+        """Restore a completed dataset checkpoint without loading its members.
 
-        return pglStorage.loadDataset(datasetID, settings=settings, settingsName=settingsName, sslRootCert=sslRootCert, includeDeleted=includeDeleted, storageOptionsByBackend=storageOptionsByBackend, cacheDirectory=cacheDirectory, directLocalPolicy=directLocalPolicy)
-    
-    def getBehaviorData(self, *, settings=None, settingsName=None, storageOptionsByBackend=None, sslRootCert=None, cacheDirectory=None, directLocalPolicy=None):
-        """Return the dataset-owned comprehensive behavioral matrix.
+        User-facing wrapper for pglDatabase.loadDataset().
+        Restores lightweight metadata, ordered membership, annotations,
+        unopened scientific-product references, and the history baseline.
 
-        Reuses data["behavior"] when present, resolving a saved reference
-        through the normal product loader and validating its behavioral schema.
+        Does not construct sessions, open Zarr stores, or rebuild products.
+        No SQL connection is retained by the returned dataset.
 
-        Otherwise constructs from exact saved member checkpoints, in membership
-        order, without using editable sessions in _sessionCache.
+        Runtime storage, TLS, and member-loading options are retained for
+        subsequent getSession(), getData(), and getBehaviorData() calls.
 
-        Successful construction attaches a working pglDataMatrix.
-        Does not automatically rebuild after membership or code changes.
-        Existing products remain construction snapshots.
+        includeDeleted=True permits inspection without restoring the dataset
+        or reestablishing its protection of source sessions.
+        It does not automatically authorize loading deleted member sessions.
 
-        Reads sources as needed; does not publish.
-        Use save() to persist the attached product explicitly.
+        Returns:
+            A pglDataset, or None for an unknown/hidden checkpoint, unavailable
+            configuration, or connection cancellation.
+            Invalid arguments, malformed metadata, and database errors
+            otherwise propagate.
+
+        Reconstruction follows the saved dataset contract rather than
+        constructing a subclass through cls.
+
+        Usage:
+            dataset = pglDataset.load(7, settingsName="desktop")
         """
-        from .pglStorage import pglStorage
+        from .pglDatabase import pglDatabase
 
-        return pglStorage.getDatasetBehaviorData(self, settings=settings, settingsName=settingsName, storageOptionsByBackend=storageOptionsByBackend, sslRootCert=sslRootCert, cacheDirectory=cacheDirectory, directLocalPolicy=directLocalPolicy)
+        return pglDatabase.loadDataset(datasetID, settings=settings, settingsName=settingsName, sslRootCert=sslRootCert, includeDeleted=includeDeleted, storageOptionsByBackend=storageOptionsByBackend, cacheDirectory=cacheDirectory, directLocalPolicy=directLocalPolicy)
+    
+    # +++++++++++++++++++++++++ getBehaviorData +++++++++++++++++++++++++++++
+    def getBehaviorData(self, *, settings=None, settingsName=None, storageOptionsByBackend=None, sslRootCert=None, cacheDirectory=None, directLocalPolicy=None):
+        """Return or construct the dataset-owned comprehensive behavior matrix.
+
+        Called directly by users and internally by getBehaviorTable().
+        Delegates database-aware source resolution and construction to
+        pglDatabase.getDatasetBehaviorData().
+
+        When data["behavior"] exists:
+            Resolve an unopened saved reference through the product loader.
+            Validate its behavioral schema and return the working matrix.
+            An invalid existing product raises rather than being replaced.
+
+        When the product is absent:
+            Load exact saved member checkpoints afresh in membership order.
+            Do not reuse editable sessions in _sessionCache or their attached
+            behavior matrices.
+            Extract and combine behavioral sources, then attach the completed
+            working matrix only after validation succeeds.
+
+        Missing-product construction rejects empty datasets and members
+        without behavioral runs. Deleted source checkpoints are not implicitly
+        permitted merely because the dataset was loaded for inspection.
+
+        Existing products remain construction snapshots. Membership, alias,
+        label, or code changes do not automatically rebuild them.
+
+        Returns:
+            The behavioral pglDataMatrix, or None when configuration or an
+            existing-product loader returns no result.
+            Source loading, extraction, and validation failures propagate.
+
+        Construction reads behavioral payloads and retains temporary extracted
+        matrices until assembly completes; it is not bounded-memory streaming.
+        General member loading may also inspect matrix and MNE metadata.
+
+        Does not publish database records or Zarr bundles.
+        Use save() to persist the attached product.
+        Concurrent mutation during construction is unsupported.
+
+        Usage:
+            behavior = dataset.getBehaviorData()
+        """
+        from .pglDatabase import pglDatabase
+
+        return pglDatabase.getDatasetBehaviorData(self, settings=settings, settingsName=settingsName, storageOptionsByBackend=storageOptionsByBackend, sslRootCert=sslRootCert, cacheDirectory=cacheDirectory, directLocalPolicy=directLocalPolicy)
     
     def getBehaviorTable(self, taskName=None, *, settings=None, settingsName=None, storageOptionsByBackend=None, sslRootCert=None, cacheDirectory=None, directLocalPolicy=None, **options):
         """Return dataset behavioral trials as an independent pandas DataFrame.

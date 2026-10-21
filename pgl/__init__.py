@@ -29,7 +29,8 @@ from .pglFlywheel import pglFlywheel
 from .pglDigitalBrain import pglChooseBlock, pglDigitalBrainMemoryTask, pglDigitalBrainConfigure
 from .pglChoose import pglChoose
 from .pglSession import pglSession
-from .pglStorage import pglStorage, pglCheckpointFilesystem
+from .pglStorage import pglStorage
+from .pglDatabase import pglDatabase
 from .pglPostgres import pglPostgres
 from .pglActionsFixes import pglActionsFixes
 from .pglActionsMNE import pglActionsMNE

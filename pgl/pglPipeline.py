@@ -1026,19 +1026,47 @@ class pglPipeline(pglAction):
 
         printSteps(self, "  ", set())
 
+    # +++++++++++++++++++++++++++++++ run +++++++++++++++++++++++++++++++++++
     def run(self, *, session=None, sessionID=None, start=None, end=None, allowCodeMismatch=False, settings=None, settingsName=None, storageOptionsByBackend=None, sslRootCert=None, cacheDirectory=None, directLocalPolicy="materialize"):
-        """Run selected steps on an explicit input or a verified replay default.
+        """Run selected recipe steps on a working object or saved checkpoint.
+
+        User-facing pipeline execution coordinator. Prepares an independent
+        recipe snapshot, resolves its input, then invokes pglAction.run()
+        for execution identity, history recording, and failure bookkeeping.
+
+        Input selection:
+            session supplies an existing scientific working object.
+            sessionID loads an exact active checkpoint through pglDatabase.
+            With neither, use the verified default recorded in replayInput.
 
         Explicit session/sessionID overrides the default for this execution.
-        Nested execution must receive its working object explicitly.
+        Only default replay requires the loaded checkpoint identity and
+        history to match the previously recorded replay input.
 
-        Validate recipe and selection before loading. When using the default,
-        compare the loaded database identity and history to the recorded input
-        before scientific execution begins.
+        start/end select an inclusive range of top-level steps using the
+        existing step selectors. Recipe and selection validation occur before
+        checkpoint loading. Nested pipelines must receive a working object
+        explicitly rather than load a new checkpoint.
 
-        No checkpoint is saved automatically.
+        Database loading options apply only to checkpoint inputs.
+        Resolving a checkpoint reads metadata and establishes lazy payload
+        backings; selected actions may subsequently load scientific arrays.
+
+        Returns:
+            The resulting scientific actionable on success.
+            None if input loading returns no session or action execution fails
+            through the ordinary action runner.
+
+        Preparation, input-validation, and source-mismatch errors propagate.
+        Scientific mutations are not rolled back.
+        No session or dataset checkpoint is saved automatically.
+
+        Usage:
+            result = pipeline.run(sessionID=42, settingsName="desktop")
+            result = pipeline.run(session=workingSession)
+            result = pipeline.run()
         """
-        from .pglStorage import pglStorage
+        from .pglDatabase import pglDatabase
 
         if getattr(self, "_executionInProgress", False) or getattr(self, "_pipelineExecutionPrepared", False):
             raise RuntimeError("This pipeline is already preparing or executing a run.")
@@ -1057,7 +1085,7 @@ class pglPipeline(pglAction):
                 raise ValueError("This pipeline has no verified default input. Supply session or sessionID explicitly.")
 
             expectedInput = deepcopy(self.replayInput)
-            pglStorage._validatePipelineReplayInput(expectedInput)
+            pglDatabase._validatePipelineReplayInput(expectedInput)
             sessionID = expectedInput["sessionID"]
 
         if sessionID is not None:
@@ -1088,15 +1116,15 @@ class pglPipeline(pglAction):
 
             if sessionID is not None:
                 pglMessages.message(f"Pipeline {self.name!r}: loading input checkpoint {sessionID}...")
-                session, inputRecord = pglStorage._loadPipelineInput(sessionID, settings=settings, settingsName=settingsName, storageOptionsByBackend=storageOptionsByBackend, sslRootCert=sslRootCert, cacheDirectory=cacheDirectory, directLocalPolicy=directLocalPolicy)
+                session, inputRecord = pglDatabase._loadPipelineInput(sessionID, settings=settings, settingsName=settingsName, storageOptionsByBackend=storageOptionsByBackend, sslRootCert=sslRootCert, cacheDirectory=cacheDirectory, directLocalPolicy=directLocalPolicy)
 
                 if session is None:
                     pglMessages.warning(f"Pipeline {self.name!r} was not run: input checkpoint {sessionID} could not be loaded.", level=2)
                     return None
 
-                # An explicit override intentionally selects another input.
-                # Only default replay requires a match to the recorded baseline.
-                pglStorage._validatePipelineReplayInput(inputRecord, expected=expectedInput)
+                # Explicit overrides intentionally select another input.
+                # Default replay must match the recorded checkpoint boundary.
+                pglDatabase._validatePipelineReplayInput(inputRecord, expected=expectedInput)
                 inputLabel = f"checkpoint {sessionID}"
 
             else:
@@ -1368,18 +1396,32 @@ class pglPipeline(pglAction):
         restored._validateStructure()
         return restored
     
+    # +++++++++++++++++++++++++++ toJSONdict ++++++++++++++++++++++++++++++++
     def toJSONdict(self, type="all"):
-        """Serialize recipe, source associations, and optional replay input.
+        """Build the recipe document used by pglSerialize.
 
-        Values are encoded by pglSerialize. Replay input is stored only on the
-        top-level recipe; nested execution always receives its parent's object.
+        Called during recipe serialization and execution-snapshot preparation.
+        Includes recipe configuration, historical source associations, and an
+        optional top-level checkpoint replay input.
+
+        pglSerialize handles recursive encoding of the returned values.
+        Database-specific replay metadata is structurally validated through
+        pglDatabase without connecting to PostgreSQL or reading payloads.
+
+        Nested execution receives its parent's working object. Only the
+        top-level recipe's replayInput is included in this document.
+
+        Returns a new document without modifying the recipe or its history.
+        Structural and serialization-preparation errors propagate.
         """
-        from .pglStorage import pglStorage
+        from .pglDatabase import pglDatabase
 
         recipe = self._toRecipeRecord()
         sources = {}
 
+        # +++++++++++++++++++++++++++ collect +++++++++++++++++++++++++++++++
         def collect(pipeline, path):
+            """Copy source associations for each nested recipe location."""
             if pipeline.stepSources:
                 sources[path] = deepcopy(pipeline.stepSources)
 
@@ -1395,15 +1437,27 @@ class pglPipeline(pglAction):
             document["stepSourcesByPipeline"] = sources
 
         if self.replayInput:
-            pglStorage._validatePipelineReplayInput(self.replayInput)
+            pglDatabase._validatePipelineReplayInput(self.replayInput)
             document["replayInput"] = deepcopy(self.replayInput)
 
         return document
 
+    # ++++++++++++++++++++++++++ fromJSONdict +++++++++++++++++++++++++++++++
     @classmethod
     def fromJSONdict(cls, data, type="all", filename=None):
-        """Restore the tested recipe document plus optional replay metadata."""
-        from .pglStorage import pglStorage
+        """Restore a recipe document and optional checkpoint replay metadata.
+
+        Called by pglSerialize after decoding the document's values.
+        Delegates recipe/source restoration to _fromRecipeDocument() and
+        checkpoint-input structure validation to pglDatabase.
+
+        Does not load the referenced checkpoint, verify current database
+        availability, execute scientific actions, or connect to PostgreSQL.
+
+        Returns a reconstructed pipeline with an independent replay-input
+        record. Invalid documents and restoration errors propagate.
+        """
+        from .pglDatabase import pglDatabase
 
         if not isinstance(data, dict):
             raise ValueError("Invalid serialized pipeline document.")
@@ -1413,7 +1467,7 @@ class pglPipeline(pglAction):
         replayInput = document.pop("replayInput", None)
 
         if hasReplayInput:
-            pglStorage._validatePipelineReplayInput(replayInput)
+            pglDatabase._validatePipelineReplayInput(replayInput)
 
         restored = cls._fromRecipeDocument(document, type=type, filename=filename)
 
@@ -1494,20 +1548,40 @@ class pglPipeline(pglAction):
 
         return result
     
+    # +++++++++++++++++++++++++++ fromHistory +++++++++++++++++++++++++++++++
     @classmethod
     def fromHistory(cls, actionable, *, name=None):
-        """Extract a recipe and, when proven, its default checkpoint input.
+        """Extract an independent recipe and any recorded checkpoint input.
 
-        Find the earliest successful top-level pipeline execution carrying an
-        explicit checkpoint input. Verify the history prefix represented by
-        that checkpoint before excluding it from the executable recipe.
+        Called by pglActionable.getPipeline() and the database extraction
+        coordinator when no saved checkpoint baseline is available.
 
-        Histories without such evidence remain extractable, but have no
-        automatic replay input. No checkpoint is inferred from sessionID.
+        Finds the earliest successful top-level pipeline execution carrying
+        explicit checkpoint-input metadata. Verifies the corresponding
+        in-memory history prefix against its recorded fingerprints before
+        excluding that prefix from the executable recipe.
+
+        Histories without this evidence remain extractable but have no default
+        replay input. A checkpoint is never inferred from sessionID alone.
+
+        Uses pglDatabase for checkpoint-input structure validation and the
+        checkpoint history encoding contract. Does not query PostgreSQL,
+        read archived checkpoint files, or verify current source availability.
+
+        Returns:
+            An independent pglPipeline, possibly with replayInput attached.
+
+        Does not modify source history, copy scientific payloads, or execute
+        actions. Invalid provenance, inconsistent history, and unsupported
+        extraction structures raise.
+
+        Current database correspondence is checked later when default replay
+        loads its checkpoint.
         """
         import hashlib
         import json
-        from .pglStorage import pglStorage
+
+        from .pglDatabase import pglDatabase
 
         if not isinstance(actionable, pglActionable):
             raise TypeError("Pipeline extraction requires a pglActionable object.")
@@ -1529,14 +1603,14 @@ class pglPipeline(pglAction):
 
         sourceIndex, sourceEntry = candidates[0]
         inputRecord = deepcopy(sourceEntry.actionInput)
-        pglStorage._validatePipelineReplayInput(inputRecord)
+        pglDatabase._validatePipelineReplayInput(inputRecord)
         boundary = inputRecord["historyCount"]
 
         if boundary > sourceIndex:
             raise ValueError("Recorded replay boundary lies after the execution that supplied it.")
 
-        # The runtime recorder currently attaches checkpoint input metadata
-        # to pipeline executions. Reject another class instead of guessing.
+        # Checkpoint inputs are currently recorded by pipeline executions.
+        # Reject another class rather than inferring its replay semantics.
         code = sourceEntry.actionCode
 
         if not isinstance(code, dict) or not code.get("module") or not code.get("qualname"):
@@ -1549,21 +1623,21 @@ class pglPipeline(pglAction):
 
         for index, expectedHash in enumerate(inputRecord["historyHashes"]):
             document = json.loads(history[index].toJSON())
-            actualHash = hashlib.sha256(pglStorage.encodeRawManifest(document)).hexdigest()
+            actualHash = hashlib.sha256(pglDatabase.encodeRawManifest(document)).hexdigest()
 
             if actualHash != expectedHash:
                 raise ValueError(f"History entry {index} does not match the recorded checkpoint input. Cannot safely exclude the checkpoint history prefix.")
 
-        # Use a lightweight history view rather than copying the scientific
-        # session. The existing extractor reads entries but does not edit them.
+        # Use a lightweight history view rather than copying scientific data.
+        # The extractor reads historical entries without editing them.
         view = pglActionable()
         view.actionHistory = list(history[boundary:])
         view._failedActionIDs = list(actionable._failedActionIDs)
         pipeline = cls._fromHistoryRecipe(view, name=name)
 
-        # The extractor saw a suffix. Restore source indices to positions in
-        # the original full history, including inside nested extracted recipes.
+        # ++++++++++++++++++++ restoreHistoryIndices +++++++++++++++++++++++
         def restoreHistoryIndices(recipe):
+            """Translate extracted suffix indices back to full-history positions."""
             for record in recipe.stepSources.values():
                 record["historyIndex"] += boundary
 

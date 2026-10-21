@@ -2548,43 +2548,58 @@ class pglSession(pglActionable):
         pglMessages.warning(f"Unknown data type: {dataName}")
         return None
 
-
+    # +++++++++++++++++++++++++ saveRawSession ++++++++++++++++++++++++++++++
     def saveRawSession(self, *, settings=None, settingsName=None, backendID=None, storageOptions=None, sslRootCert=None, allowMissingMetadata=False):
-        """Save this session as a parentless acquisition/root checkpoint.
+        """Publish this session as a parentless acquisition checkpoint.
+
+        User-facing convenience wrapper for pglDatabase.saveRawSession().
+        The database layer owns configuration, SQL transactions, payload
+        publication, duplicate detection, and checkpoint completion.
 
         Supports behavioral-only, MNE-only, and mixed sessions.
 
-        Behavioral acquisition labels and files come from saved run sources,
+        Behavioral files and labels come from saved acquisition sources,
         not in-memory edits. Without behavioral runs, labels come from
-        session.experimentName and session.subjectID.
+        self.experimentName and self.subjectID.
 
-        Missing experimentName or subjectID warns and cancels by default.
-        allowMissingMetadata=True explicitly permits unset labels.
+        Missing experiment/subject labels warn and cancel unless
+        allowMissingMetadata=True. Malformed or unreadable settings still
+        raise; the override permits missing labels only.
 
-        Attached MNE objects are serialized from their current contents.
-        Original vendor files are not automatically archived.
+        MNE objects are serialized from their current contents. Original
+        vendor acquisition files are not automatically archived.
 
-        Returns a completed checkpoint ID, or None for rejected missing
-        metadata, unavailable configuration, or connection cancellation.
+        Attached data matrices are omitted with a warning and remain attached
+        to the working session. Use saveSession() to persist those products.
 
-        After a successful save, self.sessionID becomes the new checkpoint ID,
-        so subsequent saveSession() calls default to this checkpoint as parent.
+        Returns:
+            Completed raw checkpoint ID, possibly reusing an identical active
+            checkpoint; None for missing-label rejection, unavailable
+            configuration, or connection cancellation.
+
+        After successful publication and connection cleanup, this wrapper
+        assigns self.sessionID so saveSession() can use it as the parent.
+        It does not bind a new history baseline or clear action history.
         Failure or cancellation leaves self.sessionID unchanged.
 
-        Accumulated action history is retained, not cleared by this wrapper.
-        Each saveRawSession() call creates a parentless root.
+        Database writes are transactional; payload writes are not.
+        Other errors propagate and may leave unregistered payload files.
+
+        Usage:
+            rawID = session.saveRawSession(settingsName="desktop")
         """
-        from .pglStorage import pglStorage
+        from .pglDatabase import pglDatabase
 
         if type(allowMissingMetadata) is not bool:
             raise ValueError("allowMissingMetadata must be a boolean.")
 
-        sessionID = pglStorage.saveRawSession(self, settings=settings, settingsName=settingsName, backendID=backendID, storageOptions=storageOptions, sslRootCert=sslRootCert, allowMissingMetadata=allowMissingMetadata)
+        sessionID = pglDatabase.saveRawSession(self, settings=settings, settingsName=settingsName, backendID=backendID, storageOptions=storageOptions, sslRootCert=sslRootCert, allowMissingMetadata=allowMissingMetadata)
 
         if sessionID is not None:
             self.sessionID = sessionID
 
         return sessionID
+
     
     def print(self, verbose=False):
         """Print the session overview, description, labels, and runs.
@@ -2646,46 +2661,112 @@ class pglSession(pglActionable):
 
         return figures
 
+    # +++++++++++++++++++++++++++ loadSession +++++++++++++++++++++++++++++++
     @classmethod
     def loadSession(cls, sessionID, *, settings=None, settingsName=None, storageOptionsByBackend=None, sslRootCert=None, includeDeleted=False, cacheDirectory=None, directLocalPolicy="materialize"):
-        """Load through pglStorage, including checkpoint ID and description.
+        """Load a completed database checkpoint as a working session.
+
+        User-facing convenience wrapper for pglDatabase.loadSession().
+        The database layer resolves registered locations, verifies checkpoint
+        metadata, restores annotations and products, and binds the saved
+        history baseline.
+
+        Returns:
+            A restored pglSession, or None for invalid arguments, unavailable
+            configuration, connection cancellation, an unknown/hidden
+            checkpoint, or handled database errors.
+
+        Manifest, payload-integrity, and contract errors propagate.
+        Other connection errors may also propagate.
+
+        Behavioral and MNE scientific contents remain deferred where supported.
+        Saved matrix arrays remain lazy, although restoration reads matrix
+        descriptors and Zarr metadata. No SQL connection is retained.
 
         cacheDirectory overrides settings.cacheDir for MNE checkpoints.
-        directLocalPolicy='immutable' requires source paths and files to
-        remain unchanged and available while readers use them.
+        The cache belongs to the computer running this loader.
 
-        includeDeleted permits inspection without undeleting the checkpoint.
+        directLocalPolicy="immutable" permits eligible direct-local access
+        only when the caller guarantees that source files and paths remain
+        unchanged and available while readers use them.
+
+        includeDeleted=True permits inspection without restoring the
+        checkpoint or its lifecycle protection.
+
+        This wrapper does not construct subclasses through cls; reconstruction
+        follows the saved contracts implemented by pglDatabase.
+
+        Usage:
+            session = pglSession.loadSession(42, settingsName="desktop")
         """
-        from .pglStorage import pglStorage
+        from .pglDatabase import pglDatabase
 
-        return pglStorage.loadSession(sessionID, settings=settings, settingsName=settingsName, storageOptionsByBackend=storageOptionsByBackend, sslRootCert=sslRootCert, includeDeleted=includeDeleted, cacheDirectory=cacheDirectory, directLocalPolicy=directLocalPolicy)
-
+        return pglDatabase.loadSession(sessionID, settings=settings, settingsName=settingsName, storageOptionsByBackend=storageOptionsByBackend, sslRootCert=sslRootCert, includeDeleted=includeDeleted, cacheDirectory=cacheDirectory, directLocalPolicy=directLocalPolicy)
+    
+    # +++++++++++++++++++++++++++ saveSession +++++++++++++++++++++++++++++++
     def saveSession(self, *, parentSessionID=None, settings=None, settingsName=None, backendID=None, checkpointName=None, description=None, ingestMethod="manual", storageOptions=None, sslRootCert=None):
-        """Save current contents through pglStorage.
+        """Publish current session contents as a derived database checkpoint.
 
-        Defaults to the session's current checkpoint as parent.
+        User-facing convenience wrapper for pglDatabase.saveSession().
+        The database layer validates the parent and working history, exports
+        behavioral/MNE contents, publishes attached matrices, registers their
+        references, and completes the checkpoint.
 
+        parentSessionID=None uses self.sessionID.
         checkpointName=None carries forward self.checkpointName.
         description=None carries forward self.description.
-        Explicit blank strings clear the corresponding annotation.
+        Explicit blank annotation strings clear the corresponding annotation.
 
-        Storage updates checkpoint identity, annotations, and the history
+        Returns:
+            New or reused checkpoint ID, or None for missing-parent rejection,
+            unavailable configuration, or connection cancellation.
+            Other failures propagate.
+
+        pglDatabase updates self.sessionID, annotations, and the history
         baseline only after successful commit and connection cleanup.
-        """
-        from .pglStorage import pglStorage
+        Accumulated action history and working matrix attachments are retained.
 
-        return pglStorage.saveSession(self, parentSessionID=parentSessionID, settings=settings, settingsName=settingsName, backendID=backendID, checkpointName=checkpointName, description=description, ingestMethod=ingestMethod, storageOptions=storageOptions, sslRootCert=sslRootCert)        
+        Database writes are transactional; payload writes are not.
+        Failed saves can leave unregistered files or matrix bundles.
+        Do not modify the session or its matrices concurrently while saving.
+
+        Usage:
+            checkpointID = session.saveSession(checkpointName="filtered")
+        """
+        from .pglDatabase import pglDatabase
+
+        return pglDatabase.saveSession(self, parentSessionID=parentSessionID, settings=settings, settingsName=settingsName, backendID=backendID, checkpointName=checkpointName, description=description, ingestMethod=ingestMethod, storageOptions=storageOptions, sslRootCert=sslRootCert)    
     
+    # +++++++++++++++++++++++++++ getPipeline +++++++++++++++++++++++++++++++
     def getPipeline(self, name=None, *, settings=None, settingsName=None, storageOptionsByBackend=None, sslRootCert=None):
-        """Ask storage to extract a recipe and resolve its replay boundary.
+        """Extract an analysis recipe with its recorded replay boundary.
 
-        May read checkpoint manifests and history metadata.
-        Does not open scientific payloads, edit history, or execute actions.
+        User-facing convenience wrapper for pglDatabase.getSessionPipeline().
+
+        With a saved checkpoint baseline:
+            Inspect active checkpoint ancestry and verified manifest/history
+            metadata to identify the raw input and subsequent analysis.
+
+        Without a saved checkpoint baseline:
+            Delegate to the existing history-only extraction path.
+
+        Returns:
+            An extracted pipeline, or None when configuration/connection is
+            unavailable or extraction is refused through a handled warning.
+            Invalid ancestry, unsupported replay contracts, and metadata
+            errors propagate.
+
+        May read SQL metadata and archived manifest/history files.
+        Does not load scientific payload arrays, modify session history,
+        save a recipe, or execute actions.
+
+        Usage:
+            pipeline = session.getPipeline(name="preprocessing")
         """
-        from .pglStorage import pglStorage
+        from .pglDatabase import pglDatabase
 
-        return pglStorage.getSessionPipeline(self, name=name, settings=settings, settingsName=settingsName, storageOptionsByBackend=storageOptionsByBackend, sslRootCert=sslRootCert)
-    
+        return pglDatabase.getSessionPipeline(self, name=name, settings=settings, settingsName=settingsName, storageOptionsByBackend=storageOptionsByBackend, sslRootCert=sslRootCert)
+        
     def exportFig(self, fig, filename=None, *, filesystem=None, storageOptions=None, dpi=100, overwrite=True):
         """Export a figure or open it in the browser.
 
@@ -2714,22 +2795,32 @@ class pglSession(pglActionable):
 
         return pglStorage.exportFigRows(filename, filesystem=filesystem, storageOptions=storageOptions, dpi=dpi, overwrite=overwrite, maxPixels=maxPixels)
     
+    # +++++++++++++++++++++++++ getBehaviorData +++++++++++++++++++++++++++++
     def getBehaviorData(self):
-        """Return the session-owned comprehensive behavioral matrix.
+        """Return or construct this session's comprehensive behavioral matrix.
+
+        Called directly by users and internally by getBehaviorTable().
 
         First access reads behavioral sources, constructs a pglDataMatrix,
-        and attaches it under dataMatrices["behavior"].
+        validates its behavioral contract, and attaches it under
+        self.dataMatrices["behavior"].
 
-        Subsequent access returns the same attached object. Recorded session
-        sources are assumed immutable; this accessor does not perform source
-        freshness checks or automatically reconstruct existing matrices.
+        Subsequent access validates and returns the existing attachment.
+        An invalid attachment raises rather than being silently replaced.
+        Source or code changes do not automatically rebuild an existing matrix.
+
+        Returns:
+            The session-owned behavioral pglDataMatrix.
+
+        Extraction or validation failures propagate. A failed initial
+        construction does not replace the session's attachment dictionary.
 
         Does not access MNE payloads or publish database/Zarr records.
+        saveSession() explicitly persists attached matrices through
+        pglDatabase; saveRawSession() omits them.
 
-        Persistence note:
-            Session matrix save/load integration is a separate implementation
-            step. This method currently provides lazy construction and reuse
-            within the working session.
+        Usage:
+            behavior = session.getBehaviorData()
         """
         from .pglBehavior import pglBehavior
         from .pglData import pglDataMatrix
@@ -2742,13 +2833,10 @@ class pglSession(pglActionable):
             if not isinstance(matrix, pglDataMatrix):
                 raise TypeError(f"dataMatrices[{matrixName!r}] must be a pglDataMatrix.")
 
-            # Validate the behavioral contract without computing arrays.
-            # An invalid attachment must not be silently replaced.
             pglBehavior._requireBehaviorData(matrix)
             return matrix
 
-        # Construct completely before attaching. Extraction failure leaves
-        # the session's matrix collection unchanged.
+        # Construct and validate completely before installing the attachment.
         matrix = pglBehavior.extractSession(self, name=matrixName)
         pglBehavior._requireBehaviorData(matrix)
 

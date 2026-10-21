@@ -1097,7 +1097,7 @@ class pglPostgres(pglTraitSettings):
     def _adminConnect(self, password, database="postgres"):
         """Open a verified local administrator connection; caller closes it.
 
-        Retained for compatibility with pglStorage's local migration runner.
+        Retained for compatibility with pglDatabase's local migration runner.
         Does not use the client SSH/direct transport settings.
         """
         self._requireLocalConfiguration()
