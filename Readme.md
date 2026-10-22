@@ -47,10 +47,6 @@ python -m pip install --no-deps --no-build-isolation -e .
 Remove-Item Env:PGL_BUILD_NATIVE
 ```
 
-Analysis environments are intended to be portable. The current setup has been tested on macOS; Linux and Windows validation is pending.
-
-**Current limitation:** on macOS, `pglTimestamp.getSecs()` still requires the native timestamp extension. Analysis imports do not require it, but workflows that call this method do.
-
 #### Option C: macOS graphics and experiment acquisition
 
 Install Apple's Command Line Tools if they are not already installed:
@@ -71,23 +67,7 @@ Graphics and native acquisition extensions require macOS. Device-specific integr
 
 For Eyelink, use SR Research's Python SDK; do not assume that a PyPI package named `pylink` is the correct SDK.
 
-### 3. Verify installation
-
-For analysis:
-
-```bash
-python -c "from pgl import pglStorage, pglDatabase, pglSession, pglDataset, pglPostgres; print('PGL analysis imports succeeded.')"
-```
-
-For macOS graphics:
-
-```bash
-python -c "from pgl import pgl; print('PGL graphics class imported successfully.')"
-```
-
-The graphics check imports the controller class without creating a controller or explicitly opening a display.
-
-### 4. Allow Accessibility access for keyboard and mouse events
+### 3. Allow Accessibility access for keyboard and mouse events
 
 This step is only needed for macOS keyboard/mouse acquisition.
 
@@ -101,55 +81,3 @@ If events are not received from VS Code, try launching it from an authorized Ter
 
 Depending on the macOS version and how Python is launched, VS Code or the actual host application may also need its own permission. Launching from Terminal does not guarantee permission inheritance.
 
-## Using an existing environment
-
-Activate the environment before starting Python or a notebook:
-
-```bash
-conda activate pgl
-```
-
-Use `pgl_mne` or `pgl_macos` instead when appropriate. In notebooks, select the kernel belonging to that environment.
-
-If the environment name already exists, either reuse it or create a new one with an explicit name:
-
-```bash
-conda env create -n pgl_analysis_test -f pgl.yml
-conda activate pgl_analysis_test
-env PGL_BUILD_NATIVE=0 python -m pip install --no-deps --no-build-isolation -e .
-```
-
-## Development
-
-PGL is installed in editable mode (`-e .`), so Python source changes do not require reinstalling. Restart Python or the notebook kernel to reliably load changed code.
-
-Run Makefile commands from the repository root:
-
-| Command | Purpose |
-|---|---|
-| `make` | Build macOS native extensions in place |
-| `make force` | Force recompilation of native extensions |
-| `make yml` | Regenerate the environment YAML files |
-| `make clean` | Remove build outputs and native extension binaries |
-
-To change environment dependencies, edit `scripts/makeEnvironments.py`, then run:
-
-```bash
-make yml
-```
-
-Alternatively, without Make:
-
-```bash
-python scripts/makeEnvironments.py
-```
-
-Regenerating YAML files does not change installed environments. To update one:
-
-```bash
-conda env update -n pgl -f pgl.yml
-```
-
-Use the matching environment name and YAML file for MNE or macOS graphics.
-
-**Note:** editable installations share the repository checkout. Running `make clean` removes its native extension binaries for every environment using that checkout. Rebuild them from your graphics environment when needed.
