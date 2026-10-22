@@ -11,7 +11,7 @@
 import numpy as np
 from types import SimpleNamespace
 from .pglMessages import pglMessages
-from .pglBase import pglBase
+from .pglStorage import pglStorage
 from .pglSettings import pglTraitSettings
 from PIL import Image, UnidentifiedImageError
 from traitlets import HasTraits, Float, Int, List, Tuple, TraitError, Unicode, Dict, default, link, Bool, TraitType, Instance
@@ -349,7 +349,7 @@ class pglImageFile(pglStimulusFile):
     
     def _loadMetadata(self):
         pglMessages.message(f"Loading image metadata: {self.filesystemPrefix}/{self.filename}")
-        filesystem, filename, _ = pglBase.validateFilesystem(filesystem=self.filesystem, dataPath=self.filename, filesystemPrefix=self.filesystemPrefix)
+        filesystem, filename, _ = pglStorage.validateFilesystem(filesystem=self.filesystem, dataPath=self.filename, filesystemPrefix=self.filesystemPrefix)
         with filesystem.open(filename, "rb") as h:
             img = Image.open(h)
             self._size = img.size
@@ -358,7 +358,7 @@ class pglImageFile(pglStimulusFile):
 
     def _loadImage(self):
         pglMessages.message(f"Loading image: {self.filesystemPrefix}/{self.filename}")
-        filesystem, filename, _ = pglBase.validateFilesystem(filesystem=self.filesystem, dataPath=self.filename, filesystemPrefix=self.filesystemPrefix)
+        filesystem, filename, _ = pglStorage.validateFilesystem(filesystem=self.filesystem, dataPath=self.filename, filesystemPrefix=self.filesystemPrefix)
         with filesystem.open(filename, "rb") as h:
             img = Image.open(h)
             img.load()
@@ -444,7 +444,7 @@ class pglMovieFile(pglStimulusFile):
         Returns:
             imageio reader, or None if unavailable/nonlocal.
         '''
-        filesystem, filename, _ = pglBase.validateFilesystem(filesystem=self.filesystem, dataPath=self.filename, filesystemPrefix=self.filesystemPrefix)
+        filesystem, filename, _ = pglStorage.validateFilesystem(filesystem=self.filesystem, dataPath=self.filename, filesystemPrefix=self.filesystemPrefix)
 
         # fsspec filesystems generally identify local files with protocol="file".
         protocol = filesystem.protocol
@@ -517,7 +517,7 @@ class pglStimulusDatabase(pglTraitSettings):
         if dataPath:
     
             # parse filesystem
-            self.filesystem, self.dataPath, self.filesystemPrefix = pglBase.validateFilesystem(filesystem, dataPath)
+            self.filesystem, self.dataPath, self.filesystemPrefix = pglStorage.validateFilesystem(filesystem, dataPath)
             if not self.filesystem:
                 pglMessages.warning(f"Could not resolve path to images: {self.dataPaths}")
                 return

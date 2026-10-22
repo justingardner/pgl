@@ -121,13 +121,13 @@ class pglSerialize:
             import posixpath
 
             try:
-                from .pglBase import pglBase
+                from .pglStorage import pglStorage
 
                 filename = str(filename)
                 dataPath = posixpath.dirname(filename) or "."
                 fileName = posixpath.basename(filename)
 
-                filesystem, dataPath, _ = pglBase.validateFilesystem(filesystem=filesystem, dataPath=dataPath, filesystemPrefix=filesystemPrefix, create=True)
+                filesystem, dataPath, _ = pglStorage.validateFilesystem(filesystem=filesystem, dataPath=dataPath, filesystemPrefix=filesystemPrefix, create=True)
                 if filesystem is None:
                     pglMessages.warning(f"(pglSerialize) Could not resolve a filesystem for '{filename}'.")
                     return
@@ -168,8 +168,8 @@ class pglSerialize:
         filename = posixpath.splitext(str(filename))[0] + ".json"
 
         # Validate/resolve filesystem and normalise the path
-        from .pglBase import pglBase
-        filesystem, filename, _ = pglBase.validateFilesystem(filesystem=filesystem, dataPath=filename, filesystemPrefix=filesystemPrefix)
+        from .pglStorage import pglStorage
+        filesystem, filename, _ = pglStorage.validateFilesystem(filesystem=filesystem, dataPath=filename, filesystemPrefix=filesystemPrefix)
         if filesystem is None:
             pglMessages.warning(f"(pglSerialize) Could not resolve a filesystem for '{filename}'.")
             return None
@@ -1038,13 +1038,13 @@ class pglSerialize:
                 
     def saveStrict(self, filename, filesystem=None, filesystemPrefix=None):
         """Serialize before opening the destination; propagate failures."""
-        from .pglBase import pglBase
+        from .pglStorage import pglStorage
 
         filename = str(filename)
         dataPath = posixpath.dirname(filename) or "."
         fileName = posixpath.splitext(posixpath.basename(filename))[0] + ".json"
 
-        filesystem, dataPath, _ = pglBase.validateFilesystem(
+        filesystem, dataPath, _ = pglStorage.validateFilesystem(
             filesystem=filesystem,
             dataPath=dataPath,
             filesystemPrefix=filesystemPrefix,

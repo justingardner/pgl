@@ -8,8 +8,8 @@
 #############å
 # Import modules
 #############
-from pgl import pglEyeTracker
-from pgl import pglDevice
+from .pglEyeTracker import pglEyeTracker
+from .pglDevice import pglDevice
 import numpy as np
 import matplotlib.pyplot as plt
 from .pglMessages import pglMessages

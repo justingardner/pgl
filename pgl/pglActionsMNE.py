@@ -81,7 +81,7 @@ class pglActionsMNE(pglActionCollection):
                 return None
 
             # load libraries
-            from pgl import pglBase
+            from pgl.pglStorage import pglStorage
             try:            
                 import mne
             except Exception as e:
@@ -89,7 +89,7 @@ class pglActionsMNE(pglActionCollection):
                 return None
 
             # Validate the filesystem once, using the first selected FIF path plus the saved filesystem prefix.
-            filesystem, _, _ = pglBase.validateFilesystem(dataPath=self.selectedPaths[0],filesystemPrefix=self.filesystemPrefix)
+            filesystem, _, _ = pglStorage.validateFilesystem(dataPath=self.selectedPaths[0],filesystemPrefix=self.filesystemPrefix)
 
             if filesystem is None:
                 self.setError(f"Could not access Fieldline FIF file: {self.selectedPaths[0]}")
@@ -182,7 +182,7 @@ class pglActionsMNE(pglActionCollection):
             from pathlib import Path
             from tempfile import TemporaryDirectory
             from fsspec.implementations.local import LocalFileSystem
-            from pgl import pglBase
+            from pgl.pglStorage import pglStorage
 
             try:
                 import mne
@@ -191,7 +191,7 @@ class pglActionsMNE(pglActionCollection):
                 return None
 
             # Recreate the filesystem using the saved path and prefix.
-            filesystem, _, _ = pglBase.validateFilesystem(dataPath=self.selectedPaths[0], filesystemPrefix=self.filesystemPrefix)
+            filesystem, _, _ = pglStorage.validateFilesystem(dataPath=self.selectedPaths[0], filesystemPrefix=self.filesystemPrefix)
 
             if filesystem is None:
                 self.setError(f"Could not access NetStation MFF recording: {self.selectedPaths[0]}")

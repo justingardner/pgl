@@ -9,7 +9,7 @@
 # import
 ##############
 import time
-from . import _pglTimestamp
+import sys
 
 #################################################################
 # pglTimestamp
@@ -20,13 +20,15 @@ class pglTimestamp:
     '''
     @staticmethod
     def getSecs():
-        '''
-        Get the current system time in seconds.
-        
-        Returns:
-            float: Current system time in seconds.
-        '''
-        return _pglTimestamp.getSecs()
+        """Select the clock on first use; subsequent calls use it directly."""
+        if sys.platform == "darwin":
+            from . import _pglTimestamp
+            clock = _pglTimestamp.getSecs
+        else:
+            clock = time.perf_counter
+
+        pglTimestamp.getSecs = staticmethod(clock)
+        return clock()
     
     @staticmethod
     def waitSecs(secs):

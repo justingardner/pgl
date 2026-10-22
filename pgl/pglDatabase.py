@@ -20,10 +20,10 @@ from psycopg import sql
 from fsspec import AbstractFileSystem
 from fsspec.core import url_to_fs
 
-from .pglBase import pglBase
 from .pglData import pglDataMatrix
 from .pglMessages import pglMessages
 from .pglStorage import pglStorage
+from .pglInfo import pglInfo
 
 
 class pglDatabase:
@@ -5722,7 +5722,7 @@ class pglDatabase:
         Writes files and manifest.json, but does not register database rows,
         publish matrix payloads, or modify working session attachments.
         """
-        from .pglBase import pglBase
+        from .pglStorage import pglStorage
         from .pglSession import pglMNE
 
         runs = list(session.runs or [])
@@ -5750,7 +5750,7 @@ class pglDatabase:
         if dataPath is None or not str(dataPath).strip():
             raise ValueError("A destination path is required.")
 
-        filesystem, destination, _ = pglBase.validateFilesystem(filesystem=filesystem, dataPath=dataPath, filesystemPrefix=filesystemPrefix, requireExists=False)
+        filesystem, destination, _ = pglStorage.validateFilesystem(filesystem=filesystem, dataPath=dataPath, filesystemPrefix=filesystemPrefix, requireExists=False)
 
         if filesystem is None:
             raise ValueError("Could not resolve destination filesystem.")
@@ -9002,7 +9002,7 @@ class pglDatabase:
     @classmethod
     def _readMigrations(cls):
         """Read and checksum the SQL migration files shipped with pglStorage."""
-        directory = Path(pglBase.getPGLDir()) / "database" / "migrations"
+        directory = Path(pglInfo.getPGLDir()) / "database" / "migrations"
 
         if not directory.is_dir():
             raise FileNotFoundError(f"Migration directory not found: {directory}")

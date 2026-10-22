@@ -12,7 +12,7 @@ import sys, array
 import numpy as np
 from pynput import keyboard
 from .pglEyeTracker import pglEventBlink, pglEyeTracker, pglEyeTrackerData, pglEventSaccade, pglEventEyeTrackerTrial, pglEyePositionSample
-from pgl import pglEventKeyboard
+from .pglKeyboardMouse import pglEventKeyboard
 import socket
 import os
 import matplotlib.pyplot as plt

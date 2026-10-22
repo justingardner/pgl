@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from .pglSerialize import pglSerialize
 import re
 from .pglMessages import pglMessages
+from .pglInfo import pglInfo
 from importlib.metadata import version as _pkg_version, PackageNotFoundError
 import functools
 
@@ -69,7 +70,7 @@ class pglBase:
                 
         # get some directories
         self.homeDir = os.path.expanduser("~")
-        self.pglDir = self.getPGLDir()
+        self.pglDir = pglInfo.getPGLDir()
         
         # github status
         
@@ -117,11 +118,6 @@ class pglBase:
     ################################################################
     # getPGLDir
     ################################################################
-    @classmethod
-    def getPGLDir(cls):
-        pglDir = inspect.getfile(cls)
-        pglDir = os.path.dirname(os.path.dirname(pglDir))
-        return(Path(pglDir))
 
 
     ################################################################
@@ -740,8 +736,8 @@ class pglBase:
             self.state = pglState()
             
             # set some fields
-            self.state.pgldir = self.getPGLDir()
-            self.state.version = self.versionDict()
+            self.state.pgldir = pglInfo.getPGLDir()
+            self.state.version = pglInfo.versionDict()
             self.state.screenWidthPixels = self.screenWidth.pix
             self.state.screenHeightPixels = self.screenHeight.pix
             self.state.screenWidthDegrees = self.screenWidth.deg
@@ -754,94 +750,6 @@ class pglBase:
         except Exception as e:
             pglMessages.warning(f"Failed to save to {filepath}: {e}")
 
-    ################################################################
-    # # validate filesystem: used for fsspec 
-    ################################################################
-    @staticmethod
-    def validateFilesystem(filesystem=None, dataPath=None, filesystemPrefix="", create=False, requireExists=True):
-        '''
-        Return a valid fsspec filesystem and data path.
-
-        Filesystem selection priority:
-            1. Explicitly supplied filesystem
-            2. Explicitly supplied filesystemPrefix
-            3. Prefix embedded in dataPath
-            4. Local filesystem ("file")
-        '''
-
-        import fsspec
-        from fsspec.core import url_to_fs
-        from fsspec import AbstractFileSystem
-
-        # ------------------------------------------------------------
-        # 1. Normalize dataPath and separate any embedded prefix
-        # ------------------------------------------------------------
-        dataPath = str(dataPath) if dataPath is not None else None
-        originalDataPath = dataPath
-        if dataPath is None or dataPath == "":
-            dataPath = ""
-            dataPathPrefix = ""
-
-        else:
-            dataPath = str(dataPath)
-
-            if "://" in dataPath:
-                protocol, _, rest = dataPath.partition("://")
-                authority = rest.split("/", 1)[0]
-                dataPathPrefix = f"{protocol}://{authority}"
-                dataPath = rest[len(authority):]
-            else:
-                dataPathPrefix = ""
-
-        # ------------------------------------------------------------
-        # 2. Determine filesystem
-        # ------------------------------------------------------------
-
-        if filesystem is not None:
-
-            if not isinstance(filesystem, AbstractFileSystem):
-                pglMessages.warning(f"Expected an fsspec AbstractFileSystem, got {type(filesystem).__name__}.")
-                return None, dataPath, ""
-
-            dataPath = filesystem._strip_protocol(originalDataPath) if originalDataPath else ""
-            filesystemPrefix = filesystemPrefix or dataPathPrefix
-                
-        elif filesystemPrefix:
-
-            filesystemPrefix = str(filesystemPrefix)
-            try:
-                filesystem, dataPath = url_to_fs(f"{filesystemPrefix.rstrip('/')}/{dataPath.lstrip('/')}")
-            except Exception as e:
-                pglMessages.warning(f"Error accessing filesystem {filesystemPrefix}: {e}")
-
-        elif dataPathPrefix:
-
-            filesystemPrefix = dataPathPrefix
-            try:
-                filesystem, dataPath = url_to_fs(originalDataPath)
-            except Exception as e:
-                pglMessages.warning(f"Error accessing filesystem {filesystemPrefix}: {e}")
-            
-        else:
-
-            filesystemPrefix = ""
-            filesystem = fsspec.filesystem("file")
-
-        # ------------------------------------------------------------
-        # 3. Validate filesystem and dataPath
-        # ------------------------------------------------------------
-        try:
-            if not filesystem.exists(dataPath):
-                if create:
-                    filesystem.makedirs(dataPath, exist_ok=True)
-                elif requireExists:
-                    pglMessages.warning(f"{dataPath} does not exist")
-                    filesystem = None
-        except Exception as e:
-                pglMessages.warning(f"Error accessing {dataPath}: {e}")
-                filesystem = None
-            
-        return filesystem, dataPath, filesystemPrefix
     ################################################################
     # Clean up open windows (which may be orphaned) and their socket connections
     ################################################################
@@ -941,24 +849,6 @@ class pglBase:
         signal.signal(signal.SIGINT, self.originalHandler)
 
     ###################################
-    # make valid filename
-    ###################################
-    @staticmethod
-    def makeValidFilename(nameStr):
-        
-        # replace anything that isn't a letter, number, dash or underscore with an underscore
-        cleanStr = re.sub(r'[^A-Za-z0-9_-]', '_', nameStr)
-        
-        # collapse runs of underscores into one
-        cleanStr = re.sub(r'_+', '_', cleanStr)
-        
-        # strip leading/trailing underscores and dots
-        cleanStr = cleanStr.strip('_.')
-        
-        # guard against an empty result
-        return cleanStr.lower() or 'unnamed'
-
-    ###################################
     # get the name of the mglMetalApp
     ###################################
     def getMetalAppName(self, stable=False, mglMetalPath=None):
@@ -1028,76 +918,22 @@ class pglBase:
     #################################################################
     # get the github revision
     #################################################################
-    @classmethod
-    @functools.lru_cache(maxsize=1)
-    def getRepoRevision(cls):
-        '''
-        Get the github revision        
-        '''
-        try:
-            result = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True, cwd=cls.getPGLDir())
-            return result.stdout.strip()
-        except (subprocess.CalledProcessError, FileNotFoundError, OSError):
-            return "Unknown"
 
     #################################################################
     # get repo dirty files
     #################################################################
-    @classmethod
-    def getRepoDirtyFiles(cls):
-        '''
-        Get the list of files with uncommitted changes
-        '''
-        try:
-            result = subprocess.run(
-                ["git", "status", "--porcelain"],
-                capture_output=True, text=True, check=True, cwd=cls.getPGLDir()
-            )
-            # each line looks like " M pgl/pglDraw.py" or "?? newfile.py"
-            return [line[3:] for line in result.stdout.splitlines()]
-        except (subprocess.CalledProcessError, FileNotFoundError, OSError):
-            return []
     
     #################################################################
     # get repo branch
     #################################################################
-    @classmethod
-    @functools.lru_cache(maxsize=1)
-    def getRepoBranch(cls):
-        try:
-            result = subprocess.run(
-                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                capture_output=True, text=True, check=True, cwd=cls.getPGLDir()
-            )
-            return result.stdout.strip()
-        except (subprocess.CalledProcessError, FileNotFoundError, OSError):
-            return "unknown"
         
     #################################################################
     # get PGL version
     #################################################################
-    @classmethod
-    def version(cls):
-        try:
-            v = _pkg_version("pgl")
-        except PackageNotFoundError:
-            v = "unknown"
-        return v
 
     #################################################################
     # get PGL version dict
     #################################################################
-    @classmethod
-    def versionDict(cls):
-        return {
-            "version": cls.version(),
-            "github": cls.getRepoRevision(),
-            "dirtyFiles": cls.getRepoDirtyFiles(),
-            "branch": cls.getRepoBranch(),
-            "python": sys.version.split()[0],
-            "platform": platform.platform(),
-            "numpy": np.__version__
-        }
 
 ################
 # getCPUInfo   #

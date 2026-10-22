@@ -13,9 +13,8 @@ import io
 import sys
 from time import sleep
 from typing import Optional
-from pgl import pglTimestamp
+from .pglTimestamp import pglTimestamp
 from .pglEvent import List, pglEvent
-from .pglEventListener import pglEventListener
 from dataclasses import dataclass
 from .pglSerialize import pglSerialize
 import matplotlib.pyplot as plt

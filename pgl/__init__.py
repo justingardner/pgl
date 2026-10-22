@@ -1,81 +1,121 @@
-from .pglBase import pglBase
-from .pglResolution import pglResolution
-from .pglDraw import pglDraw
-from .pglTransform import pglTransform
-from .pglProfile import pglProfile
-from .pglBatch import pglBatch
-from .pglImage import pglImage, pglImageDatabase, pglMovieDatabase
-from .pglStimuli import pglStimuli
-from .pglTimestamp import pglTimestamp
-from .pglDevice import pglDevice, pglDevices, pglDigitalIODevice, pglAnalogTraceData
-from .pglKeyboardMouse import pglKeyboardMouse, pglEventKeyboard, pglKeyBuffer
-from .pglEvent import pglEvent, pglEvents
-from .pglCommandReplayer import pglCommandReplayer
-from .pglFrameGrab import pglFrameGrab
-from .pglExperiment import pglExperiment, pglTask
-from .pglParameter import pglParameter, pglParameterBlock, pglParameterNestedBlock, pglParameterBatch
-from .pglStaircase import pglStaircase, pglStaircaseUpDown
-from .pglTasks import pglFixationTaskLeftRight, pglBarTask, pglTestTask, pglEyeTrackingCalibrationTask, pglMessageAckTask
-from ._pglComm import pglSerial
-from .pglCalibration import pglDisplayCalibration, pglLuminanceCalibrationDeviceMinolta, pglDisplayLuminanceCalibrationData, pglLuminanceCalibrationDeviceDebug
-from .pglGammaTable import pglGammaTable 
-from .pglSettings import pglSettingsManager, pglDisplaySettings, pglDisplaySettingsList, pglDisplayModeSettings, pglSettings, pglTraitSettings, pglStateDataSettings
-from .pglEventListener import pglEventListener
-from .pglEyeTracker import pglEyeTracker
-from .pglDialog import pglDialogs
-from .pglMessages import pglMessages
-from .pglActions import pglActions
-from .pglFlywheel import pglFlywheel
-from .pglDigitalBrain import pglChooseBlock, pglDigitalBrainMemoryTask, pglDigitalBrainConfigure
-from .pglChoose import pglChoose
-from .pglSession import pglSession
-from .pglStorage import pglStorage
-from .pglDatabase import pglDatabase
-from .pglPostgres import pglPostgres
-from .pglActionsFixes import pglActionsFixes
-from .pglActionsMNE import pglActionsMNE
-from .pglDataset import pglDataset
-from .pglData import pglDataMatrix, pglDataMatrixReference
-from .pglBehavior import pglBehavior
-from .pglDataset import pglDataset
+"""Public PGL exports, loaded on demand."""
 
-# Device specific imports (eye trackers, etc.)
-from .pglVPixx import pglProPixx, pglDataPixx
-from .pglTrackPixx import pglTrackPixx3
-from .pglLabJack import pglLabJack
-from .pglEyelink import pglEyelinkData
-from .pglVWFA import pglVWFATask
-from .pglEyelink import pglEyelink
+import importlib as _importlib
+import sys as _sys
+import types as _types
 
-try:
-    import pylink
-except ImportError:
-    pass
+_EXPORTS = {'pglBase': ('.pglBase', 'pglBase'),
+ 'pglResolution': ('.pglResolution', 'pglResolution'),
+ 'pglDraw': ('.pglDraw', 'pglDraw'),
+ 'pglTransform': ('.pglTransform', 'pglTransform'),
+ 'pglProfile': ('.pglProfile', 'pglProfile'),
+ 'pglBatch': ('.pglBatch', 'pglBatch'),
+ 'pglImage': ('.pglImage', 'pglImage'),
+ 'pglImageDatabase': ('.pglImage', 'pglImageDatabase'),
+ 'pglMovieDatabase': ('.pglImage', 'pglMovieDatabase'),
+ 'pglStimuli': ('.pglStimuli', 'pglStimuli'),
+ 'pglTimestamp': ('.pglTimestamp', 'pglTimestamp'),
+ 'pglDevice': ('.pglDevice', 'pglDevice'),
+ 'pglDevices': ('.pglDevice', 'pglDevices'),
+ 'pglDigitalIODevice': ('.pglDevice', 'pglDigitalIODevice'),
+ 'pglAnalogTraceData': ('.pglDevice', 'pglAnalogTraceData'),
+ 'pglKeyboardMouse': ('.pglKeyboardMouse', 'pglKeyboardMouse'),
+ 'pglEventKeyboard': ('.pglKeyboardMouse', 'pglEventKeyboard'),
+ 'pglKeyBuffer': ('.pglKeyboardMouse', 'pglKeyBuffer'),
+ 'pglEvent': ('.pglEvent', 'pglEvent'),
+ 'pglEvents': ('.pglEvent', 'pglEvents'),
+ 'pglCommandReplayer': ('.pglCommandReplayer', 'pglCommandReplayer'),
+ 'pglFrameGrab': ('.pglFrameGrab', 'pglFrameGrab'),
+ 'pglExperiment': ('.pglExperiment', 'pglExperiment'),
+ 'pglTask': ('.pglExperiment', 'pglTask'),
+ 'pglParameter': ('.pglParameter', 'pglParameter'),
+ 'pglParameterBlock': ('.pglParameter', 'pglParameterBlock'),
+ 'pglParameterNestedBlock': ('.pglParameter', 'pglParameterNestedBlock'),
+ 'pglParameterBatch': ('.pglParameter', 'pglParameterBatch'),
+ 'pglStaircase': ('.pglStaircase', 'pglStaircase'),
+ 'pglStaircaseUpDown': ('.pglStaircase', 'pglStaircaseUpDown'),
+ 'pglFixationTaskLeftRight': ('.pglTasks', 'pglFixationTaskLeftRight'),
+ 'pglBarTask': ('.pglTasks', 'pglBarTask'),
+ 'pglTestTask': ('.pglTasks', 'pglTestTask'),
+ 'pglEyeTrackingCalibrationTask': ('.pglTasks',
+                                   'pglEyeTrackingCalibrationTask'),
+ 'pglMessageAckTask': ('.pglTasks', 'pglMessageAckTask'),
+ 'pglSerial': ('._pglComm', 'pglSerial'),
+ 'pglDisplayCalibration': ('.pglCalibration', 'pglDisplayCalibration'),
+ 'pglLuminanceCalibrationDeviceMinolta': ('.pglCalibration',
+                                          'pglLuminanceCalibrationDeviceMinolta'),
+ 'pglDisplayLuminanceCalibrationData': ('.pglCalibration',
+                                        'pglDisplayLuminanceCalibrationData'),
+ 'pglLuminanceCalibrationDeviceDebug': ('.pglCalibration',
+                                        'pglLuminanceCalibrationDeviceDebug'),
+ 'pglGammaTable': ('.pglGammaTable', 'pglGammaTable'),
+ 'pglSettingsManager': ('.pglSettings', 'pglSettingsManager'),
+ 'pglDisplaySettings': ('.pglSettings', 'pglDisplaySettings'),
+ 'pglDisplaySettingsList': ('.pglSettings', 'pglDisplaySettingsList'),
+ 'pglDisplayModeSettings': ('.pglSettings', 'pglDisplayModeSettings'),
+ 'pglSettings': ('.pglSettings', 'pglSettings'),
+ 'pglTraitSettings': ('.pglSettings', 'pglTraitSettings'),
+ 'pglStateDataSettings': ('.pglSettings', 'pglStateDataSettings'),
+ 'pglEventListener': ('.pglEventListener', 'pglEventListener'),
+ 'pglEyeTracker': ('.pglEyeTracker', 'pglEyeTracker'),
+ 'pglDialogs': ('.pglDialog', 'pglDialogs'),
+ 'pglMessages': ('.pglMessages', 'pglMessages'),
+ 'pglActions': ('.pglActions', 'pglActions'),
+ 'pglFlywheel': ('.pglFlywheel', 'pglFlywheel'),
+ 'pglChooseBlock': ('.pglDigitalBrain', 'pglChooseBlock'),
+ 'pglDigitalBrainMemoryTask': ('.pglDigitalBrain', 'pglDigitalBrainMemoryTask'),
+ 'pglDigitalBrainConfigure': ('.pglDigitalBrain', 'pglDigitalBrainConfigure'),
+ 'pglChoose': ('.pglChoose', 'pglChoose'),
+ 'pglSession': ('.pglSession', 'pglSession'),
+ 'pglStorage': ('.pglStorage', 'pglStorage'),
+ 'pglDatabase': ('.pglDatabase', 'pglDatabase'),
+ 'pglPostgres': ('.pglPostgres', 'pglPostgres'),
+ 'pglActionsFixes': ('.pglActionsFixes', 'pglActionsFixes'),
+ 'pglActionsMNE': ('.pglActionsMNE', 'pglActionsMNE'),
+ 'pglDataset': ('.pglDataset', 'pglDataset'),
+ 'pglDataMatrix': ('.pglData', 'pglDataMatrix'),
+ 'pglDataMatrixReference': ('.pglData', 'pglDataMatrixReference'),
+ 'pglBehavior': ('.pglBehavior', 'pglBehavior'),
+ 'pglProPixx': ('.pglVPixx', 'pglProPixx'),
+ 'pglDataPixx': ('.pglVPixx', 'pglDataPixx'),
+ 'pglTrackPixx3': ('.pglTrackPixx', 'pglTrackPixx3'),
+ 'pglLabJack': ('.pglLabJack', 'pglLabJack'),
+ 'pglEyelinkData': ('.pglEyelink', 'pglEyelinkData'),
+ 'pglVWFATask': ('.pglVWFA', 'pglVWFATask'),
+ 'pglEyelink': ('.pglEyelink', 'pglEyelink'),
+ 'pgl': ('._graphics', 'pgl'),
+ 'pglInfo': ('.pglInfo', 'pglInfo')}
 
-class pgl(pglBase, pglResolution, pglDraw, pglTransform, pglProfile, pglBatch, pglImage, pglStimuli, pglTimestamp, pglDevices, pglEvents, pglCommandReplayer, pglFrameGrab, pglGammaTable, pglSettingsManager, pglMessages, pglDialogs):
-    """
-    purpose: psychophysics and experiment library for Python.
-    License: MIT License — see LICENSE file for details.
-         by: JLG
-       date: July 9, 2025
-    """
-    def __init__(self, *args, **kwargs):
-      # Explicitly initialize each parent class
-      pglGammaTable.__init__(self, *args, **kwargs)
-      pglBase.__init__(self, *args, **kwargs)
-      pglResolution.__init__(self, *args, **kwargs)
-      pglDraw.__init__(self, *args, **kwargs)
-      pglTransform.__init__(self, *args, **kwargs)
-      pglProfile.__init__(self, *args, **kwargs)
-      pglBatch.__init__(self, *args, **kwargs)
-      pglImage.__init__(self, *args, **kwargs)
-      pglStimuli.__init__(self, *args, **kwargs)
-      pglTimestamp.__init__(self, *args, **kwargs)
-      pglDevices.__init__(self, *args, **kwargs)
-      pglEvents.__init__(self, *args, **kwargs)
-      pglCommandReplayer.__init__(self, *args, **kwargs)
-      pglFrameGrab.__init__(self, *args, **kwargs)
-      pglSettingsManager.__init__(self, *args, **kwargs)
-      pglDialogs.__init__(self, *args, **kwargs)
-__version__ = "1.0.0"
-__author__ = "JLG"
+_resolved_exports = {}
+__all__ = list(_EXPORTS)
+
+__version__ = '1.0.0'
+__author__ = 'JLG'
+
+
+class _LazyPackage(_types.ModuleType):
+    """Keep public class exports stable even after submodule imports."""
+
+    def __getattribute__(self, name):
+        namespace = _types.ModuleType.__getattribute__(self, "__dict__")
+        exports = namespace.get("_EXPORTS", {})
+
+        if name in exports:
+            cache = namespace["_resolved_exports"]
+
+            if name not in cache:
+                module_name, attribute_name = exports[name]
+                module = _importlib.import_module(module_name, namespace["__name__"])
+                value = getattr(module, attribute_name)
+                cache[name] = value
+
+            return cache[name]
+
+        return _types.ModuleType.__getattribute__(self, name)
+
+    def __dir__(self):
+        namespace = _types.ModuleType.__getattribute__(self, "__dict__")
+        return sorted(set(namespace) | set(namespace["_EXPORTS"]))
+
+
+_sys.modules[__name__].__class__ = _LazyPackage

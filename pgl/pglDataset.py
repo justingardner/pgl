@@ -26,7 +26,7 @@ class pglDataset(pglActionable):
     Membership is independent of cached working sessions.
     Editing or saving a cached session never repoints membership.
 
-    Persistence and database access are delegated to pglStorage.
+    Persistence and database access are delegated to pglDatabase.
     """
 
     datasetID = Int(default_value=None, allow_none=True, help="Most recently loaded or saved dataset checkpoint ID").tag(serialize=False)

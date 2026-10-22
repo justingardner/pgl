@@ -25,6 +25,7 @@ from .pglMessages import pglMessages
 from scipy.interpolate import PchipInterpolator
 from .pglSettings import pglSettingsManager
 from datetime import datetime, date as Date
+from .pglStorage import pglStorage
 
 ##########################
 # Calibration device class
@@ -1086,7 +1087,7 @@ class pglDisplayCalibration():
         
         # make the path be a directory
         settingsPath = pglSettingsManager().getCalibrationsDir()
-        settingsPath = settingsPath / pgl.makeValidFilename(displayName)
+        settingsPath = settingsPath / pglStorage.makeValidFilename(displayName)
         settingsPath = settingsPath / calibrationType
         
         # Check if directory exists, if so add time

@@ -11,7 +11,7 @@
 from .pglMessages import pglMessages
 from .pglSettings import pglTraitSettings, pglSettingsManager
 from .pglDialog import pglDialogs
-from .pglBase import pglBase
+from .pglStorage import pglStorage
 from pathlib import Path
 from .pglSession import pglRun
 from fsspec import AbstractFileSystem
@@ -47,7 +47,7 @@ class pglChooseLevel(pglTraitSettings):
 
         # Validate only the root; children reuse their parent's filesystem.
         if filesystem is None:
-            filesystem, dataPath, filesystemPrefix = pglBase.validateFilesystem(filesystem=filesystem, dataPath=dataPath, filesystemPrefix=filesystemPrefix)
+            filesystem, dataPath, filesystemPrefix = pglStorage.validateFilesystem(filesystem=filesystem, dataPath=dataPath, filesystemPrefix=filesystemPrefix)
 
         self.name = name
         self.dataPath = str(dataPath)
@@ -64,7 +64,7 @@ class pglChooseLevel(pglTraitSettings):
         """Create a valid node, omitting branches with no valid leaves."""
 
         if filesystem is None:
-            filesystem, dataPath, filesystemPrefix = pglBase.validateFilesystem(filesystem=filesystem, dataPath=dataPath, filesystemPrefix=filesystemPrefix)
+            filesystem, dataPath, filesystemPrefix = pglStorage.validateFilesystem(filesystem=filesystem, dataPath=dataPath, filesystemPrefix=filesystemPrefix)
 
         if filesystem is None:
             return None
@@ -524,10 +524,10 @@ class pglChoose():
                     so that the same path can be accessed again
         
         '''
-        from .pglBase import pglBase
+        from .pglStorage import pglStorage
         if fullDataPath:
             # validate and return
-            filesystem, fullDataPath, filesystemPrefix = pglBase.validateFilesystem(filesystem=filesystem, dataPath=fullDataPath, filesystemPrefix=filesystemPrefix)
+            filesystem, fullDataPath, filesystemPrefix = pglStorage.validateFilesystem(filesystem=filesystem, dataPath=fullDataPath, filesystemPrefix=filesystemPrefix)
             return (filesystem, fullDataPath, filesystemPrefix)
             
         # if not fullDatadir passed in, construct it from arguments
@@ -547,7 +547,7 @@ class pglChoose():
             fullDataPath = Path(dataPath).expanduser()
             
             # now that we have the start of a path, validate the filesystem
-            filesystem, fullDataPath, filesystemPrefix = pglBase.validateFilesystem(filesystem=filesystem, dataPath=fullDataPath, filesystemPrefix=filesystemPrefix)
+            filesystem, fullDataPath, filesystemPrefix = pglStorage.validateFilesystem(filesystem=filesystem, dataPath=fullDataPath, filesystemPrefix=filesystemPrefix)
             if filesystem is None:
                 pglMessages.warning("Could not find dataPath: {fullDataPath}")
                 return (None, None, None)
@@ -710,7 +710,7 @@ class pglChoose():
             dataPath = settings.dataPath
 
         # Validate once; all descendant nodes reuse this filesystem.
-        filesystem, dataPath, filesystemPrefix = pglBase.validateFilesystem(
+        filesystem, dataPath, filesystemPrefix = pglStorage.validateFilesystem(
             filesystem=filesystem,
             dataPath=dataPath,
             filesystemPrefix=filesystemPrefix,

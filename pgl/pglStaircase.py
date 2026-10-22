@@ -11,7 +11,7 @@
 import numpy as np
 import itertools
 import random
-from . import pglParameter
+from .pglParameter import pglParameter
 import matplotlib.pyplot as plt
 from .pglTimestamp import pglTimestamp
 from dataclasses import dataclass, field

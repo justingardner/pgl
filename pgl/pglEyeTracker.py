@@ -8,7 +8,7 @@
 ###########
 # Import
 ##########
-from pgl import pglDevice
+from .pglDevice import pglDevice
 from .pglData import pglTimeSeries, pglEventsData
 from .pglEvent import pglEvent
 from dataclasses import dataclass, field

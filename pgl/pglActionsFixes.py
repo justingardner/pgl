@@ -15,7 +15,7 @@ from .pglPipeline import pglAction
 from traitlets import HasTraits, Enum, Float, Int, List, Tuple, TraitError, Unicode, Dict, default, link, Bool, TraitType, Instance
 from .pglExperiment import pglEventSegment, pglEventVolumeTrigger
 from .pglSession import pglTaskBase
-from .pglBase import pglBase
+from .pglStorage import pglStorage
 from .pglPipeline import pglActionStatus
 import json
 import posixpath
@@ -56,7 +56,7 @@ class pglActionsFixes:
             # Read disk directly: legacy task directories cannot yet be loaded
             # through the current task-directory convention.
             for runIndex, run in enumerate(session.runs or []):
-                filesystem, runPath, _ = pglBase.validateFilesystem(filesystem=run.filesystem, dataPath=run.fullDataPath, filesystemPrefix=run.filesystemPrefix)
+                filesystem, runPath, _ = pglStorage.validateFilesystem(filesystem=run.filesystem, dataPath=run.fullDataPath, filesystemPrefix=run.filesystemPrefix)
 
                 if filesystem is None:
                     raise ValueError(f"Could not resolve filesystem for run {runIndex + 1}: {run.fullDataPath!r}")
@@ -472,7 +472,7 @@ class pglActionsFixes:
             """Choose a TR and exactly one source task for each run."""
             import math
             import posixpath
-            from pgl import pglDialogs
+            from .pglDialog import pglDialogs
             from .pglPipeline import pglActionStatus
 
             self.status = pglActionStatus.INITIALIZED

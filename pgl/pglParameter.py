@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Any
 import posixpath
 from .pglMessages import pglMessages
-from .pglBase import pglBase
+from .pglStorage import pglStorage
 from .pglSettings import pglStateDataSettings
 import numpy as np
 import itertools
@@ -235,7 +235,7 @@ class pglParameter(pglStateDataSettings):
         '''
 
         # validate filesystem
-        filesystem, parameterDir, _ = pglBase.validateFilesystem(filesystem, parameterDir)
+        filesystem, parameterDir, _ = pglStorage.validateFilesystem(filesystem, parameterDir)
 
         import posixpath
 
@@ -289,7 +289,7 @@ class pglParameter(pglStateDataSettings):
         Load the parameter settings, state and data.         
         '''
         # validate filesystem
-        filesystem, parameterDir, _ = pglBase.validateFilesystem(filesystem, parameterDir)
+        filesystem, parameterDir, _ = pglStorage.validateFilesystem(filesystem, parameterDir)
 
         # Create the directory to load data from
         try:

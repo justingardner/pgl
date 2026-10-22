@@ -16,7 +16,6 @@ import numpy as np
 import random
 import math
 from dataclasses import dataclass, field
-from .pglKeyboardMouse import pglKeyboardMouse
 from pathlib import Path
 from IPython.display import display, HTML
 import ipywidgets as widgets
@@ -31,14 +30,12 @@ from matplotlib.lines import Line2D
 import numpy as np
 import numpy.typing as npt
 from enum import Enum
-from . import pglTimestamp
-from .pglEyeTracker import pglEyeTracker
-from .pglEyelink import pglEyelink, pglEyelinkData
+from .pglTimestamp import pglTimestamp
 from .pglSettings import pglDisplaySettings, pglTraitSettings, pglStateDataSettings
 from .pglMessages import pglMessages
 import fsspec
 import posixpath
-from .pglBase import pglBase
+from .pglStorage import pglStorage
 from .pglDialog import pglDialogs
 from types import SimpleNamespace
 from .pglDevice import pglDigitalIODevice
@@ -289,7 +286,7 @@ class pglExperimentBase(pglStateDataSettings):
         Print a summary of the experiment events.
         Warn and skip summaries whose required contents could not be loaded.
         '''
-        from pgl import pglTimestamp
+        from .pglTimestamp import pglTimestamp
         timestamp = pglTimestamp()
         runPath = getattr(self, "fullDataPath", "(unknown run path)")
 
@@ -485,6 +482,7 @@ class pglExperiment(pglExperimentBase):
         Args:
             backgroundColor: The background color as a list of RGB values, each between 0 and 1. If omitted, will use the color from settings.
         '''    
+        from .pglKeyboardMouse import pglKeyboardMouse
         if self.settings is None:
             pglMessages.warning("(pglExperiment:initScreen) No settings found to open screen.")
             return
@@ -686,6 +684,7 @@ class pglExperiment(pglExperimentBase):
         '''
         Close the screen
         '''
+        from .pglKeyboardMouse import pglKeyboardMouse
         try:
             # stop the keyboard listener
             keyboardDevices = self.pgl.devicesGet(pglKeyboardMouse)
@@ -1253,6 +1252,7 @@ class pglExperiment(pglExperimentBase):
         self.eyeTrackerSettings = self.pgl.getEyeTrackerSettings(settings=self.settings)
         
         if self.settings.eyetracker[0] == "Eyelink":
+            from .pglEyelink import pglEyelink
             # set edf filename to current date (note it has to be 8.3 characters
             # since SR Research has progressed from the days of DOS)
             self.settings.edfFilename = f"{datetime.now().strftime('%Y%m%d')}"
@@ -1863,7 +1863,7 @@ class pglTaskBase(pglTraitSettings):
         dataPath is the destination run directory.
         Does not read or copy original acquisition files.
         """
-        filesystem, dataPath, _ = pglBase.validateFilesystem(
+        filesystem, dataPath, _ = pglStorage.validateFilesystem(
             filesystem=filesystem,
             dataPath=dataPath,
             filesystemPrefix=filesystemPrefix,
@@ -1919,7 +1919,7 @@ class pglTaskBase(pglTraitSettings):
                 raise TypeError(f"Cannot save parameter {type(parameter).__name__}: no saveBundleStrict() method")
 
         taskDirectory = self._getTaskDirectoryName()
-        filesystem, dataPath, _ = pglBase.validateFilesystem(
+        filesystem, dataPath, _ = pglStorage.validateFilesystem(
             filesystem=filesystem,
             dataPath=dataPath,
             filesystemPrefix=filesystemPrefix,
@@ -1963,7 +1963,7 @@ class pglTaskBase(pglTraitSettings):
         pglMessages.message(f"Loading task data from: {dataPath}", messageType='detailed')
 
         # validate filesystem
-        filesystem, taskPath, _ = pglBase.validateFilesystem(filesystem, dataPath)
+        filesystem, taskPath, _ = pglStorage.validateFilesystem(filesystem, dataPath)
 
         # load settings, state and data
         try:
@@ -2006,7 +2006,7 @@ class pglTaskBase(pglTraitSettings):
         '''
         Print a summary of the task data
         '''
-        from pgl import pglTimestamp
+        from .pglTimestamp import pglTimestamp
         timestamp = pglTimestamp()
         
         if self.data.startTime is None:

@@ -1,4 +1,3 @@
-
 ################################################################
 #   filename: pglSettings.py
 #    purpose: Provides settings management for pgl
@@ -19,10 +18,8 @@ from datetime import datetime
 import numpy as np
 from .pglSerialize import pglSerialize
 from .pglDialog import pglDialogs
-import Quartz
-import CoreFoundation
-from AppKit import NSScreen
-from .pglBase import pglBase
+from .pglStorage import pglStorage
+from .pglInfo import pglInfo
 import re
 from collections import OrderedDict
 from .pglMessages import pglMessages
@@ -121,6 +118,7 @@ class pglSettingsManager:
                 return pglEyelinkSettings()
                         
     def isShiftPressed(self):
+        import Quartz
         flags = Quartz.CGEventSourceFlagsState(Quartz.kCGEventSourceStateHIDSystemState)
         return bool(flags & Quartz.kCGEventFlagMaskShift) 
     
@@ -175,6 +173,8 @@ class pglSettingsManager:
         Args:
             displayName (str): If not (default=None) will return the matching setting or None if not found
         '''
+        import Quartz
+        import CoreFoundation
         displays = []
         
         # Get CGDisplayCreateUUIDFromDisplayID
@@ -191,7 +191,7 @@ class pglSettingsManager:
             # load json settings
             displaySettings = pglDisplaySettings().load(p)
             # make sure displayName matches diectory
-            if pglBase.makeValidFilename(displaySettings.name) != str(p.parent.name):
+            if pglStorage.makeValidFilename(displaySettings.name) != str(p.parent.name):
                 displaySettings.name = str(p.parent.name)
             # get the calibrations
             displaySettings.getCalibrations()
@@ -318,7 +318,7 @@ class pglSettingsManager:
         if displayName is not None:
             # find the display with the matching displayName (compare using makeValidFilename to make case insenstive)
             return next(
-                (d for d in displays if pglBase.makeValidFilename(d.name) == pglBase.makeValidFilename(displayName)),
+                (d for d in displays if pglStorage.makeValidFilename(d.name) == pglStorage.makeValidFilename(displayName)),
                 None
             )                
         return(displays)
@@ -326,6 +326,7 @@ class pglSettingsManager:
     @classmethod
     def getMatchingDisplayName(cls, display):
         
+        from AppKit import NSScreen
         displayName = None
         # get the display name from Appkit
         for screen in NSScreen.screens():
@@ -563,7 +564,7 @@ class pglSettingsManager:
         # append display specific directory if displaySettings is passed in
         if displaySettings is not None:
             # get a valid filename for displayName
-            displayName = pglBase.makeValidFilename(displaySettings.name)
+            displayName = pglStorage.makeValidFilename(displaySettings.name)
             # and append that if it is not empty
             if displayName != "":
                 displayDir = displayDir / displayName
@@ -664,7 +665,7 @@ class pglSettingsManager:
         elif settingsName is not None:
             # get the settings directory and create the full path to the settings file
             settingsDir = cls.getSettingsDir()
-            settingsPath = Path(settingsDir) / pglBase.makeValidFilename(settingsName)
+            settingsPath = Path(settingsDir) / pglStorage.makeValidFilename(settingsName)
             settingsPath = settingsPath.with_suffix(".json")
         
             # see if the file exists
@@ -760,11 +761,11 @@ class pglTraitSettings(HasTraits, pglSerialize):
 
     @default("pglVersion")
     def _default_pglVersion(self):
-        return pglBase.version()
+        return pglInfo.version()
     
     @default("github")
     def _default_github(self):
-        return pglBase.getRepoRevision()
+        return pglInfo.getRepoRevision()
     
     
     def __eq__(self, other):
@@ -895,8 +896,8 @@ class pglStateDataSettings(pglTraitSettings):
             The loaded object, or None if it could not be loaded.
         """
         # Validate/resolve filesystem and normalise the path
-        from .pglBase import pglBase
-        filesystem, dataPath, _ = pglBase.validateFilesystem(filesystem=filesystem, dataPath=dataPath, filesystemPrefix=filesystemPrefix)
+        from .pglStorage import pglStorage
+        filesystem, dataPath, _ = pglStorage.validateFilesystem(filesystem=filesystem, dataPath=dataPath, filesystemPrefix=filesystemPrefix)
         if filesystem is None:
             pglMessages.warning(f"(pglSerialize) Could not resolve a filesystem for '{dataPath}'")
             return None
@@ -943,8 +944,8 @@ class pglStateDataSettings(pglTraitSettings):
             filesystemPrefix (str): 'ssh://' like strings to qualify filename
         '''
         # Validate/resolve filesystem and normalise the path
-        from .pglBase import pglBase
-        filesystem, dataPath, _ = pglBase.validateFilesystem(filesystem=filesystem, dataPath=dataPath, filesystemPrefix=filesystemPrefix, create=True)
+        from .pglStorage import pglStorage
+        filesystem, dataPath, _ = pglStorage.validateFilesystem(filesystem=filesystem, dataPath=dataPath, filesystemPrefix=filesystemPrefix, create=True)
         if filesystem is None:
             pglMessages.warning(f"(pglSerialize) Could not resolve a filesystem for '{dataPath}'")
             return None
@@ -981,7 +982,7 @@ class pglStateDataSettings(pglTraitSettings):
         Preserves the existing traits/settings/state/data layout.
         Does not provide atomic writes or remove partial output.
         """
-        from .pglBase import pglBase
+        from .pglStorage import pglStorage
 
         # Resolve required values before creating the destination directory.
         components = {}
@@ -992,7 +993,7 @@ class pglStateDataSettings(pglTraitSettings):
                 raise TypeError(f"Cannot save {type(self).__name__}.{name}: no saveStrict() method")
             components[name] = component
 
-        filesystem, dataPath, _ = pglBase.validateFilesystem(
+        filesystem, dataPath, _ = pglStorage.validateFilesystem(
             filesystem=filesystem,
             dataPath=dataPath,
             filesystemPrefix=filesystemPrefix,
@@ -1066,12 +1067,12 @@ class pglDisplaySettings(pglTraitSettings):
     
         Also loads displays list so that it has up to date display settings
         '''
-        filesystem, filename, _ = pglBase.validateFilesystem(filesystem=filesystem, dataPath=filename, filesystemPrefix=filesystemPrefix)
+        filesystem, filename, _ = pglStorage.validateFilesystem(filesystem=filesystem, dataPath=filename, filesystemPrefix=filesystemPrefix)
         
         # check if filename exists
         if not filesystem.exists(str(filename)):
             # look for it in the display directory
-            filename = str(Path(pglSettingsManager.getDisplayDir()) / pglBase.makeValidFilename(filename) / "display.json")
+            filename = str(Path(pglSettingsManager.getDisplayDir()) / pglStorage.makeValidFilename(filename) / "display.json")
             if not filesystem.exists(filename):
                 pglMessages.warning(f"File {filename} does not exist")
                 return None
@@ -1418,7 +1419,7 @@ class pglSettings(pglTraitSettings):
         pglMessages.message(f"Saved settings to {filename}")
         
     def saveDir(self):
-        return pglSettingsManager.getSettingsDir() / f"{pglBase.makeValidFilename(self.name)}.json"
+        return pglSettingsManager.getSettingsDir() / f"{pglStorage.makeValidFilename(self.name)}.json"
 
     
     def reloadDisplays(self, selected=None, overwrite=False):

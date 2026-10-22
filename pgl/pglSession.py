@@ -24,7 +24,7 @@ try:
     import mne
 except ImportError:
     mne = None
-from .pglBase import pglBase
+from .pglStorage import pglStorage
 from pathlib import Path
 from .pglData import pglEpochsDataMatrix
 import posixpath
@@ -162,7 +162,7 @@ class pglRun(pglLazyLoad, pglExperimentBase):
             self.filesystemPrefix = filesystemPrefix or ""
             return
 
-        self.filesystem, self.fullDataPath, self.filesystemPrefix = pglBase.validateFilesystem(
+        self.filesystem, self.fullDataPath, self.filesystemPrefix = pglStorage.validateFilesystem(
             filesystem=filesystem,
             dataPath=fullDataPath,
             filesystemPrefix=filesystemPrefix,
@@ -378,7 +378,7 @@ class pglRun(pglLazyLoad, pglExperimentBase):
             if actual != expected:
                 raise ValueError(f"Task {index} directory mismatch: {actual!r} != {expected!r}")
 
-        filesystem, destination, _ = pglBase.validateFilesystem(
+        filesystem, destination, _ = pglStorage.validateFilesystem(
             filesystem=filesystem,
             dataPath=dataPath,
             filesystemPrefix=filesystemPrefix,

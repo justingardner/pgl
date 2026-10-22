@@ -439,6 +439,113 @@ class pglStorage:
         """
         return pglFigureRowExport(filename, filesystem=filesystem, storageOptions=storageOptions, dpi=dpi, overwrite=overwrite, maxPixels=maxPixels)
 
+    ###################################
+    # make valid filename
+    ###################################
+    @staticmethod
+    def makeValidFilename(nameStr):
+        
+        # replace anything that isn't a letter, number, dash or underscore with an underscore
+        cleanStr = re.sub(r'[^A-Za-z0-9_-]', '_', nameStr)
+        
+        # collapse runs of underscores into one
+        cleanStr = re.sub(r'_+', '_', cleanStr)
+        
+        # strip leading/trailing underscores and dots
+        cleanStr = cleanStr.strip('_.')
+        
+        # guard against an empty result
+        return cleanStr.lower() or 'unnamed'
+
+
+    ################################################################
+    # validate filesystem: used for fsspec 
+    ################################################################
+    @staticmethod
+    def validateFilesystem(filesystem=None, dataPath=None, filesystemPrefix="", create=False, requireExists=True):
+        '''
+        Return a valid fsspec filesystem and data path.
+
+        Filesystem selection priority:
+            1. Explicitly supplied filesystem
+            2. Explicitly supplied filesystemPrefix
+            3. Prefix embedded in dataPath
+            4. Local filesystem ("file")
+        '''
+
+        import fsspec
+        from fsspec.core import url_to_fs
+        from fsspec import AbstractFileSystem
+
+        # ------------------------------------------------------------
+        # 1. Normalize dataPath and separate any embedded prefix
+        # ------------------------------------------------------------
+        dataPath = str(dataPath) if dataPath is not None else None
+        originalDataPath = dataPath
+        if dataPath is None or dataPath == "":
+            dataPath = ""
+            dataPathPrefix = ""
+
+        else:
+            dataPath = str(dataPath)
+
+            if "://" in dataPath:
+                protocol, _, rest = dataPath.partition("://")
+                authority = rest.split("/", 1)[0]
+                dataPathPrefix = f"{protocol}://{authority}"
+                dataPath = rest[len(authority):]
+            else:
+                dataPathPrefix = ""
+
+        # ------------------------------------------------------------
+        # 2. Determine filesystem
+        # ------------------------------------------------------------
+
+        if filesystem is not None:
+
+            if not isinstance(filesystem, AbstractFileSystem):
+                pglMessages.warning(f"Expected an fsspec AbstractFileSystem, got {type(filesystem).__name__}.")
+                return None, dataPath, ""
+
+            dataPath = filesystem._strip_protocol(originalDataPath) if originalDataPath else ""
+            filesystemPrefix = filesystemPrefix or dataPathPrefix
+                
+        elif filesystemPrefix:
+
+            filesystemPrefix = str(filesystemPrefix)
+            try:
+                filesystem, dataPath = url_to_fs(f"{filesystemPrefix.rstrip('/')}/{dataPath.lstrip('/')}")
+            except Exception as e:
+                pglMessages.warning(f"Error accessing filesystem {filesystemPrefix}: {e}")
+
+        elif dataPathPrefix:
+
+            filesystemPrefix = dataPathPrefix
+            try:
+                filesystem, dataPath = url_to_fs(originalDataPath)
+            except Exception as e:
+                pglMessages.warning(f"Error accessing filesystem {filesystemPrefix}: {e}")
+            
+        else:
+
+            filesystemPrefix = ""
+            filesystem = fsspec.filesystem("file")
+
+        # ------------------------------------------------------------
+        # 3. Validate filesystem and dataPath
+        # ------------------------------------------------------------
+        try:
+            if not filesystem.exists(dataPath):
+                if create:
+                    filesystem.makedirs(dataPath, exist_ok=True)
+                elif requireExists:
+                    pglMessages.warning(f"{dataPath} does not exist")
+                    filesystem = None
+        except Exception as e:
+                pglMessages.warning(f"Error accessing {dataPath}: {e}")
+                filesystem = None
+            
+        return filesystem, dataPath, filesystemPrefix
     # ---------------------------------------------------------------------
     # Reusable file operations
     #
