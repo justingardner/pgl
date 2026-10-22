@@ -1,54 +1,68 @@
-import numpy
-from setuptools import setup, find_packages, Extension
+import os
 import sys
 
-if sys.platform != 'darwin':
-    raise RuntimeError("This package only works on macOS")
+from setuptools import Extension, find_packages, setup
 
-displayInfoExtension = Extension(
-    'pgl._resolution', 
-    sources=['pgl/_resolution.m'],
-    extra_compile_args=['-ObjC'],
-    extra_link_args=[
-        '-framework', 'CoreGraphics',
-        '-framework', 'Cocoa',
-        '-framework', 'CoreFoundation'
+
+native_setting = os.environ.get("PGL_BUILD_NATIVE", "auto").strip().lower()
+
+if native_setting not in {"auto", "0", "1"}:
+    raise RuntimeError("PGL_BUILD_NATIVE must be 'auto', '0', or '1'.")
+
+build_native = (
+    sys.platform == "darwin"
+    if native_setting == "auto"
+    else native_setting == "1"
+)
+
+if build_native and sys.platform != "darwin":
+    raise RuntimeError(
+        "PGL native extensions require macOS. "
+        "Use PGL_BUILD_NATIVE=0 for an analysis-only installation."
+    )
+
+extensions = []
+
+if build_native:
+    import numpy
+
+    extensions = [
+        Extension(
+            "pgl._resolution",
+            sources=["pgl/_resolution.m"],
+            extra_compile_args=["-ObjC"],
+            extra_link_args=[
+                "-framework", "CoreGraphics",
+                "-framework", "Cocoa",
+                "-framework", "CoreFoundation",
+            ],
+        ),
+        Extension(
+            "pgl._pglGammaTable",
+            sources=["pgl/_pglGammaTable.m"],
+            include_dirs=[numpy.get_include()],
+            extra_compile_args=["-ObjC"],
+            extra_link_args=[
+                "-framework", "CoreGraphics",
+                "-framework", "Cocoa",
+                "-framework", "CoreFoundation",
+            ],
+        ),
+        Extension(
+            "pgl._pglTimestamp",
+            sources=["pgl/_pglTimestamp.c"],
+        ),
+        Extension(
+            "pgl._pglEventListener",
+            sources=["pgl/_pglEventListener.cpp"],
+            extra_link_args=[
+                "-framework", "ApplicationServices",
+                "-framework", "Carbon",
+            ],
+        ),
     ]
-)
-
-gammaTableExtension = Extension(
-    'pgl._pglGammaTable',
-    sources=['pgl/_pglGammaTable.m'],
-    include_dirs=[numpy.get_include()], 
-    extra_compile_args=['-ObjC'],
-    extra_link_args=[
-        '-framework', 'CoreGraphics',
-        '-framework', 'Cocoa',
-        '-framework', 'CoreFoundation'
-    ]
-)
-
-timestampExtension = Extension(
-    'pgl._pglTimestamp',
-    sources=['pgl/_pglTimestamp.c'],  
-    extra_compile_args=[],
-    extra_link_args=[]
-)
-
-eventListenerExtension = Extension(
-    'pgl._pglEventListener',
-    sources=['pgl/_pglEventListener.cpp'],
-    extra_link_args=[
-        '-framework', 'ApplicationServices',
-        '-framework', 'Carbon'
-    ]
-)
 
 setup(
-    name='pgl',  
-    version='0.1.0',
-    packages=find_packages(), 
-    description='PGL Psychophysics and experiment library',
-    python_requires='>=3.9',
-    ext_modules=[displayInfoExtension,gammaTableExtension,timestampExtension,eventListenerExtension]
+    packages=find_packages(),
+    ext_modules=extensions,
 )
