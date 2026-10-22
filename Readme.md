@@ -4,8 +4,6 @@ Install [Miniforge](https://github.com/conda-forge/miniforge) or another
 Conda distribution.
 
 Run the commands below in a terminal where Python and Conda are available.
-On Windows, the Miniforge Prompt is a convenient option. If your system
-uses `python3` rather than `python`, substitute that command.
 
 ### 1. Clone the library
 
@@ -64,22 +62,13 @@ Use `mne` or `native` instead of `analysis` for those profiles.
 
 ### 3. Use the environment
 
-Select the environment in your IDE, or run a Python script through Conda:
+Select the environment in your IDE, or with
 
 ```text
-conda run --no-capture-output -n pgl python your_script.py
+conda activate pgl
 ```
 
 For the other profiles, replace `pgl` with `pgl_mne` or `pgl_macos`.
-
-### Native acquisition requirements
-
-Graphics and native acquisition extensions require macOS. Device-specific
-integrations, including Eyelink, VPixx, and LabJack, may require separately
-installed vendor SDKs and drivers.
-
-For Eyelink, use SR Research's Python SDK; do not assume that a PyPI
-package named `pylink` is the correct SDK.
 
 ### Accessibility access for keyboard and mouse events
 
@@ -92,3 +81,13 @@ Code. Quit and reopen the application after changing permissions if needed.
 Depending on the macOS version and how Python is launched, the actual
 host application may need its own permission. Launching VS Code from an
 authorized Terminal does not guarantee permission inheritance.
+
+### Device specific libraries
+
+Graphics and native acquisition extensions require macOS. Device-specific
+integrations, including Eyelink, VPixx, and LabJack, may require separately
+installed vendor SDKs and drivers.
+
+For Eyelink, use SR Research's Python SDK; do not assume that a PyPI
+package named `pylink` is the correct SDK.
+
