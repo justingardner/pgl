@@ -71,6 +71,7 @@ _EXPORTS = {
  'pglDigitalBrainMemoryTask': ('.pglDigitalBrain', 'pglDigitalBrainMemoryTask'),
  'pglDigitalBrainConfigure': ('.pglDigitalBrain', 'pglDigitalBrainConfigure'),
  'pglChoose': ('.pglChoose', 'pglChoose'),
+ 'pglItem': ('.pglChoose', 'pglItem'),
  'pglSession': ('.pglSession', 'pglSession'),
  'pglStorage': ('.pglStorage', 'pglStorage'),
  'pglDatabase': ('.pglDatabase', 'pglDatabase'),
