@@ -1420,6 +1420,11 @@ class pglBehavior:
 
         # Include labels in explicit-column availability checks.
         trialData = cls._addBehaviorResponseLabels(trialData)
+        if includeAllColumns or (
+            columns is not None
+            and any(re.fullmatch(r"segmentStart[0-9]{2,}", name) for name in columns)
+        ):
+            trialData = cls._addBehaviorSegmentStarts(matrix, trialData)
         availableNames = set()
 
         for variableName, variable in trialData.data_vars.items():
@@ -1519,7 +1524,11 @@ class pglBehavior:
 
         trialData = cls.getTrialData(matrix, **projectionOptions)
         trialData = cls._addBehaviorResponseLabels(trialData)
-
+        if includeAllColumns or (
+            columns is not None
+            and any(re.fullmatch(r"segmentStart[0-9]{2,}", name) for name in columns)
+        ):
+            trialData = cls._addBehaviorSegmentStarts(matrix, trialData)
         columnValues = {}
         columnMetadata = {}
         excludedParameterFields = []
@@ -1646,6 +1655,9 @@ class pglBehavior:
 
                 return (3, 3, columnName)
 
+            if sourceGroup == "segmentStartProjection":
+                return (4, "segmentStart", metadata["segmentNum"], columnName)
+
             return (4, sourceVariable, componentIndex, columnName)
 
         defaultHiddenFields = {
@@ -1655,6 +1667,9 @@ class pglBehavior:
 
         def hiddenByDefault(columnName):
             metadata = columnMetadata[columnName]
+            
+            if metadata.get("sourceGroup") == "segmentStartProjection":
+                return True
 
             if columnName in defaultHiddenFields:
                 return True
@@ -2459,3 +2474,127 @@ class pglBehavior:
             )
 
         return mapping[matches[0]] if matches else None
+    
+    @classmethod
+    def _addBehaviorSegmentStarts(cls, matrix, trialData):
+        """Add recorded segment starts relative to trial start.
+
+        Segment numbering is zero-based. Missing or duplicate starts yield
+        missing values. No timestamps are inferred.
+        """
+        data = cls._requireBehaviorData(matrix)
+
+        for variableName in ("eventSubtype", "eventSegmentNum", "eventTime"):
+            if variableName not in data:
+                raise ValueError(f"Segment-start projection requires {variableName!r}.")
+
+            if data[variableName].attrs.get("extractionStatus") != "supported":
+                raise ValueError(f"{variableName}: segment-start projection requires a supported encoding.")
+
+        trialIDs = trialData.coords["trial"].values.tolist()
+        trialPositions = {trialID: position for position, trialID in enumerate(trialIDs)}
+
+        if len(trialPositions) != len(trialIDs):
+            raise ValueError("Trial coordinates must identify unique source rows.")
+
+        trialStarts = cls._behaviorValues(trialData, "trialStartTime")
+        eventTypes = cls._behaviorValues(data, "eventType")
+        eventScopes = cls._behaviorValues(data, "eventScope")
+        eventTrials = cls._behaviorValues(data, "eventTrialIndex")
+        eventSubtypes = cls._behaviorValues(data, "eventSubtype")
+        eventSegments = cls._behaviorValues(data, "eventSegmentNum")
+        eventTimes = cls._behaviorValues(data, "eventTime")
+        eventIDs = data.coords["event"].values.tolist()
+
+        startsBySegment = {}
+
+        for eventPosition, eventType in enumerate(eventTypes):
+            if eventType != "segment" or eventScopes[eventPosition] != "task":
+                continue
+
+            if eventSubtypes[eventPosition] != "start":
+                continue
+
+            trialPosition = trialPositions.get(eventTrials[eventPosition])
+
+            if trialPosition is None:
+                continue
+
+            segmentNumber = eventSegments[eventPosition]
+
+            if isinstance(segmentNumber, (bool, np.bool_)) or not isinstance(segmentNumber, Integral) or segmentNumber < 0:
+                raise ValueError(f"Event {eventIDs[eventPosition]!r}: segment start requires a nonnegative integer eventSegmentNum.")
+
+            segmentNumber = int(segmentNumber)
+            startsBySegment.setdefault(segmentNumber, {}).setdefault(trialPosition, []).append(eventPosition)
+
+        # Validate all generated names before adding any columns.
+        reserved = set(trialData.variables) | set(trialData.dims)
+
+        for segmentNumber in sorted(startsBySegment):
+            field = f"segmentStart{segmentNumber:02d}"
+            generatedNames = {field, field + "Present"}
+            collisions = reserved.intersection(generatedNames)
+
+            if collisions:
+                raise ValueError(f"Segment-start projection column collision: {sorted(collisions)}.")
+
+            reserved.update(generatedNames)
+
+        diagnostics = []
+
+        for segmentNumber, startsByTrial in sorted(startsBySegment.items()):
+            field = f"segmentStart{segmentNumber:02d}"
+            values = np.full(len(trialIDs), np.nan, dtype=np.float64)
+            present = np.zeros(len(trialIDs), dtype=bool)
+
+            for trialPosition, trialID in enumerate(trialIDs):
+                candidates = startsByTrial.get(trialPosition, [])
+
+                if len(candidates) != 1:
+                    status = "missingSegmentStart" if not candidates else "ambiguousSegmentStart"
+                else:
+                    eventPosition = candidates[0]
+                    latency, status = cls._behaviorLatency(
+                        eventTimes[eventPosition],
+                        trialStarts[trialPosition],
+                    )
+
+                    if status == "ok":
+                        values[trialPosition] = latency
+                        present[trialPosition] = True
+
+                if status != "ok":
+                    diagnostics.append({
+                        "trialIndex": trialID,
+                        "segmentNum": segmentNumber,
+                        "status": status,
+                        "candidateEventIndices": [eventIDs[position] for position in candidates],
+                    })
+
+            attributes = {
+                "sourceGroup": "segmentStartProjection",
+                "logicalType": "float",
+                "extractionStatus": "supported",
+                "units": "seconds",
+                "reference": "trialStartTime",
+                "segmentNum": segmentNumber,
+                "segmentBoundary": "start",
+                "referenceMatching": "Exactly one task-scoped start associated with this trial",
+                "inferenceRules": "none",
+            }
+
+            if not present.all():
+                maskName = field + "Present"
+                trialData[maskName] = xr.DataArray(
+                    present,
+                    dims=("trial",),
+                    attrs={"role": "presenceMask", "forVariable": field},
+                )
+                attributes["presenceVariable"] = maskName
+
+            trialData[field] = xr.DataArray(values, dims=("trial",), attrs=attributes)
+
+        trialData.attrs["segmentStartTimingDiagnostics"] = diagnostics
+
+        return trialData
