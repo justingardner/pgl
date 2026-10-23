@@ -1178,7 +1178,7 @@ class pglBehavior:
     def getBehaviorTable(cls, matrix, *, includeAllColumns=False, columns=None, **options):
         """Return an independent pandas table, warning for invalid requests.
 
-        Public entry point used directly and by session/dataset accessors.
+        allResponses is an alias for includeAllResponses.
 
         Invalid options, ambiguous task selections, unavailable requested
         columns, and unimplemented projection features warn and return None.
@@ -1198,9 +1198,24 @@ class pglBehavior:
         if matrix is None:
             return warn("No behavioral matrix is available.")
 
-        # Validate the source outside request-error handling. A malformed
-        # scientific product must not be disguised as an invalid user option.
+        # Validate scientific source data outside request-error handling.
         data = cls._requireBehaviorData(matrix)
+
+        # Normalize the public alias before validating or forwarding options.
+        if "allResponses" in options:
+            allResponses = options.pop("allResponses")
+
+            if type(allResponses) is not bool:
+                return warn("allResponses must be a Boolean.")
+
+            if "includeAllResponses" in options:
+                if type(options["includeAllResponses"]) is not bool:
+                    return warn("includeAllResponses must be a Boolean.")
+
+                if options["includeAllResponses"] != allResponses:
+                    return warn("allResponses and includeAllResponses must agree when both are supplied.")
+
+            options["includeAllResponses"] = allResponses
 
         allowedOptions = {
             "taskName", "taskIndex", "taskSelection",
@@ -1213,7 +1228,8 @@ class pglBehavior:
         unknownOptions = sorted(set(options) - allowedOptions)
 
         if unknownOptions:
-            return warn(f"Unknown option(s): {', '.join(unknownOptions)}.\nSupported options: {', '.join(sorted(allowedOptions | {'includeAllColumns', 'columns'}))}.")
+            supportedOptions = sorted(allowedOptions | {"includeAllColumns", "columns", "allResponses"})
+            return warn(f"Unknown option(s): {', '.join(unknownOptions)}.\nSupported options: {', '.join(supportedOptions)}.")
 
         if type(includeAllColumns) is not bool:
             return warn("includeAllColumns must be a Boolean.")
@@ -1271,8 +1287,7 @@ class pglBehavior:
         runSources = data.attrs.get("runSources")
         taskSources = data.attrs.get("taskSources")
 
-        # Keep source metadata failures separate from ordinary task-selection
-        # problems handled below.
+        # Keep malformed metadata separate from task-selection errors.
         if not isinstance(runSources, list) or not isinstance(taskSources, list):
             raise ValueError("Behavioral source metadata must include runSources and taskSources.")
 
@@ -1286,13 +1301,10 @@ class pglBehavior:
         taskIndex = options.get("taskIndex")
         taskSelection = options.get("taskSelection")
 
-        # A selection-only view avoids materializing scientific context arrays
-        # twice. Task resolution uses the full run/task metadata; empty trial
-        # arrays suffice for this preliminary request validation.
+        # Validate task selection without materializing scientific arrays twice.
         selectionData = data[["runIndex", "taskIndex"]].isel(trial=slice(0, 0)).copy(deep=False)
         selectionData.attrs = dict(data.attrs)
 
-        # Presence masks, if referenced, are needed by the selection helper.
         for field in ("runIndex", "taskIndex"):
             maskName = data[field].attrs.get("presenceVariable")
 
@@ -1340,11 +1352,6 @@ class pglBehavior:
             message += "\n\nFor all tasks:\n  getBehaviorTable(taskSelection='all', includeTriggers=False)"
             return warn(message)
 
-        # Column availability depends on the actual projection. Build the
-        # complete candidate table once, retaining absent parameters so an
-        # explicit request can still select them.
-        projectionColumns = [] if columns is not None else None
-
         projectionOptions = dict(options)
 
         if columns is not None and any(re.fullmatch(r"(responseEventIndex|responseTime|responseType|response)([1-9][0-9]*)", name) for name in columns):
@@ -1356,15 +1363,9 @@ class pglBehavior:
             except NotImplementedError as error:
                 return warn(str(error))
 
-        # Preserve the existing converter's explicit-column behavior without
-        # catching scientific ValueErrors indiscriminately. A private exception
-        # type is unnecessary: discover available columns through its existing
-        # tableSpecification metadata on an all-columns conversion below.
-        #
-        # Explicit columns=[] causes the converter to encode absent parameters,
-        # but returns no columns. Its selection metadata lists available names
-        # only indirectly, so use a trial projection to derive all scalar/vector
-        # output names before invoking the converter with the actual request.
+        # Determine available scalar/vector output names before passing an
+        # explicit request to the converter. Do not catch scientific
+        # ValueErrors indiscriminately.
         try:
             trialData = cls.getTrialData(matrix, **{**projectionOptions, "includeAllResponses": includeAllColumns or projectionOptions.get("includeAllResponses", False)})
         except NotImplementedError as error:
@@ -1393,10 +1394,6 @@ class pglBehavior:
     def _getBehaviorTable(cls, matrix, *, includeAllColumns=False, columns=None, **options):
         """Return behavioral trials as an independent pandas DataFrame.
 
-        Obtains the session-owned behavioral matrix internally. If absent,
-        constructs and attaches it; otherwise reuses the existing matrix.
-        Users do not need to call getBehaviorData() first.
-
         Each row represents a selected recorded trial START. Unanswered and
         incomplete trials are retained. The DataFrame index preserves source
         matrix trial IDs; sourceTrialNum contains the recorded trial number.
@@ -1404,129 +1401,85 @@ class pglBehavior:
         Task selection
         --------------
         taskName : str, optional
-            Exact match against recorded taskSaveName, not the human-readable
-            taskName. Example: "memoryDescriptionTask".
+            Exact match against recorded taskSaveName.
         taskIndex : int, optional
             Zero-based task index, resolved independently within each run.
         taskSelection : "all", optional
             Include trials from all tasks.
 
         Specify at most one task-selection option. Without one, each run
-        must contain exactly one task. Missing or ambiguous matches raise;
-        automatic main-task resolution is not yet implemented.
+        must contain exactly one task. Automatic main-task selection is not
+        implemented.
 
-        Response summaries
-        ------------------
+        Responses
+        ---------
         responsePolicy : {"first", "last"}, default "first"
-            Select the summary response by RECORDED EVENT ORDER, not sorted
-            timestamp order. responseCount always counts all accepted
-            response events associated with the trial, not physical keys.
+            Select summary responses by recorded event order, not timestamp
+            order. responseCount counts all accepted response events.
         includeAllResponses : bool, default False
-            Add response1, responseType1, responseTime1, etc., while retaining
-            the ordinary summary columns. All times use the same reference.
+            Expand responses into response1, responseType1, responseTime1,
+            responseEventIndex1, etc. Automatic output omits each unnumbered
+            summary column when its numbered replacement exists.
+            responseCount is retained.
+        allResponses : bool, optional
+            Alias for includeAllResponses.
 
         Response timing
         ---------------
         responseReference : {"trial", "segment", "trigger"}, default "trial"
-            responseTime = response timestamp - reference timestamp, seconds.
-
-            "trial":
-                Use the recorded trial START timestamp.
-            "segment":
-                Require exactly one associated task-scoped segment boundary.
-            "trigger":
-                Require exactly one eligible associated task-scoped event
-                with the requested recorded trigger name.
-
-        segmentNum : int, required for segment timing
-            Recorder's ZERO-BASED segment number. segmentNum=1 means the
-            second segment; segmentNum=2 means the third.
+            Response time is response timestamp minus reference timestamp,
+            in seconds.
+        segmentNum : int
+            Required for segment timing; zero-based segment number.
         segmentBoundary : {"start", "end"}, default "start"
-            Use an actually recorded boundary. Segment END events are not
-            inferred from the next boundary.
-        triggerName : str, required for trigger timing
-            Exact recorded trigger name.
+            Use an actually recorded segment boundary.
+        triggerName : str
+            Required for trigger timing; exact recorded trigger name.
         requireTriggerSent : bool, default True
-            Trigger timing requires recorded triggerSent=True.
-            With False, failed or unspecified attempts also become eligible;
-            multiple eligible attempts make the reference ambiguous.
+            Require triggerSent=True for trigger timing. False also permits
+            failed or unspecified attempts.
 
-        Missing or ambiguous references produce missing responseTime, not
-        missing responses. Nonfinite/missing timestamps also produce missing
-        latency. Negative offsets are preserved and diagnosed, never clipped.
+        Missing or ambiguous references yield missing latency, not missing
+        responses. Nonfinite/missing timestamps yield missing latency.
+        Negative offsets are preserved. Recorded order may differ from
+        timestamp order. Segment START is not verified stimulus onset.
+        No run-level temporal trigger association is performed.
 
-        Recorded order and timestamp order can differ: a response may be
-        appended after a segment transition while carrying an earlier input
-        timestamp. A segment START is not automatically verified stimulus
-        onset. Timestamps are compared only within the associated trial;
-        no run-level temporal trigger association is performed.
+        Timing metadata is retained in viewSpecification,
+        responseTimingDiagnostics, and responseTimingReferences.
 
-        Timing details are available in:
-            trials.attrs["viewSpecification"]
-            trials.attrs["responseTimingDiagnostics"]
-            trials.attrs["responseTimingReferences"]
-
-        Display and column selection
-        ----------------------------
+        Column selection
+        ----------------
         includeAllColumns : bool, default False
-            Show internal indices, taskSaveName, and unsupported field markers.
-            Also enables numbered response expansion, even if
-            includeAllResponses=False was supplied.
-
-            Defaults hide runIndex, taskIndex, taskSaveName,
-            trialStartEventIndex, responseEventIndex and numbered variants,
-            and fields marked extractionStatus="unsupported".
-
-            This means all available TRIAL TABLE columns, not raw event rows,
-            configuration export, or unimplemented trigger expansion.
+            Include internal indices and unsupported field markers, and
+            enable numbered response expansion. Redundant unnumbered
+            response summaries are still omitted when numbered replacements
+            exist.
         columns : list[str] or tuple[str], optional
-            Return exactly these columns in the requested order. Explicit
-            selection can expose otherwise hidden or absent parameter fields.
-            Unknown or duplicate column names raise. Requesting numbered
-            response columns enables response expansion.
+            Return exactly these columns in this order, overriding automatic
+            hiding of summary/internal/absent parameter columns. Requesting
+            numbered responses enables response expansion.
 
         Automatically returned parameters must be present in at least one
-        selected trial. Parameters belonging only to other tasks are omitted,
-        even with includeAllColumns=True. Current encoding treats recorded
-        None and absence alike; recorded floating NaNs remain present.
+        selected trial, including with includeAllColumns=True. Explicit
+        column requests may select absent parameter fields.
 
-        Fixed-length vectors become zero-based ComponentN columns. Missing
-        integer/Boolean/string values use pandas nullable representations.
-        Unsupported markers identify an encoding limitation, not preserved
-        original scientific values. Column metadata is stored in:
-            trials.attrs["columnMetadata"]
+        Fixed-length vectors expand into zero-based ComponentN columns.
+        Missing integer/Boolean/string values use pandas nullable types.
+        Floating missing values use NaN. Unsupported markers indicate
+        encoding limitations rather than preserved scientific values.
 
-        Current feature limits
-        ----------------------
+        Feature limits
+        --------------
         includeTriggers : bool, default True
-            Wide trigger-column expansion is not implemented. If triggers
-            are detected, use includeTriggers=False to generate a table.
-            Trigger timing references STILL WORK with includeTriggers=False;
-            source trigger records are not removed.
+            Wide trigger expansion is not implemented. If triggers are
+            detected, use False. Trigger timing references still work.
         includeConfiguration : bool, default False
-            Configuration projection is not implemented; True raises.
+            Configuration projection is not implemented.
 
-        Examples
-        --------
-        trials = session.getBehaviorTable(taskName="memoryDescriptionTask")
-
-        # Relative to recorded segment 1 START, not verified visual onset.
-        trials = session.getBehaviorTable(taskName="memoryDescriptionTask", responseReference="segment", segmentNum=1)
-
-        # Trigger reference without the unimplemented wide trigger columns.
-        trials = session.getBehaviorTable(taskName="memoryDescriptionTask", responseReference="trigger", triggerName="stimulusOnset", includeTriggers=False)
-
-        trials = session.getBehaviorTable(taskName="memoryDescriptionTask", includeAllColumns=True)
-        trials = session.getBehaviorTable(taskName="memoryDescriptionTask", columns=["runName", "sourceTrialNum", "responseTime"])
-
-        Side effects and persistence
-        ----------------------------
-        First access may read behavioral sources and attach a working matrix.
-        Projection may materialize matrix arrays. Editing the returned
-        DataFrame does not modify the source matrix.
-
-        Does not automatically save database records or Zarr payloads.
-        Use session.saveSession() to persist attached matrices explicitly.
+        Reads the supplied matrix as needed without attaching/rebuilding it
+        or publishing records. Editing the returned table does not modify
+        the source matrix.
         """
         from copy import deepcopy
 
@@ -1534,6 +1487,22 @@ class pglBehavior:
 
         if type(includeAllColumns) is not bool:
             raise TypeError("includeAllColumns must be a Boolean.")
+
+        # Also support the alias when this converter is called directly.
+        if "allResponses" in options:
+            allResponses = options.pop("allResponses")
+
+            if type(allResponses) is not bool:
+                raise TypeError("allResponses must be a Boolean.")
+
+            if "includeAllResponses" in options:
+                if type(options["includeAllResponses"]) is not bool:
+                    raise TypeError("includeAllResponses must be a Boolean.")
+
+                if options["includeAllResponses"] != allResponses:
+                    raise ValueError("allResponses and includeAllResponses must agree when both are supplied.")
+
+            options["includeAllResponses"] = allResponses
 
         if columns is not None:
             if not isinstance(columns, (list, tuple)):
@@ -1599,17 +1568,15 @@ class pglBehavior:
             metadata = {**variable.attrs, "sourceVariable": variableName}
 
             if variable.attrs.get("sourceGroup") == "params":
-                # Adapted structured parameters have parent-object presence.
-                # Keep their components when the parent parameter is present,
-                # even if a particular component is missing on every row.
+                # Retain structured components when the parent is present,
+                # even if an individual component is missing on every row.
                 parentMaskName = variable.attrs.get("parentPresenceVariable")
                 parameterPresent = present if parentMaskName is None else trialData[parentMaskName].values.astype(bool, copy=True)
 
                 if not parameterPresent.any():
                     excludedParameterFields.append(variableName)
 
-                    # Explicit column requests can inspect absent fields.
-                    # Automatic tables, including all-columns tables, omit them.
+                    # Explicit requests may inspect absent parameters.
                     if columns is None:
                         continue
 
@@ -1699,6 +1666,14 @@ class pglBehavior:
 
         availableNames = sorted(columnValues, key=columnOrder)
 
+        # Numbered responses replace all four unnumbered summaries in
+        # automatic output. Keep summaries available for explicit requests.
+        redundantResponseColumns = {
+            name
+            for name in responseFields
+            if name in columnValues and f"{name}1" in columnValues
+        }
+
         if columns is not None:
             missingNames = [name for name in columns if name not in columnValues]
 
@@ -1707,9 +1682,16 @@ class pglBehavior:
 
             selectedNames = columns
         elif includeAllColumns:
-            selectedNames = availableNames
+            selectedNames = [
+                name for name in availableNames
+                if name not in redundantResponseColumns
+            ]
         else:
-            selectedNames = [name for name in availableNames if not hiddenByDefault(name)]
+            selectedNames = [
+                name for name in availableNames
+                if not hiddenByDefault(name)
+                and name not in redundantResponseColumns
+            ]
 
         table = pd.DataFrame(
             {name: columnValues[name] for name in selectedNames},
@@ -1722,6 +1704,10 @@ class pglBehavior:
             "includeAllColumns": includeAllColumns,
             "columns": None if columns is None else list(columns),
             "defaultHiddenColumns": [name for name in availableNames if hiddenByDefault(name)],
+            "omittedRedundantResponseColumns": [
+                name for name in availableNames
+                if name in redundantResponseColumns and name not in selectedNames
+            ],
             "returnedColumns": list(selectedNames),
             "parameterSelection": "Present in at least one selected trial; explicit column requests override",
             "absentParameterVariables": sorted(excludedParameterFields),
@@ -1733,7 +1719,7 @@ class pglBehavior:
             "columnOrdering": "Explicit requested order, otherwise context; alphabetical parameters; alphabetical trial variables; response summaries and numerically ordered responses; alphabetical remaining fields",
         }
 
-        return table    
+        return table
     
     @classmethod
     def combineSessionData(cls, matrices, *, members, databaseIdentity, name="behavior"):
