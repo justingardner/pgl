@@ -763,8 +763,10 @@ class pglBehavior:
     def _selectBehaviorTrials(cls, data, *, taskName=None, taskIndex=None, taskSelection=None):
         """Resolve tasks independently per run and return trial positions.
 
-        taskName matches taskSaveName exactly.
+        taskName matches either taskName or taskSaveName, ignoring capitalization
+        and trailing whitespace.
         Runs missing a requested task raise rather than disappearing silently.
+        Ambiguous name matches raise; use taskIndex to disambiguate.
         Without explicit selection, only single-task runs resolve automatically.
         """
         if taskSelection not in (None, "all"):
@@ -775,8 +777,14 @@ class pglBehavior:
         if selectionCount > 1:
             raise ValueError("Specify only one of taskName, taskIndex, or taskSelection.")
 
-        if taskName is not None and (not isinstance(taskName, str) or not taskName):
-            raise TypeError("taskName must be a nonempty taskSaveName string.")
+        def normalizeTaskName(value):
+            return value.rstrip().casefold() if isinstance(value, str) else None
+
+        normalizedTaskName = None
+        if taskName is not None:
+            if not isinstance(taskName, str) or not taskName.rstrip():
+                raise TypeError("taskName must be a nonempty taskName or taskSaveName string.")
+            normalizedTaskName = normalizeTaskName(taskName)
 
         if taskIndex is not None:
             if isinstance(taskIndex, (bool, np.bool_)) or not isinstance(taskIndex, Integral) or taskIndex < 0:
@@ -797,15 +805,32 @@ class pglBehavior:
             if taskSelection == "all":
                 matches = candidates
             elif taskName is not None:
-                matches = [source for source in candidates if source.get("taskSaveName") == taskName]
+                matches = [
+                    source
+                    for source in candidates
+                    if any(
+                        normalizeTaskName(source.get(field)) == normalizedTaskName
+                        for field in ("taskName", "taskSaveName")
+                    )
+                ]
             elif taskIndex is not None:
                 matches = [source for source in candidates if source["taskIndex"] == taskIndex]
             else:
                 matches = candidates
 
             if taskSelection != "all" and len(matches) != 1:
-                available = [(source["taskIndex"], source.get("taskSaveName")) for source in candidates]
-                raise ValueError(f"Run {runIndex}: selection resolved to {len(matches)} tasks; specify an unambiguous selection. Available tasks: {available}.")
+                available = [
+                    {
+                        "taskIndex": source["taskIndex"],
+                        "taskName": source.get("taskName"),
+                        "taskSaveName": source.get("taskSaveName"),
+                    }
+                    for source in candidates
+                ]
+                raise ValueError(
+                    f"Run {runIndex}: selection resolved to {len(matches)} tasks; "
+                    f"specify an unambiguous selection. Available tasks: {available}."
+                )
 
             for source in matches:
                 selectedTasks.add((source["runIndex"], source["taskIndex"]))
