@@ -4,7 +4,11 @@ import importlib as _importlib
 import sys as _sys
 import types as _types
 
-_EXPORTS = {'pglBase': ('.pglBase', 'pglBase'),
+# export table (lists all the classes and files that are publicly exported from the PGL package)
+# this is done so that the class import can be lazy and avoid loading dependencies that do not
+# work on non macOS systems
+_EXPORTS = {
+ 'pglBase': ('.pglBase', 'pglBase'),
  'pglResolution': ('.pglResolution', 'pglResolution'),
  'pglDraw': ('.pglDraw', 'pglDraw'),
  'pglTransform': ('.pglTransform', 'pglTransform'),
@@ -20,7 +24,7 @@ _EXPORTS = {'pglBase': ('.pglBase', 'pglBase'),
  'pglDigitalIODevice': ('.pglDevice', 'pglDigitalIODevice'),
  'pglAnalogTraceData': ('.pglDevice', 'pglAnalogTraceData'),
  'pglKeyboardMouse': ('.pglKeyboardMouse', 'pglKeyboardMouse'),
- 'pglEventKeyboard': ('.pglKeyboardMouse', 'pglEventKeyboard'),
+ 'pglEventKeyboard': ('.pglEvent', 'pglEventKeyboard'),
  'pglKeyBuffer': ('.pglKeyboardMouse', 'pglKeyBuffer'),
  'pglEvent': ('.pglEvent', 'pglEvent'),
  'pglEvents': ('.pglEvent', 'pglEvents'),
@@ -58,6 +62,7 @@ _EXPORTS = {'pglBase': ('.pglBase', 'pglBase'),
  'pglStateDataSettings': ('.pglSettings', 'pglStateDataSettings'),
  'pglEventListener': ('.pglEventListener', 'pglEventListener'),
  'pglEyeTracker': ('.pglEyeTracker', 'pglEyeTracker'),
+ 'pglEyePositionSample': ('.pglEyeTracker', 'pglEyePositionSample'),
  'pglDialogs': ('.pglDialog', 'pglDialogs'),
  'pglMessages': ('.pglMessages', 'pglMessages'),
  'pglActions': ('.pglActions', 'pglActions'),

@@ -196,6 +196,7 @@ class pglEyePositionSample(pglTraitSettings):
         obj = cls(x=data["x"], y=data["y"], pupilSize=data.get("pupilSize"), whichEye=data.get("whichEye", "unknown"), units=data.get("units", "device"))
         obj.updateTraitsFromDict(data, filename=filename)
         return obj
+
 #################################################################
 # Parent class for eye tracker devices
 #################################################################

@@ -69,6 +69,52 @@ def pglGetAllSubclasses(baseClass):
     collect(baseClass)
     return allSubclasses
 
+##########################
+#  pglResolveSerializationClass
+##########################
+def pglResolveSerializationClass(className, classRegistry):
+    """Resolve a loaded serialization class or import its public export."""
+    if not isinstance(className, str):
+        return None
+
+    objectClass = classRegistry.get(className)
+    if objectClass is not None:
+        return objectClass
+
+    package = sys.modules.get(__package__)
+    if package is None:
+        return None
+
+    exports = vars(package).get("_EXPORTS", {})
+    export = exports.get(className)
+    if export is None:
+        return None
+
+    moduleName, attributeName = export
+
+    try:
+        import importlib
+
+        module = importlib.import_module(moduleName, package=__package__)
+        objectClass = getattr(module, attributeName)
+
+        if not isinstance(objectClass, type) or not issubclass(objectClass, pglSerialize):
+            raise TypeError(
+                f"Export {className!r} is not a pglSerialize subclass."
+            )
+
+        classRegistry.update(pglGetAllSubclasses(pglSerialize))
+        classRegistry[className] = objectClass
+        return objectClass
+
+    except Exception as error:
+        pglMessages.warning(
+            f"(pglSerialize) Could not import serialization class "
+            f"'{className}' from '{moduleName}': "
+            f"{type(error).__name__}: {error}",
+            level=1
+        )
+        return None
 
 ##########################
 #  pglSerializedError
@@ -602,7 +648,10 @@ class pglSerialize:
                 if not isinstance(className, str):
                     raise ValueError(f"{path}: class name must be a string.")
 
-                objectClass = loadAsClass if isRoot and loadAsClass is not None else classRegistry.get(className)
+                if isRoot and loadAsClass is not None:
+                    objectClass = loadAsClass
+                else:
+                    objectClass = pglResolveSerializationClass(className, classRegistry)
 
                 if objectClass is None:
                     raise ValueError(f"{path}: unknown serialization class {className!r}.")
@@ -862,11 +911,16 @@ class pglSerialize:
 
                 if loadAsClass is not None:
                     objectClass = loadAsClass
-                elif className in classRegistry:
-                    objectClass = classRegistry[className]
                 else:
+                    objectClass = pglResolveSerializationClass(className, classRegistry)
+
+                if objectClass is None:
                     availableClasses = sorted(classRegistry)
-                    pglMessages.warning(f"(pglSerialize) Could not restore object of class '{className}' from '{filename}'.\nKnown classes: {availableClasses}")
+                    pglMessages.warning(
+                        f"(pglSerialize) Could not restore object of class "
+                        f"'{className}' from '{filename}'.\n"
+                        f"Known classes: {availableClasses}"
+                    )
                     dct["__class__"] = className
                     return dct
 
