@@ -474,22 +474,21 @@ class pglBehavior:
     def extractSession(cls, session, *, name="behavior"):
         """Extract current session contents into an in-memory pglDataMatrix.
 
-        Reads all runs/tasks and their behavioral data. Does not access MNE,
-        save the session, publish a matrix, or claim checkpoint equivalence.
+        Reads all runs/tasks and their behavioral data, including each task's
+        current responseMapping. Does not access MNE, save the session,
+        publish a matrix, or claim checkpoint equivalence.
 
-        Initial strict contract:
-            One sequentially numbered START per params/trialVariables entry.
-            Recorded scientific fields must contain supported scalar values.
+        Requires one sequentially numbered START per params/trialVariables
+        entry. Task response mappings are preserved as portable metadata
+        records, not dictionaries with potentially non-string JSON keys.
 
-        Relevant settings/configuration export is intentionally not part of
-        this first implementation.
+        General configuration export remains excluded.
         """
         trialRecords = []
         parameterRecords = []
         variableRecords = []
         eventRecords = []
         eventContexts = []
-
         runMetadata = []
         taskMetadata = []
 
@@ -515,15 +514,20 @@ class pglBehavior:
                 field: cls._label(getattr(experimentSettings, field, None), f"Run {runIndex}.{field}")
                 for field in ("subjectID", "sessionName", "runName", "experimentName")
             }
-
             runMetadata.append({"runIndex": runIndex, **labels})
 
-            # Run-level events are preserved without guessing trial association.
             for sourceIndex, event in enumerate(runData.events):
                 fields = cls._eventFields(event)
-                appendEvent(fields, runIndex=runIndex, taskIndex=-1, trialIndex=-1, sourceIndex=sourceIndex, scope="run", association="runUnassigned")
+                appendEvent(
+                    fields,
+                    runIndex=runIndex,
+                    taskIndex=-1,
+                    trialIndex=-1,
+                    sourceIndex=sourceIndex,
+                    scope="run",
+                    association="runUnassigned",
+                )
 
-            # Respect the authoritative working task list when already loaded.
             if run.lazyIsPending("tasks"):
                 taskCount = len(experimentSettings.tasks)
             else:
@@ -549,16 +553,29 @@ class pglBehavior:
                     for field in ("taskName", "taskSaveName")
                 }
 
-                taskMetadata.append({"runIndex": runIndex, "taskIndex": taskIndex, **taskLabels})
+                mappingRecords = cls._behaviorResponseMappingRecords(
+                    getattr(data, "responseMapping", None),
+                    context=context,
+                )
 
-                # Copy dictionaries so the result does not alias source records.
+                taskMetadata.append({
+                    "runIndex": runIndex,
+                    "taskIndex": taskIndex,
+                    **taskLabels,
+                    "responseMappingRecords": mappingRecords,
+                })
+
                 params = list(data.params)
                 variables = list(data.trialVariables)
                 cls._dictionaryFields(params, f"{context}.params")
                 cls._dictionaryFields(variables, f"{context}.trialVariables")
 
                 fieldsList = [cls._eventFields(event) for event in data.events]
-                starts = [fields for fields in fieldsList if fields.get("type") == "trial" and fields.get("eventType") == "start"]
+                starts = [
+                    fields for fields in fieldsList
+                    if fields.get("type") == "trial"
+                    and fields.get("eventType") == "start"
+                ]
 
                 if len(starts) != len(params) or len(starts) != len(variables):
                     raise ValueError(f"{context}: {len(starts)} trial STARTs, {len(params)} parameter records, and {len(variables)} trial-variable records do not align.")
@@ -576,8 +593,6 @@ class pglBehavior:
                         trialNum = cls._trialNumber(fields.get("trialNum"), f"{context}, event {sourceIndex}")
                         trialTime = cls._trialTime(fields.get("timestamp"), f"{context}, event {sourceIndex}")
 
-                        # Current recorder numbers STARTs consecutively from zero.
-                        # Refuse ambiguous parameter joins rather than guess.
                         if trialNum != trialPosition:
                             raise ValueError(f"{context}: START trialNum {trialNum} does not match parameter position {trialPosition}.")
 
@@ -610,15 +625,24 @@ class pglBehavior:
                         else:
                             association = "outsideTrial"
 
-                    appendEvent(fields, runIndex=runIndex, taskIndex=taskIndex, trialIndex=activeTrialIndex, sourceIndex=sourceIndex, scope="task", association=association)
+                    appendEvent(
+                        fields,
+                        runIndex=runIndex,
+                        taskIndex=taskIndex,
+                        trialIndex=activeTrialIndex,
+                        sourceIndex=sourceIndex,
+                        scope="task",
+                        association=association,
+                    )
 
-                    # Preserve events after termination without assigning them
-                    # silently to the preceding trial.
                     if isTrial and boundary == "end":
                         activeTrialIndex = -1
                         activeTrialNum = None
 
-        dataset = xr.Dataset(coords={"trial": np.arange(len(trialRecords), dtype=np.int64), "event": np.arange(len(eventRecords), dtype=np.int64)})
+        dataset = xr.Dataset(coords={
+            "trial": np.arange(len(trialRecords), dtype=np.int64),
+            "event": np.arange(len(eventRecords), dtype=np.int64),
+        })
 
         trialFields = [
             "subjectID", "sessionName", "runName", "experimentName",
@@ -639,9 +663,6 @@ class pglBehavior:
 
         parameterMapping = {field: cls._fieldName("parameter", field) for field in parameterNames}
         variableMapping = {field: cls._fieldName("variable", field) for field in variableNames}
-
-        # Include familiar fields even when absent, so the event schema is
-        # inspectable on sessions without responses or triggers.
         eventMapping = dict(cls.eventFieldNames)
 
         for field in eventNames:
@@ -653,7 +674,11 @@ class pglBehavior:
         cls._addColumns(dataset, "event", eventRecords, eventMapping, sourceGroup="events")
 
         for field in ("trialStartTime", "eventTime"):
-            dataset[field].attrs.update({"units": "seconds", "clockScope": "source run acquisition clock", "reference": "original recorded timestamp"})
+            dataset[field].attrs.update({
+                "units": "seconds",
+                "clockScope": "source run acquisition clock",
+                "reference": "original recorded timestamp",
+            })
 
         dataset["eventTrialIndex"].attrs.update({"referencesDimension": "trial", "missingRelationship": -1})
         dataset["trialStartEventIndex"].attrs.update({"referencesDimension": "event"})
@@ -673,7 +698,6 @@ class pglBehavior:
         })
 
         matrix = pglDataMatrix(dataset, name=name)
-
         checkpointID = getattr(session, "sessionID", None)
 
         matrix.provenance = {
@@ -1176,18 +1200,16 @@ class pglBehavior:
 
     @classmethod
     def getBehaviorTable(cls, matrix, *, includeAllColumns=False, columns=None, **options):
-        """Return an independent pandas table, warning for invalid requests.
+        """Return an independent pandas behavioral table.
 
         allResponses is an alias for includeAllResponses.
+        Task-specific responseLabel columns accompany response values.
 
-        Invalid options, ambiguous task selections, unavailable requested
-        columns, and unimplemented projection features warn and return None.
+        Invalid requests warn and return None. Malformed source schemas,
+        invalid mapping metadata, incompatible scientific encodings, and
+        unexpected implementation errors propagate.
 
-        Malformed source schemas, incompatible scientific encodings, and
-        unexpected implementation errors still propagate.
-
-        Reads matrix arrays as needed. Does not attach/rebuild a matrix,
-        modify scientific values, or publish database records.
+        Does not modify, rebuild, attach, or publish the source matrix.
         """
         from .pglMessages import pglMessages
 
@@ -1198,10 +1220,8 @@ class pglBehavior:
         if matrix is None:
             return warn("No behavioral matrix is available.")
 
-        # Validate scientific source data outside request-error handling.
         data = cls._requireBehaviorData(matrix)
 
-        # Normalize the public alias before validating or forwarding options.
         if "allResponses" in options:
             allResponses = options.pop("allResponses")
 
@@ -1287,7 +1307,6 @@ class pglBehavior:
         runSources = data.attrs.get("runSources")
         taskSources = data.attrs.get("taskSources")
 
-        # Keep malformed metadata separate from task-selection errors.
         if not isinstance(runSources, list) or not isinstance(taskSources, list):
             raise ValueError("Behavioral source metadata must include runSources and taskSources.")
 
@@ -1301,7 +1320,6 @@ class pglBehavior:
         taskIndex = options.get("taskIndex")
         taskSelection = options.get("taskSelection")
 
-        # Validate task selection without materializing scientific arrays twice.
         selectionData = data[["runIndex", "taskIndex"]].isel(trial=slice(0, 0)).copy(deep=False)
         selectionData.attrs = dict(data.attrs)
 
@@ -1352,9 +1370,10 @@ class pglBehavior:
             message += "\n\nFor all tasks:\n  getBehaviorTable(taskSelection='all', includeTriggers=False)"
             return warn(message)
 
+        numberedResponsePattern = r"(responseEventIndex|responseTime|responseType|responseLabel|response)([1-9][0-9]*)"
         projectionOptions = dict(options)
 
-        if columns is not None and any(re.fullmatch(r"(responseEventIndex|responseTime|responseType|response)([1-9][0-9]*)", name) for name in columns):
+        if columns is not None and any(re.fullmatch(numberedResponsePattern, name) for name in columns):
             projectionOptions["includeAllResponses"] = True
 
         if columns is None:
@@ -1363,14 +1382,19 @@ class pglBehavior:
             except NotImplementedError as error:
                 return warn(str(error))
 
-        # Determine available scalar/vector output names before passing an
-        # explicit request to the converter. Do not catch scientific
-        # ValueErrors indiscriminately.
         try:
-            trialData = cls.getTrialData(matrix, **{**projectionOptions, "includeAllResponses": includeAllColumns or projectionOptions.get("includeAllResponses", False)})
+            trialData = cls.getTrialData(
+                matrix,
+                **{
+                    **projectionOptions,
+                    "includeAllResponses": includeAllColumns or projectionOptions.get("includeAllResponses", False),
+                },
+            )
         except NotImplementedError as error:
             return warn(str(error))
 
+        # Include labels in explicit-column availability checks.
+        trialData = cls._addBehaviorResponseLabels(trialData)
         availableNames = set()
 
         for variableName, variable in trialData.data_vars.items():
@@ -1388,98 +1412,41 @@ class pglBehavior:
         if missingNames:
             return warn(f"Requested columns are unavailable: {missingNames}.\nAvailable columns: {sorted(availableNames)}")
 
-        return cls._getBehaviorTable(matrix, includeAllColumns=includeAllColumns, columns=columns, **projectionOptions)
-
+        return cls._getBehaviorTable(
+            matrix,
+            includeAllColumns=includeAllColumns,
+            columns=columns,
+            **projectionOptions,
+        )
+    
     @classmethod
     def _getBehaviorTable(cls, matrix, *, includeAllColumns=False, columns=None, **options):
         """Return behavioral trials as an independent pandas DataFrame.
 
-        Each row represents a selected recorded trial START. Unanswered and
-        incomplete trials are retained. The DataFrame index preserves source
-        matrix trial IDs; sourceTrialNum contains the recorded trial number.
+        Each row represents a selected trial START. Unanswered and incomplete
+        trials remain present. The index retains source matrix trial IDs.
 
-        Task selection
-        --------------
-        taskName : str, optional
-            Exact match against recorded taskSaveName.
-        taskIndex : int, optional
-            Zero-based task index, resolved independently within each run.
-        taskSelection : "all", optional
-            Include trials from all tasks.
+        allResponses is an alias for includeAllResponses.
+        includeAllColumns also enables numbered response expansion.
 
-        Specify at most one task-selection option. Without one, each run
-        must contain exactly one task. Automatic main-task selection is not
-        implemented.
+        responseLabel uses the source task's extracted responseMapping.
+        Numbered responses receive corresponding responseLabelN columns.
+        Missing mappings and unmatched keys yield nullable missing labels.
+        Colors remain in task metadata rather than becoming table columns.
 
-        Responses
-        ---------
-        responsePolicy : {"first", "last"}, default "first"
-            Select summary responses by recorded event order, not timestamp
-            order. responseCount counts all accepted response events.
-        includeAllResponses : bool, default False
-            Expand responses into response1, responseType1, responseTime1,
-            responseEventIndex1, etc. Automatic output omits each unnumbered
-            summary column when its numbered replacement exists.
-            responseCount is retained.
-        allResponses : bool, optional
-            Alias for includeAllResponses.
+        Automatic expanded output omits unnumbered response, responseLabel,
+        responseType, responseTime, and responseEventIndex columns whenever
+        their numbered replacements exist. responseCount is retained.
 
-        Response timing
-        ---------------
-        responseReference : {"trial", "segment", "trigger"}, default "trial"
-            Response time is response timestamp minus reference timestamp,
-            in seconds.
-        segmentNum : int
-            Required for segment timing; zero-based segment number.
-        segmentBoundary : {"start", "end"}, default "start"
-            Use an actually recorded segment boundary.
-        triggerName : str
-            Required for trigger timing; exact recorded trigger name.
-        requireTriggerSent : bool, default True
-            Require triggerSent=True for trigger timing. False also permits
-            failed or unspecified attempts.
-
-        Missing or ambiguous references yield missing latency, not missing
-        responses. Nonfinite/missing timestamps yield missing latency.
-        Negative offsets are preserved. Recorded order may differ from
-        timestamp order. Segment START is not verified stimulus onset.
-        No run-level temporal trigger association is performed.
-
-        Timing metadata is retained in viewSpecification,
-        responseTimingDiagnostics, and responseTimingReferences.
-
-        Column selection
-        ----------------
-        includeAllColumns : bool, default False
-            Include internal indices and unsupported field markers, and
-            enable numbered response expansion. Redundant unnumbered
-            response summaries are still omitted when numbered replacements
-            exist.
-        columns : list[str] or tuple[str], optional
-            Return exactly these columns in this order, overriding automatic
-            hiding of summary/internal/absent parameter columns. Requesting
-            numbered responses enables response expansion.
+        Explicit columns requests return exactly the requested columns in
+        order, including otherwise hidden summaries or absent parameters.
+        Requesting numbered response or label columns enables expansion.
 
         Automatically returned parameters must be present in at least one
-        selected trial, including with includeAllColumns=True. Explicit
-        column requests may select absent parameter fields.
+        selected trial. Fixed-length vectors expand into ComponentN columns.
 
-        Fixed-length vectors expand into zero-based ComponentN columns.
-        Missing integer/Boolean/string values use pandas nullable types.
-        Floating missing values use NaN. Unsupported markers indicate
-        encoding limitations rather than preserved scientific values.
-
-        Feature limits
-        --------------
-        includeTriggers : bool, default True
-            Wide trigger expansion is not implemented. If triggers are
-            detected, use False. Trigger timing references still work.
-        includeConfiguration : bool, default False
-            Configuration projection is not implemented.
-
-        Reads the supplied matrix as needed without attaching/rebuilding it
-        or publishing records. Editing the returned table does not modify
-        the source matrix.
+        Task selection and timing semantics are delegated to getTrialData.
+        Reads arrays but does not change or publish the source matrix.
         """
         from copy import deepcopy
 
@@ -1488,7 +1455,6 @@ class pglBehavior:
         if type(includeAllColumns) is not bool:
             raise TypeError("includeAllColumns must be a Boolean.")
 
-        # Also support the alias when this converter is called directly.
         if "allResponses" in options:
             allResponses = options.pop("allResponses")
 
@@ -1516,21 +1482,27 @@ class pglBehavior:
 
             columns = list(columns)
 
-        numberedResponsePattern = r"(responseEventIndex|responseTime|responseType|response)([1-9][0-9]*)"
+        numberedResponsePattern = r"(responseEventIndex|responseTime|responseType|responseLabel|response)([1-9][0-9]*)"
         projectionOptions = dict(options)
-        requestsNumberedResponses = columns is not None and any(re.fullmatch(numberedResponsePattern, name) is not None for name in columns)
+        requestsNumberedResponses = columns is not None and any(
+            re.fullmatch(numberedResponsePattern, name) is not None
+            for name in columns
+        )
 
         if includeAllColumns or requestsNumberedResponses:
             projectionOptions["includeAllResponses"] = True
 
         trialData = cls.getTrialData(matrix, **projectionOptions)
+        trialData = cls._addBehaviorResponseLabels(trialData)
+
         columnValues = {}
         columnMetadata = {}
         excludedParameterFields = []
 
         scalarNames = {
             name for name, variable in trialData.data_vars.items()
-            if variable.dims == ("trial",) and variable.attrs.get("role") not in ("presenceMask", "structuredPresence")
+            if variable.dims == ("trial",)
+            and variable.attrs.get("role") not in ("presenceMask", "structuredPresence")
         }
 
         def addColumn(columnName, values, present, logicalType, metadata):
@@ -1568,15 +1540,12 @@ class pglBehavior:
             metadata = {**variable.attrs, "sourceVariable": variableName}
 
             if variable.attrs.get("sourceGroup") == "params":
-                # Retain structured components when the parent is present,
-                # even if an individual component is missing on every row.
                 parentMaskName = variable.attrs.get("parentPresenceVariable")
                 parameterPresent = present if parentMaskName is None else trialData[parentMaskName].values.astype(bool, copy=True)
 
                 if not parameterPresent.any():
                     excludedParameterFields.append(variableName)
 
-                    # Explicit requests may inspect absent parameters.
                     if columns is None:
                         continue
 
@@ -1603,7 +1572,13 @@ class pglBehavior:
                     "sourceComponentIndex": componentIndex,
                 }
 
-                addColumn(columnName, values[:, componentIndex], present, variable.attrs["elementLogicalType"], componentMetadata)
+                addColumn(
+                    columnName,
+                    values[:, componentIndex],
+                    present,
+                    variable.attrs["elementLogicalType"],
+                    componentMetadata,
+                )
 
         contextFields = [
             "subjectID", "sessionName", "runName", "experimentName",
@@ -1611,7 +1586,10 @@ class pglBehavior:
             "sourceTrialNum", "trialStartTime", "trialStartEventIndex",
         ]
         contextOrder = {name: index for index, name in enumerate(contextFields)}
-        responseFields = ["response", "responseType", "responseTime", "responseEventIndex"]
+        responseFields = [
+            "response", "responseLabel", "responseType",
+            "responseTime", "responseEventIndex",
+        ]
         responseOrder = {name: index for index, name in enumerate(responseFields)}
 
         def columnOrder(columnName):
@@ -1665,9 +1643,6 @@ class pglBehavior:
             return False
 
         availableNames = sorted(columnValues, key=columnOrder)
-
-        # Numbered responses replace all four unnumbered summaries in
-        # automatic output. Keep summaries available for explicit requests.
         redundantResponseColumns = {
             name
             for name in responseFields
@@ -1699,11 +1674,15 @@ class pglBehavior:
         )
 
         table.attrs = deepcopy(trialData.attrs)
-        table.attrs["columnMetadata"] = {name: columnMetadata[name] for name in selectedNames}
+        table.attrs["columnMetadata"] = {
+            name: columnMetadata[name] for name in selectedNames
+        }
         table.attrs["tableSpecification"] = {
             "includeAllColumns": includeAllColumns,
             "columns": None if columns is None else list(columns),
-            "defaultHiddenColumns": [name for name in availableNames if hiddenByDefault(name)],
+            "defaultHiddenColumns": [
+                name for name in availableNames if hiddenByDefault(name)
+            ],
             "omittedRedundantResponseColumns": [
                 name for name in availableNames
                 if name in redundantResponseColumns and name not in selectedNames
@@ -1716,7 +1695,7 @@ class pglBehavior:
             "vectorColumns": "Zero-based ComponentN suffix; see columnMetadata",
             "missingValues": "Nullable integer/Boolean/string; NaN for floating columns",
             "floatingNaN": "Recorded NaN and absent floating values both display as NaN; consult xarray presence masks to distinguish",
-            "columnOrdering": "Explicit requested order, otherwise context; alphabetical parameters; alphabetical trial variables; response summaries and numerically ordered responses; alphabetical remaining fields",
+            "columnOrdering": "Explicit requested order, otherwise context; alphabetical parameters; alphabetical trial variables; response summaries and numerically ordered responses with adjacent labels; alphabetical remaining fields",
         }
 
         return table
@@ -2121,3 +2100,337 @@ class pglBehavior:
 
         cls._requireBehaviorData(result)
         return result
+    
+    @classmethod
+    def _behaviorResponseMappingRecords(cls, mapping, *, context):
+        """Encode a task response mapping as portable metadata records.
+
+        Values must be (label, color) pairs. Keys must be supported finite
+        scalar values. Keys are stored as values rather than JSON object keys
+        so Boolean/numeric keys survive metadata serialization.
+
+        String keys are preserved literally, including strings such as
+        "true" and "false"; no historical key-type recovery is attempted.
+        """
+        import math
+
+        if mapping is None:
+            return None
+
+        if not isinstance(mapping, dict):
+            raise TypeError(f"{context}.responseMapping must be a dictionary.")
+
+        records = []
+
+        for response, presentation in mapping.items():
+            if isinstance(response, np.generic):
+                response = response.item()
+
+            if type(response) not in (bool, int, float, str):
+                raise TypeError(
+                    f"{context}.responseMapping: unsupported key type "
+                    f"{type(response).__name__}."
+                )
+
+            if isinstance(response, float) and not math.isfinite(response):
+                raise ValueError(
+                    f"{context}.responseMapping: nonfinite numeric keys "
+                    "are not supported."
+                )
+
+            if not isinstance(presentation, (tuple, list)) or len(presentation) != 2:
+                raise ValueError(
+                    f"{context}.responseMapping[{response!r}] must be "
+                    "a (label, color) pair."
+                )
+
+            label, color = presentation
+
+            if not isinstance(label, str):
+                raise TypeError(
+                    f"{context}.responseMapping[{response!r}]: "
+                    "label must be a string."
+                )
+
+            if color is not None and not isinstance(color, str):
+                raise TypeError(
+                    f"{context}.responseMapping[{response!r}]: "
+                    "color must be a string or None."
+                )
+
+            records.append({
+                "response": response,
+                "label": label,
+                "color": color,
+            })
+
+        return records
+
+    @classmethod
+    def _addBehaviorResponseLabels(cls, trialData):
+        """Add task-specific response labels to an independent trial view.
+
+        Uses mappings associated with each trial's source run/task.
+        Supports legacy JSON-stringified numeric and Boolean mapping keys.
+
+        Missing mappings or unmatched responses produce missing labels.
+        Malformed mappings and ambiguous fallback matches raise.
+
+        Called on a newly created trial projection, not the source matrix.
+        """
+        from copy import deepcopy
+
+        taskSources = trialData.attrs.get("taskSources")
+
+        if not isinstance(taskSources, list):
+            raise ValueError("Response labeling requires taskSources metadata.")
+
+        mappings = {}
+
+        for source in taskSources:
+            if not isinstance(source, dict) or not {"runIndex", "taskIndex"}.issubset(source):
+                raise ValueError("Invalid taskSources metadata.")
+
+            identity = (source["runIndex"], source["taskIndex"])
+
+            if identity in mappings:
+                raise ValueError(
+                    f"Duplicate task identity in taskSources: {identity}."
+                )
+
+            records = source.get("responseMappingRecords")
+
+            if records is None:
+                mappings[identity] = None
+                continue
+
+            if not isinstance(records, list):
+                raise ValueError(
+                    f"Task {identity}: responseMappingRecords must be a list."
+                )
+
+            mapping = {}
+
+            for record in records:
+                if not isinstance(record, dict) or set(record) != {"response", "label", "color"}:
+                    raise ValueError(
+                        f"Task {identity}: invalid response-mapping record."
+                    )
+
+                response = record["response"]
+
+                if type(response) not in (bool, int, float, str):
+                    raise TypeError(
+                        f"Task {identity}: unsupported response-mapping key."
+                    )
+
+                cls._behaviorResponseMappingRecords(
+                    {response: (record["label"], record["color"])},
+                    context=f"Task {identity}",
+                )
+
+                if response in mapping:
+                    raise ValueError(
+                        f"Task {identity}: duplicate response-mapping key "
+                        f"{response!r}."
+                    )
+
+                mapping[response] = record["label"]
+
+            mappings[identity] = mapping
+
+        runIndices = cls._behaviorValues(trialData, "runIndex")
+        taskIndices = cls._behaviorValues(trialData, "taskIndex")
+        identities = list(zip(runIndices, taskIndices))
+
+        for identity in identities:
+            if identity not in mappings:
+                raise ValueError(f"Trial references unknown task {identity}.")
+
+        responseFields = [
+            name
+            for name, variable in trialData.data_vars.items()
+            if variable.attrs.get("sourceGroup") == "responseProjection"
+            and re.fullmatch(r"response([1-9][0-9]*)?", name)
+        ]
+
+        diagnostics = {}
+
+        for responseField in responseFields:
+            suffix = responseField[len("response"):]
+            labelField = "responseLabel" + suffix
+            maskName = labelField + "Present"
+
+            collisions = {labelField, maskName}.intersection(
+                set(trialData.variables) | set(trialData.dims)
+            )
+
+            if collisions:
+                raise ValueError(
+                    f"Response-label projection collision: {sorted(collisions)}."
+                )
+
+            responses = cls._behaviorValues(trialData, responseField)
+            labels = []
+            missingMappingCount = 0
+            unmatchedResponseCount = 0
+
+            for identity, response in zip(identities, responses):
+                mapping = mappings[identity]
+
+                if response is None:
+                    labels.append(None)
+                    continue
+
+                if mapping is None:
+                    labels.append(None)
+                    missingMappingCount += 1
+                    continue
+
+                try:
+                    label = cls._lookupBehaviorResponseLabel(mapping, response)
+                except (TypeError, ValueError) as error:
+                    raise ValueError(
+                        f"Task {identity}, column {responseField}: {error}"
+                    ) from error
+
+                labels.append(label)
+
+                if label is None:
+                    unmatchedResponseCount += 1
+
+            # Retain string dtype even when every label is missing.
+            present = np.asarray(
+                [label is not None for label in labels],
+                dtype=bool,
+            )
+            values = np.asarray(
+                ["" if label is None else label for label in labels],
+                dtype=str,
+            )
+
+            attributes = {
+                "sourceGroup": "responseProjection",
+                "logicalType": "string",
+                "extractionStatus": "supported",
+                "sourceResponseVariable": responseField,
+                "mappingSource": "taskSources.responseMappingRecords",
+                "mappingScope": "source runIndex/taskIndex",
+            }
+
+            if not present.all():
+                trialData[maskName] = xr.DataArray(
+                    present,
+                    dims=("trial",),
+                    attrs={
+                        "role": "presenceMask",
+                        "forVariable": labelField,
+                    },
+                )
+                attributes["presenceVariable"] = maskName
+
+            trialData[labelField] = xr.DataArray(
+                values,
+                dims=("trial",),
+                attrs=attributes,
+            )
+
+            diagnostics[labelField] = {
+                "responsesWithoutMapping": missingMappingCount,
+                "responsesWithoutMatchingKey": unmatchedResponseCount,
+            }
+
+        trialData.attrs = deepcopy(trialData.attrs)
+        trialData.attrs["responseLabelSpecification"] = {
+            "mappingSource": "taskSources.responseMappingRecords",
+            "matching": (
+                "Exact Python dictionary match first; then legacy JSON "
+                "numeric/Boolean key spellings. Integral numeric spellings "
+                "may match across integer/float promotion. "
+                "Ambiguous fallback matches raise; strings remain literal."
+            ),
+            "missing": "Missing response, unavailable mapping, or unmatched key",
+            "colors": "Preserved in task metadata; not projected as columns",
+        }
+        trialData.attrs["responseLabelDiagnostics"] = diagnostics
+
+        return trialData
+    
+    @classmethod
+    def _lookupBehaviorResponseLabel(cls, mapping, response):
+        """Look up a response label, supporting legacy JSON-stringified keys.
+
+        Exact Python dictionary matching takes precedence. If that fails,
+        numeric and Boolean responses may match their JSON key spellings.
+
+        Integral numeric values also consider the equivalent integer/float
+        spelling because scientific column encoding may promote integers
+        to floats.
+
+        String responses are matched literally, never converted to numbers.
+        Ambiguous fallback matches raise rather than guess.
+        """
+        import math
+        from numbers import Integral, Real
+
+        if mapping is None or response is None:
+            return None
+
+        if isinstance(response, np.generic):
+            response = response.item()
+
+        if not isinstance(response, (str, bool, Integral, Real)):
+            raise TypeError(
+                f"Unsupported response-label lookup type: "
+                f"{type(response).__name__}."
+            )
+
+        if isinstance(response, Real) and not isinstance(response, Integral):
+            if not math.isfinite(response):
+                return None
+
+        # Preserve normal dictionary semantics, including numeric equality.
+        if response in mapping:
+            return mapping[response]
+
+        candidates = []
+
+        if isinstance(response, bool):
+            candidates.append("true" if response else "false")
+
+        elif isinstance(response, Integral):
+            integerValue = int(response)
+            candidates.append(str(integerValue))
+
+            # Consider float spelling only when conversion is lossless.
+            try:
+                floatValue = float(integerValue)
+            except OverflowError:
+                floatValue = None
+
+            if floatValue is not None and math.isfinite(floatValue):
+                if int(floatValue) == integerValue:
+                    candidates.append(str(floatValue))
+
+        elif isinstance(response, Real):
+            floatValue = float(response)
+            candidates.append(str(floatValue))
+
+            if floatValue.is_integer():
+                candidates.append(str(int(floatValue)))
+
+        # Strings intentionally have no coercion fallback.
+        matches = [
+            key
+            for key in dict.fromkeys(candidates)
+            if key in mapping
+        ]
+
+        if len(matches) > 1:
+            raise ValueError(
+                f"Ambiguous response mapping for {response!r}: "
+                f"legacy keys {matches!r} both match. "
+                "Correct the source mapping rather than choosing implicitly."
+            )
+
+        return mapping[matches[0]] if matches else None
