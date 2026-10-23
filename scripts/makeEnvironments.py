@@ -37,6 +37,11 @@ TOOLS = [
     "wheel",
 ]
 
+# Shared pip dependencies, with platform-specific installation markers.
+BASE_PIP = [
+    "windows-curses; sys_platform == 'win32'",
+]
+
 MNE = [
     "mne",
 ]
@@ -57,18 +62,17 @@ MACOS_PIP = [
 ENVIRONMENTS = {
     "pgl": {
         "conda": BASE + TOOLS,
-        "pip": [],
+        "pip": BASE_PIP,
     },
     "pgl_mne": {
         "conda": BASE + TOOLS + MNE,
-        "pip": [],
+        "pip": BASE_PIP,
     },
     "pgl_macos": {
         "conda": BASE + TOOLS + MACOS,
-        "pip": MACOS_PIP,
+        "pip": BASE_PIP + MACOS_PIP,
     },
 }
-
 
 def render_environment(name, conda_packages, pip_packages):
     if len(conda_packages) != len(set(conda_packages)):

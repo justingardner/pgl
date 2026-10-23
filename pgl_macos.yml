@@ -31,4 +31,5 @@ dependencies:
   - "pynput"
   - "h5py"
   - pip:
+      - "windows-curses; sys_platform == 'win32'"
       - "pyobjc; sys_platform == 'darwin'"

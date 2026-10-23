@@ -26,3 +26,5 @@ dependencies:
   - "pip"
   - "setuptools>=77.0.3"
   - "wheel"
+  - pip:
+      - "windows-curses; sys_platform == 'win32'"
