@@ -401,6 +401,132 @@ class pglPostgres(pglTraitSettings):
         return filesystem, path, isLocal
 
     @classmethod
+    def _readConfigurationDocument(cls, location, *, filesystem=None, storageOptions=None):
+        """Read configuration with explicit filesystem ownership.
+
+        Internally created SFTP filesystems:
+            Bypass the instance cache.
+            Close their SFTP/SSH resources after reading.
+            Retry once if the connection drops during the read.
+
+        Caller-supplied filesystems:
+            Are not replaced, closed, or retried.
+
+        Returns filesystem metadata plus the parsed document. An internally
+        created SFTP filesystem is already closed when this method returns;
+        its configuration attributes remain available for transport inference.
+        """
+        import errno
+
+        def connectionDropped(error):
+            """Recognize transport failures, not authentication or file errors."""
+            from paramiko import SSHException
+            from paramiko.ssh_exception import AuthenticationException, BadHostKeyException
+
+            if isinstance(error, (AuthenticationException, BadHostKeyException)):
+                return False
+
+            if isinstance(error, (EOFError, ConnectionError, TimeoutError)):
+                return True
+
+            if isinstance(error, OSError):
+                return error.errno in {
+                    errno.ECONNRESET,
+                    errno.ECONNABORTED,
+                    errno.EPIPE,
+                    errno.ENOTCONN,
+                    errno.ETIMEDOUT,
+                }
+
+            if isinstance(error, SSHException):
+                message = str(error).lower()
+                return (
+                    message.startswith("server connection dropped")
+                    or message in {"socket is closed", "socket is closed.", "no existing session"}
+                )
+
+            return False
+
+        def closeOwnedSFTP(ownedFilesystem):
+            """Close the resources used by fsspec's SFTP implementation."""
+            for name in ("ftp", "client"):
+                resource = getattr(ownedFilesystem, name, None)
+
+                if resource is not None:
+                    try:
+                        resource.close()
+                    except Exception as error:
+                        # Do not replace a read error with a cleanup error.
+                        pglMessages.warning(
+                            f"Could not completely close configuration SFTP "
+                            f"resource {name!r} ({type(error).__name__}).",
+                            level=0,
+                        )
+
+        # Preserve caller ownership and the existing argument validation.
+        if filesystem is not None:
+            resolvedFilesystem, path, isLocal = cls._resolveConfigurationFile(
+                location,
+                filesystem=filesystem,
+                storageOptions=storageOptions,
+            )
+
+            with resolvedFilesystem.open(path, "rt", encoding="utf-8") as file:
+                data = json.load(file)
+
+            return resolvedFilesystem, path, isLocal, data
+
+        # Never reuse a cached connection for this short configuration read.
+        options = dict(storageOptions or {})
+        options["skip_instance_cache"] = True
+
+        for attempt in range(2):
+            ownedFilesystem = None
+            ownedSFTP = False
+
+            try:
+                ownedFilesystem, path, isLocal = cls._resolveConfigurationFile(
+                    location,
+                    storageOptions=options,
+                )
+
+                protocols = ownedFilesystem.protocol
+                protocols = (protocols,) if isinstance(protocols, str) else protocols
+                isSFTP = any(protocol in {"ssh", "sftp"} for protocol in protocols)
+
+                if isSFTP:
+                    from fsspec.implementations.sftp import SFTPFileSystem
+
+                    # Only assume resource ownership details for the known
+                    # fsspec implementation and its subclasses.
+                    ownedSFTP = isinstance(ownedFilesystem, SFTPFileSystem)
+
+                with ownedFilesystem.open(path, "rt", encoding="utf-8") as file:
+                    data = json.load(file)
+
+                return ownedFilesystem, path, isLocal, data
+
+            except Exception as error:
+                if not ownedSFTP or not connectionDropped(error):
+                    raise
+
+                if attempt == 1:
+                    raise RuntimeError(
+                        "Could not read PostgreSQL configuration: the SFTP "
+                        "connection failed again after reconnecting. "
+                        "Check SSH access and retry."
+                    ) from error
+
+                pglMessages.warning(
+                    "Configuration SFTP connection was lost; reconnecting once...",
+                    level=0,
+                )
+
+            finally:
+                if ownedSFTP:
+                    closeOwnedSFTP(ownedFilesystem)
+
+    @classmethod
     def load(cls, filename=None, *, filesystem=None, storageOptions=None):
         """Load configuration and resolve caller-side SSH transport.
 
@@ -421,11 +547,8 @@ class pglPostgres(pglTraitSettings):
             filename = posixpath.join(directory, cls.CONFIGURATION_FILENAME)
 
         location = str(filename)
-        filesystem, path, isLocal = cls._resolveConfigurationFile(location, filesystem=filesystem, storageOptions=storageOptions)
-
-        with filesystem.open(path, "rt", encoding="utf-8") as file:
-            data = json.load(file)
-
+        filesystem, path, isLocal, data = cls._readConfigurationDocument(location, filesystem=filesystem, storageOptions=storageOptions)
+        
         if not isinstance(data, dict):
             raise ValueError("Postgres configuration must be a JSON object.")
 

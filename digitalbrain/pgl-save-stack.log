@@ -1,0 +1,762 @@
+Timeout (0:00:30)!
+Thread 0x000000017f11f000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/packet.py", line 322 in read_all
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/packet.py", line 496 in read_message
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/transport.py", line 2059 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x0000000178ff7000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/packet.py", line 322 in read_all
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/packet.py", line 496 in read_message
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/transport.py", line 2059 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x0000000174d6f000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 355 in wait
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 655 in wait
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/history.py", line 1272 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/history.py", line 163 in wrapper
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x0000000173d63000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/selectors.py", line 566 in select
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 1961 in _run_once
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 645 in run_forever
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/tornado/platform/asyncio.py", line 211 in start
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/thread.py", line 24 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/shellchannel.py", line 52 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x0000000172d57000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/selectors.py", line 566 in select
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 1961 in _run_once
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 645 in run_forever
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/tornado/platform/asyncio.py", line 211 in start
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/thread.py", line 24 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x0000000171d4b000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/iostream.py", line 477 in _watch_pipe_fd
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1012 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x0000000170d3f000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/iostream.py", line 477 in _watch_pipe_fd
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1012 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x000000016fc1b000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/zmq/sugar/__init__.py", line 21 in device
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/heartbeat.py", line 124 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x000000016ec0f000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/selectors.py", line 566 in select
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 1961 in _run_once
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 645 in run_forever
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/tornado/platform/asyncio.py", line 211 in start
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/iostream.py", line 167 in _thread_main
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1012 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x00000001ed452180 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 359 in wait
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/buffered_pipe.py", line 150 in read
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/channel.py", line 697 in recv
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/sftp.py", line 196 in _read_all
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/sftp.py", line 212 in _read_packet
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/sftp_client.py", line 887 in _read_response
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/sftp_client.py", line 857 in _request
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/sftp_file.py", line 185 in _read
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/file.py", line 203 in read
+  File "/Users/justin/proj/pgl/pgl/pglSSH.py", line 69 in read
+  File "/Users/justin/proj/pgl/pgl/pglStorage.py", line 581 in hashFile
+  File "/Users/justin/proj/pgl/pgl/pglStorage.py", line 661 in copyVerifiedFile
+  File "/Users/justin/proj/pgl/pgl/pglDatabase.py", line 5433 in stageRawSession
+  File "/Users/justin/proj/pgl/pgl/pglDatabase.py", line 4875 in _saveRawSession
+  File "/Users/justin/proj/pgl/pgl/pglDatabase.py", line 887 in saveRawSession
+  File "/Users/justin/proj/pgl/pgl/pglSession.py", line 2596 in saveRawSession
+  File "/var/folders/n2/4bqdpl1s6wd9x4l9ll4p03_m0000gq/T/ipykernel_77634/268232784.py", line 10 in <module>
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/interactiveshell.py", line 3823 in run_code
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/interactiveshell.py", line 3762 in run_ast_nodes
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/interactiveshell.py", line 3518 in run_cell_async
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/async_helpers.py", line 140 in _pseudo_sync_runner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/interactiveshell.py", line 3305 in _run_cell
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/interactiveshell.py", line 3248 in run_cell
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/zmqshell.py", line 665 in run_cell
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/ipkernel.py", line 460 in do_execute
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/kernelbase.py", line 834 in execute_request
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/ipkernel.py", line 372 in execute_request
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/kernelbase.py", line 478 in dispatch_shell
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/kernelbase.py", line 621 in shell_main
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/events.py", line 88 in _run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 1999 in _run_once
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 645 in run_forever
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/tornado/platform/asyncio.py", line 211 in start
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/kernelapp.py", line 807 in start
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/traitlets/config/application.py", line 1080 in launch_instance
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel_launcher.py", line 18 in <module>
+  File "<frozen runpy>", line 88 in _run_code
+  File "<frozen runpy>", line 198 in _run_module_as_main
+Timeout (0:00:30)!
+Thread 0x000000017f11f000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/packet.py", line 322 in read_all
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/packet.py", line 496 in read_message
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/transport.py", line 2059 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x0000000178ff7000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/packet.py", line 322 in read_all
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/packet.py", line 496 in read_message
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/transport.py", line 2059 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x0000000174d6f000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 355 in wait
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 655 in wait
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/history.py", line 1272 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/history.py", line 163 in wrapper
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x0000000173d63000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/selectors.py", line 566 in select
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 1961 in _run_once
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 645 in run_forever
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/tornado/platform/asyncio.py", line 211 in start
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/thread.py", line 24 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/shellchannel.py", line 52 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x0000000172d57000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/selectors.py", line 566 in select
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 1961 in _run_once
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 645 in run_forever
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/tornado/platform/asyncio.py", line 211 in start
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/thread.py", line 24 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x0000000171d4b000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/iostream.py", line 477 in _watch_pipe_fd
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1012 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x0000000170d3f000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/iostream.py", line 477 in _watch_pipe_fd
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1012 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x000000016fc1b000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/zmq/sugar/__init__.py", line 21 in device
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/heartbeat.py", line 124 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x000000016ec0f000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/selectors.py", line 566 in select
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 1961 in _run_once
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 645 in run_forever
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/tornado/platform/asyncio.py", line 211 in start
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/iostream.py", line 167 in _thread_main
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1012 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x00000001ed452180 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 359 in wait
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/buffered_pipe.py", line 150 in read
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/channel.py", line 697 in recv
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/sftp.py", line 196 in _read_all
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/sftp.py", line 212 in _read_packet
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/sftp_client.py", line 887 in _read_response
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/sftp_client.py", line 857 in _request
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/sftp_file.py", line 185 in _read
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/file.py", line 203 in read
+  File "/Users/justin/proj/pgl/pgl/pglSSH.py", line 69 in read
+  File "/Users/justin/proj/pgl/pgl/pglStorage.py", line 581 in hashFile
+  File "/Users/justin/proj/pgl/pgl/pglStorage.py", line 661 in copyVerifiedFile
+  File "/Users/justin/proj/pgl/pgl/pglDatabase.py", line 5433 in stageRawSession
+  File "/Users/justin/proj/pgl/pgl/pglDatabase.py", line 4875 in _saveRawSession
+  File "/Users/justin/proj/pgl/pgl/pglDatabase.py", line 887 in saveRawSession
+  File "/Users/justin/proj/pgl/pgl/pglSession.py", line 2596 in saveRawSession
+  File "/var/folders/n2/4bqdpl1s6wd9x4l9ll4p03_m0000gq/T/ipykernel_77634/268232784.py", line 10 in <module>
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/interactiveshell.py", line 3823 in run_code
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/interactiveshell.py", line 3762 in run_ast_nodes
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/interactiveshell.py", line 3518 in run_cell_async
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/async_helpers.py", line 140 in _pseudo_sync_runner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/interactiveshell.py", line 3305 in _run_cell
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/interactiveshell.py", line 3248 in run_cell
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/zmqshell.py", line 665 in run_cell
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/ipkernel.py", line 460 in do_execute
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/kernelbase.py", line 834 in execute_request
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/ipkernel.py", line 372 in execute_request
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/kernelbase.py", line 478 in dispatch_shell
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/kernelbase.py", line 621 in shell_main
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/events.py", line 88 in _run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 1999 in _run_once
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 645 in run_forever
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/tornado/platform/asyncio.py", line 211 in start
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/kernelapp.py", line 807 in start
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/traitlets/config/application.py", line 1080 in launch_instance
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel_launcher.py", line 18 in <module>
+  File "<frozen runpy>", line 88 in _run_code
+  File "<frozen runpy>", line 198 in _run_module_as_main
+Timeout (0:00:30)!
+Thread 0x000000017f11f000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/packet.py", line 322 in read_all
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/packet.py", line 496 in read_message
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/transport.py", line 2059 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x0000000178ff7000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/packet.py", line 322 in read_all
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/packet.py", line 496 in read_message
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/transport.py", line 2059 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x0000000174d6f000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 355 in wait
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 655 in wait
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/history.py", line 1272 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/history.py", line 163 in wrapper
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x0000000173d63000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/selectors.py", line 566 in select
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 1961 in _run_once
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 645 in run_forever
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/tornado/platform/asyncio.py", line 211 in start
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/thread.py", line 24 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/shellchannel.py", line 52 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x0000000172d57000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/selectors.py", line 566 in select
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 1961 in _run_once
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 645 in run_forever
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/tornado/platform/asyncio.py", line 211 in start
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/thread.py", line 24 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x0000000171d4b000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/iostream.py", line 477 in _watch_pipe_fd
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1012 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x0000000170d3f000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/iostream.py", line 477 in _watch_pipe_fd
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1012 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x000000016fc1b000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/zmq/sugar/__init__.py", line 21 in device
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/heartbeat.py", line 124 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x000000016ec0f000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/selectors.py", line 566 in select
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 1961 in _run_once
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 645 in run_forever
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/tornado/platform/asyncio.py", line 211 in start
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/iostream.py", line 167 in _thread_main
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1012 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x00000001ed452180 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 359 in wait
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/buffered_pipe.py", line 150 in read
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/channel.py", line 697 in recv
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/sftp.py", line 196 in _read_all
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/sftp.py", line 212 in _read_packet
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/sftp_client.py", line 887 in _read_response
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/sftp_client.py", line 857 in _request
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/sftp_client.py", line 460 in mkdir
+  File "/Users/justin/proj/pgl/pgl/pglSSH.py", line 234 in invoke
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/fsspec/implementations/sftp.py", line 90 in makedirs
+  File "/Users/justin/proj/pgl/pgl/pglStorage.py", line 635 in copyVerifiedFile
+  File "/Users/justin/proj/pgl/pgl/pglDatabase.py", line 5433 in stageRawSession
+  File "/Users/justin/proj/pgl/pgl/pglDatabase.py", line 4875 in _saveRawSession
+  File "/Users/justin/proj/pgl/pgl/pglDatabase.py", line 887 in saveRawSession
+  File "/Users/justin/proj/pgl/pgl/pglSession.py", line 2596 in saveRawSession
+  File "/var/folders/n2/4bqdpl1s6wd9x4l9ll4p03_m0000gq/T/ipykernel_77634/268232784.py", line 10 in <module>
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/interactiveshell.py", line 3823 in run_code
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/interactiveshell.py", line 3762 in run_ast_nodes
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/interactiveshell.py", line 3518 in run_cell_async
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/async_helpers.py", line 140 in _pseudo_sync_runner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/interactiveshell.py", line 3305 in _run_cell
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/interactiveshell.py", line 3248 in run_cell
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/zmqshell.py", line 665 in run_cell
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/ipkernel.py", line 460 in do_execute
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/kernelbase.py", line 834 in execute_request
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/ipkernel.py", line 372 in execute_request
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/kernelbase.py", line 478 in dispatch_shell
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/kernelbase.py", line 621 in shell_main
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/events.py", line 88 in _run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 1999 in _run_once
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 645 in run_forever
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/tornado/platform/asyncio.py", line 211 in start
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/kernelapp.py", line 807 in start
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/traitlets/config/application.py", line 1080 in launch_instance
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel_launcher.py", line 18 in <module>
+  File "<frozen runpy>", line 88 in _run_code
+  File "<frozen runpy>", line 198 in _run_module_as_main
+Timeout (0:00:30)!
+Thread 0x000000017f11f000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/packet.py", line 322 in read_all
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/packet.py", line 496 in read_message
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/transport.py", line 2059 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x0000000178ff7000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/packet.py", line 322 in read_all
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/packet.py", line 496 in read_message
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/transport.py", line 2059 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x0000000174d6f000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 355 in wait
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 655 in wait
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/history.py", line 1272 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/history.py", line 163 in wrapper
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x0000000173d63000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/selectors.py", line 566 in select
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 1961 in _run_once
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 645 in run_forever
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/tornado/platform/asyncio.py", line 211 in start
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/thread.py", line 24 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/shellchannel.py", line 52 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x0000000172d57000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/selectors.py", line 566 in select
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 1961 in _run_once
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 645 in run_forever
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/tornado/platform/asyncio.py", line 211 in start
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/thread.py", line 24 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x0000000171d4b000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/iostream.py", line 477 in _watch_pipe_fd
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1012 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x0000000170d3f000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/iostream.py", line 477 in _watch_pipe_fd
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1012 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x000000016fc1b000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/zmq/sugar/__init__.py", line 21 in device
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/heartbeat.py", line 124 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x000000016ec0f000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/selectors.py", line 566 in select
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 1961 in _run_once
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 645 in run_forever
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/tornado/platform/asyncio.py", line 211 in start
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/iostream.py", line 167 in _thread_main
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1012 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x00000001ed452180 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 359 in wait
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/buffered_pipe.py", line 150 in read
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/channel.py", line 697 in recv
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/sftp.py", line 196 in _read_all
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/sftp.py", line 212 in _read_packet
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/sftp_client.py", line 887 in _read_response
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/sftp_file.py", line 208 in _write
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/file.py", line 507 in _write_all
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/file.py", line 389 in write
+  File "/Users/justin/proj/pgl/pgl/pglSSH.py", line 95 in write
+  File "/Users/justin/proj/pgl/pgl/pglStorage.py", line 653 in copyVerifiedFile
+  File "/Users/justin/proj/pgl/pgl/pglDatabase.py", line 5433 in stageRawSession
+  File "/Users/justin/proj/pgl/pgl/pglDatabase.py", line 4875 in _saveRawSession
+  File "/Users/justin/proj/pgl/pgl/pglDatabase.py", line 887 in saveRawSession
+  File "/Users/justin/proj/pgl/pgl/pglSession.py", line 2596 in saveRawSession
+  File "/var/folders/n2/4bqdpl1s6wd9x4l9ll4p03_m0000gq/T/ipykernel_77634/268232784.py", line 10 in <module>
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/interactiveshell.py", line 3823 in run_code
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/interactiveshell.py", line 3762 in run_ast_nodes
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/interactiveshell.py", line 3518 in run_cell_async
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/async_helpers.py", line 140 in _pseudo_sync_runner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/interactiveshell.py", line 3305 in _run_cell
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/interactiveshell.py", line 3248 in run_cell
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/zmqshell.py", line 665 in run_cell
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/ipkernel.py", line 460 in do_execute
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/kernelbase.py", line 834 in execute_request
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/ipkernel.py", line 372 in execute_request
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/kernelbase.py", line 478 in dispatch_shell
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/kernelbase.py", line 621 in shell_main
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/events.py", line 88 in _run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 1999 in _run_once
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 645 in run_forever
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/tornado/platform/asyncio.py", line 211 in start
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/kernelapp.py", line 807 in start
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/traitlets/config/application.py", line 1080 in launch_instance
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel_launcher.py", line 18 in <module>
+  File "<frozen runpy>", line 88 in _run_code
+  File "<frozen runpy>", line 198 in _run_module_as_main
+Timeout (0:00:30)!
+Thread 0x000000017f11f000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/packet.py", line 322 in read_all
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/packet.py", line 496 in read_message
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/transport.py", line 2059 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x0000000178ff7000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/packet.py", line 322 in read_all
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/packet.py", line 496 in read_message
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/transport.py", line 2059 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x0000000174d6f000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 355 in wait
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 655 in wait
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/history.py", line 1272 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/history.py", line 163 in wrapper
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x0000000173d63000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/selectors.py", line 566 in select
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 1961 in _run_once
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 645 in run_forever
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/tornado/platform/asyncio.py", line 211 in start
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/thread.py", line 24 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/shellchannel.py", line 52 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x0000000172d57000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/selectors.py", line 566 in select
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 1961 in _run_once
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 645 in run_forever
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/tornado/platform/asyncio.py", line 211 in start
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/thread.py", line 24 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x0000000171d4b000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/iostream.py", line 477 in _watch_pipe_fd
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1012 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x0000000170d3f000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/iostream.py", line 477 in _watch_pipe_fd
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1012 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x000000016fc1b000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/zmq/sugar/__init__.py", line 21 in device
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/heartbeat.py", line 124 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x000000016ec0f000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/selectors.py", line 566 in select
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 1961 in _run_once
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 645 in run_forever
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/tornado/platform/asyncio.py", line 211 in start
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/iostream.py", line 167 in _thread_main
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1012 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x00000001ed452180 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 359 in wait
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/buffered_pipe.py", line 150 in read
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/channel.py", line 697 in recv
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/sftp.py", line 196 in _read_all
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/sftp.py", line 212 in _read_packet
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/sftp_client.py", line 887 in _read_response
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/sftp_file.py", line 208 in _write
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/file.py", line 507 in _write_all
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/file.py", line 389 in write
+  File "/Users/justin/proj/pgl/pgl/pglSSH.py", line 95 in write
+  File "/Users/justin/proj/pgl/pgl/pglStorage.py", line 653 in copyVerifiedFile
+  File "/Users/justin/proj/pgl/pgl/pglDatabase.py", line 5433 in stageRawSession
+  File "/Users/justin/proj/pgl/pgl/pglDatabase.py", line 4875 in _saveRawSession
+  File "/Users/justin/proj/pgl/pgl/pglDatabase.py", line 887 in saveRawSession
+  File "/Users/justin/proj/pgl/pgl/pglSession.py", line 2596 in saveRawSession
+  File "/var/folders/n2/4bqdpl1s6wd9x4l9ll4p03_m0000gq/T/ipykernel_77634/268232784.py", line 10 in <module>
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/interactiveshell.py", line 3823 in run_code
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/interactiveshell.py", line 3762 in run_ast_nodes
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/interactiveshell.py", line 3518 in run_cell_async
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/async_helpers.py", line 140 in _pseudo_sync_runner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/interactiveshell.py", line 3305 in _run_cell
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/interactiveshell.py", line 3248 in run_cell
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/zmqshell.py", line 665 in run_cell
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/ipkernel.py", line 460 in do_execute
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/kernelbase.py", line 834 in execute_request
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/ipkernel.py", line 372 in execute_request
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/kernelbase.py", line 478 in dispatch_shell
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/kernelbase.py", line 621 in shell_main
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/events.py", line 88 in _run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 1999 in _run_once
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 645 in run_forever
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/tornado/platform/asyncio.py", line 211 in start
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/kernelapp.py", line 807 in start
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/traitlets/config/application.py", line 1080 in launch_instance
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel_launcher.py", line 18 in <module>
+  File "<frozen runpy>", line 88 in _run_code
+  File "<frozen runpy>", line 198 in _run_module_as_main
+Timeout (0:00:30)!
+Thread 0x000000017f11f000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/packet.py", line 322 in read_all
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/packet.py", line 496 in read_message
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/transport.py", line 2059 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x0000000178ff7000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/packet.py", line 322 in read_all
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/packet.py", line 496 in read_message
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/transport.py", line 2059 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x0000000174d6f000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 355 in wait
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 655 in wait
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/history.py", line 1272 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/history.py", line 163 in wrapper
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x0000000173d63000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/selectors.py", line 566 in select
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 1961 in _run_once
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 645 in run_forever
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/tornado/platform/asyncio.py", line 211 in start
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/thread.py", line 24 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/shellchannel.py", line 52 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x0000000172d57000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/selectors.py", line 566 in select
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 1961 in _run_once
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 645 in run_forever
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/tornado/platform/asyncio.py", line 211 in start
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/thread.py", line 24 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x0000000171d4b000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/iostream.py", line 477 in _watch_pipe_fd
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1012 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x0000000170d3f000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/iostream.py", line 477 in _watch_pipe_fd
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1012 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x000000016fc1b000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/zmq/sugar/__init__.py", line 21 in device
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/heartbeat.py", line 124 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x000000016ec0f000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/selectors.py", line 566 in select
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 1961 in _run_once
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 645 in run_forever
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/tornado/platform/asyncio.py", line 211 in start
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/iostream.py", line 167 in _thread_main
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1012 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x00000001ed452180 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 359 in wait
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/buffered_pipe.py", line 150 in read
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/channel.py", line 697 in recv
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/sftp.py", line 196 in _read_all
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/sftp.py", line 212 in _read_packet
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/sftp_client.py", line 887 in _read_response
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/sftp_client.py", line 857 in _request
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/sftp_file.py", line 185 in _read
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/file.py", line 203 in read
+  File "/Users/justin/proj/pgl/pgl/pglSSH.py", line 69 in read
+  File "/Users/justin/proj/pgl/pgl/pglStorage.py", line 581 in hashFile
+  File "/Users/justin/proj/pgl/pgl/pglDatabase.py", line 3514 in verifyAndRegisterStorageLocation
+  File "/Users/justin/proj/pgl/pgl/pglDatabase.py", line 3164 in registerPayload
+  File "/Users/justin/proj/pgl/pgl/pglDatabase.py", line 3170 in registerStagedRawCheckpoint
+  File "/Users/justin/proj/pgl/pgl/pglDatabase.py", line 4878 in _saveRawSession
+  File "/Users/justin/proj/pgl/pgl/pglDatabase.py", line 887 in saveRawSession
+  File "/Users/justin/proj/pgl/pgl/pglSession.py", line 2596 in saveRawSession
+  File "/var/folders/n2/4bqdpl1s6wd9x4l9ll4p03_m0000gq/T/ipykernel_77634/268232784.py", line 10 in <module>
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/interactiveshell.py", line 3823 in run_code
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/interactiveshell.py", line 3762 in run_ast_nodes
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/interactiveshell.py", line 3518 in run_cell_async
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/async_helpers.py", line 140 in _pseudo_sync_runner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/interactiveshell.py", line 3305 in _run_cell
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/interactiveshell.py", line 3248 in run_cell
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/zmqshell.py", line 665 in run_cell
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/ipkernel.py", line 460 in do_execute
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/kernelbase.py", line 834 in execute_request
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/ipkernel.py", line 372 in execute_request
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/kernelbase.py", line 478 in dispatch_shell
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/kernelbase.py", line 621 in shell_main
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/events.py", line 88 in _run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 1999 in _run_once
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 645 in run_forever
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/tornado/platform/asyncio.py", line 211 in start
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/kernelapp.py", line 807 in start
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/traitlets/config/application.py", line 1080 in launch_instance
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel_launcher.py", line 18 in <module>
+  File "<frozen runpy>", line 88 in _run_code
+  File "<frozen runpy>", line 198 in _run_module_as_main
+Timeout (0:00:30)!
+Thread 0x000000017f11f000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/packet.py", line 322 in read_all
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/packet.py", line 545 in read_message
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/transport.py", line 2059 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x0000000178ff7000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/packet.py", line 322 in read_all
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/packet.py", line 496 in read_message
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/transport.py", line 2059 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x0000000174d6f000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 355 in wait
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 655 in wait
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/history.py", line 1272 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/history.py", line 163 in wrapper
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x0000000173d63000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/selectors.py", line 566 in select
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 1961 in _run_once
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 645 in run_forever
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/tornado/platform/asyncio.py", line 211 in start
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/thread.py", line 24 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/shellchannel.py", line 52 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x0000000172d57000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/selectors.py", line 566 in select
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 1961 in _run_once
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 645 in run_forever
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/tornado/platform/asyncio.py", line 211 in start
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/thread.py", line 24 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x0000000171d4b000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/iostream.py", line 477 in _watch_pipe_fd
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1012 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x0000000170d3f000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/iostream.py", line 477 in _watch_pipe_fd
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1012 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x000000016fc1b000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/zmq/sugar/__init__.py", line 21 in device
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/heartbeat.py", line 124 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x000000016ec0f000 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/selectors.py", line 566 in select
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 1961 in _run_once
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 645 in run_forever
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/tornado/platform/asyncio.py", line 211 in start
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/iostream.py", line 167 in _thread_main
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1012 in run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1075 in _bootstrap_inner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 1032 in _bootstrap
+
+Thread 0x00000001ed452180 (most recent call first):
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/threading.py", line 359 in wait
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/buffered_pipe.py", line 150 in read
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/channel.py", line 697 in recv
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/sftp.py", line 196 in _read_all
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/sftp.py", line 212 in _read_packet
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/sftp_client.py", line 887 in _read_response
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/sftp_client.py", line 857 in _request
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/sftp_file.py", line 185 in _read
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/paramiko/file.py", line 203 in read
+  File "/Users/justin/proj/pgl/pgl/pglSSH.py", line 69 in read
+  File "/Users/justin/proj/pgl/pgl/pglStorage.py", line 581 in hashFile
+  File "/Users/justin/proj/pgl/pgl/pglDatabase.py", line 3514 in verifyAndRegisterStorageLocation
+  File "/Users/justin/proj/pgl/pgl/pglDatabase.py", line 3164 in registerPayload
+  File "/Users/justin/proj/pgl/pgl/pglDatabase.py", line 3170 in registerStagedRawCheckpoint
+  File "/Users/justin/proj/pgl/pgl/pglDatabase.py", line 4878 in _saveRawSession
+  File "/Users/justin/proj/pgl/pgl/pglDatabase.py", line 887 in saveRawSession
+  File "/Users/justin/proj/pgl/pgl/pglSession.py", line 2596 in saveRawSession
+  File "/var/folders/n2/4bqdpl1s6wd9x4l9ll4p03_m0000gq/T/ipykernel_77634/268232784.py", line 10 in <module>
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/interactiveshell.py", line 3823 in run_code
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/interactiveshell.py", line 3762 in run_ast_nodes
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/interactiveshell.py", line 3518 in run_cell_async
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/async_helpers.py", line 140 in _pseudo_sync_runner
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/interactiveshell.py", line 3305 in _run_cell
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/IPython/core/interactiveshell.py", line 3248 in run_cell
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/zmqshell.py", line 665 in run_cell
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/ipkernel.py", line 460 in do_execute
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/kernelbase.py", line 834 in execute_request
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/ipkernel.py", line 372 in execute_request
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/kernelbase.py", line 478 in dispatch_shell
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/kernelbase.py", line 621 in shell_main
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/events.py", line 88 in _run
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 1999 in _run_once
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/asyncio/base_events.py", line 645 in run_forever
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/tornado/platform/asyncio.py", line 211 in start
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel/kernelapp.py", line 807 in start
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/traitlets/config/application.py", line 1080 in launch_instance
+  File "/Users/justin/miniforge3/envs/pgl_mne/lib/python3.12/site-packages/ipykernel_launcher.py", line 18 in <module>
+  File "<frozen runpy>", line 88 in _run_code
+  File "<frozen runpy>", line 198 in _run_module_as_main
