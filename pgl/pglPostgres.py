@@ -402,7 +402,20 @@ class pglPostgres(pglTraitSettings):
 
     @classmethod
     def load(cls, filename=None, *, filesystem=None, storageOptions=None):
-        """Load configuration through fsspec and infer a missing SSH hostname."""
+        """Load configuration and resolve caller-side SSH transport.
+
+        A direct-loopback configuration discovered through SSH/SFTP describes
+        a database on the discovery machine. Adapt the returned object to use
+        an SSH tunnel to that machine without rewriting the saved file.
+
+        Explicit SSH endpoints and direct non-loopback endpoints are preserved.
+        Other remote protocols do not authorize automatic SSH inference.
+
+        Does not open a SQL connection or administer the server.
+        """
+        import ipaddress
+        from urllib.parse import unquote
+
         if filename is None:
             directory = cls.class_traits()["installDirectory"].default_value
             filename = posixpath.join(directory, cls.CONFIGURATION_FILENAME)
@@ -419,41 +432,87 @@ class pglPostgres(pglTraitSettings):
         if data.pop("__class__", None) != cls.__name__:
             raise ValueError("The file is not a pglPostgres configuration.")
 
-        if data.get("connectionTransport") == "ssh" and not data.get("sshHost"):
-            url = urlsplit(location)
-
-            if url.scheme in {"ssh", "sftp"} and url.hostname:
-                data["sshHost"] = url.hostname
-            else:
-                protocols = filesystem.protocol
-                protocols = (protocols,) if isinstance(protocols, str) else protocols
-
-                if any(protocol in {"ssh", "sftp"} for protocol in protocols):
-                    data["sshHost"] = getattr(filesystem, "host", "") or ""
-
+        # Upgrade and validate the saved document before adapting access.
         obj = cls.fromJSONdict(data)
         obj._configurationLoadedRemotely = not isLocal
+
+        protocols = filesystem.protocol
+        protocols = (protocols,) if isinstance(protocols, str) else protocols
+        discoveredThroughSSH = not isLocal and any(protocol in {"ssh", "sftp"} for protocol in protocols)
+
+        host = obj.connectionHost
+        candidate = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+
+        try:
+            loopback = ipaddress.ip_address(candidate).is_loopback
+        except ValueError:
+            loopback = candidate.lower() == "localhost"
+
+        inferTransport = discoveredThroughSSH and obj.connectionTransport == "direct" and loopback
+        inferEndpoint = discoveredThroughSSH and obj.connectionTransport == "ssh" and not obj.sshHost
+
+        if inferTransport or inferEndpoint:
+            url = urlsplit(location)
+            sourceOptions = dict(getattr(filesystem, "storage_options", {}) or {})
+            sourceOptions.update(storageOptions or {})
+
+            if url.scheme in {"ssh", "sftp"} and url.hostname:
+                # Preserve the caller's alias instead of replacing it with
+                # a resolved hostname; OpenSSH applies the caller's policy.
+                sshHost = url.hostname
+                sshUser = unquote(url.username) if url.username is not None else sourceOptions.get("username", "")
+                sshPort = url.port if url.port is not None else sourceOptions.get("port", 22)
+            else:
+                # Support an explicitly supplied SSH/SFTP filesystem with
+                # a protocol-free configuration path.
+                sshHost = getattr(filesystem, "host", "") or sourceOptions.get("host", "")
+                sshUser = sourceOptions.get("username", "")
+                sshPort = sourceOptions.get("port", getattr(filesystem, "port", 22))
+
+            if not sshHost:
+                raise ValueError("Cannot infer the SSH configuration source hostname.")
+
+            if inferTransport:
+                # The discovery endpoint, not unused server-side SSH fields,
+                # determines access to this installation.
+                obj.connectionTransport = "ssh"
+                obj.sshHost = sshHost
+                obj.sshUser = sshUser or ""
+                obj.sshPort = sshPort
+            else:
+                # Preserve explicitly configured user/port values when
+                # completing an existing SSH configuration.
+                obj.sshHost = sshHost
+
+                if not obj.sshUser:
+                    obj.sshUser = sshUser or ""
+
+                if obj.sshPort == 22:
+                    obj.sshPort = sshPort
+
+            obj._validateValues()
+
         return obj
 
     @classmethod
     def fromSettings(cls, settings=None, settingsName=None, *, filesystem=None, storageOptions=None):
-        """Discover configuration from databasePath in pgl settings.
+        """Discover configuration from databasePath in database settings.
 
         Missing configuration produces a warning and returns None.
         Invalid configuration and authentication failures remain errors.
         """
-        from .pglSettings import pglSettingsManager
+        from .pglDatabase import pglDatabase
 
-        resolvedSettings = pglSettingsManager.getSettings(settings=settings, settingsName=settingsName)
-
+        resolvedSettings = pglDatabase.getSettings(settings=settings, settingsName=settingsName)
+        
         if resolvedSettings is None:
-            pglMessages.warning("Could not resolve pgl settings.")
+            pglMessages.warning("Could not resolve database settings.")
             return None
 
         directory = resolvedSettings.databasePath.strip()
 
         if not directory:
-            pglMessages.warning("No databasePath is configured in pgl settings.")
+            pglMessages.warning("No databasePath is configured in database settings.")
             return None
 
         filename = posixpath.join(directory.rstrip("/") + "/", cls.CONFIGURATION_FILENAME)
@@ -677,7 +736,7 @@ class pglPostgres(pglTraitSettings):
             raise ValueError("installDirectory must not be blank or contain NUL.")
 
         if "://" in self.installDirectory:
-            raise ValueError("installDirectory is a server-local path, not an fsspec URL. Use databasePath in pgl settings for configuration discovery.")
+            raise ValueError("installDirectory is a server-local path, not an fsspec URL. Use databasePath in database settings for configuration discovery.")
 
         if self.connectionTransport not in {"direct", "ssh"}:
             raise ValueError("connectionTransport must be direct or ssh.")

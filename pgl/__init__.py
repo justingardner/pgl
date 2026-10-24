@@ -59,6 +59,8 @@ _EXPORTS = {
  'pglDisplayModeSettings': ('.pglSettings', 'pglDisplayModeSettings'),
  'pglSettings': ('.pglSettings', 'pglSettings'),
  'pglTraitSettings': ('.pglSettings', 'pglTraitSettings'),
+ 'pglDatabaseSettings': ('.pglDatabase', 'pglDatabaseSettings'),
+ 'pglDatabaseSettingsList': ('.pglDatabase', 'pglDatabaseSettingsList'),
  'pglStateDataSettings': ('.pglSettings', 'pglStateDataSettings'),
  'pglEventListener': ('.pglEventListener', 'pglEventListener'),
  'pglEyeTracker': ('.pglEyeTracker', 'pglEyeTracker'),

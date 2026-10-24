@@ -24,8 +24,69 @@ from .pglData import pglDataMatrix
 from .pglMessages import pglMessages
 from .pglStorage import pglStorage
 from .pglInfo import pglInfo
+from .pglSettings import pglTraitSettings
+from traitlets import Instance, List, Unicode, default
+from .pglSettings import pglSettingsManager
+from .pglDialog import pglDialogs
+
+##################################################
+# Database settings
+##################################################
+class pglDatabaseSettings(pglTraitSettings):
+
+    name = Unicode("default", help="Display name for these settings")
+    databasePath = Unicode("~/data/pgl", isPath=True, help="Directory containing the PostgreSQL configuration, server log, and database files. Supports ~ for the home directory.")
+    cacheDir = Unicode("~/data/pgl/cache", help="Local directory for files downloaded from database (e.g. raw mne files). Cached files are not automatically deleted.", isPath=True)
+    username = Unicode(help="Creator username for data-store provenance. Defaults to the OS login username; editable to use a consistent identity across machines.")
+    
+    @default("username")
+    def _default_username(self):
+        import getpass
+        return getpass.getuser()
+
+    def save(self, filename=None, filesystem=None, filesystemPrefix=None):
+        """
+        Save database settings.
+
+        If filename is omitted, save under the local database-settings
+        directory using the settings name.
+        """
+        if filename is None:
+            filename = self.saveDir()
+
+        super().save(
+            filename=filename,
+            filesystem=filesystem,
+            filesystemPrefix=filesystemPrefix,
+        )
+        pglMessages.message(f"Saved database settings to {filename}")
+
+    def saveDir(self):
+        return pglDatabase.getSettingsDir() / f"{pglStorage.makeValidFilename(self.name)}.json"
 
 
+##################################################
+# Database settings dialog wrapper
+##################################################
+class pglDatabaseSettingsList(pglTraitSettings):
+
+    settingsList = List(
+        Instance(pglDatabaseSettings),
+        buttons=True,
+        setDefault=True,
+        settingsListKey="name",
+        traitDisplayName="Choose database settings",
+        help="List of database settings",
+    )
+
+    def __init__(self, settingsList=None):
+        super().__init__()
+        if settingsList is not None:
+            self.settingsList = settingsList
+
+########################################################
+# pglDatabase
+########################################################
 class pglDatabase:
     """Coordinate PostgreSQL-backed scientific checkpoints.
 
@@ -73,6 +134,178 @@ class pglDatabase:
     # =========================================================================
 
     # -------------------------------------------------------------------------
+    # Settings
+    # -------------------------------------------------------------------------
+    @classmethod
+    def settings(cls):
+        """
+        Edit database settings using the standard settings dialog.
+        """
+        settingsList = cls.getSettings(returnSettingsList=True)
+
+        original = pglDatabaseSettingsList(settingsList)
+
+        modified = pglDialogs.traitsDialog(original)
+
+        cls._saveModifiedSettings(modified, original)
+
+    @classmethod
+    def getSettingsDir(cls):
+        """
+        Return the directory containing local database-settings profiles.
+        """
+        pglDir = pglSettingsManager.getPGLSettingsDir()
+        if pglDir is None:
+            raise OSError("Could not resolve the PGL settings directory.")
+
+        settingsDir = pglDir / "databaseSettings"
+        settingsDir.mkdir(parents=True, exist_ok=True)
+        return settingsDir
+
+    @classmethod
+    def getSettings(cls, settingsName=None, settings=None, returnSettingsList=False):
+        """
+        Load database settings.
+
+        Explicit settings supersede settingsName.
+        With neither, return the default settings.
+        returnSettingsList=True ignores other arguments and returns all
+        settings, with the default first.
+        """
+        if returnSettingsList:
+            settings = None
+            settingsName = None
+
+        if settings is not None:
+            if not isinstance(settings, pglDatabaseSettings):
+                pglMessages.warning("Settings must be pglDatabaseSettings.")
+                return None
+            return settings
+
+        settingsDir = cls.getSettingsDir()
+
+        if settingsName is not None:
+            filename = pglStorage.makeValidFilename(settingsName)
+            settingsPath = settingsDir / f"{filename}.json"
+
+            if not settingsPath.is_file():
+                pglMessages.warning(f"Database settings file '{settingsPath}' not found.")
+                return None
+
+            return pglDatabaseSettings.load(filename=settingsPath)
+
+        settingsList = []
+        for filename in sorted(settingsDir.glob("*.json")):
+            loaded = pglDatabaseSettings.load(filename=filename)
+            if not isinstance(loaded, pglDatabaseSettings):
+                raise ValueError(f"Invalid database settings file: {filename}")
+            settingsList.append(loaded)
+
+        if not settingsList:
+            pglMessages.message("No saved database settings found, creating default settings.")
+            settings = pglDatabaseSettings()
+            settings.isDefault = True
+            settings.save()
+            settingsList = [settings]
+        else:
+            defaults = [s for s in settingsList if s.isDefault]
+
+            if defaults:
+                settings = defaults[0]
+
+                if len(defaults) > 1:
+                    pglMessages.warning(
+                        f"Found {len(defaults)} default database settings, keeping only the first."
+                    )
+                    for other in defaults[1:]:
+                        other.isDefault = False
+                        other.save()
+            else:
+                settings = settingsList[0]
+                settings.isDefault = True
+                settings.save()
+                pglMessages.message(
+                    f"No default database settings found, using: {settings.name}."
+                )
+
+            # Move the default to the front.
+            settingsList.remove(settings)
+            settingsList.insert(0, settings)
+
+        if returnSettingsList:
+            return settingsList
+
+        return settingsList[0]
+    
+    @classmethod
+    def _saveModifiedSettings(cls, modifiedSettingsList, originalSettingsList):
+        """
+        Save new or modified database settings and trash removed files.
+
+        Renaming a profile changes only its local settings filename.
+        It does not rename or move databasePath or cacheDir.
+        """
+        if modifiedSettingsList is None:
+            return
+
+        modifiedList = modifiedSettingsList.settingsList
+        originalList = originalSettingsList.settingsList
+
+        # Validate before writing anything. Names must map to unique files.
+        filenames = set()
+        uuids = set()
+
+        for settings in modifiedList:
+            filename = pglStorage.makeValidFilename(settings.name)
+
+            if not filename:
+                pglMessages.warning("Database settings must have a nonempty valid name.")
+                return
+
+            if filename in filenames:
+                pglMessages.warning(
+                    f"Database settings names must produce unique filenames: {settings.name}"
+                )
+                return
+
+            if not settings.uuid or settings.uuid in uuids:
+                pglMessages.warning("Database settings must have unique, nonempty UUIDs.")
+                return
+
+            filenames.add(filename)
+            uuids.add(settings.uuid)
+
+        # Ensure exactly one default when profiles remain.
+        if modifiedList:
+            defaults = [s for s in modifiedList if s.isDefault]
+            selectedDefault = defaults[0] if defaults else modifiedList[0]
+
+            for settings in modifiedList:
+                settings.isDefault = settings is selectedDefault
+
+        originalByUUID = {s.uuid: s for s in originalList}
+
+        # Write all new/changed profiles before removing obsolete files.
+        for settings in modifiedList:
+            original = originalByUUID.get(settings.uuid)
+
+            if original is None:
+                pglMessages.message(f"Saving new database settings {settings.name}")
+                settings.save()
+            elif not original.equals(settings):
+                settings.save()
+
+        # Preserve any filename still used by the resulting settings list,
+        # including when profiles exchange names.
+        retainedPaths = {s.saveDir() for s in modifiedList}
+
+        for original in originalList:
+            oldPath = original.saveDir()
+
+            if oldPath not in retainedPaths and oldPath.exists():
+                pglSettingsManager.moveToTrash(oldPath)
+
+    # -------------------------------------------------------------------------
     # Database setup
     # -------------------------------------------------------------------------
     # User entry point for local server setup and schema initialization.
@@ -99,13 +332,12 @@ class pglDatabase:
         Returns False on cancellation or an operational connection failure.
         """
         from .pglPostgres import pglPostgres
-        from .pglSettings import pglSettingsManager
 
         if postgres is not None and (settings is not None or settingsName is not None):
             raise ValueError("Supply either postgres or PGL settings, not both.")
 
         if postgres is None:
-            resolvedSettings = pglSettingsManager.getSettings(settings=settings, settingsName=settingsName)
+            resolvedSettings = cls.getSettings(settings=settings, settingsName=settingsName)
 
             if resolvedSettings is None:
                 pglMessages.warning("Could not resolve PGL settings.", level=0)
@@ -212,7 +444,6 @@ class pglDatabase:
         Does not publish or modify database records.
         """
         from .pglPostgres import pglPostgres
-        from .pglSettings import pglSettingsManager
 
         if type(sessionID) is not int or not 0 <= sessionID <= 9223372036854775807:
             pglMessages.warning("sessionID must be a nonnegative PostgreSQL bigint.", level=1)
@@ -257,7 +488,7 @@ class pglDatabase:
 
         try:
             try:
-                resolvedSettings = pglSettingsManager.getSettings(settings=settings, settingsName=settingsName)
+                resolvedSettings = cls.getSettings(settings=settings, settingsName=settingsName)
 
                 if resolvedSettings is None:
                     pglMessages.warning("Cannot load session: could not resolve PGL settings.", level=0)
@@ -371,7 +602,6 @@ class pglDatabase:
         """
         from time import perf_counter
         from .pglPostgres import pglPostgres
-        from .pglSettings import pglSettingsManager
 
         pglStorage.requireSafeSave(session)
         cls._getCheckpointHistoryBoundary(session)
@@ -407,7 +637,7 @@ class pglDatabase:
         if not isinstance(ingestMethod, str) or ingestMethod not in {"manual", "automated"}:
             raise ValueError("ingestMethod must be manual or automated.")
 
-        resolvedSettings = pglSettingsManager.getSettings(settings=settings, settingsName=settingsName)
+        resolvedSettings = cls.getSettings(settings=settings, settingsName=settingsName)
 
         if resolvedSettings is None:
             pglMessages.warning("Cannot save session: could not resolve PGL settings.", level=0)
@@ -500,7 +730,6 @@ class pglDatabase:
         from time import perf_counter
 
         from .pglPostgres import pglPostgres
-        from .pglSettings import pglSettingsManager
 
         if not cls._checkRawSessionLabels(session, allowMissingMetadata=allowMissingMetadata):
             return None
@@ -511,7 +740,7 @@ class pglDatabase:
             productNames = list(session.dataMatrices)
             pglMessages.warning(f"saveRawSession() saves acquisition contents only. Attached data matrices {productNames!r} will not be included in this checkpoint. Working attachments are unchanged; use saveSession() to preserve them.", level=1)
 
-        resolvedSettings = pglSettingsManager.getSettings(settings=settings, settingsName=settingsName)
+        resolvedSettings = cls.getSettings(settings=settings, settingsName=settingsName)
 
         if resolvedSettings is None:
             pglMessages.warning("Cannot save raw session: could not resolve PGL settings.", level=0)
@@ -528,8 +757,21 @@ class pglDatabase:
         if postgres is None:
             return None
 
+        # Numeric checkpoint IDs belong to one database. Until transfers
+        # are implemented, do not reinterpret a loaded session's parent ID
+        # against another database, even with an explicit parentSessionID.
+        baseline = session._checkpointBaseline
+
+        if baseline and baseline["databaseIdentity"] != cls._checkpointDatabaseIdentity(postgres):
+            pglMessages.warning(
+                "Cannot save this session to a different database. "
+                "Cross-database checkpoint transfer is not implemented; "
+                "session IDs are local to their database."
+            )
+            return None
+
         if backendID is None and not postgres.storageLocations:
-            pglMessages.warning("Cannot save raw session: no storageLocations are configured in the PostgreSQL configuration.", level=0)
+            pglMessages.warning("Cannot save session: no storageLocations are configured in the PostgreSQL configuration.", level=0)
             return None
 
         databasePath = resolvedSettings.databasePath.strip()
@@ -1742,193 +1984,6 @@ class pglDatabase:
             return pglDatabase.printTables(details=details, postgres=postgres, settings=settings, settingsName=settingsName, nRows=nRows, maxWidth=maxWidth, sslRootCert=sslRootCert, includeDeleted=includeDeleted)
 
         return pglDatabase.printSessions(postgres=postgres, settings=settings, settingsName=settingsName, sslRootCert=sslRootCert, includeDeleted=includeDeleted, storageOptionsByBackend=storageOptionsByBackend)
-
-    # +++++++++++++++++++++++++++++ printSessions +++++++++++++++++++++++++++++
-    # User-facing database API. See the docstring for configuration, side effects, and return
-    # conventions.
-    # Direct callers in this module: print.
-    @staticmethod
-    def printSessions(postgres=None, *, settings=None, settingsName=None, sslRootCert=None, includeDeleted=False, storageOptionsByBackend=None):
-        """Print sessions grouped by root experiment and subject.
-
-        Parentless roots display behavioral sessionName values from verified
-        archived experimentSettings.json files, in brackets.
-        Descendants display database checkpoint_name values in parentheses.
-        Descriptions are omitted.
-
-        Uses mirrored root experiment/subject labels when available.
-        Older behavioral roots fall back to archived experiment settings.
-        Descendants inherit their root's grouping.
-
-        Reads root behavioral settings even when grouping labels are mirrored,
-        because sessionName is not included in that mirrored metadata.
-        Distinct nonblank session names retain their first-run order.
-
-        Unset grouping labels display as Unknown.
-        Does not reconstruct runs, tasks, or MNE payloads.
-        """
-        from psycopg.rows import tuple_row
-
-        if type(includeDeleted) is not bool:
-            raise ValueError("includeDeleted must be a boolean.")
-
-        postgres = pglDatabase._printPostgres(postgres, settings=settings, settingsName=settingsName)
-
-        if postgres is None:
-            return False
-
-        sessionsTable = sql.Identifier(postgres.databaseSchema, "session")
-        linksTable = sql.Identifier(postgres.databaseSchema, "session_files")
-        filesTable = sql.Identifier(postgres.databaseSchema, "files")
-        locationsTable = sql.Identifier(postgres.databaseSchema, "storage_locations")
-        backendsTable = sql.Identifier(postgres.databaseSchema, "storage_backends")
-
-        records = {}
-        groupsByRoot = {}
-        settingsByRoot = {}
-        identities = {}
-        locationsByFile = {}
-
-        with postgres.connect(sslRootCert=sslRootCert) as connection:
-            if connection is None:
-                return False
-
-            with connection.transaction():
-                connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
-
-                with connection.cursor(row_factory=tuple_row) as cursor:
-                    cursor.execute("SELECT current_database(), transaction_timestamp()")
-                    databaseName, snapshotTime = cursor.fetchone()
-
-                    statement = sql.SQL("SELECT session_id, parent_session_id, root_session_id, origin, status, deleted_at, meta, checkpoint_name FROM {} WHERE (%s OR deleted_at IS NULL) ORDER BY session_id").format(sessionsTable)
-                    cursor.execute(statement, (includeDeleted,))
-
-                    for sessionID, parentID, rootID, origin, status, deletedAt, meta, checkpointName in cursor.fetchall():
-                        records[sessionID] = {
-                            "session_id": sessionID,
-                            "parent_session_id": parentID,
-                            "root_session_id": rootID,
-                            "origin": origin,
-                            "status": status,
-                            "deleted_at": deletedAt,
-                            "meta": meta,
-                            "checkpoint_name": checkpointName,
-                            "session_names": [],
-                        }
-
-                    rootIDs = {record["root_session_id"] for record in records.values()}
-                    visibleRootIDs = []
-
-                    for rootID in sorted(rootIDs):
-                        record = records.get(rootID)
-
-                        if record is None:
-                            groupsByRoot[rootID] = {("Unknown", "Unknown")}
-                            continue
-
-                        visibleRootIDs.append(rootID)
-                        meta = record["meta"] or {}
-
-                        if "pgl_session_labels" in meta:
-                            metadata = pglDatabase._validateSessionLabelMetadata(meta["pgl_session_labels"])
-                            groupsByRoot[rootID] = {(label["experimentName"] if label["experimentName"] is not None else "Unknown", label["subjectID"] if label["subjectID"] is not None else "Unknown") for label in metadata["labels"]}
-
-                    # Query all visible roots, not only grouping fallbacks:
-                    # sessionName exists in behavioral settings, not mirrored labels.
-                    # MNE-only roots have no matching behavioral settings links.
-                    if visibleRootIDs:
-                        statement = sql.SQL("SELECT link.session_id, link.name, content.file_id, content.sha256, content.size_bytes FROM {} AS link JOIN {} AS content ON content.file_id = link.file_id WHERE link.session_id = ANY(%s::bigint[]) AND link.name ~ '^runs/[0-9]+/experimentSettings[.]json$' AND (%s OR (link.deleted_at IS NULL AND content.deleted_at IS NULL)) ORDER BY link.session_id, link.name").format(linksTable, filesTable)
-                        cursor.execute(statement, (visibleRootIDs, includeDeleted))
-
-                        for rootID, name, fileID, digest, size in cursor.fetchall():
-                            settingsByRoot.setdefault(rootID, []).append((name, fileID))
-                            identities[fileID] = {"sha256": digest, "size_bytes": size}
-
-                    if identities:
-                        statement = sql.SQL("SELECT location.file_id, backend.backend_id, backend.url_prefix, location.object_key FROM {} AS location JOIN {} AS backend ON backend.backend_id = location.backend_id WHERE location.file_id = ANY(%s::bigint[]) AND (%s OR location.deleted_at IS NULL) AND location.status = 'present' AND location.verified_at IS NOT NULL AND backend.is_active ORDER BY location.file_id, location.priority, backend.backend_id, location.object_key").format(locationsTable, backendsTable)
-                        cursor.execute(statement, (sorted(identities), includeDeleted))
-
-                        for fileID, backendID, root, key in cursor.fetchall():
-                            locationsByFile.setdefault(fileID, []).append({"backend_id": backendID, "url_prefix": root, "object_key": key})
-
-        settingsByFile = {}
-
-        for fileID, identity in identities.items():
-            locations = locationsByFile.get(fileID, [])
-
-            if not locations:
-                raise FileNotFoundError(f"Experiment-settings file {fileID} has no eligible registered location.")
-
-            settingsByFile[fileID] = pglDatabase._readPrintExperimentSettings(identity, locations, storageOptionsByBackend=storageOptionsByBackend)
-
-        for rootID in sorted(rootIDs):
-            record = records.get(rootID)
-
-            if record is None:
-                continue
-
-            sessionNames = []
-            pairs = set()
-            needsGrouping = rootID not in groupsByRoot
-            runSettings = sorted(settingsByRoot.get(rootID, []), key=lambda item: int(item[0].split("/")[1]))
-
-            for name, fileID in runSettings:
-                savedSettings = settingsByFile[fileID]
-                sessionName = savedSettings.get("sessionName")
-
-                if sessionName is not None:
-                    if not isinstance(sessionName, str):
-                        raise ValueError(f"Saved sessionName must be a string or None: root {rootID}, {name}")
-
-                    if sessionName.strip() and sessionName not in sessionNames:
-                        sessionNames.append(sessionName)
-
-                if needsGrouping:
-                    experiment = pglDatabase._printGroupingValue(savedSettings.get("experimentName"), "experimentName")
-                    subject = pglDatabase._printGroupingValue(savedSettings.get("subjectID"), "subjectID")
-                    pairs.add((experiment, subject))
-
-            record["session_names"] = sessionNames
-
-            if needsGrouping:
-                groupsByRoot[rootID] = pairs or {("Unknown", "Unknown")}
-
-        grouped = {}
-
-        for sessionID, record in records.items():
-            for experiment, subject in groupsByRoot[record["root_session_id"]]:
-                grouped.setdefault(experiment, {}).setdefault(subject, {})[sessionID] = record
-
-        # +++++++++++++++++++++++++++++++ groupOrder ++++++++++++++++++++++++++++++
-        # Local implementation within printSessions.
-        def groupOrder(value):
-            return (value == "Unknown", value.casefold(), value)
-
-        output = []
-
-        for experiment in sorted(grouped, key=groupOrder):
-            output.append(pglDatabase._printValue(experiment))
-
-            for subject in sorted(grouped[experiment], key=groupOrder):
-                output.append("  " + pglDatabase._printValue(subject))
-                output.extend(pglDatabase._sessionLineageLines(grouped[experiment][subject]))
-
-            output.append("")
-
-        pglMessages.printHeader("Sessions")
-        pglMessages.message(f"Database: {databaseName}.{postgres.databaseSchema}", wrapText=False)
-        pglMessages.message(f"Metadata snapshot: {snapshotTime}", wrapText=False)
-        pglMessages.print("  Including deleted sessions." if includeDeleted else "  Deleted sessions excluded.")
-        pglMessages.print()
-
-        if not records:
-            pglMessages.print("  (no visible sessions)")
-        else:
-            for line in output:
-                pglMessages.print(line)
-
-        pglMessages.printHeader()
-        return True
 
     # +++++++++++++++++++++++++++++ printSessions +++++++++++++++++++++++++++
     @staticmethod
@@ -7289,7 +7344,6 @@ class pglDatabase:
         """
         from .pglDataset import pglDataset
         from .pglPostgres import pglPostgres
-        from .pglSettings import pglSettingsManager
 
         if not isinstance(dataset, pglDataset):
             raise TypeError("Expected a pglDataset.")
@@ -7301,7 +7355,7 @@ class pglDatabase:
             settings = dataset._datasetSettings
             settingsName = dataset._datasetSettingsName if settings is None else None
 
-        resolvedSettings = pglSettingsManager.getSettings(settings=settings, settingsName=settingsName)
+        resolvedSettings = cls.getSettings(settings=settings, settingsName=settingsName)
 
         if resolvedSettings is None:
             return None, None
