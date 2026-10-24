@@ -272,10 +272,6 @@ class pglPostgres(pglTraitSettings):
         return self.STARTUP_TIMEOUT_SECONDS
 
     @property
-    def connectTimeoutSeconds(self):
-        return self.CONNECT_TIMEOUT_SECONDS
-
-    @property
     def connectionHost(self):
         return self.databaseHost or self.postgresHost
 
@@ -2407,3 +2403,129 @@ class pglPostgres(pglTraitSettings):
         copied._ioTimeoutSeconds = ioTimeoutSeconds
         copied._connectTimeoutSeconds = connectTimeoutSeconds
         return copied
+    
+    def acquireTableShareLock(self, connection, tableName, *, description="dataset dependency lock", progress=None, pollSeconds=0.25):
+        """Acquire a SHARE table lock with bounded contention waiting.
+
+        Uses this configuration's schema and lockTimeoutSeconds.
+        Requires an active explicit transaction.
+
+        Each NOWAIT attempt uses a savepoint. Successful acquisition remains
+        held until the outer transaction ends.
+
+        Initial contention reports conflicting granted relation-lock holders.
+        Diagnostics are snapshots, not proof of abandonment, and do not cache
+        targets for termination.
+
+        Does not change session-wide SQL timeout settings.
+        The deadline bounds retries, not network stalls within SQL requests.
+        """
+        import math
+        import time
+
+        from psycopg.pq import TransactionStatus
+        from psycopg.rows import dict_row
+
+        from .pglDatabase import pglDatabase
+
+        if not isinstance(tableName, str) or not tableName or "\x00" in tableName:
+            raise ValueError("tableName must be a nonempty string without NUL.")
+
+        if isinstance(pollSeconds, bool) or not isinstance(pollSeconds, (int, float)) or not math.isfinite(pollSeconds) or pollSeconds <= 0:
+            raise ValueError("pollSeconds must be a finite positive number.")
+
+        if connection.info.transaction_status != TransactionStatus.INTRANS:
+            raise RuntimeError("acquireTableShareLock() requires an active explicit transaction.")
+
+        timeoutSeconds = self.lockTimeoutSeconds
+        table = sql.Identifier(self.databaseSchema, tableName)
+        statement = sql.SQL("LOCK TABLE {} IN SHARE MODE NOWAIT").format(table)
+        started = time.monotonic()
+        deadline = started + timeoutSeconds
+        reportedWait = False
+
+        def reportOwners():
+            """Describe granted relation locks conflicting with SHARE."""
+            diagnostic = """
+                SELECT DISTINCT
+                    a.pid,
+                    a.backend_start AS "backendStart",
+                    a.usename AS "databaseUser",
+                    a.application_name AS "clientIdentity",
+                    a.state,
+                    clock_timestamp() - a.backend_start AS "connectionAge",
+                    clock_timestamp() - a.xact_start AS "transactionAge",
+                    clock_timestamp() - a.state_change AS "stateAge",
+                    a.wait_event_type AS "waitType",
+                    a.wait_event AS "waitEvent",
+                    pg_blocking_pids(a.pid) AS "blockingPIDs",
+                    (
+                        SELECT count(*)
+                        FROM pg_locks AS held
+                        WHERE held.pid = a.pid
+                          AND held.locktype = 'advisory'
+                          AND held.granted
+                    ) AS "heldAdvisoryLocks",
+                    l.mode AS "tableLockMode"
+                FROM pg_locks AS l
+                JOIN pg_stat_activity AS a ON a.pid = l.pid
+                JOIN pg_class AS c ON c.oid = l.relation
+                JOIN pg_namespace AS n ON n.oid = c.relnamespace
+                WHERE l.locktype = 'relation'
+                  AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())
+                  AND n.nspname = %s
+                  AND c.relname = %s
+                  AND l.granted
+                  AND l.mode IN (
+                      'RowExclusiveLock',
+                      'ShareUpdateExclusiveLock',
+                      'ShareRowExclusiveLock',
+                      'ExclusiveLock',
+                      'AccessExclusiveLock'
+                  )
+                  AND a.pid <> pg_backend_pid()
+                ORDER BY a.pid
+            """
+
+            try:
+                with connection.transaction():
+                    with connection.cursor(row_factory=dict_row) as cursor:
+                        cursor.execute(diagnostic, (self.databaseSchema, tableName))
+                        records = cursor.fetchall()
+            except Exception as error:
+                pglMessages.warning(f"Could not inspect dependency-lock holders ({type(error).__name__}).", level=0)
+                return
+
+            if not records:
+                pglMessages.message("No conflicting granted holder is currently visible; the lock may have changed or be blocked behind a queued request.")
+                return
+
+            for record in records:
+                pglMessages.message(f"Table-lock holder: {pglDatabase._formatPostgresLock(record)} | table lock: {record['tableLockMode']}", wrapText=False)
+
+        while True:
+            if reportedWait and time.monotonic() >= deadline:
+                raise TimeoutError(f"Timed out after {timeoutSeconds:g} s waiting for {description}.")
+
+            try:
+                with connection.transaction():
+                    connection.execute(statement)
+            except psycopg.errors.LockNotAvailable:
+                if not reportedWait:
+                    reportedWait = True
+
+                    if progress is not None:
+                        progress(None, f"Waiting for {description} (timeout {timeoutSeconds:g} s)")
+
+                    pglMessages.message(f"Waiting for {description} (timeout: {timeoutSeconds:g} s)...")
+                    reportOwners()
+
+                remaining = deadline - time.monotonic()
+
+                if remaining > 0:
+                    time.sleep(min(pollSeconds, remaining))
+            else:
+                if reportedWait:
+                    pglMessages.message(f"Acquired {description} after {time.monotonic() - started:.1f} s.")
+
+                return

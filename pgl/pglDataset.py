@@ -403,39 +403,34 @@ class pglDataset(pglActionable):
         return pglDatabase.printDataset(self, verbose=verbose, settings=settings, settingsName=settingsName, sslRootCert=sslRootCert)
     
     # +++++++++++++++++++++++++++++++ save ++++++++++++++++++++++++++++++++++
-    def save(self, *, settings=None, settingsName=None, backendID=None, storageOptions=None, sslRootCert=None):
-        """Publish a new dataset checkpoint with its attached products.
+    def save(self, *, settings=None, settingsName=None, backendID=None, storageOptions=None, sslRootCert=None, lockTimeoutSeconds=30.0, ioTimeoutSeconds=60, connectTimeoutSeconds=10):
+        """Publish a dataset checkpoint and its attached scientific products.
 
-        User-facing wrapper for pglDatabase.saveDataset().
-        The database layer validates membership and history, publishes working
-        matrices, registers product links, and completes the checkpoint.
+        Saved references reuse registered matrix revisions.
+        Working matrices publish new revisions.
+        Cached working sessions are not saved.
 
-        Unopened saved references reuse registered matrix revisions.
-        Attached mutable matrices publish new revisions.
-        Cached working sessions are not saved by this operation.
+        Runtime timeout overrides are not saved to configuration:
+            lockTimeoutSeconds: advisory and dataset dependency-lock waits.
+            ioTimeoutSeconds: PGL-owned inferred SFTP channel I/O.
+            connectTimeoutSeconds: PostgreSQL and PGL-owned SSH setup.
 
-        Does not construct missing products, rebuild existing products after
-        membership changes, or rerun analyses.
+        These are not total-save or SQL-statement deadlines. They do not alter
+        caller-owned source filesystems or explicit-URL backend options.
 
-        Returns:
-            New dataset checkpoint ID, or None for unavailable configuration,
-            invalid/missing creator configuration, or connection cancellation.
-            Other errors propagate.
+        Returns a checkpoint ID, or None for unavailable configuration,
+        cancellation, invalid creator configuration, or handled operational
+        failure. Other errors and KeyboardInterrupt propagate.
 
-        Dataset identity, annotations, binding, and history baseline are updated
-        only after successful commit and connection cleanup.
-        Working matrix attachments remain attached.
+        Identity and baseline update only after commit and connection cleanup.
+        Working matrices remain attached. No products are automatically rebuilt.
 
-        Database writes are transactional; payload writes are not.
-        Failed saves may leave unregistered bundles.
-        Concurrent mutation of the dataset or its products is unsupported.
-
-        Usage:
-            datasetID = dataset.save(settingsName="desktop")
+        SQL writes are transactional; payload writes are not.
+        Concurrent working-object mutation is unsupported.
         """
         from .pglDatabase import pglDatabase
 
-        return pglDatabase.saveDataset(self, settings=settings, settingsName=settingsName, backendID=backendID, storageOptions=storageOptions, sslRootCert=sslRootCert)
+        return pglDatabase.saveDataset(self, settings=settings, settingsName=settingsName, backendID=backendID, storageOptions=storageOptions, sslRootCert=sslRootCert, lockTimeoutSeconds=lockTimeoutSeconds, ioTimeoutSeconds=ioTimeoutSeconds, connectTimeoutSeconds=connectTimeoutSeconds)
     
     # +++++++++++++++++++++++++++++ getData +++++++++++++++++++++++++++++++++
     def getData(self, productName, *, settings=None, settingsName=None, storageOptionsByBackend=None, sslRootCert=None):

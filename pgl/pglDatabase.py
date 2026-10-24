@@ -823,32 +823,25 @@ class pglDatabase:
     # User-facing database API. See the docstring for configuration, side effects, and return
     # conventions.
     @classmethod
-    def saveSession(cls, session, *, parentSessionID=None, settings=None, settingsName=None, backendID=None, checkpointName=None, description=None, ingestMethod="manual", storageOptions=None, sslRootCert=None):
-        """Save current contents and history as a derived checkpoint.
+    def saveSession(cls, session, *, parentSessionID=None, settings=None, settingsName=None, backendID=None, checkpointName=None, description=None, ingestMethod="manual", storageOptions=None, sslRootCert=None, lockTimeoutSeconds=30.0, ioTimeoutSeconds=60, connectTimeoutSeconds=10):
+        """Save current contents/history as a derived checkpoint with progress.
 
-        Defaults parentSessionID to session.sessionID.
-        None annotation arguments carry forward the working session values.
-        Explicit blank strings clear the corresponding annotations.
+        Runtime timeout overrides apply to a private configuration copy.
+        They do not impose a total-save deadline or modify source filesystems.
 
-        Rejects failed working state and changes to an established baseline's
-        historical prefix before opening a database connection.
+        Prepares baseline metadata before commit.
+        Updates working identity, annotations, and baseline only after commit
+        and connection cleanup.
 
-        Returns the new or reused checkpoint ID, or None for missing-parent
-        rejection, unavailable configuration, or connection cancellation.
-
-        Prepares new baseline metadata before commit. Updates sessionID,
-        checkpointName, description, and baseline only after commit and
-        connection cleanup.
-
-        Database changes are transactional; payload writes are not.
-        Failed saves may leave unregistered files. Other errors propagate.
-        Accumulated action history is retained.
-
-        The working object must not be modified concurrently while saving.
+        Expected operational failures warn and return None.
+        Integrity/programming errors and KeyboardInterrupt propagate.
+        Payload writes are not transactional.
         """
         from time import perf_counter
+
         from .pglPostgres import pglPostgres
 
+        pglPostgres.validateTimeouts(lockTimeoutSeconds=lockTimeoutSeconds, ioTimeoutSeconds=ioTimeoutSeconds, connectTimeoutSeconds=connectTimeoutSeconds)
         pglStorage.requireSafeSave(session)
         cls._getCheckpointHistoryBoundary(session)
 
@@ -865,8 +858,9 @@ class pglDatabase:
             if type(value) is not int or not 0 <= value <= 9223372036854775807:
                 raise ValueError(f"{label} must be a nonnegative PostgreSQL bigint.")
 
-        # ++++++++++++++++++++++++++ normalizeAnnotation ++++++++++++++++++++++++++
-        # Local implementation within saveSession.
+        if storageOptions is not None and not isinstance(storageOptions, dict):
+            raise TypeError("storageOptions must be a dictionary or None.")
+
         def normalizeAnnotation(value, label):
             if value is None:
                 return None
@@ -874,7 +868,6 @@ class pglDatabase:
             if not isinstance(value, str) or "\x00" in value:
                 raise ValueError(f"{label} must be a string without NUL, or None.")
 
-            # Preserve nonblank text verbatim, matching description semantics.
             return value if value.strip() else None
 
         resolvedCheckpointName = normalizeAnnotation(session.checkpointName if checkpointName is None else checkpointName, "checkpointName")
@@ -883,60 +876,85 @@ class pglDatabase:
         if not isinstance(ingestMethod, str) or ingestMethod not in {"manual", "automated"}:
             raise ValueError("ingestMethod must be manual or automated.")
 
-        resolvedSettings = cls.getSettings(settings=settings, settingsName=settingsName)
-
-        if resolvedSettings is None:
-            pglMessages.warning("Cannot save session: could not resolve PGL settings.", level=0)
-            return None
-
-        username = resolvedSettings.username
-
-        if not isinstance(username, str) or not username.strip() or "\x00" in username:
-            pglMessages.warning("Cannot save session: set a valid username in PGL settings.", level=0)
-            return None
-
-        postgres = pglPostgres.fromSettings(settings=resolvedSettings)
-
-        if postgres is None:
-            return None
-
-        if backendID is None and not postgres.storageLocations:
-            pglMessages.warning("Cannot save session: no storageLocations are configured in the PostgreSQL configuration.", level=0)
-            return None
-
-        databasePath = resolvedSettings.databasePath.strip()
+        sessionID = None
+        commitAttempted = False
+        commitConfirmed = False
+        progress = None
+        operation = "resolving database settings"
         saveStarted = perf_counter()
-        pglMessages.message("Saving session: connecting to PostgreSQL...")
 
-        with postgres.connect(sslRootCert=sslRootCert) as connection:
-            if connection is None:
-                return None
+        try:
+            with pglProgress("Saving session") as progress:
+                progress(0, "Resolving database settings")
+                resolvedSettings = cls.getSettings(settings=settings, settingsName=settingsName)
 
-            with connection.transaction():
-                if backendID is None:
-                    pglMessages.message("Saving session: resolving storage destination...")
-                    backendID = cls._getConfiguredStorageBackend(connection, postgres, storageOptions=storageOptions)
+                if resolvedSettings is None:
+                    pglMessages.warning("Cannot save session: could not resolve PGL settings.", level=0)
+                    return None
 
-                pglMessages.message("Saving session: resolving checkpoint owner...")
-                createdBy = cls.getOrCreateUser(connection, postgres, username)
+                username = resolvedSettings.username
 
-                pglMessages.message("Saving session: checking current contents and preparing checkpoint...")
-                contentsStarted = perf_counter()
-                sessionID = cls._saveDerivedSession(connection, postgres, session, createdBy, backendID, parentSessionID=resolvedParentID, checkpointName=resolvedCheckpointName, description=resolvedDescription, ingestMethod=ingestMethod, storageOptions=storageOptions)
+                if not isinstance(username, str) or not username.strip() or "\x00" in username:
+                    pglMessages.warning("Cannot save session: set a valid username in PGL settings.", level=0)
+                    return None
 
-                # Prepare baseline metadata while errors can still roll back
-                # checkpoint publication.
-                pglStorage.requireSafeSave(session)
-                cls._getCheckpointHistoryBoundary(session)
-                pendingBaseline = cls._prepareCheckpointBaseline(session, sessionID, postgres)
+                progress(0.01, "Loading PostgreSQL configuration")
+                postgres = pglPostgres.fromSettings(settings=resolvedSettings)
 
-                pglMessages.message(f"Saving session: checkpoint ready ({perf_counter() - contentsStarted:.1f} s); committing transaction...")
+                if postgres is None:
+                    return None
 
-        # Publication and connection cleanup have succeeded.
-        session.sessionID = sessionID
-        session.checkpointName = resolvedCheckpointName
-        session.description = resolvedDescription
-        session._checkpointBaseline = pendingBaseline
+                postgres = postgres.withTimeouts(lockTimeoutSeconds=lockTimeoutSeconds, ioTimeoutSeconds=ioTimeoutSeconds, connectTimeoutSeconds=connectTimeoutSeconds)
+
+                if backendID is None and not postgres.storageLocations:
+                    pglMessages.warning("Cannot save session: no storageLocations are configured in the PostgreSQL configuration.", level=0)
+                    return None
+
+                databasePath = resolvedSettings.databasePath.strip()
+                progress(0.02, "Connecting to PostgreSQL")
+
+                with postgres.connect(sslRootCert=sslRootCert) as connection:
+                    if connection is None:
+                        progress(None, "Connection cancelled")
+                        return None
+
+                    with connection.transaction():
+                        if backendID is None:
+                            progress(0.03, "Resolving storage destination / acquiring registration lock")
+                            backendID = cls._getConfiguredStorageBackend(connection, postgres, storageOptions=storageOptions)
+
+                        progress(0.04, "Resolving checkpoint owner")
+                        createdBy = cls.getOrCreateUser(connection, postgres, username)
+
+                        progress(0.05, "Preparing derived checkpoint")
+                        sessionID = cls._saveDerivedSession(connection, postgres, session, createdBy, backendID, parentSessionID=resolvedParentID, checkpointName=resolvedCheckpointName, description=resolvedDescription, ingestMethod=ingestMethod, storageOptions=storageOptions, progress=progress.section(0.05, 0.95))
+
+                        progress(0.96, "Validating working history and preparing checkpoint baseline")
+                        pglStorage.requireSafeSave(session)
+                        cls._getCheckpointHistoryBoundary(session)
+                        pendingBaseline = cls._prepareCheckpointBaseline(session, sessionID, postgres)
+
+                        progress(0.98, "Committing transaction")
+                        commitAttempted = True
+
+                    commitConfirmed = True
+                    progress(0.99, "Closing PostgreSQL connection and tunnel")
+
+                # No database or payload resources remain owned by this save.
+                session.sessionID = sessionID
+                session.checkpointName = resolvedCheckpointName
+                session.description = resolvedDescription
+                session._checkpointBaseline = pendingBaseline
+
+                progress.finish(f"Checkpoint {sessionID} saved")
+
+        except Exception as error:
+            operation = getattr(progress, "_description", operation)
+
+            if not cls._handleCheckpointSaveFailure(error, checkpointKind="Session checkpoint", checkpointID=sessionID, operation=operation, commitAttempted=commitAttempted, commitConfirmed=commitConfirmed):
+                raise
+
+            return None
 
         pglMessages.message(f"Checkpoint {sessionID} is complete. Database configuration: {databasePath} (database={postgres.databaseName}, schema={postgres.databaseSchema}; {perf_counter() - saveStarted:.1f} s total).", wrapText=False)
         return sessionID
@@ -1440,52 +1458,35 @@ class pglDatabase:
 
     # +++++++++++++++++++++++++++++ saveDataset +++++++++++++++++++++++++++++
     @classmethod
-    def saveDataset(cls, dataset, *, settings=None, settingsName=None, backendID=None, storageOptions=None, sslRootCert=None):
-        """Publish a dataset checkpoint with named scientific products.
+    def saveDataset(cls, dataset, *, settings=None, settingsName=None, backendID=None, storageOptions=None, sslRootCert=None, lockTimeoutSeconds=30.0, ioTimeoutSeconds=60, connectTimeoutSeconds=10):
+        """Publish a dataset checkpoint with progress and runtime timeouts.
 
-        Called by pglDataset.save().
+        Existing references reuse registered matrix revisions.
+        Working matrices publish new standalone Zarr bundles.
+        Cached working sessions are not saved.
 
-        Existing unopened references reuse registered matrix revisions.
-        Attached working matrices publish fresh standalone Zarr bundles.
-        Cached working sessions are not saved by this operation.
+        Preserves dependency-lock ordering and validates required sources.
+        Payload access closes before the commit attempt.
 
-        Resolves server-local destinations through the caller's local/SSH
-        access context. Catalog roots and relative object keys remain unchanged;
-        caller-specific SSH access URLs are not registered.
+        Updates dataset identity, binding, annotations, and baseline only
+        after successful commit and connection cleanup.
 
-        Acquires the session dependency lock before dataset publication.
-        Membership and required ancestors must be complete and active.
+        Progress is per product for Zarr publication, not byte-level.
+        Expected operational failures warn and return None.
+        Other errors and KeyboardInterrupt propagate.
 
-        Owns its SQL transaction and, when writing matrices, one destination
-        access context. The access context closes before SQL commit. Working
-        matrices' source readers are borrowed and remain caller-owned.
-
-        Updates dataset identity, annotations, binding, and history baseline
-        only after successful commit and connection cleanup.
-
-        Returns:
-            New checkpoint ID, or None for unavailable configuration, invalid
-            creator configuration, or connection cancellation.
-            Other errors propagate.
-
-        Payload writes cannot be rolled back by PostgreSQL. Failed publication
-        may leave orphaned matrix bundles but not a committed completed dataset.
-
-        Does not rebuild products or rerun analyses.
-        Concurrent working-object mutation is unsupported.
+        Payload writes are not transactional. Failed publication may leave
+        unregistered matrix bundles. Concurrent mutation is unsupported.
         """
         from contextlib import ExitStack
+        from time import perf_counter
 
         from psycopg.types.json import Jsonb
 
         from .pglData import pglDataMatrix, pglDataMatrixReference
+        from .pglPostgres import pglPostgres
 
-        metadata = cls._prepareDatasetMetadata(dataset)
-        members = dataset._validateMembers(dataset.members)
-        products = cls._validateDatasetProducts(dataset)
-        checkpointName = cls._datasetAnnotation(dataset.checkpointName, "checkpointName")
-        description = cls._datasetAnnotation(dataset.description, "description")
-        historyHashes = cls._datasetHistoryHashes(dataset)
+        pglPostgres.validateTimeouts(lockTimeoutSeconds=lockTimeoutSeconds, ioTimeoutSeconds=ioTimeoutSeconds, connectTimeoutSeconds=connectTimeoutSeconds)
 
         if backendID is not None and (type(backendID) is not int or not 0 <= backendID <= 9223372036854775807):
             raise ValueError("backendID must be a nonnegative PostgreSQL bigint.")
@@ -1493,175 +1494,237 @@ class pglDatabase:
         if storageOptions is not None and not isinstance(storageOptions, dict):
             raise TypeError("storageOptions must be a dictionary or None.")
 
-        # Reject structural errors before allocating permanent payload paths.
-        for product in products.values():
-            if isinstance(product, pglDataMatrix):
-                pglStorage.requireSafeSave(product)
-                pglStorage.validateDataMatrixEncoding(product.requireData())
+        datasetID = None
+        commitAttempted = False
+        commitConfirmed = False
+        progress = None
+        operation = "validating dataset contents"
+        saveStarted = perf_counter()
 
-        resolvedSettings, postgres = cls._resolveDatasetStorage(dataset, settings=settings, settingsName=settingsName)
+        try:
+            with pglProgress("Saving dataset") as progress:
+                progress(0, "Validating dataset membership, history, and products")
 
-        if postgres is None:
+                metadata = cls._prepareDatasetMetadata(dataset)
+                members = dataset._validateMembers(dataset.members)
+                products = cls._validateDatasetProducts(dataset)
+                checkpointName = cls._datasetAnnotation(dataset.checkpointName, "checkpointName")
+                description = cls._datasetAnnotation(dataset.description, "description")
+                historyHashes = cls._datasetHistoryHashes(dataset)
+
+                for product in products.values():
+                    if isinstance(product, pglDataMatrix):
+                        pglStorage.requireSafeSave(product)
+                        pglStorage.validateDataMatrixEncoding(product.requireData())
+
+                progress(0.01, "Resolving dataset database configuration")
+                resolvedSettings, postgres = cls._resolveDatasetStorage(dataset, settings=settings, settingsName=settingsName)
+
+                if postgres is None:
+                    return None
+
+                postgres = postgres.withTimeouts(lockTimeoutSeconds=lockTimeoutSeconds, ioTimeoutSeconds=ioTimeoutSeconds, connectTimeoutSeconds=connectTimeoutSeconds)
+                username = resolvedSettings.username
+
+                if not isinstance(username, str) or not username.strip() or "\x00" in username:
+                    pglMessages.warning("Cannot save dataset: set a valid username in PGL settings.", level=0)
+                    return None
+
+                databaseIdentity = deepcopy(cls._checkpointDatabaseIdentity(postgres))
+                identityJSON = cls._datasetDatabaseIdentityJSON(databaseIdentity)
+
+                for name, product in products.items():
+                    if isinstance(product, pglDataMatrixReference) and product.databaseIdentityJSON != identityJSON:
+                        raise ValueError(f"Product {name!r} references a different configured database.")
+
+                datasetsTable = sql.Identifier(postgres.databaseSchema, "dataset")
+                membersTable = sql.Identifier(postgres.databaseSchema, "dataset_members")
+                productsTable = sql.Identifier(postgres.databaseSchema, "dataset_products")
+                revisionsTable = sql.Identifier(postgres.databaseSchema, "matrix_revisions")
+                backendsTable = sql.Identifier(postgres.databaseSchema, "storage_backends")
+                hasWorkingProducts = any(isinstance(product, pglDataMatrix) for product in products.values())
+
+                progress(0.02, "Connecting to PostgreSQL")
+
+                with postgres.connect(sslRootCert=sslRootCert) as connection:
+                    if connection is None:
+                        progress(None, "Connection cancelled")
+                        return None
+
+                    with connection.transaction():
+                        connection.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+
+                        progress(0.03, "Acquiring dataset session-dependency lock")
+                        postgres.acquireTableShareLock(connection, "session", description="dataset session-dependency lock", progress=progress)
+
+                        # Keep all owned payload resources inside the transaction,
+                        # but close them before marking the commit attempt.
+                        with ExitStack() as resources:
+                            progress(0.04, "Resolving checkpoint owner")
+                            createdBy = cls.getOrCreateUser(connection, postgres, username)
+                            destinationFS = None
+                            destinationRoot = None
+
+                            if hasWorkingProducts:
+                                if backendID is None:
+                                    progress(0.05, "Resolving matrix storage destination")
+                                    backendID = cls._getConfiguredStorageBackend(connection, postgres, storageOptions=storageOptions)
+
+                                statement = sql.SQL("SELECT url_prefix, is_active FROM {} WHERE backend_id = %s FOR SHARE").format(backendsTable)
+                                backend = connection.execute(statement, (backendID,)).fetchone()
+
+                                if backend is None or not backend[1]:
+                                    raise ValueError("Matrix destination backend is missing or inactive.")
+
+                                progress(0.06, "Opening matrix destination storage")
+                                access = resources.enter_context(pglDatabaseAccess(postgres, {backendID: storageOptions or {}}))
+                                destinationFS, destinationRoot = access.resolve(backendID, backend[0])
+
+                            progress(0.07, "Allocating dataset checkpoint")
+
+                            statement = sql.SQL("""
+                                INSERT INTO {} (
+                                    family_uuid, name, checkpoint_name, description,
+                                    metadata, created_by
+                                )
+                                VALUES (%s::uuid, %s, %s, %s, %s, %s)
+                                RETURNING dataset_id
+                            """).format(datasetsTable)
+
+                            datasetID = connection.execute(statement, (dataset.uuid, dataset.name, checkpointName, description, Jsonb(metadata), createdBy)).fetchone()[0]
+
+                            statement = sql.SQL("""
+                                INSERT INTO {} (
+                                    dataset_id, session_id, member_index, entry_name, labels
+                                )
+                                VALUES (%s, %s, %s, %s, %s)
+                            """).format(membersTable)
+
+                            for index, member in enumerate(members):
+                                progress(0.07 + 0.02 * index / max(len(members), 1), f"Registering dataset member {index + 1}/{len(members)}")
+                                connection.execute(statement, (datasetID, member["sessionID"], index, member["entryName"], Jsonb(member["labels"])))
+
+                            progress(0.09, "Checking dataset members and required ancestors")
+                            problems = cls._getDatasetSourceProblems(connection, postgres, datasetID)
+
+                            if problems:
+                                problem = problems[0]
+                                raise ValueError(f"Cannot save dataset: member session {problem['memberSessionID']} requires active completed source checkpoint {problem['sourceSessionID']}.")
+
+                            # Product-level estimates: working products dominate;
+                            # reference-only catalog checks receive small weight.
+                            productItems = list(products.items())
+                            weights = [1 if isinstance(product, pglDataMatrixReference) else 100 for _, product in productItems]
+                            totalWeight = sum(weights)
+                            completedWeight = 0
+
+                            for index, ((productName, product), weight) in enumerate(zip(productItems, weights)):
+                                start = 0.10 + 0.84 * completedWeight / totalWeight
+                                end = 0.10 + 0.84 * (completedWeight + weight) / totalWeight
+                                productProgress = progress.section(start, end, label=f"Product {index + 1}/{len(productItems)} {productName}")
+
+                                if isinstance(product, pglDataMatrixReference):
+                                    productProgress(0, "Checking saved matrix reference")
+                                    revisionID = product.matrixRevisionID
+
+                                    statement = sql.SQL("SELECT contract_version FROM {} WHERE matrix_revision_id = %s::uuid").format(revisionsTable)
+                                    registered = connection.execute(statement, (revisionID,)).fetchone()
+
+                                    if registered != ("pgl.matrix.zarr.v1",):
+                                        raise ValueError(f"Product {productName!r} references an unknown or unsupported matrix revision.")
+
+                                else:
+                                    productProgress(0, "Publishing matrix Zarr bundle")
+                                    productRoot = posixpath.join(destinationRoot, "matrices")
+                                    savedURL = pglStorage.saveDataMatrix(product, productRoot, filesystem=destinationFS)
+                                    savedPath = destinationFS._strip_protocol(savedURL)
+
+                                    productProgress(0.90, "Checking published matrix descriptor")
+
+                                    with destinationFS.open(posixpath.join(savedPath, "matrix.json"), "rb") as source:
+                                        descriptorBytes = source.read(16 * 1024 * 1024 + 1)
+
+                                    if len(descriptorBytes) > 16 * 1024 * 1024:
+                                        raise ValueError("Published matrix descriptor exceeds the size limit.")
+
+                                    descriptor = json.loads(descriptorBytes)
+                                    revisionID = descriptor["matrixRevisionID"]
+                                    objectKey = f"matrices/matrix-{revisionID}"
+                                    expectedPath = posixpath.join(destinationRoot, objectKey)
+
+                                    if posixpath.normpath(savedPath) != posixpath.normpath(expectedPath):
+                                        raise ValueError("Published matrix path differs from its expected backend-relative location.")
+
+                                    productProgress(0.95, "Registering matrix revision")
+
+                                    statement = sql.SQL("""
+                                        INSERT INTO {} (
+                                            matrix_revision_id, backend_id, object_key,
+                                            contract_version, descriptor, created_by
+                                        )
+                                        VALUES (%s::uuid, %s, %s, %s, %s, %s)
+                                    """).format(revisionsTable)
+
+                                    connection.execute(statement, (revisionID, backendID, objectKey, "pgl.matrix.zarr.v1", Jsonb(descriptor), createdBy))
+
+                                productProgress(None, "Attaching dataset product")
+                                statement = sql.SQL("INSERT INTO {} (dataset_id, product_name, matrix_revision_id) VALUES (%s, %s, %s::uuid)").format(productsTable)
+                                connection.execute(statement, (datasetID, productName, revisionID))
+                                productProgress(1, "Product registered")
+                                completedWeight += weight
+
+                            progress(0.94, "Rechecking working dataset before publication")
+                            cls._requireSafeDatasetCheckpoint(dataset)
+                            cls._requireDatasetProductsUnchanged(dataset, products)
+
+                            if dataset.members != members or cls._prepareDatasetMetadata(dataset) != metadata:
+                                raise ValueError("Dataset changed while saving. No checkpoint was published.")
+
+                            if cls._datasetAnnotation(dataset.checkpointName, "checkpointName") != checkpointName or cls._datasetAnnotation(dataset.description, "description") != description:
+                                raise ValueError("Dataset annotations changed while saving. No checkpoint was published.")
+
+                            progress(0.95, "Completing dataset checkpoint")
+                            statement = sql.SQL("UPDATE {} SET status = 'complete', completed_at = statement_timestamp() WHERE dataset_id = %s RETURNING dataset_id").format(datasetsTable)
+
+                            if connection.execute(statement, (datasetID,)).fetchone() != (datasetID,):
+                                raise RuntimeError("Dataset checkpoint completion failed.")
+
+                            pendingBaseline = {
+                                "version": 1,
+                                "datasetID": datasetID,
+                                "familyUUID": dataset.uuid,
+                                "databaseIdentity": databaseIdentity,
+                                "historyHashes": historyHashes,
+                            }
+
+                            progress(0.97, "Closing dataset payload access")
+
+                        progress(0.98, "Committing dataset transaction")
+                        commitAttempted = True
+
+                    commitConfirmed = True
+                    progress(0.99, "Closing PostgreSQL connection and tunnel")
+
+                dataset.datasetID = datasetID
+                dataset.checkpointName = checkpointName
+                dataset.description = description
+                dataset._datasetDatabaseIdentity = databaseIdentity
+                dataset._datasetSettings = resolvedSettings
+                dataset._datasetSettingsName = None
+                dataset._datasetBaseline = pendingBaseline
+
+                progress.finish(f"Dataset checkpoint {datasetID} saved")
+
+        except Exception as error:
+            operation = getattr(progress, "_description", operation)
+
+            if not cls._handleCheckpointSaveFailure(error, checkpointKind="Dataset checkpoint", checkpointID=datasetID, operation=operation, commitAttempted=commitAttempted, commitConfirmed=commitConfirmed):
+                raise
+
             return None
 
-        username = resolvedSettings.username
-
-        if not isinstance(username, str) or not username.strip() or "\x00" in username:
-            pglMessages.warning("Cannot save dataset: set a valid username in PGL settings.", level=0)
-            return None
-
-        databaseIdentity = deepcopy(cls._checkpointDatabaseIdentity(postgres))
-        identityJSON = cls._datasetDatabaseIdentityJSON(databaseIdentity)
-
-        for name, product in products.items():
-            if isinstance(product, pglDataMatrixReference) and product.databaseIdentityJSON != identityJSON:
-                raise ValueError(f"Product {name!r} references a different configured database.")
-
-        sessionsTable = sql.Identifier(postgres.databaseSchema, "session")
-        datasetsTable = sql.Identifier(postgres.databaseSchema, "dataset")
-        membersTable = sql.Identifier(postgres.databaseSchema, "dataset_members")
-        productsTable = sql.Identifier(postgres.databaseSchema, "dataset_products")
-        revisionsTable = sql.Identifier(postgres.databaseSchema, "matrix_revisions")
-        backendsTable = sql.Identifier(postgres.databaseSchema, "storage_backends")
-
-        hasWorkingProducts = any(isinstance(product, pglDataMatrix) for product in products.values())
-
-        with postgres.connect(sslRootCert=sslRootCert) as connection:
-            if connection is None:
-                return None
-
-            # ExitStack closes destination access before the SQL transaction
-            # commits. No destination context is needed for reference-only saves.
-            with connection.transaction(), ExitStack() as resources:
-                connection.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
-                connection.execute(sql.SQL("LOCK TABLE {} IN SHARE MODE").format(sessionsTable))
-
-                createdBy = cls.getOrCreateUser(connection, postgres, username)
-                destinationFS = None
-                destinationRoot = None
-
-                if hasWorkingProducts:
-                    if backendID is None:
-                        backendID = cls._getConfiguredStorageBackend(connection, postgres, storageOptions=storageOptions)
-
-                    statement = sql.SQL("SELECT url_prefix, is_active FROM {} WHERE backend_id = %s FOR SHARE").format(backendsTable)
-                    backend = connection.execute(statement, (backendID,)).fetchone()
-
-                    if backend is None or not backend[1]:
-                        raise ValueError("Matrix destination backend is missing or inactive.")
-
-                    access = resources.enter_context(pglDatabaseAccess(postgres, {backendID: storageOptions or {}}))
-                    destinationFS, destinationRoot = access.resolve(backendID, backend[0])
-
-                statement = sql.SQL("""
-                    INSERT INTO {} (
-                        family_uuid, name, checkpoint_name, description,
-                        metadata, created_by
-                    )
-                    VALUES (%s::uuid, %s, %s, %s, %s, %s)
-                    RETURNING dataset_id
-                """).format(datasetsTable)
-
-                datasetID = connection.execute(statement, (dataset.uuid, dataset.name, checkpointName, description, Jsonb(metadata), createdBy)).fetchone()[0]
-
-                statement = sql.SQL("""
-                    INSERT INTO {} (
-                        dataset_id, session_id, member_index, entry_name, labels
-                    )
-                    VALUES (%s, %s, %s, %s, %s)
-                """).format(membersTable)
-
-                for index, member in enumerate(members):
-                    connection.execute(statement, (datasetID, member["sessionID"], index, member["entryName"], Jsonb(member["labels"])))
-
-                problems = cls._getDatasetSourceProblems(connection, postgres, datasetID)
-
-                if problems:
-                    problem = problems[0]
-                    raise ValueError(f"Cannot save dataset: member session {problem['memberSessionID']} requires active completed source checkpoint {problem['sourceSessionID']}.")
-
-                for productName, product in products.items():
-                    if isinstance(product, pglDataMatrixReference):
-                        revisionID = product.matrixRevisionID
-
-                        # Preserve existing reference-reuse policy. This is a
-                        # catalog check, not a fresh payload availability scan.
-                        statement = sql.SQL("SELECT contract_version FROM {} WHERE matrix_revision_id = %s::uuid").format(revisionsTable)
-                        registered = connection.execute(statement, (revisionID,)).fetchone()
-
-                        if registered != ("pgl.matrix.zarr.v1",):
-                            raise ValueError(f"Product {productName!r} references an unknown or unsupported matrix revision.")
-
-                    else:
-                        productRoot = posixpath.join(destinationRoot, "matrices")
-                        savedURL = pglStorage.saveDataMatrix(product, productRoot, filesystem=destinationFS)
-                        savedPath = destinationFS._strip_protocol(savedURL)
-
-                        with destinationFS.open(posixpath.join(savedPath, "matrix.json"), "rb") as source:
-                            descriptorBytes = source.read(16 * 1024 * 1024 + 1)
-
-                        if len(descriptorBytes) > 16 * 1024 * 1024:
-                            raise ValueError("Published matrix descriptor exceeds the size limit.")
-
-                        descriptor = json.loads(descriptorBytes)
-                        revisionID = descriptor["matrixRevisionID"]
-                        objectKey = f"matrices/matrix-{revisionID}"
-                        expectedPath = posixpath.join(destinationRoot, objectKey)
-
-                        if posixpath.normpath(savedPath) != posixpath.normpath(expectedPath):
-                            raise ValueError("Published matrix path differs from its expected backend-relative location.")
-
-                        # Store only the backend ID and relative object key.
-                        # The filesystem's caller-specific access path is not
-                        # used as a new backend registration.
-                        statement = sql.SQL("""
-                            INSERT INTO {} (
-                                matrix_revision_id, backend_id, object_key,
-                                contract_version, descriptor, created_by
-                            )
-                            VALUES (%s::uuid, %s, %s, %s, %s, %s)
-                        """).format(revisionsTable)
-
-                        connection.execute(statement, (revisionID, backendID, objectKey, "pgl.matrix.zarr.v1", Jsonb(descriptor), createdBy))
-
-                    statement = sql.SQL("INSERT INTO {} (dataset_id, product_name, matrix_revision_id) VALUES (%s, %s, %s::uuid)").format(productsTable)
-                    connection.execute(statement, (datasetID, productName, revisionID))
-
-                cls._requireSafeDatasetCheckpoint(dataset)
-                cls._requireDatasetProductsUnchanged(dataset, products)
-
-                if dataset.members != members or cls._prepareDatasetMetadata(dataset) != metadata:
-                    raise ValueError("Dataset changed while saving. No checkpoint was published.")
-
-                if cls._datasetAnnotation(dataset.checkpointName, "checkpointName") != checkpointName or cls._datasetAnnotation(dataset.description, "description") != description:
-                    raise ValueError("Dataset annotations changed while saving. No checkpoint was published.")
-
-                statement = sql.SQL("UPDATE {} SET status = 'complete', completed_at = statement_timestamp() WHERE dataset_id = %s RETURNING dataset_id").format(datasetsTable)
-
-                if connection.execute(statement, (datasetID,)).fetchone() != (datasetID,):
-                    raise RuntimeError("Dataset checkpoint completion failed.")
-
-                pendingBaseline = {
-                    "version": 1,
-                    "datasetID": datasetID,
-                    "familyUUID": dataset.uuid,
-                    "databaseIdentity": databaseIdentity,
-                    "historyHashes": historyHashes,
-                }
-
-        # Publication and connection cleanup succeeded. Keep editable working
-        # matrices attached; saving does not relabel them as immutable references.
-        dataset.datasetID = datasetID
-        dataset.checkpointName = checkpointName
-        dataset.description = description
-        dataset._datasetDatabaseIdentity = databaseIdentity
-        dataset._datasetSettings = resolvedSettings
-        dataset._datasetSettingsName = None
-        dataset._datasetBaseline = pendingBaseline
-
-        pglMessages.message(f"Dataset checkpoint {datasetID} saved with {len(members)} members and {len(products)} products in {postgres.databaseName}.{postgres.databaseSchema}.")
+        pglMessages.message(f"Dataset checkpoint {datasetID} saved with {len(members)} members and {len(products)} products in {postgres.databaseName}.{postgres.databaseSchema} ({perf_counter() - saveStarted:.1f} s total).")
         return datasetID
-
 
     # -------------------------------------------------------------------------
     # Datasets: members and scientific products
@@ -3443,19 +3506,14 @@ class pglDatabase:
 
     # ++++++++++++++++++++++ registerDerivedSessionFiles ++++++++++++++++++++
     @classmethod
-    def registerDerivedSessionFiles(cls, connection, postgres, sessionID, backendID, manifest, *, objectPrefix, storageOptions=None, accessContext=None):
-        """Register a staged derived bundle in the caller's transaction.
+    def registerDerivedSessionFiles(cls, connection, postgres, sessionID, backendID, manifest, *, objectPrefix, storageOptions=None, accessContext=None, progress=None):
+        """Verify/register a staged derived bundle without committing.
 
-        Advanced wrapper used by the derived save coordinator.
-
-        A supplied accessContext is borrowed and forwarded unchanged.
-        Otherwise the shared implementation owns a temporary context.
-        Configure storage options on the context when supplying one.
-
-        Verifies and registers files but does not copy payloads, register
-        matrix-product links, complete the checkpoint, or commit.
+        A supplied access context is borrowed.
+        Optional progress reports verification and file registration.
+        Does not copy payloads, register matrix links, or complete the checkpoint.
         """
-        return cls._registerSessionBundleFiles(connection, postgres, sessionID, backendID, manifest, objectPrefix=objectPrefix, storageOptions=storageOptions, origin="derived", accessContext=accessContext)
+        return cls._registerSessionBundleFiles(connection, postgres, sessionID, backendID, manifest, objectPrefix=objectPrefix, storageOptions=storageOptions, origin="derived", accessContext=accessContext, progress=progress)
     
     # +++++++++++++++++++++++++ completeRawCheckpoint +++++++++++++++++++++++++
     # Advanced database/checkpoint API. Observe the connection and transaction requirements in the
@@ -6136,42 +6194,20 @@ class pglDatabase:
 
     # ++++++++++++++++++++++++++ _saveDerivedSession ++++++++++++++++++++++++
     @classmethod
-    def _saveDerivedSession(cls, connection, postgres, session, createdBy, backendID, *, parentSessionID, checkpointName=None, description=None, ingestMethod="manual", storageOptions=None):
+    def _saveDerivedSession(cls, connection, postgres, session, createdBy, backendID, *, parentSessionID, checkpointName=None, description=None, ingestMethod="manual", storageOptions=None, progress=None):
         """Publish current contents and matrices as a derived v2 checkpoint.
 
-        Called by saveSession(), which owns the outer SQL transaction and
-        updates working-session bookkeeping only after successful commit.
+        Uses the caller's outer SQL transaction and an internal savepoint.
+        One payload access context is shared across publication and verification.
 
-        Resolves the registered destination through one operation-owned
-        pglDatabaseAccess context. Server-local roots use local or SSH access
-        according to the caller's configuration.
+        Optional progress covers matrix publication, temporary export, parent
+        comparison, byte-based copying/verification, registration, and completion.
 
-        The same destination context is used for:
-            Working matrix publication.
-            Checkpoint file transfers.
-            Archived metadata reads.
-            Stored-file verification and location registration.
+        Working matrices always publish fresh revisions. Parent reuse remains
+        limited to matching saves with no attached products.
 
-        Registered roots and relative keys remain unchanged by access
-        resolution. Caller-specific SSH URLs and credentials are not stored.
-
-        Working matrices publish fresh Zarr revisions. Named revision
-        references enter the hashed manifest and session_products.
-
-        Without attached matrices, an identical active derived v2 parent may
-        be reused after checking metadata, registered files, and empty products.
-
-        Uses a nested SQL transaction/savepoint. The outer transaction must
-        commit for publication to persist. Temporary staging and owned SSH
-        connections are cleaned up when this method exits.
-
-        Filesystem writes are not transactional. Failure may leave orphaned
-        payloads even when SQL registration rolls back.
-
-        Returns the new or reused checkpoint ID.
-
-        Does not change working session identity, annotations, matrix revision
-        IDs, or action history. Concurrent working-object mutation is unsupported.
+        Does not update working identity or history baseline.
+        Payload writes are not transactional.
         """
         from tempfile import TemporaryDirectory
 
@@ -6203,7 +6239,6 @@ class pglDatabase:
         if hasMNE and type(session.mne) is not pglMNE:
             raise TypeError("MNE checkpoints currently support pglMNE, not subclasses.")
 
-        # Reject unsupported matrix encodings before permanent payload writes.
         for matrix in products.values():
             pglStorage.requireSafeSave(matrix)
             pglStorage.validateDataMatrixEncoding(matrix.requireData())
@@ -6218,16 +6253,22 @@ class pglDatabase:
         files = sql.Identifier(postgres.databaseSchema, "files")
         locations = sql.Identifier(postgres.databaseSchema, "storage_locations")
 
-        # ++++++++++++++++++++++++++++ isLocal ++++++++++++++++++++++++++++++
         def isLocal(filesystem):
-            """Determine actual caller-side filesystem locality."""
             protocols = filesystem.protocol
             protocols = {protocols} if isinstance(protocols, str) else set(protocols)
             return bool(protocols.intersection({"file", "local"}))
 
-        # The access context exits before this savepoint exits. The outer
-        # saveSession transaction remains responsible for final commit.
+        def report(fraction, description):
+            if progress is not None:
+                progress(fraction, description)
+
+        # Reserve additional weight for matrix publication only when needed.
+        matrixEnd = 0.35 if products else 0.04
+        transferStart = matrixEnd + 0.06
+
         with connection.transaction(), pglDatabaseAccess(postgres, {backendID: storageOptions or {}}) as access:
+            report(0, "Validating creator, storage backend, and parent checkpoint")
+
             statement = sql.SQL("SELECT 1 FROM {} WHERE user_id = %s FOR SHARE").format(users)
 
             if connection.execute(statement, (createdBy,)).fetchone() is None:
@@ -6255,18 +6296,15 @@ class pglDatabase:
             if parent is None or parent[1] != "complete" or parent[8] is not None:
                 raise ValueError("Parent must be a completed, active checkpoint.")
 
-            # The registered root is not edited. Only physical access is
-            # selected according to this caller's database configuration.
+            report(0.02, "Opening destination storage")
             destinationFS, destinationRoot = access.resolve(backendID, registeredRoot)
             stagingFS = LocalFileSystem(skip_instance_cache=True)
 
-            # Matrix publication is not transactional. Later failures may
-            # leave orphaned bundles, while their catalog rows roll back.
-            pglMessages.message(f"Saving session: publishing {len(products)} attached matrix product(s)...")
-            productRecords = cls._publishSessionMatrices(connection, postgres, session, products, createdBy=createdBy, backendID=backendID, filesystem=destinationFS, destinationRoot=destinationRoot)
+            productProgress = progress.section(0.03, matrixEnd) if progress is not None else None
+            productRecords = cls._publishSessionMatrices(connection, postgres, session, products, createdBy=createdBy, backendID=backendID, filesystem=destinationFS, destinationRoot=destinationRoot, progress=productProgress)
 
             with TemporaryDirectory(prefix="pgl-derived-session-") as temporary:
-                pglMessages.message("Saving session: exporting current contents to temporary staging...")
+                report(matrixEnd, "Exporting current behavioral/MNE contents to temporary staging")
                 stagingRoot, manifest = cls.saveDerivedSessionFiles(session, dataPath=Path(temporary) / "bundle", filesystem=stagingFS, productRecords=productRecords)
 
                 cls._requireSessionMatricesUnchanged(session, products)
@@ -6279,14 +6317,11 @@ class pglDatabase:
 
                 manifestBytes = cls.encodeRawManifest(manifest)
                 manifestHash = hashlib.sha256(manifestBytes).hexdigest()
-
-                pglMessages.message("Saving session: comparing contents with the parent checkpoint...")
+                report(matrixEnd + 0.03, "Comparing contents with the parent checkpoint")
 
                 sameParent = parent[0] == "derived" and parent[2] == contractVersion and parent[3] == manifestHash
                 sameMetadata = parent[4] == description and parent[5] == ingestMethod and parent[6] == createdBy and sorted(parent[7]) == sorted(modalities) and parent[9] == checkpointName
 
-                # Attached working matrices always receive new revisions.
-                # Parent reuse applies only when there are no products.
                 if not products and sameParent and sameMetadata:
                     cls._verifySessionProducts(connection, postgres, parentSessionID, [])
 
@@ -6330,27 +6365,23 @@ class pglDatabase:
                     if actual != expected:
                         raise ValueError("Parent checkpoint file links do not match its manifest identity; it cannot be reused.")
 
-                    # Preserve existing reuse semantics: availability here is
-                    # catalog metadata, not a new byte scan of the parent.
                     if all(available for name, digest, size, role, available in rows):
                         cls._requireSessionMatricesUnchanged(session, products)
                         pglMessages.warning(f"Session contents and save metadata match checkpoint {parentSessionID}. No new checkpoint was created; returning the existing ID.", level=2)
+                        report(1, f"Reusing checkpoint {parentSessionID}; cleaning up staging")
                         return parentSessionID
 
-                    pglMessages.message("Saving session: matching parent lacks eligible files on the requested backend; creating a new checkpoint.")
+                    report(None, "Matching parent lacks eligible destination files; creating a new checkpoint")
 
-                pglMessages.message("Saving session: allocating a new derived checkpoint...")
+                report(None, "Allocating derived checkpoint")
                 sessionID = cls.createDerivedCheckpoint(connection, postgres, createdBy, parentSessionID, checkpointName=checkpointName, description=description, ingestMethod=ingestMethod, contractVersion=contractVersion, modalities=modalities)
 
                 objectPrefix = f"session{sessionID:06d}"
                 destination = posixpath.join(destinationRoot, objectPrefix)
 
-                # Preserve existing source/destination overlap checks.
-                # Server-local paths accessed through SSH must not be
-                # interpreted with this client's Path.resolve().
                 for run in runs:
                     if run.filesystem is None:
-                        raise ValueError("Source run has no resolved filesystem.")
+                        raise ValueError("Source run has no filesystem.")
 
                     if isLocal(destinationFS) and isLocal(run.filesystem):
                         target = Path(destination).expanduser().resolve()
@@ -6366,39 +6397,43 @@ class pglDatabase:
                         if target == source or target.startswith(source.rstrip("/") + "/"):
                             raise ValueError("Derived destination must be outside source run directories.")
 
+                report(transferStart, "Creating checkpoint directories")
+
                 if destinationFS.exists(destination):
                     raise FileExistsError(f"Destination already exists: {destination}")
 
                 destinationFS.makedirs(destination, exist_ok=False)
 
                 for directory in manifest["directories"]:
+                    report(None, f"Creating checkpoint directory {directory}")
                     destinationFS.makedirs(posixpath.join(destination, directory), exist_ok=True)
 
-                pglMessages.message("Saving session: writing and verifying checkpoint payloads...")
                 fileRecords = [
                     *manifest["files"],
                     {"name": "manifest.json", "sha256": manifestHash, "size_bytes": len(manifestBytes)},
                 ]
 
-                for record in fileRecords:
-                    pglStorage.copyVerifiedFile(stagingFS, posixpath.join(stagingRoot, record["name"]), destinationFS, destinationRoot, record, objectKey=posixpath.join(objectPrefix, record["name"]))
+                # Copying includes one read-back verification; registration
+                # includes another full stored-file verification.
+                transferEnd = transferStart + (0.94 - transferStart) * 2 / 3
+                transferProgress = progress.section(transferStart, transferEnd) if progress is not None else None
 
-                pglMessages.message("Saving session: registering checkpoint files and matrix links...")
+                for record, fileProgress in pglProgress.fileSections(fileRecords, transferProgress):
+                    pglStorage.copyVerifiedFile(stagingFS, posixpath.join(stagingRoot, record["name"]), destinationFS, destinationRoot, record, objectKey=posixpath.join(objectPrefix, record["name"]), progress=fileProgress)
 
-                # Registration borrows this same context and therefore reuses
-                # the resolved destination connection. Catalog roots remain
-                # the original backend roots.
-                cls.registerDerivedSessionFiles(connection, postgres, sessionID, backendID, manifest, objectPrefix=objectPrefix, accessContext=access)
+                registrationProgress = progress.section(transferEnd, 0.94) if progress is not None else None
+                cls.registerDerivedSessionFiles(connection, postgres, sessionID, backendID, manifest, objectPrefix=objectPrefix, accessContext=access, progress=registrationProgress)
+
+                report(0.95, "Registering checkpoint matrix links")
                 cls._registerSessionProducts(connection, postgres, sessionID, productRecords)
-
                 cls._requireSessionMatricesUnchanged(session, products)
 
                 for matrix in products.values():
                     pglStorage.requireSafeSave(matrix)
 
-                pglMessages.message("Saving session: validating checkpoint completion...")
+                report(0.97, "Validating derived checkpoint completion")
                 cls.completeDerivedCheckpoint(connection, postgres, sessionID, manifest)
-
+                report(1, "Cleaning up staging and payload access")
                 return sessionID
 
     # ++++++++++++++++++++++++ saveDerivedSessionFiles ++++++++++++++++++++++++
@@ -6950,19 +6985,15 @@ class pglDatabase:
     # ++++++++++++++++++++++++ _publishSessionMatrices ++++++++++++++++++++++++
     # Direct callers in this module: _saveDerivedSession.
     @classmethod
-    def _publishSessionMatrices(cls, connection, postgres, session, products, *, createdBy, backendID, filesystem, destinationRoot):
+    def _publishSessionMatrices(cls, connection, postgres, session, products, *, createdBy, backendID, filesystem, destinationRoot, progress=None):
         """Publish working matrices and register revisions in caller transaction.
 
         products must be a snapshot from _snapshotSessionMatrices().
+        Optional progress reports product-level publication and registration.
 
-        Writes fresh Zarr bundles through saveDataMatrix(). Inserts catalog
-        rows, but does not insert session_products links or complete a
-        checkpoint. Returns deterministic records for the session manifest.
-
-        Does not change working matrix revision IDs or session attachments.
-
-        The caller owns the transaction. Database rollback does not remove
-        payloads already written; failed saves may leave orphaned bundles.
+        Zarr writes do not currently expose byte-level progress here.
+        Does not mutate working matrix revision IDs or session attachments.
+        Failed publication may leave unregistered matrix bundles.
         """
         from psycopg.types.json import Jsonb
 
@@ -6972,34 +7003,39 @@ class pglDatabase:
 
         cls._requireSessionMatricesUnchanged(session, products)
 
-        # Validate every product before writing the first permanent bundle.
         for productName, matrix in products.items():
             pglStorage.requireSafeSave(matrix)
             pglStorage.validateDataMatrixEncoding(matrix.requireData())
 
         if not products:
+            if progress is not None:
+                progress(1, "No attached matrices to publish")
+
             return []
 
         backends = sql.Identifier(postgres.databaseSchema, "storage_backends")
         revisions = sql.Identifier(postgres.databaseSchema, "matrix_revisions")
-
         statement = sql.SQL("SELECT is_active FROM {} WHERE backend_id = %s FOR SHARE").format(backends)
-        backend = connection.execute(statement, (backendID,)).fetchone()
 
-        if backend != (True,):
+        if connection.execute(statement, (backendID,)).fetchone() != (True,):
             raise ValueError("Matrix destination backend is missing or inactive.")
 
-        # filesystem/destinationRoot must be the destination already resolved
-        # from this backend by the enclosing session save implementation.
         productRoot = posixpath.join(destinationRoot, "matrices")
         records = []
+        productCount = len(products)
 
-        for productName, matrix in products.items():
+        for index, (productName, matrix) in enumerate(products.items()):
             cls._requireSessionMatricesUnchanged(session, products)
+
+            if progress is not None:
+                progress(index / productCount, f"Publishing matrix {index + 1}/{productCount}: {productName}")
 
             savedURL = pglStorage.saveDataMatrix(matrix, productRoot, filesystem=filesystem)
             savedPath = filesystem._strip_protocol(savedURL)
             descriptorPath = posixpath.join(savedPath, "matrix.json")
+
+            if progress is not None:
+                progress(None, f"Checking published matrix descriptor: {productName}")
 
             with filesystem.open(descriptorPath, "rb") as source:
                 descriptorBytes = source.read(16 * 1024 * 1024 + 1)
@@ -7019,6 +7055,9 @@ class pglDatabase:
             if posixpath.normpath(savedPath) != posixpath.normpath(expectedPath):
                 raise ValueError("Published matrix path differs from its expected backend-relative location.")
 
+            if progress is not None:
+                progress(None, f"Registering matrix revision: {productName}")
+
             statement = sql.SQL("""
                 INSERT INTO {} (
                     matrix_revision_id, backend_id, object_key,
@@ -7028,11 +7067,10 @@ class pglDatabase:
             """).format(revisions)
 
             connection.execute(statement, (revisionID, backendID, objectKey, "pgl.matrix.zarr.v1", Jsonb(descriptor), createdBy))
+            records.append({"name": productName, "matrixRevisionID": revisionID})
 
-            records.append({
-                "name": productName,
-                "matrixRevisionID": revisionID,
-            })
+            if progress is not None:
+                progress((index + 1) / productCount, f"Matrix registered: {productName}")
 
         cls._requireSessionMatricesUnchanged(session, products)
 
@@ -10467,3 +10505,98 @@ class pglCheckpointFilesystem(AbstractFileSystem):
 
         if self._ownsAccess and self._accessContext is not None:
             self._accessContext.close()
+
+    @classmethod
+    def _handleCheckpointSaveFailure(cls, error, *, checkpointKind, checkpointID, operation, commitAttempted, commitConfirmed):
+        """Warn for recognized operational failures after resource cleanup.
+
+        Returns True when handled, False when the caller should re-raise.
+        Does not retry, connect for diagnostics, terminate sessions, or delete
+        payloads. Avoids exposing backend exception text or signed URLs.
+
+        Authentication/host-key failures, integrity failures, and programming
+        errors are not intentionally suppressed.
+        """
+        from paramiko import SSHException
+        from paramiko.ssh_exception import AuthenticationException, BadHostKeyException
+
+        lockFailure = False
+
+        if isinstance(error, (AuthenticationException, BadHostKeyException)):
+            return False
+
+        if isinstance(error, psycopg.errors.LockNotAvailable):
+            reason = "a required PostgreSQL lock could not be acquired"
+            lockFailure = True
+        elif isinstance(error, TimeoutError):
+            reason = "a lock wait, connection attempt, or I/O operation timed out"
+            lockFailure = True
+        elif isinstance(error, SSHException):
+            message = str(error).strip().lower()
+            dropped = message.startswith("server connection dropped:") or message in {
+                "socket is closed",
+                "socket is closed.",
+                "server connection dropped",
+                "ssh session not active",
+                "no existing session",
+            }
+
+            if not dropped:
+                return False
+
+            reason = "the SSH/SFTP connection was lost"
+        elif isinstance(error, (psycopg.OperationalError, psycopg.InterfaceError)):
+            # Explicit authentication/authorization failures remain visible.
+            if getattr(error, "sqlstate", None) in {"28000", "28P01", "42501"}:
+                return False
+
+            reason = "a PostgreSQL connection or operational failure occurred"
+        elif isinstance(error, ConnectionError):
+            reason = "a network connection failed"
+        else:
+            return False
+
+        label = checkpointKind if checkpointID is None else f"{checkpointKind} {checkpointID}"
+
+        if commitConfirmed:
+            outcome = (
+                f"The transaction for {label} committed, but subsequent cleanup failed. "
+                "The committed checkpoint was not rolled back. "
+                "The working object's checkpoint bookkeeping was not updated."
+            )
+        elif commitAttempted:
+            outcome = (
+                f"The failure occurred during commit for {label}. "
+                "The outcome is not confirmed by this client; the checkpoint may "
+                "already have been saved. Inspect the database before retrying."
+            )
+        else:
+            outcome = (
+                "The final checkpoint commit was not attempted. "
+                "Transaction and connection cleanup were attempted. "
+                "If PostgreSQL is unreachable, its transaction and locks may remain "
+                "until the server detects the disconnected client."
+            )
+
+        inspection = (
+            "Run pglDatabase.inspectPostgresLocks() with the same settings to inspect "
+            "current lock-related sessions. For table-lock blockers, inspect live "
+            "activity while the wait is occurring; a timed-out waiter may already "
+            "have disappeared. Idle database state does not prove abandonment."
+            if lockFailure else
+            "Restore VPN/network access and check pglDatabase.inspectPostgres() "
+            "with the same settings before retrying."
+        )
+
+        report = "pglDatabase.print(datasets=True)" if checkpointKind == "Dataset checkpoint" else "pglDatabase.print()"
+
+        pglMessages.warning(
+            f"{checkpointKind} save stopped while {operation}: {reason} ({type(error).__name__}).\n"
+            f"{outcome}\n"
+            f"{inspection}\n"
+            f"Inspect saved checkpoints with {report}. "
+            "Partial or unregistered files/matrix bundles may remain. "
+            "No automatic retry, connection termination, or payload deletion occurred.",
+            level=2,
+        )
+        return True

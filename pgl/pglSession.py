@@ -2701,38 +2701,33 @@ class pglSession(pglActionable):
         return pglDatabase.loadSession(sessionID, settings=settings, settingsName=settingsName, storageOptionsByBackend=storageOptionsByBackend, sslRootCert=sslRootCert, includeDeleted=includeDeleted, cacheDirectory=cacheDirectory, directLocalPolicy=directLocalPolicy)
     
     # +++++++++++++++++++++++++++ saveSession +++++++++++++++++++++++++++++++
-    def saveSession(self, *, parentSessionID=None, settings=None, settingsName=None, backendID=None, checkpointName=None, description=None, ingestMethod="manual", storageOptions=None, sslRootCert=None):
-        """Publish current session contents as a derived database checkpoint.
+    def saveSession(self, *, parentSessionID=None, settings=None, settingsName=None, backendID=None, checkpointName=None, description=None, ingestMethod="manual", storageOptions=None, sslRootCert=None, lockTimeoutSeconds=30.0, ioTimeoutSeconds=60, connectTimeoutSeconds=10):
+        """Publish current contents as a derived database checkpoint.
 
-        User-facing convenience wrapper for pglDatabase.saveSession().
-        The database layer validates the parent and working history, exports
-        behavioral/MNE contents, publishes attached matrices, registers their
-        references, and completes the checkpoint.
+        None parentSessionID uses self.sessionID.
+        None annotations retain their working values; blank strings clear them.
 
-        parentSessionID=None uses self.sessionID.
-        checkpointName=None carries forward self.checkpointName.
-        description=None carries forward self.description.
-        Explicit blank annotation strings clear the corresponding annotation.
+        Runtime timeout overrides are not saved to configuration:
+            lockTimeoutSeconds: each explicitly managed lock acquisition.
+            ioTimeoutSeconds: PGL-owned inferred SFTP channel I/O.
+            connectTimeoutSeconds: PostgreSQL and PGL-owned SSH setup.
 
-        Returns:
-            New or reused checkpoint ID, or None for missing-parent rejection,
-            unavailable configuration, or connection cancellation.
-            Other failures propagate.
+        These are not total-save or SQL-statement deadlines. They do not alter
+        caller-owned source filesystems or explicit-URL backend options.
 
-        pglDatabase updates self.sessionID, annotations, and the history
-        baseline only after successful commit and connection cleanup.
-        Accumulated action history and working matrix attachments are retained.
+        Returns a new/reused checkpoint ID, or None for rejection, cancellation,
+        unavailable configuration, or handled operational failure.
 
-        Database writes are transactional; payload writes are not.
-        Failed saves can leave unregistered files or matrix bundles.
-        Do not modify the session or its matrices concurrently while saving.
+        Identity, annotations, and baseline update only after commit and
+        connection cleanup. Working matrices and action history remain attached.
 
-        Usage:
-            checkpointID = session.saveSession(checkpointName="filtered")
+        Payload writes are not transactional. Failed saves may leave files.
+        Integrity/programming errors and KeyboardInterrupt propagate.
+        Concurrent working-object mutation is unsupported.
         """
         from .pglDatabase import pglDatabase
 
-        return pglDatabase.saveSession(self, parentSessionID=parentSessionID, settings=settings, settingsName=settingsName, backendID=backendID, checkpointName=checkpointName, description=description, ingestMethod=ingestMethod, storageOptions=storageOptions, sslRootCert=sslRootCert)    
+        return pglDatabase.saveSession(self, parentSessionID=parentSessionID, settings=settings, settingsName=settingsName, backendID=backendID, checkpointName=checkpointName, description=description, ingestMethod=ingestMethod, storageOptions=storageOptions, sslRootCert=sslRootCert, lockTimeoutSeconds=lockTimeoutSeconds, ioTimeoutSeconds=ioTimeoutSeconds, connectTimeoutSeconds=connectTimeoutSeconds)
     
     # +++++++++++++++++++++++++++ getPipeline +++++++++++++++++++++++++++++++
     def getPipeline(self, name=None, *, settings=None, settingsName=None, storageOptionsByBackend=None, sslRootCert=None):
