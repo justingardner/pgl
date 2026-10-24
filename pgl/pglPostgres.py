@@ -61,6 +61,7 @@ class pglPostgresTransport:
             "connect_timeout": postgres.connectTimeoutSeconds,
             "sslmode": postgres.databaseSSLMode,
             "autocommit": True,
+            "application_name": f"pgl:{getpass.getuser()}@{socket.gethostname()}:pid={os.getpid()}"[:63],
         }
 
         if sslRootCert:
@@ -1678,21 +1679,32 @@ class pglPostgres(pglTraitSettings):
     # ------------------------------------------------------------ 
     @staticmethod
     def acquireTransactionLock(connection, lockName, *, description="database operation", timeoutSeconds=30.0, pollSeconds=0.25):
-        """Acquire a named transaction advisory lock with bounded contention wait.
+        """Acquire a transaction advisory lock with bounded contention waiting.
 
-        Requires an explicit active transaction.
-        The lock remains held until that transaction ends.
+        Requires an active explicit transaction.
+        The acquired lock remains held until that transaction ends.
 
-        Reports contention once and raises TimeoutError on deadline.
-        Callers must let failures unwind their transaction context.
+        On initial contention:
+            Report the operation and timeout.
+            Inspect the exact advisory lock and display its current holders.
+            Remember displayed connection identities for PID-only recovery.
 
-        The deadline bounds lock-contention retries, not network stalls
-        inside an individual SQL request.
+        Lock diagnostics use a savepoint so a diagnostic SQL failure does not
+        invalidate the enclosing save transaction.
+
+        Raises TimeoutError on contention deadline. The caller must let that
+        exception unwind its transaction before handling it.
+
+        The deadline bounds contention retries, not network stalls inside an
+        individual SQL request. No connection is automatically terminated.
         """
         import math
         import time
 
         from psycopg.pq import TransactionStatus
+        from psycopg.rows import dict_row
+
+        from .pglDatabase import pglDatabase
 
         if not isinstance(lockName, str) or not lockName or "\x00" in lockName:
             raise ValueError("lockName must be a nonempty string without NUL.")
@@ -1704,6 +1716,79 @@ class pglPostgres(pglTraitSettings):
         if connection.info.transaction_status != TransactionStatus.INTRANS:
             raise RuntimeError("acquireTransactionLock() requires an active explicit transaction.")
 
+        def reportLockOwners():
+            """Inspect holders of this exact bigint advisory-lock key."""
+            statement = """
+                WITH requested AS (
+                    SELECT hashtextextended(%s, 0) AS lock_key
+                )
+                SELECT
+                    a.pid,
+                    a.backend_start AS "backendStart",
+                    a.usename AS "databaseUser",
+                    a.application_name AS "clientIdentity",
+                    a.client_addr AS "clientAddress",
+                    a.state,
+                    clock_timestamp() - a.backend_start AS "connectionAge",
+                    clock_timestamp() - a.xact_start AS "transactionAge",
+                    clock_timestamp() - a.state_change AS "stateAge",
+                    CASE
+                        WHEN a.state IN (
+                            'idle',
+                            'idle in transaction',
+                            'idle in transaction (aborted)'
+                        )
+                        THEN clock_timestamp() - a.state_change
+                        ELSE NULL
+                    END AS "idleTime",
+                    a.wait_event_type AS "waitType",
+                    a.wait_event AS "waitEvent",
+                    pg_blocking_pids(a.pid) AS "blockingPIDs",
+                    (
+                        SELECT count(*)
+                        FROM pg_locks AS held
+                        WHERE held.pid = a.pid
+                          AND held.locktype = 'advisory'
+                          AND held.granted
+                    ) AS "heldAdvisoryLocks",
+                    left(a.query, 1000) AS "lastQuery"
+                FROM requested AS requested_lock
+                JOIN pg_locks AS lock
+                  ON lock.locktype = 'advisory'
+                 AND lock.objsubid = 1
+                 AND lock.classid::bigint =
+                     ((requested_lock.lock_key >> 32) & 4294967295::bigint)
+                 AND lock.objid::bigint =
+                     (requested_lock.lock_key & 4294967295::bigint)
+                 AND lock.database = (
+                     SELECT oid
+                     FROM pg_database
+                     WHERE datname = current_database()
+                 )
+                JOIN pg_stat_activity AS a ON a.pid = lock.pid
+                WHERE lock.granted
+                  AND a.pid <> pg_backend_pid()
+                ORDER BY a.pid
+            """
+
+            try:
+                # This creates a savepoint within the caller's transaction.
+                with connection.transaction():
+                    with connection.cursor(row_factory=dict_row) as cursor:
+                        cursor.execute(statement, (lockName,))
+                        records = cursor.fetchall()
+
+            except Exception as error:
+                pglMessages.warning(f"Could not inspect the lock owner ({type(error).__name__}). The bounded lock wait will continue.", level=0)
+                return
+
+            if not records:
+                pglMessages.message("Lock owner changed or is unavailable to inspection; retrying acquisition.")
+                return
+
+            for record in records:
+                pglMessages.message(f"Lock holder: {pglDatabase._formatPostgresLock(record)}", wrapText=False)
+
         started = time.monotonic()
         deadline = started + timeoutSeconds
         reportedWait = False
@@ -1711,27 +1796,24 @@ class pglPostgres(pglTraitSettings):
         while True:
             if reportedWait and time.monotonic() >= deadline:
                 raise TimeoutError(
-                    f"Timed out after {timeoutSeconds:g} s waiting for {description}: "
-                    "another database session holds a conflicting lock. "
-                    "It may still be working or may have an unfinished transaction."
+                    f"Timed out after {timeoutSeconds:g} s waiting for {description}. "
+                    "Another database session held a conflicting lock. "
+                    "Run pglDatabase.inspectPostgresLocks() to inspect current owners. "
+                    "An idle database connection may still be uploading or verifying files."
                 )
 
-            acquired = connection.execute(
-                "SELECT pg_try_advisory_xact_lock(hashtextextended(%s, 0))",
-                (lockName,),
-            ).fetchone()[0]
+            acquired = connection.execute("SELECT pg_try_advisory_xact_lock(hashtextextended(%s, 0))", (lockName,)).fetchone()[0]
 
             if acquired:
                 if reportedWait:
                     pglMessages.message(f"Lock acquired for {description} after {time.monotonic() - started:.1f} s.")
+
                 return
 
             if not reportedWait:
-                pglMessages.message(
-                    f"Waiting for {description}: another database session holds "
-                    f"a conflicting lock (timeout: {timeoutSeconds:g} s)..."
-                )
+                pglMessages.message(f"Waiting for {description}: another database session holds a conflicting lock (timeout: {timeoutSeconds:g} s)...")
                 reportedWait = True
+                reportLockOwners()
 
             remaining = deadline - time.monotonic()
 
@@ -2070,4 +2152,210 @@ class pglPostgres(pglTraitSettings):
         pglMessages.message(f"Verified PostgreSQL {version}")
         pglMessages.message(f"Verified data directory: {self.dataDirectory}")
         pglMessages.message(f"Verified endpoint: {self.postgresHost}:{self.postgresPort}")
+        return True
+    
+    def inspectLocks(self, *, user=None, sslRootCert=None):
+        """Return advisory-lock holders and blocked sessions in this database.
+
+        Uses normal direct/SSH client access.
+        Returns None on connection cancellation.
+
+        A transaction's age or idle state does not establish abandonment.
+        Query text and other-role visibility depend on PostgreSQL permissions.
+
+        Does not cancel queries, terminate connections, or change data.
+        """
+        from psycopg.rows import dict_row
+
+        statement = """
+            SELECT
+                a.pid,
+                a.backend_start AS "backendStart",
+                a.usename AS "databaseUser",
+                a.application_name AS "clientIdentity",
+                a.client_addr AS "clientAddress",
+                a.state,
+                clock_timestamp() - a.backend_start AS "connectionAge",
+                clock_timestamp() - a.xact_start AS "transactionAge",
+                clock_timestamp() - a.state_change AS "stateAge",
+                CASE
+                    WHEN a.state IN ('idle', 'idle in transaction', 'idle in transaction (aborted)')
+                    THEN clock_timestamp() - a.state_change
+                    ELSE NULL
+                END AS "idleTime",
+                a.wait_event_type AS "waitType",
+                a.wait_event AS "waitEvent",
+                pg_blocking_pids(a.pid) AS "blockingPIDs",
+                (
+                    SELECT count(*)
+                    FROM pg_locks AS l
+                    WHERE l.pid = a.pid
+                      AND l.locktype = 'advisory'
+                      AND l.granted
+                ) AS "heldAdvisoryLocks",
+                left(a.query, 1000) AS "lastQuery"
+            FROM pg_stat_activity AS a
+            WHERE a.datname = current_database()
+              AND a.pid <> pg_backend_pid()
+              AND (
+                  EXISTS (
+                      SELECT 1
+                      FROM pg_locks AS l
+                      WHERE l.pid = a.pid
+                        AND l.locktype = 'advisory'
+                  )
+                  OR cardinality(pg_blocking_pids(a.pid)) > 0
+              )
+            ORDER BY a.xact_start NULLS LAST, a.pid
+        """
+
+        with self.connect(user=user, sslRootCert=sslRootCert) as connection:
+            if connection is None:
+                return None
+
+            with connection.cursor(row_factory=dict_row) as cursor:
+                cursor.execute(statement)
+                return cursor.fetchall()
+            
+    def terminateLockOwner(self, pid, backendStart, *, sslRootCert=None):
+        """Administratively terminate a confirmed abandoned advisory-lock owner.
+
+        Uses the configured administrator role over normal client transport.
+        Requires PID plus backendStart from inspectLocks() and typed confirmation.
+
+        Refuses an owner with currently blocked followers. Resolve abandoned
+        waiting saves first; otherwise releasing the owner could start them.
+
+        Terminates the whole connection, not just one lock. Its uncommitted
+        transaction rolls back. Payload files are not removed.
+
+        Returns True for confirmed termination, False for refusal/cancellation,
+        or None for administrator connection cancellation.
+
+        PostgreSQL permissions remain authoritative. This method's admin-only
+        interface does not revoke PostgreSQL's ability for a role to signal
+        its own other sessions through direct SQL.
+        """
+        from datetime import datetime
+        from pprint import pformat
+
+        from psycopg.rows import dict_row
+
+        if type(pid) is not int or pid <= 0:
+            raise ValueError("pid must be a positive integer.")
+
+        if not isinstance(backendStart, datetime) or backendStart.tzinfo is None:
+            raise ValueError("backendStart must be the timezone-aware value returned by inspectLocks().")
+
+        statement = """
+            SELECT
+                a.pid,
+                a.backend_start AS "backendStart",
+                a.usename AS "databaseUser",
+                a.application_name AS "clientIdentity",
+                a.state,
+                clock_timestamp() - a.xact_start AS "transactionAge",
+                clock_timestamp() - a.state_change AS "stateAge",
+                left(a.query, 1000) AS "lastQuery",
+                ARRAY(
+                    SELECT follower.pid
+                    FROM pg_stat_activity AS follower
+                    WHERE a.pid = ANY(pg_blocking_pids(follower.pid))
+                    ORDER BY follower.pid
+                ) AS "waitingPIDs"
+            FROM pg_stat_activity AS a
+            WHERE a.pid = %s
+              AND a.backend_start = %s
+              AND a.datname = current_database()
+              AND a.pid <> pg_backend_pid()
+              AND EXISTS (
+                  SELECT 1
+                  FROM pg_locks AS l
+                  WHERE l.pid = a.pid
+                    AND l.locktype = 'advisory'
+                    AND l.granted
+              )
+        """
+
+        with self.connect(user=self.adminUser, sslRootCert=sslRootCert) as connection:
+            if connection is None:
+                return None
+
+            if connection.execute("SELECT current_user").fetchone() != (self.adminUser,):
+                raise PermissionError("Lock-owner termination requires the configured administrator account.")
+
+            with connection.cursor(row_factory=dict_row) as cursor:
+                cursor.execute(statement, (pid, backendStart))
+                owner = cursor.fetchone()
+
+            if owner is None:
+                pglMessages.warning("That exact connection no longer holds an advisory lock in this database. Nothing was terminated.", level=0)
+                return False
+
+            pglMessages.message(pformat(owner, sort_dicts=False), wrapText=False)
+
+            if owner["waitingPIDs"]:
+                pglMessages.warning(f"Refusing to terminate this owner while sessions {owner['waitingPIDs']} are queued behind it. Cancel confirmed abandoned waiting saves first, then inspect again.", level=2)
+                return False
+
+            pglMessages.warning("Only continue if this connection belongs to an abandoned operation. A database-idle connection may still be uploading files. Termination rolls back uncommitted SQL but does not remove uploaded files.", level=2)
+            expected = f"terminate {pid}"
+
+            try:
+                response = input(f"Type '{expected}' to terminate this connection; anything else cancels: ")
+            except (KeyboardInterrupt, EOFError, OSError):
+                pglMessages.message("Termination cancelled.")
+                return False
+
+            if response.strip() != expected:
+                pglMessages.message("Termination cancelled.")
+                return False
+
+            # Fresh autocommit query after confirmation: no diagnostic snapshot
+            # or transaction is kept open while waiting for user input.
+            with connection.cursor(row_factory=dict_row) as cursor:
+                cursor.execute(statement, (pid, backendStart))
+                current = cursor.fetchone()
+
+            if current is None:
+                pglMessages.warning("The connection is gone or no longer holds an advisory lock. Nothing was terminated.", level=0)
+                return False
+
+            if current["waitingPIDs"]:
+                pglMessages.warning(f"New waiting sessions appeared: {current['waitingPIDs']}. Nothing was terminated; inspect again.", level=2)
+                return False
+
+            result = connection.execute(
+                """
+                SELECT pg_terminate_backend(a.pid, 5000)
+                FROM pg_stat_activity AS a
+                WHERE a.pid = %s
+                  AND a.backend_start = %s
+                  AND a.datname = current_database()
+                  AND a.pid <> pg_backend_pid()
+                  AND EXISTS (
+                      SELECT 1
+                      FROM pg_locks AS l
+                      WHERE l.pid = a.pid
+                        AND l.locktype = 'advisory'
+                        AND l.granted
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM pg_stat_activity AS follower
+                      WHERE a.pid = ANY(pg_blocking_pids(follower.pid))
+                  )
+                """,
+                (pid, backendStart),
+            ).fetchone()
+
+        if result is None:
+            pglMessages.warning("The termination conditions changed. Nothing was terminated; inspect again.", level=0)
+            return False
+
+        if not result[0]:
+            pglMessages.warning("Termination was not confirmed. Inspect PostgreSQL activity before retrying.", level=2)
+            return False
+
+        pglMessages.message(f"Connection {pid} terminated. Its transaction locks are released; uploaded payload files were not removed.")
         return True

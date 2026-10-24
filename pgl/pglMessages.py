@@ -108,35 +108,40 @@ class pglMessages:
     
     @staticmethod
     def wrapText(msg: str, lineLength: int = 120) -> str:
-        """
-        Split msg into lines, preferring to break at a space.
-        If no space is found within lineLength characters, break at lineLength anyway.
+        """Wrap each existing line independently, preserving explicit newlines.
 
-        Args:
-            msg: The string to wrap.
-            lineLength: Max characters per line (default 80).
+        Prefer breaking at spaces; split long unbroken strings when needed.
+        Preserve blank lines and trailing newlines.
+        Normalize Windows and old Mac line endings to newline characters.
 
-        Returns:
-            The message with '\n' inserted as needed.
+        lineLength limits message text only, not caller prefixes or warning
+        decorations added afterward.
         """
+        if not isinstance(msg, str):
+            raise TypeError("msg must be a string.")
+
+        if type(lineLength) is not int or lineLength <= 0:
+            raise ValueError("lineLength must be a positive integer.")
+
         lines = []
-        remaining = msg
+        normalized = msg.replace("\r\n", "\n").replace("\r", "\n")
 
-        while len(remaining) > lineLength:
-            # Look for the last space within the lineLength window
-            breakAt = remaining.rfind(' ', 0, lineLength + 1)
+        for originalLine in normalized.split("\n"):
+            remaining = originalLine
 
-            if breakAt == -1:
-                # No space found within window; hard break at lineLength
-                breakAt = lineLength
-                lines.append(remaining[:breakAt])
-                remaining = remaining[breakAt:]
-            else:
-                lines.append(remaining[:breakAt])
-                remaining = remaining[breakAt + 1:]  # skip the space
+            while len(remaining) > lineLength:
+                breakAt = remaining.rfind(" ", 0, lineLength + 1)
 
-        lines.append(remaining)
-        return '\n'.join(lines) 
+                if breakAt <= 0:
+                    lines.append(remaining[:lineLength])
+                    remaining = remaining[lineLength:]
+                else:
+                    lines.append(remaining[:breakAt])
+                    remaining = remaining[breakAt + 1:]
+
+            lines.append(remaining)
+
+        return "\n".join(lines)
         
     @classmethod
     def oneTimeWarning(cls, msg, level=2):

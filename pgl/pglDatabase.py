@@ -315,12 +315,6 @@ class pglDatabase:
         if activity is None:
             return None
 
-        pglMessages.message(
-            f"PostgreSQL activity: database={postgres.databaseName}, "
-            f"schema={postgres.databaseSchema}, transport={postgres.connectionTransport}",
-            wrapText=False,
-        )
-
         if not activity:
             pglMessages.message("No other sessions are currently connected to this database.")
             return activity
@@ -329,6 +323,165 @@ class pglDatabase:
             pglMessages.message(pformat(entry, sort_dicts=False), wrapText=False)
 
         return activity
+    
+    @classmethod
+    def inspectPostgresLocks(cls, *, settings=None, settingsName=None, sslRootCert=None, verbose=False, returnRecords=False):
+        """Display lock-related sessions and remember their connection identity.
+
+        Default:
+            One line per session, with PID, database owner, client identity,
+            state/ages, advisory-lock count, and blocking PIDs.
+
+        verbose=True:
+            Also display the complete diagnostic dictionaries.
+
+        returnRecords=True:
+            Return the records for programmatic use. Otherwise return None
+            to avoid duplicate notebook output.
+
+        Displayed PID/backend-start pairs are remembered in this Python
+        process, scoped to the configured database, for safe recovery using
+        terminatePostgresLock(pid).
+
+        Diagnostic information does not establish abandonment. A database-idle
+        session may still be uploading or verifying payloads.
+
+        Does not terminate sessions or modify database data.
+        """
+        from pprint import pformat
+
+        from .pglPostgres import pglPostgres
+
+        if type(verbose) is not bool or type(returnRecords) is not bool:
+            raise ValueError("verbose and returnRecords must be booleans.")
+
+        postgres = pglPostgres.fromSettings(settings=settings, settingsName=settingsName)
+
+        if postgres is None:
+            return None
+
+        records = postgres.inspectLocks(sslRootCert=sslRootCert)
+
+        if records is None:
+            return None
+
+        databaseKey = json.dumps(cls._checkpointDatabaseIdentity(postgres), sort_keys=True)
+        snapshots = dict(getattr(cls, "_postgresLockSnapshots", {}))
+
+        # Replace this database's snapshot, preserving other database entries.
+        snapshots = {key: value for key, value in snapshots.items() if key[0] != databaseKey}
+
+        for record in records:
+            snapshots[(databaseKey, record["pid"])] = dict(record)
+
+        cls._postgresLockSnapshots = snapshots
+
+        #pglMessages.message(f"PostgreSQL locks: {postgres.databaseName}.{postgres.databaseSchema}", wrapText=False)
+
+        if not records:
+            pglMessages.message("No advisory-lock holders or blocked sessions found.")
+        else:
+            for record in records:
+                pglMessages.message(cls._formatPostgresLock(record), wrapText=False)
+
+                if verbose:
+                    pglMessages.message(pformat(record, sort_dicts=False), wrapText=False)
+
+            pglMessages.message("Idle does not mean abandoned. Confirm ownership before terminating; recovery uses terminatePostgresLock(PID).", wrapText=False)
+
+        return records if returnRecords else None
+    
+    @classmethod
+    def terminatePostgresLock(cls, pid, *, settings=None, settingsName=None, sslRootCert=None):
+        """Administratively terminate a previously inspected abandoned owner.
+
+        Requires only the displayed PID. The connection start time is retrieved
+        from this process's latest inspection of the same configured database.
+
+        Refuses targets that have not been inspected in this Python process.
+        The underlying pglPostgres method rechecks connection identity, requires
+        administrator authentication and confirmation, and refuses owners with
+        queued followers.
+
+        Does not remove payload files or retry saves.
+        """
+        from .pglPostgres import pglPostgres
+
+        if type(pid) is not int or pid <= 0:
+            raise ValueError("pid must be a positive integer.")
+
+        postgres = pglPostgres.fromSettings(settings=settings, settingsName=settingsName)
+
+        if postgres is None:
+            return None
+
+        databaseKey = json.dumps(cls._checkpointDatabaseIdentity(postgres), sort_keys=True)
+        snapshotKey = (databaseKey, pid)
+        snapshots = getattr(cls, "_postgresLockSnapshots", {})
+        owner = snapshots.get(snapshotKey)
+
+        if owner is None:
+            pglMessages.warning(f"PID {pid} has not been inspected in this Python process for this database. Run pglDatabase.inspectPostgresLocks() with the same settings first, then retry.", level=1)
+            return False
+
+        if not owner.get("heldAdvisoryLocks"):
+            pglMessages.warning(f"PID {pid} was not an advisory-lock holder in the last inspection. Inspect again; this operation is for confirmed abandoned lock owners.", level=1)
+            return False
+
+        pglMessages.message(f"Selected: {cls._formatPostgresLock(owner)}", wrapText=False)
+
+        try:
+            result = postgres.terminateLockOwner(pid, owner["backendStart"], sslRootCert=sslRootCert)
+
+        except psycopg.errors.InsufficientPrivilege:
+            pglMessages.warning("PostgreSQL refused termination. The configured administrator account lacks permission to terminate this backend. No automatic privilege changes were attempted.", level=2)
+            return False
+
+        except (psycopg.OperationalError, psycopg.InterfaceError, ConnectionError, TimeoutError):
+            pglMessages.warning("The administrator connection failed. Termination may not have completed; restore connectivity and inspect PostgreSQL activity before retrying.", level=2)
+            return None
+
+        if result:
+            snapshots.pop(snapshotKey, None)
+
+        return result
+    
+    @staticmethod
+    def _formatPostgresLock(record):
+        """Format one diagnostic record without exposing full SQL by default."""
+
+        def formatAge(value):
+            if value is None:
+                return "-"
+
+            seconds = max(0, int(value.total_seconds()))
+
+            if seconds < 60:
+                return f"{seconds}s"
+
+            if seconds < 3600:
+                return f"{seconds // 60}m{seconds % 60:02d}s"
+
+            return f"{seconds // 3600}h{seconds % 3600 // 60:02d}m"
+
+        def singleLine(value):
+            return " ".join(str(value).split())
+
+        pid = record["pid"]
+        owner = singleLine(record.get("databaseUser") or "unknown")
+        client = singleLine(record.get("clientIdentity") or "client unidentified")
+        state = singleLine(record.get("state") or "unknown")
+        stateAge = formatAge(record.get("stateAge"))
+        connectionAge = formatAge(record.get("connectionAge"))
+        transactionAge = formatAge(record.get("transactionAge"))
+        heldLocks = record.get("heldAdvisoryLocks", 0)
+        blockingPIDs = record.get("blockingPIDs") or []
+        blockers = ",".join(str(value) for value in blockingPIDs) or "none"
+        waitType = record.get("waitType")
+        waitEvent = record.get("waitEvent")
+        waitLabel = f" | wait: {singleLine(waitType)}/{singleLine(waitEvent)}" if waitType else ""
+
+        return f"PID {pid} | {owner} | {client} | {state} {stateAge} | connected {connectionAge} | transaction {transactionAge} | holds {heldLocks} advisory locks | blocked by: {blockers}{waitLabel}"
     
     @classmethod
     def _saveModifiedSettings(cls, modifiedSettingsList, originalSettingsList):
@@ -802,88 +955,206 @@ class pglDatabase:
         Missing-label validation occurs before configuration or publication.
         allowMissingMetadata permits missing labels, not malformed settings.
 
-        Progress is approximate and weighted toward payload transfer and
-        verification. Success is shown only after commit and connection cleanup.
+        Returns:
+            Checkpoint ID after successful commit and connection cleanup.
+            None for rejected labels, unavailable configuration, connection
+            cancellation, or handled lock/connection/timeout failures.
 
-        Returns the checkpoint ID, or None for rejected labels, unavailable
-        configuration, or connection cancellation. Other errors propagate.
+        Expected operational failures warn after resource contexts unwind.
+        Authentication, host-key, integrity, programming, and other unexpected
+        SSH errors propagate. KeyboardInterrupt also propagates.
+
+        Connection failure during commit can leave its outcome uncertain.
+        Cleanup failure after confirmed commit does not undo publication.
 
         SQL changes are transactional; filesystem writes are not.
-        Interrupted/failed saves may leave unregistered payloads.
+        Failed saves may leave unregistered payloads.
+        No automatic retry, lock-owner termination, or payload deletion occurs.
         """
         from time import perf_counter
 
+        from paramiko import SSHException
+        from paramiko.ssh_exception import AuthenticationException, BadHostKeyException
+
         from .pglPostgres import pglPostgres
 
-        if not cls._checkRawSessionLabels(session, allowMissingMetadata=allowMissingMetadata):
-            return None
-
-        if session.dataMatrices:
-            productNames = list(session.dataMatrices)
-            pglMessages.warning(f"saveRawSession() saves acquisition contents only. Attached data matrices {productNames!r} will not be included in this checkpoint. Working attachments are unchanged; use saveSession() to preserve them.", level=1)
-
-        resolvedSettings = cls.getSettings(settings=settings, settingsName=settingsName)
-
-        if resolvedSettings is None:
-            pglMessages.warning("Cannot save raw session: could not resolve PGL settings.", level=0)
-            return None
-
-        username = resolvedSettings.username
-
-        if not isinstance(username, str) or not username.strip() or "\x00" in username:
-            pglMessages.warning("Cannot save raw session: set a valid username in PGL settings.", level=0)
-            return None
-
-        databasePath = resolvedSettings.databasePath.strip()
+        sessionID = None
+        commitAttempted = False
+        commitConfirmed = False
+        operation = "validating raw acquisition metadata"
         saveStarted = perf_counter()
 
-        with pglProgress() as progress:
-            progress(0, "Loading PostgreSQL configuration")
-            postgres = pglPostgres.fromSettings(settings=resolvedSettings)
+        def isDroppedSSHConnection(error):
+            """Recognize connection loss without hiding SSH security failures."""
+            if isinstance(error, (AuthenticationException, BadHostKeyException)):
+                return False
 
-            if postgres is None:
-                progress(None, "PostgreSQL configuration unavailable")
+            if not isinstance(error, SSHException):
+                return False
+
+            message = str(error).strip().lower()
+
+            return message.startswith("server connection dropped:") or message in {
+                "socket is closed",
+                "socket is closed.",
+                "server connection dropped",
+                "ssh session not active",
+                "no existing session",
+            }
+
+        def warnSaveFailure(reason, *, inspectLocks=False):
+            """Warn after cleanup and optionally show concise lock diagnostics."""
+            if commitConfirmed:
+                outcome = (
+                    f"Raw checkpoint {sessionID}: the database transaction committed, "
+                    "but subsequent cleanup failed. The checkpoint was not rolled back. "
+                    "This call returns no checkpoint ID, so the working session's "
+                    "checkpoint identity was not updated."
+                )
+            elif commitAttempted:
+                outcome = (
+                    f"Raw checkpoint {sessionID}: the failure occurred during commit. "
+                    "The commit outcome is not confirmed by this client. "
+                    "The checkpoint may already have been saved."
+                )
+            else:
+                outcome = (
+                    "The final checkpoint commit was not attempted. "
+                    "Transaction and connection cleanup were attempted. "
+                    "If PostgreSQL is unreachable, its transaction and locks may remain "
+                    "until the server detects the disconnected client."
+                )
+
+            pglMessages.warning(
+                f"Raw session save stopped while {operation}: {reason}. \n\n"
+                f"{outcome} Partial or unregistered payload files may remain. "
+                "No automatic retry or connection termination was performed.",
+                level=2,
+            )
+
+            if inspectLocks:
+
+                try:
+                    cls.inspectPostgresLocks(settings=settings, settingsName=settingsName, sslRootCert=sslRootCert)
+                except Exception as diagnosticError:
+                    # Diagnostics must not replace the original save failure.
+                    # Do not print backend exception text containing credentials.
+                    pglMessages.warning(f"Lock inspection was unavailable ({type(diagnosticError).__name__}). Restore connectivity and run pglDatabase.inspectPostgresLocks() with the same database settings.", level=1)
+
+                pglMessages.message("For a confirmed abandoned lock, use pglDatabase.terminatePostgresLock(PID). Administrator authorization and confirmation are required. Current holders are not necessarily the original blocker.", wrapText=False)
+            else:
+                pglMessages.message("Check VPN/network and database/storage availability. After restoring connectivity, run pglDatabase.inspectPostgres() before retrying.", wrapText=False)
+
+            if commitAttempted:
+                pglMessages.message("Check pglDatabase.print() to establish whether the checkpoint was saved before retrying.", wrapText=False)
+
+        try:
+            if not cls._checkRawSessionLabels(session, allowMissingMetadata=allowMissingMetadata):
                 return None
 
-            baseline = session._checkpointBaseline
+            if session.dataMatrices:
+                productNames = list(session.dataMatrices)
+                pglMessages.warning(f"saveRawSession() saves acquisition contents only. Attached data matrices {productNames!r} will not be included in this checkpoint. Working attachments are unchanged; use saveSession() to preserve them.", level=1)
 
-            if baseline and baseline["databaseIdentity"] != cls._checkpointDatabaseIdentity(postgres):
-                pglMessages.warning("Cannot save this session to a different database. Cross-database checkpoint transfer is not implemented; session IDs are local to their database.")
-                progress(None, "Database identity mismatch")
+            operation = "resolving database settings"
+            resolvedSettings = cls.getSettings(settings=settings, settingsName=settingsName)
+
+            if resolvedSettings is None:
+                pglMessages.warning("Cannot save raw session: could not resolve PGL settings.", level=0)
                 return None
 
-            if backendID is None and not postgres.storageLocations:
-                pglMessages.warning("Cannot save session: no storageLocations are configured in the PostgreSQL configuration.", level=0)
-                progress(None, "No storage destination configured")
+            username = resolvedSettings.username
+
+            if not isinstance(username, str) or not username.strip() or "\x00" in username:
+                pglMessages.warning("Cannot save raw session: set a valid username in PGL settings.", level=0)
                 return None
 
-            progress(0.01, "Connecting to PostgreSQL")
+            databasePath = resolvedSettings.databasePath.strip()
 
-            with postgres.connect(sslRootCert=sslRootCert) as connection:
-                if connection is None:
-                    progress(None, "Connection cancelled")
+            with pglProgress() as progress:
+                operation = "loading PostgreSQL configuration"
+                progress(0, "Loading PostgreSQL configuration")
+                postgres = pglPostgres.fromSettings(settings=resolvedSettings)
+
+                if postgres is None:
+                    progress(None, "PostgreSQL configuration unavailable")
                     return None
 
-                with connection.transaction():
-                    if backendID is None:
-                        progress(0.03, "Resolving storage destination / acquiring registration lock")
-                        backendID = cls._getConfiguredStorageBackend(connection, postgres, storageOptions=storageOptions)
+                baseline = session._checkpointBaseline
 
-                    progress(0.04, "Resolving checkpoint owner")
-                    createdBy = cls.getOrCreateUser(connection, postgres, username)
+                if baseline and baseline["databaseIdentity"] != cls._checkpointDatabaseIdentity(postgres):
+                    pglMessages.warning("Cannot save this session to a different database. Cross-database checkpoint transfer is not implemented; session IDs are local to their database.")
+                    progress(None, "Database identity mismatch")
+                    return None
 
-                    progress(0.05, "Preparing raw checkpoint")
-                    sessionID = cls._saveRawSession(connection, postgres, session, createdBy, backendID, storageOptions=storageOptions, progress=progress)
+                if backendID is None and not postgres.storageLocations:
+                    pglMessages.warning("Cannot save raw session: no storageLocations are configured in the PostgreSQL configuration.", level=0)
+                    progress(None, "No storage destination configured")
+                    return None
 
-                    progress(0.98, "Committing transaction")
+                operation = "connecting to PostgreSQL"
+                progress(0.01, "Connecting to PostgreSQL")
 
-                progress(0.99, "Closing PostgreSQL connection and tunnel")
+                with postgres.connect(sslRootCert=sslRootCert) as connection:
+                    if connection is None:
+                        progress(None, "Connection cancelled")
+                        return None
 
-            progress.finish(f"Raw checkpoint {sessionID} saved")
+                    with connection.transaction():
+                        if backendID is None:
+                            operation = "resolving storage destination and acquiring its registration lock"
+                            progress(0.03, "Resolving storage destination / acquiring registration lock")
+                            backendID = cls._getConfiguredStorageBackend(connection, postgres, storageOptions=storageOptions)
+
+                        operation = "resolving checkpoint owner"
+                        progress(0.04, "Resolving checkpoint owner")
+                        createdBy = cls.getOrCreateUser(connection, postgres, username)
+
+                        operation = "preparing, transferring, verifying, or registering checkpoint contents"
+                        progress(0.05, "Preparing raw checkpoint")
+                        sessionID = cls._saveRawSession(connection, postgres, session, createdBy, backendID, storageOptions=storageOptions, progress=progress)
+
+                        operation = "committing the checkpoint transaction"
+                        progress(0.98, "Committing transaction")
+
+                        # The outer transaction commits as its context exits.
+                        # Set this immediately before leaving that context.
+                        commitAttempted = True
+
+                    # Successful transaction-context exit confirms commit.
+                    commitConfirmed = True
+                    operation = "closing the PostgreSQL connection and tunnel"
+                    progress(0.99, "Closing PostgreSQL connection and tunnel")
+
+                progress.finish(f"Raw checkpoint {sessionID} saved")
+
+        except psycopg.errors.LockNotAvailable:
+            warnSaveFailure("PostgreSQL could not acquire a required lock", inspectLocks=True)
+            return None
+
+        except TimeoutError:
+            # Python TimeoutError is used by both our advisory-lock helper
+            # and network/SFTP operations. Do not label every timeout a lock.
+            warnSaveFailure("a lock wait, connection attempt, or I/O operation timed out", inspectLocks=True)
+            return None
+
+        except SSHException as error:
+            if not isDroppedSSHConnection(error):
+                raise
+
+            warnSaveFailure("the SSH/SFTP connection was lost")
+            return None
+
+        except (psycopg.OperationalError, psycopg.InterfaceError):
+            warnSaveFailure("a PostgreSQL connection or operational failure occurred")
+            return None
+
+        except ConnectionError:
+            warnSaveFailure("a network connection failed")
+            return None
 
         pglMessages.message(f"Raw checkpoint {sessionID} is complete. Database configuration: {databasePath} (database={postgres.databaseName}, schema={postgres.databaseSchema}; {perf_counter() - saveStarted:.1f} s total).", wrapText=False)
         return sessionID
-
 
     # -------------------------------------------------------------------------
     # Sessions: annotations and lifecycle
