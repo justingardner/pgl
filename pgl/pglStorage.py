@@ -555,26 +555,41 @@ class pglStorage:
 
     # +++++++++++++++++++++++++++++ hashFile ++++++++++++++++++++++++++++++++
     @staticmethod
-    def hashFile(filesystem, path, chunkSize=1024 * 1024):
-        """Compute a file's SHA-256 and byte count with bounded read buffers.
+    def hashFile(filesystem, path, chunkSize=1024 * 1024, *, progress=None, expectedSize=None, description="Hashing file"):
+        """Compute SHA-256 and byte count with optional progress reporting.
 
-        Usage:
-            identity = pglStorage.hashFile(filesystem, path)
+        progress receives (fraction, description).
+        expectedSize affects progress estimation only; actual bytes are read
+        through EOF and returned for the caller's integrity comparison.
 
-        Returns:
-            {"sha256": lowercaseDigest, "size_bytes": byteCount}
-
-        Reads the entire file without retaining it in memory.
-        Does not modify the file or register its identity.
-        Filesystem and read errors propagate.
-
-        Callers requiring a stable snapshot must prevent concurrent mutation.
+        Does not modify files or register database records.
         """
         if type(chunkSize) is not int or chunkSize <= 0:
             raise ValueError("chunkSize must be a positive integer.")
 
+        if expectedSize is not None and (type(expectedSize) is not int or expectedSize < 0):
+            raise ValueError("expectedSize must be a nonnegative integer or None.")
+
+        if progress is not None and not callable(progress):
+            raise TypeError("progress must be callable or None.")
+
         digest = hashlib.sha256()
         sizeBytes = 0
+
+        def reportProgress(finished=False):
+            if progress is None:
+                return
+
+            if expectedSize is None:
+                fraction = 1.0 if finished else None
+                detail = f"{sizeBytes / 1048576:.1f} MiB read"
+            else:
+                fraction = 1.0 if finished else min(sizeBytes / max(expectedSize, 1), 1.0)
+                detail = f"{sizeBytes / 1048576:.1f} / {expectedSize / 1048576:.1f} MiB"
+
+            progress(fraction, f"{description} — {detail}")
+
+        reportProgress()
 
         with filesystem.open(path, "rb") as source:
             while True:
@@ -585,39 +600,23 @@ class pglStorage:
 
                 digest.update(chunk)
                 sizeBytes += len(chunk)
+                reportProgress()
 
+        reportProgress(finished=True)
         return {"sha256": digest.hexdigest(), "size_bytes": sizeBytes}
 
     # +++++++++++++++++++++++++ copyVerifiedFile ++++++++++++++++++++++++++++
     @classmethod
-    def copyVerifiedFile(cls, sourceFilesystem, sourcePath, destinationFilesystem, destinationRoot, expected, *, objectKey):
-        """Copy a file to a relative key and verify source and stored bytes.
+    def copyVerifiedFile(cls, sourceFilesystem, sourcePath, destinationFilesystem, destinationRoot, expected, *, objectKey, progress=None):
+        """Copy exclusively and verify both source and stored bytes.
 
-        Called by:
-            Standalone export code requiring verified copies.
-            pglDatabase when staging checkpoint payloads.
+        progress receives (fraction, description).
+        Copying receives half the progress range; read-back verification
+        receives the other half.
 
-        Parameters:
-            sourceFilesystem, sourcePath:
-                Source file location.
-            destinationFilesystem, destinationRoot:
-                Destination filesystem and containing directory.
-            expected:
-                Mapping containing sha256 and size_bytes.
-            objectKey:
-                Relative POSIX path beneath destinationRoot.
-
-        Returns:
-            {"object_key": objectKey, "sha256": digest, "size_bytes": size}
-
-        Creates parent directories and uses exclusive file creation.
-        Does not deliberately overwrite an existing file or fall back to
-        overwrite mode if the backend rejects exclusive creation.
-
-        Hashes bytes while copying, then rereads the destination to verify it.
-        Failure can leave an incomplete or invalid destination file.
-        No cleanup, database registration, or publication is performed.
-        Exceptions propagate.
+        Preserves exclusive creation and all content-identity checks.
+        Errors propagate and may leave incomplete or unregistered files.
+        Does not register database records or publish a checkpoint.
         """
         expectedHash = expected["sha256"]
         expectedSize = expected["size_bytes"]
@@ -631,11 +630,24 @@ class pglStorage:
         if not isinstance(objectKey, str) or objectKey.startswith("/") or "\\" in objectKey or "\x00" in objectKey or any(part in {"", ".", ".."} for part in objectKey.split("/")):
             raise ValueError("objectKey must be a valid relative POSIX path.")
 
+        if progress is not None and not callable(progress):
+            raise TypeError("progress must be callable or None.")
+
+        protocols = destinationFilesystem.protocol
+        protocols = {protocols} if isinstance(protocols, str) else set(protocols)
+        copyDescription = "Copying file" if protocols.intersection({"file", "local"}) else "Uploading file"
+
+        if progress is not None:
+            progress(0, "Preparing destination")
+
         destinationPath = posixpath.join(destinationRoot, objectKey)
         destinationFilesystem.makedirs(posixpath.dirname(destinationPath), exist_ok=True)
 
         digest = hashlib.sha256()
         sizeBytes = 0
+
+        if progress is not None:
+            progress(0, f"{copyDescription} — 0.0 / {expectedSize / 1048576:.1f} MiB")
 
         with sourceFilesystem.open(sourcePath, "rb") as source:
             with destinationFilesystem.open(destinationPath, "xb") as destination:
@@ -655,13 +667,26 @@ class pglStorage:
 
                     digest.update(chunk)
 
+                    if progress is not None:
+                        progress(0.5 * sizeBytes / max(expectedSize, 1), f"{copyDescription} — {sizeBytes / 1048576:.1f} / {expectedSize / 1048576:.1f} MiB")
+
+                if progress is not None:
+                    progress(0.5, "Closing copied file")
+
         if digest.hexdigest() != expectedHash or sizeBytes != expectedSize:
             raise ValueError(f"Source bytes do not match the expected identity: {objectKey}")
 
-        stored = cls.hashFile(destinationFilesystem, destinationPath)
+        def reportVerification(fraction, description):
+            if progress is not None:
+                progress(None if fraction is None else 0.5 + 0.5 * fraction, description)
+
+        stored = cls.hashFile(destinationFilesystem, destinationPath, progress=reportVerification if progress is not None else None, expectedSize=expectedSize, description="Verifying copied file")
 
         if stored != {"sha256": expectedHash, "size_bytes": expectedSize}:
             raise ValueError(f"Stored payload verification failed: {objectKey}")
+
+        if progress is not None:
+            progress(1, "Copy verified")
 
         return {"object_key": objectKey, **stored}
 

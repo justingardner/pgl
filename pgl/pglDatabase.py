@@ -28,6 +28,7 @@ from .pglSettings import pglTraitSettings
 from traitlets import Instance, List, Unicode, default
 from .pglSettings import pglSettingsManager
 from .pglDialog import pglDialogs
+from .pglProgress import pglProgress
 
 ##################################################
 # Database settings
@@ -792,32 +793,23 @@ class pglDatabase:
     # conventions.
     @classmethod
     def saveRawSession(cls, session, *, settings=None, settingsName=None, backendID=None, storageOptions=None, sslRootCert=None, allowMissingMetadata=False):
-        """Save a parentless acquisition/root checkpoint.
+        """Save or reuse a parentless acquisition checkpoint with progress.
 
-        Behavioral labels/files come from saved acquisition sources.
-        MNE-only labels come from session.experimentName and session.subjectID.
+        Behavioral acquisition files and current MNE contents are supported.
+        Attached derived matrices are warned about and omitted without changing
+        working attachments.
 
-        Attached data matrices are derived products: warn and omit them from
-        the raw checkpoint. Working attachments remain unchanged. Use
-        saveSession() to persist those matrices.
+        Missing-label validation occurs before configuration or publication.
+        allowMissingMetadata permits missing labels, not malformed settings.
 
-        Missing labels warn and cancel before SQL or export.
-        allowMissingMetadata=True explicitly permits unset labels.
-        Malformed/unreadable settings are not bypassed by that override.
+        Progress is approximate and weighted toward payload transfer and
+        verification. Success is shown only after commit and connection cleanup.
 
-        Behavioral-only, MNE-only, and mixed sessions are supported.
-        MNE objects are serialized from current contents; original vendor
-        acquisition files are not automatically archived.
+        Returns the checkpoint ID, or None for rejected labels, unavailable
+        configuration, or connection cancellation. Other errors propagate.
 
-        Identical active raw checkpoints are reused with a warning.
-        Matching deleted checkpoints are left deleted; a new checkpoint
-        is created, subject to the current schema migration being installed.
-
-        Returns the checkpoint ID, or None for missing-label rejection,
-        unavailable configuration, or connection cancellation.
-
-        Database changes are transactional; payload writes are not.
-        Success is reported only after commit and connection cleanup.
+        SQL changes are transactional; filesystem writes are not.
+        Interrupted/failed saves may leave unregistered payloads.
         """
         from time import perf_counter
 
@@ -826,8 +818,6 @@ class pglDatabase:
         if not cls._checkRawSessionLabels(session, allowMissingMetadata=allowMissingMetadata):
             return None
 
-        # Do not validate or materialize matrices that will not be saved.
-        # Do not remove them, even temporarily, from the working session.
         if session.dataMatrices:
             productNames = list(session.dataMatrices)
             pglMessages.warning(f"saveRawSession() saves acquisition contents only. Attached data matrices {productNames!r} will not be included in this checkpoint. Working attachments are unchanged; use saveSession() to preserve them.", level=1)
@@ -844,49 +834,52 @@ class pglDatabase:
             pglMessages.warning("Cannot save raw session: set a valid username in PGL settings.", level=0)
             return None
 
-        postgres = pglPostgres.fromSettings(settings=resolvedSettings)
-
-        if postgres is None:
-            return None
-
-        # Numeric checkpoint IDs belong to one database. Until transfers
-        # are implemented, do not reinterpret a loaded session's parent ID
-        # against another database, even with an explicit parentSessionID.
-        baseline = session._checkpointBaseline
-
-        if baseline and baseline["databaseIdentity"] != cls._checkpointDatabaseIdentity(postgres):
-            pglMessages.warning(
-                "Cannot save this session to a different database. "
-                "Cross-database checkpoint transfer is not implemented; "
-                "session IDs are local to their database."
-            )
-            return None
-
-        if backendID is None and not postgres.storageLocations:
-            pglMessages.warning("Cannot save session: no storageLocations are configured in the PostgreSQL configuration.", level=0)
-            return None
-
         databasePath = resolvedSettings.databasePath.strip()
         saveStarted = perf_counter()
-        pglMessages.message("Saving raw session: connecting to PostgreSQL...")
 
-        with postgres.connect(sslRootCert=sslRootCert) as connection:
-            if connection is None:
+        with pglProgress() as progress:
+            progress(0, "Loading PostgreSQL configuration")
+            postgres = pglPostgres.fromSettings(settings=resolvedSettings)
+
+            if postgres is None:
+                progress(None, "PostgreSQL configuration unavailable")
                 return None
 
-            with connection.transaction():
-                if backendID is None:
-                    pglMessages.message("Saving raw session: resolving storage destination...")
-                    backendID = cls._getConfiguredStorageBackend(connection, postgres, storageOptions=storageOptions)
+            baseline = session._checkpointBaseline
 
-                pglMessages.message("Saving raw session: resolving checkpoint owner...")
-                createdBy = cls.getOrCreateUser(connection, postgres, username)
+            if baseline and baseline["databaseIdentity"] != cls._checkpointDatabaseIdentity(postgres):
+                pglMessages.warning("Cannot save this session to a different database. Cross-database checkpoint transfer is not implemented; session IDs are local to their database.")
+                progress(None, "Database identity mismatch")
+                return None
 
-                pglMessages.message("Saving raw session: checking for an existing checkpoint or saving new contents...")
-                contentsStarted = perf_counter()
-                sessionID = cls._saveRawSession(connection, postgres, session, createdBy, backendID, storageOptions=storageOptions)
+            if backendID is None and not postgres.storageLocations:
+                pglMessages.warning("Cannot save session: no storageLocations are configured in the PostgreSQL configuration.", level=0)
+                progress(None, "No storage destination configured")
+                return None
 
-                pglMessages.message(f"Saving raw session: checkpoint ready ({perf_counter() - contentsStarted:.1f} s); committing transaction...")
+            progress(0.01, "Connecting to PostgreSQL")
+
+            with postgres.connect(sslRootCert=sslRootCert) as connection:
+                if connection is None:
+                    progress(None, "Connection cancelled")
+                    return None
+
+                with connection.transaction():
+                    if backendID is None:
+                        progress(0.03, "Resolving storage destination / acquiring registration lock")
+                        backendID = cls._getConfiguredStorageBackend(connection, postgres, storageOptions=storageOptions)
+
+                    progress(0.04, "Resolving checkpoint owner")
+                    createdBy = cls.getOrCreateUser(connection, postgres, username)
+
+                    progress(0.05, "Preparing raw checkpoint")
+                    sessionID = cls._saveRawSession(connection, postgres, session, createdBy, backendID, storageOptions=storageOptions, progress=progress)
+
+                    progress(0.98, "Committing transaction")
+
+                progress(0.99, "Closing PostgreSQL connection and tunnel")
+
+            progress.finish(f"Raw checkpoint {sessionID} saved")
 
         pglMessages.message(f"Raw checkpoint {sessionID} is complete. Database configuration: {databasePath} (database={postgres.databaseName}, schema={postgres.databaseSchema}; {perf_counter() - saveStarted:.1f} s total).", wrapText=False)
         return sessionID
@@ -3011,39 +3004,18 @@ class pglDatabase:
 
     # ++++++++++++++++++++++ registerStagedRawCheckpoint +++++++++++++++++++++
     @classmethod
-    def registerStagedRawCheckpoint(cls, connection, postgres, createdBy, backendID, manifest, staged, storedManifest, storageOptions=None, *, sessionID=None, accessContext=None):
-        """Register a staged behavioral archive without completing it.
+    def registerStagedRawCheckpoint(cls, connection, postgres, createdBy, backendID, manifest, staged, storedManifest, storageOptions=None, *, sessionID=None, accessContext=None, progress=None):
+        """Register a staged behavioral archive without completing or committing.
 
-        Called by the raw behavioral save coordinator after payload staging.
+        Validates staged identities, reads verified acquisition labels,
+        verifies/registers stored payloads, and attaches checkpoint file links.
 
-        Validates staged identities against the manifest, reads acquisition
-        labels through verified checkpoint files, registers content locations,
-        and attaches logical files to an unpublished checkpoint.
+        A supplied access context is borrowed. Otherwise this method owns and
+        closes one temporary context.
 
-        Server-local roots resolve through the caller's local/SSH context.
-        The catalog retains its original backend root and relative keys.
-
-        accessContext:
-            Optional borrowed context from the publication coordinator.
-            Configure storage options on that context, not both arguments.
-            The caller retains ownership.
-
-        Without accessContext:
-            Creates one operation-owned context using storageOptions for the
-            destination backend, then closes it on success or failure.
-
-        Uses the caller's SQL transaction; does not commit or complete the
-        checkpoint. Does not copy or rewrite payloads.
-
-        Missing subjects become SQL NULL. Missing-label consent is enforced
-        by the public raw saver before staging.
-
-        Returns:
-            The allocated or supplied unpublished checkpoint ID.
-
-        Exceptions propagate. The caller must roll back failed registration.
-        Closing access resources does not undo database changes or files
-        written during the earlier staging operation.
+        Optional progress weights registration verification by file size.
+        Repeated identical payload/location registrations are verified once.
+        All existing publication and integrity checks remain in place.
         """
         from contextlib import ExitStack
 
@@ -3062,6 +3034,9 @@ class pglDatabase:
 
             if cls._checkpointDatabaseIdentity(accessContext._postgres) != cls._checkpointDatabaseIdentity(postgres):
                 raise ValueError("The supplied payload context belongs to a different configured database.")
+
+        if progress is not None:
+            progress(0, "Validating staged file inventory")
 
         cls.validateRawManifest(manifest)
         expectedByName = {record["name"]: record for record in manifest["files"]}
@@ -3115,10 +3090,11 @@ class pglDatabase:
                 for name, record in stagedByName.items()
             }
 
-            # The archive borrows access. Closing it must not close a context
-            # supplied by the enclosing save coordinator.
             archive = pglCheckpointFilesystem(manifest, fileLocations, accessContext=access, ownsAccess=False)
             resources.callback(archive.close)
+
+            if progress is not None:
+                progress(0, "Verifying archived acquisition labels")
 
             metadata = cls._behaviorLabelMetadata(manifest, archive)
             subjectsByRun = {run["path"]: metadata["labels"][run["index"]]["subjectID"] for run in manifest["runs"]}
@@ -3131,6 +3107,9 @@ class pglDatabase:
                     raise ValueError(f"File does not belong to exactly one run: {name}")
 
                 subjectsByName[name] = subjectsByRun[matchingRuns[0]]
+
+            if progress is not None:
+                progress(None, "Validating unpublished checkpoint")
 
             if sessionID is None:
                 checkpointID = cls.createRawCheckpoint(connection, postgres, createdBy)
@@ -3154,24 +3133,37 @@ class pglDatabase:
             cls._recordSessionLabelMetadata(connection, postgres, checkpointID, metadata)
             registeredPayloads = {}
 
-            # +++++++++++++++++++++++ registerPayload +++++++++++++++++++++++
-            def registerPayload(record):
-                """Verify/register each distinct staged identity and location once."""
+            def registerPayload(record, fileProgress=None):
+                """Verify/register each distinct identity and location once."""
                 identity = (record["sha256"], record["size_bytes"], record["object_key"])
 
                 if identity not in registeredPayloads:
+                    if fileProgress is not None:
+                        fileProgress(0, "Resolving content identity")
+
                     fileID = cls.getOrCreateFile(connection, postgres, record["sha256"], record["size_bytes"])
-                    cls.verifyAndRegisterStorageLocation(connection, postgres, fileID, backendID, record["object_key"], accessContext=access)
+                    cls.verifyAndRegisterStorageLocation(connection, postgres, fileID, backendID, record["object_key"], accessContext=access, progress=fileProgress)
                     registeredPayloads[identity] = fileID
+                elif fileProgress is not None:
+                    fileProgress(1, "Reusing verification from this registration")
 
                 return registeredPayloads[identity]
 
-            for name in sorted(expectedByName):
-                fileID = registerPayload(stagedByName[name])
-                cls.attachCheckpointFile(connection, postgres, checkpointID, name, fileID, role="acquisition", subjectID=subjectsByName[name])
+            records = [stagedByName[name] for name in sorted(expectedByName)]
+            records.append({**storedManifest, "name": "manifest.json"})
+            fileRange = progress.section(0.05, 1) if progress is not None else None
 
-            manifestFileID = registerPayload(storedManifest)
-            cls.attachCheckpointFile(connection, postgres, checkpointID, "manifest.json", manifestFileID, role="manifest")
+            for record, fileProgress in pglProgress.fileSections(records, fileRange):
+                name = record["name"]
+                fileID = registerPayload(record, fileProgress)
+
+                if fileProgress is not None:
+                    fileProgress(None, "Attaching checkpoint file")
+
+                if name == "manifest.json":
+                    cls.attachCheckpointFile(connection, postgres, checkpointID, name, fileID, role="manifest")
+                else:
+                    cls.attachCheckpointFile(connection, postgres, checkpointID, name, fileID, role="acquisition", subjectID=subjectsByName[name])
 
             return checkpointID
 
@@ -3429,38 +3421,21 @@ class pglDatabase:
 
     # ++++++++++++++++++++ verifyAndRegisterStorageLocation +++++++++++++++++
     @classmethod
-    def verifyAndRegisterStorageLocation(cls, connection, postgres, fileID, backendID, objectKey, storageOptions=None, *, accessContext=None):
+    def verifyAndRegisterStorageLocation(cls, connection, postgres, fileID, backendID, objectKey, storageOptions=None, *, accessContext=None, progress=None):
         """Verify stored bytes and register their backend-relative location.
 
-        Called by raw and session-bundle registration coordinators.
+        Uses the caller's SQL transaction and does not commit.
+        Registered roots and relative object keys remain unchanged.
 
-        Queries the registered content identity and backend root, resolves
-        caller-side filesystem access, hashes the complete stored file, then
-        inserts or refreshes its verified location.
+        A supplied payload access context is borrowed. Otherwise this method
+        creates and closes its own context.
 
-        The catalog retains:
-            The original backend root.
-            The supplied relative object key.
-            The verified content identity.
-
-        Caller-derived SSH URLs and credentials are never registered.
-
-        accessContext:
-            Optional borrowed publication context configured for the same
-            database and backend. Its caller owns it and its storage options.
-            This method does not close a supplied context.
-
-        Without a supplied context:
-            Creates a temporary context using storageOptions for backendID.
-            Closes that context after verification, including on failure.
-
-        Uses the caller's SQL transaction; does not commit.
-        Does not write, copy, or delete payload files.
-        A location cannot be reassigned to a different content identity.
-
-        Returns the registered object key. Errors propagate.
-        Verification establishes the bytes read now, not future immutability.
+        Optional progress reports byte-based verification and SQL registration.
+        All existing integrity and location-identity checks are retained.
         """
+        if progress is not None:
+            progress(0, "Resolving registered file identity")
+
         for label, value in (("fileID", fileID), ("backendID", backendID)):
             if type(value) is not int or not 0 <= value <= 9223372036854775807:
                 raise ValueError(f"{label} must be a nonnegative PostgreSQL bigint.")
@@ -3478,9 +3453,6 @@ class pglDatabase:
             if storageOptions:
                 raise ValueError("Configure storage options on accessContext, not on both arguments.")
 
-            # A borrowed context must describe the same configured database.
-            # This is the existing runtime endpoint identity check, not a
-            # globally portable database UUID.
             if cls._checkpointDatabaseIdentity(accessContext._postgres) != cls._checkpointDatabaseIdentity(postgres):
                 raise ValueError("The supplied payload context belongs to a different configured database.")
 
@@ -3510,8 +3482,11 @@ class pglDatabase:
         access = pglDatabaseAccess(postgres, {backendID: storageOptions or {}}) if ownsAccess else accessContext
 
         try:
+            if progress is not None:
+                progress(None, "Opening stored file for verification")
+
             filesystem, root = access.resolve(backendID, backend[0])
-            actual = pglStorage.hashFile(filesystem, posixpath.join(root, objectKey))
+            actual = pglStorage.hashFile(filesystem, posixpath.join(root, objectKey), progress=progress, expectedSize=identity[1], description="Verifying stored file for registration")
 
             if actual["sha256"] != identity[0] or actual["size_bytes"] != identity[1]:
                 raise ValueError("Stored payload does not match the registered file identity.")
@@ -3520,8 +3495,11 @@ class pglDatabase:
             if ownsAccess:
                 access.close()
 
-        # Verification precedes catalog publication. The existing database
-        # trigger coordinates deletion markers with shared content identity.
+        if progress is not None:
+            progress(None, "Registering verified storage location")
+
+        # Verification precedes catalog publication. Existing triggers retain
+        # responsibility for deletion-marker coordination.
         statement = sql.SQL("""
             INSERT INTO {} AS location
                 (file_id, backend_id, object_key, status, verified_at)
@@ -4763,32 +4741,18 @@ class pglDatabase:
 
     # ++++++++++++++++++++++++++++ _saveRawSession ++++++++++++++++++++++++++
     @classmethod
-    def _saveRawSession(cls, connection, postgres, session, createdBy, backendID, storageOptions=None):
+    def _saveRawSession(cls, connection, postgres, session, createdBy, backendID, storageOptions=None, *, progress=None):
         """Publish or reuse a parentless raw checkpoint.
 
-        Called by saveRawSession() using its connection and outer transaction.
+        The caller owns the outer SQL transaction and final commit.
+        Payload writes are not transactional.
 
-        Behavioral-only sessions:
-            Inventory unchanged acquisition files.
-            Reuse an identical active raw checkpoint when available.
-            Otherwise stage, verify, register, and complete a new checkpoint.
+        Behavioral acquisition files are inventoried, staged, verified, and
+        registered through one operation-owned payload access context.
+        MNE-containing sessions delegate to _saveRawMNECheckpoint().
 
-        MNE-containing sessions:
-            Delegate to _saveRawMNECheckpoint().
-
-        Server-local destinations resolve through caller-side local/SSH access.
-        One operation-owned context is reused for behavioral staging,
-        deduplication verification, and registration.
-
-        Registered roots and object keys remain independent of caller access.
-        Existing deleted checkpoints remain deleted.
-
-        Returns the new or reused checkpoint ID.
-        Does not change the working session's identity or history.
-
-        Uses a nested SQL transaction/savepoint. The caller must commit.
-        Payload writes are not rolled back; failures may leave unregistered
-        files. Destination access closes on success and failure.
+        progress is an optional save-level pglProgress instance.
+        Existing integrity, duplicate-reuse, and deletion behavior is retained.
         """
         for label, value in (("createdBy", createdBy), ("backendID", backendID)):
             if type(value) is not int or not 0 <= value <= 9223372036854775807:
@@ -4798,11 +4762,17 @@ class pglDatabase:
             raise TypeError("storageOptions must be a dictionary or None.")
 
         if session.mne is not None:
-            return cls._saveRawMNECheckpoint(connection, postgres, session, createdBy, backendID, storageOptions=storageOptions)
+            return cls._saveRawMNECheckpoint(connection, postgres, session, createdBy, backendID, storageOptions=storageOptions, progress=progress)
 
-        manifest = cls.buildRawManifest(session)
+        if progress is not None:
+            progress(0.05, "Inventorying and hashing acquisition sources")
+
+        manifest = cls.buildRawManifest(session, progress=progress.section(0.05, 0.09) if progress is not None else None)
         cls.validateRawManifest(manifest)
         manifestHash = cls.hashRawManifest(manifest)
+
+        if progress is not None:
+            progress(0.09, "Checking for an existing raw checkpoint")
 
         sessionsTable = sql.Identifier(postgres.databaseSchema, "session")
         backendsTable = sql.Identifier(postgres.databaseSchema, "storage_backends")
@@ -4820,7 +4790,13 @@ class pglDatabase:
             if backend is None or not backend[1]:
                 raise ValueError(f"Storage backend is missing or inactive: {backendID}")
 
-            connection.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (manifestHash,))
+            if progress is not None:
+                progress(None, "Acquiring raw-checkpoint identity lock")
+
+            postgres.acquireTransactionLock(connection, manifestHash, description="raw-checkpoint identity", timeoutSeconds=30.0)
+
+            if progress is not None:
+                progress(None, "Comparing checkpoint catalog")
 
             statement = sql.SQL("""
                 SELECT session_id, status, contract_version
@@ -4838,18 +4814,23 @@ class pglDatabase:
                 if (status, contractVersion) != ("complete", "pgl.raw.behavior.v1"):
                     raise ValueError("Matching manifest belongs to an incomplete or unsupported checkpoint.")
 
-                # Reuse the publication context for the archived manifest.
-                # Other replica backends use their own registered roots.
+                if progress is not None:
+                    progress(None, f"Verifying existing checkpoint {existingID}")
+
                 archivedManifest = cls.loadRawManifest(connection, postgres, existingID, accessContext=access)
 
                 if archivedManifest != manifest:
                     raise ValueError("Existing checkpoint manifest differs from source manifest.")
 
-                # Preserve existing reuse semantics: file-location checks here
-                # are catalog checks, not a fresh scan of every archived file.
+                # Preserve existing reuse semantics: this checks catalog
+                # correspondence, not a new byte scan of every archived file.
                 cls.getRawFileLocations(connection, postgres, existingID, archivedManifest)
 
                 pglMessages.warning(f"This raw session is already saved as active checkpoint {existingID}. No new checkpoint was created; returning the existing ID. To save another raw copy, delete checkpoint {existingID} and call saveRawSession() again. To save further work as a derived checkpoint, use saveSession().", level=2)
+
+                if progress is not None:
+                    progress(0.97, f"Reusing existing checkpoint {existingID}")
+
                 return existingID
 
             statement = sql.SQL("""
@@ -4867,211 +4848,195 @@ class pglDatabase:
                 deletedIDs = ", ".join(str(row[0]) for row in deletedMatches)
                 pglMessages.message(f"Found matching deleted raw checkpoint(s) {deletedIDs}; leaving them unchanged and saving a new checkpoint.")
 
-            # Keep the registered root unchanged. Resolve only the caller's
-            # filesystem and physical root for this publication operation.
-            filesystem, root = access.resolve(backendID, backend[0])
+            if progress is not None:
+                progress(0.10, "Opening destination storage")
 
+            filesystem, root = access.resolve(backendID, backend[0])
             sessionID = cls.createRawCheckpoint(connection, postgres, createdBy)
-            staged = cls.stageRawSession(session, manifest, filesystem, root, sessionID=sessionID, connection=connection, postgres=postgres, backendID=backendID)
+
+            staged = cls.stageRawSession(session, manifest, filesystem, root, sessionID=sessionID, connection=connection, postgres=postgres, backendID=backendID, progress=progress.section(0.10, 0.70) if progress is not None else None)
+
+            if progress is not None:
+                progress(0.70, "Writing and verifying checkpoint manifest")
+
             storedManifest = cls.stageRawManifest(manifest, filesystem, root, sessionID=sessionID)
 
-            cls.registerStagedRawCheckpoint(connection, postgres, createdBy, backendID, manifest, staged, storedManifest, sessionID=sessionID, accessContext=access)
+            cls.registerStagedRawCheckpoint(connection, postgres, createdBy, backendID, manifest, staged, storedManifest, sessionID=sessionID, accessContext=access, progress=progress.section(0.71, 0.95) if progress is not None else None)
+
+            if progress is not None:
+                progress(0.96, "Validating checkpoint completion")
+
             cls.completeRawCheckpoint(connection, postgres, sessionID, manifest)
+
+            if progress is not None:
+                progress(0.97, "Closing payload access")
 
             return sessionID
 
     # +++++++++++++++++++++++++ _saveRawMNECheckpoint +++++++++++++++++++++++
     @classmethod
-    def _saveRawMNECheckpoint(cls, connection, postgres, session, createdBy, backendID, storageOptions=None):
-        """Publish or reuse a parentless raw checkpoint containing MNE.
+    def registerStagedRawCheckpoint(cls, connection, postgres, createdBy, backendID, manifest, staged, storedManifest, storageOptions=None, *, sessionID=None, accessContext=None, progress=None):
+        """Register a staged behavioral archive without completing or committing.
 
-        Called by _saveRawSession() for MNE-only or mixed sessions.
+        Validates staged identities, reads verified acquisition labels,
+        verifies/registers stored payloads, and attaches checkpoint file links.
 
-        Exports current MNE contents and unchanged behavioral acquisition
-        files into a verified temporary bundle. Exact encoded-manifest matches
-        may reuse an active completed raw checkpoint.
+        A supplied access context is borrowed. Otherwise this method owns and
+        closes one temporary context.
 
-        New publication:
-            Resolve the registered destination through caller-side access.
-            Copy and verify staged files.
-            Register files using the same access context.
-            Validate and complete the checkpoint.
-
-        Matching deleted checkpoints remain deleted. New checkpoints use
-        separate checkpoint-specific directories.
-
-        Owns temporary staging and a destination access context. Source
-        session readers remain caller-owned and are not closed here.
-
-        Duplicate inspection creates a private lazy session; that session's
-        matrix and checkpoint resources are closed before returning.
-
-        Returns the new or reused checkpoint ID without changing the working
-        session's identity, annotations, or history.
-
-        Uses a nested transaction/savepoint; the caller's outer transaction
-        must commit. Payload writes are not transactional and failures may
-        leave unregistered files. Errors propagate.
+        Optional progress weights registration verification by file size.
+        Repeated identical payload/location registrations are verified once.
+        All existing publication and integrity checks remain in place.
         """
-        from tempfile import TemporaryDirectory
+        from contextlib import ExitStack
 
-        from fsspec.implementations.local import LocalFileSystem
-
-        from .pglSession import pglMNE
-
-        for label, value in (("createdBy", createdBy), ("backendID", backendID)):
-            if type(value) is not int or not 0 <= value <= 9223372036854775807:
-                raise ValueError(f"{label} must be a nonnegative PostgreSQL bigint.")
+        if type(backendID) is not int or not 0 <= backendID <= 9223372036854775807:
+            raise ValueError("backendID must be a nonnegative PostgreSQL bigint.")
 
         if storageOptions is not None and not isinstance(storageOptions, dict):
             raise TypeError("storageOptions must be a dictionary or None.")
 
-        if type(session.mne) is not pglMNE:
-            raise TypeError("MNE raw checkpoints require a pglMNE instance.")
+        if accessContext is not None:
+            if not isinstance(accessContext, pglDatabaseAccess):
+                raise TypeError("accessContext must be a pglDatabaseAccess instance.")
 
-        sessions = sql.Identifier(postgres.databaseSchema, "session")
-        users = sql.Identifier(postgres.databaseSchema, "users")
-        backends = sql.Identifier(postgres.databaseSchema, "storage_backends")
+            if storageOptions:
+                raise ValueError("Configure storage options on accessContext, not on both arguments.")
 
-        # +++++++++++++++++++++++++++++ isLocal +++++++++++++++++++++++++++++
-        def isLocal(filesystem):
-            """Determine locality from the resolved filesystem, not its root."""
-            protocols = filesystem.protocol
-            protocols = {protocols} if isinstance(protocols, str) else set(protocols)
-            return bool(protocols.intersection({"file", "local"}))
+            if cls._checkpointDatabaseIdentity(accessContext._postgres) != cls._checkpointDatabaseIdentity(postgres):
+                raise ValueError("The supplied payload context belongs to a different configured database.")
 
-        with connection.transaction(), pglDatabaseAccess(postgres, {backendID: storageOptions or {}}) as access:
-            statement = sql.SQL("SELECT 1 FROM {} WHERE user_id = %s FOR SHARE").format(users)
+        if progress is not None:
+            progress(0, "Validating staged file inventory")
 
-            if connection.execute(statement, (createdBy,)).fetchone() is None:
-                raise ValueError(f"Unknown creator: {createdBy}")
+        cls.validateRawManifest(manifest)
+        expectedByName = {record["name"]: record for record in manifest["files"]}
+        stagedByName = {record["name"]: record for record in staged}
 
-            statement = sql.SQL("SELECT url_prefix, is_active FROM {} WHERE backend_id = %s FOR SHARE").format(backends)
-            backend = connection.execute(statement, (backendID,)).fetchone()
+        if len(expectedByName) != len(manifest["files"]) or len(stagedByName) != len(staged):
+            raise ValueError("Duplicate logical filenames are not allowed.")
 
-            if backend is None or not backend[1]:
-                raise ValueError("Storage backend is missing or inactive.")
+        if set(expectedByName) != set(stagedByName):
+            raise ValueError("Staged files do not match the manifest filenames.")
 
-            destinationFS, destinationRoot = access.resolve(backendID, backend[0])
-            stagingFS = LocalFileSystem(skip_instance_cache=True)
+        if "manifest.json" in expectedByName:
+            raise ValueError("manifest.json is reserved for the checkpoint manifest.")
 
-            with TemporaryDirectory(prefix="pgl-raw-session-") as temporary:
-                stagingRoot, manifest = cls.saveRawSessionFiles(session, Path(temporary) / "bundle", filesystem=stagingFS)
-                manifestBytes = cls.encodeRawManifest(manifest)
-                manifestHash = hashlib.sha256(manifestBytes).hexdigest()
+        for name, expected in expectedByName.items():
+            actual = stagedByName[name]
 
-                connection.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (manifestHash,))
+            if actual["sha256"] != expected["sha256"] or actual["size_bytes"] != expected["size_bytes"]:
+                raise ValueError(f"Staged identity differs from manifest: {name}")
 
-                statement = sql.SQL("""
-                    SELECT session_id, status, contract_version
-                    FROM {}
-                    WHERE origin = 'raw'
-                      AND manifest_hash = %s
-                      AND deleted_at IS NULL
-                    FOR SHARE
-                """).format(sessions)
-                existing = connection.execute(statement, (manifestHash,)).fetchone()
+        manifestBytes = cls.encodeRawManifest(manifest)
 
-                if existing is not None:
-                    existingID, status, contract = existing
+        if storedManifest["sha256"] != hashlib.sha256(manifestBytes).hexdigest() or storedManifest["size_bytes"] != len(manifestBytes):
+            raise ValueError("Stored manifest identity does not match the supplied manifest.")
 
-                    if (status, contract) != ("complete", "pgl.raw.session.v1"):
-                        raise ValueError("Matching raw manifest belongs to an unsupported or incomplete checkpoint.")
+        backendsTable = sql.Identifier(postgres.databaseSchema, "storage_backends")
+        statement = sql.SQL("SELECT url_prefix, is_active FROM {} WHERE backend_id = %s").format(backendsTable)
+        backend = connection.execute(statement, (backendID,)).fetchone()
 
-                    # The loader creates its own retained contexts. This is
-                    # private inspection, not a session returned to the caller.
-                    inspected = None
+        if backend is None or not backend[1]:
+            raise ValueError(f"Storage backend is missing or inactive: {backendID}")
 
-                    try:
-                        inspected = cls.loadRawSessionBundle(connection, postgres, existingID, storageOptionsByBackend={backendID: storageOptions or {}}, cacheDirectory=Path(temporary) / "unused-cache")
+        registeredRoot = backend[0]
 
-                    finally:
-                        if inspected is not None:
-                            try:
-                                for matrix in inspected.dataMatrices.values():
-                                    try:
-                                        matrix.close()
-                                    except Exception as error:
-                                        pglMessages.warning(f"Could not close a duplicate-inspection matrix ({type(error).__name__}).", level=1)
-                            finally:
-                                inspected.filesystem.close()
+        with ExitStack() as resources:
+            if accessContext is None:
+                access = resources.enter_context(pglDatabaseAccess(postgres, {backendID: storageOptions or {}}))
+            else:
+                access = accessContext
 
-                    pglMessages.warning(f"This raw session is already saved as active checkpoint {existingID}. No new checkpoint was created; returning the existing ID. To save another raw copy, delete checkpoint {existingID} and call saveRawSession() again. To save further work as a derived checkpoint, use saveSession().", level=2)
-                    return existingID
+            fileLocations = {
+                name: {
+                    "sha256": record["sha256"],
+                    "size_bytes": record["size_bytes"],
+                    "locations": [{
+                        "backend_id": backendID,
+                        "url_prefix": registeredRoot,
+                        "object_key": record["object_key"],
+                    }],
+                }
+                for name, record in stagedByName.items()
+            }
 
-                statement = sql.SQL("""
-                    SELECT session_id
-                    FROM {}
-                    WHERE origin = 'raw'
-                      AND manifest_hash = %s
-                      AND deleted_at IS NOT NULL
-                    ORDER BY session_id
-                    FOR SHARE
-                """).format(sessions)
-                deletedMatches = connection.execute(statement, (manifestHash,)).fetchall()
+            archive = pglCheckpointFilesystem(manifest, fileLocations, accessContext=access, ownsAccess=False)
+            resources.callback(archive.close)
 
-                if deletedMatches:
-                    deletedIDs = ", ".join(str(row[0]) for row in deletedMatches)
-                    pglMessages.message(f"Found matching deleted raw checkpoint(s) {deletedIDs}; leaving them unchanged and saving a new checkpoint.")
+            if progress is not None:
+                progress(0, "Verifying archived acquisition labels")
 
-                modalities = (["behavior"] if manifest["runs"] else []) + ["mne"]
+            metadata = cls._behaviorLabelMetadata(manifest, archive)
+            subjectsByRun = {run["path"]: metadata["labels"][run["index"]]["subjectID"] for run in manifest["runs"]}
+            subjectsByName = {}
 
-                statement = sql.SQL("""
-                    INSERT INTO {} (
-                        origin, kind, ingest_method, modalities, status,
-                        contract_version, created_by, started_at
-                    )
-                    VALUES (
-                        'raw', 'acquired', 'manual', %s::text[], 'in_progress',
-                        'pgl.raw.session.v1', %s, now()
-                    )
-                    RETURNING session_id
-                """).format(sessions)
-                sessionID = connection.execute(statement, (modalities, createdBy)).fetchone()[0]
+            for name in expectedByName:
+                matchingRuns = [path for path in subjectsByRun if name.startswith(path + "/")]
 
-                objectPrefix = f"session{sessionID:06d}"
-                destination = posixpath.join(destinationRoot, objectPrefix)
+                if len(matchingRuns) != 1:
+                    raise ValueError(f"File does not belong to exactly one run: {name}")
 
-                # Preserve existing overlap checks. Never interpret an SSH
-                # destination using client-local Path.resolve().
-                for run in session.runs or []:
-                    if run.filesystem is None:
-                        raise ValueError("Source run has no filesystem.")
+                subjectsByName[name] = subjectsByRun[matchingRuns[0]]
 
-                    if isLocal(destinationFS) and isLocal(run.filesystem):
-                        target = Path(destination).expanduser().resolve()
-                        source = Path(run.fullDataPath).expanduser().resolve()
+            if progress is not None:
+                progress(None, "Validating unpublished checkpoint")
 
-                        if target == source or source in target.parents:
-                            raise ValueError("Checkpoint destination must be outside source run directories.")
+            if sessionID is None:
+                checkpointID = cls.createRawCheckpoint(connection, postgres, createdBy)
+            else:
+                sessionsTable = sql.Identifier(postgres.databaseSchema, "session")
+                linksTable = sql.Identifier(postgres.databaseSchema, "session_files")
 
-                    elif destinationFS == run.filesystem:
-                        target = posixpath.normpath(destination)
-                        source = posixpath.normpath(run.fullDataPath)
+                statement = sql.SQL("SELECT status, origin, contract_version, created_by, deleted_at FROM {} WHERE session_id = %s FOR UPDATE").format(sessionsTable)
+                checkpoint = connection.execute(statement, (sessionID,)).fetchone()
 
-                        if target == source or target.startswith(source.rstrip("/") + "/"):
-                            raise ValueError("Checkpoint destination must be outside source run directories.")
+                if checkpoint != ("in_progress", "raw", "pgl.raw.behavior.v1", createdBy, None):
+                    raise ValueError("Checkpoint must be an active in-progress raw behavioral checkpoint owned by the supplied creator.")
 
-                if destinationFS.exists(destination):
-                    raise FileExistsError(destination)
+                statement = sql.SQL("SELECT 1 FROM {} WHERE session_id = %s LIMIT 1").format(linksTable)
 
-                destinationFS.makedirs(destination, exist_ok=False)
+                if connection.execute(statement, (sessionID,)).fetchone() is not None:
+                    raise ValueError("Checkpoint already has file links.")
 
-                for directory in manifest["directories"]:
-                    destinationFS.makedirs(posixpath.join(destination, directory), exist_ok=True)
+                checkpointID = sessionID
 
-                records = [
-                    *manifest["files"],
-                    {"name": "manifest.json", "sha256": manifestHash, "size_bytes": len(manifestBytes)},
-                ]
+            cls._recordSessionLabelMetadata(connection, postgres, checkpointID, metadata)
+            registeredPayloads = {}
 
-                for record in records:
-                    pglStorage.copyVerifiedFile(stagingFS, posixpath.join(stagingRoot, record["name"]), destinationFS, destinationRoot, record, objectKey=posixpath.join(objectPrefix, record["name"]))
+            def registerPayload(record, fileProgress=None):
+                """Verify/register each distinct identity and location once."""
+                identity = (record["sha256"], record["size_bytes"], record["object_key"])
 
-                cls._registerSessionBundleFiles(connection, postgres, sessionID, backendID, manifest, objectPrefix=objectPrefix, origin="raw", accessContext=access)
-                cls._completeSessionBundleCheckpoint(connection, postgres, sessionID, manifest, origin="raw")
+                if identity not in registeredPayloads:
+                    if fileProgress is not None:
+                        fileProgress(0, "Resolving content identity")
 
-                return sessionID
+                    fileID = cls.getOrCreateFile(connection, postgres, record["sha256"], record["size_bytes"])
+                    cls.verifyAndRegisterStorageLocation(connection, postgres, fileID, backendID, record["object_key"], accessContext=access, progress=fileProgress)
+                    registeredPayloads[identity] = fileID
+                elif fileProgress is not None:
+                    fileProgress(1, "Reusing verification from this registration")
+
+                return registeredPayloads[identity]
+
+            records = [stagedByName[name] for name in sorted(expectedByName)]
+            records.append({**storedManifest, "name": "manifest.json"})
+            fileRange = progress.section(0.05, 1) if progress is not None else None
+
+            for record, fileProgress in pglProgress.fileSections(records, fileRange):
+                name = record["name"]
+                fileID = registerPayload(record, fileProgress)
+
+                if fileProgress is not None:
+                    fileProgress(None, "Attaching checkpoint file")
+
+                if name == "manifest.json":
+                    cls.attachCheckpointFile(connection, postgres, checkpointID, name, fileID, role="manifest")
+                else:
+                    cls.attachCheckpointFile(connection, postgres, checkpointID, name, fileID, role="acquisition", subjectID=subjectsByName[name])
+
+            return checkpointID
 
     # +++++++++++++++++++++++++ _checkRawSessionLabels ++++++++++++++++++++++++
     # Direct callers in this module: saveRawSession.
@@ -5116,8 +5081,15 @@ class pglDatabase:
     # ++++++++++++++++++++++++++++ buildRawManifest +++++++++++++++++++++++++++
     # Direct callers in this module: _saveRawSession, saveRawSessionFiles, stageRawSession.
     @classmethod
-    def buildRawManifest(cls, session):
-        """Describe saved behavioral runs without copying files or publishing a checkpoint."""
+    def buildRawManifest(cls, session, *, progress=None):
+        """Inventory and hash unchanged behavioral acquisition files.
+
+        Optional progress reports run/file names and bytes read.
+        Does not copy payloads or publish database records.
+
+        Source hashing does not issue extra stat requests solely to estimate
+        progress. The returned manifest contains actual hashed byte counts.
+        """
         if not session.runs:
             raise ValueError("A raw checkpoint must contain at least one run.")
 
@@ -5127,19 +5099,36 @@ class pglDatabase:
         runs = []
         directories = []
         files = []
+        runCount = len(session.runs)
 
         for index, run in enumerate(session.runs):
             runName = f"runs/{index:06d}"
-            inventory = cls.validateRawRun(run)
 
+            if progress is not None:
+                progress(index / runCount, f"Inspecting acquisition run {index + 1}/{runCount}")
+
+            inventory = cls.validateRawRun(run)
             runs.append({"index": index, "path": runName})
             directories.append(runName)
             directories.extend(posixpath.join(runName, directory) for directory in inventory["directories"])
 
-            for relativePath in inventory["files"]:
+            fileCount = len(inventory["files"])
+
+            for fileIndex, relativePath in enumerate(inventory["files"]):
                 sourcePath = posixpath.join(run.fullDataPath, relativePath)
-                identity = pglStorage.hashFile(run.filesystem, sourcePath)
-                files.append({"name": posixpath.join(runName, relativePath), **identity})
+                name = posixpath.join(runName, relativePath)
+                fileProgress = None
+
+                if progress is not None:
+                    start = (index + fileIndex / max(fileCount, 1)) / runCount
+                    end = (index + (fileIndex + 1) / max(fileCount, 1)) / runCount
+                    fileProgress = progress.section(start, end, label=name)
+
+                identity = pglStorage.hashFile(run.filesystem, sourcePath, progress=fileProgress, description="Hashing acquisition source")
+                files.append({"name": name, **identity})
+
+        if progress is not None:
+            progress(1, "Acquisition inventory ready")
 
         return {
             "contract_version": "pgl.raw.behavior.v1",
@@ -5237,18 +5226,20 @@ class pglDatabase:
     # ++++++++++++++++++++++++++++ stageRawSession ++++++++++++++++++++++++++++
     # Direct callers in this module: _saveRawSession.
     @classmethod
-    def stageRawSession(cls, session, manifest, destinationFilesystem, destinationRoot, *, sessionID, connection, postgres, backendID):
-        """Store each distinct payload once on the destination backend.
+    def stageRawSession(cls, session, manifest, destinationFilesystem, destinationRoot, *, sessionID, connection, postgres, backendID, progress=None):
+        """Store each distinct behavioral payload once on the backend.
 
         Reuse registered copies only after verifying their bytes.
         Repeated content within this save reuses the same verified payload.
 
-        Local filesystems get readable hard-link aliases where supported.
-        Other filesystems retain only the canonical copy; logical filenames
-        resolve through the manifest and registered content locations.
+        Local destinations retain readable hard-link aliases where supported.
+        Other destinations retain canonical payload locations.
 
-        Must run inside the caller's transaction.
-        Never overwrites payloads. Failed saves may leave unregistered files.
+        Optional progress covers source revalidation, locks, comparisons,
+        copying, read-back verification, and local alias creation.
+
+        Requires the caller's transaction. Never deliberately overwrites
+        payloads. Failed saves may leave unregistered files.
         """
         import errno
         import os
@@ -5259,11 +5250,12 @@ class pglDatabase:
 
         cls.validateRawManifest(manifest)
 
-        if cls.buildRawManifest(session) != manifest:
+        if progress is not None:
+            progress(0, "Rechecking acquisition sources")
+
+        if cls.buildRawManifest(session, progress=progress.section(0, 0.10) if progress is not None else None) != manifest:
             raise ValueError("Source session no longer matches the supplied manifest.")
 
-        # ++++++++++++++++++++++++++++++++ isLocal ++++++++++++++++++++++++++++++++
-        # Local implementation within stageRawSession.
         def isLocal(filesystem):
             protocols = filesystem.protocol
             protocols = {protocols} if isinstance(protocols, str) else set(protocols)
@@ -5273,7 +5265,7 @@ class pglDatabase:
         sessionKey = f"session{sessionID:06d}"
         sessionRoot = posixpath.join(destinationRoot, sessionKey)
 
-        # Check before creating any destination paths.
+        # Reject overlap before creating destination paths.
         for run in session.runs:
             if localDestination and isLocal(run.filesystem):
                 destination = Path(sessionRoot).expanduser().resolve()
@@ -5289,29 +5281,33 @@ class pglDatabase:
                 if destination == source or destination.startswith(source.rstrip("/") + "/"):
                     raise ValueError("Checkpoint destination must be outside source run directories.")
 
-        # Stable lock ordering avoids deadlocks between cooperating saves.
-        # Locks remain held until the outer transaction finishes.
+        # Preserve stable ordering and lock identity. These transaction locks
+        # remain held until the outer transaction ends.
         for digest in sorted({record["sha256"] for record in manifest["files"]}):
             lockName = f"pgl.payload:{postgres.databaseSchema}:{backendID}:{digest}"
-            connection.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (lockName,))
+
+            if progress is not None:
+                progress(None, f"Acquiring payload lock {digest[:12]}")
+
+            postgres.acquireTransactionLock(connection, lockName, description=f"payload {digest[:12]}", timeoutSeconds=30.0)
+
+        if progress is not None:
+            progress(0.10, "Creating checkpoint directories")
 
         if destinationFilesystem.exists(sessionRoot):
             raise FileExistsError(f"Checkpoint destination already exists; it will not be overwritten: {sessionRoot}")
 
         destinationFilesystem.makedirs(destinationRoot, exist_ok=True)
         destinationFilesystem.makedirs(sessionRoot, exist_ok=False)
-
         runsByPath = {record["path"]: record for record in manifest["runs"]}
 
-        # ++++++++++++++++++++++++++++++ physicalKey ++++++++++++++++++++++++++++++
-        # Local implementation within stageRawSession.
         def physicalKey(logicalName):
             parts = logicalName.split("/", 2)
             runRecord = runsByPath["/".join(parts[:2])]
             runKey = posixpath.join(sessionKey, f"run{runRecord['index']:05d}")
             return posixpath.join(runKey, parts[2]) if len(parts) == 3 else runKey
 
-        # Physical empty directories are a local browsing convenience.
+        # Empty physical directories are a local browsing convenience.
         # The manifest preserves logical directories on every backend.
         if localDestination:
             for directory in manifest["directories"]:
@@ -5320,9 +5316,6 @@ class pglDatabase:
 
         filesTable = sql.Identifier(postgres.databaseSchema, "files")
         locationsTable = sql.Identifier(postgres.databaseSchema, "storage_locations")
-
-        # Canonical verified payload per hash for this save.
-        # This cache also covers content not yet registered in SQL.
         verifiedByHash = {}
         staged = []
 
@@ -5336,18 +5329,14 @@ class pglDatabase:
             getattr(errno, "EOPNOTSUPP", errno.EINVAL),
         }
 
-        # ++++++++++++++++++++++++++++ readableLocation +++++++++++++++++++++++++++
-        # Local implementation within stageRawSession.
         def readableLocation(canonical, targetKey):
+            """Create a verified local hard-link alias when supported."""
             if not localDestination or canonical["object_key"] == targetKey:
                 return canonical
 
             sourcePath = posixpath.join(destinationRoot, canonical["object_key"])
             targetPath = posixpath.join(destinationRoot, targetKey)
             destinationFilesystem.makedirs(posixpath.dirname(targetPath), exist_ok=True)
-
-            # Hard links are a filesystem metadata operation, not payload I/O.
-            # Do not create an alias to a symlink or special file.
             sourceStat = os.lstat(sourcePath)
 
             if not stat.S_ISREG(sourceStat.st_mode):
@@ -5367,11 +5356,7 @@ class pglDatabase:
 
             targetStat = os.lstat(targetPath)
 
-            if (
-                not stat.S_ISREG(targetStat.st_mode)
-                or targetStat.st_dev != sourceStat.st_dev
-                or targetStat.st_ino != sourceStat.st_ino
-            ):
+            if not stat.S_ISREG(targetStat.st_mode) or targetStat.st_dev != sourceStat.st_dev or targetStat.st_ino != sourceStat.st_ino:
                 raise OSError(f"Hard-link identity check failed: {targetKey}")
 
             return {
@@ -5380,7 +5365,9 @@ class pglDatabase:
                 "size_bytes": canonical["size_bytes"],
             }
 
-        for record in manifest["files"]:
+        payloadProgress = progress.section(0.10, 1) if progress is not None else None
+
+        for record, fileProgress in pglProgress.fileSections(manifest["files"], payloadProgress):
             digest = record["sha256"]
             canonical = verifiedByHash.get(digest)
 
@@ -5388,6 +5375,9 @@ class pglDatabase:
                 raise ValueError("Manifest contains conflicting sizes for the same SHA-256.")
 
             if canonical is None:
+                if fileProgress is not None:
+                    fileProgress(0, "Looking for a reusable stored copy")
+
                 statement = sql.SQL("""
                     SELECT location.object_key, content.size_bytes
                     FROM {} AS content
@@ -5398,10 +5388,11 @@ class pglDatabase:
                       AND location.verified_at IS NOT NULL
                     ORDER BY location.priority, location.object_key
                 """).format(filesTable, locationsTable)
+
                 candidates = connection.execute(statement, (digest, backendID)).fetchall()
                 failures = []
 
-                for key, registeredSize in candidates:
+                for candidateIndex, (key, registeredSize) in enumerate(candidates):
                     if registeredSize != record["size_bytes"]:
                         raise ValueError("Registered content size conflicts with the manifest.")
 
@@ -5409,7 +5400,8 @@ class pglDatabase:
                         raise ValueError("Database contains an invalid payload object key.")
 
                     try:
-                        actual = pglStorage.hashFile(destinationFilesystem, posixpath.join(destinationRoot, key))
+                        description = f"Comparing registered copy {candidateIndex + 1}/{len(candidates)}"
+                        actual = pglStorage.hashFile(destinationFilesystem, posixpath.join(destinationRoot, key), progress=fileProgress, expectedSize=record["size_bytes"], description=description)
 
                         if actual != {"sha256": digest, "size_bytes": record["size_bytes"]}:
                             raise ValueError("Registered payload integrity check failed.")
@@ -5429,16 +5421,20 @@ class pglDatabase:
                     runRecord = runsByPath["/".join(parts[:2])]
                     run = session.runs[runRecord["index"]]
                     sourcePath = posixpath.join(run.fullDataPath, parts[2])
-
-                    canonical = pglStorage.copyVerifiedFile(run.filesystem, sourcePath, destinationFilesystem, destinationRoot, record, objectKey=physicalKey(record["name"]))
+                    canonical = pglStorage.copyVerifiedFile(run.filesystem, sourcePath, destinationFilesystem, destinationRoot, record, objectKey=physicalKey(record["name"]), progress=fileProgress)
 
                 verifiedByHash[digest] = canonical
+
+            elif fileProgress is not None:
+                fileProgress(1, "Reusing verified content from this save")
+
+            if fileProgress is not None:
+                fileProgress(None, "Finalizing verified payload location")
 
             stored = readableLocation(canonical, physicalKey(record["name"]))
             staged.append({"name": record["name"], **stored})
 
         return staged
-
     # ++++++++++++++++++++++++++++ stageRawManifest +++++++++++++++++++++++++++
     # Direct callers in this module: _saveRawSession.
     @classmethod
@@ -5468,12 +5464,17 @@ class pglDatabase:
     # ++++++++++++++++++++++++++ saveRawSessionFiles ++++++++++++++++++++++++++
     # Direct callers in this module: _saveRawMNECheckpoint.
     @classmethod
-    def saveRawSessionFiles(cls, session, dataPath, filesystem=None):
+    def saveRawSessionFiles(cls, session, dataPath, filesystem=None, *, progress=None):
         """Export MNE and optional unchanged behavioral acquisition files.
 
-        Includes resolved acquisition labels in hashed history.json.
+        Includes acquisition labels in hashed history.json.
         Does not register or publish a database checkpoint.
-        Partial files may remain if export fails.
+
+        Optional progress reports export phases and individual files.
+        MNE serialization reports a phase rather than fabricated byte progress.
+
+        Partial files may remain on failure. The raw database coordinator uses
+        temporary local staging and owns its cleanup.
         """
         from .pglSession import pglSession, pglMNE
 
@@ -5491,10 +5492,29 @@ class pglDatabase:
         if filesystem.exists(destination):
             raise FileExistsError(destination)
 
+        def reportExport(description):
+            if progress is not None:
+                progress(None, description)
+
+        # Expose byte counts during temporary work without letting each file
+        # consume the entire export progress allocation.
+        def exportFileProgress(name):
+            if progress is None:
+                return None
+
+            def reportFile(fraction, description):
+                progress(None, f"{name}: {description}")
+
+            return reportFile
+
         behavior = pglSession()
         behavior.runs = list(session.runs or [])
         behavior.mne = None
-        behaviorManifest = cls.buildRawManifest(behavior) if behavior.runs else None
+
+        reportExport("Preparing behavioral acquisition inventory")
+        behaviorManifest = cls.buildRawManifest(behavior, progress=progress.section(0, 0.15) if progress is not None else None) if behavior.runs else None
+
+        reportExport("Encoding raw session history")
         historyBytes = cls._sessionHistoryBytes(session, acquisition=True)
 
         filesystem.makedirs(destination, exist_ok=False)
@@ -5506,22 +5526,35 @@ class pglDatabase:
             directories.update(behaviorManifest["directories"])
             runs = deepcopy(behaviorManifest["runs"])
 
+            reportExport("Creating temporary behavioral directories")
+
             for directory in sorted(directories):
                 filesystem.makedirs(posixpath.join(destination, directory), exist_ok=True)
 
-            for record in behaviorManifest["files"]:
+            behaviorProgress = progress.section(0.15, 0.35) if progress is not None else None
+
+            for record, fileProgress in pglProgress.fileSections(behaviorManifest["files"], behaviorProgress):
                 parts = record["name"].split("/", 2)
                 run = behavior.runs[int(parts[1])]
                 sourcePath = posixpath.join(run.fullDataPath, parts[2])
-                pglStorage.copyVerifiedFile(run.filesystem, sourcePath, filesystem, destination, record, objectKey=record["name"])
+                pglStorage.copyVerifiedFile(run.filesystem, sourcePath, filesystem, destination, record, objectKey=record["name"], progress=fileProgress)
                 files.append(dict(record))
 
-            if cls.buildRawManifest(behavior) != behaviorManifest:
+            reportExport("Rechecking behavioral acquisition sources")
+
+            if cls.buildRawManifest(behavior, progress=progress.section(0.35, 0.45) if progress is not None else None) != behaviorManifest:
                 raise ValueError("Behavioral acquisition changed during raw export.")
 
         mneRoot = posixpath.join(destination, "mne")
+
+        if progress is not None:
+            progress(0.45, "Serializing current MNE contents")
+
         session.mne.saveBundle(mneRoot, filesystem=filesystem)
         directories.add("mne")
+
+        if progress is not None:
+            progress(0.65, "Inventorying and hashing staged MNE files")
 
         for current, directoryNames, fileNames in filesystem.walk(mneRoot, detail=False, on_error="raise"):
             relative = posixpath.relpath(current, destination)
@@ -5531,7 +5564,12 @@ class pglDatabase:
 
             for name in fileNames:
                 path = posixpath.join(current, name)
-                files.append({"name": posixpath.join(relative, name), **pglStorage.hashFile(filesystem, path)})
+                logicalName = posixpath.join(relative, name)
+                identity = pglStorage.hashFile(filesystem, path, progress=exportFileProgress(logicalName), description="Hashing staged MNE file")
+                files.append({"name": logicalName, **identity})
+
+        if progress is not None:
+            progress(0.80, "Writing and verifying raw history")
 
         historyPath = posixpath.join(destination, "history.json")
 
@@ -5540,26 +5578,37 @@ class pglDatabase:
                 raise OSError("Incomplete raw session history write.")
 
         historyIdentity = {"sha256": hashlib.sha256(historyBytes).hexdigest(), "size_bytes": len(historyBytes)}
+        storedHistory = pglStorage.hashFile(filesystem, historyPath, progress=exportFileProgress("history.json"), expectedSize=len(historyBytes), description="Verifying staged history")
 
-        if pglStorage.hashFile(filesystem, historyPath) != historyIdentity:
+        if storedHistory != historyIdentity:
             raise ValueError("Raw session history verification failed.")
 
         files.append({"name": "history.json", **historyIdentity})
-        manifest = {"contract_version": "pgl.raw.session.v1", "runs": runs, "mne": {"path": "mne"}, "directories": sorted(directories), "files": sorted(files, key=lambda record: record["name"])}
+        manifest = {
+            "contract_version": "pgl.raw.session.v1",
+            "runs": runs,
+            "mne": {"path": "mne"},
+            "directories": sorted(directories),
+            "files": sorted(files, key=lambda record: record["name"]),
+        }
         cls.validateRawSessionManifest(manifest)
 
         class DestinationView:
-            # ++++++++++++++++++++++++++++++++++ open +++++++++++++++++++++++++++++++++
-            # Local implementation within saveRawSessionFiles.
-            def open(self, path, mode="rb", **kwargs):
-                return filesystem.open(posixpath.join(destination, path), mode=mode, **kwargs)
+            def open(self, path, mode="rb", **kwargs): return filesystem.open(posixpath.join(destination, path), mode=mode, **kwargs)
 
         view = DestinationView()
+
+        if progress is not None:
+            progress(0.90, "Validating exported MNE inventory and acquisition labels")
+
         cls._verifyMNEInventory(manifest, view)
         _, metadata = cls._readSessionHistory(view, len(runs))
 
         if runs and metadata != cls._behaviorLabelMetadata(manifest, view):
             raise ValueError("Raw history labels differ from the archived behavioral settings.")
+
+        if progress is not None:
+            progress(0.95, "Writing and verifying staged manifest")
 
         content = cls.encodeRawManifest(manifest)
         manifestPath = posixpath.join(destination, "manifest.json")
@@ -5569,9 +5618,13 @@ class pglDatabase:
                 raise OSError("Incomplete raw session manifest write.")
 
         expected = {"sha256": hashlib.sha256(content).hexdigest(), "size_bytes": len(content)}
+        actual = pglStorage.hashFile(filesystem, manifestPath, progress=exportFileProgress("manifest.json"), expectedSize=len(content), description="Verifying staged manifest")
 
-        if pglStorage.hashFile(filesystem, manifestPath) != expected:
+        if actual != expected:
             raise ValueError("Raw session manifest verification failed.")
+
+        if progress is not None:
+            progress(1, "Temporary raw bundle ready")
 
         return destination, manifest
 
@@ -6034,36 +6087,20 @@ class pglDatabase:
 
     # ++++++++++++++++++++++ _registerSessionBundleFiles +++++++++++++++++++++
     @classmethod
-    def _registerSessionBundleFiles(cls, connection, postgres, sessionID, backendID, manifest, *, objectPrefix, storageOptions=None, origin="derived", accessContext=None):
+    def _registerSessionBundleFiles(cls, connection, postgres, sessionID, backendID, manifest, *, objectPrefix, storageOptions=None, origin="derived", accessContext=None, progress=None):
         """Register a staged raw/derived bundle and its verified labels.
 
-        Called by raw-MNE and derived-session publication coordinators.
-        Supports derived v1/v2 inventories through manifest validation.
+        Verifies the manifest, archived metadata, and every registered file.
+        Matrix products remain separate from checkpoint file registration.
 
-        Verifies the stored manifest, reads verified history/acquisition
-        metadata, checks MNE inventory correspondence when applicable, and
-        registers every checkpoint file through the caller's access policy.
+        Uses a nested SQL transaction/savepoint. The caller must commit the
+        outer transaction. Does not copy payloads or complete the checkpoint.
 
-        Matrix references are not session files. Product links are registered
-        separately and checked during checkpoint completion.
+        A supplied access context is borrowed. Otherwise this method creates
+        and closes an operation-owned context.
 
-        Behavioral file subjects come from archived experiment settings.
-        MNE-only subjects come from hashed history metadata.
-        Missing subjects are represented as SQL NULL.
-
-        accessContext:
-            Optional borrowed publication context for the same database.
-            Configure storage options on that context, not both arguments.
-
-        Without accessContext:
-            Creates and closes one operation-owned context.
-
-        Uses a nested transaction/savepoint. The caller's outer transaction
-        must commit for registrations to persist.
-
-        Does not copy payloads, complete the checkpoint, mutate working
-        objects, or replace registered roots with caller-specific SSH URLs.
-        Exceptions propagate; operation-owned resources close on failure.
+        Optional progress allocates most of its range to byte-based stored
+        file verification and reports each subsequent catalog attachment.
         """
         from contextlib import ExitStack
 
@@ -6087,8 +6124,10 @@ class pglDatabase:
             if cls._checkpointDatabaseIdentity(accessContext._postgres) != cls._checkpointDatabaseIdentity(postgres):
                 raise ValueError("The supplied payload context belongs to a different configured database.")
 
-        cls._validateSessionBundleManifest(manifest, origin=origin)
+        if progress is not None:
+            progress(0, "Validating unpublished bundle checkpoint")
 
+        cls._validateSessionBundleManifest(manifest, origin=origin)
         payloadRole = "acquisition" if origin == "raw" else "derived"
         manifestBytes = cls.encodeRawManifest(manifest)
         manifestIdentity = {
@@ -6130,7 +6169,13 @@ class pglDatabase:
                 filesystem, root = access.resolve(backendID, registeredRoot)
                 manifestKey = posixpath.join(objectPrefix, "manifest.json")
 
-                if pglStorage.hashFile(filesystem, posixpath.join(root, manifestKey)) != manifestIdentity:
+                if progress is not None:
+                    progress(0, "Verifying stored manifest")
+
+                manifestProgress = progress.section(0, 0.01, label="manifest.json") if progress is not None else None
+                actualManifest = pglStorage.hashFile(filesystem, posixpath.join(root, manifestKey), progress=manifestProgress, expectedSize=manifestIdentity["size_bytes"], description="Verifying stored manifest")
+
+                if actualManifest != manifestIdentity:
                     raise ValueError("Saved manifest does not match the supplied manifest.")
 
                 fileLocations = {
@@ -6146,17 +6191,24 @@ class pglDatabase:
                     for record in manifest["files"]
                 }
 
-                # Retain original catalog roots in the archive inventory.
-                # Physical reads use the borrowed caller-side access context.
                 archive = pglCheckpointFilesystem(manifest, fileLocations, accessContext=access, ownsAccess=False)
                 resources.callback(archive.close)
 
                 if hasMNE:
+                    if progress is not None:
+                        progress(0.01, "Verifying archived MNE descriptor")
+
                     cls._verifyMNEInventory(manifest, archive)
+
+                if progress is not None:
+                    progress(0.02, "Verifying archived checkpoint history")
 
                 _, historyMetadata = cls._readSessionHistory(archive, len(manifest["runs"]))
 
                 if manifest["runs"]:
+                    if progress is not None:
+                        progress(0.03, "Verifying archived acquisition labels")
+
                     metadata = cls._behaviorLabelMetadata(manifest, archive)
 
                     if historyMetadata is not None and historyMetadata != metadata:
@@ -6171,32 +6223,41 @@ class pglDatabase:
                         }],
                     }
 
+                if progress is not None:
+                    progress(0.04, "Registering verified checkpoint labels")
+
                 cls._recordSessionLabelMetadata(connection, postgres, sessionID, metadata)
-                subjectsByRun = {
-                    run["path"]: metadata["labels"][run["index"]]["subjectID"]
-                    for run in manifest["runs"]
-                }
+                subjectsByRun = {run["path"]: metadata["labels"][run["index"]]["subjectID"] for run in manifest["runs"]}
                 mneSubject = metadata["labels"][0]["subjectID"] if not manifest["runs"] else None
 
-                # +++++++++++++++++++++++ registerPayload +++++++++++++++++++
-                def registerPayload(name, identity, role, subjectID=None):
-                    """Verify a stored file and attach its logical checkpoint link."""
+                def registerPayload(name, identity, role, subjectID=None, fileProgress=None):
+                    """Verify stored bytes, register their location, and attach."""
+                    if fileProgress is not None:
+                        fileProgress(0, "Resolving content identity")
+
                     fileID = cls.getOrCreateFile(connection, postgres, identity["sha256"], identity["size_bytes"])
-                    cls.verifyAndRegisterStorageLocation(connection, postgres, fileID, backendID, posixpath.join(objectPrefix, name), accessContext=access)
+                    cls.verifyAndRegisterStorageLocation(connection, postgres, fileID, backendID, posixpath.join(objectPrefix, name), accessContext=access, progress=fileProgress)
+
+                    if fileProgress is not None:
+                        fileProgress(None, "Attaching checkpoint file")
+
                     cls.attachCheckpointFile(connection, postgres, sessionID, name, fileID, role=role, subjectID=subjectID)
 
-                for record in manifest["files"]:
+                records = [*manifest["files"], {"name": "manifest.json", **manifestIdentity}]
+                fileRange = progress.section(0.05, 1) if progress is not None else None
+
+                for record, fileProgress in pglProgress.fileSections(records, fileRange):
                     name = record["name"]
 
-                    if name == "history.json":
-                        registerPayload(name, record, role="history")
+                    if name == "manifest.json":
+                        registerPayload(name, record, role="manifest", fileProgress=fileProgress)
+                    elif name == "history.json":
+                        registerPayload(name, record, role="history", fileProgress=fileProgress)
                     elif hasMNE and name.startswith("mne/"):
-                        registerPayload(name, record, role=payloadRole, subjectID=mneSubject)
+                        registerPayload(name, record, role=payloadRole, subjectID=mneSubject, fileProgress=fileProgress)
                     else:
                         runPath = "/".join(name.split("/")[:2])
-                        registerPayload(name, record, role=payloadRole, subjectID=subjectsByRun[runPath])
-
-                registerPayload("manifest.json", manifestIdentity, role="manifest")
+                        registerPayload(name, record, role=payloadRole, subjectID=subjectsByRun[runPath], fileProgress=fileProgress)
 
         return sessionID
 
