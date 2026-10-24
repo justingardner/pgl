@@ -288,6 +288,48 @@ class pglDatabase:
         return settingsList[0]
     
     @classmethod
+    def inspectPostgres(cls, *, settings=None, settingsName=None, user=None, sslRootCert=None):
+        """Display and return other sessions in the configured PostgreSQL database.
+
+        Uses pglPostgres for configuration, authentication, and direct/SSH access.
+        Does not cancel queries, terminate sessions, or change database data.
+
+        Returns:
+            List of activity dictionaries, or None if configuration is
+            unavailable or connection authentication is cancelled.
+
+        Visibility into other roles' sessions depends on database permissions.
+        """
+        from pprint import pformat
+
+        from .pglPostgres import pglPostgres
+
+        postgres = pglPostgres.fromSettings(settings=settings, settingsName=settingsName)
+
+        if postgres is None:
+            return None
+
+        activity = postgres.inspectDatabaseActivity(user=user, sslRootCert=sslRootCert)
+
+        if activity is None:
+            return None
+
+        pglMessages.message(
+            f"PostgreSQL activity: database={postgres.databaseName}, "
+            f"schema={postgres.databaseSchema}, transport={postgres.connectionTransport}",
+            wrapText=False,
+        )
+
+        if not activity:
+            pglMessages.message("No other sessions are currently connected to this database.")
+            return activity
+
+        for entry in activity:
+            pglMessages.message(pformat(entry, sort_dicts=False), wrapText=False)
+
+        return activity
+    
+    @classmethod
     def _saveModifiedSettings(cls, modifiedSettingsList, originalSettingsList):
         """
         Save new or modified database settings and trash removed files.
