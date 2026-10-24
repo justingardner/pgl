@@ -262,7 +262,7 @@ class _pglTraitsDialog(QDialog):
 
         # Set overall dimensions
         self.setMinimumWidth(560)
-        maxDialogHeight = 760
+        maxDialogHeight = 900
 
         # Height needed for the form contents
         formHeight = formWidget.sizeHint().height()
