@@ -736,7 +736,7 @@ class pglPostgres(pglTraitSettings):
             raise ValueError("installDirectory must not be blank or contain NUL.")
 
         if "://" in self.installDirectory:
-            raise ValueError("installDirectory is a server-local path, not an fsspec URL. Use databasePath in database settings for configuration discovery.")
+            raise ValueError("installDirectory is a server-local path, not an fsspec URL. Use databasePath in databasepg settings for configuration discovery.")
 
         if self.connectionTransport not in {"direct", "ssh"}:
             raise ValueError("connectionTransport must be direct or ssh.")
@@ -1341,19 +1341,25 @@ class pglPostgres(pglTraitSettings):
         }
 
     @contextmanager
-    def connect(self, *, user=None, sslRootCert=None, rememberPassword=True, useSavedPassword=True):
+    def connect(self, *, user=None, sslRootCert=None, rememberPassword=True, useSavedPassword=True, password=None):
         """Open a client connection, or yield None on password-entry cancellation.
 
-        Uses the OS credential store when available.
-        Saves a newly entered password only after login and database/schema
-        validation succeed. Rejected saved passwords are removed.
+        Without an explicit password:
+            Uses the existing saved-password and interactive-prompt behavior.
+            Rejected saved passwords are removed.
 
-        rememberPassword=False prevents saving a newly entered password.
-        useSavedPassword=False skips looking up an existing saved password.
+        With an explicit password:
+            Attempts that password once.
+            Never reads or removes an existing saved password.
+            Never prompts for a PostgreSQL password or retries authentication.
+            Authentication failures propagate.
 
-        Callers must check for None before using the connection.
+        rememberPassword controls saving after successful login and
+        database/schema validation. Set it False when the caller will
+        explicitly store the credential after connection cleanup.
+
         Connections and SSH tunnels close on exit.
-        Non-password connection failures and caller errors propagate.
+        SSH authentication retains its existing transport behavior.
         """
         from contextlib import ExitStack
 
@@ -1361,6 +1367,15 @@ class pglPostgres(pglTraitSettings):
 
         if not isinstance(rememberPassword, bool) or not isinstance(useSavedPassword, bool):
             raise ValueError("rememberPassword and useSavedPassword must be True or False.")
+
+        explicitPassword = password is not None
+
+        if explicitPassword:
+            if not isinstance(password, str) or not password:
+                raise ValueError("An explicit password must be a nonempty string.")
+
+            if any(character in password for character in ("\n", "\r", "\x00")):
+                raise ValueError("Passwords must contain no newline or NUL characters.")
 
         if self.connectionTransport == "ssh" and not self.sshHost:
             raise RuntimeError("No SSH hostname is available. Load configuration from an ssh:// URL or specify sshHost.")
@@ -1372,11 +1387,10 @@ class pglPostgres(pglTraitSettings):
             if self.connectionTransport == "direct" and self.connectionHost.lower() in {"127.0.0.1", "localhost", "::1"}:
                 raise RuntimeError("Remote configuration points directly to loopback. Configure an SSH transport or a directly reachable database endpoint.")
 
-        store = self._passwordStore() if rememberPassword or useSavedPassword else None
-        password = None
+        store = self._passwordStore() if rememberPassword or (useSavedPassword and not explicitPassword) else None
         fromSavedPassword = False
 
-        if store is not None and useSavedPassword:
+        if not explicitPassword and store is not None and useSavedPassword:
             try:
                 password = store.get_password(service, databaseUser)
                 fromSavedPassword = bool(password)
@@ -1396,9 +1410,20 @@ class pglPostgres(pglTraitSettings):
                         return
 
                     try:
-                        connection = resources.enter_context(pglPostgresTransport.connect(self, user=databaseUser, password=password, sslRootCert=sslRootCert))
+                        connection = resources.enter_context(
+                            pglPostgresTransport.connect(
+                                self,
+                                user=databaseUser,
+                                password=password,
+                                sslRootCert=sslRootCert,
+                            )
+                        )
                     except psycopg.OperationalError as error:
-                        # Connection-time errors do not always expose SQLSTATE.
+                        # Explicit credentials get exactly one attempt.
+                        # Do not delete an existing credential or prompt.
+                        if explicitPassword:
+                            raise
+
                         passwordRejected = error.sqlstate == "28P01" or "password authentication failed" in str(error).lower()
 
                         if not passwordRejected:
@@ -1435,8 +1460,6 @@ class pglPostgres(pglTraitSettings):
                 if connection.execute("SELECT current_schema()").fetchone()[0] != self.databaseSchema:
                     raise RuntimeError(f"Cannot access configured schema: {self.databaseSchema}")
 
-                # Authentication and the configured database/schema checks
-                # have succeeded. Never save a merely attempted password.
                 if rememberPassword and store is not None and not fromSavedPassword:
                     try:
                         store.set_password(service, databaseUser, password)
@@ -1446,11 +1469,11 @@ class pglPostgres(pglTraitSettings):
                         pglMessages.message(f"PostgreSQL password saved in the OS credential store for {databaseUser!r}.")
 
             finally:
-                # Drop this local reference; this is not a guarantee of
-                # secure memory erasure in Python.
+                # Drop this local reference; Python does not guarantee
+                # secure memory erasure.
                 password = None
 
-            # Caller errors occur outside the authentication retry loop.
+            # Caller errors remain outside the authentication retry loop.
             yield connection
 
     def verifyDatabase(self, *, user=None, sslRootCert=None):

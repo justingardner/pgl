@@ -373,18 +373,14 @@ class _pglTraitsDialog(QDialog):
         elif isinstance(trait, List) and trait.metadata.get("isRGB", False):
             self._addRGB(traitName, trait, current, helpText, settingsObject, layout, settingsKey)
             
-        # Path
-        elif isinstance(trait, Unicode) and trait.metadata.get("isPath", False):
-            self._addText(traitName, trait, current, helpText, settingsObject, layout, settingsKey)
-
-        # Unicode with button
+        # Unicode with button, including path fields with an action
         elif isinstance(trait, Unicode) and trait.metadata.get("hasSetButton", False):
             self._addTextWithSetButton(traitName, trait, current, helpText, settingsObject, layout, settingsKey)
 
-        # Unicode
+        # Unicode / Path
         elif isinstance(trait, Unicode):
             self._addText(traitName, trait, current, helpText, settingsObject, layout, settingsKey)
-
+            
         # List with a plot button
         elif isinstance(trait, List) and trait.metadata.get("hasPlotButton", False):
             self._addListWithPlotButton(traitName, trait, current, helpText, settingsObject, layout, settingsKey)
@@ -1596,40 +1592,144 @@ class _pglTraitsDialog(QDialog):
     # ----- Text with a set button -----
     #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
     def _addTextWithSetButton(self, traitName, trait, current, helpText, settingsObject, layout=None, settingsKey=None):
+        """
+        Add a Unicode editor with an action button.
 
-        buttonFunc = trait.metadata.get("buttonFunction", None)
+        Normal input:
+            Edits update the settings object.
+            buttonFunction() returns the replacement string.
 
-        edit = QLineEdit(str(current) if current is not None else "")
-        edit.setAlignment(Qt.AlignCenter) 
+        Transient input:
+            Edits remain exclusively in the widget.
+            buttonFunction(text) returns the replacement string.
+            Refreshing or changing profiles discards pending input.
+
+        isPassword masks input but does not itself prevent persistence.
+        """
+        buttonFunc = trait.metadata.get("buttonFunction")
+        transientInput = bool(trait.metadata.get("transientInput", False))
+        isPassword = bool(trait.metadata.get("isPassword", False))
+        writeName = trait.metadata.get("property", traitName)
+
+        edit = QLineEdit()
+        edit.setAlignment(Qt.AlignCenter)
         edit.setToolTip(helpText)
+
+        if isPassword:
+            edit.setEchoMode(QLineEdit.EchoMode.Password)
+
+        # Transient fields never populate from a stored settings value.
+        if not transientInput:
+            edit.setText(str(current) if current is not None else "")
 
         button = QPushButton(trait.metadata.get("buttonLabel", "Set"))
         button.setToolTip(helpText)
-        button.setCheckable(True)
-        
-        def onButtonClicked():
-            if buttonFunc is None:
-                return
-            method = getattr(settingsObject, buttonFunc, None)
-            if method is None:
-                return
-            edit.setText(method())
 
+        # This is an action, not a toggle or an implicit Enter-key action.
+        button.setCheckable(False)
+        button.setAutoDefault(False)
+        button.setDefault(False)
 
+        def currentOwner():
+            """Resolve the currently selected profile at action time."""
+            if isinstance(settingsObject, _RetargetableProxy):
+                return object.__getattribute__(settingsObject, "_target")
+            return settingsObject
+
+        def setEditorText(value):
+            """Update the editor without triggering a settings assignment."""
+            wasBlocked = edit.blockSignals(True)
+            try:
+                edit.setText(value)
+            finally:
+                edit.blockSignals(wasBlocked)
+
+        def showError(error):
+            """Display useful error details with the entered secret redacted."""
+            details = str(error)
+
+            if isPassword:
+                password = edit.text()
+
+                if password:
+                    details = details.replace(password, "*********")
+                else:
+                    # Without the input, we cannot reliably redact it.
+                    details = "Error details are unavailable for this password operation."
+
+            message = QMessageBox(self)
+            message.setIcon(QMessageBox.Icon.Warning)
+            message.setWindowTitle("Setting action failed")
+            message.setTextFormat(Qt.TextFormat.PlainText)
+            message.setText(f"The operation could not be completed ({type(error).__name__}).")
+            message.setInformativeText(details)
+            message.setStandardButtons(QMessageBox.StandardButton.Ok)
+            message.exec()
+            
         def onChange(text):
-            if not self._updatingWidget:
-                self._commit(settingsObject, traitName, text)
+            if self._updatingWidget or transientInput:
+                return
+
+            try:
+                # Assign directly so failures do not pass through _commit(),
+                # which prints exception messages and might expose input.
+                setattr(currentOwner(), writeName, text)
+            except Exception as error:
+                showError(error)
+
+        def onButtonClicked(checked=False):
+            if self._updatingWidget:
+                return
+
+            owner = currentOwner()
+            button.setEnabled(False)
+
+            try:
+                if not isinstance(buttonFunc, str) or not buttonFunc:
+                    raise ValueError("Missing buttonFunction metadata.")
+
+                method = getattr(owner, buttonFunc, None)
+
+                if not callable(method):
+                    raise TypeError("buttonFunction must name a callable method.")
+
+                replacement = method(edit.text()) if transientInput else method()
+
+                if not isinstance(replacement, str):
+                    raise TypeError("The button callback must return a string.")
+
+                if not transientInput:
+                    setattr(owner, writeName, replacement)
+
+                if currentOwner() is owner:
+                    setEditorText(replacement)
+
+            except Exception as error:
+                # Redact using the input before clearing it.
+                showError(error)
+
+            finally:
+                if isPassword:
+                    setEditorText("")
+
+                button.setEnabled(True)
+
+        def setter(value):
+            # Used when refreshing fields or switching profiles.
+            # Never carry pending transient input into another profile.
+            text = "" if transientInput else (str(value) if value is not None else "")
+            setEditorText(text)
 
         edit.textChanged.connect(onChange)
         button.clicked.connect(onButtonClicked)
-        
+
         row = QWidget()
         h = QHBoxLayout(row)
         h.setContentsMargins(0, 0, 0, 0)
         h.addWidget(edit, 1)
         h.addWidget(button)
 
-        self._register(traitName, trait, row, lambda v: edit.setText(str(v) if v is not None else ""), layout, settingsKey)
+        self._register(traitName, trait, row, setter, layout, settingsKey)
 
 
     #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-

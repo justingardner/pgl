@@ -38,6 +38,7 @@ class pglDatabaseSettings(pglTraitSettings):
     databasePath = Unicode("~/data/pgl", isPath=True, help="Directory containing the PostgreSQL configuration, server log, and database files. Supports ~ for the home directory.")
     cacheDir = Unicode("~/data/pgl/cache", help="Local directory for files downloaded from database (e.g. raw mne files). Cached files are not automatically deleted.", isPath=True)
     username = Unicode(help="Creator username for data-store provenance. Defaults to the OS login username; editable to use a consistent identity across machines.")
+    password = Unicode("", hasSetButton=True, buttonFunction="storePassword", buttonLabel="Store in keychain", isPassword=True, transientInput=True, help="Enter the existing PostgreSQL login password, then click Store in keychain to verify and save it securely. This does not change the server password. Unsubmitted input is discarded. Cancel does not undo a successful keychain write.")
     
     @default("username")
     def _default_username(self):
@@ -63,6 +64,55 @@ class pglDatabaseSettings(pglTraitSettings):
 
     def saveDir(self):
         return pglDatabase.getSettingsDir() / f"{pglStorage.makeValidFilename(self.name)}.json"
+    
+    def storePassword(self, password):
+        """Test and securely store the selected profile's PostgreSQL password.
+
+        Called by the dialog with transient widget input.
+        Never assigns the password to a settings trait.
+        Does not change the PostgreSQL server password.
+
+        Returns an empty string only after successful connection cleanup
+        and credential storage, instructing the dialog to clear its input.
+        """
+        from .pglPostgres import pglPostgres
+
+        if not isinstance(password, str) or not password:
+            raise ValueError("Enter a nonempty password.")
+
+        if any(character in password for character in ("\n", "\r", "\x00")):
+            raise ValueError("Passwords must contain no newline or NUL characters.")
+
+        try:
+            postgres = pglPostgres.fromSettings(settings=self)
+
+            if postgres is None:
+                raise RuntimeError("Could not resolve PostgreSQL configuration.")
+
+            # Fail before attempting login if secure storage is unavailable.
+            if postgres._passwordStore() is None:
+                raise RuntimeError("Secure password storage is unavailable.")
+
+            # Attempt only the supplied password. Do not fall back to the
+            # keychain, prompt in the subprocess, or save during connect().
+            with postgres.connect(
+                password=password,
+                rememberPassword=False,
+                useSavedPassword=False,
+            ) as connection:
+                if connection is None:
+                    raise RuntimeError("Password verification was cancelled.")
+
+            # Connection and tunnel cleanup succeeded. Store using exactly
+            # the identity used by ordinary client authentication.
+            if not postgres._saveVerifiedPassword(postgres.databaseUser, password):
+                raise RuntimeError("Could not save the password securely.")
+
+            return ""
+
+        finally:
+            # Does not guarantee secure memory erasure.
+            password = None
 
 
 ##################################################
