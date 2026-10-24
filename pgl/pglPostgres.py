@@ -1498,6 +1498,123 @@ class pglPostgres(pglTraitSettings):
         pglMessages.message(f"Transport: {self.connectionTransport}")
         pglMessages.message("Application connection and query test passed.")
         return True
+    
+    # ------------------------------------------------------------
+    # Inspect database activity
+    # ------------------------------------------------------------
+
+    def inspectDatabaseActivity(self, *, user=None, sslRootCert=None):
+        """Return other sessions in this database for lock diagnostics.
+
+        Uses the normal direct/SSH client connection.
+        Returns None on password-entry cancellation.
+
+        Query visibility depends on the connected role's permissions.
+        Does not cancel queries, terminate sessions, or change data.
+        """
+        from psycopg.rows import dict_row
+
+        statement = """
+            SELECT
+                a.pid,
+                a.backend_start,
+                a.usename,
+                a.application_name,
+                a.client_addr,
+                a.state,
+                a.xact_start,
+                clock_timestamp() - a.xact_start AS transaction_age,
+                a.wait_event_type,
+                a.wait_event,
+                pg_blocking_pids(a.pid) AS blocking_pids,
+                EXISTS (
+                    SELECT 1
+                    FROM pg_locks AS l
+                    WHERE l.pid = a.pid
+                      AND l.locktype = 'advisory'
+                      AND l.granted
+                ) AS holds_advisory_lock,
+                a.query AS last_query
+            FROM pg_stat_activity AS a
+            WHERE a.datname = current_database()
+              AND a.pid <> pg_backend_pid()
+            ORDER BY a.xact_start NULLS LAST, a.pid
+        """
+
+        with self.connect(user=user, sslRootCert=sslRootCert) as connection:
+            if connection is None:
+                return None
+
+            with connection.cursor(row_factory=dict_row) as cursor:
+                cursor.execute(statement)
+                return cursor.fetchall()
+    
+    
+    # ------------------------------------------------------------
+    # acquire transaction lock
+    # ------------------------------------------------------------ 
+    @staticmethod
+    def acquireTransactionLock(connection, lockName, *, description="database operation", timeoutSeconds=30.0, pollSeconds=0.25):
+        """Acquire a named transaction advisory lock with bounded contention wait.
+
+        Requires an explicit active transaction.
+        The lock remains held until that transaction ends.
+
+        Reports contention once and raises TimeoutError on deadline.
+        Callers must let failures unwind their transaction context.
+
+        The deadline bounds lock-contention retries, not network stalls
+        inside an individual SQL request.
+        """
+        import math
+        import time
+
+        from psycopg.pq import TransactionStatus
+
+        if not isinstance(lockName, str) or not lockName or "\x00" in lockName:
+            raise ValueError("lockName must be a nonempty string without NUL.")
+
+        for name, value in (("timeoutSeconds", timeoutSeconds), ("pollSeconds", pollSeconds)):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be a finite positive number.")
+
+        if connection.info.transaction_status != TransactionStatus.INTRANS:
+            raise RuntimeError("acquireTransactionLock() requires an active explicit transaction.")
+
+        started = time.monotonic()
+        deadline = started + timeoutSeconds
+        reportedWait = False
+
+        while True:
+            if reportedWait and time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Timed out after {timeoutSeconds:g} s waiting for {description}: "
+                    "another database session holds a conflicting lock. "
+                    "It may still be working or may have an unfinished transaction."
+                )
+
+            acquired = connection.execute(
+                "SELECT pg_try_advisory_xact_lock(hashtextextended(%s, 0))",
+                (lockName,),
+            ).fetchone()[0]
+
+            if acquired:
+                if reportedWait:
+                    pglMessages.message(f"Lock acquired for {description} after {time.monotonic() - started:.1f} s.")
+                return
+
+            if not reportedWait:
+                pglMessages.message(
+                    f"Waiting for {description}: another database session holds "
+                    f"a conflicting lock (timeout: {timeoutSeconds:g} s)..."
+                )
+                reportedWait = True
+
+            remaining = deadline - time.monotonic()
+
+            if remaining > 0:
+                time.sleep(min(pollSeconds, remaining))
+                
     # ------------------------------------------------------------
     # Local administrator connections
     # ------------------------------------------------------------

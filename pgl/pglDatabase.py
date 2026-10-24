@@ -3949,7 +3949,7 @@ class pglDatabase:
         # Serialize registration for the exact configured root. Preserve its
         # spelling and identity rather than creating a personal access URL.
         lockName = f"pgl.storage_backend:{postgres.databaseSchema}:{configuredRoot}"
-        connection.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (lockName,))
+        postgres.acquireTransactionLock(connection, lockName, description="storage-backend registration", timeoutSeconds=30.0)
 
         table = sql.Identifier(postgres.databaseSchema, "storage_backends")
         statement = sql.SQL("""
