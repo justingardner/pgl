@@ -93,7 +93,7 @@ class pglPostgresTransport:
         file.flush()
         file.seek(0)
         return file.read().decode("utf-8", errors="replace").strip()
-
+    
     @classmethod
     @contextmanager
     def _ssh(cls, postgres, options):
@@ -299,6 +299,18 @@ class pglPostgres(pglTraitSettings):
     @property
     def pgCtl(self):
         return self.binaryDirectory / "pg_ctl"
+
+    @property
+    def connectTimeoutSeconds(self):
+        return getattr(self, "_connectTimeoutSeconds", self.CONNECT_TIMEOUT_SECONDS)
+
+    @property
+    def lockTimeoutSeconds(self):
+        return getattr(self, "_lockTimeoutSeconds", 30.0)
+
+    @property
+    def ioTimeoutSeconds(self):
+        return getattr(self, "_ioTimeoutSeconds", 60)
 
     # ------------------------------------------------------------
     # Configuration serialization
@@ -2359,3 +2371,39 @@ class pglPostgres(pglTraitSettings):
 
         pglMessages.message(f"Connection {pid} terminated. Its transaction locks are released; uploaded payload files were not removed.")
         return True
+    
+    @staticmethod
+    def validateTimeouts(*, lockTimeoutSeconds, ioTimeoutSeconds, connectTimeoutSeconds):
+        """Validate runtime timeout values without opening connections."""
+        import math
+
+        if isinstance(lockTimeoutSeconds, bool) or not isinstance(lockTimeoutSeconds, (int, float)) or not math.isfinite(lockTimeoutSeconds) or lockTimeoutSeconds <= 0:
+            raise ValueError("lockTimeoutSeconds must be a finite positive number.")
+
+        if type(ioTimeoutSeconds) is not int or ioTimeoutSeconds <= 0:
+            raise ValueError("ioTimeoutSeconds must be a positive integer.")
+
+        if type(connectTimeoutSeconds) is not int or connectTimeoutSeconds < 2:
+            raise ValueError("connectTimeoutSeconds must be an integer of at least 2 seconds.")
+        
+    def withTimeouts(self, *, lockTimeoutSeconds=None, ioTimeoutSeconds=None, connectTimeoutSeconds=None):
+        """Return an independent configuration copy with runtime timeouts.
+
+        None preserves this object's effective timeout.
+        Copies configuration and remote-discovery status, not connections.
+
+        Overrides are ordinary private attributes, not serialized traits.
+        The original object and its saved configuration remain unchanged.
+        """
+        lockTimeoutSeconds = self.lockTimeoutSeconds if lockTimeoutSeconds is None else lockTimeoutSeconds
+        ioTimeoutSeconds = self.ioTimeoutSeconds if ioTimeoutSeconds is None else ioTimeoutSeconds
+        connectTimeoutSeconds = self.connectTimeoutSeconds if connectTimeoutSeconds is None else connectTimeoutSeconds
+
+        self.validateTimeouts(lockTimeoutSeconds=lockTimeoutSeconds, ioTimeoutSeconds=ioTimeoutSeconds, connectTimeoutSeconds=connectTimeoutSeconds)
+
+        copied = type(self).fromJSONdict(self.toJSONdict())
+        copied._configurationLoadedRemotely = getattr(self, "_configurationLoadedRemotely", False)
+        copied._lockTimeoutSeconds = float(lockTimeoutSeconds)
+        copied._ioTimeoutSeconds = ioTimeoutSeconds
+        copied._connectTimeoutSeconds = connectTimeoutSeconds
+        return copied

@@ -2549,51 +2549,48 @@ class pglSession(pglActionable):
         return None
 
     # +++++++++++++++++++++++++ saveRawSession ++++++++++++++++++++++++++++++
-    def saveRawSession(self, *, settings=None, settingsName=None, backendID=None, storageOptions=None, sslRootCert=None, allowMissingMetadata=False):
+    def saveRawSession(self, *, settings=None, settingsName=None, backendID=None, storageOptions=None, sslRootCert=None, allowMissingMetadata=False, lockTimeoutSeconds=30.0, ioTimeoutSeconds=60, connectTimeoutSeconds=10):
         """Publish this session as a parentless acquisition checkpoint.
-
-        User-facing convenience wrapper for pglDatabase.saveRawSession().
-        The database layer owns configuration, SQL transactions, payload
-        publication, duplicate detection, and checkpoint completion.
 
         Supports behavioral-only, MNE-only, and mixed sessions.
 
-        Behavioral files and labels come from saved acquisition sources,
-        not in-memory edits. Without behavioral runs, labels come from
-        self.experimentName and self.subjectID.
+        Behavioral files/labels come from saved acquisition sources.
+        MNE contents are serialized from their current state.
+        Attached derived matrices are omitted without changing attachments.
 
-        Missing experiment/subject labels warn and cancel unless
-        allowMissingMetadata=True. Malformed or unreadable settings still
-        raise; the override permits missing labels only.
+        Missing labels warn and cancel unless allowMissingMetadata=True.
+        Malformed settings and integrity errors are not bypassed.
 
-        MNE objects are serialized from their current contents. Original
-        vendor acquisition files are not automatically archived.
+        Runtime timeout options:
+            lockTimeoutSeconds:
+                Maximum contention wait for each advisory-lock acquisition.
+                Does not set PostgreSQL's general SQL lock_timeout.
+            ioTimeoutSeconds:
+                Channel I/O timeout for PGL-owned inferred SFTP access.
+                Does not limit total upload duration or change caller-owned
+                source filesystems or explicit-URL backend configuration.
+            connectTimeoutSeconds:
+                PostgreSQL and PGL-owned SSH connection/setup timeout.
+                Does not control remote configuration-file discovery.
 
-        Attached data matrices are omitted with a warning and remain attached
-        to the working session. Use saveSession() to persist those products.
+        Defaults are 30, 60, and 10 seconds respectively.
+        Overrides are not saved to PostgreSQL configuration.
 
-        Returns:
-            Completed raw checkpoint ID, possibly reusing an identical active
-            checkpoint; None for missing-label rejection, unavailable
-            configuration, or connection cancellation.
+        Returns a completed/reused checkpoint ID, or None for rejection,
+        cancellation, unavailable configuration, or handled operational failure.
 
-        After successful publication and connection cleanup, this wrapper
-        assigns self.sessionID so saveSession() can use it as the parent.
-        It does not bind a new history baseline or clear action history.
-        Failure or cancellation leaves self.sessionID unchanged.
+        Assigns self.sessionID only after successful publication and cleanup.
+        Does not bind a new history baseline or clear action history.
 
-        Database writes are transactional; payload writes are not.
-        Other errors propagate and may leave unregistered payload files.
-
-        Usage:
-            rawID = session.saveRawSession(settingsName="desktop")
+        SQL writes are transactional; payload writes are not.
+        Failed saves can leave unregistered files.
         """
         from .pglDatabase import pglDatabase
 
         if type(allowMissingMetadata) is not bool:
             raise ValueError("allowMissingMetadata must be a boolean.")
 
-        sessionID = pglDatabase.saveRawSession(self, settings=settings, settingsName=settingsName, backendID=backendID, storageOptions=storageOptions, sslRootCert=sslRootCert, allowMissingMetadata=allowMissingMetadata)
+        sessionID = pglDatabase.saveRawSession(self, settings=settings, settingsName=settingsName, backendID=backendID, storageOptions=storageOptions, sslRootCert=sslRootCert, allowMissingMetadata=allowMissingMetadata, lockTimeoutSeconds=lockTimeoutSeconds, ioTimeoutSeconds=ioTimeoutSeconds, connectTimeoutSeconds=connectTimeoutSeconds)
 
         if sessionID is not None:
             self.sessionID = sessionID

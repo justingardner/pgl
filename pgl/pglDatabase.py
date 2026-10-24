@@ -945,31 +945,29 @@ class pglDatabase:
     # User-facing database API. See the docstring for configuration, side effects, and return
     # conventions.
     @classmethod
-    def saveRawSession(cls, session, *, settings=None, settingsName=None, backendID=None, storageOptions=None, sslRootCert=None, allowMissingMetadata=False):
+    def saveRawSession(cls, session, *, settings=None, settingsName=None, backendID=None, storageOptions=None, sslRootCert=None, allowMissingMetadata=False, lockTimeoutSeconds=30.0, ioTimeoutSeconds=60, connectTimeoutSeconds=10):
         """Save or reuse a parentless acquisition checkpoint with progress.
 
-        Behavioral acquisition files and current MNE contents are supported.
-        Attached derived matrices are warned about and omitted without changing
-        working attachments.
+        Timeout overrides apply to a private runtime configuration copy:
+            lockTimeoutSeconds: each advisory-lock contention wait.
+            ioTimeoutSeconds: PGL-owned inferred SFTP channel I/O.
+            connectTimeoutSeconds: PostgreSQL and PGL-owned SSH setup.
 
-        Missing-label validation occurs before configuration or publication.
-        allowMissingMetadata permits missing labels, not malformed settings.
+        These do not limit total save duration, change caller-owned source
+        filesystems, configure explicit-URL storage backends, or control remote
+        configuration-file discovery. SQL statement/general lock timeouts are
+        not changed.
 
-        Returns:
-            Checkpoint ID after successful commit and connection cleanup.
-            None for rejected labels, unavailable configuration, connection
-            cancellation, or handled lock/connection/timeout failures.
+        Returns a checkpoint ID after commit and connection cleanup, or None
+        for rejection, cancellation, unavailable configuration, or handled
+        lock/connection/timeout failures.
 
-        Expected operational failures warn after resource contexts unwind.
-        Authentication, host-key, integrity, programming, and other unexpected
-        SSH errors propagate. KeyboardInterrupt also propagates.
+        Unexpected errors, integrity failures, and KeyboardInterrupt propagate.
+        Recognized dropped SSH connections warn; SSH security failures propagate.
 
-        Connection failure during commit can leave its outcome uncertain.
-        Cleanup failure after confirmed commit does not undo publication.
-
-        SQL changes are transactional; filesystem writes are not.
-        Failed saves may leave unregistered payloads.
-        No automatic retry, lock-owner termination, or payload deletion occurs.
+        SQL changes are transactional; payload writes are not.
+        Failure during commit can leave its outcome uncertain to this client.
+        No automatic retry, connection termination, or payload deletion occurs.
         """
         from time import perf_counter
 
@@ -977,6 +975,9 @@ class pglDatabase:
         from paramiko.ssh_exception import AuthenticationException, BadHostKeyException
 
         from .pglPostgres import pglPostgres
+
+        # Reject invalid timeout arguments before source reads or connections.
+        pglPostgres.validateTimeouts(lockTimeoutSeconds=lockTimeoutSeconds, ioTimeoutSeconds=ioTimeoutSeconds, connectTimeoutSeconds=connectTimeoutSeconds)
 
         sessionID = None
         commitAttempted = False
@@ -1003,7 +1004,7 @@ class pglDatabase:
             }
 
         def warnSaveFailure(reason, *, inspectLocks=False):
-            """Warn after cleanup and optionally show concise lock diagnostics."""
+            """Warn after cleanup and optionally display current lock owners."""
             if commitConfirmed:
                 outcome = (
                     f"Raw checkpoint {sessionID}: the database transaction committed, "
@@ -1026,22 +1027,22 @@ class pglDatabase:
                 )
 
             pglMessages.warning(
-                f"Raw session save stopped while {operation}: {reason}. \n\n"
-                f"{outcome} Partial or unregistered payload files may remain. "
+                f"Raw session save stopped while {operation}: {reason}.\n"
+                f"{outcome}\n"
+                "Partial or unregistered payload files may remain. "
                 "No automatic retry or connection termination was performed.",
                 level=2,
             )
 
             if inspectLocks:
+                pglMessages.message("Checking current lock owners and blocked sessions...", wrapText=False)
 
                 try:
                     cls.inspectPostgresLocks(settings=settings, settingsName=settingsName, sslRootCert=sslRootCert)
                 except Exception as diagnosticError:
-                    # Diagnostics must not replace the original save failure.
-                    # Do not print backend exception text containing credentials.
                     pglMessages.warning(f"Lock inspection was unavailable ({type(diagnosticError).__name__}). Restore connectivity and run pglDatabase.inspectPostgresLocks() with the same database settings.", level=1)
 
-                pglMessages.message("For a confirmed abandoned lock, use pglDatabase.terminatePostgresLock(PID). Administrator authorization and confirmation are required. Current holders are not necessarily the original blocker.", wrapText=False)
+                pglMessages.message("For a confirmed abandoned owner, use pglDatabase.terminatePostgresLockOwner(PID). Administrator authorization and confirmation are required. Current holders are not necessarily the original blocker.", wrapText=False)
             else:
                 pglMessages.message("Check VPN/network and database/storage availability. After restoring connectivity, run pglDatabase.inspectPostgres() before retrying.", wrapText=False)
 
@@ -1080,6 +1081,9 @@ class pglDatabase:
                     progress(None, "PostgreSQL configuration unavailable")
                     return None
 
+                # Keep saved configuration and other operations unchanged.
+                postgres = postgres.withTimeouts(lockTimeoutSeconds=lockTimeoutSeconds, ioTimeoutSeconds=ioTimeoutSeconds, connectTimeoutSeconds=connectTimeoutSeconds)
+
                 baseline = session._checkpointBaseline
 
                 if baseline and baseline["databaseIdentity"] != cls._checkpointDatabaseIdentity(postgres):
@@ -1116,12 +1120,8 @@ class pglDatabase:
 
                         operation = "committing the checkpoint transaction"
                         progress(0.98, "Committing transaction")
-
-                        # The outer transaction commits as its context exits.
-                        # Set this immediately before leaving that context.
                         commitAttempted = True
 
-                    # Successful transaction-context exit confirms commit.
                     commitConfirmed = True
                     operation = "closing the PostgreSQL connection and tunnel"
                     progress(0.99, "Closing PostgreSQL connection and tunnel")
@@ -1133,9 +1133,12 @@ class pglDatabase:
             return None
 
         except TimeoutError:
-            # Python TimeoutError is used by both our advisory-lock helper
-            # and network/SFTP operations. Do not label every timeout a lock.
-            warnSaveFailure("a lock wait, connection attempt, or I/O operation timed out", inspectLocks=True)
+            reason = (
+                "a lock wait, connection attempt, or I/O operation timed out "
+                f"(configured limits: advisory lock {lockTimeoutSeconds:g} s, "
+                f"SFTP I/O {ioTimeoutSeconds} s, connection setup {connectTimeoutSeconds} s)"
+            )
+            warnSaveFailure(reason, inspectLocks=True)
             return None
 
         except SSHException as error:
@@ -4111,7 +4114,7 @@ class pglDatabase:
             from .pglSSH import pglSSHFilesystem
 
             access = postgres.getSSHAccessConfiguration()
-            filesystem = pglSSHFilesystem(access)
+            filesystem = pglSSHFilesystem(access, ioTimeoutSeconds=postgres.ioTimeoutSeconds)
             return filesystem, serverRoot
 
         if postgres.connectionTransport == "direct":
@@ -4240,7 +4243,7 @@ class pglDatabase:
         # Serialize registration for the exact configured root. Preserve its
         # spelling and identity rather than creating a personal access URL.
         lockName = f"pgl.storage_backend:{postgres.databaseSchema}:{configuredRoot}"
-        postgres.acquireTransactionLock(connection, lockName, description="storage-backend registration", timeoutSeconds=30.0)
+        postgres.acquireTransactionLock(connection, lockName, description="storage-backend registration", timeoutSeconds=postgres.lockTimeoutSeconds)
 
         table = sql.Identifier(postgres.databaseSchema, "storage_backends")
         statement = sql.SQL("""
@@ -5064,7 +5067,7 @@ class pglDatabase:
             if progress is not None:
                 progress(None, "Acquiring raw-checkpoint identity lock")
 
-            postgres.acquireTransactionLock(connection, manifestHash, description="raw-checkpoint identity", timeoutSeconds=30.0)
+            postgres.acquireTransactionLock(connection, manifestHash, description="raw-checkpoint identity", timeoutSeconds=postgres.lockTimeoutSeconds)
 
             if progress is not None:
                 progress(None, "Comparing checkpoint catalog")
@@ -5145,6 +5148,232 @@ class pglDatabase:
             return sessionID
 
     # +++++++++++++++++++++++++ _saveRawMNECheckpoint +++++++++++++++++++++++
+    @classmethod
+    def _saveRawMNECheckpoint(cls, connection, postgres, session, createdBy, backendID, storageOptions=None, *, progress=None):
+        """Publish or reuse a parentless raw checkpoint containing MNE.
+
+        Called by _saveRawSession() using the caller's connection and outer
+        transaction.
+
+        Exports current MNE and unchanged behavioral acquisition contents to
+        temporary local staging, then copies, verifies, and registers files
+        through one operation-owned payload access context.
+
+        Identical active completed checkpoints may be reused.
+        Matching deleted checkpoints remain deleted.
+
+        Runtime timeout overrides are carried by postgres:
+            lockTimeoutSeconds controls checkpoint-identity lock waiting.
+            connectTimeoutSeconds and ioTimeoutSeconds are preserved by
+            pglDatabaseAccess for PGL-owned inferred SSH payload access.
+
+        Owns temporary staging and destination payload access.
+        Working-session source readers remain caller-owned.
+
+        Returns the new or reused checkpoint ID without changing the working
+        session's identity, annotations, or history.
+
+        Uses a nested transaction/savepoint. The outer transaction must commit.
+        Payload writes are not transactional and failures may leave files.
+
+        progress is an optional save-level pglProgress instance.
+        Successful commit and 100% reporting belong to saveRawSession().
+        """
+        from tempfile import TemporaryDirectory
+
+        from fsspec.implementations.local import LocalFileSystem
+
+        from .pglSession import pglMNE
+
+        for label, value in (("createdBy", createdBy), ("backendID", backendID)):
+            if type(value) is not int or not 0 <= value <= 9223372036854775807:
+                raise ValueError(f"{label} must be a nonnegative PostgreSQL bigint.")
+
+        if storageOptions is not None and not isinstance(storageOptions, dict):
+            raise TypeError("storageOptions must be a dictionary or None.")
+
+        if type(session.mne) is not pglMNE:
+            raise TypeError("MNE raw checkpoints require a pglMNE instance.")
+
+        sessions = sql.Identifier(postgres.databaseSchema, "session")
+        users = sql.Identifier(postgres.databaseSchema, "users")
+        backends = sql.Identifier(postgres.databaseSchema, "storage_backends")
+
+        def isLocal(filesystem):
+            """Determine locality from the resolved filesystem."""
+            protocols = filesystem.protocol
+            protocols = {protocols} if isinstance(protocols, str) else set(protocols)
+            return bool(protocols.intersection({"file", "local"}))
+
+        with connection.transaction(), pglDatabaseAccess(postgres, {backendID: storageOptions or {}}) as access:
+            statement = sql.SQL("SELECT 1 FROM {} WHERE user_id = %s FOR SHARE").format(users)
+
+            if connection.execute(statement, (createdBy,)).fetchone() is None:
+                raise ValueError(f"Unknown creator: {createdBy}")
+
+            statement = sql.SQL("SELECT url_prefix, is_active FROM {} WHERE backend_id = %s FOR SHARE").format(backends)
+            backend = connection.execute(statement, (backendID,)).fetchone()
+
+            if backend is None or not backend[1]:
+                raise ValueError("Storage backend is missing or inactive.")
+
+            if progress is not None:
+                progress(0.05, "Opening destination storage")
+
+            destinationFS, destinationRoot = access.resolve(backendID, backend[0])
+            stagingFS = LocalFileSystem(skip_instance_cache=True)
+
+            with TemporaryDirectory(prefix="pgl-raw-session-") as temporary:
+                if progress is not None:
+                    progress(0.06, "Exporting current MNE and behavioral contents to temporary staging")
+
+                stagingRoot, manifest = cls.saveRawSessionFiles(session, Path(temporary) / "bundle", filesystem=stagingFS, progress=progress.section(0.06, 0.09) if progress is not None else None)
+                manifestBytes = cls.encodeRawManifest(manifest)
+                manifestHash = hashlib.sha256(manifestBytes).hexdigest()
+
+                if progress is not None:
+                    progress(0.09, "Acquiring raw-checkpoint identity lock")
+
+                postgres.acquireTransactionLock(connection, manifestHash, description="raw-checkpoint identity", timeoutSeconds=postgres.lockTimeoutSeconds)
+
+                if progress is not None:
+                    progress(None, "Checking for an existing raw checkpoint")
+
+                statement = sql.SQL("""
+                    SELECT session_id, status, contract_version
+                    FROM {}
+                    WHERE origin = 'raw'
+                      AND manifest_hash = %s
+                      AND deleted_at IS NULL
+                    FOR SHARE
+                """).format(sessions)
+                existing = connection.execute(statement, (manifestHash,)).fetchone()
+
+                if existing is not None:
+                    existingID, status, contract = existing
+
+                    if (status, contract) != ("complete", "pgl.raw.session.v1"):
+                        raise ValueError("Matching raw manifest belongs to an unsupported or incomplete checkpoint.")
+
+                    # This private inspection creates its own payload contexts.
+                    # Close them before returning; no loaded session escapes.
+                    inspected = None
+
+                    try:
+                        if progress is not None:
+                            progress(None, f"Verifying existing checkpoint {existingID}")
+
+                        inspected = cls.loadRawSessionBundle(connection, postgres, existingID, storageOptionsByBackend={backendID: storageOptions or {}}, cacheDirectory=Path(temporary) / "unused-cache")
+
+                    finally:
+                        if inspected is not None:
+                            try:
+                                for matrix in inspected.dataMatrices.values():
+                                    try:
+                                        matrix.close()
+                                    except Exception as error:
+                                        pglMessages.warning(f"Could not close a duplicate-inspection matrix ({type(error).__name__}).", level=1)
+                            finally:
+                                inspected.filesystem.close()
+
+                    pglMessages.warning(f"This raw session is already saved as active checkpoint {existingID}. No new checkpoint was created; returning the existing ID. To save another raw copy, delete checkpoint {existingID} and call saveRawSession() again. To save further work as a derived checkpoint, use saveSession().", level=2)
+
+                    if progress is not None:
+                        progress(0.97, f"Reusing existing checkpoint {existingID}")
+
+                    return existingID
+
+                statement = sql.SQL("""
+                    SELECT session_id
+                    FROM {}
+                    WHERE origin = 'raw'
+                      AND manifest_hash = %s
+                      AND deleted_at IS NOT NULL
+                    ORDER BY session_id
+                    FOR SHARE
+                """).format(sessions)
+                deletedMatches = connection.execute(statement, (manifestHash,)).fetchall()
+
+                if deletedMatches:
+                    deletedIDs = ", ".join(str(row[0]) for row in deletedMatches)
+                    pglMessages.message(f"Found matching deleted raw checkpoint(s) {deletedIDs}; leaving them unchanged and saving a new checkpoint.")
+
+                modalities = (["behavior"] if manifest["runs"] else []) + ["mne"]
+
+                if progress is not None:
+                    progress(None, "Allocating raw MNE checkpoint")
+
+                statement = sql.SQL("""
+                    INSERT INTO {} (
+                        origin, kind, ingest_method, modalities, status,
+                        contract_version, created_by, started_at
+                    )
+                    VALUES (
+                        'raw', 'acquired', 'manual', %s::text[], 'in_progress',
+                        'pgl.raw.session.v1', %s, now()
+                    )
+                    RETURNING session_id
+                """).format(sessions)
+                sessionID = connection.execute(statement, (modalities, createdBy)).fetchone()[0]
+
+                objectPrefix = f"session{sessionID:06d}"
+                destination = posixpath.join(destinationRoot, objectPrefix)
+
+                # Preserve source/destination overlap checks. An SSH-backed
+                # server path must not be resolved on the client computer.
+                for run in session.runs or []:
+                    if run.filesystem is None:
+                        raise ValueError("Source run has no filesystem.")
+
+                    if isLocal(destinationFS) and isLocal(run.filesystem):
+                        target = Path(destination).expanduser().resolve()
+                        source = Path(run.fullDataPath).expanduser().resolve()
+
+                        if target == source or source in target.parents:
+                            raise ValueError("Checkpoint destination must be outside source run directories.")
+
+                    elif destinationFS == run.filesystem:
+                        target = posixpath.normpath(destination)
+                        source = posixpath.normpath(run.fullDataPath)
+
+                        if target == source or target.startswith(source.rstrip("/") + "/"):
+                            raise ValueError("Checkpoint destination must be outside source run directories.")
+
+                if progress is not None:
+                    progress(0.10, "Creating checkpoint directories")
+
+                if destinationFS.exists(destination):
+                    raise FileExistsError(destination)
+
+                destinationFS.makedirs(destination, exist_ok=False)
+
+                for directory in manifest["directories"]:
+                    if progress is not None:
+                        progress(None, f"Creating checkpoint directory {directory}")
+
+                    destinationFS.makedirs(posixpath.join(destination, directory), exist_ok=True)
+
+                records = [
+                    *manifest["files"],
+                    {"name": "manifest.json", "sha256": manifestHash, "size_bytes": len(manifestBytes)},
+                ]
+                payloadProgress = progress.section(0.10, 0.70) if progress is not None else None
+
+                for record, fileProgress in pglProgress.fileSections(records, payloadProgress):
+                    pglStorage.copyVerifiedFile(stagingFS, posixpath.join(stagingRoot, record["name"]), destinationFS, destinationRoot, record, objectKey=posixpath.join(objectPrefix, record["name"]), progress=fileProgress)
+
+                cls._registerSessionBundleFiles(connection, postgres, sessionID, backendID, manifest, objectPrefix=objectPrefix, origin="raw", accessContext=access, progress=progress.section(0.70, 0.95) if progress is not None else None)
+
+                if progress is not None:
+                    progress(0.96, "Validating checkpoint completion")
+
+                cls._completeSessionBundleCheckpoint(connection, postgres, sessionID, manifest, origin="raw")
+
+                if progress is not None:
+                    progress(0.97, "Cleaning up temporary staging and payload access")
+
+                return sessionID
+    
     @classmethod
     def registerStagedRawCheckpoint(cls, connection, postgres, createdBy, backendID, manifest, staged, storedManifest, storageOptions=None, *, sessionID=None, accessContext=None, progress=None):
         """Register a staged behavioral archive without completing or committing.
@@ -5560,7 +5789,7 @@ class pglDatabase:
             if progress is not None:
                 progress(None, f"Acquiring payload lock {digest[:12]}")
 
-            postgres.acquireTransactionLock(connection, lockName, description=f"payload {digest[:12]}", timeoutSeconds=30.0)
+            postgres.acquireTransactionLock(connection, lockName, description=f"payload {digest[:12]}", timeoutSeconds=postgres.lockTimeoutSeconds)
 
         if progress is not None:
             progress(0.10, "Creating checkpoint directories")
@@ -9710,15 +9939,13 @@ class pglDatabaseAccess:
 
     # +++++++++++++++++++++++++++++ __init__ ++++++++++++++++++++++++++++++++
     def __init__(self, postgres, storageOptionsByBackend=None):
-        """Snapshot access configuration without opening any connection.
+        """Snapshot configuration and runtime timeouts without connecting.
 
-        Called by pglDatabase before resolving registered payload roots.
+        Backend option dictionaries are shallow-copied.
+        Connections, tunnels, and scientific readers are not copied.
 
-        Backend option dictionaries are shallow-copied. Credential objects
-        and nested option values must not be modified while the context is
-        in use; they are not serialized or deep-copied.
-
-        Raises for invalid configuration or malformed backend option mappings.
+        Runtime timeout overrides remain private to this access context and
+        are not added to serialized database configuration.
         """
         from threading import RLock
 
@@ -9746,11 +9973,7 @@ class pglDatabaseAccess:
 
             options[backendID] = dict(backendOptions)
 
-        # Copy configuration values rather than retaining the editable caller
-        # object. Do not copy a live SQL connection or SSH tunnel.
-        self._postgres = pglPostgres.fromJSONdict(postgres.toJSONdict())
-        self._postgres._configurationLoadedRemotely = getattr(postgres, "_configurationLoadedRemotely", False)
-
+        self._postgres = postgres.withTimeouts()
         self._optionsByBackend = options
         self._resolved = {}
         self._ownedFilesystems = []
