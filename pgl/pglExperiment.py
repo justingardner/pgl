@@ -476,178 +476,199 @@ class pglExperiment(pglExperimentBase):
     
     def initScreen(self, backgroundColor=-1):
         '''
-        Initialize the screen for the experiment. This will call pgl.open() and
-        set parameters according to what is set in setParameters
-        
+        Initialize the screen for the experiment. This will call pgl.open()
+        and set parameters according to the selected settings.
+
         Args:
-            backgroundColor: The background color as a list of RGB values, each between 0 and 1. If omitted, will use the color from settings.
-        '''    
+            backgroundColor: RGB background color. If omitted, use settings.
+        '''
         from .pglKeyboardMouse import pglKeyboardMouse
+
         if self.settings is None:
             pglMessages.warning("(pglExperiment:initScreen) No settings found to open screen.")
             return
-        # get background color
-        if backgroundColor == -1:
+
+        # Get background color. Only the scalar sentinel means "use settings".
+        if isinstance(backgroundColor, (int, float)) and backgroundColor == -1:
             backgroundColor = self.settings.backgroundColor
-        
+
         try:
-            # get screen parameters
+            # Get screen parameters.
             if len(self.settings.displays) < 1:
                 pglMessages.warning(f"Settings {self.settings.name} is not associated with a display")
                 return
             self.state.display = self.settings.displays[0]
-        
-            # make pgl quieter
+
+            # Make PGL quieter.
             self.setVerbose()
-            
-            # close all other screens
+
+            # Close all other screens.
             self.pgl.cleanUp()
-            
-            # set screen resolution if necessary
+
+            # Save original screen resolution before changing it.
             self.state.originalScreenResolution = self.pgl.getResolution(self.state.display.currentDisplayNum)
 
             if self.state.display.uuid == "windowed":
-                # open the screen
-                self.pgl.open(0, screenWidth=self.state.display.windowSize[0], screenHeight=self.state.display.windowSize[1], backgroundColor=backgroundColor)                        
-                self.pgl.setWindowFrameInDisplay(0, screenX=self.state.display.windowPosition[0], screenY=self.state.display.windowPosition[1], screenWidth=self.state.display.windowSize[0], screenHeight=self.state.display.windowSize[1])
+                # Open the screen.
+                self.pgl.open(
+                    0,
+                    screenWidth=self.state.display.windowSize[0],
+                    screenHeight=self.state.display.windowSize[1],
+                    backgroundColor=backgroundColor,
+                )
+                self.pgl.setWindowFrameInDisplay(
+                    0,
+                    screenX=self.state.display.windowPosition[0],
+                    screenY=self.state.display.windowPosition[1],
+                    screenWidth=self.state.display.windowSize[0],
+                    screenHeight=self.state.display.windowSize[1],
+                )
             else:
                 if self.state.display.currentDisplayNum == -1:
                     pglMessages.warning(f"Could not open display {self.state.display.name} because it is not connected")
                     self.endVerbose()
                     return
-                # compare to what is desired
+
+                # Compare the current display mode with the desired mode.
                 displayMode = None
                 if self.state.display.displayModes:
                     displayMode = self.state.display.displayModes[0]
                     if displayMode == self.state.originalScreenResolution:
-                        pglMessages.message(f"Display mode settings {self.state.screenResolution[0]} x {self.state.screenResolution[1]} {self.state.screenResolution[2]}Hz {self.state.screenResolution[3]}bits match current mode")
+                        pglMessages.message(f"Display mode settings match current mode: {self.state.originalScreenResolution}")
                     else:
-                        self.pgl.setResolutionUsingDisplayModeSettings(self.state.display.currentDisplayNum, displayMode)      
+                        self.pgl.setResolutionUsingDisplayModeSettings(self.state.display.currentDisplayNum, displayMode)
                         self.state.screenResolution = self.pgl.getResolution()
-                        pglMessages.message(f"Changing screen resolution to: {self.state.screenResolution[0]} x {self.state.screenResolution[1]} {self.state.screenResolution[2]}Hz {self.state.screenResolution[3]}bits " +
-                                            f"from: {self.state.originalScreenResolution[0]} x {self.state.originalScreenResolution[1]} {self.state.originalScreenResolution[2]}Hz {self.state.originalScreenResolution[3]}bits")
-                
-                # open the screen
-                self.pgl.open(whichScreen=self.state.display.currentDisplayNum, backgroundColor=backgroundColor)        
-            
-            # check whether it was opened
-            if not self.pgl.isOpen():   
+                        pglMessages.message(
+                            f"Changing screen resolution to: {self.state.screenResolution[0]} x "
+                            f"{self.state.screenResolution[1]} {self.state.screenResolution[2]}Hz "
+                            f"{self.state.screenResolution[3]}bits from: "
+                            f"{self.state.originalScreenResolution[0]} x "
+                            f"{self.state.originalScreenResolution[1]} "
+                            f"{self.state.originalScreenResolution[2]}Hz "
+                            f"{self.state.originalScreenResolution[3]}bits"
+                        )
+
+                # Open the screen.
+                self.pgl.open(whichScreen=self.state.display.currentDisplayNum, backgroundColor=backgroundColor)
+
+            # Check whether it was opened.
+            if not self.pgl.isOpen():
                 pglMessages.warning("Failed to open screen.")
                 self.endVerbose()
                 return
-            
-            # set visual angle coordinates
+
+            # Set visual angle coordinates.
             self.pgl.visualAngle(self.state.display.displayDistance, self.state.display.displaySize[0], self.state.display.displaySize[1])
 
-            # flip left-right and/or up-down if specified in settings
+            # Flip left-right and/or up-down if specified in settings.
             if self.state.display.flipLeftRight: self.pgl.flipLeftRight()
             if self.state.display.flipUpDown: self.pgl.flipUpDown()
-            
-            # set the gamma table
+
+            # Set the gamma table.
             self.setGamma(self.settings, self.state.display)
-            
-            # add keyboard device if not already loaded
+
+            # Add a keyboard device if not already loaded.
             keyboardDevices = self.pgl.devicesGet(pglKeyboardMouse)
             if not keyboardDevices:
-                # nothing loaded, so create it
                 keyboardMouse = pglKeyboardMouse(eatKeys=None)
                 self.pgl.devicesAdd(keyboardMouse)
-                # check if listener is running
+
+                # Check whether the keyboard listener is running.
                 if not keyboardMouse.isRunning():
-                    warningMessage = "Accessibility permission not granted for keyboard/mouse access.\n" + \
-                        "On macOS, go to System Preferences -> Security & Privacy -> Privacy -> Accessibility\n" + \
-                        "and add your terminal application (e.g. Terminal, iTerm, etc) to the list of apps allowed to control your computer.\n" + \
-                        "If you are running VS Code and it already has permissions granted, try running directly from a terminal with:\n" + \
-                        "    /Applications/Visual\\ Studio\\ Code.app/Contents/MacOS/Code"
+                    warningMessage = (
+                        "Accessibility permission not granted for keyboard/mouse access.\n"
+                        "On macOS, go to System Preferences -> Security & Privacy -> Privacy -> Accessibility\n"
+                        "and add your terminal application (e.g. Terminal, iTerm, etc) to the list of apps allowed to control your computer.\n"
+                        "If you are using VS Code and it already has permissions, consider running directly from a terminal."
+                    )
                     pglMessages.warning(warningMessage)
-                    startTime = pglTimestamp.getSecs()     
-                    displayMessageTime = 15  
-                    while((pglTimestamp.getSecs()-startTime) < displayMessageTime):      
+                    startTime = pglTimestamp.getSecs()
+                    displayMessageTime = 15
+
+                    while (pglTimestamp.getSecs() - startTime) < displayMessageTime:
                         self.pgl.text("Accessibility permission error")
                         self.pgl.text("Need to grant for keyboard and mouse")
                         self.pgl.text("See instructions printed to console")
-                        self.pgl.text(f"Screen will close in {int(displayMessageTime-(pglTimestamp.getSecs()-startTime))} s")
+                        self.pgl.text(f"Screen will close in {int(displayMessageTime - (pglTimestamp.getSecs() - startTime))} s")
                         self.pgl.flush()
-                    
+
                     self.endScreen()
                     return
             else:
-                # if already loaded, just grab it
+                # If already loaded, use the existing keyboard device.
                 keyboardMouse = keyboardDevices[0]
-                # and if it is not running, start it
-                if not keyboardMouse.isRunning():
-                    keyboardMouse.start()
-            
-            # clear the mouse and keyboard queues of any pending events
-            keyboardMouse.clear()
+                if not keyboardMouse.isRunning(): keyboardMouse.start()
 
-            # keep a pointer to keyboardMouse
+            # Clear pending keyboard/mouse events and retain the device.
+            keyboardMouse.clear()
             self.keyboardMouse = keyboardMouse
-            
-            # If response keys is a comma-separated list, split it into a list (this is so you can do "1,space,F1,2"
+
+            # A comma-separated response list supports keys such as space/F1.
+            # Without commas, each character specifies a response key.
             if ',' in self.settings.responseKeys:
                 self.responseKeysList = [k.strip() for k in self.settings.responseKeys.split(',')]
             else:
-                # if no commas, then just make a list of characters
                 self.responseKeysList = list(self.settings.responseKeys)
-                
-            # get keyCodes
-            self.state.responseKeyCodesList = [keyboardMouse.charToKeyCode(k) for k in self.responseKeysList]
-            self.state.startKeyCode = keyboardMouse.charToKeyCode(self.settings.startKey)
-            self.state.endKeyCode = keyboardMouse.charToKeyCode(self.settings.endKey)
-            self.state.volumeTriggerKeyCode = keyboardMouse.charToKeyCode(self.settings.volumeTriggerKey)
-            
-            # if eatKeys is set, then compose a list of all keys as keyCodes
-            if self.settings.eatKeys:
-                # Collect all individual keys
-                eatKeyCodes = self.state.responseKeyCodesList.copy()  # Start with response keys list
-        
-                # Add single keys if they exist
-                if self.settings.startKey:
-                    eatKeyCodes.append(self.state.startKeyCode)
-                if self.settings.endKey:
-                    eatKeyCodes.append(self.state.endKeyCode)
-                if self.settings.volumeTriggerKey:
-                    eatKeyCodes.append(self.state.volumeTriggerKeyCode)
-        
-                # Register these as keys to be eaten
-                keyboardMouse.setEatKeys(eatKeyCodes)
-                
-            # wait half a second for metal app to initialize
-            self.pgl.waitSecs(0.5)
-            
-            # flush screen to get rid of any transients
-            self.pgl.flush()
-            self.pgl.flush()
-            
-            # initialize eye tracker
-            try:
-                self.initEyeTracker()    
-            except Exception as e:
-                pglMessages.warning(f"Could not initialize eye tracker: {e}")
 
-            # display device status
+            # Empty or None control keys are disabled, not mapped to a dummy
+            # key code. Invalid nonempty keys are reported explicitly.
+            def getControlKeyCode(key, settingName):
+                if not key: return None
+                keyCode = keyboardMouse.charToKeyCode(key)
+                if keyCode is None: raise ValueError(f"Unknown {settingName}: {key!r}")
+                return int(keyCode)
+
+            self.state.responseKeyCodesList = [keyboardMouse.charToKeyCode(k) for k in self.responseKeysList]
+            self.state.startKeyCode = getControlKeyCode(self.settings.startKey, "startKey")
+            self.state.endKeyCode = getControlKeyCode(self.settings.endKey, "endKey")
+            self.state.volumeTriggerKeyCode = getControlKeyCode(self.settings.volumeTriggerKey, "volumeTriggerKey")
+
+            # Waiting for a keyboard volume trigger requires a configured key.
+            if self.settings.startOnVolumeTrigger and self.state.volumeTriggerKeyCode is None:
+                raise ValueError("startOnVolumeTrigger requires a volumeTriggerKey.")
+
+            if self.settings.manualPreStart and self.state.startKeyCode is None:
+                raise ValueError("manualPreStart requires a startKey.")
+
+            # If eatKeys is set, include only configured keys.
+            if self.settings.eatKeys:
+                eatKeyCodes = self.state.responseKeyCodesList.copy()
+                for keyCode in (self.state.startKeyCode, self.state.endKeyCode, self.state.volumeTriggerKeyCode):
+                    if keyCode is not None: eatKeyCodes.append(keyCode)
+                keyboardMouse.setEatKeys(eatKeyCodes)
+
+            # Wait half a second for the Metal app to initialize.
+            self.pgl.waitSecs(0.5)
+
+            # Flush the screen to get rid of transients.
+            self.pgl.flush()
+            self.pgl.flush()
+
+            # Initialize eye tracker.
+            try:
+                self.initEyeTracker()
+            except Exception as error:
+                pglMessages.warning(f"Could not initialize eye tracker: {error}")
+
+            # Display device status.
             self.pgl.deviceStatus()
-            
-            # set up digitalIO
+
+            # Set up digital IO and other devices.
             self.initDigitalIO()
-            
-            # set up devices
             self.initDevices()
 
-            # call configure on all tasks, this allows any task with configure implemeneted
-            # to use information from the initialized pglExperiment in its configurtion
+            # Configure tasks using the initialized experiment/display.
             for task in self.tasks:
                 try:
                     task.configure(self)
-                except Exception as e:
-                    pglMessages.warning(f"Could not configure task {task.settings.taskName}: {e}")
+                except Exception as error:
+                    pglMessages.warning(f"Could not configure task {task.settings.taskName}: {error}")
 
-            # mark that we have opened the screen
+            # Mark that screen initialization completed.
             self.state.openScreen = True
 
-        except Exception as e:
-            pglMessages.warning(f"Could not open screen. Error {type(e).__name__}: {e}")    
+        except Exception as error:
+            pglMessages.warning(f"Could not open screen. Error {type(error).__name__}: {error}")
             self.state.openScreen = False
             self.endVerbose()
             return
@@ -680,45 +701,72 @@ class pglExperiment(pglExperimentBase):
         # save the gamma table
         self.state.gammaTable = self.pgl.getGammaTable(display.currentDisplayNum)
         
-    def endScreen(self):
-        '''
-        Close the screen
-        '''
-        from .pglKeyboardMouse import pglKeyboardMouse
-        try:
-            # stop the keyboard listener
-            keyboardDevices = self.pgl.devicesGet(pglKeyboardMouse)
-            if keyboardDevices is not []:
-                for keyboardDevice in keyboardDevices:
-                    pglMessages.message(f"Stopping keyboard/mouse device: {keyboardDevice}")
-                    keyboardDevice.stop()
+    ################################################################
+    # Restore and close the screen with independent cleanup attempts
+    ################################################################
+    def endScreen(self, clearScreen=True):
+        """Restore display settings and close this experiment's screen.
 
-            if self.settings.closeScreenOnEnd:
-                # clear screen
-                self.pgl.clearScreen(self.settings.backgroundColor)
-                self.pgl.flush()
-                
-                # reset gamma
-                if self.state.originalGammaTable:
-                    pglMessages.message("Restoring gamma table")
-                    self.pgl.setGammaTable(self.state.display.currentDisplayNum, rgbGammaTable=self.state.originalGammaTable)
-                    pglMessages.message("Restoring original gamma table")
-                    
-                # reset screen dimensions
-                if self.state.screenResolution:
-                    if self.state.screenResolution != self.state.originalScreenResolution:
-                        self.pgl.setResolution(self.state.display.currentDisplayNum, screenResolution=self.state.originalScreenResolution)
-                        pglMessages.message(f"Restoring resolution back to: {self.state.originalScreenResolution[0]} x {self.state.originalScreenResolution[1]} {self.state.originalScreenResolution[2]}Hz {self.state.originalScreenResolution[3]}bits")
-                
-                # close screen
-                self.pgl.close()
+        clearScreen=False avoids drawing commands after an interrupted exchange.
+        Failures propagate after the other cleanup operations are attempted.
+        """
+        from .pglKeyboardMouse import pglKeyboardMouse
+
+        errors = []
+
+        # Stop each keyboard listener independently.
+        try:
+            keyboardDevices = self.pgl.devicesGet(pglKeyboardMouse) or []
+        except (Exception, KeyboardInterrupt, SystemExit) as error:
+            keyboardDevices = []
+            errors.append(error)
+            self._recordRunError("find keyboard devices", error)
+
+        for keyboardDevice in keyboardDevices:
+            self._attemptRunAction("stop keyboard/mouse device", keyboardDevice.stop, errors)
+
+        if self.settings.closeScreenOnEnd:
+            # Normal callers can request a final blank. Recovery callers skip
+            # this because the renderer's command stream may be interrupted.
+            if clearScreen:
+                def clearDisplay():
+                    self.pgl.clearScreen(self.settings.backgroundColor)
+                    self.pgl.flush()
+
+                self._attemptRunAction("clear screen", clearDisplay, errors)
+
+            # Restore each display setting even if another operation fails.
+            if self.state.originalGammaTable is not None:
+                self._attemptRunAction(
+                    "restore gamma table",
+                    lambda: self.pgl.setGammaTable(
+                        self.state.display.currentDisplayNum,
+                        rgbGammaTable=self.state.originalGammaTable,
+                    ),
+                    errors,
+                )
+
+            if self.state.screenResolution is not None and self.state.originalScreenResolution is not None:
+                if self.state.screenResolution != self.state.originalScreenResolution:
+                    self._attemptRunAction(
+                        "restore screen resolution",
+                        lambda: self.pgl.setResolution(
+                            self.state.display.currentDisplayNum,
+                            screenResolution=self.state.originalScreenResolution,
+                        ),
+                        errors,
+                    )
+
+            def closeDisplay():
+                if self.pgl.close() is False: raise RuntimeError("PGL could not close its renderer.")
                 self.state.openScreen = False
-                
-        except Exception as e:
-            pglMessages.warning(f"Could not close screen. Error {type(e).__name__}: {e}")    
-            return
-        finally:
-            self.endVerbose()
+
+            self._attemptRunAction("close renderer connection", closeDisplay, errors)
+
+        self._attemptRunAction("restore verbosity", self.endVerbose, errors)
+
+        if errors: raise errors[0]
+        return True
                 
 
     def setEatAllKeys(self, eatAllKeys=False):
@@ -736,180 +784,322 @@ class pglExperiment(pglExperimentBase):
         '''
         return self.pgl.setEatKeys(eatKeys)
     
+    ################################################################
+    # Run with protected saving and finalization
+    ################################################################
     def run(self):
-        '''
-        Run the experiment.
-        '''
-        # default to error, as normal operation will set this to False
-        self.state.runFinishedWithError = True
-
-        if self.state.openScreen == False:
+        """Run acquisition, attempt saving on failure, and preserve its exception."""
+        if not self.state.openScreen:
+            self.state.runFinishedWithError = True
             pglMessages.warning("Screen is not open. Call initScreen() before running the experiment.")
             return
-        
 
-        # start eye tracker recording if we have an eye tracker
+        # A new run gets a new destination. Retrying save() within this run
+        # reuses that destination rather than creating another directory.
+        self._runSavePath = None
+        self.data.runErrors = []
+        self.data.saveStatus = "notAttempted"
+        self.data.cleanupStatus = "notAttempted"
+        self.data.eyeTrackerSaveStatus = "notAttempted" if self.eyeTracker is not None else "notApplicable"
+        self.state.runFinishedWithError = True
+
+        try:
+            self._run()
+
+        except (Exception, KeyboardInterrupt, SystemExit) as error:
+            # Save unfinished task state honestly. Do not invoke arbitrary
+            # task-ending hooks or renderer commands before emergency saving.
+            self.state.runFinishedWithError = True
+            self._recordRunError("acquisition", error)
+
+            errors = []
+            self._attemptRunAction("record experiment end time", lambda: setattr(self.data, "endTime", self.pgl.getSecs()), errors)
+
+            try:
+                self._finalizeRun()
+            except (Exception, KeyboardInterrupt, SystemExit) as finalizationError:
+                # Preserve the original acquisition exception. Individual
+                # finalization failures are already recorded by the helpers.
+                try:
+                    pglMessages.warning(f"Additional finalization failure: {type(finalizationError).__name__}: {finalizationError}")
+                except Exception:
+                    pass
+
+            # Bare raise preserves the original exception and traceback.
+            raise
+
+        else:
+            # This describes acquisition, not subsequent saving or cleanup.
+            self.state.runFinishedWithError = False
+            self._finalizeRun()
+
+    ################################################################
+    # Store errors as plain serializable metadata
+    ################################################################
+    def _recordRunError(self, operation, error):
+        """Record an error without retaining its live traceback object."""
+        import traceback
+
+        # Error reporting itself must not replace the original failure.
+        try:
+            errorInfo = {
+                "operation": operation,
+                "module": type(error).__module__,
+                "type": type(error).__name__,
+                "message": str(error),
+                "traceback": "".join(traceback.format_exception(type(error), error, error.__traceback__)),
+            }
+            if not hasattr(self.data, "runErrors"): self.data.runErrors = []
+            self.data.runErrors.append(errorInfo)
+        except Exception:
+            pass
+
+        try:
+            pglMessages.warning(f"{operation}: {type(error).__name__}: {error}")
+        except Exception:
+            pass
+
+    ################################################################
+    # Attempt an independent save or cleanup operation
+    ################################################################
+    def _attemptRunAction(self, operation, action, errors):
+        """Collect failures so other independent operations can still run."""
+        try:
+            result = action()
+            if result is False: raise RuntimeError(f"{operation} returned False.")
+            return True
+
+        except (Exception, KeyboardInterrupt, SystemExit) as error:
+            # Interrupts during finalization are deferred, not treated as
+            # success. The caller raises an error after the remaining attempts.
+            errors.append(error)
+            self._recordRunError(operation, error)
+            return False
+
+    ################################################################
+    # Finalize successful or interrupted acquisition
+    ################################################################
+    def _finalizeRun(self):
+        """Attempt local saving before cleanup or external-device transfer."""
+        errors = []
+
+        # A renderer or device call may block after an interrupted exchange.
+        # Attempt the essential local save before making those calls.
+        if not self._attemptRunAction("save experiment", lambda: self.save(includeEyeTracker=False), errors):
+            self.data.saveStatus = "failed"
+
+        # Normal acquisition already cleared/flushed the display. Recovery
+        # must not send additional drawing commands on an uncertain socket.
+        cleanupErrorCount = len(errors)
+        self._attemptRunAction("close experiment screen", lambda: self.endScreen(clearScreen=False), errors)
+        self._attemptRunAction("close digital IO", self.endDigitalIO, errors)
+        self._attemptRunAction("close experiment devices", self.endDevices, errors)
+        self.data.cleanupStatus = "failed" if len(errors) > cleanupErrorCount else "complete"
+
+        # Essential local data has already been attempted. EyeLink stop and
+        # transfer failures therefore cannot prevent that initial save.
         if self.eyeTracker is not None:
-            self.eyeTracker.start()
+            eyeTrackerErrorCount = len(errors)
+            dataPath = getattr(self, "_runSavePath", None)
 
-        # calculate the phases that we will need to cover
-        self.state.phaseNums = sorted(task.settings.phaseNum for task in self.tasks if task.settings.phaseNum is not None) or None
-        
-        # intialize variables
+            if dataPath is not None:
+                def saveEyeTracker():
+                    filename = dataPath / self.settings.eyetracker[0].lower()
+                    return self.eyeTracker.save(filename)
+
+                self._attemptRunAction("save eye tracker", saveEyeTracker, errors)
+            else:
+                # No destination was created. Still attempt to stop recording;
+                # the host EDF can be retrieved separately afterward.
+                self._attemptRunAction("stop eye tracker", self.eyeTracker.stop, errors)
+
+            self.data.eyeTrackerSaveStatus = (
+                "failed" if len(errors) > eyeTrackerErrorCount
+                else "complete" if dataPath is not None
+                else "notSaved"
+            )
+
+        # Update outcome metadata in the same directory without saving tasks
+        # again or repeating an EDF transfer.
+        dataPath = getattr(self, "_runSavePath", None)
+        if dataPath is not None:
+            if not self._attemptRunAction("update final experiment state", lambda: self.state.saveStrict(dataPath / "state.json"), errors):
+                self.data.saveStatus = "failed"
+            if not self._attemptRunAction("update final experiment data", lambda: self.data.saveStrict(dataPath / "data.json"), errors):
+                self.data.saveStatus = "failed"
+
+        # run() preserves an earlier acquisition exception. If acquisition
+        # succeeded, expose the first finalization failure to the caller.
+        if errors: raise errors[0]
+    
+    def _run(self):
+        '''
+        Execute the experiment.
+
+        The public run() method handles saving, exception recovery, and cleanup.
+        '''
+        # Default to error; the public wrapper marks successful acquisition.
+        self.state.runFinishedWithError = True
+
+        if not self.state.openScreen:
+            pglMessages.warning("Screen is not open. Call initScreen() before running the experiment.")
+            return
+
+        # Start eye tracker recording if we have an eye tracker.
+        if self.eyeTracker is not None: self.eyeTracker.start()
+
+        # Calculate the distinct phases that we will need to cover.
+        self.state.phaseNums = sorted({task.settings.phaseNum for task in self.tasks if task.settings.phaseNum is not None}) or None
+        self.state.currentPhaseIndex = 0
+
+        # Initialize variables.
         self.state.experimentDone = False
+        self.state.experimentStarted = False
         self.state.volumeNumber = 0
 
-        # set manual pre-start (this will put up a screen and wait for start key
-        # before waiting for volume trigger
-        manualPreStart = True if self.settings.manualPreStart else False
+        # Manual pre-start waits for the start key before scanner synchronization.
+        manualPreStart = bool(self.settings.manualPreStart)
         manualPreStartVolumes = 0
         ignoreInitialVolumes = self.settings.ignoreInitialVolumes
-        
-        # see if we need to run eye calibration
-        if self.settings.eyetracker is not None:
-            self.calibrateEyeTracker()
-            
-        # wait for key press to start experiment
-        if self.settings.startKey is not [] or self.settings.startOnVolumeTrigger:
-            self.state.experimentStarted = False
+
+        # See whether we need to run eye calibration.
+        if self.settings.eyetracker is not None: self.calibrateEyeTracker()
+
+        # Disabled keys must not accidentally match an event with keyCode=None.
+        def matchesKey(event, keyCode, keydownOnly=False):
+            return keyCode is not None and event.type == "keyboard" and event.keyCode == keyCode and (not keydownOnly or event.eventType == "keydown")
+
+        # Wait for a start key or scanner trigger only when configured.
+        if self.state.startKeyCode is not None or self.settings.startOnVolumeTrigger:
             while not self.state.experimentStarted:
                 if manualPreStart:
-                    self.pgl.text(f"Press {self.settings.startKey} key to make experiment start",y=0)
+                    self.pgl.text(f"Press {self.settings.startKey} key to make experiment start", y=0)
                 elif self.settings.startOnVolumeTrigger:
-                    self.pgl.text("Waiting for volume trigger to start experiment",y=0)
+                    self.pgl.text("Waiting for volume trigger to start experiment", y=0)
                 else:
-                    self.pgl.text(f"Press {self.settings.startKey} key to start experiment",y=0)
-                # flush to display text
+                    self.pgl.text(f"Press {self.settings.startKey} key to start experiment", y=0)
+
+                # Flush to display text, then poll for events.
                 self.pgl.flush()
-                # poll for events
                 events = self.pgl.poll()
                 self.data.events.extend(events)
 
-                # see if we have a match to startKey
-                if [e for e in events if e.type == "keyboard" and e.eventType == "keydown" and e.keyCode == self.state.startKeyCode]:
-                    # end manual pre-start
+                # Match the configured start key.
+                if any(matchesKey(event, self.state.startKeyCode, keydownOnly=True) for event in events):
                     if manualPreStart:
                         manualPreStart = False
                         pglMessages.message(f"Manual pre-start ended after {manualPreStartVolumes} volumes.", messageType='experiment')
-                    # or start experiment
                     else:
                         self.state.experimentStarted = True
-                
-                # if waiting to startOnVolumeTrigger, check for that key                
+
+                # Handle scanner triggers while waiting to start.
                 if self.settings.startOnVolumeTrigger:
-                    for e in events:
-                        if e.type == "keyboard" and e.eventType == "keydown" and e.keyCode == self.state.volumeTriggerKeyCode:
+                    for event in events:
+                        if matchesKey(event, self.state.volumeTriggerKeyCode, keydownOnly=True):
                             if manualPreStart:
-                                # keep count of volumes
                                 manualPreStartVolumes += 1
-                            elif ignoreInitialVolumes>0:
-                                # ignore initial volumes
+                            elif ignoreInitialVolumes > 0:
                                 ignoreInitialVolumes -= 1
                             else:
-                                pglMessages.message(f"Ignored {self.settings.ignoreInitialVolumes} initial volumes.",messageType='experiment')
+                                pglMessages.message(f"Ignored {self.settings.ignoreInitialVolumes} initial volumes.", messageType='experiment')
                                 self.state.experimentStarted = True
                                 self.state.volumeNumber += 1
-                                # and add a volume event
-                                self.data.events.append(pglEventVolumeTrigger(timestamp=e.timestamp))
-                
-                # Check for end key to allow aborting before starting    
-                if [e for e in events if e.type == "keyboard" and e.keyCode == self.state.endKeyCode]:
+                                self.data.events.append(pglEventVolumeTrigger(timestamp=event.timestamp))
+
+                # Allow aborting before any tasks have started.
+                if any(matchesKey(event, self.state.endKeyCode) for event in events):
                     self.state.experimentStarted = True
                     self.state.experimentDone = True
-        
-        # start the experiment
-        pglMessages.message(f"Experiment started.",messageType='experiment')
-        self.startPhase(phaseNum=0)
+
+        else:
+            # No start gate: begin immediately.
+            self.state.experimentStarted = True
+
+        # An abort at the waiting screen must not start tasks.
+        if self.state.experimentDone:
+            self.pgl.clearScreen(self.settings.backgroundColor)
+            self.pgl.flush()
+            self.data.endTime = self.pgl.getSecs()
+            pglMessages.message("Experiment ended before tasks started.", messageType='experiment')
+            return
+
+        # Start the experiment before invoking task start hooks, so a failure
+        # in a start hook still has an experiment start timestamp.
+        pglMessages.message("Experiment started.", messageType='experiment')
         self.data.startTime = self.pgl.getSecs()
         self.data.startDateTime = datetime.now().astimezone().isoformat()
 
+        if not self.state.phaseNums:
+            raise ValueError("Experiment needs at least one task with a phaseNum.")
+
+        self.startPhase(phaseNum=self.state.phaseNums[0])
+
         while not self.state.experimentDone:
-            
-            # poll for events
+            # Poll for events.
             events = self.pgl.poll()
             self.data.events.extend(events)
 
-            # see if we have a match to endKey
-            if [e for e in events if e.type == "keyboard" and e.keyCode == self.state.endKeyCode]:
+            # End all running tasks when the configured end key is received.
+            if any(matchesKey(event, self.state.endKeyCode) for event in events):
                 self.state.experimentDone = True
-                # end all running tasks
                 for task in self.currentTasks: task.end()
                 continue
 
-            # Check for volume trigger key
-            for i, e in enumerate(events):
-                if e.type == "keyboard" and e.keyCode == self.state.volumeTriggerKeyCode and e.eventType == "keydown":
-                    # remove it from the events list 
-                    events.pop(i)
-                    # and update volumeNumber
+            # Check for volume trigger key.
+            for iEvent, event in enumerate(events):
+                if matchesKey(event, self.state.volumeTriggerKeyCode, keydownOnly=True):
+                    # Remove it from the response-processing list. The original
+                    # keyboard event is already retained in experiment data.
+                    events.pop(iEvent)
                     self.state.volumeNumber += 1
-                    # and add a volume trigger event
-                    self.data.events.append(pglEventVolumeTrigger(timestamp=e.timestamp))
+                    self.data.events.append(pglEventVolumeTrigger(timestamp=event.timestamp))
                     break
 
-            # grab any events that match the keyList and return their index within that list and timestamp
+            # Match response keys and preserve their original event timestamps.
             subjectResponses = [
-                (self.state.responseKeyCodesList.index(e.keyCode), e.timestamp)
-                for e in events
+                (self.state.responseKeyCodesList.index(event.keyCode), event.timestamp)
+                for event in events
                 if (
-                    e.type == "keyboard"
-                    and e.eventType == "keydown"
-                    and e.keyCode in self.state.responseKeyCodesList
+                    event.type == "keyboard"
+                    and event.eventType == "keydown"
+                    and event.keyCode in self.state.responseKeyCodesList
                 )
             ]
 
-            # update tasks in current phase
+            # Update tasks in the current phase.
             phaseDone = False
             updateTime = self.pgl.getSecs()
             for task in self.currentTasks:
-                # update task
-                task.update(updateTime=updateTime, subjectResponses=subjectResponses, phaseNum=self.state.phaseNum, tasks=self.currentTasks, events=events)
-                # check if task is done
+                task.update(
+                    updateTime=updateTime,
+                    subjectResponses=subjectResponses,
+                    phaseNum=self.state.phaseNum,
+                    tasks=self.currentTasks,
+                    events=events,
+                )
                 if task.done(): phaseDone = True
-            
-            # update the screen
-            if self.flush: self.pgl.flush()
-            #else: print("No flush")
 
-            # go to next phase or end experiment
+            # Update the screen.
+            if self.flush: self.pgl.flush()
+
+            # Go to the next phase or end the experiment.
             if phaseDone:
-                # end all tasks in current phase
                 for task in self.currentTasks: task.end()
-                # check if we have ended all phases
-                if self.state.phaseNum >= len(self.state.phaseNums)-1:
+
+                if self.state.currentPhaseIndex >= len(self.state.phaseNums) - 1:
                     self.state.experimentDone = True
                 else:
-                    # update phase
                     self.state.currentPhaseIndex += 1
                     self.startPhase(phaseNum=self.state.phaseNums[self.state.currentPhaseIndex])
 
-        # clear screen
+        # Clear the screen after normal acquisition.
         self.pgl.clearScreen(self.settings.backgroundColor)
         self.pgl.flush()
 
-        # stop eye tracker recording if we have an eye tracker
-        if self.eyeTracker is not None:
-            self.eyeTracker.stop()
-
-        # mark end time
+        # Mark acquisition end before saving or device cleanup.
         self.data.endTime = self.pgl.getSecs()
-        pglMessages.message("Experiment done.",messageType='experiment')
+        pglMessages.message("Experiment done.", messageType='experiment')
         pglMessages.printHeader(messageType='experiment')
-        
-        # save data
-        self.save()
-        
-        # close screen
-        self.endScreen()
-        
-        # end digital IO
-        self.endDigitalIO()
-        
-        # end devices
-        self.endDevices()
-
-        # if we got here then we finished the run without error
-        self.state.runFinishedWithError = False
     
     def initDigitalIO(self):
         '''
@@ -1219,17 +1409,24 @@ class pglExperiment(pglExperimentBase):
         return timestamp    
     
     def endDigitalIO(self):
-        '''
-        end digitalIO devices
-        '''
-        # close all devices
+        """Close each digital IO device independently, retaining failed devices."""
+        errors = []
+        failedDevices = []
+
+        # One device failure must not prevent closing the others.
         for digitalIODevice in self.state.digitalIODevices:
-            digitalIODevice.close()
-        # empty list
-        self.state.digitalIODevices = []
-        self.state.triggers = {}
-        self.state.triggerWords = {}
-        
+            if not self._attemptRunAction("close digital IO device", digitalIODevice.close, errors):
+                failedDevices.append(digitalIODevice)
+
+        # Retain failed devices so cleanup can be retried.
+        self.state.digitalIODevices = failedDevices
+        if not failedDevices:
+            self.state.triggers = {}
+            self.state.triggerWords = {}
+
+        if errors: raise errors[0]
+        return True
+            
     def initDevices(self):
         '''
         initialize devices
@@ -1383,18 +1580,35 @@ class pglExperiment(pglExperimentBase):
                     aborted=True
         return aborted
     
-    def save(self):
-        '''
-        Save the experiment settings, state and data.         
-        '''
-        # Create the directory to save data into (dataDir/experimentSaveName/subjectID/YYYYMMDD_HHMMSS)
-        try:
-            if self.settings.saveAbortedRunsToTrash and self.isAbortedRun():
-                runName = Path("trash") / self.experimentSettings.runName
-            else:
-                runName = self.experimentSettings.runName
-            
-            dataPath = (
+    ################################################################
+    # Save experiment components independently
+    ################################################################
+    def save(self, includeEyeTracker=True):
+        """Save available run contents, continuing after component failures.
+
+        Repeated calls reuse this run's destination. Failures propagate after
+        independent saves have been attempted.
+
+        saveStrict() propagates encoding/write failures; it does not enable
+        strict JSON encoding or make the entire bundle atomic.
+        """
+        errors = []
+        dataPath = getattr(self, "_runSavePath", None)
+
+        if dataPath is None:
+            # Failed aborted-run classification must not prevent saving.
+            aborted = False
+            if self.settings.saveAbortedRunsToTrash:
+                try:
+                    aborted = self.isAbortedRun()
+                except (Exception, KeyboardInterrupt, SystemExit) as error:
+                    errors.append(error)
+                    self._recordRunError("classify aborted run", error)
+
+            runName = Path(self.experimentSettings.runName)
+            if aborted: runName = Path("trash") / runName
+
+            basePath = (
                 Path(self.settings.dataPath).expanduser()
                 / self.experimentSettings.experimentSaveName
                 / self.experimentSettings.subjectID
@@ -1402,35 +1616,101 @@ class pglExperiment(pglExperimentBase):
                 / runName
             )
 
-            # If the run directory already exists, append a timestamp to its name.
-            if dataPath.exists():
-                timestamp = datetime.now().strftime("%H-%M-%S")
-                dataPath = dataPath.parent / f"{dataPath.name}_{timestamp}"
+            # Never overwrite a previous run. Retry directory-name collisions.
+            dataPath = basePath
+            suffix = datetime.now().strftime("%H-%M-%S-%f")
+            attempt = 0
+            while True:
+                try:
+                    dataPath.mkdir(parents=True, exist_ok=False)
+                    break
+                except FileExistsError:
+                    attempt += 1
+                    dataPath = basePath.parent / f"{basePath.name}_{suffix}_{attempt}"
 
-            dataPath.mkdir(parents=True, exist_ok=False)
-        except Exception as e:
-            pglMessages.warning(f"Could not create data directory {dataPath}: {e}")
-            return
-        
-        # give user feedback where things are being saved
-        pglMessages.message(f"Saving experiment data to: {dataPath}",messageType='experiment')
-        
-        # save eye tracker data if we have an eye tracker
-        if self.eyeTracker is not None:
-            eyeTrackerFilename = dataPath / f"{self.settings.eyetracker[0].lower()}"
-            self.eyeTracker.save(eyeTrackerFilename)
+            # Keep the destination immediately so partial output is discoverable
+            # and a retry does not create another run directory.
+            self._runSavePath = dataPath
+            self.fullDataPath = str(dataPath)
 
-        # save experiment settings
-        self.experimentSettings.save(dataPath / "experimentSettings.json")
-        
-        # save pgl state
-        self.pgl.save(dataPath / "pgl.json")
-        
-        # save each task
-        for task in self.tasks: task.save(dataPath)   
-        
-        # and call parent to save rest
-        super().save(dataPath=dataPath)
+        pglMessages.message(f"Saving experiment data to: {dataPath}", messageType='experiment')
+        self.data.saveStatus = "inProgress"
+
+        # Save essential local data before external-device operations.
+        components = (
+            ("experiment data", self.data, "data.json"),
+            ("experiment state", self.state, "state.json"),
+            ("experiment settings", self.experimentSettings, "experimentSettings.json"),
+            ("settings", self.settings, "settings.json"),
+        )
+        for label, component, filename in components:
+            self._attemptRunAction(
+                f"save {label}",
+                lambda component=component, filename=filename: component.saveStrict(dataPath / filename),
+                errors,
+            )
+
+        # Preserve the parent's optional traits.json convention.
+        if set(self.traits()) != set(pglTraitSettings().traits()):
+            self._attemptRunAction(
+                "save experiment traits",
+                lambda: pglSerialize.saveStrict(self, filename=dataPath / "traits.json"),
+                errors,
+            )
+
+        # Save each task component independently. One broken component must not
+        # prevent saving that task's events or the next task.
+        for taskIndex, task in enumerate(self.tasks):
+            try:
+                taskPath = dataPath / task._getTaskDirectoryName()
+                taskPath.mkdir(parents=True, exist_ok=True)
+            except (Exception, KeyboardInterrupt, SystemExit) as error:
+                errors.append(error)
+                self._recordRunError(f"create task {taskIndex + 1} directory", error)
+                continue
+
+            for componentName in ("data", "state", "settings"):
+                self._attemptRunAction(
+                    f"save task {taskIndex + 1} {componentName}",
+                    lambda task=task, componentName=componentName, taskPath=taskPath:
+                        getattr(task, componentName).saveStrict(taskPath / f"{componentName}.json"),
+                    errors,
+                )
+
+            parameterPath = taskPath / "parameters"
+            if self._attemptRunAction(
+                f"create task {taskIndex + 1} parameters directory",
+                lambda parameterPath=parameterPath: parameterPath.mkdir(parents=True, exist_ok=True),
+                errors,
+            ):
+                for parameterIndex, parameter in enumerate(task.parameters):
+                    self._attemptRunAction(
+                        f"save task {taskIndex + 1} parameter {parameterIndex + 1}",
+                        lambda parameter=parameter, parameterPath=parameterPath:
+                            parameter.saveBundleStrict(dataPath=parameterPath),
+                        errors,
+                    )
+
+        # Uses cached PGL state, not a renderer query.
+        self._attemptRunAction("save PGL state", lambda: self.pgl.saveStrict(dataPath / "pgl.json"), errors)
+
+        # Direct save() callers retain EDF retrieval. run() postpones it until
+        # essential local saving and screen/device cleanup have been attempted.
+        if includeEyeTracker and self.eyeTracker is not None:
+            def saveEyeTracker():
+                filename = dataPath / self.settings.eyetracker[0].lower()
+                return self.eyeTracker.save(filename)
+
+            saved = self._attemptRunAction("save eye tracker", saveEyeTracker, errors)
+            self.data.eyeTrackerSaveStatus = "complete" if saved else "failed"
+
+        # Persist findings from the independent save attempts.
+        self.data.saveStatus = "failed" if errors else "complete"
+        if not self._attemptRunAction("save final save status", lambda: self.data.saveStrict(dataPath / "data.json"), errors):
+            self.data.saveStatus = "failed"
+
+        if errors: raise errors[0]
+        return dataPath
     
     def getLastRun(self, task=None, allRuns=False):
         """Load saved runs or their matching tasks.
@@ -2502,28 +2782,37 @@ class pglExperimentData(pglTraitSettings):
 ##############################################
 # State for pglExperiment
 ##############################################
+##############################################
+# State for pglExperiment
+##############################################
 class pglExperimentState(pglTraitSettings):
     phaseNum = Int(default_value=None, allow_none=True, help="Current experiment phase number.")
     phaseNums = List(trait=Int(), default_value=None, allow_none=True, help="List of experiment phase numbers.")
     currentPhaseIndex = Int(default_value=0, help="Index into phaseNums for the current phase.")
+
     openScreen = Bool(default_value=False, help="Whether the experiment screen is currently open.")
-    runFinishedWithError = Bool(default_value=False, help="Whether the experiment ended with an error.")
+    runFinishedWithError = Bool(default_value=False, help="Whether experiment acquisition ended with an error.")
     volumeNumber = Int(default_value=0, help="Current scanner-volume number.")
     experimentStarted = Bool(default_value=False, help="Whether the experiment has started.")
     experimentDone = Bool(default_value=False, help="Whether the experiment has completed.")
-    responseKeyCodesList = List(Int(), help="List of response key codes received during the experiment.")
-    startKeyCode = Int(default_value=0, help="Key code used to begin the experiment.")
-    endKeyCode = Int(default_value=0, help="Key code used to end the experiment.")
-    volumeTriggerKeyCode = Int(default_value=0, help="Key code received for each scanner-volume trigger.")
+
+    # None means the corresponding control key is disabled.
+    responseKeyCodesList = List(Int(), help="List of subject response key codes.")
+    startKeyCode = Int(default_value=None, allow_none=True, help="Key code used to begin the experiment; None disables the key.")
+    endKeyCode = Int(default_value=None, allow_none=True, help="Key code used to end the experiment; None disables the key.")
+    volumeTriggerKeyCode = Int(default_value=None, allow_none=True, help="Scanner-volume trigger key code; None disables the key.")
+
     originalGammaTable = Tuple(List, List, List, default_value=None, allow_none=True, help="Original display gamma table: (red, green, blue).")
     gammaTable = Tuple(List, List, List, default_value=None, allow_none=True, help="Current display gamma table: (red, green, blue).")
     display = Instance(pglDisplaySettings, default_value=None, allow_none=True, help="Current display settings.")
-    originalScreenResolution = Tuple(Int(),Int(),Int(),Int(), default_value=None, allow_none=True, help="Original screen resolution: (left, top, width, height).")
-    screenResolution = Tuple(Int(),Int(),Int(),Int(), default_value=None, allow_none=True, help="Current screen resolution: (left, top, width, height).")
-    digitalIODevices = List(Instance(pglDigitalIODevice), help="List of digitalIOdevices the experiment is using")
-    triggerWords = Dict(help="Runtime lookup of trigger word keys to configurations and devices")
-    triggers = Dict(help="Runtime lookup of trigger keys to configurations and devices")
-    # make sure any variabels added by experimenter code gets saved
+    originalScreenResolution = Tuple(Int(), Int(), Int(), Int(), default_value=None, allow_none=True, help="Original screen resolution.")
+    screenResolution = Tuple(Int(), Int(), Int(), Int(), default_value=None, allow_none=True, help="Current screen resolution.")
+
+    digitalIODevices = List(Instance(pglDigitalIODevice), help="List of digital IO devices the experiment is using.")
+    triggerWords = Dict(help="Runtime lookup of trigger word keys to configurations and devices.")
+    triggers = Dict(help="Runtime lookup of trigger keys to configurations and devices.")
+
+    # Make sure any variables added by experimenter code get saved.
     _serializeUnregisteredFields = True
 
 ##############################################

@@ -249,50 +249,55 @@ class pglEyelink(pglEyeTracker):
             return False
         
     def save(self, filename):
-        """Stop recording and retrieve data file.
-        
-        Args:
-            filename (str): Name of the file to save locally 
-            
-        Returns:
-            bool: True if stopped and saved successfully, False otherwise.
+        """Stop recording, close the host EDF, and retrieve it locally.
+
+        Returns True on success and False for reported stop/transfer failures.
+        Unexpected SDK/filesystem exceptions propagate to the caller.
         """
-        import os
-        
-        # Stop recording first
-        if self.eyelink.isRecording():
+        tracker = getattr(self, "eyelink", None)
+        if tracker is None:
+            pglMessages.warning("Cannot save EyeLink data: tracker is not initialized.")
+            return False
+
+        if not getattr(self, "edfFilename", ""):
+            pglMessages.warning("Cannot save EyeLink data: no EDF filename is available.")
+            return False
+
+        # PyLink returns zero when recording is active.
+        if tracker.isRecording() == 0:
             if not self.stop():
-                pglMessages.warning("Warning: Issue stopping recording", level=1)
-        
-        # Close file on Host PC
-        pglMessages.message("Closing data file...")
-        self.eyelink.closeDataFile()
-        pylink.msecDelay(100)
-        
-        # Ensure local directory exists
-        localDir = os.path.dirname(filename)
-        if localDir:
-            os.makedirs(localDir, exist_ok=True)
-        
-        # Make sure to use the edf extension
-        filename, fileext = os.path.splitext(filename)
-        filename = filename + ".edf"
-        
-        # Transfer file
-        pglMessages.message(f"Transferring data file...")
-        result = self.eyelink.receiveDataFile(self.edfFilename, filename)
-        
-        if result > 0:
-            if os.path.exists(filename):
-                filesize = os.path.getsize(filename)
-                pglMessages.message(f"Successfully saved: {filename} ({filesize} bytes)")
-                return True
-            else:
-                pglMessages.warning(f"Transfer reported success but file {filename} not found locally")
+                pglMessages.warning("EyeLink recording did not stop; EDF transfer was not attempted.")
                 return False
-        else:
-            pglMessages.warning(f"Transfer failed. Error code: {result}")
-            return False        
+
+        # Close the host file before requesting transfer.
+        pglMessages.message("Closing EyeLink data file...")
+        tracker.closeDataFile()
+        pylink.msecDelay(100)
+
+        # Normalize the local filename and ensure its directory exists.
+        filename = os.fspath(filename)
+        filename = os.path.splitext(filename)[0] + ".edf"
+        localDir = os.path.dirname(filename)
+        if localDir: os.makedirs(localDir, exist_ok=True)
+
+        pglMessages.message("Transferring EyeLink data file...")
+        result = tracker.receiveDataFile(self.edfFilename, filename)
+
+        if result <= 0:
+            pglMessages.warning(f"EyeLink transfer failed. Error code: {result}")
+            return False
+
+        if not os.path.isfile(filename):
+            pglMessages.warning(f"EyeLink reported a successful transfer, but {filename} was not found.")
+            return False
+
+        filesize = os.path.getsize(filename)
+        if filesize <= 0:
+            pglMessages.warning(f"EyeLink transferred an empty file: {filename}")
+            return False
+
+        pglMessages.message(f"Successfully saved: {filename} ({filesize} bytes)")
+        return True
     
     def setCustomCalibrationPoints(self, margin=0.2, numPoints=9):
         """Set custom calibrtion points

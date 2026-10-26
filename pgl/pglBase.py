@@ -723,33 +723,37 @@ class pglBase:
             pglMessages.warning("PGL is only supported on macOS")
             return False
     
-    
     ################################################################
-    # save 
+    # Save PGL state, reporting failures as warnings
     ################################################################
-    def save(self, filepath = None):
+    def save(self, filepath=None):
+        """Save cached PGL state, preserving the existing warning-only behavior."""
+        try:
+            return self.saveStrict(filepath)
+        except Exception as error:
+            pglMessages.warning(f"Failed to save PGL state: {type(error).__name__}: {error}")
+
+    ################################################################
+    # Save PGL state, propagating failures
+    ################################################################
+    def saveStrict(self, filepath=None):
+        """Build and save cached PGL state without querying the renderer."""
         if filepath is None:
             pglMessages.message("No filepath given, saving to Desktop.")
-            filepath = str(Path.home() / "Desktop" / "pgl.json")
-        try:
-            # initialize state (FIX: this should go in init!)            
-            self.state = pglState()
-            
-            # set some fields
-            self.state.pgldir = pglInfo.getPGLDir()
-            self.state.version = pglInfo.versionDict()
-            self.state.screenWidthPixels = self.screenWidth.pix
-            self.state.screenHeightPixels = self.screenHeight.pix
-            self.state.screenWidthDegrees = self.screenWidth.deg
-            self.state.screenHeightDegrees = self.screenHeight.deg
-            self.state.frameRate = self.frameRate   
-            
-            # save
-            self.state.save(filepath)
+            filepath = Path.home() / "Desktop" / "pgl.json"
 
-        except Exception as e:
-            pglMessages.warning(f"Failed to save to {filepath}: {e}")
+        # Build the saved state here only, so both save paths stay consistent.
+        self.state = pglState()
+        self.state.version = pglInfo.versionDict()
+        self.state.screenWidthPixels = self.screenWidth.pix
+        self.state.screenHeightPixels = self.screenHeight.pix
+        self.state.screenWidthDegrees = self.screenWidth.deg
+        self.state.screenHeightDegrees = self.screenHeight.deg
+        self.state.frameRate = self.frameRate
 
+        # Propagate encoding and filesystem errors to the caller.
+        return self.state.saveStrict(filepath)
+        
     ################################################################
     # Clean up open windows (which may be orphaned) and their socket connections
     ################################################################
