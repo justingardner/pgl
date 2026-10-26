@@ -317,7 +317,10 @@ class pglBase:
     # flush
     ################################################################
     def flush(self):
-        """Present drawing commands and optionally retain existing results.
+        """Present drawing commands and retain enabled recording information.
+
+        Pending movie draws are associated with this flush attempt. Their
+        presentation timing is retained only when flush logging is enabled.
 
         Returns:
             drawablePresented: Renderer presentation time, or None if absent.
@@ -327,17 +330,36 @@ class pglBase:
             pglMessages.warning("No screen is open", level=1)
             return None
 
-        commandSent = self.s.writeCommand("mglFlush")
+        # Preserve the capture setting for this synchronous command exchange.
+        recordTiming = self.flushRecording
+        commandIndex = -1
 
-        # Capture the association immediately after issuing this command.
-        # No lookup or recording bookkeeping is needed when flush logging is off.
-        if self.flushRecording:
-            commandIndex = self.commandRecordIndex() if commandSent else -1
+        try:
+            commandSent = self.s.writeCommand("mglFlush")
 
-        self.commandResults = self.s.readCommandResults()
+            # Capture this command's association immediately after sending it.
+            if recordTiming:
+                commandIndex = self.commandRecordIndex() if commandSent else -1
+
+            self.commandResults = self.s.readCommandResults()
+
+        except BaseException:
+            # Do not allow pending movie samples to attach to a later flush
+            # after this exchange was interrupted. Preserve the original error.
+            if getattr(self, "_movieDrawPending", None):
+                try:
+                    self.movieRecordFlush(None, recordTiming, interrupted=True)
+                except Exception:
+                    pass
+            raise
+
+        # Consume movie associations before profiling or buffer exports.
+        # Even absent results belong to this attempt, not the next flush.
+        if getattr(self, "_movieDrawPending", None):
+            self.movieRecordFlush(self.commandResults, recordTiming)
 
         # Preserve missing results as a row instead of silently dropping them.
-        if self.flushRecording: self._presentationLog.append(self.commandResults, commandIndex)
+        if recordTiming: self._presentationLog.append(self.commandResults, commandIndex)
 
         if self.commandResults is None:
             self.currentLine = 1

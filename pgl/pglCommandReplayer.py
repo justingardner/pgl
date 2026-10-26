@@ -344,3 +344,185 @@ class pglCommandReplayer:
         """Release a stopped recording; never silently discard active data."""
         if self.flushRecording: raise RuntimeError("Stop flush recording before clearing its data.")
         self._presentationLog = None
+        
+    ################################################################
+    # Retain one renderer-controlled movie playback
+    ################################################################
+    def movieRecordPlayback(self, metadata, presentedTimes, movieTimes, targetPresentationTimestamps, drawFrameTimes, commandResults):
+        """Retain one playback without copying its returned timing arrays.
+
+        Metadata is snapshotted. Returned arrays must not be modified in place
+        afterward; assigning new arrays for another playback is safe.
+        """
+        from copy import deepcopy
+
+        # Store records on PGL rather than the movie object so movie deletion
+        # or another play() call cannot discard earlier playback records.
+        if not hasattr(self, "_moviePlaybacks"): self._moviePlaybacks = []
+
+        record = {
+            "playbackIndex": len(self._moviePlaybacks),
+            "metadata": deepcopy(metadata),
+            "presentedTimes": presentedTimes,
+            "movieTimes": movieTimes,
+            "targetPresentationTimestamps": targetPresentationTimestamps,
+            "drawFrameTimes": drawFrameTimes,
+            "commandResults": commandResults,
+        }
+        self._moviePlaybacks.append(record)
+        return record["playbackIndex"]
+
+    ################################################################
+    # Retrieve movie playback records
+    ################################################################
+    def movieRecordData(self):
+        """Return independent copies of retained playback records."""
+        from copy import deepcopy
+        return deepcopy(getattr(self, "_moviePlaybacks", []))
+
+    ################################################################
+    # Explicitly discard movie playback records
+    ################################################################
+    def movieRecordClear(self):
+        """Release retained playback data after exporting or saving it."""
+        self._moviePlaybacks = []
+        
+    ################################################################
+    # Retain one task-controlled movie draw
+    ################################################################
+    def movieRecordDraw(self, movie, drawFrameTime, targetPresentationTimestamp, movieTime):
+        """Retain a movie draw until the next explicit flush associates it.
+
+        Metadata is copied only when this movie's placement changes or a new
+        draw recording starts. No movie object is retained in the recording.
+        """
+        from copy import deepcopy
+
+        if not hasattr(self, "_movieDrawSamples"):
+            self._movieDrawSamples = []
+            self._movieDrawSources = []
+            self._movieDrawPending = []
+            self._movieDrawFlushCount = 0
+
+        positionParams = getattr(movie, "positionParams", None)
+        context = getattr(movie, "_movieDrawRecordContext", None)
+
+        # setDisplayPosition() replaces positionParams with a new dictionary.
+        # A new source snapshot therefore captures position changes without
+        # copying metadata for every movie frame.
+        if context is None or context[0] is not self._movieDrawSources or context[2] is not positionParams:
+            def scalar(value):
+                return value.item() if isinstance(value, (np.ndarray, np.generic)) and np.size(value) == 1 else value
+
+            transform = getattr(movie, "preferredTransform", None)
+            metadata = {
+                "filename": movie.filename,
+                "originalMovieID": int(movie.movieNum),
+                "widthPixels": scalar(getattr(movie, "width", None)),
+                "heightPixels": scalar(getattr(movie, "height", None)),
+                "sourceFrameRate": scalar(getattr(movie, "frameRate", None)),
+                "duration": scalar(getattr(movie, "duration", None)),
+                "positionParameters": deepcopy(positionParams),
+                "preferredTransform": None if transform is None else {
+                    name: scalar(getattr(transform, name))
+                    for name in ("a", "b", "c", "d", "tx", "ty")
+                },
+                "hostTimestampUnits": "seconds",
+                "hostClockBasis": "assumedSameAsGetSecs",
+                "movieTimeUnits": "seconds",
+                "movieTimeBasis": "sourceMovie",
+                "movieTimeMinusOneMeaning": "noNewSourceFrame",
+            }
+
+            sourceIndex = len(self._movieDrawSources)
+            self._movieDrawSources.append(metadata)
+            movie._movieDrawRecordContext = (self._movieDrawSources, sourceIndex, positionParams)
+        else:
+            sourceIndex = context[1]
+
+        # These values were already returned by the renderer. Retain them
+        # without extra clock calls, socket operations, or image copies.
+        sample = {
+            "sourceIndex": sourceIndex,
+            "drawFrameTime": drawFrameTime,
+            "targetPresentationTimestamp": targetPresentationTimestamp,
+            "movieTime": movieTime,
+            "flushGroupIndex": -1,
+            "flushStatus": "pending",
+            "flushTimingRecorded": False,
+            "drawablePresented": None,
+            "flushSuccess": None,
+        }
+
+        sampleIndex = len(self._movieDrawSamples)
+        self._movieDrawSamples.append(sample)
+        self._movieDrawPending.append(sampleIndex)
+        return sampleIndex
+
+    ################################################################
+    # Associate pending movie draws with a flush attempt
+    ################################################################
+    def movieRecordFlush(self, commandResults, recordTiming, interrupted=False):
+        """Associate pending draws without interpreting presentation validity.
+
+        flushGroupIndex is local to this movie-draw collection. It identifies
+        a shared flush attempt, not an index into the presentation-log array.
+        """
+        pending = getattr(self, "_movieDrawPending", None)
+        if not pending: return
+
+        groupIndex = self._movieDrawFlushCount
+        self._movieDrawFlushCount += 1
+
+        if interrupted:
+            status = "interrupted"
+        elif commandResults is None:
+            status = "missingResults"
+        else:
+            status = "resultsReceived"
+
+        # Capture raw timing only when flush logging is enabled.
+        presentedTime = None
+        success = None
+        if recordTiming and commandResults is not None:
+            presentedTime = commandResults.get("drawablePresented")
+            success = commandResults.get("success")
+
+        for sampleIndex in pending:
+            sample = self._movieDrawSamples[sampleIndex]
+            sample["flushGroupIndex"] = groupIndex
+            sample["flushStatus"] = status
+            sample["flushTimingRecorded"] = bool(recordTiming)
+            sample["drawablePresented"] = presentedTime
+            sample["flushSuccess"] = success
+
+        # Consume the pending group even when timing is missing. It must not
+        # accidentally attach to some later, unrelated presentation.
+        pending.clear()
+
+    ################################################################
+    # Retrieve task-controlled movie drawing records
+    ################################################################
+    def movieDrawRecordData(self):
+        """Return independent copies, including draws without a subsequent flush."""
+        from copy import deepcopy
+
+        return deepcopy({
+            "sources": getattr(self, "_movieDrawSources", []),
+            "samples": getattr(self, "_movieDrawSamples", []),
+            "flushGroupCount": getattr(self, "_movieDrawFlushCount", 0),
+        })
+
+    ################################################################
+    # Explicitly discard task-controlled movie drawing records
+    ################################################################
+    def movieDrawRecordClear(self):
+        """Release incremental movie records without changing playback records.
+
+        This explicitly discards any pending draws as well. Source contexts
+        on movie objects are invalidated by replacing the source-list object.
+        """
+        self._movieDrawSamples = []
+        self._movieDrawSources = []
+        self._movieDrawPending = []
+        self._movieDrawFlushCount = 0

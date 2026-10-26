@@ -117,14 +117,19 @@ class pglRecordingFile:
     # Save
     ################################################################
     @classmethod
-    def save(cls, filename, commands=None, presentations=None):
-        """Write a local recording, atomically replacing the destination.
+    def save(cls, filename, commands=None, presentations=None, moviePlaybacks=None, movieDraws=None):
+        """Write a version-2 local recording, atomically replacing the destination.
 
-        Capture must already be stopped. No recording objects are modified.
-        Validation/metadata encoding occurs before creating the temporary file.
+        Capture must already be stopped. Movie-only recordings are supported.
+        Existing capture data is not modified or cleared.
         """
-        cls.validate(commands, presentations)
+        if all(value is None for value in (commands, presentations, moviePlaybacks, movieDraws)):
+            raise ValueError("No recording data was supplied.")
 
+        if commands is not None or presentations is not None:
+            cls.validate(commands, presentations)
+
+        # Encode small metadata and validate movies before creating a file.
         commandMetadata = None
         presentationMetadata = None
         if commands is not None:
@@ -132,27 +137,25 @@ class pglRecordingFile:
         if presentations is not None:
             presentationMetadata = cls._encodeMetadata(presentations, cls.presentationArrayNames)
 
+        preparedPlaybacks, preparedDraws = cls._prepareMovies(moviePlaybacks, movieDraws)
+
         filename = Path(filename).expanduser()
         filename.parent.mkdir(parents=True, exist_ok=True)
-
-        # Same-directory temporary file allows local atomic replacement.
         descriptor, temporaryName = tempfile.mkstemp(prefix=f".{filename.name}.", suffix=".tmp", dir=filename.parent)
         os.close(descriptor)
 
         try:
             with h5py.File(temporaryName, "w") as file:
                 file.attrs["formatName"] = cls.formatName
-                file.attrs["formatVersion"] = cls.formatVersion
+                file.attrs["formatVersion"] = 2
 
                 if commands is not None:
                     group = file.create_group("commands")
                     cls._writeMetadata(group, commandMetadata)
+                    for name in cls.commandArrayNames: group.create_dataset(name, data=commands[name])
 
-                    for name in cls.commandArrayNames:
-                        group.create_dataset(name, data=commands[name])
-
-                    # Preserve both command boundaries and individual write()
-                    # chunks. No concatenation of all payload bytes is required.
+                    # Preserve command boundaries, write-chunk boundaries,
+                    # and the distinction between None and an empty list.
                     payloads = commands["commandData"]
                     commandOffsets = np.zeros(len(payloads) + 1, dtype=np.uint64)
                     payloadPresent = np.zeros(len(payloads), dtype=np.bool_)
@@ -169,8 +172,7 @@ class pglRecordingFile:
                     group.create_dataset("payloadPresent", data=payloadPresent)
                     payloadBytes = group.create_dataset("payloadBytes", shape=(chunkOffsets[-1],), dtype=np.uint8)
 
-                    # Disk work happens after recording. Retain the original
-                    # chunk buffers and avoid an additional giant bytes object.
+                    # Avoid building one additional giant bytes object.
                     byteIndex = 0
                     for chunks in payloads:
                         if chunks is None: continue
@@ -181,15 +183,14 @@ class pglRecordingFile:
                 if presentations is not None:
                     group = file.create_group("presentations")
                     cls._writeMetadata(group, presentationMetadata)
+                    for name in cls.presentationArrayNames: group.create_dataset(name, data=presentations[name])
 
-                    for name in cls.presentationArrayNames:
-                        group.create_dataset(name, data=presentations[name])
+                cls._writeMovies(file, preparedPlaybacks, preparedDraws)
 
-            # Publish only after all datasets have been written and HDF5 closed.
+            # Publish only after HDF5 closes successfully.
             os.replace(temporaryName, filename)
 
         finally:
-            # Leave an existing destination untouched if writing failed.
             if os.path.exists(temporaryName): os.unlink(temporaryName)
 
         return filename
@@ -212,15 +213,19 @@ class pglRecordingFile:
     ################################################################
     @classmethod
     def load(cls, filename):
-        """Load arrays and payload bytes without executing recorded commands."""
+        """Load version-1 or version-2 data without executing commands."""
         commands = None
         presentations = None
+        moviePlaybacks = None
+        movieDraws = None
 
         with h5py.File(Path(filename).expanduser(), "r") as file:
             if file.attrs.get("formatName") != cls.formatName:
                 raise ValueError("Not a PGL recording file.")
-            if file.attrs.get("formatVersion") != cls.formatVersion:
-                raise ValueError(f"Unsupported recording format version: {file.attrs.get('formatVersion')}")
+
+            version = file.attrs.get("formatVersion")
+            if version not in (1, 2):
+                raise ValueError(f"Unsupported recording format version: {version}")
 
             if "commands" in file:
                 group = file["commands"]
@@ -267,5 +272,241 @@ class pglRecordingFile:
                 presentations = cls._readMetadata(group)
                 for name in cls.presentationArrayNames: presentations[name] = group[name][...]
 
-        cls.validate(commands, presentations)
-        return {"commands": commands, "presentations": presentations}
+            if version == 2:
+                moviePlaybacks, movieDraws = cls._readMovies(file)
+
+        if commands is not None or presentations is not None:
+            cls.validate(commands, presentations)
+
+        if all(value is None for value in (commands, presentations, moviePlaybacks, movieDraws)):
+            raise ValueError("File contains no recording sections.")
+
+        return {
+            "commands": commands,
+            "presentations": presentations,
+            "moviePlaybacks": moviePlaybacks,
+            "movieDraws": movieDraws,
+        }
+    
+    ################################################################
+    # Prepare movie data before opening the destination
+    ################################################################
+    @classmethod
+    def _prepareMovies(cls, moviePlaybacks, movieDraws):
+        """Validate and prepare movie data outside the file-writing operation."""
+        playbackFields = (
+            "presentedTimes",
+            "movieTimes",
+            "targetPresentationTimestamps",
+            "drawFrameTimes",
+        )
+        preparedPlaybacks = None
+
+        if moviePlaybacks is not None:
+            if not isinstance(moviePlaybacks, list): raise TypeError("moviePlaybacks must be a list.")
+            preparedPlaybacks = []
+
+            for record in moviePlaybacks:
+                if not isinstance(record, dict): raise TypeError("Each playback must be a dictionary.")
+
+                arrays = {}
+                for name in playbackFields:
+                    value = record[name]
+                    if value is not None:
+                        if not isinstance(value, np.ndarray) or value.ndim != 1 or value.dtype.kind not in "iuf":
+                            raise TypeError(f"Playback {name} must be a numeric one-dimensional array or None.")
+                    arrays[name] = value
+
+                # Do not require matching array lengths: incomplete returned
+                # timing must remain savable for later diagnosis.
+                metadata = cls._encodeMetadata(record, playbackFields)
+                preparedPlaybacks.append((metadata, arrays))
+
+        preparedDraws = None
+        if movieDraws is not None:
+            if set(movieDraws) != {"sources", "samples", "flushGroupCount"}:
+                raise ValueError("Unexpected movie-draw fields.")
+
+            sources = movieDraws["sources"]
+            samples = movieDraws["samples"]
+            flushGroupCount = movieDraws["flushGroupCount"]
+
+            if not isinstance(sources, list) or not isinstance(samples, list):
+                raise TypeError("Movie-draw sources and samples must be lists.")
+            if isinstance(flushGroupCount, bool) or not isinstance(flushGroupCount, int) or flushGroupCount < 0:
+                raise ValueError("flushGroupCount must be a nonnegative integer.")
+
+            numericFields = (
+                "drawFrameTime",
+                "targetPresentationTimestamp",
+                "movieTime",
+                "drawablePresented",
+                "flushSuccess",
+            )
+            requiredFields = {
+                "sourceIndex", "flushGroupIndex", "flushStatus",
+                "flushTimingRecorded", *numericFields,
+            }
+
+            count = len(samples)
+            values = np.zeros((count, len(numericFields)), dtype=np.float64)
+            present = np.zeros((count, len(numericFields)), dtype=np.bool_)
+            sourceIndices = np.empty(count, dtype=np.int64)
+            flushGroupIndices = np.empty(count, dtype=np.int64)
+            timingRecorded = np.empty(count, dtype=np.bool_)
+            statuses = []
+
+            for index, sample in enumerate(samples):
+                if set(sample) != requiredFields: raise ValueError("Unexpected movie-draw sample fields.")
+
+                sourceIndex = sample["sourceIndex"]
+                groupIndex = sample["flushGroupIndex"]
+                for name, value in (("sourceIndex", sourceIndex), ("flushGroupIndex", groupIndex)):
+                    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
+                        raise TypeError(f"{name} must be an integer.")
+
+                if not 0 <= sourceIndex < len(sources): raise ValueError("Invalid movie-draw source index.")
+                if groupIndex < -1 or groupIndex >= flushGroupCount: raise ValueError("Invalid movie-draw flush group index.")
+                if not isinstance(sample["flushStatus"], str): raise TypeError("flushStatus must be a string.")
+                if not isinstance(sample["flushTimingRecorded"], (bool, np.bool_)):
+                    raise TypeError("flushTimingRecorded must be Boolean.")
+
+                sourceIndices[index] = sourceIndex
+                flushGroupIndices[index] = groupIndex
+                timingRecorded[index] = sample["flushTimingRecorded"]
+                statuses.append(sample["flushStatus"])
+
+                # The existing draw API returns float64 times and uint32
+                # success values. Both are represented exactly by float64.
+                for column, name in enumerate(numericFields):
+                    value = sample[name]
+                    if value is None: continue
+                    array = np.asarray(value)
+                    if array.ndim != 0 or array.dtype.kind not in "iuf":
+                        raise TypeError(f"Movie-draw {name} must be a numeric scalar or None.")
+                    values[index, column] = array
+                    present[index, column] = True
+
+            metadata = pglSerialize.toJSON({
+                "sources": sources,
+                "flushGroupCount": flushGroupCount,
+                "numericFields": list(numericFields),
+                "statuses": statuses,
+            }, strict=True)
+
+            preparedDraws = {
+                "metadata": metadata,
+                "values": values,
+                "present": present,
+                "sourceIndices": sourceIndices,
+                "flushGroupIndices": flushGroupIndices,
+                "timingRecorded": timingRecorded,
+            }
+
+        return preparedPlaybacks, preparedDraws
+
+    ################################################################
+    # Write prepared movie sections
+    ################################################################
+    @classmethod
+    def _writeMovies(cls, file, preparedPlaybacks, preparedDraws):
+        """Store movie arrays directly and incremental samples in numeric columns."""
+        if preparedPlaybacks is None and preparedDraws is None: return
+        movies = file.create_group("movies")
+
+        if preparedPlaybacks is not None:
+            playbacks = movies.create_group("playbacks")
+            playbacks.attrs["count"] = len(preparedPlaybacks)
+
+            for index, (metadata, arrays) in enumerate(preparedPlaybacks):
+                group = playbacks.create_group(str(index))
+                cls._writeMetadata(group, metadata)
+
+                # An absent timing dataset means the original value was None.
+                for name, value in arrays.items():
+                    if value is not None: group.create_dataset(name, data=value)
+
+        if preparedDraws is not None:
+            group = movies.create_group("draws")
+            cls._writeMetadata(group, preparedDraws["metadata"])
+            for name, value in preparedDraws.items():
+                if name != "metadata": group.create_dataset(name, data=value)
+
+    ################################################################
+    # Read movie sections
+    ################################################################
+    @classmethod
+    def _readMovies(cls, file):
+        """Restore movie data without interpreting or repairing raw timing."""
+        moviePlaybacks = None
+        movieDraws = None
+
+        if "movies" not in file: return moviePlaybacks, movieDraws
+        movies = file["movies"]
+
+        if "playbacks" in movies:
+            playbacks = movies["playbacks"]
+            count = int(playbacks.attrs["count"])
+            if count < 0 or set(playbacks.keys()) != {str(index) for index in range(count)}:
+                raise ValueError("Invalid movie playback groups.")
+
+            moviePlaybacks = []
+            for index in range(count):
+                group = playbacks[str(index)]
+                record = cls._readMetadata(group)
+                for name in ("presentedTimes", "movieTimes", "targetPresentationTimestamps", "drawFrameTimes"):
+                    record[name] = group[name][...] if name in group else None
+                moviePlaybacks.append(record)
+
+        if "draws" in movies:
+            group = movies["draws"]
+            metadata = cls._readMetadata(group)
+            numericFields = (
+                "drawFrameTime",
+                "targetPresentationTimestamp",
+                "movieTime",
+                "drawablePresented",
+                "flushSuccess",
+            )
+            if metadata["numericFields"] != list(numericFields):
+                raise ValueError("Unknown movie-draw numeric fields.")
+
+            values = group["values"][...]
+            present = group["present"][...]
+            sourceIndices = group["sourceIndices"][...]
+            flushGroupIndices = group["flushGroupIndices"][...]
+            timingRecorded = group["timingRecorded"][...]
+            statuses = metadata["statuses"]
+            count = len(statuses)
+
+            if values.shape != (count, len(numericFields)) or values.dtype != np.dtype("float64"):
+                raise ValueError("Invalid movie-draw values.")
+            if present.shape != values.shape or present.dtype != np.dtype("bool"):
+                raise ValueError("Invalid movie-draw presence mask.")
+            for array in (sourceIndices, flushGroupIndices):
+                if array.shape != (count,) or array.dtype.kind != "i":
+                    raise ValueError("Invalid movie-draw indices.")
+            if timingRecorded.shape != (count,) or timingRecorded.dtype != np.dtype("bool"):
+                raise ValueError("Invalid movie-draw timing flags.")
+
+            samples = []
+            for index in range(count):
+                sample = {
+                    "sourceIndex": int(sourceIndices[index]),
+                    "flushGroupIndex": int(flushGroupIndices[index]),
+                    "flushStatus": statuses[index],
+                    "flushTimingRecorded": bool(timingRecorded[index]),
+                }
+                for column, name in enumerate(numericFields):
+                    sample[name] = float(values[index, column]) if present[index, column] else None
+                samples.append(sample)
+
+            movieDraws = {
+                "sources": metadata["sources"],
+                "samples": samples,
+                "flushGroupCount": metadata["flushGroupCount"],
+            }
+
+        # Reuse the same structural checks used before saving.
+        cls._prepareMovies(moviePlaybacks, movieDraws)
+        return moviePlaybacks, movieDraws

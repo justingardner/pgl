@@ -1554,46 +1554,105 @@ class pglStimulusMovie(_pglStimulus):
 
     def play(self, **positionParams):
         '''
-        play the Movie.
-        
+        Play the movie and retain its renderer-reported timing.
+
         Args:
-            Any args that setDisplayPosition takes (x,y,displayWidth,displayHeight,xAlign,yAlign)
-        
+            Position parameters accepted by setDisplayPosition(), including
+            x, y, displayWidth, displayHeight, xAlign, and yAlign.
+
+        Playback timing is retained on PGL independently of command and flush
+        recording. The latest timing arrays also remain available on this movie.
         '''
         if self.movieNum is None:
-            print(f"(pglStimulusMovie:setDisplayPosition) ❌ Movie has been deleted")
+            pglMessages.warning("Cannot play movie: movie has been deleted.")
             return False
-        
-        # Check for positionParams or if we not yet gotten dimensions
+
+        # Apply requested position parameters or wait for movie dimensions.
         if positionParams or not self.dimensionsReady.is_set():
-            self.setDisplayPosition(**positionParams)
-        
-        self.pgl.s.writeCommand("mglMoviePlay")
+            if self.setDisplayPosition(**positionParams) is False: return False
+
+        # Snapshot metadata before starting playback. Source identity currently
+        # uses the supplied filename; a stable database asset ID/hash comes later.
+        def scalar(value):
+            return value.item() if isinstance(value, (np.ndarray, np.generic)) and np.size(value) == 1 else value
+
+        transform = getattr(self, "preferredTransform", None)
+        metadata = {
+            "filename": self.filename,
+            "originalMovieID": int(self.movieNum),
+            "widthPixels": scalar(getattr(self, "width", None)),
+            "heightPixels": scalar(getattr(self, "height", None)),
+            "duration": scalar(getattr(self, "duration", None)),
+            "sourceFrameRate": scalar(getattr(self, "frameRate", None)),
+            "totalFrames": scalar(getattr(self, "totalFrames", None)),
+            "positionParameters": dict(getattr(self, "positionParams", {})),
+            "preferredTransform": None if transform is None else {
+                name: scalar(getattr(transform, name))
+                for name in ("a", "b", "c", "d", "tx", "ty")
+            },
+            "hostTimestampUnits": "seconds",
+            "hostClockBasis": "assumedSameAsGetSecs",
+            "movieTimeUnits": "seconds",
+            "movieTimeBasis": "sourceMovie",
+        }
+
+        # Send the existing playback command.
+        if not self.pgl.s.writeCommand("mglMoviePlay"): return False
+
+        # Associate playback with its command when command capture is active.
+        metadata["commandIndex"] = self.pgl.commandRecordIndex() if self.pgl.commandRecording else -1
+
         ackTime = self.pgl.s.readAck()
         self.pgl.s.write(np.uint32(self.movieNum))
-        
-        # read drawable presentedTimes
+
+        # Read renderer presentation times.
         self.presentedTimes = self.pgl.s.readArray(np.float64)
-        
-        # read corresponding movie times - this is the corresponding time in the movie
+
+        # Read corresponding times within the source movie.
         self.movieTimes = self.pgl.s.readArray(np.float64)
-        
-        # read corresponding targetPresentationTimestamps (the time the os thinks the frame will be displayed)
+
+        # Read the OS's predicted presentation times.
         self.targetPresentationTimestamps = self.pgl.s.readArray(np.float64)
 
-        # read corresponding draw frame times (the time at which the code to draw the frame
-        # ran - which is different from when it was displayed which is presentedTimes)
+        # Read times when the frame-drawing code ran, distinct from presentation.
         self.drawFrameTimes = self.pgl.s.readArray(np.float64)
 
-        # command Results
+        # Read ordinary command completion results.
         self.commandResults = self.pgl.s.readCommandResults(ackTime)
-        
-        # print summary if verbose
-        if self.pgl.verbose>1:
-            print(f"(pglStimulusMovie:play) Movie played {len(self.presentedTimes)} frames")
 
-        # display frame statistics if versbose is set
-        if self.pgl.verbose>0:
+        # Retain before statistics/reporting so an analysis error cannot discard
+        # the timing arrays already received from the renderer.
+        self.pgl.movieRecordPlayback(
+            metadata,
+            self.presentedTimes,
+            self.movieTimes,
+            self.targetPresentationTimestamps,
+            self.drawFrameTimes,
+            self.commandResults,
+        )
+
+        # Preserve missing/inconsistent arrays in the record, but do not pass
+        # them into statistics code that expects matching complete arrays.
+        timingArrays = (
+            self.presentedTimes,
+            self.movieTimes,
+            self.targetPresentationTimestamps,
+            self.drawFrameTimes,
+        )
+        if any(values is None for values in timingArrays):
+            pglMessages.warning("Movie playback returned incomplete timing arrays; available data was retained.")
+            return False
+
+        if len({len(values) for values in timingArrays}) != 1:
+            pglMessages.warning("Movie playback returned timing arrays with different lengths; available data was retained.")
+            return False
+
+        # Print summary if verbose.
+        if self.pgl.verbose > 1:
+            print(f"(pglStimulusMovie:play) Movie played {len(self.presentedTimes)} timing entries")
+
+        # The existing statistics method requires nonempty arrays.
+        if self.pgl.verbose > 0 and len(self.presentedTimes) > 0:
             self.displayFrameStatistics()
 
     # display frame statistics    
@@ -1729,29 +1788,42 @@ class pglStimulusMovie(_pglStimulus):
         
     def drawFrame(self, **positionParams):
         '''
-        draw the current frame of the movie (requires a pgl.flush() to display).
-        
+        Draw the current movie frame; a subsequent pgl.flush() presents it.
+
+        Returned frame information is retained on PGL independently of the
+        arrays returned by play(). The next flush associates pending draws
+        with its presentation attempt.
+
         Args:
-            Any args that setDisplayPosition takes (x,y,displayWidth,displayHeight,xAlign,yAlign)
-        
+            Position parameters accepted by setDisplayPosition().
         '''
         if self.movieNum is None:
-            print(f"(pglStimulusMovie:setDisplayPosition) ❌ Movie has been deleted")
+            pglMessages.warning("Cannot draw movie frame: movie has been deleted.")
             return False
 
-        # Check for positionParams
+        # Apply requested position parameters or wait for dimensions.
         if positionParams or not self.dimensionsReady.is_set():
-            self.setDisplayPosition(**positionParams)
-            
-        self.pgl.s.writeCommand("mglMovieDrawFrame")
+            if self.setDisplayPosition(**positionParams) is False: return False
+
+        if not self.pgl.s.writeCommand("mglMovieDrawFrame"): return False
         ackTime = self.pgl.s.readAck()
         self.pgl.s.write(np.uint32(self.movieNum))
 
-        self.drawFrameTimes.append(self.pgl.s.read(np.float64))
-        self.targetPresentationTimestamps.append(self.pgl.s.read(np.float64))
-        self.movieTimes.append(self.pgl.s.read(np.float64))
+        # Read the existing movie-specific results. A source time of -1 means
+        # no new source frame; retain it rather than forward-filling here.
+        drawFrameTime = self.pgl.s.read(np.float64)
+        targetPresentationTimestamp = self.pgl.s.read(np.float64)
+        movieTime = self.pgl.s.read(np.float64)
+
+        # Retain received frame information before reading normal completion
+        # results, so a later interruption does not discard these values.
+        self.pgl.movieRecordDraw(self, drawFrameTime, targetPresentationTimestamp, movieTime)
 
         self.commandResults = self.pgl.s.readCommandResults(ackTime)
+
+        if any(value is None for value in (drawFrameTime, targetPresentationTimestamp, movieTime)):
+            pglMessages.warning("Movie draw returned incomplete timing; available data was retained.")
+            return False
 
     def status(self):
         '''
