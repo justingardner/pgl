@@ -630,13 +630,13 @@ class pglPostgres(pglTraitSettings):
     def fromSettings(cls, settings=None, settingsName=None, *, filesystem=None, storageOptions=None):
         """Discover configuration from databasePath in database settings.
 
-        Missing configuration produces a warning and returns None.
+        Missing or inaccessible configuration produces a warning and returns None.
         Invalid configuration and authentication failures remain errors.
         """
         from .pglDatabase import pglDatabase
 
         resolvedSettings = pglDatabase.getSettings(settings=settings, settingsName=settingsName)
-        
+
         if resolvedSettings is None:
             pglMessages.warning("Could not resolve database settings.")
             return None
@@ -653,6 +653,15 @@ class pglPostgres(pglTraitSettings):
             return cls.load(filename, filesystem=filesystem, storageOptions=storageOptions)
         except FileNotFoundError:
             pglMessages.warning("No PostgreSQL configuration was found in the configured databasePath.")
+            return None
+        except PermissionError:
+            pglMessages.warning(
+                f"Permission denied reading PostgreSQL configuration: {filename}\n"
+                "Check that the account accessing this path has read permission on the "
+                "configuration file and execute (traverse) permission on its parent directories.\n"
+                "For SSH/SFTP paths, verify the remote username; specify it explicitly "
+                "with ssh://username@hostname/path if needed."
+            )
             return None
 
     # ++++++++++++++++++++++++ saveClientConfiguration ++++++++++++++++++++++

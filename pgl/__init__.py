@@ -65,6 +65,7 @@ _EXPORTS = {
  'pglEventListener': ('.pglEventListener', 'pglEventListener'),
  'pglEyeTracker': ('.pglEyeTracker', 'pglEyeTracker'),
  'pglEyePositionSample': ('.pglEyeTracker', 'pglEyePositionSample'),
+ 'pglEyelinkSettings': ('.pglEyelink', 'pglEyelinkSettings'),
  'pglDialogs': ('.pglDialog', 'pglDialogs'),
  'pglMessages': ('.pglMessages', 'pglMessages'),
  'pglActions': ('.pglActions', 'pglActions'),
