@@ -226,38 +226,87 @@ class pglSerialize:
     '''
     verbose = False
     _serializeUnregisteredFields = False
+
     ##########################
     # Save to JSON file
     ##########################
     def save(self, filename, filesystem=None, filesystemPrefix=None):
-            """Save object to JSON through an fsspec filesystem."""
-            import posixpath
+        """Save object to JSON through an fsspec filesystem.
 
-            try:
-                from .pglStorage import pglStorage
+        Return True on success or False on failure.
+        Normalize Windows separators for local paths only.
+        """
+        import posixpath
 
-                filename = str(filename)
-                dataPath = posixpath.dirname(filename) or "."
-                fileName = posixpath.basename(filename)
+        try:
+            from .pglStorage import pglStorage
 
-                filesystem, dataPath, _ = pglStorage.validateFilesystem(filesystem=filesystem, dataPath=dataPath, filesystemPrefix=filesystemPrefix, create=True)
-                if filesystem is None:
-                    pglMessages.warning(f"(pglSerialize) Could not resolve a filesystem for '{filename}'.")
-                    return
+            filename = str(filename)
 
-                filename = posixpath.join(dataPath, posixpath.splitext(fileName)[0] + ".json")
+            # ------------------------------------------------------------
+            # Determine whether the selected filesystem is local.
+            # Follow validateFilesystem's filesystem selection priority.
+            # ------------------------------------------------------------
+            if filesystem is not None:
+                protocols = getattr(filesystem, "protocol", ())
+                if isinstance(protocols, str):
+                    protocols = (protocols,)
+                isLocal = any(protocol in ("file", "local") for protocol in protocols)
+            else:
+                location = str(filesystemPrefix) if filesystemPrefix else filename
+                protocol = location.partition("://")[0].lower() if "://" in location else "file"
+                isLocal = protocol in ("file", "local")
 
-                with filesystem.open(filename, "w", encoding="utf-8") as file:
-                    file.write(self.toJSON(filename=filename))
+            # ------------------------------------------------------------
+            # posixpath can split Windows paths after separator normalization.
+            # Do not alter backslashes in remote filesystem paths.
+            # ------------------------------------------------------------
+            if isLocal:
+                filename = filename.replace("\\", "/")
 
-            except PermissionError:
-                pglMessages.warning(f"(pglSerialize) No permission to write to '{filename}'")
-            except IsADirectoryError:
-                pglMessages.warning(f"(pglSerialize) '{filename}' is a directory, cannot write file")
-            except OSError as e:
-                pglMessages.warning(f"(pglSerialize) OS error while saving '{filename}': {e}")
-            except Exception as e:
-                pglMessages.warning(f"(pglSerialize) Unknown error ({type(e).__name__}) while saving '{filename}': {e}")    
+            dataPath = posixpath.dirname(filename) or "."
+            fileName = posixpath.basename(filename)
+
+            filesystem, dataPath, _ = pglStorage.validateFilesystem(
+                filesystem=filesystem,
+                dataPath=dataPath,
+                filesystemPrefix=filesystemPrefix,
+                create=True,
+            )
+
+            if filesystem is None:
+                pglMessages.warning(
+                    f"(pglSerialize) Could not resolve a filesystem for '{filename}'."
+                )
+                return False
+
+            filename = posixpath.join(
+                dataPath,
+                posixpath.splitext(fileName)[0] + ".json",
+            )
+
+            with filesystem.open(filename, "w", encoding="utf-8") as file:
+                file.write(self.toJSON(filename=filename))
+
+            return True
+
+        except PermissionError:
+            pglMessages.warning(f"(pglSerialize) No permission to write to '{filename}'")
+        except IsADirectoryError:
+            pglMessages.warning(
+                f"(pglSerialize) '{filename}' is a directory, cannot write file"
+            )
+        except OSError as e:
+            pglMessages.warning(
+                f"(pglSerialize) OS error while saving '{filename}': {e}"
+            )
+        except Exception as e:
+            pglMessages.warning(
+                f"(pglSerialize) Unknown error ({type(e).__name__}) "
+                f"while saving '{filename}': {e}"
+            )
+
+        return False
     ##########################
     # Load from JSON file
     ##########################
