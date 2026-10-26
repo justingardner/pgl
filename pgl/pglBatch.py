@@ -47,8 +47,10 @@ class pglBatch:
             raise RuntimeError("Batch already started. End the current batch first.")
         if self._profileMode != 0:
             raise RuntimeError("Profiling is already active. Stop profiling before starting a batch.")
+        if getattr(self, "_recordingState", None) == "active":
+            raise RuntimeError("Batch mode during a recording session is not supported yet.")
         if getattr(self, "flushRecording", False) or getattr(self, "commandRecording", False):
-            raise RuntimeError("Stop flush and command recording before starting a batch; batch recording is not implemented yet.")
+            raise RuntimeError("Stop flush and command recording before starting a batch.")
 
         # Initialize profiling before requesting batch mode.
         self._profileMode = -1
@@ -58,7 +60,7 @@ class pglBatch:
             self._profileMode = 0
             raise
 
-        # An interrupted protocol exchange must not falsely mark the batch idle.
+        # An interrupted exchange must not falsely mark the batch idle.
         self._batchState = 1
         self.s.writeCommand("mglStartBatch")
         ack = self.s.readAck()

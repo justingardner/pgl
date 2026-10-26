@@ -349,15 +349,18 @@ class pglCommandReplayer:
     # Retain one renderer-controlled movie playback
     ################################################################
     def movieRecordPlayback(self, metadata, presentedTimes, movieTimes, targetPresentationTimestamps, drawFrameTimes, commandResults):
-        """Retain one playback without copying its returned timing arrays.
+        """Retain playback timing during an active recording session.
 
-        Metadata is snapshotted. Returned arrays must not be modified in place
-        afterward; assigning new arrays for another playback is safe.
+        Before the session API is used, preserve standalone capture behavior.
+        Once a session is stopped/cleared, require recordingStart() to resume.
         """
         from copy import deepcopy
 
-        # Store records on PGL rather than the movie object so movie deletion
-        # or another play() call cannot discard earlier playback records.
+        state = getattr(self, "_recordingState", None)
+        if state is not None and state != "active": return None
+
+        # Retain on PGL, not the movie object, so another play() or movie
+        # deletion cannot discard earlier playback timing.
         if not hasattr(self, "_moviePlaybacks"): self._moviePlaybacks = []
 
         record = {
@@ -371,7 +374,7 @@ class pglCommandReplayer:
         }
         self._moviePlaybacks.append(record)
         return record["playbackIndex"]
-
+    
     ################################################################
     # Retrieve movie playback records
     ################################################################
@@ -391,12 +394,15 @@ class pglCommandReplayer:
     # Retain one task-controlled movie draw
     ################################################################
     def movieRecordDraw(self, movie, drawFrameTime, targetPresentationTimestamp, movieTime):
-        """Retain a movie draw until the next explicit flush associates it.
+        """Retain a movie draw until its next explicit flush association.
 
-        Metadata is copied only when this movie's placement changes or a new
-        draw recording starts. No movie object is retained in the recording.
+        Metadata is copied when placement changes or a new collection begins.
+        No movie object or image pixels are retained in the recording.
         """
         from copy import deepcopy
+
+        state = getattr(self, "_recordingState", None)
+        if state is not None and state != "active": return None
 
         if not hasattr(self, "_movieDrawSamples"):
             self._movieDrawSamples = []
@@ -407,9 +413,8 @@ class pglCommandReplayer:
         positionParams = getattr(movie, "positionParams", None)
         context = getattr(movie, "_movieDrawRecordContext", None)
 
-        # setDisplayPosition() replaces positionParams with a new dictionary.
-        # A new source snapshot therefore captures position changes without
-        # copying metadata for every movie frame.
+        # setDisplayPosition() replaces this dictionary. Use that identity to
+        # detect placement updates without copying metadata on every frame.
         if context is None or context[0] is not self._movieDrawSources or context[2] is not positionParams:
             def scalar(value):
                 return value.item() if isinstance(value, (np.ndarray, np.generic)) and np.size(value) == 1 else value
@@ -440,8 +445,8 @@ class pglCommandReplayer:
         else:
             sourceIndex = context[1]
 
-        # These values were already returned by the renderer. Retain them
-        # without extra clock calls, socket operations, or image copies.
+        # Retain values already returned by the renderer. No extra timing
+        # queries, socket operations, or image copies are performed.
         sample = {
             "sourceIndex": sourceIndex,
             "drawFrameTime": drawFrameTime,
@@ -458,7 +463,7 @@ class pglCommandReplayer:
         self._movieDrawSamples.append(sample)
         self._movieDrawPending.append(sampleIndex)
         return sampleIndex
-
+    
     ################################################################
     # Associate pending movie draws with a flush attempt
     ################################################################
@@ -526,3 +531,191 @@ class pglCommandReplayer:
         self._movieDrawSources = []
         self._movieDrawPending = []
         self._movieDrawFlushCount = 0
+        
+    ################################################################
+    # Start a run-level recording session
+    ################################################################
+    def recordingStart(self, estimatedDuration=600, recordFlush=True, recordCommands=False):
+        """Start a fresh recording session without discarding existing data.
+
+        estimatedDuration controls initial capacity, not recording duration.
+        Movie timing is retained during the session independently of the
+        command and flush recording options.
+        """
+        import math
+        import uuid
+        from copy import deepcopy
+
+        if getattr(self, "_recordingState", None) in ("active", "stopped"):
+            raise RuntimeError("A recording session already exists. Save/export it, then call recordingClear().")
+        if not isinstance(recordFlush, bool) or not isinstance(recordCommands, bool):
+            raise TypeError("recordFlush and recordCommands must be Boolean.")
+        if isinstance(estimatedDuration, (bool, np.bool_)):
+            raise ValueError("estimatedDuration must be a positive number of seconds.")
+
+        estimatedDuration = float(estimatedDuration)
+        frameRate = float(self.frameRate)
+        if not math.isfinite(estimatedDuration) or estimatedDuration <= 0:
+            raise ValueError("estimatedDuration must be finite and positive.")
+        if not math.isfinite(frameRate) or frameRate <= 0:
+            raise ValueError("The cached display frame rate must be finite and positive.")
+        if not self.isOpen(): raise RuntimeError("Open the screen before starting recording.")
+        if getattr(self, "_batchState", 0) != 0 or getattr(self, "_profileMode", 0) < 0:
+            raise RuntimeError("Run-level recording during batch mode is not supported yet.")
+
+        # Do not silently mix standalone recordings with a new session.
+        if self.commandRecording or self.flushRecording:
+            raise RuntimeError("Stop and export existing capture before starting a session.")
+        if self.commandRecordingMetadata is not None or self._presentationLog is not None:
+            raise RuntimeError("Export and clear existing command/flush data before starting a session.")
+        if getattr(self, "_moviePlaybacks", []) or getattr(self, "_movieDrawSamples", []):
+            raise RuntimeError("Export and clear existing movie data before starting a session.")
+
+        # Snapshot cached display information only. No extra renderer queries.
+        def snapshotDimensions(name):
+            value = getattr(self, name, None)
+            return {
+                unit: deepcopy(getattr(value, unit))
+                for unit in ("pix", "cm", "deg")
+                if value is not None and hasattr(value, unit)
+            }
+
+        metadata = {
+            "recordingId": str(uuid.uuid4()),
+            "estimatedDuration": estimatedDuration,
+            "allocationFrameRate": frameRate,
+            "recordFlush": recordFlush,
+            "recordCommandsInitially": recordCommands,
+            "recordMovies": True,
+            "startTime": float(self.getSecs()),
+            "stopTime": None,
+            "outcome": "active",
+            "timestampUnits": "seconds",
+            "clockBasis": "assumedSameAsGetSecs",
+            "initialDisplay": {
+                "screenWidth": snapshotDimensions("screenWidth"),
+                "screenHeight": snapshotDimensions("screenHeight"),
+                "distanceToScreen": snapshotDimensions("distanceToScreen"),
+                "coordinateFrame": deepcopy(getattr(self, "coordinateFrame", None)),
+                "clearScreenColor": deepcopy(getattr(self, "clearScreenColor", None)),
+                "textRenderingParameters": deepcopy(getattr(self, "textRenderingParameters", None)),
+            },
+        }
+
+        # Allocate before marking the session active. If allocation fails,
+        # release only the new, still-empty buffers created by this call.
+        try:
+            if recordFlush: self.flushRecord(estimatedDuration=estimatedDuration)
+            if recordCommands: self.commandRecord(estimatedDuration=estimatedDuration)
+        except BaseException:
+            self.flushRecordStop()
+            self.commandRecordStop()
+            self.flushRecordClear()
+            self.commandRecordClear()
+            raise
+
+        # A new source-list identity invalidates cached movie source contexts.
+        self.movieRecordClear()
+        self.movieDrawRecordClear()
+        self._recordingMetadata = metadata
+        self._recordingState = "active"
+
+    ################################################################
+    # Stop run-level capture
+    ################################################################
+    def recordingStop(self, outcome="completed"):
+        """Stop capture without discarding data or performing disk/device work.
+
+        outcome describes acquisition, not whether saving or cleanup succeeds.
+        Repeated calls leave the original stop boundary unchanged.
+        """
+        if outcome not in ("completed", "aborted", "error", "interrupted"):
+            raise ValueError("Unknown recording outcome.")
+        if getattr(self, "_recordingState", None) != "active": return
+
+        # Disable the session first so subsequent movie operations cannot
+        # append data during finalization or device cleanup.
+        self._recordingState = "stopped"
+        self._recordingMetadata["outcome"] = outcome
+        self.flushRecordStop()
+
+        try:
+            self.commandRecordStop()
+        finally:
+            # Unflushed samples remain explicitly unassociated. Do not allow
+            # a later cleanup flush to claim they were presented.
+            pending = getattr(self, "_movieDrawPending", [])
+            for sampleIndex in pending:
+                self._movieDrawSamples[sampleIndex]["flushStatus"] = "recordingStoppedBeforeFlush"
+            pending.clear()
+
+            self._recordingMetadata["stopTime"] = float(self.getSecs())
+
+    ################################################################
+    # Export a stopped session
+    ################################################################
+    def recordingData(self):
+        """Return independent recording data for analysis or saving.
+
+        Call only after stopping capture. Export can copy substantial data,
+        so it does not belong in a frame-critical loop.
+        """
+        from copy import deepcopy
+
+        state = getattr(self, "_recordingState", None)
+        if state == "active": raise RuntimeError("Stop recording before exporting it.")
+        if state != "stopped": return None
+
+        return {
+            "metadata": deepcopy(self._recordingMetadata),
+            "commands": self.commandRecordData(),
+            "presentations": self.flushRecordData(),
+            "moviePlaybacks": self.movieRecordData(),
+            "movieDraws": self.movieDrawRecordData(),
+        }
+
+    ################################################################
+    # Explicitly release a stopped session
+    ################################################################
+    def recordingClear(self):
+        """Discard stopped recording data after saving/exporting it."""
+        if getattr(self, "_recordingState", None) == "active":
+            raise RuntimeError("Stop recording before clearing it.")
+        if self.commandRecording or self.flushRecording:
+            raise RuntimeError("Stop command and flush capture before clearing recording data.")
+
+        # Clear presentation associations before releasing their commands.
+        self.flushRecordClear()
+        self.commandRecordClear()
+        self.movieRecordClear()
+        self.movieDrawRecordClear()
+        self._recordingMetadata = None
+        self._recordingState = "idle"
+        
+    ################################################################
+    # Finalize and save the current recording session
+    ################################################################
+    def recordingSave(self, filename, outcome="completed"):
+        """Stop capture and save the session, retaining all buffers for retry.
+
+        A previously stopped session keeps its original outcome and stop time.
+        Saving does not establish that every command is supported by replay.
+        """
+        from .pglRecordingFile import pglRecordingFile
+
+        state = getattr(self, "_recordingState", None)
+        if state not in ("active", "stopped"):
+            raise RuntimeError("No recording session is available to save.")
+        if outcome not in ("completed", "aborted", "error", "interrupted"):
+            raise ValueError("Unknown recording outcome.")
+
+        # Low-level capture must not have been restarted outside the session.
+        if state == "stopped" and (self.commandRecording or self.flushRecording):
+            raise RuntimeError("Capture was restarted after the session stopped.")
+
+        if state == "active": self.recordingStop(outcome=outcome)
+
+        # Export and write outside presentation. No buffers are cleared on
+        # success or failure; recordingClear() remains an explicit operation.
+        data = self.recordingData()
+        return pglRecordingFile.save(filename, **data)

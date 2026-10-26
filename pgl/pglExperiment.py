@@ -76,10 +76,9 @@ class pglExperimentBase(pglStateDataSettings):
                             settingsName=None, experimentName=None, subjectID=None,
                             sessionName=None, runName=None, filesystem=None,
                             filesystemPrefix=None, dataPath=None):
-        '''
-        Check whether the experiment dir has all the correct files
-        '''
+        """Check required experiment/task files, allowing an optional recording."""
         from .pglChoose import pglChoose
+
         filesystem, fullDataPath, _ = pglChoose.getExperimentPath(
             fullDataPath=fullDataPath,
             settings=settings,
@@ -90,76 +89,56 @@ class pglExperimentBase(pglStateDataSettings):
             runName=runName,
             filesystem=filesystem,
             filesystemPrefix=filesystemPrefix,
-            dataPath=dataPath)
+            dataPath=dataPath,
+        )
+        if filesystem is None: return False
 
         sep = filesystem.sep
-
-        # Top-level required JSON files
-        requiredExperimentFiles = [
-            "data.json", "experimentSettings.json", "settings.json",
-            "pgl.json", "state.json"
-        ]
+        requiredExperimentFiles = ["data.json", "experimentSettings.json", "settings.json", "pgl.json", "state.json"]
         requiredFiles = ["data.json", "settings.json", "state.json"]
 
-        # Check top-level JSON files
+        # Check top-level required JSON files.
         for fileName in requiredExperimentFiles:
             filePath = f"{fullDataPath}{sep}{fileName}"
             if not filesystem.isfile(filePath):
-                if verbose:
-                    pglMessages.message(f"Missing file: {filePath}")
+                if verbose: pglMessages.message(f"Missing file: {filePath}")
                 return False
 
-        # Check non-json entries
+        # Permit the explicitly named recording artifact alongside task dirs.
         for item in filesystem.ls(fullDataPath, detail=False):
             fileName = item.rsplit(sep, 1)[-1]
+            if fileName.endswith(".json"): continue
+            if fileName == "recording.h5" and filesystem.isfile(item): continue
 
-            if not fileName.endswith(".json"):
+            if not filesystem.isdir(item):
+                if verbose: pglMessages.message(f"Unexpected non-directory artifact: {item}")
+                return False
 
-                # Everything non-json should be a directory
-                if not filesystem.isdir(item):
-                    if verbose:
-                        pglMessages.message(f"Expected directory, found: {item}")
+            # Check task files only if any task component exists.
+            taskFilesFound = [name for name in requiredFiles if filesystem.isfile(f"{item}{sep}{name}")]
+            if not taskFilesFound: continue
+
+            for name in requiredFiles:
+                filePath = f"{item}{sep}{name}"
+                if not filesystem.isfile(filePath):
+                    if verbose: pglMessages.message(f"Missing file in task directory: {filePath}")
                     return False
 
-                # Check task files only if any task file exists
-                taskFilesFound = [
-                    fileName for fileName in requiredFiles
-                    if filesystem.isfile(f"{item}{sep}{fileName}")
-                ]
+            # Parameters directory may be empty.
+            parametersPath = f"{item}{sep}parameters"
+            if not filesystem.isdir(parametersPath):
+                if verbose: pglMessages.message(f"No parameters directory in {item}")
+                return False
 
-                if len(taskFilesFound) > 0:
-
-                    # If one exists, all must exist
-                    for fileName in requiredFiles:
-                        filePath = f"{item}{sep}{fileName}"
-                        if not filesystem.isfile(filePath):
-                            if verbose:
-                                pglMessages.message(
-                                    f"Missing file in task directory {item}: {fileName}")
-                            return False
-
-                    # parameters must be a directory (may be empty)
-                    parametersPath = f"{item}{sep}parameters"
-                    if not filesystem.isdir(parametersPath):
-                        if verbose:
-                            pglMessages.message(
-                                f"No parameters directory in {item}")
+            for subItem in filesystem.ls(parametersPath, detail=False):
+                if not filesystem.isdir(subItem): continue
+                for name in requiredFiles:
+                    filePath = f"{subItem}{sep}{name}"
+                    if not filesystem.isfile(filePath):
+                        if verbose: pglMessages.message(f"Missing parameter file: {filePath}")
                         return False
 
-                    # Any directories inside parameters must contain required task files
-                    for subItem in filesystem.ls(parametersPath, detail=False):
-                        if not filesystem.isdir(subItem):
-                            continue
-
-                        for fileName in requiredFiles:
-                            filePath = f"{subItem}{sep}{fileName}"
-                            if not filesystem.isfile(filePath):
-                                if verbose:
-                                    pglMessages.message(
-                                        f"Missing file in parameter directory {subItem}: {fileName}")
-                                return False
-
-        return True  
+        return True
 
     @classmethod
     def load(cls, settings=None, dataPath=None, experimentName=None, subjectID=None, sessionName=None, runName=None, fullDataPath=None, filesystem=None, filesystemPrefix=None):
@@ -474,19 +453,51 @@ class pglExperiment(pglExperimentBase):
     def __repr__(self):
         return f"<pglExperiment: {len(self.task)} phases>"
     
-    def initScreen(self, backgroundColor=-1):
+    def initScreen(self, backgroundColor=-1, recordFlush=True, recordCommands=False, estimatedDuration=600):
         '''
-        Initialize the screen for the experiment. This will call pgl.open()
-        and set parameters according to the selected settings.
+        Initialize the screen, start recording, and configure tasks.
 
         Args:
-            backgroundColor: RGB background color. If omitted, use settings.
+            backgroundColor: RGB background color; -1 uses settings.
+            recordFlush: Retain flush presentation timing.
+            recordCommands: Begin command buffering immediately.
+            estimatedDuration: Initial recording capacity estimate in seconds.
+
+        Movie timing is retained independently of the two recording flags.
+        Existing recordings must be explicitly saved/exported and cleared.
         '''
         from .pglKeyboardMouse import pglKeyboardMouse
 
-        if self.settings is None:
-            pglMessages.warning("(pglExperiment:initScreen) No settings found to open screen.")
-            return
+        if self.settings is None: raise RuntimeError("No settings found to open screen.")
+        if not isinstance(recordFlush, bool) or not isinstance(recordCommands, bool):
+            raise TypeError("recordFlush and recordCommands must be Boolean.")
+        if isinstance(estimatedDuration, (bool, np.bool_)):
+            raise ValueError("estimatedDuration must be a positive number of seconds.")
+        estimatedDuration = float(estimatedDuration)
+        if not math.isfinite(estimatedDuration) or estimatedDuration <= 0:
+            raise ValueError("estimatedDuration must be finite and positive.")
+
+        # Check before screen cleanup: never discard or disturb an old session.
+        if getattr(self, "_recordingId", None) is not None:
+            raise RuntimeError("This experiment already owns a recording. Create a new experiment for another run.")
+        if getattr(self.pgl, "_recordingState", None) in ("active", "stopped"):
+            raise RuntimeError("Save/export the previous recording, then call pgl.recordingClear().")
+        if self.pgl.commandRecording or self.pgl.flushRecording:
+            raise RuntimeError("Stop and export existing capture before initializing this experiment.")
+        if self.pgl.commandRecordingMetadata is not None or self.pgl._presentationLog is not None:
+            raise RuntimeError("Export existing recording data, then call pgl.recordingClear().")
+        if getattr(self.pgl, "_moviePlaybacks", []) or getattr(self.pgl, "_movieDrawSamples", []):
+            raise RuntimeError("Export existing movie data, then call pgl.recordingClear().")
+
+        # Initialize recovery bookkeeping before task configuration can fail.
+        self._runSavePath = None
+        self._runStarted = False
+        self._recordingOutcome = "error"
+        self.data.runErrors = []
+        self.data.saveStatus = "notAttempted"
+        self.data.cleanupStatus = "notAttempted"
+        self.data.eyeTrackerSaveStatus = "notAttempted"
+        self.state.openScreen = False
 
         # Get background color. Only the scalar sentinel means "use settings".
         if isinstance(backgroundColor, (int, float)) and backgroundColor == -1:
@@ -495,14 +506,13 @@ class pglExperiment(pglExperimentBase):
         try:
             # Get screen parameters.
             if len(self.settings.displays) < 1:
-                pglMessages.warning(f"Settings {self.settings.name} is not associated with a display")
-                return
+                raise RuntimeError(f"Settings {self.settings.name} is not associated with a display.")
             self.state.display = self.settings.displays[0]
 
             # Make PGL quieter.
             self.setVerbose()
 
-            # Close all other screens.
+            # Preserve the existing screen-initialization cleanup behavior.
             self.pgl.cleanUp()
 
             # Save original screen resolution before changing it.
@@ -510,12 +520,8 @@ class pglExperiment(pglExperimentBase):
 
             if self.state.display.uuid == "windowed":
                 # Open the screen.
-                self.pgl.open(
-                    0,
-                    screenWidth=self.state.display.windowSize[0],
-                    screenHeight=self.state.display.windowSize[1],
-                    backgroundColor=backgroundColor,
-                )
+                self.pgl.open(0, screenWidth=self.state.display.windowSize[0], screenHeight=self.state.display.windowSize[1], backgroundColor=backgroundColor)
+                if not self.pgl.isOpen(): raise RuntimeError("Failed to open windowed screen.")
                 self.pgl.setWindowFrameInDisplay(
                     0,
                     screenX=self.state.display.windowPosition[0],
@@ -525,12 +531,9 @@ class pglExperiment(pglExperimentBase):
                 )
             else:
                 if self.state.display.currentDisplayNum == -1:
-                    pglMessages.warning(f"Could not open display {self.state.display.name} because it is not connected")
-                    self.endVerbose()
-                    return
+                    raise RuntimeError(f"Display {self.state.display.name} is not connected.")
 
                 # Compare the current display mode with the desired mode.
-                displayMode = None
                 if self.state.display.displayModes:
                     displayMode = self.state.display.displayModes[0]
                     if displayMode == self.state.originalScreenResolution:
@@ -551,11 +554,7 @@ class pglExperiment(pglExperimentBase):
                 # Open the screen.
                 self.pgl.open(whichScreen=self.state.display.currentDisplayNum, backgroundColor=backgroundColor)
 
-            # Check whether it was opened.
-            if not self.pgl.isOpen():
-                pglMessages.warning("Failed to open screen.")
-                self.endVerbose()
-                return
+            if not self.pgl.isOpen(): raise RuntimeError("Failed to open screen.")
 
             # Set visual angle coordinates.
             self.pgl.visualAngle(self.state.display.displayDistance, self.state.display.displaySize[0], self.state.display.displaySize[1])
@@ -575,25 +574,11 @@ class pglExperiment(pglExperimentBase):
 
                 # Check whether the keyboard listener is running.
                 if not keyboardMouse.isRunning():
-                    warningMessage = (
+                    pglMessages.warning(
                         "Accessibility permission not granted for keyboard/mouse access.\n"
-                        "On macOS, go to System Preferences -> Security & Privacy -> Privacy -> Accessibility\n"
-                        "and add your terminal application (e.g. Terminal, iTerm, etc) to the list of apps allowed to control your computer.\n"
-                        "If you are using VS Code and it already has permissions, consider running directly from a terminal."
+                        "On macOS, enable your terminal or application in Privacy & Security > Accessibility."
                     )
-                    pglMessages.warning(warningMessage)
-                    startTime = pglTimestamp.getSecs()
-                    displayMessageTime = 15
-
-                    while (pglTimestamp.getSecs() - startTime) < displayMessageTime:
-                        self.pgl.text("Accessibility permission error")
-                        self.pgl.text("Need to grant for keyboard and mouse")
-                        self.pgl.text("See instructions printed to console")
-                        self.pgl.text(f"Screen will close in {int(displayMessageTime - (pglTimestamp.getSecs() - startTime))} s")
-                        self.pgl.flush()
-
-                    self.endScreen()
-                    return
+                    raise RuntimeError("Keyboard/mouse listener could not start.")
             else:
                 # If already loaded, use the existing keyboard device.
                 keyboardMouse = keyboardDevices[0]
@@ -610,8 +595,7 @@ class pglExperiment(pglExperimentBase):
             else:
                 self.responseKeysList = list(self.settings.responseKeys)
 
-            # Empty or None control keys are disabled, not mapped to a dummy
-            # key code. Invalid nonempty keys are reported explicitly.
+            # Empty or None control keys are disabled.
             def getControlKeyCode(key, settingName):
                 if not key: return None
                 keyCode = keyboardMouse.charToKeyCode(key)
@@ -623,10 +607,9 @@ class pglExperiment(pglExperimentBase):
             self.state.endKeyCode = getControlKeyCode(self.settings.endKey, "endKey")
             self.state.volumeTriggerKeyCode = getControlKeyCode(self.settings.volumeTriggerKey, "volumeTriggerKey")
 
-            # Waiting for a keyboard volume trigger requires a configured key.
+            # Waiting for keyboard synchronization requires configured keys.
             if self.settings.startOnVolumeTrigger and self.state.volumeTriggerKeyCode is None:
                 raise ValueError("startOnVolumeTrigger requires a volumeTriggerKey.")
-
             if self.settings.manualPreStart and self.state.startKeyCode is None:
                 raise ValueError("manualPreStart requires a startKey.")
 
@@ -657,21 +640,39 @@ class pglExperiment(pglExperimentBase):
             self.initDigitalIO()
             self.initDevices()
 
-            # Configure tasks using the initialized experiment/display.
-            for task in self.tasks:
-                try:
-                    task.configure(self)
-                except Exception as error:
-                    pglMessages.warning(f"Could not configure task {task.settings.taskName}: {error}")
+            # Start before configure(), which may create stimulus resources.
+            self._startExperimentRecording(estimatedDuration, recordFlush, recordCommands)
 
-            # Mark that screen initialization completed.
+            # A failed configuration is not a successfully initialized task.
+            # Propagate it through the same partial-save recovery path.
+            for task in self.tasks: task.configure(self)
+
             self.state.openScreen = True
 
-        except Exception as error:
-            pglMessages.warning(f"Could not open screen. Error {type(error).__name__}: {error}")
-            self.state.openScreen = False
-            self.endVerbose()
-            return
+        except (Exception, KeyboardInterrupt, SystemExit) as error:
+            self.state.runFinishedWithError = True
+            self._recordingOutcome = "interrupted" if isinstance(error, (KeyboardInterrupt, SystemExit)) else "error"
+            self._recordRunError("screen initialization", error)
+
+            errors = []
+            self._attemptRunAction("record initialization end time", lambda: setattr(self.data, "endTime", self.pgl.getSecs()), errors)
+
+            try:
+                if getattr(self, "_recordingId", None) is not None:
+                    # Recording has started: save available task/recording data
+                    # before renderer or device cleanup.
+                    self._finalizeRun()
+                else:
+                    # No recording was started. Attempt independent cleanup.
+                    self._attemptRunAction("close experiment screen", lambda: self.endScreen(clearScreen=False), errors)
+                    self._attemptRunAction("close digital IO", self.endDigitalIO, errors)
+                    self._attemptRunAction("close experiment devices", self.endDevices, errors)
+            except (Exception, KeyboardInterrupt, SystemExit) as finalizationError:
+                self._recordRunError("initialization finalization", finalizationError)
+            finally:
+                self.state.openScreen = False
+
+            raise
 
     def setGamma(self, settings, display):
         '''
@@ -788,28 +789,40 @@ class pglExperiment(pglExperimentBase):
     # Run with protected saving and finalization
     ################################################################
     def run(self):
-        """Run acquisition, attempt saving on failure, and preserve its exception."""
+        """Run acquisition, save partial data on failure, and preserve its error."""
         if not self.state.openScreen:
             self.state.runFinishedWithError = True
             pglMessages.warning("Screen is not open. Call initScreen() before running the experiment.")
             return
 
-        # A new run gets a new destination. Retrying save() within this run
-        # reuses that destination rather than creating another directory.
-        self._runSavePath = None
-        self.data.runErrors = []
+        if getattr(self, "_runStarted", False):
+            raise RuntimeError("This experiment has already run. Create a new experiment for another run.")
+
+        # Verify ownership before running or cleaning up anything.
+        metadata = self._getExperimentRecording()
+        if metadata is not None and self.pgl._recordingState != "active":
+            raise RuntimeError("The experiment recording is already stopped.")
+        if metadata is None and getattr(self.pgl, "_recordingState", None) == "active":
+            raise RuntimeError("PGL has an active recording not owned by this experiment.")
+
+        self._runStarted = True
+        if not hasattr(self, "_runSavePath"): self._runSavePath = None
+        if not hasattr(self.data, "runErrors"): self.data.runErrors = []
+
         self.data.saveStatus = "notAttempted"
         self.data.cleanupStatus = "notAttempted"
         self.data.eyeTrackerSaveStatus = "notAttempted" if self.eyeTracker is not None else "notApplicable"
         self.state.runFinishedWithError = True
+        self._recordingOutcome = "error"
 
         try:
             self._run()
 
         except (Exception, KeyboardInterrupt, SystemExit) as error:
-            # Save unfinished task state honestly. Do not invoke arbitrary
-            # task-ending hooks or renderer commands before emergency saving.
+            # Preserve unfinished tasks; do not invoke task-ending hooks or
+            # renderer commands before emergency saving.
             self.state.runFinishedWithError = True
+            self._recordingOutcome = "interrupted" if isinstance(error, (KeyboardInterrupt, SystemExit)) else "error"
             self._recordRunError("acquisition", error)
 
             errors = []
@@ -818,19 +831,20 @@ class pglExperiment(pglExperimentBase):
             try:
                 self._finalizeRun()
             except (Exception, KeyboardInterrupt, SystemExit) as finalizationError:
-                # Preserve the original acquisition exception. Individual
-                # finalization failures are already recorded by the helpers.
                 try:
                     pglMessages.warning(f"Additional finalization failure: {type(finalizationError).__name__}: {finalizationError}")
                 except Exception:
                     pass
 
-            # Bare raise preserves the original exception and traceback.
+            # Preserve the original acquisition exception and traceback.
             raise
 
         else:
-            # This describes acquisition, not subsequent saving or cleanup.
+            # "completed" means acquisition returned normally. Existing aborted-
+            # run heuristics remain responsible for trash routing; an end-key
+            # exit is not classified as a Python error.
             self.state.runFinishedWithError = False
+            self._recordingOutcome = "completed"
             self._finalizeRun()
 
     ################################################################
@@ -880,24 +894,30 @@ class pglExperiment(pglExperimentBase):
     # Finalize successful or interrupted acquisition
     ################################################################
     def _finalizeRun(self):
-        """Attempt local saving before cleanup or external-device transfer."""
+        """Stop owned capture, attempt local saving, then clean up devices."""
         errors = []
 
-        # A renderer or device call may block after an interrupted exchange.
-        # Attempt the essential local save before making those calls.
+        def stopRecording():
+            metadata = self._getExperimentRecording()
+            if metadata is not None:
+                self.pgl.recordingStop(outcome=getattr(self, "_recordingOutcome", "error"))
+
+        # Stop before any save or cleanup command can enter the recording.
+        self._attemptRunAction("stop experiment recording", stopRecording, errors)
+
+        # Attempt local saving before potentially blocking device operations.
         if not self._attemptRunAction("save experiment", lambda: self.save(includeEyeTracker=False), errors):
             self.data.saveStatus = "failed"
 
         # Normal acquisition already cleared/flushed the display. Recovery
-        # must not send additional drawing commands on an uncertain socket.
+        # must not send drawing commands on a potentially interrupted socket.
         cleanupErrorCount = len(errors)
         self._attemptRunAction("close experiment screen", lambda: self.endScreen(clearScreen=False), errors)
         self._attemptRunAction("close digital IO", self.endDigitalIO, errors)
         self._attemptRunAction("close experiment devices", self.endDevices, errors)
         self.data.cleanupStatus = "failed" if len(errors) > cleanupErrorCount else "complete"
 
-        # Essential local data has already been attempted. EyeLink stop and
-        # transfer failures therefore cannot prevent that initial save.
+        # Essential local files have been attempted before EyeLink transfer.
         if self.eyeTracker is not None:
             eyeTrackerErrorCount = len(errors)
             dataPath = getattr(self, "_runSavePath", None)
@@ -909,8 +929,6 @@ class pglExperiment(pglExperimentBase):
 
                 self._attemptRunAction("save eye tracker", saveEyeTracker, errors)
             else:
-                # No destination was created. Still attempt to stop recording;
-                # the host EDF can be retrieved separately afterward.
                 self._attemptRunAction("stop eye tracker", self.eyeTracker.stop, errors)
 
             self.data.eyeTrackerSaveStatus = (
@@ -919,8 +937,7 @@ class pglExperiment(pglExperimentBase):
                 else "notSaved"
             )
 
-        # Update outcome metadata in the same directory without saving tasks
-        # again or repeating an EDF transfer.
+        # Persist final outcome metadata without repeating task or EDF saves.
         dataPath = getattr(self, "_runSavePath", None)
         if dataPath is not None:
             if not self._attemptRunAction("update final experiment state", lambda: self.state.saveStrict(dataPath / "state.json"), errors):
@@ -928,8 +945,8 @@ class pglExperiment(pglExperimentBase):
             if not self._attemptRunAction("update final experiment data", lambda: self.data.saveStrict(dataPath / "data.json"), errors):
                 self.data.saveStatus = "failed"
 
-        # run() preserves an earlier acquisition exception. If acquisition
-        # succeeded, expose the first finalization failure to the caller.
+        # run() preserves an earlier acquisition error. Otherwise this exposes
+        # the first finalization failure after all independent attempts.
         if errors: raise errors[0]
     
     def _run(self):
@@ -1586,11 +1603,9 @@ class pglExperiment(pglExperimentBase):
     def save(self, includeEyeTracker=True):
         """Save available run contents, continuing after component failures.
 
-        Repeated calls reuse this run's destination. Failures propagate after
-        independent saves have been attempted.
-
-        saveStrict() propagates encoding/write failures; it does not enable
-        strict JSON encoding or make the entire bundle atomic.
+        Repeated calls reuse this run's directory. Recording buffers are retained
+        for retry. The bundle is not atomic, although recording.h5 is published
+        through its own temporary-file replacement.
         """
         errors = []
         dataPath = getattr(self, "_runSavePath", None)
@@ -1628,15 +1643,14 @@ class pglExperiment(pglExperimentBase):
                     attempt += 1
                     dataPath = basePath.parent / f"{basePath.name}_{suffix}_{attempt}"
 
-            # Keep the destination immediately so partial output is discoverable
-            # and a retry does not create another run directory.
+            # Retain the destination immediately for discovery and retries.
             self._runSavePath = dataPath
             self.fullDataPath = str(dataPath)
 
         pglMessages.message(f"Saving experiment data to: {dataPath}", messageType='experiment')
         self.data.saveStatus = "inProgress"
 
-        # Save essential local data before external-device operations.
+        # Save essential local data before HDF5 export or device operations.
         components = (
             ("experiment data", self.data, "data.json"),
             ("experiment state", self.state, "state.json"),
@@ -1658,8 +1672,7 @@ class pglExperiment(pglExperimentBase):
                 errors,
             )
 
-        # Save each task component independently. One broken component must not
-        # prevent saving that task's events or the next task.
+        # Save task components independently.
         for taskIndex, task in enumerate(self.tasks):
             try:
                 taskPath = dataPath / task._getTaskDirectoryName()
@@ -1691,11 +1704,21 @@ class pglExperiment(pglExperimentBase):
                         errors,
                     )
 
-        # Uses cached PGL state, not a renderer query.
+        # Cached PGL state does not require a renderer query.
         self._attemptRunAction("save PGL state", lambda: self.pgl.saveStrict(dataPath / "pgl.json"), errors)
 
+        # HDF5 failure must not prevent the other experiment files above.
+        # A successful reference is published only by _saveExperimentRecording().
+        if getattr(self, "_recordingId", None) is not None:
+            saved = self._attemptRunAction("save experiment recording", lambda: self._saveExperimentRecording(dataPath), errors)
+            if not saved:
+                reference = dict(getattr(self.data, "recording", {}))
+                reference["recordingId"] = self._recordingId
+                reference["saveStatus"] = "failed"
+                self.data.recording = reference
+
         # Direct save() callers retain EDF retrieval. run() postpones it until
-        # essential local saving and screen/device cleanup have been attempted.
+        # local saving and screen/device cleanup have been attempted.
         if includeEyeTracker and self.eyeTracker is not None:
             def saveEyeTracker():
                 filename = dataPath / self.settings.eyetracker[0].lower()
@@ -1704,7 +1727,7 @@ class pglExperiment(pglExperimentBase):
             saved = self._attemptRunAction("save eye tracker", saveEyeTracker, errors)
             self.data.eyeTrackerSaveStatus = "complete" if saved else "failed"
 
-        # Persist findings from the independent save attempts.
+        # Persist recording reference and findings from independent saves.
         self.data.saveStatus = "failed" if errors else "complete"
         if not self._attemptRunAction("save final save status", lambda: self.data.saveStrict(dataPath / "data.json"), errors):
             self.data.saveStatus = "failed"
@@ -1860,6 +1883,90 @@ class pglExperiment(pglExperimentBase):
             # Restore verbose settings
             self.pgl.verbose=True
             pglMessages.setEnabledTypes(None)
+            
+    ################################################################
+    # Start this experiment's recording
+    ################################################################
+    def _startExperimentRecording(self, estimatedDuration, recordFlush, recordCommands):
+        """Start capture before task configuration and bind it to this experiment."""
+        if getattr(self, "_recordingId", None) is not None:
+            raise RuntimeError("This experiment already owns a recording. Create a new experiment for another run.")
+
+        self.pgl.recordingStart(
+            estimatedDuration=estimatedDuration,
+            recordFlush=recordFlush,
+            recordCommands=recordCommands,
+        )
+
+        metadata = self.pgl._recordingMetadata
+        self._recordingId = metadata["recordingId"]
+
+        # Store identifiers, not a reference to the live experiment.
+        metadata["experiment"] = {
+            "experimentUUID": self.uuid,
+            "experimentName": self.experimentSettings.experimentName,
+            "experimentSaveName": self.experimentSettings.experimentSaveName,
+            "subjectID": self.experimentSettings.subjectID,
+            "sessionName": self.experimentSettings.sessionName,
+            "runName": self.experimentSettings.runName,
+        }
+
+        # Filename is published only after a successful HDF5 write.
+        self.data.recording = {
+            "recordingId": self._recordingId,
+            "filename": None,
+            "formatVersion": None,
+            "saveStatus": "notAttempted",
+        }
+
+    ################################################################
+    # Verify recording ownership without exporting the buffers
+    ################################################################
+    def _getExperimentRecording(self):
+        """Return owned session metadata, or None for a legacy unrecorded run."""
+        recordingId = getattr(self, "_recordingId", None)
+        if recordingId is None: return None
+
+        metadata = getattr(self.pgl, "_recordingMetadata", None)
+        if not isinstance(metadata, dict) or metadata.get("recordingId") != recordingId:
+            raise RuntimeError("This experiment's recording was cleared or replaced; refusing to use another recording.")
+
+        if metadata.get("experiment", {}).get("experimentUUID") != self.uuid:
+            raise RuntimeError("Recording ownership does not match this experiment.")
+
+        if getattr(self.pgl, "_recordingState", None) not in ("active", "stopped"):
+            raise RuntimeError("This experiment's recording session is unavailable.")
+
+        return metadata
+
+    ################################################################
+    # Save the owned recording into the run directory
+    ################################################################
+    def _saveExperimentRecording(self, dataPath):
+        """Save a stopped session and publish its reference only after success."""
+        from .pglRecordingFile import pglRecordingFile
+
+        metadata = self._getExperimentRecording()
+        if metadata is None: return
+
+        if self.pgl._recordingState != "stopped":
+            raise RuntimeError("Stop acquisition before saving the experiment recording.")
+        if self.pgl.commandRecording or self.pgl.flushRecording:
+            raise RuntimeError("Low-level capture was restarted after session finalization.")
+
+        # Add task-run boundaries without changing the raw recording clock.
+        metadata["experimentStartTime"] = self.data.startTime
+        metadata["experimentEndTime"] = self.data.endTime
+
+        self.pgl.recordingSave(Path(dataPath) / "recording.h5")
+
+        # Small reference only: recording buffers never enter experiment JSON.
+        self.data.recording = {
+            "recordingId": metadata["recordingId"],
+            "filename": "recording.h5",
+            "formatVersion": pglRecordingFile.formatVersion,
+            "saveStatus": "complete",
+        }
         
 
 ##############################################

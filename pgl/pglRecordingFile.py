@@ -20,14 +20,14 @@ from .pglSerialize import pglSerialize
 
 
 class pglRecordingFile:
-    """Local HDF5 storage for captured commands and presentation timing.
+    """Local HDF5 storage for commands, presentations, and movie timing.
 
-    This class stores data only. Loading does not open a renderer, execute
-    commands, or establish that a recording is independently replayable.
+    Loading does not open a renderer, execute commands, or establish that
+    a recording is independently replayable.
     """
 
     formatName = "pglRecording"
-    formatVersion = 1
+    formatVersion = 3
 
     commandArrayNames = ("commandValues", "commandTimes")
     presentationArrayNames = (
@@ -38,13 +38,26 @@ class pglRecordingFile:
         "commandCode",
         "commandIndices",
     )
+    playbackArrayNames = (
+        "presentedTimes",
+        "movieTimes",
+        "targetPresentationTimestamps",
+        "drawFrameTimes",
+    )
+    movieDrawNumericFields = (
+        "drawFrameTime",
+        "targetPresentationTimestamp",
+        "movieTime",
+        "drawablePresented",
+        "flushSuccess",
+    )
 
     ################################################################
-    # Validate the capture structures used by this format
+    # Validate command and presentation structures
     ################################################################
     @classmethod
     def validate(cls, commands=None, presentations=None):
-        """Validate basic structure and associations without interpreting timing."""
+        """Validate structure and associations without interpreting timing."""
         if commands is None and presentations is None:
             raise ValueError("No command or presentation recording was supplied.")
 
@@ -56,7 +69,7 @@ class pglRecordingFile:
             if not isinstance(data, dict): raise TypeError(f"{label} must be a dictionary.")
 
             count = data.get("count")
-            if isinstance(count, bool) or not isinstance(count, (int, np.integer)) or count < 0:
+            if isinstance(count, (bool, np.bool_)) or not isinstance(count, (int, np.integer)) or count < 0:
                 raise ValueError(f"{label}.count must be a nonnegative integer.")
 
             for name in arrayNames:
@@ -85,8 +98,7 @@ class pglRecordingFile:
             if indices.dtype.kind != "i": raise TypeError("Presentation command indices must be signed integers.")
             if np.any(indices < -1): raise ValueError("Presentation command indices cannot be less than -1.")
 
-            # Do not silently write a presentation-only file with dangling
-            # references to command data that was omitted.
+            # Do not silently omit commands referenced by presentation records.
             if commands is None:
                 if np.any(indices != -1): raise ValueError("Presentation command associations require the command recording.")
             elif np.any(indices >= commands["count"]):
@@ -97,13 +109,13 @@ class pglRecordingFile:
     ################################################################
     @staticmethod
     def _encodeMetadata(data, excludedNames):
-        """Use the existing strict JSON codec for small metadata only."""
+        """Use strict JSON encoding for small metadata, not payload arrays."""
         metadata = {name: value for name, value in data.items() if name not in excludedNames}
         return pglSerialize.toJSON(metadata, strict=True)
 
     @staticmethod
     def _writeMetadata(group, text):
-        """Store JSON as a UTF-8 dataset rather than a large HDF5 attribute."""
+        """Store JSON as a UTF-8 dataset rather than a large attribute."""
         group.create_dataset("metadata", data=text, dtype=h5py.string_dtype("utf-8"))
 
     @staticmethod
@@ -117,68 +129,45 @@ class pglRecordingFile:
     # Save
     ################################################################
     @classmethod
-    def save(cls, filename, commands=None, presentations=None, moviePlaybacks=None, movieDraws=None):
-        """Write a version-2 local recording, atomically replacing the destination.
+    def save(cls, filename, commands=None, presentations=None, moviePlaybacks=None, movieDraws=None, metadata=None):
+        """Write a local recording and atomically replace the destination.
 
-        Capture must already be stopped. Movie-only recordings are supported.
-        Existing capture data is not modified or cleared.
+        Capture must already be stopped. Validation and metadata encoding occur
+        before creating the temporary file. Existing capture data is unchanged.
+
+        Atomic publication does not guarantee durability after power loss.
         """
-        if all(value is None for value in (commands, presentations, moviePlaybacks, movieDraws)):
+        if all(value is None for value in (commands, presentations, moviePlaybacks, movieDraws, metadata)):
             raise ValueError("No recording data was supplied.")
+        if metadata is not None and not isinstance(metadata, dict):
+            raise TypeError("Session metadata must be a dictionary or None.")
 
         if commands is not None or presentations is not None:
             cls.validate(commands, presentations)
 
-        # Encode small metadata and validate movies before creating a file.
-        commandMetadata = None
-        presentationMetadata = None
-        if commands is not None:
-            commandMetadata = cls._encodeMetadata(commands, (*cls.commandArrayNames, "commandData"))
-        if presentations is not None:
-            presentationMetadata = cls._encodeMetadata(presentations, cls.presentationArrayNames)
-
+        # Encode metadata before any destination file can be replaced.
+        sessionMetadata = None if metadata is None else cls._encodeMetadata(metadata, ())
+        commandMetadata = None if commands is None else cls._encodeMetadata(commands, (*cls.commandArrayNames, "commandData"))
+        presentationMetadata = None if presentations is None else cls._encodeMetadata(presentations, cls.presentationArrayNames)
         preparedPlaybacks, preparedDraws = cls._prepareMovies(moviePlaybacks, movieDraws)
 
         filename = Path(filename).expanduser()
         filename.parent.mkdir(parents=True, exist_ok=True)
         descriptor, temporaryName = tempfile.mkstemp(prefix=f".{filename.name}.", suffix=".tmp", dir=filename.parent)
-        os.close(descriptor)
 
         try:
+            os.close(descriptor)
+
             with h5py.File(temporaryName, "w") as file:
                 file.attrs["formatName"] = cls.formatName
-                file.attrs["formatVersion"] = 2
+                file.attrs["formatVersion"] = cls.formatVersion
+
+                if sessionMetadata is not None: cls._writeMetadata(file, sessionMetadata)
 
                 if commands is not None:
                     group = file.create_group("commands")
                     cls._writeMetadata(group, commandMetadata)
-                    for name in cls.commandArrayNames: group.create_dataset(name, data=commands[name])
-
-                    # Preserve command boundaries, write-chunk boundaries,
-                    # and the distinction between None and an empty list.
-                    payloads = commands["commandData"]
-                    commandOffsets = np.zeros(len(payloads) + 1, dtype=np.uint64)
-                    payloadPresent = np.zeros(len(payloads), dtype=np.bool_)
-                    chunkOffsets = [0]
-
-                    for index, chunks in enumerate(payloads):
-                        payloadPresent[index] = chunks is not None
-                        if chunks is not None:
-                            for chunk in chunks: chunkOffsets.append(chunkOffsets[-1] + len(chunk))
-                        commandOffsets[index + 1] = len(chunkOffsets) - 1
-
-                    group.create_dataset("commandChunkOffsets", data=commandOffsets)
-                    group.create_dataset("chunkByteOffsets", data=np.asarray(chunkOffsets, dtype=np.uint64))
-                    group.create_dataset("payloadPresent", data=payloadPresent)
-                    payloadBytes = group.create_dataset("payloadBytes", shape=(chunkOffsets[-1],), dtype=np.uint8)
-
-                    # Avoid building one additional giant bytes object.
-                    byteIndex = 0
-                    for chunks in payloads:
-                        if chunks is None: continue
-                        for chunk in chunks:
-                            if chunk: payloadBytes[byteIndex:byteIndex + len(chunk)] = np.frombuffer(chunk, dtype=np.uint8)
-                            byteIndex += len(chunk)
+                    cls._writeCommands(group, commands)
 
                 if presentations is not None:
                     group = file.create_group("presentations")
@@ -187,7 +176,7 @@ class pglRecordingFile:
 
                 cls._writeMovies(file, preparedPlaybacks, preparedDraws)
 
-            # Publish only after HDF5 closes successfully.
+            # Publish only after all writes and HDF5 closure succeed.
             os.replace(temporaryName, filename)
 
         finally:
@@ -196,12 +185,45 @@ class pglRecordingFile:
         return filename
 
     ################################################################
+    # Write command arrays and packed payloads
+    ################################################################
+    @classmethod
+    def _writeCommands(cls, group, commands):
+        """Preserve command/chunk boundaries without concatenating all bytes."""
+        for name in cls.commandArrayNames: group.create_dataset(name, data=commands[name])
+
+        # Preserve None separately from an empty list or an empty bytes chunk.
+        payloads = commands["commandData"]
+        commandOffsets = np.zeros(len(payloads) + 1, dtype=np.uint64)
+        payloadPresent = np.zeros(len(payloads), dtype=np.bool_)
+        chunkOffsets = [0]
+
+        for index, chunks in enumerate(payloads):
+            payloadPresent[index] = chunks is not None
+            if chunks is not None:
+                for chunk in chunks: chunkOffsets.append(chunkOffsets[-1] + len(chunk))
+            commandOffsets[index + 1] = len(chunkOffsets) - 1
+
+        group.create_dataset("commandChunkOffsets", data=commandOffsets)
+        group.create_dataset("chunkByteOffsets", data=np.asarray(chunkOffsets, dtype=np.uint64))
+        group.create_dataset("payloadPresent", data=payloadPresent)
+        payloadBytes = group.create_dataset("payloadBytes", shape=(chunkOffsets[-1],), dtype=np.uint8)
+
+        # Avoid building one additional giant bytes object.
+        byteIndex = 0
+        for chunks in payloads:
+            if chunks is None: continue
+            for chunk in chunks:
+                if chunk: payloadBytes[byteIndex:byteIndex + len(chunk)] = np.frombuffer(chunk, dtype=np.uint8)
+                byteIndex += len(chunk)
+
+    ################################################################
     # Validate packed payload offsets
     ################################################################
     @staticmethod
     def _validateOffsets(offsets, expectedLength, finalValue, label):
         """Reject malformed offsets before slicing payload storage."""
-        if offsets.ndim != 1 or offsets.dtype.kind not in "iu" or len(offsets) != expectedLength:
+        if offsets.ndim != 1 or offsets.dtype.kind not in "iu" or len(offsets) != expectedLength or expectedLength < 1:
             raise ValueError(f"Invalid {label} shape or dtype.")
         if offsets[0] != 0 or offsets[-1] != finalValue:
             raise ValueError(f"Invalid {label} endpoints.")
@@ -209,11 +231,60 @@ class pglRecordingFile:
             raise ValueError(f"{label} must be nondecreasing.")
 
     ################################################################
+    # Read command arrays and packed payloads
+    ################################################################
+    @classmethod
+    def _readCommands(cls, group):
+        """Restore outgoing command bytes without executing them."""
+        commands = cls._readMetadata(group)
+        for name in cls.commandArrayNames: commands[name] = group[name][...]
+
+        count = len(commands["commandValues"])
+        commandOffsets = group["commandChunkOffsets"][...]
+        chunkOffsets = group["chunkByteOffsets"][...]
+        payloadPresent = group["payloadPresent"][...]
+        payloadBytes = group["payloadBytes"]
+
+        if payloadBytes.ndim != 1 or payloadBytes.dtype != np.dtype("uint8"):
+            raise ValueError("Invalid payload byte dataset.")
+        if payloadPresent.shape != (count,) or payloadPresent.dtype != np.dtype("bool"):
+            raise ValueError("Invalid payload-presence array.")
+        if chunkOffsets.ndim != 1 or len(chunkOffsets) == 0:
+            raise ValueError("Invalid chunk offsets.")
+
+        cls._validateOffsets(commandOffsets, count + 1, len(chunkOffsets) - 1, "command chunk offsets")
+        cls._validateOffsets(chunkOffsets, len(chunkOffsets), len(payloadBytes), "chunk byte offsets")
+
+        payloads = []
+        for index in range(count):
+            firstChunk = int(commandOffsets[index])
+            lastChunk = int(commandOffsets[index + 1])
+
+            if not payloadPresent[index]:
+                if firstChunk != lastChunk: raise ValueError("Absent command payload has recorded chunks.")
+                payloads.append(None)
+                continue
+
+            chunks = []
+            for chunkIndex in range(firstChunk, lastChunk):
+                start = int(chunkOffsets[chunkIndex])
+                stop = int(chunkOffsets[chunkIndex + 1])
+                chunks.append(payloadBytes[start:stop].tobytes())
+            payloads.append(chunks)
+
+        commands["commandData"] = payloads
+        return commands
+
+    ################################################################
     # Load
     ################################################################
     @classmethod
     def load(cls, filename):
-        """Load version-1 or version-2 data without executing commands."""
+        """Load supported recording versions without executing commands.
+
+        Older files without session metadata return metadata=None.
+        """
+        metadata = None
         commands = None
         presentations = None
         moviePlaybacks = None
@@ -224,82 +295,42 @@ class pglRecordingFile:
                 raise ValueError("Not a PGL recording file.")
 
             version = file.attrs.get("formatVersion")
-            if version not in (1, 2):
+            if version not in (1, 2, cls.formatVersion):
                 raise ValueError(f"Unsupported recording format version: {version}")
 
-            if "commands" in file:
-                group = file["commands"]
-                commands = cls._readMetadata(group)
-                for name in cls.commandArrayNames: commands[name] = group[name][...]
+            if version == cls.formatVersion and "metadata" in file:
+                metadata = cls._readMetadata(file)
 
-                count = len(commands["commandValues"])
-                commandOffsets = group["commandChunkOffsets"][...]
-                chunkOffsets = group["chunkByteOffsets"][...]
-                payloadPresent = group["payloadPresent"][...]
-                payloadBytes = group["payloadBytes"]
-
-                if payloadBytes.ndim != 1 or payloadBytes.dtype != np.dtype("uint8"):
-                    raise ValueError("Invalid payload byte dataset.")
-                if payloadPresent.shape != (count,) or payloadPresent.dtype != np.dtype("bool"):
-                    raise ValueError("Invalid payload-presence array.")
-                if chunkOffsets.ndim != 1 or len(chunkOffsets) == 0:
-                    raise ValueError("Invalid chunk offsets.")
-
-                cls._validateOffsets(commandOffsets, count + 1, len(chunkOffsets) - 1, "command chunk offsets")
-                cls._validateOffsets(chunkOffsets, len(chunkOffsets), len(payloadBytes), "chunk byte offsets")
-
-                payloads = []
-                for index in range(count):
-                    firstChunk = int(commandOffsets[index])
-                    lastChunk = int(commandOffsets[index + 1])
-
-                    if not payloadPresent[index]:
-                        if firstChunk != lastChunk: raise ValueError("Absent command payload has recorded chunks.")
-                        payloads.append(None)
-                        continue
-
-                    chunks = []
-                    for chunkIndex in range(firstChunk, lastChunk):
-                        start = int(chunkOffsets[chunkIndex])
-                        stop = int(chunkOffsets[chunkIndex + 1])
-                        chunks.append(payloadBytes[start:stop].tobytes())
-                    payloads.append(chunks)
-
-                commands["commandData"] = payloads
+            if "commands" in file: commands = cls._readCommands(file["commands"])
 
             if "presentations" in file:
                 group = file["presentations"]
                 presentations = cls._readMetadata(group)
                 for name in cls.presentationArrayNames: presentations[name] = group[name][...]
 
-            if version == 2:
+            if version >= 2:
                 moviePlaybacks, movieDraws = cls._readMovies(file)
 
         if commands is not None or presentations is not None:
             cls.validate(commands, presentations)
 
-        if all(value is None for value in (commands, presentations, moviePlaybacks, movieDraws)):
+        if all(value is None for value in (commands, presentations, moviePlaybacks, movieDraws, metadata)):
             raise ValueError("File contains no recording sections.")
 
         return {
+            "metadata": metadata,
             "commands": commands,
             "presentations": presentations,
             "moviePlaybacks": moviePlaybacks,
             "movieDraws": movieDraws,
         }
-    
+
     ################################################################
     # Prepare movie data before opening the destination
     ################################################################
     @classmethod
     def _prepareMovies(cls, moviePlaybacks, movieDraws):
         """Validate and prepare movie data outside the file-writing operation."""
-        playbackFields = (
-            "presentedTimes",
-            "movieTimes",
-            "targetPresentationTimestamps",
-            "drawFrameTimes",
-        )
         preparedPlaybacks = None
 
         if moviePlaybacks is not None:
@@ -310,21 +341,20 @@ class pglRecordingFile:
                 if not isinstance(record, dict): raise TypeError("Each playback must be a dictionary.")
 
                 arrays = {}
-                for name in playbackFields:
+                for name in cls.playbackArrayNames:
                     value = record[name]
                     if value is not None:
                         if not isinstance(value, np.ndarray) or value.ndim != 1 or value.dtype.kind not in "iuf":
                             raise TypeError(f"Playback {name} must be a numeric one-dimensional array or None.")
                     arrays[name] = value
 
-                # Do not require matching array lengths: incomplete returned
-                # timing must remain savable for later diagnosis.
-                metadata = cls._encodeMetadata(record, playbackFields)
+                # Incomplete timing remains savable for later diagnosis.
+                metadata = cls._encodeMetadata(record, cls.playbackArrayNames)
                 preparedPlaybacks.append((metadata, arrays))
 
         preparedDraws = None
         if movieDraws is not None:
-            if set(movieDraws) != {"sources", "samples", "flushGroupCount"}:
+            if not isinstance(movieDraws, dict) or set(movieDraws) != {"sources", "samples", "flushGroupCount"}:
                 raise ValueError("Unexpected movie-draw fields.")
 
             sources = movieDraws["sources"]
@@ -336,13 +366,7 @@ class pglRecordingFile:
             if isinstance(flushGroupCount, bool) or not isinstance(flushGroupCount, int) or flushGroupCount < 0:
                 raise ValueError("flushGroupCount must be a nonnegative integer.")
 
-            numericFields = (
-                "drawFrameTime",
-                "targetPresentationTimestamp",
-                "movieTime",
-                "drawablePresented",
-                "flushSuccess",
-            )
+            numericFields = cls.movieDrawNumericFields
             requiredFields = {
                 "sourceIndex", "flushGroupIndex", "flushStatus",
                 "flushTimingRecorded", *numericFields,
@@ -357,7 +381,8 @@ class pglRecordingFile:
             statuses = []
 
             for index, sample in enumerate(samples):
-                if set(sample) != requiredFields: raise ValueError("Unexpected movie-draw sample fields.")
+                if not isinstance(sample, dict) or set(sample) != requiredFields:
+                    raise ValueError("Unexpected movie-draw sample fields.")
 
                 sourceIndex = sample["sourceIndex"]
                 groupIndex = sample["flushGroupIndex"]
@@ -376,8 +401,8 @@ class pglRecordingFile:
                 timingRecorded[index] = sample["flushTimingRecorded"]
                 statuses.append(sample["flushStatus"])
 
-                # The existing draw API returns float64 times and uint32
-                # success values. Both are represented exactly by float64.
+                # Float64 times and uint32 success values fit these columns.
+                # Presence is separate so None remains distinct from NaN.
                 for column, name in enumerate(numericFields):
                     value = sample[name]
                     if value is None: continue
@@ -410,7 +435,7 @@ class pglRecordingFile:
     ################################################################
     @classmethod
     def _writeMovies(cls, file, preparedPlaybacks, preparedDraws):
-        """Store movie arrays directly and incremental samples in numeric columns."""
+        """Store playback arrays and columnar incremental-draw samples."""
         if preparedPlaybacks is None and preparedDraws is None: return
         movies = file.create_group("movies")
 
@@ -422,7 +447,7 @@ class pglRecordingFile:
                 group = playbacks.create_group(str(index))
                 cls._writeMetadata(group, metadata)
 
-                # An absent timing dataset means the original value was None.
+                # An absent timing dataset represents an original None value.
                 for name, value in arrays.items():
                     if value is not None: group.create_dataset(name, data=value)
 
@@ -454,20 +479,14 @@ class pglRecordingFile:
             for index in range(count):
                 group = playbacks[str(index)]
                 record = cls._readMetadata(group)
-                for name in ("presentedTimes", "movieTimes", "targetPresentationTimestamps", "drawFrameTimes"):
+                for name in cls.playbackArrayNames:
                     record[name] = group[name][...] if name in group else None
                 moviePlaybacks.append(record)
 
         if "draws" in movies:
             group = movies["draws"]
             metadata = cls._readMetadata(group)
-            numericFields = (
-                "drawFrameTime",
-                "targetPresentationTimestamp",
-                "movieTime",
-                "drawablePresented",
-                "flushSuccess",
-            )
+            numericFields = cls.movieDrawNumericFields
             if metadata["numericFields"] != list(numericFields):
                 raise ValueError("Unknown movie-draw numeric fields.")
 
@@ -507,6 +526,6 @@ class pglRecordingFile:
                 "flushGroupCount": metadata["flushGroupCount"],
             }
 
-        # Reuse the same structural checks used before saving.
+        # Reuse the structural checks used before saving.
         cls._prepareMovies(moviePlaybacks, movieDraws)
         return moviePlaybacks, movieDraws
