@@ -237,50 +237,81 @@ class pglBase:
         return True
  
     ################################################################
-    # close
+    # Close this renderer and its client connection
     ################################################################
     def close(self):
+        """Close this instance's renderer and socket without touching other instances.
+
+        Returns True only when renderer termination and socket closure were
+        successful. An absent connection is already closed.
+
+        If renderer identification fails, still close the client socket, but
+        return False because renderer shutdown could not be confirmed.
         """
-        Close the connection to the mglMetal application and clean up.
+        connection = self.s
+        if connection is None: return True
 
-        This function sends a close command to the mglMetal application, waits for a response,
-        and then closes the socket connection.
+        socketName = getattr(connection, "socketName", None)
+        rendererStopped = False
+        socketClosed = False
+        socketPathRemoved = True
 
-        Returns:
-            bool: True if the connection was closed successfully, False otherwise.
-        """
-         # make sure that a screen is open
-        if self.isOpen() is False: return True
-        
-        # Print what we are doing
-        if self.verbose > 0: 
-            pglMessages.printHeader("pglBase:close")
-            pglMessages.message("Closing connection to mglMetal application")
-
-        # Check if the socket is connected
-        if not self.s:
-            pglMessages.warning(f"Not connected to socket")
-            return False
-        
-        # get the PID of the mglMetal application
-        pid = self.s.getPID()
-        if pid is None:
-            pglMessages.warning(f"Could not find PID of mglMetal application")
-            return False
-        
-        # close the application
-        if self.verbose > 0: pglMessages.message(f"Closing mglMetal application with PID {pid}")
         try:
-            subprocess.run(["kill", "-9", str(pid)], check=True)
-            if self.verbose > 0: pglMessages.message(f"mglMetal application with PID: {pid} was killed successfully.")
-        except subprocess.CalledProcessError as e:
-            pglMessages.warning(f"Error killing mglMetal application with PID: {pid} : {e}")
+            pid = connection.getPID()
 
-        # Close the socket
-        self.s.close()
-        self.s = None
-        if self.verbose>0: pglMessages.printHeader()
-        return True
+            if pid is None:
+                pglMessages.warning("Could not identify this connection's renderer; closing the client socket without terminating a process.")
+            else:
+                try:
+                    process = psutil.Process(pid)
+
+                    # Check again immediately before termination. PID discovery
+                    # and shutdown are separate operations.
+                    if pid == os.getpid() or process.name() != "mglMetal":
+                        pglMessages.warning(f"Refusing to terminate PID {pid}: it is not an identified mglMetal renderer.")
+                    else:
+                        if self.verbose > 0: pglMessages.message(f"Closing mglMetal renderer with PID {pid}")
+
+                        # Give this renderer a chance to exit normally.
+                        process.terminate()
+                        try:
+                            process.wait(timeout=3)
+                        except psutil.TimeoutExpired:
+                            pglMessages.warning(f"Renderer {pid} did not exit; forcefully terminating this renderer.")
+                            process.kill()
+                            process.wait(timeout=3)
+
+                        rendererStopped = True
+
+                except psutil.NoSuchProcess:
+                    # The identified renderer exited before/during shutdown.
+                    rendererStopped = True
+
+        except Exception as error:
+            pglMessages.warning(f"Could not close renderer: {type(error).__name__}: {error}")
+
+        finally:
+            # Client closure must happen even when PID lookup or termination
+            # fails. _pglComm.close() explicitly closes the underlying socket.
+            try:
+                socketClosed = connection.close() is not False
+            except Exception as error:
+                pglMessages.warning(f"Could not close client socket: {type(error).__name__}: {error}")
+            finally:
+                self.s = None
+
+            # Only remove this socket pathname after its renderer has stopped.
+            # Do not unlink a live or unidentified renderer's listening socket.
+            if rendererStopped and socketName:
+                try:
+                    os.unlink(socketName)
+                except FileNotFoundError:
+                    pass
+                except OSError as error:
+                    socketPathRemoved = False
+                    pglMessages.warning(f"Could not remove stopped renderer's socket {socketName}: {error}")
+
+        return rendererStopped and socketClosed and socketPathRemoved
     
     ################################################################
     # flush

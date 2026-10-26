@@ -50,19 +50,25 @@ class _pglComm:
         """
         return self.s is not None
 
+    
     def close(self):
-        """
-          Close the socket connection. 
-        """
-        if os.path.exists(self.socketName):
-            try:
-                os.remove(self.socketName)
-                pglMessages.message(f"Closed socket: {self.socketName}")
-            except Exception as e:
-                pglMessages.warning(f"Error closing socket: {e}",level=1)
-            finally:
-                self.s = None
+        """Close the underlying client socket without unlinking the server path.
 
+        The renderer owns the listening socket pathname. Closing a client
+        connection must not remove that pathname while the renderer is alive.
+        """
+        connection = self.s
+        if connection is None: return True
+
+        try:
+            connection.close()
+        finally:
+            # Never reuse a connection whose close was attempted, even if
+            # close() raised. Let the caller report the failure.
+            self.s = None
+
+        return True
+    
     def write(self, message):
         """
         Write a message to the socket.
@@ -426,19 +432,53 @@ class _pglComm:
                     self.commandValues[name] = value
         # now let's make a reverse lookup dictionary
         self.commandNames = {v: k for k, v in self.commandValues.items()}
+
     def getPID(self):
+        """Find the unique mglMetal process associated with this socket path.
+
+        Use machine-readable lsof output rather than matching human-readable
+        lines. Never return the Python client or guess between renderers.
         """
-        Find the PID of the process who made the socket
-        """
+        import psutil
+
+        if not self.socketName: return None
+
         try:
-            output = subprocess.check_output(['lsof', '-U', self.socketName])
-            for line in output.decode().splitlines():
-                if 'pgl' in line:
-                    return int(line.split()[1])
-        except Exception as e:
-            pglMessages.warning(f"Error finding PID: {e}",level=1)
-        return None
-    
+            result = subprocess.run(
+                ["lsof", "-t", "-a", "-U", self.socketName],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+
+            # lsof normally returns 1 when no matching open file was found.
+            if result.returncode not in (0, 1):
+                pglMessages.warning(f"Could not inspect socket {self.socketName}: {result.stderr.strip()}")
+                return None
+
+            rendererPIDs = set()
+            for line in result.stdout.splitlines():
+                if not line.strip().isdigit(): continue
+                pid = int(line.strip())
+                if pid == os.getpid(): continue
+
+                try:
+                    if psutil.Process(pid).name() == "mglMetal": rendererPIDs.add(pid)
+                except psutil.NoSuchProcess:
+                    # The process may have exited during inspection.
+                    continue
+
+            if len(rendererPIDs) == 1: return rendererPIDs.pop()
+
+            if len(rendererPIDs) > 1:
+                pglMessages.warning(f"Multiple mglMetal processes found for {self.socketName}; refusing to select one.")
+
+            return None
+
+        except (OSError, subprocess.TimeoutExpired, psutil.Error) as error:
+            pglMessages.warning(f"Could not identify renderer for {self.socketName}: {error}")
+            return None    
    
 class pglSerial:
     '''
