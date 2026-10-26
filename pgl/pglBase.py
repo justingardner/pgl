@@ -317,47 +317,57 @@ class pglBase:
     # flush
     ################################################################
     def flush(self):
-        """        
-        Flush the drawing commands to the screen.
-
-        This function sends a flush command to the mglMetal application to ensure that all
-        drawing commands are executed.
-
-        Args:
-            None
+        """Present drawing commands and optionally retain existing results.
 
         Returns:
-            drawablePresented: Returns the time the frame was presented or None if unsuccessful.
+            drawablePresented: Renderer presentation time, or None if absent.
         """
-        # make sure that a screen is open
-        if self.isOpen() is False: 
-            pglMessages.warning(f"No screen is open",level=1)
+        # Make sure that a screen is open.
+        if self.isOpen() is False:
+            pglMessages.warning("No screen is open", level=1)
             return None
-        self.s.writeCommand("mglFlush")
+
+        commandSent = self.s.writeCommand("mglFlush")
+
+        # Capture the association immediately after issuing this command.
+        # No lookup or recording bookkeeping is needed when flush logging is off.
+        if self.flushRecording:
+            commandIndex = self.commandRecordIndex() if commandSent else -1
+
         self.commandResults = self.s.readCommandResults()
-        
-        # keep profile information if profileMode is set
+
+        # Preserve missing results as a row instead of silently dropping them.
+        if self.flushRecording: self._presentationLog.append(self.commandResults, commandIndex)
+
+        if self.commandResults is None:
+            self.currentLine = 1
+            return None
+
+        # Keep profile information if profileMode is set.
         if self.profileMode > 0:
-            # check if we need to reallocate the buffer
+            # Check if we need to reallocate the buffer.
             if self.profileModeBufferIndex >= self.profileModeBufferSize:
-                # reallocate the buffer
                 self.profileModeBufferSize *= 2
                 self.profileModeFlushBuffer = np.resize(self.profileModeFlushBuffer, self.profileModeBufferSize)
-                # reallocate the commandResults buffer
+
+                # Reallocate the commandResults buffer.
                 if self._profileMode >= 2:
-                    self.profileModeCommandResults.extend([{} for _ in range(self.profileModeBufferSize - len(self.profileModeCommandResults))])
-            # store the results in the buffer
-            self.profileModeFlushBuffer[self.profileModeBufferIndex] = self.commandResults[self.profileCommandResultsField]
-            # save the whole command structure if needed
+                    self.profileModeCommandResults.extend(
+                        [{} for _ in range(self.profileModeBufferSize - len(self.profileModeCommandResults))]
+                    )
+
+            # Store the selected result, preserving missing timing as NaN.
+            profileValue = self.commandResults.get(self.profileCommandResultsField)
+            self.profileModeFlushBuffer[self.profileModeBufferIndex] = np.nan if profileValue is None else profileValue
+
+            # Save the whole command structure if needed.
             if self._profileMode >= 2:
-                self.profileModeCommandResults[self.profileModeBufferIndex] = self.commandResults 
+                self.profileModeCommandResults[self.profileModeBufferIndex] = self.commandResults
             self.profileModeBufferIndex += 1
-        
-        # reset line counter for pglDraw:text
+
+        # Reset line counter for pglDraw:text.
         self.currentLine = 1
-        
-        # success
-        return self.commandResults.get('drawablePresented', None)
+        return self.commandResults.get("drawablePresented", None)
     
     ################################################################
     # setDesiredFrameRate

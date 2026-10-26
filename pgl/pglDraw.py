@@ -9,12 +9,9 @@
 #############
 # Import modules
 #############
-import numpy as np
-from PIL import Image, ImageDraw, ImageFont
-import os
-from pathlib import Path
-from pgl.pglImage import pglImageInstance
 import math
+import numpy as np
+from .pglImage import pglImageInstance
 from .pglMessages import pglMessages
 
 #############
@@ -880,29 +877,26 @@ class pglDraw:
         )    
     
     ######################################################
-    # textCreate
+    # _textCreate
     ######################################################
     def _textCreate(self, textString, color=None, fontSize=40, fontName="Helvetica"):
         '''
         Create a text texture on the mglMetal server.
 
-        Text parameters are sent to Swift only when they differ from the
-        currently active server-side text-rendering parameters.
+        Text parameters are sent only when they differ from cached settings.
+        During command recording, retain the returned texture ID so replay
+        can map original IDs to IDs assigned by its own renderer.
         '''
-
         if not isinstance(textString, str):
             pglMessages.warning("textString must be a string.")
             return None
 
-        # empty string, nothing to do.
-        if not str: 
-            pglMessages.warning("str is empty, returning none",level=0)
-            return None
-        # Convert the requested text color to RGBA.
-        #
-        # validateColor(None) should produce the normal default text color.
-        foregroundColor = self.validateColor(color).flatten()
+        # Empty string: nothing to create.
+        if not textString: return None
 
+        # Convert the requested text color to RGBA.
+        # validateColor(None) provides the normal default text color.
+        foregroundColor = self.validateColor(color).flatten()
         if foregroundColor.size != 4:
             pglMessages.warning("color must resolve to an RGBA color.")
             return None
@@ -917,13 +911,14 @@ class pglDraw:
             fontSize=fontSize,
             paddingPixels=paddingPixels,
             foregroundColor=foregroundColor,
-            backgroundColor=backgroundColor
+            backgroundColor=backgroundColor,
         ):
             pglMessages.message("Could not set text-rendering parameters.")
             return None
 
-        # Request a new texture containing the rendered string.
-        self.s.writeCommand("mglCreateTextTexture")
+        # Request a texture containing the server-rendered string.
+        if not self.s.writeCommand("mglCreateTextTexture"): return None
+        commandIndex = self.commandRecordIndex() if self.commandRecording else -1
         ackTime = self.s.readAck()
 
         if ackTime is None:
@@ -935,11 +930,9 @@ class pglDraw:
 
         # Read text-specific query results.
         result = self.s.read(np.float64)
-
         if result is None:
             pglMessages.message("Did not receive text texture results.")
             return None
-
         if result < 0:
             pglMessages.message(f"Failed to create text texture for '{textString}'.")
             return None
@@ -949,10 +942,22 @@ class pglDraw:
         textureNumber = self.s.read(np.uint32)
         textureCount = self.s.read(np.uint32)
 
-        if (textWidthPixels is None or textHeightPixels is None or
-                textureNumber is None or textureCount is None):
+        if any(value is None for value in (textWidthPixels, textHeightPixels, textureNumber, textureCount)):
             pglMessages.message("Did not receive complete text texture data.")
             return None
+
+        # Preserve the original resource identity before reading completion
+        # results, so an interruption there does not lose the received ID.
+        if commandIndex != -1:
+            self.commandRecordResource(
+                commandIndex,
+                "texture",
+                textureNumber,
+                source="serverText",
+                widthPixels=int(textWidthPixels),
+                heightPixels=int(textHeightPixels),
+                textureCount=int(textureCount),
+            )
 
         self.commandResults = self.s.readCommandResults(ackTime)
 
@@ -960,8 +965,9 @@ class pglDraw:
             int(textureNumber),
             int(textWidthPixels),
             int(textHeightPixels),
-            self
+            self,
         )
+
     ######################################################
     # text
     ######################################################

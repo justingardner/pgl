@@ -35,101 +35,135 @@ class pglProfile:
     profileCommandResultsField = 'processedTime'  # Default field for command results to track
 
     ################################################################
+    # Initialize instance-owned profile state
+    ################################################################
+    def __init__(self):
+        """Keep profile buffers and history separate for each PGL instance."""
+        self._profileMode = 0
+        self.profileModeBufferSize = None
+        self.profileModeFlushBuffer = None
+        self.profileModeCommandResults = None
+        self.profileModeBufferIndex = 0
+        self.profileList = []
+        self.profileInfo = {}
+
+    ################################################################
     # profileMode property
     ################################################################
     @property
     def profileMode(self):
-        # Get the current verbosity level.
+        """Get the current profiling mode."""
         return self._profileMode
+
     @profileMode.setter
     def profileMode(self, level):
-        # Set the verbosity level.
-        if level < 0 or level > 2:
-            print("(pglProfile) profileMode must be either 0 (off), 1 (dropped frames), or 2 (detailed).")
-        else:
-            # set the verbosity level
-            self._profileMode = level
-        
-        # check if batch mode is running, which keeps track of profiling itself
+        """Start/stop profiling without discarding an active session."""
+        if level not in (0, 1, 2):
+            raise ValueError("profileMode must be 0 (off), 1 (timing), or 2 (detailed).")
+
+        # Batch profiling owns its lifecycle until batchEnd().
         if self._profileMode < 0:
-            print("(pglProfile) Profiler for batch mode already running")
-            return
-        
-        # If profileMode is set
+            raise RuntimeError("Batch profiling is active; finish the batch before changing profileMode.")
+
+        # Reassigning the current mode must not reset its buffers.
+        if level == self._profileMode: return
+
+        # Finish the existing session before switching to another mode.
         if self._profileMode > 0:
-            self._profileModeStart()
-        else:
-            # If profileMode is set to off, then save the profile information
-            if self.profileModeBufferIndex > 0:
-                print("(pglProfile) profileMode is off, saving profile data.")
-                self._profileModeEnd()
-                # package into the dict
-                self.profileInfo['flushTimes'] = self.profileModeFlushBuffer[:self.profileModeBufferIndex-1]
-                # convert the commandResults arrays and place in profileInfo
-                self.profileInfo['commandResults'] = {}
-                for dict in self.profileModeCommandResults[:self.profileModeBufferIndex-1]:
-                    for key, value in dict.items():
-                        if key not in self.profileInfo['commandResults']:
-                            self.profileInfo['commandResults'][key] = np.array([])
-                        self.profileInfo['commandResults'][key] = np.append(self.profileInfo['commandResults'][key], value)
+            self._profileModeEnd()
+            count = self.profileModeBufferIndex
 
-                # Save the profile information to the profileList
-                self.profileList.append(self.profileInfo)
-                # Reset the buffer index
-                self.profileModeBufferIndex = 0
+            # Include every populated entry, and detach it from live buffers.
+            self.profileInfo["flushTimes"] = self.profileModeFlushBuffer[:count].copy()
+            self.profileInfo["commandResults"] = None
 
-        # Print the new verbosity level
+            if self._profileMode >= 2:
+                results = self.profileModeCommandResults[:count]
+                fieldNames = {key for result in results for key in result}
+                self.profileInfo["commandResults"] = {
+                    key: np.asarray([
+                        np.nan if result.get(key) is None else result[key]
+                        for result in results
+                    ])
+                    for key in fieldNames
+                }
+
+            self.profileList.append(self.profileInfo)
+            self.profileModeBufferIndex = 0
+            self._profileMode = 0
+
+        if level > 0:
+            self._profileMode = level
+            try:
+                self._profileModeStart()
+            except BaseException:
+                # Do not leave profiling enabled after failed initialization.
+                self._profileMode = 0
+                raise
+
         if self.verbose > 0: print(f"(pglProfile) profileMode set to {self._profileMode}")
 
     ################################################################
     # _profileModeStart
     ################################################################
     def _profileModeStart(self):
-        # get frameRate of screen
-        frameRate = self.getFrameRate()
-        # set default profileModeBufferSize if not set
+        """Initialize a new profile session, including batch profiling."""
+        import copy
+
+        # Get the display frame rate before allocating buffers.
+        frameRate = float(self.getFrameRate())
+        if not np.isfinite(frameRate) or frameRate <= 0:
+            raise ValueError("Profiling requires a finite, positive display frame rate.")
+
+        # Default allocation is 60 seconds of frames.
         if self.profileModeBufferSize is None:
-            # set buffer size to 60 seconds worth of frames
-            self.profileModeBufferSize = int(frameRate * 60)
-            # print the buffer size
+            self.profileModeBufferSize = max(1, int(np.ceil(frameRate * 60)))
             if self.verbose > 0:
                 print(f"(pglProfile) profileModeBufferSize set to {self.profileModeBufferSize} frames ({self.profileModeBufferSize / frameRate:.2f} seconds)")
-                print(f"(pglProfile) Will reallocate if this is exceeded, but you can change this with pgl.profileModeBufferSize = <new size>")
-            # init buffer 
-            self.profileModeFlushBuffer = np.zeros(self.profileModeBufferSize)
-            self.profileModeBufferIndex = 0
-            if self._profileMode >= 2:
-                # If profileMode is set to detailed, initialize the profileInfo dict
-                self.profileModeCommandResults =[{} for _ in range(self.profileModeBufferSize)]
-            else:
-                self.profileModeCommandResults = None
-        # initialize information about the profile
-        self.profileInfo['startTime'] = time.time()
-        localTime = time.localtime(self.profileInfo['startTime'])
-        self.profileInfo['startTimeStr'] = time.strftime("%Y-%m-%d %H:%M:%S", localTime)
-        # get the cpu and gpu times
-        (cpuTime, gpuTime) = self.getTimestamps()
-        self.profileInfo['cpuTime'] = cpuTime
-        self.profileInfo['gpuTime'] = gpuTime
-        self.profileInfo['profileMode'] = self._profileMode
-        self.profileInfo['profileModeBufferStartSize'] = self.profileModeBufferSize
-        self.profileInfo['frameRate'] = frameRate
-        # save screen info
+                print("(pglProfile) Will reallocate if exceeded; set profileModeBufferSize before starting to choose another capacity.")
+
+        capacity = self.profileModeBufferSize
+        if isinstance(capacity, (bool, np.bool_)) or not isinstance(capacity, (int, np.integer)) or capacity <= 0:
+            raise ValueError("profileModeBufferSize must be a positive integer.")
+        self.profileModeBufferSize = int(capacity)
+
+        # Always start a fresh session, even when capacity was already set.
+        # Batch mode collects its result arrays at batchEnd(), not in flush().
+        self.profileModeBufferIndex = 0
+        self.profileModeFlushBuffer = np.empty(self.profileModeBufferSize, dtype=np.float64)
+        self.profileModeCommandResults = [None] * self.profileModeBufferSize if self._profileMode >= 2 else None
+        self.profileInfo = {}
+
+        # Record session start information.
+        self.profileInfo["startTime"] = time.time()
+        localTime = time.localtime(self.profileInfo["startTime"])
+        self.profileInfo["startTimeStr"] = time.strftime("%Y-%m-%d %H:%M:%S", localTime)
+
+        # Sample CPU/GPU clocks using the existing profiling behavior.
+        cpuTime, gpuTime = self.getTimestamps()
+        self.profileInfo["cpuTime"] = cpuTime
+        self.profileInfo["gpuTime"] = gpuTime
+        self.profileInfo["profileMode"] = self._profileMode
+        self.profileInfo["profileModeBufferStartSize"] = self.profileModeBufferSize
+        self.profileInfo["frameRate"] = frameRate
+
+        # Snapshot display information so later display changes cannot modify
+        # the metadata of an earlier profile.
         self.getWindowFrameInDisplay()
-        self.profileInfo['whichScreen'] = self.whichScreen
-        self.profileInfo['screenX'] = self.screenX
-        self.profileInfo['screenY'] = self.screenY
-        self.profileInfo['screenWidth'] = self.screenWidth
-        self.profileInfo['screenHeight'] = self.screenHeight
-    
+        self.profileInfo["whichScreen"] = self.whichScreen
+        self.profileInfo["screenX"] = copy.deepcopy(self.screenX)
+        self.profileInfo["screenY"] = copy.deepcopy(self.screenY)
+        self.profileInfo["screenWidth"] = copy.deepcopy(self.screenWidth)
+        self.profileInfo["screenHeight"] = copy.deepcopy(self.screenHeight)
+
     ################################################################
     # _profileModeEnd
     ################################################################
     def _profileModeEnd(self):
-        # set end time
-        self.profileInfo['endTime'] = time.time()
-        localTime = time.localtime(self.profileInfo['endTime'])
-        self.profileInfo['endTimeStr'] = time.strftime("%H:%M:%S", localTime)
+        """Record the end of the current profile session."""
+        self.profileInfo["endTime"] = time.time()
+        localTime = time.localtime(self.profileInfo["endTime"])
+        self.profileInfo["endTimeStr"] = time.strftime("%H:%M:%S", localTime)
 
     ################################################################
     # profileModeDisplay
