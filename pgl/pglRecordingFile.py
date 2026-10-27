@@ -1044,3 +1044,335 @@ class pglRecordingFile:
         # Reuse the structural checks used before saving.
         cls._prepareMovies(moviePlaybacks, movieDraws)
         return moviePlaybacks, movieDraws
+    
+    ################################################################
+    # Select drawing frames using original reported presentation timing
+    ################################################################
+    @classmethod
+    def selectFrames(cls, recording, time=None, startTime=None, stopTime=None):
+        """Select candidate drawing frames for a time or half-open range.
+
+        Specify either time, or both startTime and stopTime. Times use the
+        original recording clock; no offsets or timestamp repairs are applied.
+
+        Frame indices count recorded mglFlush commands, matching the drawing
+        reconstruction API. This method does not execute or reconstruct them.
+
+        Selection uses a reported-timing model:
+        - A timestamp group supplies candidate content until the next group.
+        - Equal timestamps do not establish which frame was displayed.
+        - Untimed flushes are conservatively included between neighboring
+          reported boundaries, without using command submission times.
+        - Recording stop bounds the query, not the final image's visibility.
+
+        Duplicate groups additionally retain the preceding timestamp group's
+        frames as possible carry-over content. This is deliberately conservative,
+        not a model of the renderer's actual duplicate-timestamp behavior.
+
+        Returns candidate indices, selected intervals/groups, and ambiguities.
+        Absence of detected ambiguity is not independent presentation validation.
+        """
+        if not isinstance(recording, dict):
+            raise TypeError("recording must be a dictionary.")
+
+        def finiteScalar(value, label):
+            array = np.asarray(value)
+            if (array.ndim != 0 or array.dtype.kind not in "iuf"
+                    or not np.isfinite(array)):
+                raise ValueError(f"{label} must be a finite numeric scalar.")
+            return float(array)
+
+        # Validate query form before inspecting any renderer data.
+        if time is not None:
+            if startTime is not None or stopTime is not None:
+                raise ValueError("Specify time OR startTime and stopTime.")
+            queryTime = finiteScalar(time, "time")
+            query = {"type": "time", "time": queryTime}
+        else:
+            if startTime is None or stopTime is None:
+                raise ValueError("Specify time OR both startTime and stopTime.")
+            queryStart = finiteScalar(startTime, "startTime")
+            queryStop = finiteScalar(stopTime, "stopTime")
+            if queryStop <= queryStart:
+                raise ValueError("stopTime must be greater than startTime.")
+            query = {
+                "type": "range",
+                "startTime": queryStart,
+                "stopTime": queryStop,
+            }
+
+        metadata = recording.get("metadata")
+        commands = recording.get("commands")
+        presentations = recording.get("presentations")
+
+        if not isinstance(metadata, dict):
+            raise ValueError("Session metadata is required for time selection.")
+        if commands is None:
+            raise ValueError("Drawing time selection requires recorded commands.")
+        if metadata.get("outcome") == "active":
+            raise ValueError("Stop recording before time selection.")
+
+        sessionStart = finiteScalar(metadata.get("startTime"), "session startTime")
+        sessionStop = finiteScalar(metadata.get("stopTime"), "session stopTime")
+        if sessionStop <= sessionStart:
+            raise ValueError("Session stopTime must follow startTime.")
+
+        if query["type"] == "time":
+            if not sessionStart <= queryTime < sessionStop:
+                raise ValueError("Requested time is outside [session start, session stop).")
+        elif queryStart < sessionStart or queryStop > sessionStop:
+            raise ValueError("Requested range extends outside the recorded session.")
+
+        cls.validate(commands, presentations)
+
+        segments = commands.get("segments") or []
+        if (len(segments) != 1
+                or segments[0].get("commandStartIndex") != 0
+                or segments[0].get("commandStopIndex") != commands["count"]):
+            raise ValueError("Time selection currently requires one continuous command segment.")
+
+        mapping = (commands.get("metadata") or {}).get("commandValues") or {}
+        if "mglFlush" not in mapping:
+            raise ValueError("The saved command mapping has no mglFlush entry.")
+
+        # Movies have a separate source-frame/timing interpretation. Do not
+        # accidentally equate a movie playback with an ordinary flush frame.
+        movieCodes = {
+            int(value) for name, value in mapping.items()
+            if name.startswith("mglMovie")
+        }
+        draws = recording.get("movieDraws") or {}
+        if (recording.get("moviePlaybacks") or draws.get("samples")
+                or any(int(value) in movieCodes for value in commands["commandValues"])):
+            raise ValueError("This drawing selector does not yet support movie-containing recordings.")
+
+        flushCode = int(mapping["mglFlush"])
+        flushCommands = [
+            int(index) for index in
+            np.flatnonzero(commands["commandValues"] == flushCode)
+        ]
+        if not flushCommands:
+            raise ValueError("Recording contains no flush frames to select.")
+
+        commandToFrame = {
+            commandIndex: frameIndex
+            for frameIndex, commandIndex in enumerate(flushCommands)
+        }
+        rowByFrame = {}
+
+        if presentations is not None:
+            for row in range(presentations["count"]):
+                commandIndex = int(presentations["commandIndices"][row])
+
+                # An unlinked presentation means the captured command stream
+                # does not cover all available presentation evidence.
+                if commandIndex == -1:
+                    raise ValueError(
+                        "Unlinked presentation rows prevent drawing-only time selection; "
+                        "use frame-index reconstruction instead."
+                    )
+                if commandIndex not in commandToFrame:
+                    raise ValueError("A presentation row references a non-flush command.")
+
+                frameIndex = commandToFrame[commandIndex]
+                if frameIndex in rowByFrame:
+                    raise ValueError("Multiple presentation rows reference the same flush.")
+
+                returnedCode = presentations["commandCode"][row]
+                if np.isfinite(returnedCode) and returnedCode != flushCode:
+                    raise ValueError("Presentation command code differs from mglFlush.")
+                rowByFrame[frameIndex] = row
+
+        # Read raw values in command order, not presentation-row order.
+        frameRecords = []
+        groups = []
+        untimedFrames = []
+
+        for frameIndex, commandIndex in enumerate(flushCommands):
+            row = rowByFrame.get(frameIndex)
+            presented = None if row is None else float(presentations["drawablePresented"][row])
+            success = None if row is None else float(presentations["success"][row])
+            usable = (
+                presented is not None and np.isfinite(presented) and presented > 0
+                and success is not None and np.isfinite(success) and success == 1
+            )
+
+            frameRecords.append({
+                "frameIndex": frameIndex,
+                "commandIndex": commandIndex,
+                "presentationIndex": row,
+                "drawablePresented": presented,
+                "success": success,
+                "timingUsable": bool(usable),
+            })
+
+            if not usable:
+                untimedFrames.append(frameIndex)
+                continue
+
+            if not sessionStart <= presented < sessionStop:
+                raise ValueError(
+                    f"Frame {frameIndex} has a presentation time outside session bounds."
+                )
+            if groups and presented < groups[-1]["time"]:
+                raise ValueError(
+                    "Presentation times move backward in command order; "
+                    "use frame-index reconstruction instead."
+                )
+
+            if groups and presented == groups[-1]["time"]:
+                groups[-1]["frameIndices"].append(frameIndex)
+            else:
+                groups.append({
+                    "groupIndex": len(groups),
+                    "time": presented,
+                    "frameIndices": [frameIndex],
+                })
+
+        # Describe intervals conservatively. Extra candidate indices do not
+        # imply that those images actually became visible.
+        intervals = []
+
+        def addInterval(start, stop, frameIndices, groupIndex, issues):
+            if stop <= start: return
+            intervals.append({
+                "startTime": start,
+                "stopTime": stop,
+                "frameIndices": set(frameIndices),
+                "groupIndex": groupIndex,
+                "issues": list(issues),
+            })
+
+        firstTime = groups[0]["time"] if groups else sessionStop
+        addInterval(sessionStart, firstTime, [], None, ["initialContentUnknown"])
+
+        for groupIndex, group in enumerate(groups):
+            stop = groups[groupIndex + 1]["time"] if groupIndex + 1 < len(groups) else sessionStop
+            candidates = list(group["frameIndices"])
+            issues = []
+
+            if len(group["frameIndices"]) > 1:
+                issues.append("duplicatePresentationTimestamp")
+                if groupIndex > 0:
+                    candidates.extend(groups[groupIndex - 1]["frameIndices"])
+                else:
+                    issues.append("precedingContentUnknown")
+
+            addInterval(group["time"], stop, candidates, groupIndex, issues)
+
+        # Locate untimed commands relative to timed command groups. These
+        # bounds use the reported-order model, not submission-time estimates.
+        invalidRegions = []
+
+        if not groups:
+            invalidRegions.append({
+                "startTime": sessionStart,
+                "stopTime": sessionStop,
+                "frameIndices": list(untimedFrames),
+            })
+        else:
+            validFrameIndices = [
+                index for index, frame in enumerate(frameRecords) if frame["timingUsable"]
+            ]
+            groupByFrame = {
+                frameIndex: group["groupIndex"]
+                for group in groups for frameIndex in group["frameIndices"]
+            }
+
+            for frameIndex in untimedFrames:
+                position = int(np.searchsorted(validFrameIndices, frameIndex))
+                previousFrame = validFrameIndices[position - 1] if position else None
+                nextFrame = (
+                    validFrameIndices[position]
+                    if position < len(validFrameIndices) else None
+                )
+
+                start = (
+                    sessionStart if previousFrame is None
+                    else frameRecords[previousFrame]["drawablePresented"]
+                )
+                stop = (
+                    sessionStop if nextFrame is None
+                    else frameRecords[nextFrame]["drawablePresented"]
+                )
+
+                # If an untimed flush falls between equal reported times,
+                # mark that group's following interval as ambiguous as well.
+                if stop <= start and nextFrame is not None:
+                    groupIndex = groupByFrame[nextFrame]
+                    stop = (
+                        groups[groupIndex + 1]["time"]
+                        if groupIndex + 1 < len(groups) else sessionStop
+                    )
+
+                invalidRegions.append({
+                    "startTime": start,
+                    "stopTime": stop,
+                    "frameIndices": [frameIndex],
+                })
+
+        for region in invalidRegions:
+            for interval in intervals:
+                if (interval["startTime"] < region["stopTime"]
+                        and region["startTime"] < interval["stopTime"]):
+                    interval["frameIndices"].update(region["frameIndices"])
+                    if "untimedFlush" not in interval["issues"]:
+                        interval["issues"].append("untimedFlush")
+
+        def overlapsQuery(start, stop):
+            if query["type"] == "time":
+                return start <= queryTime < stop
+            return start < queryStop and queryStart < stop
+
+        selectedIntervals = []
+        selectedIndices = set()
+        selectedGroupIndices = set()
+        ambiguityCodes = set()
+
+        for interval in intervals:
+            if not overlapsQuery(interval["startTime"], interval["stopTime"]): continue
+
+            entry = {
+                **interval,
+                "frameIndices": sorted(interval["frameIndices"]),
+            }
+            selectedIntervals.append(entry)
+            selectedIndices.update(entry["frameIndices"])
+            ambiguityCodes.update(entry["issues"])
+            if entry["groupIndex"] is not None:
+                selectedGroupIndices.add(entry["groupIndex"])
+
+        # Include timing groups for conservative carried-in candidates too.
+        for group in groups:
+            if any(index in selectedIndices for index in group["frameIndices"]):
+                selectedGroupIndices.add(group["groupIndex"])
+
+        return {
+            "selectionVersion": 1,
+            "recordingId": metadata.get("recordingId"),
+            "query": query,
+            "frameIndices": sorted(selectedIndices),
+            "frames": [frameRecords[index] for index in sorted(selectedIndices)],
+            "timingGroups": [
+                group for group in groups
+                if group["groupIndex"] in selectedGroupIndices
+            ],
+            "intervals": selectedIntervals,
+            "ambiguous": bool(ambiguityCodes),
+            "ambiguities": sorted(ambiguityCodes),
+            "sessionBounds": {
+                "startTime": sessionStart,
+                "stopTime": sessionStop,
+            },
+            "selectionBasis": "reportedPresentationTimingWithConservativeCandidates",
+            "physicalVisibilityVerified": False,
+            "limitations": [
+                "Candidate frames are not confirmed physical presentations.",
+                "Reported timestamp order is assumed to describe presentation order.",
+                "Repeated or stale renderer timestamps can invalidate that assumption.",
+                "Untimed flush bounds are inferred from neighboring reported groups, not measured.",
+                "The final interval is bounded by capture stop, not image disappearance.",
+                "Pre-capture content is unknown.",
+                "No command timestamps replace missing presentation times.",
+            ],
+        }

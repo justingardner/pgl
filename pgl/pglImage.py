@@ -226,22 +226,50 @@ class pglImage:
  
     def imageDelete(self, imageInstance):
         '''
-            Delete the specified image instance. This returns memory from the mglMetal app
-            which is allocated to hold the image.
+        Delete an image texture from the renderer.
+
+        Successful deletion clears imageNum so a later explicit deletion
+        or pglImageInstance destructor cannot delete the same texture twice.
+
+        Returns:
+            True if already deleted or deletion reports success.
+            False if the renderer is unavailable or deletion is unconfirmed.
         '''
-        if self.isOpen() == False:
-            return
         if not isinstance(imageInstance, pglImageInstance):
             print("(pglImage:imageDelete) imageInstance should be an instance of pglImageInstance.")
-            return
-        
-        # Delete texture
-        if self.verbose>1: print(f"(pglImage:imageDelete) Deleting image {imageInstance.imageNum} ({imageInstance.width.pix}x{imageInstance.height.pix})")
-        # send the deleteTexture command
-        self.s.writeCommand("mglDeleteTexture")
-        self.s.write(np.uint32(imageInstance.imageNum))
+            return False
+
+        # An explicitly deleted image may subsequently reach its destructor.
+        if imageInstance.imageNum is None: return True
+        if not self.isOpen(): return False
+
+        imageNum = imageInstance.imageNum
+        if self.verbose > 1:
+            print(
+                f"(pglImage:imageDelete) Deleting image {imageNum} "
+                f"({imageInstance.width.pix}x{imageInstance.height.pix})"
+            )
+
+        # Send the existing texture deletion protocol.
+        if not self.s.writeCommand("mglDeleteTexture"): return False
+        self.s.write(np.uint32(imageNum))
         self.commandResults = self.s.readCommandResults()
 
+        # Do not claim successful deletion when completion is missing.
+        success = None if self.commandResults is None else self.commandResults.get("success")
+        if success is None:
+            pglMessages.warning("Texture deletion returned no success result.")
+            return False
+
+        success = np.asarray(success)
+        if success.size != 1 or not bool(np.all(success == 1)):
+            pglMessages.warning("Texture deletion did not report success=1.")
+            return False
+
+        # Prevent a later destructor from deleting this ID again.
+        imageInstance.imageNum = None
+        return True
+    
     def imageValidate(self, imageData):
         '''
         Validate the image data and return a tuple of (True, imageData) if valid,

@@ -775,3 +775,553 @@ class pglCommandReplayer:
                 pass
 
         return savedFilename
+    
+    ################################################################
+    # Prepare drawing reconstruction without touching the renderer
+    ################################################################
+    @staticmethod
+    def _recordingReconstructionPlan(recording, frameIndices=None):
+        """Validate a continuous drawing recording and select flush outputs.
+
+        Frame indices identify mglFlush commands in command order, not rows
+        in the optional presentation log. Presentation rows are linked through
+        their recorded commandIndices.
+
+        Earlier commands remain in the plan even when only later frames are
+        requested. Selection controls image readback, not state reconstruction.
+
+        This first implementation supports basic drawing and server-generated
+        text. Movies, uploaded image creation, capture gaps, and unreviewed
+        commands are rejected before renderer execution.
+
+        Payload decoding assumes the current little-endian capture platform.
+        """
+        from copy import deepcopy
+        from .pglRecordingFile import pglRecordingFile
+
+        if not isinstance(recording, dict):
+            raise TypeError("recording must be a dictionary.")
+
+        commands = recording.get("commands")
+        presentations = recording.get("presentations")
+        metadata = recording.get("metadata")
+
+        if commands is None:
+            raise ValueError("Drawing reconstruction requires recorded commands.")
+        if not isinstance(metadata, dict):
+            raise ValueError("Drawing reconstruction requires session metadata.")
+        if metadata.get("outcome") == "active":
+            raise ValueError("Stop capture before preparing reconstruction.")
+
+        pglRecordingFile.validate(commands, presentations)
+
+        # Gaps cannot be repaired by treating a flush as a state checkpoint.
+        segments = commands.get("segments") or []
+        if len(segments) != 1:
+            raise ValueError("This reconstruction version requires one continuous command segment.")
+
+        segment = segments[0]
+        if (segment.get("commandStartIndex") != 0
+                or segment.get("commandStopIndex") != commands["count"]):
+            raise ValueError("The command segment must cover the entire stopped command recording.")
+
+        supportedNames = {
+            "mglSetClearColor",
+            "mglSetXform",
+            "mglQuad",
+            "mglLine",
+            "mglDots",
+            "mglFlush",
+            "mglSetTextRenderingParameters",
+            "mglCreateTextTexture",
+            "mglBltTexture",
+            "mglDeleteTexture",
+        }
+
+        # Reuse reviewed payload and resource-lifetime checks. Timing findings
+        # do not block pixel reconstruction, but malformed/unresolved command
+        # state does. This helper performs no renderer or filesystem work.
+        commandFindings = []
+
+        def collectFinding(code, severity, message, location=None):
+            commandFindings.append({
+                "code": code,
+                "severity": severity,
+                "message": message,
+                "location": location,
+            })
+
+        info = pglRecordingFile._analyzeCommands(commands, "little", collectFinding)
+
+        for index, name in enumerate(info["names"]):
+            if name not in supportedNames:
+                raise ValueError(
+                    f"Command {index} ({name!r}) is not supported by drawing reconstruction."
+                )
+
+        for finding in commandFindings:
+            if finding["severity"] != "warning": continue
+
+            # Client logging times are not used to execute drawing commands
+            # or assign physical presentation times.
+            if finding["code"] == "commandLoggingTimeMissing": continue
+
+            raise ValueError(
+                f"Cannot reconstruct: {finding['code']} at "
+                f"{finding['location']}: {finding['message']}"
+            )
+
+        # Match the original pixel dimensions and angular extent. Recorded
+        # dot sizes and text textures already contain pixel-valued quantities.
+        display = metadata.get("initialDisplay") or {}
+
+        def positiveDimension(dimension, unit, integer=False):
+            value = (display.get(dimension) or {}).get(unit)
+            array = np.asarray(value)
+            if (array.ndim != 0 or array.dtype.kind not in "iuf"
+                    or not np.isfinite(array) or array <= 0):
+                raise ValueError(f"Missing or invalid initialDisplay.{dimension}.{unit}.")
+            if integer:
+                if float(array) != int(array):
+                    raise ValueError(f"initialDisplay.{dimension}.{unit} must be an integer.")
+                return int(array)
+            return float(array)
+
+        setup = {
+            "widthPixels": positiveDimension("screenWidth", "pix", integer=True),
+            "heightPixels": positiveDimension("screenHeight", "pix", integer=True),
+            "widthDegrees": positiveDimension("screenWidth", "deg"),
+            "heightDegrees": positiveDimension("screenHeight", "deg"),
+            "clearScreenColor": deepcopy(display.get("clearScreenColor")),
+        }
+
+        # A fresh renderer must receive these settings explicitly rather
+        # than relying on Python's cached font state.
+        textSettings = deepcopy(segment.get("textRenderingParameters"))
+        if "mglCreateTextTexture" in info["names"]:
+            requiredSettings = {
+                "fontName", "fontSize", "paddingPixels",
+                "foregroundColor", "backgroundColor",
+            }
+            if not isinstance(textSettings, dict) or not requiredSettings.issubset(textSettings):
+                raise ValueError("Text reconstruction requires complete segment-start text settings.")
+
+        flushCommandIndices = info["flushIndices"]
+        frameCount = len(flushCommandIndices)
+
+        if frameIndices is None:
+            selectedIndices = list(range(frameCount))
+        else:
+            try:
+                selectedIndices = list(frameIndices)
+            except TypeError as error:
+                raise TypeError("frameIndices must be an iterable of integer indices or None.") from error
+
+            for index in selectedIndices:
+                if (not isinstance(index, (int, np.integer))
+                        or isinstance(index, (bool, np.bool_))):
+                    raise TypeError("Each frame index must be an integer.")
+                if not 0 <= index < frameCount:
+                    raise ValueError(f"Frame index {index} is outside [0, {frameCount}).")
+
+            selectedIndices = [int(index) for index in selectedIndices]
+            if len(set(selectedIndices)) != len(selectedIndices):
+                raise ValueError("Duplicate frame indices are not supported.")
+
+            # Execution and output follow original command order.
+            selectedIndices.sort()
+
+        # Link optional physical presentation records by command index.
+        # Never assume presentation-row index equals reconstructed-frame index.
+        presentationByCommand = {}
+        unlinkedPresentationRows = []
+
+        if presentations is not None:
+            for row in range(presentations["count"]):
+                commandIndex = int(presentations["commandIndices"][row])
+                if commandIndex == -1:
+                    unlinkedPresentationRows.append(row)
+                    continue
+
+                if info["names"][commandIndex] != "mglFlush":
+                    raise ValueError(f"Presentation row {row} references a non-flush command.")
+                if commandIndex in presentationByCommand:
+                    raise ValueError(f"Multiple presentation rows reference command {commandIndex}.")
+
+                returnedCode = presentations["commandCode"][row]
+                if (np.isfinite(returnedCode)
+                        and returnedCode != commands["commandValues"][commandIndex]):
+                    raise ValueError(f"Presentation row {row} has a mismatched command code.")
+
+                presentationByCommand[commandIndex] = row
+
+        frames = []
+        for frameIndex, commandIndex in enumerate(flushCommandIndices):
+            row = presentationByCommand.get(commandIndex)
+            timing = None
+
+            if row is not None:
+                # Copy raw scalars without offsets, sentinel repair, or
+                # substitution of client/processing timestamps.
+                timing = {
+                    name: presentations[name][row].item()
+                    for name in pglRecordingFile.presentationArrayNames
+                    if name != "commandIndices"
+                }
+
+            frames.append({
+                "frameIndex": frameIndex,
+                "commandIndex": commandIndex,
+                "presentationIndex": row,
+                "timing": timing,
+            })
+
+        resources = {
+            int(resource["commandIndex"]): deepcopy(resource)
+            for resource in commands.get("resources", [])
+        }
+
+        # Snapshot containers but share immutable packed bytes. No extra
+        # content copy of large vertex payloads is made.
+        plannedCommands = [
+            {
+                "commandIndex": index,
+                "name": name,
+                "chunks": tuple(commands["commandData"][index]),
+                "resource": resources.get(index),
+            }
+            for index, name in enumerate(info["names"])
+        ]
+
+        # Execute all preceding commands, including unselected flushes.
+        # An empty selection needs no renderer work.
+        executeStopIndex = (
+            frames[selectedIndices[-1]]["commandIndex"] + 1
+            if selectedIndices else 0
+        )
+
+        return {
+            "planVersion": 1,
+            "recordingId": metadata.get("recordingId"),
+            "commandByteOrder": "little",
+            "setup": setup,
+            "textSettings": textSettings,
+            "commands": plannedCommands,
+            "frames": frames,
+            "selectedFrameIndices": selectedIndices,
+            "executeStopIndex": executeStopIndex,
+            "unlinkedPresentationRows": unlinkedPresentationRows,
+            "initialStateBasis": "matchingVisualAngleExtent",
+        }
+        
+    ################################################################
+    # Reconstruct selected recorded drawing frames
+    ################################################################
+    def recordingReconstruct(self, recording, frameIndices=None, onFrame=None,
+                             maxMemoryBytes=256 * 1024 * 1024):
+        """Reconstruct drawing frames using a temporary renderer connection.
+
+        frameIndices selects recorded flushes, not presentation-log rows.
+        Earlier commands and unselected flushes still execute to establish
+        renderer state. Only selected frames are read back.
+
+        With onFrame=None, return frames in result["frames"], subject to
+        maxMemoryBytes. Otherwise call onFrame(frame) synchronously and do
+        not retain images internally. Callback exceptions stop reconstruction.
+
+        The callback receives:
+            image: float32 (height, width, 4), unchanged orientation
+            frameIndex: index among recorded flush commands
+            commandIndex: original recorded command index
+            presentationIndex: linked timing row, or None
+            timing: raw recorded flush results, or None
+
+        This method owns the renderer it opens and closes it afterward.
+        It does not change or clear the source recording. Initial setup uses
+        matching visual-angle extent, not arbitrary pre-capture renderer state.
+        """
+        import struct
+        import sys
+        from copy import deepcopy
+
+        if sys.byteorder != "little":
+            raise RuntimeError("Drawing reconstruction currently requires a little-endian platform.")
+        if onFrame is not None and not callable(onFrame):
+            raise TypeError("onFrame must be callable or None.")
+        if (isinstance(maxMemoryBytes, (bool, np.bool_))
+                or not isinstance(maxMemoryBytes, (int, np.integer))
+                or maxMemoryBytes <= 0):
+            raise ValueError("maxMemoryBytes must be a positive integer.")
+
+        if self.isOpen(): raise RuntimeError("Close the current renderer before reconstruction.")
+        if self.renderTarget is not None:
+            raise RuntimeError("An old render-target reference remains; resolve it before reconstruction.")
+        if getattr(self, "_recordingState", None) == "active":
+            raise RuntimeError("Stop capture before reconstruction.")
+        if self.commandRecording or self.flushRecording:
+            raise RuntimeError("Stop command and flush capture before reconstruction.")
+        if getattr(self, "_batchState", 0) != 0 or getattr(self, "_profileMode", 0) != 0:
+            raise RuntimeError("Disable batching and profiling before reconstruction.")
+
+        # Complete offline command/resource validation before renderer work.
+        plan = self._recordingReconstructionPlan(recording, frameIndices)
+        selected = set(plan["selectedFrameIndices"])
+        setup = plan["setup"]
+        bytesPerFrame = setup["widthPixels"] * setup["heightPixels"] * 4 * 4
+        estimatedImageBytes = len(selected) * bytesPerFrame
+
+        if onFrame is None and estimatedImageBytes > maxMemoryBytes:
+            raise ValueError(
+                f"Selected images require approximately {estimatedImageBytes / 1024**2:.1f} MiB. "
+                "Use onFrame to stream images, select fewer frames, or explicitly increase maxMemoryBytes."
+            )
+
+        # Establish the recorded clear color without adding an unrecorded
+        # full-screen quad. Reject invalid metadata before opening the renderer.
+        clearColor = setup["clearScreenColor"]
+        if clearColor is None:
+            raise ValueError("Initial clearScreenColor is required for this reconstruction version.")
+        clearColor = np.asarray(clearColor, dtype=np.float32)
+        if clearColor.shape != (3,) or not np.all(np.isfinite(clearColor)):
+            raise ValueError("Initial clearScreenColor must contain three finite RGB values.")
+
+        result = {
+            "recordingId": plan["recordingId"],
+            "selectedFrameIndices": list(plan["selectedFrameIndices"]),
+            "frameCount": 0,
+            "frames": [] if onFrame is None else None,
+            "estimatedImageBytes": estimatedImageBytes,
+            "initialStateBasis": plan["initialStateBasis"],
+            "timingBasis": "originalRecordedFlushResults",
+        }
+        if not selected: return result
+
+        def checkCompletion(results, label):
+            success = None if results is None else results.get("success")
+            if success is None or np.size(success) != 1 or not np.all(np.asarray(success) == 1):
+                raise RuntimeError(f"{label} did not report success=1.")
+
+        def sendChunks(chunks):
+            # Direct transmission of prevalidated bytes, without recording
+            # replay traffic or swallowing sendall failures.
+            for chunk in chunks: self.s.s.sendall(chunk)
+
+        def readAck(label):
+            ack = self.s.readAck()
+            if ack is None: raise RuntimeError(f"Missing acknowledgment for {label}.")
+            return ack
+
+        def readUInt(label):
+            value = self.s.read(np.uint32)
+            array = np.asarray(value)
+            if array.ndim != 0 or array.dtype.kind not in "iu":
+                raise RuntimeError(f"Missing or invalid {label}.")
+            return int(array)
+
+        framesByCommand = {
+            frame["commandIndex"]: frame for frame in plan["frames"]
+        }
+        textureMap = {}
+        primaryError = None
+
+        try:
+            self.open(
+                0,
+                screenWidth=setup["widthPixels"],
+                screenHeight=setup["heightPixels"],
+                backgroundColor=clearColor.tolist(),
+            )
+            if not self.isOpen(): raise RuntimeError("Reconstruction renderer did not open.")
+
+            self.setTransformScale(
+                2.0 / setup["widthDegrees"],
+                2.0 / setup["heightDegrees"],
+            )
+            checkCompletion(self.commandResults, "Coordinate setup")
+
+            # Force actual server settings rather than trusting a cache left
+            # over from a previously opened renderer.
+            if any(
+                command["name"] == "mglCreateTextTexture"
+                for command in plan["commands"][:plan["executeStopIndex"]]
+            ):
+                if not self.textSetRenderingParameters(**plan["textSettings"]):
+                    raise RuntimeError("Could not restore segment-start text settings.")
+                checkCompletion(self.commandResults, "Initial text settings")
+
+            self.frameGrabInit()
+            if self.renderTarget is None:
+                raise RuntimeError("Offscreen target creation failed.")
+            checkCompletion(self.commandResults, "Target selection")
+
+            # Explicit setup boundary before executing recorded commands.
+            # It does not create an output frame or consume original timing.
+            self.flush()
+            checkCompletion(self.commandResults, "Target setup flush")
+
+            for command in plan["commands"][:plan["executeStopIndex"]]:
+                name = command["name"]
+                chunks = command["chunks"]
+                index = command["commandIndex"]
+
+                if name == "mglCreateTextTexture":
+                    sendChunks(chunks[:1])
+                    ack = readAck(name)
+                    sendChunks(chunks[1:])
+
+                    creationResult = self.s.read(np.float64)
+                    value = np.asarray(creationResult)
+                    if (value.ndim != 0 or value.dtype.kind not in "iuf"
+                            or not np.isfinite(value) or value < 0):
+                        raise RuntimeError(f"Text creation failed at command {index}.")
+
+                    width = readUInt("text width")
+                    height = readUInt("text height")
+                    replayID = readUInt("text texture ID")
+                    readUInt("texture count")
+                    checkCompletion(self.s.readCommandResults(ack), name)
+
+                    resource = command["resource"]
+                    originalID = int(resource["originalID"])
+                    resourceMetadata = resource.get("metadata") or {}
+
+                    # Font/environment differences can change text geometry.
+                    for field, actual in (("widthPixels", width), ("heightPixels", height)):
+                        expected = resourceMetadata.get(field)
+                        if expected is not None and int(expected) != actual:
+                            raise RuntimeError(
+                                f"Text {field} differs at command {index}: "
+                                f"recorded={expected}, reconstructed={actual}."
+                            )
+                    textureMap[originalID] = replayID
+
+                elif name == "mglBltTexture":
+                    replacement = list(chunks)
+                    originalID = struct.unpack("<I", chunks[7])[0]
+                    replacement[7] = struct.pack("<I", textureMap[originalID])
+
+                    sendChunks(replacement[:1])
+                    ack = readAck(name)
+                    sendChunks(replacement[1:])
+                    checkCompletion(self.s.readCommandResults(ack), name)
+
+                elif name == "mglDeleteTexture":
+                    originalID = struct.unpack("<I", chunks[1])[0]
+                    sendChunks([
+                        chunks[0],
+                        struct.pack("<I", textureMap[originalID]),
+                    ])
+                    checkCompletion(self.s.readCommandResults(), name)
+                    del textureMap[originalID]
+
+                elif name == "mglSetTextRenderingParameters":
+                    sendChunks(chunks[:1])
+                    ack = readAck(name)
+                    sendChunks(chunks[1:])
+                    checkCompletion(self.s.readCommandResults(ack), name)
+
+                else:
+                    # All remaining admitted commands use ordinary completion
+                    # results in the reviewed Python paths.
+                    sendChunks(chunks)
+                    checkCompletion(self.s.readCommandResults(), f"{name} at {index}")
+
+                if name == "mglFlush":
+                    frameInfo = framesByCommand[index]
+                    if frameInfo["frameIndex"] not in selected: continue
+
+                    frame = deepcopy(frameInfo)
+                    frame["image"] = self.frameGrab()
+
+                    if onFrame is None:
+                        result["frames"].append(frame)
+                    else:
+                        onFrame(frame)
+
+                    result["frameCount"] += 1
+                    # Do not retain the callback's image until the next readback.
+                    del frame
+
+        except BaseException as error:
+            primaryError = error
+            raise
+
+        finally:
+            # The renderer is exclusively owned by this operation. Closing it
+            # releases all replay textures, including resources whose recorded
+            # deletion lies beyond the selected prefix. Do not send more
+            # protocol commands after a failed exchange.
+            try:
+                if self.close() is False:
+                    raise RuntimeError("Reconstruction renderer shutdown was not confirmed.")
+
+                # Renderer exit invalidates its target ID. Clear it before
+                # releasing the Python object to avoid destructor deletion.
+                if self.renderTarget is not None:
+                    self.renderTarget.imageNum = None
+                    self.renderTarget = None
+
+            except BaseException as cleanupError:
+                if primaryError is None: raise
+                if hasattr(primaryError, "add_note"):
+                    primaryError.add_note(
+                        f"Secondary renderer cleanup failure: "
+                        f"{type(cleanupError).__name__}: {cleanupError}"
+                    )
+
+        return result
+    
+    ################################################################
+    # Reconstruct drawing frames selected by original experiment time
+    ################################################################
+    def recordingReconstructTime(self, recording, time=None, startTime=None,
+                                 stopTime=None, onFrame=None,
+                                 allowAmbiguous=False,
+                                 maxMemoryBytes=256 * 1024 * 1024):
+        """Reconstruct candidate frames at a time or within [startTime, stopTime).
+
+        Times use the original recording/experiment clock, without offsets.
+
+        By default, detected timing ambiguity raises before opening a renderer.
+        With allowAmbiguous=True, reconstruct all selected candidates without
+        claiming which candidate was physically displayed.
+
+        onFrame receives the same frame dictionaries as recordingReconstruct().
+        The returned selection retains interval/group information, assumptions,
+        and ambiguities alongside the reconstruction result.
+
+        An unambiguous selection is still conditional on reported renderer
+        timing; it is not independent verification of physical visibility.
+        """
+        from .pglRecordingFile import pglRecordingFile
+
+        if not isinstance(allowAmbiguous, bool):
+            raise TypeError("allowAmbiguous must be Boolean.")
+
+        # Selection is offline and happens before any renderer operation.
+        selection = pglRecordingFile.selectFrames(
+            recording,
+            time=time,
+            startTime=startTime,
+            stopTime=stopTime,
+        )
+
+        if selection["ambiguous"] and not allowAmbiguous:
+            reasons = ", ".join(selection["ambiguities"])
+            raise ValueError(
+                f"Time selection is ambiguous: {reasons}. "
+                "Inspect pglRecordingFile.selectFrames() or explicitly set "
+                "allowAmbiguous=True to reconstruct candidate images."
+            )
+
+        reconstruction = self.recordingReconstruct(
+            recording,
+            frameIndices=selection["frameIndices"],
+            onFrame=onFrame,
+            maxMemoryBytes=maxMemoryBytes,
+        )
+
+        return {
+            "selection": selection,
+            "reconstruction": reconstruction,
+        }

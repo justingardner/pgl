@@ -80,41 +80,85 @@ class pglFrameGrab:
 
     def frameGrabEnd(self):
         '''
-        End frame grabbing and return to normal rendering to the screen
+        End frame grabbing and return to rendering to the screen.
+
+        Retain the target reference when reset or deletion is unconfirmed,
+        allowing inspection or retry without an immediate destructor retry.
         '''
-        if self.renderTarget is not None:
-            # reset render target to screen
-            self.setRenderTarget()
-            # delete the render target image
-            self.imageDelete(self.renderTarget)
-            self.renderTarget = None
+        if self.renderTarget is None: return True
+        if not self.isOpen(): return False
+
+        # Reset rendering to the screen before deleting the target.
+        self.setRenderTarget()
+
+        # setRenderTarget() stores its completion result on PGL.
+        results = self.commandResults
+        success = None if results is None else results.get("success")
+        if success is None: return False
+
+        success = np.asarray(success)
+        if success.size != 1 or not bool(np.all(success == 1)): return False
+
+        if not self.imageDelete(self.renderTarget): return False
+
+        # imageDelete() cleared the ID, so destruction cannot delete it twice.
+        self.renderTarget = None
+        return True
 
     def frameGrab(self):
         '''
-        Grab the current frame from the offscreen rendering context.
-        
-        Returns:
-            np.ndarray: The grabbed image as a numpy array of shape (height, width, 4).
+        Read the current offscreen image as a float32 (height, width, 4) array.
+
+        Preserve the existing renderer readback protocol. Read its length
+        field without interpreting it as a byte count.
         '''
         if self.renderTarget is None:
-            print("(pglFrameGrab:frameGrab) Frame grabber is not initialized. Call frameGrabInit() first.")
-            return None
-        
-        self.s.writeCommand("mglFrameGrab")
-        ackTime = self.s.readAck()
+            raise RuntimeError("Call frameGrabInit() before frameGrab().")
+        if not self.isOpen():
+            raise RuntimeError("Cannot grab a frame: renderer is not open.")
+        if self.renderTarget.imageNum is None:
+            raise RuntimeError("Cannot grab a frame: render target was deleted.")
 
-        # read width and height
+        if not self.s.writeCommand("mglFrameGrab"):
+            raise RuntimeError("Could not send frame-grab command.")
+
+        ackTime = self.s.readAck()
+        if ackTime is None:
+            raise RuntimeError("Missing frame-grab acknowledgment.")
+
+        # Read the existing response header.
         imageWidth = self.s.read(np.uint32)
         imageHeight = self.s.read(np.uint32)
-
-        # read the length in bytes
         dataLength = self.s.read(np.uint32)
 
-        # then read that many bytes
-        frame = self.s.read(np.float32, imageHeight, imageWidth, 4)
-        #print(frame)
-        #frame = np.transpose(frame, (2, 1, 0))
+        if any(value is None for value in (imageWidth, imageHeight, dataLength)):
+            raise RuntimeError("Incomplete frame-grab header.")
 
-        results = self.s.readCommandResults(ackTime)
+        imageWidth = int(imageWidth)
+        imageHeight = int(imageHeight)
+        expectedWidth = int(self.renderTarget.width.pix)
+        expectedHeight = int(self.renderTarget.height.pix)
+
+        if (imageWidth, imageHeight) != (expectedWidth, expectedHeight):
+            raise RuntimeError(
+                f"Frame-grab dimensions {imageWidth}x{imageHeight} differ "
+                f"from render target {expectedWidth}x{expectedHeight}."
+            )
+
+        # Preserve the original float32 RGBA read.
+        frame = self.s.read(np.float32, imageHeight, imageWidth, 4)
+        if frame is None:
+            raise RuntimeError("Missing frame-grab pixels.")
+
+        # Restore singleton dimensions removed by _pglComm.read().
+        frame = np.asarray(frame)
+        if frame.dtype != np.dtype(np.float32) or frame.size != imageHeight * imageWidth * 4:
+            raise RuntimeError("Invalid frame-grab pixel array.")
+        frame = frame.reshape(imageHeight, imageWidth, 4)
+
+        self.commandResults = self.s.readCommandResults(ackTime)
+        success = None if self.commandResults is None else self.commandResults.get("success")
+        if success is None or np.size(success) != 1 or not np.all(np.asarray(success) == 1):
+            raise RuntimeError("Frame-grab command did not report success=1.")
 
         return frame
