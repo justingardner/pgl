@@ -1274,6 +1274,33 @@ class pglPostgres(pglTraitSettings):
     # Application connections: local or remote
     # ------------------------------------------------------------
     # ++++++++++++++++++++++++ getSSHAccessConfiguration +++++++++++++++++++++
+    @staticmethod
+    def _splitSSHPathList(value, windows=None):
+        """Split a multi-path value printed by `ssh -G` (e.g. UserKnownHostsFile).
+
+        POSIX shlex rules treat backslashes as escapes, which corrupts Windows
+        paths such as C:\\Users\\name/.ssh/known_hosts into C:Usersname/...
+        On Windows, split without escape processing, strip surrounding quotes,
+        and expand Win32-OpenSSH's __PROGRAMDATA__ placeholder.
+        """
+        import shlex
+
+        windows = (os.name == "nt") if windows is None else windows
+        if not windows:
+            return shlex.split(value)
+
+        items = []
+        for token in shlex.split(value, posix=False):
+            if len(token) >= 2 and token[0] == token[-1] and token[0] in "\"'":
+                token = token[1:-1]
+            if token.startswith("__PROGRAMDATA__"):
+                programData = os.environ.get("PROGRAMDATA")
+                if not programData:
+                    continue
+                token = programData + token[len("__PROGRAMDATA__"):]
+            items.append(token)
+        return items
+
     def getSSHAccessConfiguration(self):
         """Resolve caller-side SSH settings for database payload access.
 
@@ -1476,7 +1503,7 @@ class pglPostgres(pglTraitSettings):
         for settingName in ("userknownhostsfile", "globalknownhostsfile"):
             for value in values.get(settingName, []):
                 # These settings can contain multiple quoted paths.
-                for item in shlex.split(value):
+                for item in self._splitSSHPathList(value):
                     if item.lower() == "none":
                         continue
 
