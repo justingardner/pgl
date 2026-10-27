@@ -1275,6 +1275,24 @@ class pglPostgres(pglTraitSettings):
     # ------------------------------------------------------------
     # ++++++++++++++++++++++++ getSSHAccessConfiguration +++++++++++++++++++++
     @staticmethod
+    def _sshAgentReachable():
+        """Report whether Paramiko can reach an SSH agent from this process.
+
+        POSIX agents are located through SSH_AUTH_SOCK. On Windows, Paramiko
+        ignores SSH_AUTH_SOCK and talks directly to the Windows OpenSSH
+        agent's named pipe (or Pageant), neither of which sets the variable.
+        Agent credentials are never copied; this only enables Paramiko's
+        own agent lookup.
+        """
+        if os.name != "nt":
+            return bool(os.environ.get("SSH_AUTH_SOCK"))
+        try:
+            from paramiko import win_openssh, win_pageant
+            return bool(win_openssh.can_talk_to_agent() or win_pageant.can_talk_to_agent())
+        except Exception:
+            return False
+
+    @staticmethod
     def _splitSSHPathList(value, windows=None):
         """Split a multi-path value printed by `ssh -G` (e.g. UserKnownHostsFile).
 
@@ -1518,7 +1536,7 @@ class pglPostgres(pglTraitSettings):
         # Do not copy agent credentials. Only report whether the caller's
         # current process has an agent available and the SSH policy permits it.
         agentPermitted = identityAgent is None or identityAgent.lower() != "none"
-        agentAvailable = agentPermitted and bool(os.environ.get("SSH_AUTH_SOCK"))
+        agentAvailable = agentPermitted and self._sshAgentReachable()
 
         return {
             "version": 1,
