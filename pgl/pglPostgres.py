@@ -94,10 +94,32 @@ class pglPostgresTransport:
         file.seek(0)
         return file.read().decode("utf-8", errors="replace").strip()
     
+    @staticmethod
+    def _sshControlMasterSupported():
+        """Windows OpenSSH does not support ControlMaster/ControlPath sockets."""
+        return os.name != "nt"
+
+    @staticmethod
+    def _localPortAcceptsConnections(port, timeout=0.5):
+        """Report whether the forwarded local tunnel port is accepting connections."""
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=timeout):
+                return True
+        except OSError:
+            return False
+
     @classmethod
     @contextmanager
     def _ssh(cls, postgres, options):
-        """Open an SSH tunnel whose lifetime matches the database connection."""
+        """Open an SSH tunnel whose lifetime matches the database connection.
+
+        On macOS/Linux, readiness is confirmed through an OpenSSH control
+        socket. Windows OpenSSH lacks control-master support, so there the
+        tunnel runs without one and readiness is confirmed by the forwarded
+        local port accepting connections (OpenSSH binds it only after
+        authentication and forward setup).
+        """
+        useControlMaster = cls._sshControlMasterSupported()
         ssh = shutil.which("ssh")
 
         if ssh is None:
@@ -119,23 +141,23 @@ class pglPostgresTransport:
         with tempfile.TemporaryDirectory(prefix="pgl-ssh-", dir=temporaryRoot) as directory:
             controlPath = str(Path(directory) / "control")
 
-            arguments = [
-                ssh,
-                "-N",
-                "-T",
-                "-M",
-                "-S", controlPath,
+            arguments = [ssh, "-N", "-T"]
+            if useControlMaster:
+                arguments.extend(["-M", "-S", controlPath])
+            arguments.extend([
                 "-p", str(postgres.sshPort),
                 "-L", forwarding,
                 "-o", "BatchMode=yes",
                 "-o", "StrictHostKeyChecking=yes",
                 "-o", "ExitOnForwardFailure=yes",
-                "-o", "ControlPersist=no",
-                "-o", "ForkAfterAuthentication=no",
                 "-o", f"ConnectTimeout={postgres.connectTimeoutSeconds}",
                 "-o", "ServerAliveInterval=15",
                 "-o", "ServerAliveCountMax=3",
-            ]
+            ])
+            if useControlMaster:
+                arguments.extend(["-o", "ControlPersist=no", "-o", "ForkAfterAuthentication=no"])
+            else:
+                arguments.extend(["-o", "ControlMaster=no", "-o", "ControlPath=none"])
 
             if postgres.sshUser:
                 arguments.extend(["-l", postgres.sshUser])
@@ -143,7 +165,8 @@ class pglPostgresTransport:
             arguments.append(postgres.sshHost)
 
             with tempfile.TemporaryFile(mode="w+b") as diagnostic:
-                process = subprocess.Popen(arguments, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=diagnostic)
+                popenOptions = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+                process = subprocess.Popen(arguments, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=diagnostic, **popenOptions)
 
                 try:
                     deadline = time.monotonic() + postgres.connectTimeoutSeconds
@@ -153,7 +176,10 @@ class pglPostgresTransport:
                             detail = cls._sshDiagnostic(diagnostic)
                             raise RuntimeError(f"SSH tunnel failed: {detail or 'SSH exited before the tunnel was ready.'}")
 
-                        if Path(controlPath).exists():
+                        if not useControlMaster:
+                            if cls._localPortAcceptsConnections(localPort):
+                                break
+                        elif Path(controlPath).exists():
                             try:
                                 check = subprocess.run([ssh, "-S", controlPath, "-O", "check", postgres.sshHost], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1, check=False)
                             except subprocess.TimeoutExpired:
@@ -1248,6 +1274,51 @@ class pglPostgres(pglTraitSettings):
     # Application connections: local or remote
     # ------------------------------------------------------------
     # ++++++++++++++++++++++++ getSSHAccessConfiguration +++++++++++++++++++++
+    @staticmethod
+    def _sshAgentReachable():
+        """Report whether Paramiko can reach an SSH agent from this process.
+
+        POSIX agents are located through SSH_AUTH_SOCK. On Windows, Paramiko
+        ignores SSH_AUTH_SOCK and talks directly to the Windows OpenSSH
+        agent's named pipe (or Pageant), neither of which sets the variable.
+        Agent credentials are never copied; this only enables Paramiko's
+        own agent lookup.
+        """
+        if os.name != "nt":
+            return bool(os.environ.get("SSH_AUTH_SOCK"))
+        try:
+            from paramiko import win_openssh, win_pageant
+            return bool(win_openssh.can_talk_to_agent() or win_pageant.can_talk_to_agent())
+        except Exception:
+            return False
+
+    @staticmethod
+    def _splitSSHPathList(value, windows=None):
+        """Split a multi-path value printed by `ssh -G` (e.g. UserKnownHostsFile).
+
+        POSIX shlex rules treat backslashes as escapes, which corrupts Windows
+        paths such as C:\\Users\\name/.ssh/known_hosts into C:Usersname/...
+        On Windows, split without escape processing, strip surrounding quotes,
+        and expand Win32-OpenSSH's __PROGRAMDATA__ placeholder.
+        """
+        import shlex
+
+        windows = (os.name == "nt") if windows is None else windows
+        if not windows:
+            return shlex.split(value)
+
+        items = []
+        for token in shlex.split(value, posix=False):
+            if len(token) >= 2 and token[0] == token[-1] and token[0] in "\"'":
+                token = token[1:-1]
+            if token.startswith("__PROGRAMDATA__"):
+                programData = os.environ.get("PROGRAMDATA")
+                if not programData:
+                    continue
+                token = programData + token[len("__PROGRAMDATA__"):]
+            items.append(token)
+        return items
+
     def getSSHAccessConfiguration(self):
         """Resolve caller-side SSH settings for database payload access.
 
@@ -1450,7 +1521,7 @@ class pglPostgres(pglTraitSettings):
         for settingName in ("userknownhostsfile", "globalknownhostsfile"):
             for value in values.get(settingName, []):
                 # These settings can contain multiple quoted paths.
-                for item in shlex.split(value):
+                for item in self._splitSSHPathList(value):
                     if item.lower() == "none":
                         continue
 
@@ -1465,7 +1536,7 @@ class pglPostgres(pglTraitSettings):
         # Do not copy agent credentials. Only report whether the caller's
         # current process has an agent available and the SSH policy permits it.
         agentPermitted = identityAgent is None or identityAgent.lower() != "none"
-        agentAvailable = agentPermitted and bool(os.environ.get("SSH_AUTH_SOCK"))
+        agentAvailable = agentPermitted and self._sshAgentReachable()
 
         return {
             "version": 1,
