@@ -790,6 +790,9 @@ class pglExperiment(pglExperimentBase):
     ################################################################
     def run(self):
         """Run acquisition, save partial data on failure, and preserve its error."""
+        if getattr(self, "_recordingReleased", False):
+            raise RuntimeError("This experiment's recording was already saved and released. Create a new experiment.")
+
         if not self.state.openScreen:
             self.state.runFinishedWithError = True
             pglMessages.warning("Screen is not open. Call initScreen() before running the experiment.")
@@ -1603,9 +1606,11 @@ class pglExperiment(pglExperimentBase):
     def save(self, includeEyeTracker=True):
         """Save available run contents, continuing after component failures.
 
-        Repeated calls reuse this run's directory. Recording buffers are retained
-        for retry. The bundle is not atomic, although recording.h5 is published
-        through its own temporary-file replacement.
+        Repeated calls reuse this run's directory. Experiment recording buffers
+        are automatically released after HDF5 and its JSON reference are saved.
+
+        The bundle is not atomic, although recording.h5 is published through
+        its own temporary-file replacement.
         """
         errors = []
         dataPath = getattr(self, "_runSavePath", None)
@@ -1708,9 +1713,13 @@ class pglExperiment(pglExperimentBase):
         self._attemptRunAction("save PGL state", lambda: self.pgl.saveStrict(dataPath / "pgl.json"), errors)
 
         # HDF5 failure must not prevent the other experiment files above.
-        # A successful reference is published only by _saveExperimentRecording().
+        # Repeated saves after release reuse the existing recording artifact.
         if getattr(self, "_recordingId", None) is not None:
-            saved = self._attemptRunAction("save experiment recording", lambda: self._saveExperimentRecording(dataPath), errors)
+            saved = self._attemptRunAction(
+                "save experiment recording",
+                lambda: self._saveExperimentRecording(dataPath),
+                errors,
+            )
             if not saved:
                 reference = dict(getattr(self.data, "recording", {}))
                 reference["recordingId"] = self._recordingId
@@ -1727,10 +1736,32 @@ class pglExperiment(pglExperimentBase):
             saved = self._attemptRunAction("save eye tracker", saveEyeTracker, errors)
             self.data.eyeTrackerSaveStatus = "complete" if saved else "failed"
 
-        # Persist recording reference and findings from independent saves.
+        # Persist the recording reference before releasing its only RAM copy.
         self.data.saveStatus = "failed" if errors else "complete"
-        if not self._attemptRunAction("save final save status", lambda: self.data.saveStrict(dataPath / "data.json"), errors):
+        referenceSaved = self._attemptRunAction(
+            "save final save status",
+            lambda: self.data.saveStrict(dataPath / "data.json"),
+            errors,
+        )
+        if not referenceSaved:
             self.data.saveStatus = "failed"
+
+        reference = getattr(self.data, "recording", {})
+        if (referenceSaved and getattr(self, "_recordingId", None) is not None
+                and reference.get("saveStatus") == "complete"):
+            if not self._attemptRunAction(
+                "release saved experiment recording",
+                self._releaseExperimentRecording,
+                errors,
+            ):
+                # Buffer-release failure is separate from artifact success:
+                # do not relabel the successfully written HDF5 as failed.
+                self.data.saveStatus = "failed"
+                self._attemptRunAction(
+                    "save recording release failure",
+                    lambda: self.data.saveStrict(dataPath / "data.json"),
+                    errors,
+                )
 
         if errors: raise errors[0]
         return dataPath
@@ -1923,9 +1954,14 @@ class pglExperiment(pglExperimentBase):
     # Verify recording ownership without exporting the buffers
     ################################################################
     def _getExperimentRecording(self):
-        """Return owned session metadata, or None for a legacy unrecorded run."""
+        """Return owned live metadata, or None after automatic release.
+
+        A released experiment must never access a later experiment's buffers.
+        Its saved artifact is handled separately by _saveExperimentRecording().
+        """
         recordingId = getattr(self, "_recordingId", None)
         if recordingId is None: return None
+        if getattr(self, "_recordingReleased", False): return None
 
         metadata = getattr(self.pgl, "_recordingMetadata", None)
         if not isinstance(metadata, dict) or metadata.get("recordingId") != recordingId:
@@ -1938,16 +1974,51 @@ class pglExperiment(pglExperimentBase):
             raise RuntimeError("This experiment's recording session is unavailable.")
 
         return metadata
-
+    
     ################################################################
     # Save the owned recording into the run directory
     ################################################################
     def _saveExperimentRecording(self, dataPath):
-        """Save a stopped session and publish its reference only after success."""
+        """Save owned capture or reuse its already-published artifact.
+
+        Buffers are released separately, only after data.json successfully
+        persists the recording reference.
+        """
+        import h5py
         from .pglRecordingFile import pglRecordingFile
 
+        filename = (Path(dataPath) / "recording.h5").resolve()
+
+        if getattr(self, "_recordingReleased", False):
+            # Do not inspect, save, or clear the current PGL recording here:
+            # it may now belong to another experiment.
+            savedPath = getattr(self, "_recordingSavedPath", None)
+            reference = getattr(self, "_recordingSavedReference", None)
+
+            if savedPath is None or filename != Path(savedPath):
+                raise RuntimeError("Released recording cannot be saved to a different run directory.")
+            if not isinstance(reference, dict) or reference.get("recordingId") != self._recordingId:
+                raise RuntimeError("Released recording has no valid saved reference.")
+            if not filename.is_file():
+                raise FileNotFoundError(f"Saved recording is missing: {filename}")
+
+            # Read only the small root metadata, not the recording arrays.
+            with h5py.File(filename, "r") as file:
+                if file.attrs.get("formatName") != pglRecordingFile.formatName:
+                    raise RuntimeError("Saved recording artifact has an unexpected format.")
+                if file.attrs.get("formatVersion") != reference["formatVersion"]:
+                    raise RuntimeError("Saved recording artifact has an unexpected version.")
+                metadata = pglRecordingFile._readMetadata(file)
+
+            if (metadata.get("recordingId") != self._recordingId
+                    or metadata.get("experiment", {}).get("experimentUUID") != self.uuid):
+                raise RuntimeError("Saved recording artifact does not belong to this experiment.")
+
+            self.data.recording = dict(reference)
+            return filename
+
         metadata = self._getExperimentRecording()
-        if metadata is None: return
+        if metadata is None: return None
 
         if self.pgl._recordingState != "stopped":
             raise RuntimeError("Stop acquisition before saving the experiment recording.")
@@ -1958,16 +2029,47 @@ class pglExperiment(pglExperimentBase):
         metadata["experimentStartTime"] = self.data.startTime
         metadata["experimentEndTime"] = self.data.endTime
 
-        self.pgl.recordingSave(Path(dataPath) / "recording.h5")
+        self.pgl.recordingSave(filename)
 
         # Small reference only: recording buffers never enter experiment JSON.
-        self.data.recording = {
+        reference = {
             "recordingId": metadata["recordingId"],
             "filename": "recording.h5",
             "formatVersion": pglRecordingFile.formatVersion,
             "saveStatus": "complete",
         }
+        self.data.recording = dict(reference)
+
+        # Retain only publication bookkeeping, not a copy of captured data.
+        self._recordingSavedPath = filename
+        self._recordingSavedReference = dict(reference)
+        return filename
         
+    ################################################################
+    # release experiment recording
+    ################################################################
+    def _releaseExperimentRecording(self):
+        """Release this experiment's saved buffers after reference publication.
+
+        Called by save() only after data.json was successfully written.
+        Never release an active, replaced, or foreign recording.
+        """
+        if getattr(self, "_recordingId", None) is None: return
+        if getattr(self, "_recordingReleased", False): return
+
+        reference = getattr(self.data, "recording", {})
+        if (reference.get("recordingId") != self._recordingId
+                or reference.get("saveStatus") != "complete"):
+            raise RuntimeError("Cannot release a recording without a successful saved reference.")
+
+        metadata = self._getExperimentRecording()
+        if metadata is None or self.pgl._recordingState != "stopped":
+            raise RuntimeError("Cannot release an unavailable or active experiment recording.")
+        if self.pgl.commandRecording or self.pgl.flushRecording:
+            raise RuntimeError("Cannot release recording while low-level capture is active.")
+
+        self.pgl.recordingClear()
+        self._recordingReleased = True
 
 ##############################################
 # Settings for pglTask
