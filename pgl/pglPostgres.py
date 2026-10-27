@@ -94,10 +94,32 @@ class pglPostgresTransport:
         file.seek(0)
         return file.read().decode("utf-8", errors="replace").strip()
     
+    @staticmethod
+    def _sshControlMasterSupported():
+        """Windows OpenSSH does not support ControlMaster/ControlPath sockets."""
+        return os.name != "nt"
+
+    @staticmethod
+    def _localPortAcceptsConnections(port, timeout=0.5):
+        """Report whether the forwarded local tunnel port is accepting connections."""
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=timeout):
+                return True
+        except OSError:
+            return False
+
     @classmethod
     @contextmanager
     def _ssh(cls, postgres, options):
-        """Open an SSH tunnel whose lifetime matches the database connection."""
+        """Open an SSH tunnel whose lifetime matches the database connection.
+
+        On macOS/Linux, readiness is confirmed through an OpenSSH control
+        socket. Windows OpenSSH lacks control-master support, so there the
+        tunnel runs without one and readiness is confirmed by the forwarded
+        local port accepting connections (OpenSSH binds it only after
+        authentication and forward setup).
+        """
+        useControlMaster = cls._sshControlMasterSupported()
         ssh = shutil.which("ssh")
 
         if ssh is None:
@@ -119,23 +141,23 @@ class pglPostgresTransport:
         with tempfile.TemporaryDirectory(prefix="pgl-ssh-", dir=temporaryRoot) as directory:
             controlPath = str(Path(directory) / "control")
 
-            arguments = [
-                ssh,
-                "-N",
-                "-T",
-                "-M",
-                "-S", controlPath,
+            arguments = [ssh, "-N", "-T"]
+            if useControlMaster:
+                arguments.extend(["-M", "-S", controlPath])
+            arguments.extend([
                 "-p", str(postgres.sshPort),
                 "-L", forwarding,
                 "-o", "BatchMode=yes",
                 "-o", "StrictHostKeyChecking=yes",
                 "-o", "ExitOnForwardFailure=yes",
-                "-o", "ControlPersist=no",
-                "-o", "ForkAfterAuthentication=no",
                 "-o", f"ConnectTimeout={postgres.connectTimeoutSeconds}",
                 "-o", "ServerAliveInterval=15",
                 "-o", "ServerAliveCountMax=3",
-            ]
+            ])
+            if useControlMaster:
+                arguments.extend(["-o", "ControlPersist=no", "-o", "ForkAfterAuthentication=no"])
+            else:
+                arguments.extend(["-o", "ControlMaster=no", "-o", "ControlPath=none"])
 
             if postgres.sshUser:
                 arguments.extend(["-l", postgres.sshUser])
@@ -143,7 +165,8 @@ class pglPostgresTransport:
             arguments.append(postgres.sshHost)
 
             with tempfile.TemporaryFile(mode="w+b") as diagnostic:
-                process = subprocess.Popen(arguments, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=diagnostic)
+                popenOptions = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+                process = subprocess.Popen(arguments, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=diagnostic, **popenOptions)
 
                 try:
                     deadline = time.monotonic() + postgres.connectTimeoutSeconds
@@ -153,7 +176,10 @@ class pglPostgresTransport:
                             detail = cls._sshDiagnostic(diagnostic)
                             raise RuntimeError(f"SSH tunnel failed: {detail or 'SSH exited before the tunnel was ready.'}")
 
-                        if Path(controlPath).exists():
+                        if not useControlMaster:
+                            if cls._localPortAcceptsConnections(localPort):
+                                break
+                        elif Path(controlPath).exists():
                             try:
                                 check = subprocess.run([ssh, "-S", controlPath, "-O", "check", postgres.sshHost], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1, check=False)
                             except subprocess.TimeoutExpired:
