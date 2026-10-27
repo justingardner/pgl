@@ -101,46 +101,76 @@ class pglEyelink(pglEyeTracker):
 
     @staticmethod
     def eyelinkIsAvailable(eyelinkAddress="100.1.1.1", timeout=3.0):
-        """Return True if the EyeLink Host PC responds on its control port."""
+        """Conservatively check host reachability without calling PyLink.
 
-        import threading        
-        result = {'available': False, 'tracker': None}
-        
-        def tryConnect():
-            try:
-                tracker = pylink.EyeLink(eyelinkAddress)
-                result['available'] = True
-                result['tracker'] = tracker
-            except Exception:
-                result['available'] = False
-        
-        thread = threading.Thread(target=tryConnect)
-        thread.daemon = True
-        thread.start()
-        thread.join(timeout)
-        
-        if thread.is_alive():
-            # Timeout occurred - connection attempt still hanging
+        Despite the historical method name, True means only that the
+        configured IPv4 address answered a ping. It does not verify an
+        EyeLink service or guarantee that subsequent SDK calls are safe.
+
+        False prevents the constructor from entering the SDK. Hosts that
+        block ICMP will therefore be skipped even if their SDK service works.
+
+        Uses a bounded subprocess, not a background Python thread.
+        """
+        import ipaddress
+        import math
+        import shutil
+        import subprocess
+        import sys
+
+        # Accept a numeric IPv4 address only: no DNS lookup, shell command,
+        # SDK dummy mode, or user-supplied ping arguments.
+        try:
+            if not isinstance(eyelinkAddress, str): return False
+            address = str(ipaddress.IPv4Address(eyelinkAddress))
+            if isinstance(timeout, (bool, np.bool_)): return False
+            timeout = float(timeout)
+            if not math.isfinite(timeout) or timeout <= 0: return False
+        except (TypeError, ValueError):
             return False
-        
-        # Clean up if connection succeeded
-        if result['tracker'] is not None:
-            try:
-                result['tracker'].close()
-            except Exception:
-                pass
-        
-        return result['available']
-    def __del__(self):
-        """Destructor to clean up resources."""
-        if self.eyelink is not None:
-            if self.eyelink.isConnected():
-                pglMessages.message("(pglEyelink) Closing connection to Eyelink.")
-                try:
-                    self.eyelink.close()
-                except Exception as e:
-                    pglMessages.warning(f"(pglEyelink) Error closing Eyelink: {e}")
 
+        # These ping arguments are supported on macOS and Linux.
+        # Fail closed on platforms not covered by this implementation.
+        if sys.platform != "darwin" and not sys.platform.startswith("linux"):
+            return False
+
+        pingPath = shutil.which("ping")
+        if pingPath is None and sys.platform == "darwin":
+            pingPath = shutil.which("/sbin/ping")
+        if pingPath is None: return False
+
+        try:
+            result = subprocess.run(
+                [pingPath, "-n", "-c", "1", address],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=timeout,
+                check=False,
+            )
+            return result.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            # subprocess.run kills and waits for its child on timeout.
+            # No SDK connection attempt or background thread survives.
+            return False
+
+    def __del__(self):
+        """Best-effort cleanup, including partially initialized objects.
+
+        Python exception handling does not protect against native SDK crashes.
+        An object skipped by the reachability gate has no tracker to call.
+        """
+        tracker = getattr(self, "eyelink", None)
+        if tracker is None: return
+
+        try:
+            if tracker.isConnected():
+                pglMessages.message("(pglEyelink) Closing connection to Eyelink.")
+                tracker.close()
+        except Exception:
+            # Never propagate ordinary errors from a destructor, especially
+            # during interpreter shutdown.
+            pass
 
     def start(self, filename="PGL00000"):
         """Start eye tracking.
