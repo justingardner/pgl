@@ -673,7 +673,7 @@ class pglExperiment(pglExperimentBase):
                 self.state.openScreen = False
 
             raise
-
+        
     def setGamma(self, settings, display):
         '''
         set the gamma table based on settings

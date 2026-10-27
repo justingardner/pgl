@@ -36,64 +36,88 @@ class pglImage:
 
     def imageCreate(self, imageData):
         '''
-            Creates a new image from the provided image data.
+        Creates a new image from the provided image data.
 
-            Args:
-                imageData: The image data to create the image from. Can be HxW grayscale,
-                 HxWx3 RGB, or HxWx4 RGBA data.
+        Args:
+            imageData: The image data to create the image from. Can be HxW
+                grayscale, HxWx3 RGB, or HxWx4 RGBA data.
 
-            Returns:
-                An instance of pglImageInstance or None if the image could not be created.
-                The pglImageInstance can be displayed by calling imageDisplay(). This is used
-                if you want to display an image multiple times and want to save the overhead
-                of creating the image each type. If you want to just display once, you can
-                just call imageDisplay().
+        Returns:
+            An instance of pglImageInstance or None if the image could not
+            be created. Use imageDisplay() or the instance's display()
+            method to display it repeatedly without uploading it again.
 
-            Example:
-                pgl.open()
-                imageData = np.random.rand(480, 640, 3)
-                imageInstance = pgl.imageCreate(imageData)
-                if imageInstance is not None:
-                    pgl.imageDisplay(imageInstance)
+        During command recording, the outgoing command already retains
+        the uploaded pixels. Record the returned texture ID separately
+        so later reconstruction can map resource identities without
+        duplicating pixel data.
 
+        Example:
+            pgl.open()
+            imageData = np.random.rand(480, 640, 3)
+            imageInstance = pgl.imageCreate(imageData)
+            if imageInstance is not None:
+                pgl.imageDisplay(imageInstance)
         '''
-     
-        # check dimensions of imageData
-        (tf, imageData) = self.imageValidate(imageData)
+        # Check dimensions and convert to supported RGBA image data.
+        tf, imageData = self.imageValidate(imageData)
         if not tf: return None
-    
-        # get image width and height
+
+        # Get image width and height.
         imageWidth = imageData.shape[1]
         imageHeight = imageData.shape[0]
 
-        # flatten and convert to float32
+        # Flatten and convert to float32.
         imageData = imageData.astype(np.float32).flatten()
 
-        # send the createTexture command
-        self.s.writeCommand("mglCreateTexture")
+        # Send the createTexture command and capture its recorded index.
+        if not self.s.writeCommand("mglCreateTexture"): return None
+        commandIndex = self.commandRecordIndex() if self.commandRecording else -1
         ackTime = self.s.readAck()
 
-        # send the image width, height and data
+        # Send the image width, height and data. Command capture retains
+        # the packed bytes through the existing socket write hooks.
         self.s.write(np.uint32(imageWidth))
         self.s.write(np.uint32(imageHeight))
-        if self.verbose>1: print(f"(pglImage:imageCreate) Creating image {imageWidth}x{imageHeight}")
+        if self.verbose > 1:
+            print(f"(pglImage:imageCreate) Creating image {imageWidth}x{imageHeight}")
         self.s.write(imageData)
 
-        # read the imageNum
+        # Read the existing texture-specific result.
         result = self.s.read(np.float64)
-        if (result < 0): 
+        if result is None:
+            pglMessages.warning("Did not receive image creation result.")
+            return None
+        if result < 0:
             print("(pglImage:imageCreate) Error creating image")
             return None
-    
-        # create an imageInstance with all the info
+
+        # Preserve the returned identity before reading the texture count
+        # or ordinary completion results. This records receipt of an ID,
+        # not proof that command completion succeeded.
         imageNum = self.s.read(np.uint32)
+        if imageNum is not None and commandIndex != -1:
+            self.commandRecordResource(
+                commandIndex,
+                "texture",
+                imageNum,
+                source="uploadedPixels",
+                widthPixels=int(imageWidth),
+                heightPixels=int(imageHeight),
+            )
+
         nImages = self.s.read(np.uint32)
-        if self.verbose>1: print(f"(pglImage:imageCreate) Created image {imageNum} ({nImages} total images)")
+        if self.verbose > 1:
+            print(f"(pglImage:imageCreate) Created image {imageNum} ({nImages} total images)")
         self.s.readCommandResults(ackTime)
 
-        # create an instance of pglImageInstance
-        imageInstance = pglImageInstance(imageNum, imageWidth, imageHeight, self)
-        return imageInstance
+        # Do not construct an image reference without a returned texture ID.
+        if imageNum is None:
+            pglMessages.warning("Did not receive image texture ID.")
+            return None
+
+        # Create an instance of pglImageInstance.
+        return pglImageInstance(imageNum, imageWidth, imageHeight, self)
     
     def imageDisplay(self, imageInstance, x=None, y=None, width=None, height=None, xAlign=0, yAlign=0):
         '''

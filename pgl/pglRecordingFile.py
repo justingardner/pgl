@@ -105,6 +105,521 @@ class pglRecordingFile:
                 raise ValueError("Presentation association exceeds the command recording.")
 
     ################################################################
+    # Analyze a recording without replaying or modifying it
+    ################################################################
+    @classmethod
+    def analyze(cls, recording, byteOrder="little"):
+        """Return offline findings about captured commands and timing.
+
+        This is diagnostic analysis, not proof of replay completeness.
+        Movies are analyzed as source references and timing, not replayed.
+
+        byteOrder describes the computer that packed the command payloads.
+        Current Mac captures use little-endian encoding; older recordings
+        do not explicitly store the capture computer's byte order.
+        """
+        if not isinstance(recording, dict): raise TypeError("recording must be a dictionary.")
+        if byteOrder not in ("little", "big"): raise ValueError("byteOrder must be 'little' or 'big'.")
+
+        commands = recording.get("commands")
+        presentations = recording.get("presentations")
+        if commands is not None or presentations is not None:
+            cls.validate(commands, presentations)
+
+        findings = {}
+
+        def add(code, severity, message, location=None):
+            # Aggregate repeated findings; avoid storing thousands of indices
+            # in metadata for a long recording. Counts remain complete.
+            if code not in findings:
+                findings[code] = {
+                    "code": code,
+                    "severity": severity,
+                    "message": message,
+                    "count": 0,
+                    "examples": [],
+                }
+            finding = findings[code]
+            finding["count"] += 1
+            if location is not None and len(finding["examples"]) < 10:
+                finding["examples"].append(location)
+
+        def usableTime(value):
+            # This is a necessary timing check, not proof of presentation.
+            if value is None: return False
+            array = np.asarray(value)
+            return bool(array.ndim == 0 and array.dtype.kind in "iuf"
+                        and np.isfinite(array) and array > 0)
+
+        commandInfo = cls._analyzeCommands(commands, byteOrder, add)
+
+        if presentations is None:
+            add("flushTimingNotRecorded", "info", "No explicit flush timing section is available.")
+        else:
+            associated = set()
+            for index in range(presentations["count"]):
+                location = {"section": "presentations", "index": index}
+                commandIndex = int(presentations["commandIndices"][index])
+                presented = presentations["drawablePresented"][index]
+                success = presentations["success"][index]
+
+                if not usableTime(presented):
+                    add("flushPresentationTimeUnusable", "warning",
+                        "Flush presentation time is missing, nonfinite, or nonpositive.", location)
+
+                if not np.isfinite(success):
+                    add("flushSuccessMissing", "warning", "Flush success result is missing or nonfinite.", location)
+                elif success != 1:
+                    add("flushNotSuccessful", "warning", "Flush result does not report success=1.", location)
+
+                if commandIndex == -1:
+                    add("flushWithoutCommandLink", "info",
+                        "Flush timing has no recorded command association; this is allowed.", location)
+                else:
+                    if commandIndex in associated:
+                        add("duplicateFlushCommandLink", "warning",
+                            "Multiple presentation rows reference the same command.", location)
+                    associated.add(commandIndex)
+
+                    name = commandInfo["names"][commandIndex]
+                    if name is not None and name != "mglFlush":
+                        add("flushLinkedToNonFlush", "warning",
+                            "A presentation row references a command other than mglFlush.", location)
+
+                    # Compare raw numeric codes even if the command name is unknown.
+                    code = presentations["commandCode"][index]
+                    if np.isfinite(code) and code != commands["commandValues"][commandIndex]:
+                        add("flushCommandCodeMismatch", "warning",
+                            "The returned command code differs from the associated recorded command.", location)
+
+            for commandIndex in commandInfo["flushIndices"]:
+                if commandIndex not in associated:
+                    add("flushWithoutTimingRow", "info",
+                        "A recorded flush has no timing row; capture may have been disabled or interrupted.",
+                        {"section": "commands", "index": commandIndex})
+
+        cls._analyzeMovies(recording, commandInfo, usableTime, add)
+
+        orderedFindings = [findings[code] for code in sorted(findings)]
+        warningTypes = sum(finding["severity"] == "warning" for finding in orderedFindings)
+        infoTypes = sum(finding["severity"] == "info" for finding in orderedFindings)
+
+        return {
+            "analysisVersion": 1,
+            "replayCompleteness": "notEstablished",
+            "assumptions": {
+                "commandByteOrder": byteOrder,
+                "hostClockBasis": "assumedSameAsGetSecs",
+                "drawingReplaySetup": "matchingVisualAngleExtent",
+                "movieAnalysis": "sourceReferencesAndTimingOnly",
+            },
+            "coverage": {
+                "commandCount": 0 if commands is None else int(commands["count"]),
+                "presentationCount": 0 if presentations is None else int(presentations["count"]),
+                "reviewedCommandNames": sorted(commandInfo["reviewedNames"]),
+                "unverifiedCommandNames": sorted(commandInfo["unverifiedNames"]),
+            },
+            "limitations": [
+                "No findings does not establish replay completeness.",
+                "Recorded command bytes describe attempted sends, not confirmed delivery or execution.",
+                "Missing timing does not identify a communication failure or prove a dropped physical refresh.",
+                "Positive presentation times are timing evidence, not independently verified visibility.",
+                "Initial nonstandard renderer state and changes during capture gaps are not reconstructed.",
+                "Movie source updates are not automatically treated as displayed-frame changes.",
+                "External movie filenames are not resolved or checked for availability.",
+                "Payload byte order is supplied to analysis, not verified from capture metadata.",
+            ],
+            "summary": f"{warningTypes} warning categories; {infoTypes} informational categories. Replay completeness not established.",
+            "findings": orderedFindings,
+        }
+
+    ################################################################
+    # Analyze reviewed atomic commands and resource lifetimes
+    ################################################################
+    @classmethod
+    def _analyzeCommands(cls, commands, byteOrder, add):
+        """Inspect known payload layouts without sending commands.
+
+        Resource tracking describes recorded requests and returned IDs.
+        Deletion success is not retained, so deletion requests end the
+        analyzer's usable mapping conservatively.
+        """
+        info = {
+            "names": [],
+            "flushIndices": [],
+            "reviewedNames": set(),
+            "unverifiedNames": set(),
+        }
+        if commands is None:
+            add("commandsNotRecorded", "info",
+                "No command section is available; drawing reconstruction is outside this recording's coverage.")
+            return info
+
+        import struct
+
+        prefix = "<" if byteOrder == "little" else ">"
+        count = int(commands["count"])
+        metadata = commands.get("metadata") or {}
+        mapping = metadata.get("commandValues") or {}
+        namesByValue = {}
+        for name, value in mapping.items():
+            namesByValue.setdefault(int(value), []).append(name)
+
+        def commandName(value):
+            names = namesByValue.get(int(value), [])
+            return names[0] if len(names) == 1 else None
+
+        info["names"] = [commandName(value) for value in commands["commandValues"]]
+
+        def uint(chunk):
+            if len(chunk) != 4: raise ValueError("Expected a uint32 chunk.")
+            return struct.unpack(prefix + "I", chunk)[0]
+
+        def string(chunk):
+            if len(chunk) < 4: raise ValueError("Missing string length.")
+            length = uint(chunk[:4])
+            if len(chunk) != 4 + 2 * length: raise ValueError("Incorrect UTF-16 string length.")
+            # _pglComm writes string content as UTF-16LE, independently
+            # of the native numeric prefix encoding.
+            return chunk[4:].decode("utf-16le")
+
+        def sizes(chunks, expected):
+            if len(chunks) != len(expected) or any(len(chunk) != size for chunk, size in zip(chunks, expected)):
+                raise ValueError("Unexpected payload chunk lengths.")
+
+        # Segment boundaries constrain resource certainty. Treat each resumed
+        # segment conservatively, even if its command indices are adjacent.
+        segments = commands.get("segments") or []
+        boundaries = set()
+        previousStop = 0
+        segmentsValid = bool(segments)
+        for segmentIndex, segment in enumerate(segments):
+            start = segment.get("commandStartIndex")
+            stop = segment.get("commandStopIndex")
+            valid = (
+                isinstance(start, (int, np.integer)) and not isinstance(start, (bool, np.bool_))
+                and isinstance(stop, (int, np.integer)) and not isinstance(stop, (bool, np.bool_))
+                and 0 <= start <= stop <= count and start == previousStop
+            )
+            if not valid:
+                segmentsValid = False
+                break
+            if segmentIndex > 0:
+                boundaries.add(int(start))
+                add("commandCaptureGap", "warning",
+                    "Capture resumed in another segment; intervening stimulus history and resource state are unknown.",
+                    {"section": "segments", "index": segmentIndex})
+            previousStop = int(stop)
+
+        if previousStop != count: segmentsValid = False
+        if not segmentsValid:
+            add("commandSegmentsUnverified", "warning",
+                "Segment ranges are absent or incomplete; resource continuity cannot be established.")
+
+        resourcesByCommand = {}
+        for resourceIndex, resource in enumerate(commands.get("resources") or []):
+            index = resource.get("commandIndex")
+            if (not isinstance(index, (int, np.integer)) or isinstance(index, (bool, np.bool_))
+                    or not 0 <= index < count):
+                add("invalidResourceCommandLink", "warning",
+                    "A resource record has an invalid creation-command index.",
+                    {"section": "resources", "index": resourceIndex})
+                continue
+            resourcesByCommand.setdefault(int(index), []).append(resource)
+
+        basicNames = {
+            "mglFlush", "mglSetClearColor", "mglSetXform",
+            "mglDots", "mglLine", "mglQuad", "mglArcs",
+        }
+        movieNames = {
+            "mglMovieCreate", "mglMoviePlay", "mglMovieDrawFrame",
+            "mglMovieSetDisplayPosition", "mglMovieStatus", "mglMovieDelete",
+        }
+        reviewed = basicNames | movieNames | {
+            "mglSetTextRenderingParameters", "mglCreateTextTexture",
+            "mglCreateTexture", "mglBltTexture", "mglDeleteTexture",
+        }
+        specialized = {
+            "mglCreateTextTexture", "mglCreateTexture", "mglMovieCreate",
+            "mglMoviePlay", "mglMovieDrawFrame", "mglMovieStatus", "mglMovieDelete",
+        }
+        activeResources = {}
+
+        for index, value in enumerate(commands["commandValues"]):
+            name = info["names"][index]
+            location = {"section": "commands", "index": index, "command": name}
+            if index in boundaries: activeResources.clear()
+            if not segmentsValid: activeResources.clear()
+
+            if not np.isfinite(commands["commandTimes"][index]):
+                add("commandLoggingTimeMissing", "warning",
+                    "A client command logging timestamp is nonfinite.", location)
+
+            if name == "mglFlush": info["flushIndices"].append(index)
+
+            if name not in reviewed:
+                label = name if name is not None else f"code:{int(value)}"
+                info["unverifiedNames"].add(label)
+                add("commandProtocolUnverified", "warning",
+                    "A command's payload, responses, and state effects have not been reviewed.", location)
+                # An unknown operation could alter resource state.
+                activeResources.clear()
+                continue
+
+            info["reviewedNames"].add(name)
+            if name in specialized:
+                add("specializedResponseHandling", "info",
+                    "This command returns command-specific data in addition to ordinary completion results.", location)
+
+            chunks = commands["commandData"][index]
+            creationType = None
+            source = None
+            filename = None
+            useType = None
+            resourceID = None
+            delete = False
+
+            try:
+                if not chunks or len(chunks[0]) != 2:
+                    raise ValueError("Missing command-code chunk.")
+                if struct.unpack(prefix + "H", chunks[0])[0] != int(value):
+                    raise ValueError("Command-code chunk mismatch.")
+                payload = chunks[1:]
+
+                if name == "mglFlush":
+                    sizes(payload, [])
+                elif name == "mglSetClearColor":
+                    sizes(payload, [12])
+                elif name == "mglSetXform":
+                    sizes(payload, [64])
+                elif name in ("mglDots", "mglLine", "mglQuad", "mglArcs"):
+                    if len(payload) != 2: raise ValueError("Expected count and vertex data.")
+                    columns = {"mglDots": 11, "mglLine": 6, "mglQuad": 6, "mglArcs": 14}[name]
+                    sizes(payload, [4, uint(payload[0]) * columns * 4])
+                elif name == "mglSetTextRenderingParameters":
+                    if len(payload) != 11: raise ValueError("Incomplete text settings.")
+                    string(payload[0])
+                    sizes(payload[1:], [4] * 10)
+                elif name == "mglCreateTextTexture":
+                    if len(payload) != 1: raise ValueError("Expected text string.")
+                    string(payload[0])
+                    creationType, source = "texture", "serverText"
+                elif name == "mglCreateTexture":
+                    if len(payload) != 3: raise ValueError("Expected image dimensions and pixels.")
+                    width, height = uint(payload[0]), uint(payload[1])
+                    sizes(payload, [4, 4, width * height * 4 * 4])
+                    creationType, source = "texture", "uploadedPixels"
+                elif name == "mglBltTexture":
+                    if len(payload) != 7: raise ValueError("Incomplete texture draw.")
+                    sizes(payload, [4, 4, 4, 4, uint(payload[3]) * 5 * 4, 4, 4])
+                    useType, resourceID = "texture", uint(payload[6])
+                elif name == "mglDeleteTexture":
+                    sizes(payload, [4])
+                    useType, resourceID, delete = "texture", uint(payload[0]), True
+                elif name == "mglMovieCreate":
+                    if len(payload) != 1: raise ValueError("Expected movie filename.")
+                    filename = string(payload[0])
+                    creationType, source = "movie", "externalMovie"
+                    add("externalMovieReference", "info",
+                        "Movie content is referenced by filename, not embedded or checked for availability.",
+                        {**location, "filename": filename})
+                elif name == "mglMovieSetDisplayPosition":
+                    if len(payload) != 3: raise ValueError("Incomplete movie placement.")
+                    sizes(payload, [4, 4, uint(payload[1]) * 5 * 4])
+                    useType, resourceID = "movie", uint(payload[0])
+                elif name in movieNames:
+                    sizes(payload, [4])
+                    useType, resourceID = "movie", uint(payload[0])
+                    delete = name == "mglMovieDelete"
+
+            except (ValueError, UnicodeError, struct.error) as error:
+                add("commandPayloadIncomplete", "warning",
+                    "A reviewed command has a missing, malformed, or unexpected payload.",
+                    {**location, "detail": str(error)})
+                activeResources.clear()
+                continue
+
+            if useType is not None:
+                key = (useType, resourceID)
+                if key not in activeResources:
+                    add("resourceCreationUnresolved", "warning",
+                        "A referenced ID has no established creation mapping in the reviewed continuous sequence; "
+                        "it may predate capture, lack a returned-ID record, or follow a gap/deletion/unverified command.",
+                        {**location, "resourceType": useType, "originalID": resourceID})
+                if delete: activeResources.pop(key, None)
+
+            records = resourcesByCommand.get(index, [])
+            if creationType is None:
+                if records:
+                    add("resourceOnNonCreationCommand", "warning",
+                        "Resource metadata is attached to a reviewed non-creation command.", location)
+                continue
+
+            matching = [
+                record for record in records
+                if record.get("resourceType") == creationType
+                and isinstance(record.get("originalID"), (int, np.integer))
+                and not isinstance(record.get("originalID"), (bool, np.bool_))
+                and 0 <= record["originalID"] <= 0xFFFFFFFF
+            ]
+            if len(records) != 1 or len(matching) != 1:
+                add("creationIdMissingOrAmbiguous", "warning",
+                    "A creation command does not have exactly one valid returned-resource ID record.", location)
+                continue
+
+            record = matching[0]
+            resourceMetadata = record.get("metadata") or {}
+            if resourceMetadata.get("source") != source:
+                add("resourceSourceMismatch", "warning",
+                    "Resource source metadata differs from the creation-command type.", location)
+            if creationType == "movie" and resourceMetadata.get("filename") != filename:
+                add("movieFilenameMismatch", "warning",
+                    "The resource filename differs from the filename sent in the creation command.", location)
+
+            key = (creationType, int(record["originalID"]))
+            if key in activeResources:
+                add("resourceIdReusedWithoutDeletion", "warning",
+                    "A creation returns an ID that already has a live recorded mapping.", location)
+            activeResources[key] = index
+
+        return info
+
+    ################################################################
+    # Analyze movie source references and timing, not movie replay
+    ################################################################
+    @classmethod
+    def _analyzeMovies(cls, recording, commandInfo, usableTime, add):
+        """Check retained movie timing without forward-filling source frames."""
+        def sourceReference(metadata, location):
+            filename = metadata.get("filename")
+            if not isinstance(filename, str) or not filename:
+                add("movieFilenameMissing", "warning", "Movie source filename is absent or empty.", location)
+            else:
+                add("externalMovieReference", "info",
+                    "Movie content is referenced by filename, not embedded or checked for availability.",
+                    {**location, "filename": filename})
+
+        def sourceTime(value, location):
+            if value is None:
+                add("movieSourceTimeInvalid", "warning", "Movie source time is missing or invalid.", location)
+                return False
+            array = np.asarray(value)
+            valid = bool(array.ndim == 0 and array.dtype.kind in "iuf"
+                         and np.isfinite(array) and (array == -1 or array >= 0))
+            if not valid:
+                add("movieSourceTimeInvalid", "warning", "Movie source time is missing or invalid.", location)
+                return False
+            return bool(array >= 0)
+
+        linkedPlaybacks = set()
+        for index, playback in enumerate(recording.get("moviePlaybacks") or []):
+            location = {"section": "moviePlaybacks", "index": index}
+            metadata = playback.get("metadata") or {}
+            sourceReference(metadata, location)
+            commandIndex = metadata.get("commandIndex", -1)
+
+            if commandIndex != -1:
+                validLink = (
+                    isinstance(commandIndex, (int, np.integer))
+                    and not isinstance(commandIndex, (bool, np.bool_))
+                    and 0 <= commandIndex < len(commandInfo["names"])
+                    and commandInfo["names"][commandIndex] == "mglMoviePlay"
+                )
+                if not validLink:
+                    add("moviePlaybackCommandLinkInvalid", "warning",
+                        "Playback metadata does not reference a reviewed mglMoviePlay command.", location)
+                else:
+                    linkedPlaybacks.add(int(commandIndex))
+
+            arrays = {}
+            for name in cls.playbackArrayNames:
+                array = playback.get(name)
+                if not isinstance(array, np.ndarray) or array.ndim != 1 or array.dtype.kind not in "iuf":
+                    add("moviePlaybackArrayMissing", "warning",
+                        "A movie playback timing array is absent or structurally invalid.",
+                        {**location, "field": name})
+                    arrays[name] = None
+                else:
+                    arrays[name] = array
+
+            lengths = [len(array) for array in arrays.values() if array is not None]
+            if len(set(lengths)) > 1:
+                add("moviePlaybackLengthsDiffer", "warning",
+                    "Movie playback timing arrays have different lengths; they were not repaired.", location)
+            if lengths and all(length == 0 for length in lengths):
+                add("moviePlaybackEmpty", "info", "Movie playback contains no timing samples.", location)
+
+            presented = arrays["presentedTimes"]
+            if presented is not None:
+                for sampleIndex, time in enumerate(presented):
+                    if not usableTime(time):
+                        add("moviePresentationTimeUnusable", "warning",
+                            "Movie presentation time is missing, nonfinite, or nonpositive.",
+                            {**location, "sampleIndex": sampleIndex})
+
+            movieTimes = arrays["movieTimes"]
+            if movieTimes is not None:
+                for sampleIndex, time in enumerate(movieTimes):
+                    sampleLocation = {**location, "sampleIndex": sampleIndex}
+                    update = sourceTime(time, sampleLocation)
+                    if update and (presented is None or sampleIndex >= len(presented)
+                                   or not usableTime(presented[sampleIndex])):
+                        add("movieUpdateWithoutPresentationTime", "warning",
+                            "A new source-frame time lacks usable associated presentation timing; "
+                            "do not automatically advance displayed content.", sampleLocation)
+
+        for index, name in enumerate(commandInfo["names"]):
+            if name == "mglMoviePlay" and index not in linkedPlaybacks:
+                add("moviePlayWithoutTimingRecord", "warning",
+                    "A captured movie-play command has no linked retained playback record.",
+                    {"section": "commands", "index": index})
+
+        draws = recording.get("movieDraws") or {}
+        sources = draws.get("sources") or []
+        for index, source in enumerate(sources):
+            sourceReference(source, {"section": "movieDrawSources", "index": index})
+
+        groupCount = draws.get("flushGroupCount", 0)
+        for index, sample in enumerate(draws.get("samples") or []):
+            location = {"section": "movieDraws", "index": index}
+            sourceIndex = sample.get("sourceIndex")
+            if (not isinstance(sourceIndex, (int, np.integer))
+                    or isinstance(sourceIndex, (bool, np.bool_))
+                    or not 0 <= sourceIndex < len(sources)):
+                add("movieDrawSourceInvalid", "warning", "Movie draw source index is invalid.", location)
+
+            status = sample.get("flushStatus")
+            group = sample.get("flushGroupIndex")
+            validGroup = (
+                isinstance(group, (int, np.integer)) and not isinstance(group, (bool, np.bool_))
+                and 0 <= group < groupCount
+            )
+            if not validGroup or status != "resultsReceived":
+                add("movieDrawFlushUnresolved", "warning",
+                    "Movie draw has no completed, valid flush association.", location)
+
+            timingRecorded = bool(sample.get("flushTimingRecorded", False))
+            presented = sample.get("drawablePresented")
+            if not timingRecorded:
+                add("movieDrawTimingNotRecorded", "info",
+                    "Movie draw has no retained flush presentation timing.", location)
+            elif not usableTime(presented):
+                add("moviePresentationTimeUnusable", "warning",
+                    "Movie presentation time is missing, nonfinite, or nonpositive.", location)
+
+            success = sample.get("flushSuccess")
+            if timingRecorded and (success is None or not np.isfinite(success) or success != 1):
+                add("movieDrawFlushSuccessUnconfirmed", "warning",
+                    "The associated flush does not have a retained success=1 result.", location)
+
+            update = sourceTime(sample.get("movieTime"), location)
+            if update and not (validGroup and status == "resultsReceived"
+                               and timingRecorded and usableTime(presented)):
+                add("movieUpdateWithoutPresentationTime", "warning",
+                    "A new source-frame time lacks usable associated presentation timing; "
+                    "do not automatically advance displayed content.", location)
+
+    ################################################################
     # Metadata encoding
     ################################################################
     @staticmethod

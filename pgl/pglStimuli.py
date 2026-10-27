@@ -1251,54 +1251,82 @@ class pglStimulusMovie(_pglStimulus):
         Args:
             pgl: reference to pgl
             filename: name of movie file
-            positionParams - you can set any parameter that setDisplayPosition takes (x, y, displayWidth, displayHeight, xAlign, yAlign)
-                but, be aware that this will block until dimensions are read from the movie file.
-                see setDisplayPosition for more info
+            positionParams - you can set any parameter that setDisplayPosition takes
+                (x, y, displayWidth, displayHeight, xAlign, yAlign).
+                Be aware that this will block until dimensions are read from
+                the movie file. See setDisplayPosition for more info.
+
+        During command recording, associate the returned movie ID with its
+        creation command and the filename exactly as supplied. The filename
+        is an external reference; movie contents are not embedded or copied.
         '''
         super().__init__(pgl)
         self.pgl = pgl
         self.filename = filename
         self.movieNum = None
-        
-        # make sure that a screen is open
-        if self.pgl.isOpen() is False: 
-            pglMessages.warning(f"No screen is open")
+
+        # Make sure that a screen is open.
+        if self.pgl.isOpen() is False:
+            pglMessages.warning("No screen is open")
             return
-        
-        # send movie create command
-        self.pgl.s.writeCommand("mglMovieCreate")
+
+        # Send movie creation command and retain its recorded command index.
+        if not self.pgl.s.writeCommand("mglMovieCreate"): return
+        commandIndex = self.pgl.commandRecordIndex() if self.pgl.commandRecording else -1
         ackTime = self.pgl.s.readAck()
         self.pgl.s.write(filename)
-        
-        # get result
+
+        # Get the existing creation result.
         result = self.pgl.s.read(np.float64)
-        if (result < 0): 
-            pglMessages.warning(f"Error creating movie {filename}: {self.movieError.get(int(result),"Unrecogonized Error")}")
-            if int(result)== -2:
-                pglMessages.warning(f"Permission errors can be caused by sandboxing of mglMetal.app. Consider unsandboxing using: \ncodesign --force --deep --sign - {pgl.metalAppName}",wrapText=False)
+        if result is None:
+            pglMessages.warning(f"Did not receive movie creation result for {filename}")
+            return
+
+        if result < 0:
+            errorMessage = self.movieError.get(int(result), "Unrecognized Error")
+            pglMessages.warning(f"Error creating movie {filename}: {errorMessage}")
+            if int(result) == -2:
+                pglMessages.warning(
+                    "Permission errors can be caused by sandboxing of mglMetal.app. "
+                    "Consider unsandboxing using:\n"
+                    f"codesign --force --deep --sign - {pgl.metalAppName}",
+                    wrapText=False,
+                )
             self.commandResults = self.pgl.s.readCommandResults(ackTime)
             return
-        
-        # initialize preferredTransform
+
+        # Initialize preferredTransform.
         self.preferredTransform = videoTransform()
-        
-        # If details are ready for the movie, read them
+
+        # If details are ready for the movie, read them.
         self.dimensionsReady = threading.Event()
-        if result>1.0:
-            # read details of movie
+        if result > 1.0:
             self.readDimensions()
-            
-        # Read the movie number
+
+        # Read the movie number.
         self.movieNum = self.pgl.s.read(np.uint32)
-        nMovies = self.pgl.s.read(np.uint32)      
-        if self.pgl.verbose>0:  
+
+        # Preserve the returned identity as soon as it is available, before
+        # reading the movie count or ordinary completion results. Filename is
+        # retained exactly as supplied, without resolving, hashing, or embedding.
+        if self.movieNum is not None and commandIndex != -1:
+            self.pgl.commandRecordResource(
+                commandIndex,
+                "movie",
+                self.movieNum,
+                source="externalMovie",
+                filename=self.filename,
+            )
+
+        nMovies = self.pgl.s.read(np.uint32)
+        if self.pgl.verbose > 0:
             print(f"(pglStimulusMovie:init) Created movie {self.movieNum} ({nMovies} total movies)")
-        
-        # get command results
+
+        # Get command results.
         self.commandResults = self.pgl.s.readCommandResults(ackTime)
-        
-        # do positionParams if given, this can block as setDisplayPosition
-        # will keep calling status until dimensions are read
+
+        # Apply positionParams if given. This can block because
+        # setDisplayPosition keeps calling status until dimensions are read.
         if positionParams:
             self.setDisplayPosition(**positionParams)
             

@@ -696,12 +696,14 @@ class pglCommandReplayer:
     # Finalize and save the current recording session
     ################################################################
     def recordingSave(self, filename, outcome="completed"):
-        """Stop capture and save the session, retaining all buffers for retry.
+        """Stop capture, analyze, and save while retaining buffers for retry.
 
         A previously stopped session keeps its original outcome and stop time.
+        Analysis is diagnostic: failure must not prevent raw recording saving.
         Saving does not establish that every command is supported by replay.
         """
         from .pglRecordingFile import pglRecordingFile
+        from .pglMessages import pglMessages
 
         state = getattr(self, "_recordingState", None)
         if state not in ("active", "stopped"):
@@ -715,7 +717,61 @@ class pglCommandReplayer:
 
         if state == "active": self.recordingStop(outcome=outcome)
 
-        # Export and write outside presentation. No buffers are cleared on
-        # success or failure; recordingClear() remains an explicit operation.
+        # Export outside presentation. Exported metadata is independent of
+        # the live session; analysis does not modify the captured buffers.
         data = self.recordingData()
-        return pglRecordingFile.save(filename, **data)
+        warningMessage = None
+
+        try:
+            report = dict(pglRecordingFile.analyze(data))
+            report["status"] = "completed"
+
+            # Check report serialization inside the analysis failure boundary.
+            # An unserializable report must not block saving the raw capture.
+            pglRecordingFile._encodeMetadata({"analysis": report}, ())
+
+            warningFindings = [
+                finding for finding in report["findings"]
+                if finding["severity"] == "warning"
+            ]
+            if warningFindings:
+                details = "; ".join(
+                    f"{finding['code']}={finding['count']}"
+                    for finding in warningFindings[:5]
+                )
+                if len(warningFindings) > 5:
+                    details += f"; {len(warningFindings) - 5} additional categories"
+                warningMessage = f"Recording analysis: {details}. See metadata['analysis'] for details."
+
+        except Exception as error:
+            # Preserve a small, serializable diagnostic instead of allowing
+            # optional analysis to prevent essential raw recording storage.
+            report = {
+                "status": "failed",
+                "replayCompleteness": "notEstablished",
+                "error": {
+                    "module": type(error).__module__,
+                    "type": type(error).__name__,
+                    "message": str(error),
+                },
+            }
+            warningMessage = (
+                f"Recording analysis failed ({type(error).__name__}: {error}). "
+                "Raw recording was saved with analysis failure metadata."
+            )
+
+        data["metadata"]["analysis"] = report
+
+        # HDF5 failures still propagate normally. Buffers remain available
+        # for retry, and no successful publication is reported prematurely.
+        savedFilename = pglRecordingFile.save(filename, **data)
+
+        # Diagnostic output must not turn a successful publication into a
+        # reported save failure, including when warning handling is customized.
+        if warningMessage:
+            try:
+                pglMessages.warning(warningMessage)
+            except Exception:
+                pass
+
+        return savedFilename
