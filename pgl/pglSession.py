@@ -2386,7 +2386,8 @@ class pglSession(pglActionable):
     runs = List(Instance(pglRun), allow_none=True, help="List of behavioral runs")
     mne = Instance(pglMNE, allow_none=True, help="MEG/EEG data")
     dataMatrices = Dict(default_value={}, help="Named scientific matrices owned by this working session; persisted explicitly through session checkpoint integration", serialize=False)
-
+    derivedFiles = Dict(default_value={}, help="Named derived file attachments; persisted explicitly through session checkpoint integration", serialize=False)
+    
     # Explicit labels apply only when there are no behavioral runs.
     # Checkpoint persistence will handle these explicitly rather than relying
     # on generic session serialization.
@@ -2658,6 +2659,113 @@ class pglSession(pglActionable):
 
         return figures
 
+    ################################################################
+    # Identify a completed local derived file
+    ################################################################
+    @staticmethod
+    def _derivedFileIdentity(filename):
+        """Hash a regular local file without loading its contents into RAM.
+
+        Leaf symlinks are rejected. Callers must keep registered files
+        unchanged and available until checkpoint publication completes.
+
+        This is an integrity check, not protection against concurrent writers.
+        """
+        import hashlib
+        import os
+        import stat
+        from pathlib import Path
+
+        path = Path(filename).expanduser().absolute()
+        if path.is_symlink(): raise ValueError(f"Derived file must not be a symlink: {path}")
+
+        digest = hashlib.sha256()
+        size = 0
+
+        with path.open("rb") as source:
+            if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                raise ValueError(f"Derived file must be a regular file: {path}")
+
+            while True:
+                block = source.read(1024 * 1024)
+                if not block: break
+                digest.update(block)
+                size += len(block)
+
+        return {"sha256": digest.hexdigest(), "size_bytes": size}
+
+    ################################################################
+    # Register a completed derived file
+    ################################################################
+    def addDerivedFile(self, name, filename, *, runIndex=None, mediaType="application/octet-stream", overwrite=False):
+        """Attach a completed local file without copying or uploading it.
+
+        name is a session-wide logical attachment name, not a filesystem path.
+        runIndex optionally associates the attachment with a behavioral run.
+
+        Actions should generate files in the managed local cache and register
+        them only after generation and cleanup have succeeded.
+
+        Existing attachments are preserved on validation failure.
+        Action settings belong to action history, not this attachment record.
+
+        Returns the registered local Path.
+        """
+        from pathlib import Path
+
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("Derived file name must be a nonblank string.")
+        if any(character in name for character in ("\x00", "\n", "\r")):
+            raise ValueError("Derived file name must not contain NUL or newline characters.")
+        if type(overwrite) is not bool: raise TypeError("overwrite must be Boolean.")
+
+        if runIndex is not None:
+            if type(runIndex) is not int: raise TypeError("runIndex must be an integer or None.")
+            if not 0 <= runIndex < len(self.runs or []): raise ValueError("runIndex is outside this session's runs.")
+
+        if not isinstance(mediaType, str) or not mediaType.strip():
+            raise ValueError("mediaType must be a nonblank string.")
+        if any(character in mediaType for character in ("\x00", "\n", "\r")):
+            raise ValueError("mediaType must not contain NUL or newline characters.")
+
+        if name in self.derivedFiles and not overwrite:
+            raise ValueError(f"Derived file {name!r} is already attached; use overwrite=True to replace it.")
+
+        path = Path(filename).expanduser().absolute()
+        identity = self._derivedFileIdentity(path)
+
+        # Local paths are runtime access information, not portable database
+        # references. Checkpoint integration will serialize a separate record.
+        attachment = {
+            "version": 1,
+            "runIndex": runIndex,
+            "filename": path.name,
+            "mediaType": mediaType,
+            **identity,
+            "localPath": str(path),
+        }
+
+        # Replace the dictionary so trait observers can see the attachment.
+        # Register only after all validation and hashing have succeeded.
+        self.derivedFiles = {**self.derivedFiles, name: attachment}
+        return path
+
+    ################################################################
+    # Resolve a registered derived file
+    ################################################################
+    def getDerivedFile(self, name, *, cacheDirectory=None):
+        """Return a verified local Path, or None for an unknown attachment.
+
+        Delegates local verification and deferred checkpoint retrieval to
+        pglDatabase. Never generates missing derived content.
+
+        cacheDirectory optionally overrides the restored local cache location.
+        Missing or corrupt registered payloads raise.
+        """
+        from .pglDatabase import pglDatabase
+
+        return pglDatabase.getSessionDerivedFile(self, name, cacheDirectory=cacheDirectory)
+    
     # +++++++++++++++++++++++++++ loadSession +++++++++++++++++++++++++++++++
     @classmethod
     def loadSession(cls, sessionID, *, settings=None, settingsName=None, storageOptionsByBackend=None, sslRootCert=None, includeDeleted=False, cacheDirectory=None, directLocalPolicy="materialize"):

@@ -704,7 +704,15 @@ class pglRecordingFile:
     ################################################################
     @classmethod
     def _writeCommands(cls, group, commands):
-        """Preserve command/chunk boundaries without concatenating all bytes."""
+        """Preserve command/chunk boundaries with lossless payload compression.
+
+        Compression runs during saving, not acquisition. A bounded staging
+        buffer fills HDF5 storage chunks sequentially without concatenating
+        all command bytes into another large object.
+
+        HDF5 storage chunks are independent of the original socket payload
+        chunks, whose boundaries remain preserved by the offset arrays.
+        """
         for name in cls.commandArrayNames: group.create_dataset(name, data=commands[name])
 
         # Preserve None separately from an empty list or an empty bytes chunk.
@@ -722,15 +730,55 @@ class pglRecordingFile:
         group.create_dataset("commandChunkOffsets", data=commandOffsets)
         group.create_dataset("chunkByteOffsets", data=np.asarray(chunkOffsets, dtype=np.uint64))
         group.create_dataset("payloadPresent", data=payloadPresent)
-        payloadBytes = group.create_dataset("payloadBytes", shape=(chunkOffsets[-1],), dtype=np.uint8)
 
-        # Avoid building one additional giant bytes object.
+        totalBytes = chunkOffsets[-1]
+
+        # Empty recordings need no compressed storage. Their original payload
+        # presence and chunk boundaries are still retained in the arrays above.
+        if totalBytes == 0:
+            group.create_dataset("payloadBytes", shape=(0,), dtype=np.uint8)
+            return
+
+        bufferBytes = min(256 * 1024, totalBytes)
+        payloadBytes = group.create_dataset(
+            "payloadBytes",
+            shape=(totalBytes,),
+            dtype=np.uint8,
+            chunks=(bufferBytes,),
+            compression="gzip",
+            compression_opts=1,
+        )
+
+        # Avoid building one additional giant bytes object. Write each HDF5
+        # storage chunk once, including a possible shorter final chunk.
+        buffer = np.empty(bufferBytes, dtype=np.uint8)
+        bufferedBytes = 0
         byteIndex = 0
+
         for chunks in payloads:
             if chunks is None: continue
             for chunk in chunks:
-                if chunk: payloadBytes[byteIndex:byteIndex + len(chunk)] = np.frombuffer(chunk, dtype=np.uint8)
-                byteIndex += len(chunk)
+                if not chunk: continue
+                source = np.frombuffer(chunk, dtype=np.uint8)
+                sourceIndex = 0
+
+                while sourceIndex < len(source):
+                    copyBytes = min(bufferBytes - bufferedBytes, len(source) - sourceIndex)
+                    buffer[bufferedBytes:bufferedBytes + copyBytes] = source[sourceIndex:sourceIndex + copyBytes]
+                    bufferedBytes += copyBytes
+                    sourceIndex += copyBytes
+
+                    if bufferedBytes == bufferBytes:
+                        payloadBytes[byteIndex:byteIndex + bufferedBytes] = buffer
+                        byteIndex += bufferedBytes
+                        bufferedBytes = 0
+
+        if bufferedBytes:
+            payloadBytes[byteIndex:byteIndex + bufferedBytes] = buffer[:bufferedBytes]
+            byteIndex += bufferedBytes
+
+        if byteIndex != totalBytes:
+            raise RuntimeError("Packed payload byte count changed during saving.")
 
     ################################################################
     # Validate packed payload offsets
@@ -1374,5 +1422,191 @@ class pglRecordingFile:
                 "The final interval is bounded by capture stop, not image disappearance.",
                 "Pre-capture content is unknown.",
                 "No command timestamps replace missing presentation times.",
+            ],
+        }
+        
+    ################################################################
+    # Select source images for a regularly sampled recording movie
+    ################################################################
+    @staticmethod
+    def _recordingMovieTimingPlan(frames, fps=None, sampling="nearest", allowAmbiguous=False, progress=None):
+        """Plan movie sampling from reconstruction-plan frame records.
+
+        fps=None infers the rate from the median positive interval between
+        usable presentation timestamps. Near-integer rates are snapped within
+        0.01 Hz; other rates are rounded to three decimal places.
+
+        sampling:
+            nearest: Closest presentation timestamp; earlier wins midpoint ties.
+            previous: Latest presentation at or before the output sample.
+
+        Default sampling bounds:
+            [first usable timestamp, last usable timestamp)
+
+        With explicit allowAmbiguous=True:
+            Untimed/unsuccessful images are excluded from timestamp selection.
+            Duplicate timestamps select the last flush in command order.
+
+        Excluding an image from selection does not mean its drawing commands
+        can be skipped during reconstruction.
+
+        This helper performs no renderer or filesystem work and does not
+        modify source frames. The caller owns and finishes the progress bar.
+        """
+        import numpy as np
+
+        if sampling not in ("nearest", "previous"):
+            raise ValueError("sampling must be 'nearest' or 'previous'.")
+        if not isinstance(allowAmbiguous, bool): raise TypeError("allowAmbiguous must be Boolean.")
+
+        if fps is not None:
+            if isinstance(fps, (bool, np.bool_)) or not isinstance(fps, (int, float, np.integer, np.floating)):
+                raise TypeError("fps must be a positive finite number or None.")
+            if not np.isfinite(fps) or fps <= 0: raise ValueError("fps must be positive and finite.")
+
+        if progress is not None: progress(0, "Inspecting presentation timing")
+
+        usableTimes = []
+        usableFrameIndices = []
+        excludedFrames = []
+        previousFrameIndex = -1
+
+        for frame in frames:
+            frameIndex = int(frame["frameIndex"])
+            if frameIndex <= previousFrameIndex:
+                raise ValueError("Frames must have strictly increasing frame indices.")
+            previousFrameIndex = frameIndex
+
+            timing = frame.get("timing")
+            reasons = []
+
+            if frame.get("presentationIndex") is None or timing is None:
+                reasons.append("missingPresentationLink")
+            else:
+                timestamp = timing.get("drawablePresented")
+                if timestamp is None or not np.isfinite(timestamp) or timestamp <= 0:
+                    reasons.append("unusablePresentationTime")
+                if timing.get("success") != 1: reasons.append("unsuccessfulFlush")
+
+            if reasons:
+                excludedFrames.append({"frameIndex": frameIndex, "reasons": reasons})
+                continue
+
+            usableTimes.append(float(timestamp))
+            usableFrameIndices.append(frameIndex)
+
+        times = np.asarray(usableTimes, dtype=np.float64)
+        frameIndices = np.asarray(usableFrameIndices, dtype=np.int64)
+        if len(times) < 2: raise ValueError("At least two usable presentations are required.")
+
+        # Preserve command order. Sorting would hide backward timestamps.
+        intervals = np.diff(times)
+        if np.any(intervals < 0): raise ValueError("Usable presentation timestamps move backward.")
+
+        # Duplicate timestamps do not contribute a zero interval to the median.
+        positiveIntervals = intervals[intervals > 0]
+        if not len(positiveIntervals): raise ValueError("At least two distinct usable timestamps are required.")
+
+        medianInterval = float(np.median(positiveIntervals))
+        inferredFps = 1.0 / medianInterval
+
+        if fps is None:
+            nearestInteger = round(inferredFps)
+            if nearestInteger > 0 and abs(inferredFps - nearestInteger) <= 0.01:
+                chosenFps = float(nearestInteger)
+            else:
+                chosenFps = float(round(inferredFps, 3))
+        else:
+            chosenFps = float(fps)
+
+        if not np.isfinite(chosenFps) or chosenFps <= 0:
+            raise ValueError("Could not infer a usable rate; specify fps explicitly.")
+
+        # Group equal timestamps in recorded order.
+        groupStarts = np.r_[0, np.flatnonzero(intervals > 0) + 1]
+        groupStops = np.r_[groupStarts[1:], len(times)]
+        duplicateGroups = []
+
+        for start, stop in zip(groupStarts, groupStops):
+            if stop - start <= 1: continue
+            duplicateGroups.append({
+                "timestamp": float(times[start]),
+                "frameIndices": frameIndices[start:stop].tolist(),
+                "chosenFrameIndex": int(frameIndices[stop - 1]),
+            })
+
+        ambiguous = bool(excludedFrames or duplicateGroups)
+        if ambiguous and not allowAmbiguous:
+            raise ValueError(
+                f"Movie timing is ambiguous: {len(excludedFrames)} excluded frames and "
+                f"{len(duplicateGroups)} duplicate timestamp groups. "
+                "Use allowAmbiguous=True to accept the documented preview policies."
+            )
+
+        if progress is not None: progress(0.5, "Selecting movie images")
+
+        # Last flush wins only as an explicitly accepted preview convention.
+        candidateTimes = times[groupStops - 1]
+        candidateFrameIndices = frameIndices[groupStops - 1]
+        startTime = float(candidateTimes[0])
+        stopTime = float(candidateTimes[-1])
+        span = stopTime - startTime
+
+        # Use offsets and division rather than accumulating time increments.
+        candidateOffsets = candidateTimes - startTime
+        outputCount = int(np.ceil(span * chosenFps))
+        outputOffsets = np.arange(outputCount, dtype=np.float64) / chosenFps
+        outputOffsets = outputOffsets[outputOffsets < span]
+        if not len(outputOffsets): raise ValueError("No output samples fall within the timing interval.")
+
+        if sampling == "previous":
+            positions = np.searchsorted(candidateOffsets, outputOffsets, side="right") - 1
+            positions = np.clip(positions, 0, len(candidateOffsets) - 1)
+        else:
+            right = np.searchsorted(candidateOffsets, outputOffsets, side="left")
+            right = np.clip(right, 0, len(candidateOffsets) - 1)
+            left = np.maximum(right - 1, 0)
+
+            leftDistance = np.abs(outputOffsets - candidateOffsets[left])
+            rightDistance = np.abs(candidateOffsets[right] - outputOffsets)
+
+            # Resolve differences below host-timestamp numerical precision
+            # as midpoint ties. This is not a display-timing tolerance.
+            tieTolerance = float(max(abs(np.spacing(startTime)), abs(np.spacing(stopTime))))
+            positions = np.where(leftDistance <= rightDistance + tieTolerance, left, right)
+
+        sourceFrameIndices = candidateFrameIndices[positions]
+
+        if progress is not None: progress(1, "Movie timing planned")
+
+        return {
+            "fps": chosenFps,
+            "fpsWasInferred": fps is None,
+            "rawInferredFps": inferredFps,
+            "medianPositiveIntervalSeconds": medianInterval,
+            "sampling": sampling,
+            "startTime": startTime,
+            "stopTime": stopTime,
+            "bounds": "[startTime, stopTime)",
+            "recordedSpanSeconds": span,
+            "outputFrameCount": len(outputOffsets),
+            "outputDurationSeconds": len(outputOffsets) / chosenFps,
+            "outputTimeOffsets": outputOffsets,
+            "sourceFrameIndices": sourceFrameIndices,
+            "selectedFrameIndices": np.unique(sourceFrameIndices).tolist(),
+            "ambiguous": ambiguous,
+            "excludedFrames": excludedFrames,
+            "duplicateGroups": duplicateGroups,
+            "untimedPolicy": "excludeFromTimestampSelection",
+            "duplicatePolicy": "lastFlushInCommandOrder",
+            "tiePolicy": "earlierTimestamp",
+            "physicalVisibilityVerified": False,
+            "limitations": [
+                "Reported timestamps are not independent verification of physical visibility.",
+                "Untimed images may have been visible but receive no invented timestamp.",
+                "Duplicate timestamps do not establish a unique physically displayed image.",
+                "Nearest sampling can select an image before its reported presentation.",
+                "No final-image persistence is inferred beyond the last usable timestamp.",
+                "Encoded duration is quantized to whole output frames.",
             ],
         }

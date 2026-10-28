@@ -790,9 +790,9 @@ class pglCommandReplayer:
         Earlier commands remain in the plan even when only later frames are
         requested. Selection controls image readback, not state reconstruction.
 
-        This first implementation supports basic drawing and server-generated
-        text. Movies, uploaded image creation, capture gaps, and unreviewed
-        commands are rejected before renderer execution.
+        This first implementation supports basic drawing, including arcs, and
+        server-generated text. Movies, uploaded image creation, capture gaps,
+        and unreviewed commands are rejected before renderer execution.
 
         Payload decoding assumes the current little-endian capture platform.
         """
@@ -831,6 +831,7 @@ class pglCommandReplayer:
             "mglQuad",
             "mglLine",
             "mglDots",
+            "mglArcs",
             "mglFlush",
             "mglSetTextRenderingParameters",
             "mglCreateTextTexture",
@@ -841,6 +842,9 @@ class pglCommandReplayer:
         # Reuse reviewed payload and resource-lifetime checks. Timing findings
         # do not block pixel reconstruction, but malformed/unresolved command
         # state does. This helper performs no renderer or filesystem work.
+        #
+        # Arc payload validation is already handled by _analyzeCommands:
+        # one uint32 count followed by 14 float32 values per arc.
         commandFindings = []
 
         def collectFinding(code, severity, message, location=None):
@@ -1214,7 +1218,10 @@ class pglCommandReplayer:
                     checkCompletion(self.s.readCommandResults(), name)
                     del textureMap[originalID]
 
-                elif name == "mglSetTextRenderingParameters":
+                elif name in ("mglSetTextRenderingParameters", "mglArcs"):
+                    # Match the original acknowledgment-before-payload sequence.
+                    # Arc payloads contain the count and packed vertex data;
+                    # replay those validated bytes without conversion.
                     sendChunks(chunks[:1])
                     ack = readAck(name)
                     sendChunks(chunks[1:])
@@ -1325,3 +1332,559 @@ class pglCommandReplayer:
             "selection": selection,
             "reconstruction": reconstruction,
         }
+        
+    ################################################################
+    # Reconstruct selected recorded drawing frames
+    ################################################################
+    def recordingReconstruct(self, recording, frameIndices=None, onFrame=None,
+                             maxMemoryBytes=256 * 1024 * 1024, progress=None):
+        """Reconstruct drawing frames using a temporary renderer connection.
+
+        frameIndices selects recorded flushes, not presentation-log rows.
+        Earlier commands and unselected flushes still execute to establish
+        renderer state. Only selected frames are read back.
+
+        With onFrame=None, return frames in result["frames"], subject to
+        maxMemoryBytes. Otherwise call onFrame(frame) synchronously and do
+        not retain images internally. Callback exceptions stop reconstruction.
+
+        The callback receives:
+            image: float32 (height, width, 4), unchanged orientation
+            frameIndex: index among recorded flush commands
+            commandIndex: original recorded command index
+            presentationIndex: linked timing row, or None
+            timing: raw recorded flush results, or None
+
+        progress is an optional pglProgress-compatible callable or section.
+        Its owner is responsible for finish() and close(). Progress advances
+        during command replay, including commands without selected readback.
+
+        This method owns the renderer it opens and closes it afterward.
+        It does not change or clear the source recording. Initial setup uses
+        matching visual-angle extent, not arbitrary pre-capture renderer state.
+        """
+        import struct
+        import sys
+        from copy import deepcopy
+
+        if sys.byteorder != "little":
+            raise RuntimeError("Drawing reconstruction currently requires a little-endian platform.")
+        if onFrame is not None and not callable(onFrame):
+            raise TypeError("onFrame must be callable or None.")
+        if progress is not None and not callable(progress):
+            raise TypeError("progress must be callable or None.")
+        if (isinstance(maxMemoryBytes, (bool, np.bool_))
+                or not isinstance(maxMemoryBytes, (int, np.integer))
+                or maxMemoryBytes <= 0):
+            raise ValueError("maxMemoryBytes must be a positive integer.")
+
+        if self.isOpen(): raise RuntimeError("Close the current renderer before reconstruction.")
+        if self.renderTarget is not None:
+            raise RuntimeError("An old render-target reference remains; resolve it before reconstruction.")
+        if getattr(self, "_recordingState", None) == "active":
+            raise RuntimeError("Stop capture before reconstruction.")
+        if self.commandRecording or self.flushRecording:
+            raise RuntimeError("Stop command and flush capture before reconstruction.")
+        if getattr(self, "_batchState", 0) != 0 or getattr(self, "_profileMode", 0) != 0:
+            raise RuntimeError("Disable batching and profiling before reconstruction.")
+
+        # Complete offline command/resource validation before renderer work.
+        if progress is not None: progress(0, "Validating reconstruction")
+        plan = self._recordingReconstructionPlan(recording, frameIndices)
+        selected = set(plan["selectedFrameIndices"])
+        setup = plan["setup"]
+        bytesPerFrame = setup["widthPixels"] * setup["heightPixels"] * 4 * 4
+        estimatedImageBytes = len(selected) * bytesPerFrame
+
+        if onFrame is None and estimatedImageBytes > maxMemoryBytes:
+            raise ValueError(
+                f"Selected images require approximately {estimatedImageBytes / 1024**2:.1f} MiB. "
+                "Use onFrame to stream images, select fewer frames, or explicitly increase maxMemoryBytes."
+            )
+
+        # Establish the recorded clear color without adding an unrecorded
+        # full-screen quad. Reject invalid metadata before opening the renderer.
+        clearColor = setup["clearScreenColor"]
+        if clearColor is None:
+            raise ValueError("Initial clearScreenColor is required for this reconstruction version.")
+        clearColor = np.asarray(clearColor, dtype=np.float32)
+        if clearColor.shape != (3,) or not np.all(np.isfinite(clearColor)):
+            raise ValueError("Initial clearScreenColor must contain three finite RGB values.")
+
+        result = {
+            "recordingId": plan["recordingId"],
+            "selectedFrameIndices": list(plan["selectedFrameIndices"]),
+            "frameCount": 0,
+            "frames": [] if onFrame is None else None,
+            "estimatedImageBytes": estimatedImageBytes,
+            "initialStateBasis": plan["initialStateBasis"],
+            "timingBasis": "originalRecordedFlushResults",
+        }
+        if not selected:
+            if progress is not None: progress(1, "No frames selected")
+            return result
+
+        def checkCompletion(results, label):
+            success = None if results is None else results.get("success")
+            if success is None or np.size(success) != 1 or not np.all(np.asarray(success) == 1):
+                raise RuntimeError(f"{label} did not report success=1.")
+
+        def sendChunks(chunks):
+            # Direct transmission of prevalidated bytes, without recording
+            # replay traffic or swallowing sendall failures.
+            for chunk in chunks: self.s.s.sendall(chunk)
+
+        def readAck(label):
+            ack = self.s.readAck()
+            if ack is None: raise RuntimeError(f"Missing acknowledgment for {label}.")
+            return ack
+
+        def readUInt(label):
+            value = self.s.read(np.uint32)
+            array = np.asarray(value)
+            if array.ndim != 0 or array.dtype.kind not in "iu":
+                raise RuntimeError(f"Missing or invalid {label}.")
+            return int(array)
+
+        framesByCommand = {
+            frame["commandIndex"]: frame for frame in plan["frames"]
+        }
+        textureMap = {}
+        primaryError = None
+        executeStopIndex = plan["executeStopIndex"]
+
+        try:
+            if progress is not None: progress(0.03, "Opening reconstruction renderer")
+            self.open(
+                0,
+                screenWidth=setup["widthPixels"],
+                screenHeight=setup["heightPixels"],
+                backgroundColor=clearColor.tolist(),
+            )
+            if not self.isOpen(): raise RuntimeError("Reconstruction renderer did not open.")
+
+            self.setTransformScale(
+                2.0 / setup["widthDegrees"],
+                2.0 / setup["heightDegrees"],
+            )
+            checkCompletion(self.commandResults, "Coordinate setup")
+
+            # Force actual server settings rather than trusting a cache left
+            # over from a previously opened renderer.
+            if any(
+                command["name"] == "mglCreateTextTexture"
+                for command in plan["commands"][:executeStopIndex]
+            ):
+                if not self.textSetRenderingParameters(**plan["textSettings"]):
+                    raise RuntimeError("Could not restore segment-start text settings.")
+                checkCompletion(self.commandResults, "Initial text settings")
+
+            self.frameGrabInit()
+            if self.renderTarget is None:
+                raise RuntimeError("Offscreen target creation failed.")
+            checkCompletion(self.commandResults, "Target selection")
+
+            # Explicit setup boundary before executing recorded commands.
+            # It does not create an output frame or consume original timing.
+            self.flush()
+            checkCompletion(self.commandResults, "Target setup flush")
+
+            if progress is not None: progress(0.08, "Reconstructing frames")
+
+            for command in plan["commands"][:executeStopIndex]:
+                name = command["name"]
+                chunks = command["chunks"]
+                index = command["commandIndex"]
+
+                if name == "mglCreateTextTexture":
+                    sendChunks(chunks[:1])
+                    ack = readAck(name)
+                    sendChunks(chunks[1:])
+
+                    creationResult = self.s.read(np.float64)
+                    value = np.asarray(creationResult)
+                    if (value.ndim != 0 or value.dtype.kind not in "iuf"
+                            or not np.isfinite(value) or value < 0):
+                        raise RuntimeError(f"Text creation failed at command {index}.")
+
+                    width = readUInt("text width")
+                    height = readUInt("text height")
+                    replayID = readUInt("text texture ID")
+                    readUInt("texture count")
+                    checkCompletion(self.s.readCommandResults(ack), name)
+
+                    resource = command["resource"]
+                    originalID = int(resource["originalID"])
+                    resourceMetadata = resource.get("metadata") or {}
+
+                    # Font/environment differences can change text geometry.
+                    for field, actual in (("widthPixels", width), ("heightPixels", height)):
+                        expected = resourceMetadata.get(field)
+                        if expected is not None and int(expected) != actual:
+                            raise RuntimeError(
+                                f"Text {field} differs at command {index}: "
+                                f"recorded={expected}, reconstructed={actual}."
+                            )
+                    textureMap[originalID] = replayID
+
+                elif name == "mglBltTexture":
+                    replacement = list(chunks)
+                    originalID = struct.unpack("<I", chunks[7])[0]
+                    replacement[7] = struct.pack("<I", textureMap[originalID])
+
+                    sendChunks(replacement[:1])
+                    ack = readAck(name)
+                    sendChunks(replacement[1:])
+                    checkCompletion(self.s.readCommandResults(ack), name)
+
+                elif name == "mglDeleteTexture":
+                    originalID = struct.unpack("<I", chunks[1])[0]
+                    sendChunks([
+                        chunks[0],
+                        struct.pack("<I", textureMap[originalID]),
+                    ])
+                    checkCompletion(self.s.readCommandResults(), name)
+                    del textureMap[originalID]
+
+                elif name in ("mglSetTextRenderingParameters", "mglArcs"):
+                    # Match the original acknowledgment-before-payload sequence.
+                    # Arc count and vertex bytes are replayed without conversion.
+                    sendChunks(chunks[:1])
+                    ack = readAck(name)
+                    sendChunks(chunks[1:])
+                    checkCompletion(self.s.readCommandResults(ack), name)
+
+                else:
+                    # All remaining admitted commands use ordinary completion
+                    # results in the reviewed Python paths.
+                    sendChunks(chunks)
+                    checkCompletion(self.s.readCommandResults(), f"{name} at {index}")
+
+                if name == "mglFlush":
+                    frameInfo = framesByCommand[index]
+
+                    if frameInfo["frameIndex"] in selected:
+                        frame = deepcopy(frameInfo)
+                        frame["image"] = self.frameGrab()
+
+                        if onFrame is None:
+                            result["frames"].append(frame)
+                        else:
+                            onFrame(frame)
+
+                        result["frameCount"] += 1
+
+                        # Do not retain the callback's image until next readback.
+                        del frame
+
+                # Advance even when no selected image was read back.
+                # pglProgress throttles display rendering internally.
+                if progress is not None:
+                    fraction = 0.08 + 0.87 * (index + 1) / executeStopIndex
+                    progress(
+                        fraction,
+                        f"Reconstructing frames — commands {index + 1:,}/{executeStopIndex:,}; "
+                        f"images {result['frameCount']:,}/{len(selected):,}",
+                    )
+
+            if progress is not None: progress(0.95, "Closing reconstruction renderer")
+
+        except BaseException as error:
+            primaryError = error
+            raise
+
+        finally:
+            # The renderer is exclusively owned by this operation. Closing it
+            # releases replay textures, including resources whose recorded
+            # deletion lies beyond the selected prefix. Do not send more
+            # protocol commands after a failed exchange.
+            try:
+                if self.close() is False:
+                    raise RuntimeError("Reconstruction renderer shutdown was not confirmed.")
+
+                # Renderer exit invalidates its target ID. Clear it before
+                # releasing the Python object to avoid destructor deletion.
+                if self.renderTarget is not None:
+                    self.renderTarget.imageNum = None
+                    self.renderTarget = None
+
+            except BaseException as cleanupError:
+                if primaryError is None: raise
+                if hasattr(primaryError, "add_note"):
+                    primaryError.add_note(
+                        f"Secondary renderer cleanup failure: "
+                        f"{type(cleanupError).__name__}: {cleanupError}"
+                    )
+
+        # This completes only the assigned section, not the owner's whole job.
+        if progress is not None: progress(1, "Reconstruction complete")
+        return result
+    
+    ################################################################
+    # Export a timestamp-sampled reconstruction movie
+    ################################################################
+    def recordingMovie(self, recording, outputFilename, fps=None, sampling="nearest",
+                       allowAmbiguous=False, overwrite=False):
+        """Stream a reconstructed recording to a timestamp-sampled MP4.
+
+        fps=None infers the rate from median positive presentation intervals.
+        sampling is "nearest" by default, or "previous".
+
+        allowAmbiguous=True explicitly accepts the timing helper's conventions:
+            Exclude untimed images from timestamp selection.
+            Choose the last flush at duplicate timestamps.
+
+        All preceding drawing commands still execute to establish state.
+        Only selected images are read back. Repeated output samples reuse
+        the same encoded-input pixel bytes.
+
+        Output is an 8-bit RGB-to-H.264 yuv420p preview, not a lossless archive.
+        Alpha is discarded and RGB is clipped to [0, 1].
+        The tested image orientation is preserved.
+
+        The destination is published only after encoding and renderer cleanup.
+        Existing files are not replaced unless overwrite=True.
+        """
+        import os
+        import shutil
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        from .pglProgress import pglProgress
+        from .pglRecordingFile import pglRecordingFile
+
+        if not isinstance(overwrite, bool): raise TypeError("overwrite must be Boolean.")
+        if self.isOpen(): raise RuntimeError("Close the current renderer before movie export.")
+        if self.renderTarget is not None: raise RuntimeError("Resolve the stale render target before movie export.")
+        if getattr(self, "_recordingState", None) == "active":
+            raise RuntimeError("Stop capture before movie export.")
+        if self.commandRecording or self.flushRecording:
+            raise RuntimeError("Stop command and flush capture before movie export.")
+        if getattr(self, "_batchState", 0) != 0 or getattr(self, "_profileMode", 0) != 0:
+            raise RuntimeError("Disable batching and profiling before movie export.")
+
+        ffmpegPath = shutil.which("ffmpeg")
+        if ffmpegPath is None: raise RuntimeError("FFmpeg was not found on PATH.")
+
+        outputPath = Path(outputFilename).expanduser().absolute()
+        if outputPath.suffix.lower() != ".mp4": raise ValueError("outputFilename must end in .mp4.")
+        if os.path.lexists(outputPath) and not overwrite: raise FileExistsError(outputPath)
+
+        with pglProgress("Exporting recording movie") as progress:
+            progress(0, "Validating recording")
+            reconstructionPlan = self._recordingReconstructionPlan(recording)
+
+            if reconstructionPlan["unlinkedPresentationRows"]:
+                raise ValueError("Movie export requires presentation rows linked to recorded flushes.")
+
+            timingPlan = pglRecordingFile._recordingMovieTimingPlan(
+                reconstructionPlan["frames"],
+                fps=fps,
+                sampling=sampling,
+                allowAmbiguous=allowAmbiguous,
+                progress=progress.section(0.02, 0.08),
+            )
+
+            setup = reconstructionPlan["setup"]
+            width = setup["widthPixels"]
+            height = setup["heightPixels"]
+            expectedShape = (height, width, 4)
+
+            # H.264 yuv420p requires even dimensions. Do not silently resize.
+            if width % 2 or height % 2:
+                raise ValueError("This MP4 exporter requires even width and height.")
+
+            sourceIndices = timingPlan["sourceFrameIndices"]
+            selectedIndices = timingPlan["selectedFrameIndices"]
+            outputCount = timingPlan["outputFrameCount"]
+
+            # Monotonic source selection permits streaming without an image cache.
+            if np.any(np.diff(sourceIndices) < 0):
+                raise ValueError("Movie source selection must follow recorded frame order.")
+
+            selectedArray, repeatCounts = np.unique(sourceIndices, return_counts=True)
+            if selectedArray.tolist() != selectedIndices:
+                raise ValueError("Movie source selection is inconsistent.")
+
+            chosenFps = timingPlan["fps"]
+            outputPath.parent.mkdir(parents=True, exist_ok=True)
+            replayProgress = progress.section(0.08, 0.94)
+
+            # Release the redundant plan containers before reconstruction.
+            # The source recording still owns its immutable command bytes.
+            del reconstructionPlan
+
+            writtenCount = 0
+            receivedCount = 0
+
+            # Temporary output resides beside the destination for publication
+            # on the same filesystem. Partial output is removed on failure.
+            with tempfile.TemporaryDirectory(prefix=".pglMovie_", dir=str(outputPath.parent)) as temporaryDirectory:
+                temporaryPath = Path(temporaryDirectory) / "movie.mp4"
+
+                # A file avoids deadlock from an unread stderr pipe.
+                with tempfile.TemporaryFile(mode="w+b") as encoderLog:
+                    command = [
+                        ffmpegPath,
+                        "-hide_banner",
+                        "-loglevel", "error",
+                        "-nostdin",
+                        "-y",
+                        "-f", "rawvideo",
+                        "-pixel_format", "rgb24",
+                        "-video_size", f"{width}x{height}",
+                        "-framerate", str(chosenFps),
+                        "-i", "pipe:0",
+                        "-an",
+                        "-c:v", "libx264",
+                        "-preset", "fast",
+                        "-crf", "18",
+                        "-pix_fmt", "yuv420p",
+                        "-movflags", "+faststart",
+                        str(temporaryPath),
+                    ]
+
+                    progress(0.08, "Starting movie encoder")
+                    encoder = subprocess.Popen(
+                        command,
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.DEVNULL,
+                        stderr=encoderLog,
+                    )
+
+                    def encoderDetails():
+                        # Keep diagnostic messages bounded.
+                        encoderLog.flush()
+                        encoderLog.seek(0, os.SEEK_END)
+                        encoderLog.seek(max(0, encoderLog.tell() - 8192))
+                        return encoderLog.read().decode("utf-8", errors="replace").strip()
+
+                    def encodeFrame(frame):
+                        nonlocal writtenCount, receivedCount
+
+                        if receivedCount >= len(selectedIndices):
+                            raise RuntimeError("Reconstruction returned an unexpected extra image.")
+
+                        expectedIndex = selectedIndices[receivedCount]
+                        if frame["frameIndex"] != expectedIndex:
+                            raise RuntimeError(
+                                f"Expected source frame {expectedIndex}, received {frame['frameIndex']}."
+                            )
+
+                        image = frame["image"]
+                        if image.shape != expectedShape:
+                            raise ValueError(f"Unexpected image shape: {image.shape}.")
+                        if not np.all(np.isfinite(image)):
+                            raise ValueError(f"Frame {expectedIndex} contains nonfinite pixels.")
+
+                        # Preserve orientation. Conversion affects only the movie
+                        # preview, never the source recording or recorded bytes.
+                        rgb = np.rint(np.clip(image[:, :, :3], 0, 1) * 255).astype(np.uint8)
+                        payload = rgb.tobytes(order="C")
+
+                        # One source image may supply several output sample times.
+                        # Reuse its bytes rather than reading the renderer again.
+                        for repeatIndex in range(int(repeatCounts[receivedCount])):
+                            if encoder.poll() is not None:
+                                raise RuntimeError("FFmpeg exited before reconstruction finished.")
+
+                            byteCount = encoder.stdin.write(payload)
+                            if byteCount != len(payload):
+                                raise RuntimeError("Incomplete frame write to FFmpeg.")
+
+                            writtenCount += 1
+
+                            # Keep long repeated-image runs visibly active.
+                            # Fractional progress is based on completed replay
+                            # commands; this only updates the status description.
+                            if repeatIndex % 30 == 0:
+                                replayProgress(
+                                    None,
+                                    f"Reconstructing frames — encoding movie frame "
+                                    f"{writtenCount:,}/{outputCount:,}",
+                                )
+
+                        receivedCount += 1
+
+                    try:
+                        reconstruction = self.recordingReconstruct(
+                            recording,
+                            frameIndices=selectedIndices,
+                            onFrame=encodeFrame,
+                            progress=replayProgress,
+                        )
+
+                        if receivedCount != len(selectedIndices):
+                            raise RuntimeError("Reconstruction returned an incomplete source-image sequence.")
+                        if writtenCount != outputCount:
+                            raise RuntimeError("Movie output frame count mismatch.")
+                        if reconstruction["frameCount"] != receivedCount:
+                            raise RuntimeError("Reconstruction frame count mismatch.")
+                        if self.isOpen(): raise RuntimeError("Reconstruction left the renderer open.")
+                        if self.renderTarget is not None:
+                            raise RuntimeError("Reconstruction left a stale render target.")
+
+                        # EOF completes encoding and writes the MP4 index.
+                        progress(0.95, "Finalizing movie encoder")
+                        encoder.stdin.close()
+                        returnCode = encoder.wait(timeout=120)
+                        if returnCode != 0:
+                            raise RuntimeError(f"FFmpeg exited with code {returnCode}.")
+                        if not temporaryPath.is_file() or temporaryPath.stat().st_size == 0:
+                            raise RuntimeError("FFmpeg did not produce a nonempty movie.")
+
+                        progress(0.98, "Publishing movie")
+
+                        if overwrite:
+                            os.replace(temporaryPath, outputPath)
+                        else:
+                            # Atomic no-clobber publication on the same filesystem.
+                            # Unlike an existence check followed by replace(), this
+                            # cannot overwrite a file created by another process.
+                            os.link(temporaryPath, outputPath)
+                            temporaryPath.unlink()
+
+                    except BaseException as error:
+                        # Stop the encoder before closing its input, which might
+                        # otherwise block if the encoder stopped consuming bytes.
+                        try:
+                            if encoder.poll() is None: encoder.kill()
+                            encoder.wait(timeout=10)
+                        except Exception as cleanupError:
+                            if hasattr(error, "add_note"):
+                                error.add_note(f"Encoder cleanup failed: {cleanupError}")
+
+                        try:
+                            details = encoderDetails()
+                            if details and hasattr(error, "add_note"):
+                                error.add_note(f"FFmpeg diagnostics:\n{details}")
+                        except Exception:
+                            pass
+
+                        raise
+
+                    finally:
+                        try:
+                            if encoder.stdin is not None and not encoder.stdin.closed: encoder.stdin.close()
+                        except (BrokenPipeError, OSError):
+                            pass
+
+            # Finish only after publication and temporary-resource cleanup.
+            result = {
+                "outputFilename": str(outputPath),
+                "recordingId": reconstruction["recordingId"],
+                "frameCount": writtenCount,
+                "sourceImageCount": receivedCount,
+                "fps": chosenFps,
+                "durationSeconds": timingPlan["outputDurationSeconds"],
+                "widthPixels": width,
+                "heightPixels": height,
+                "sampling": sampling,
+                "timingMode": "recordedPresentationSampling",
+                "physicalVisibilityVerified": False,
+                "timingPlan": timingPlan,
+            }
+            progress.finish(f"Movie saved — {writtenCount:,} frames at {chosenFps:g} fps")
+
+        return result
