@@ -643,10 +643,20 @@ class pglExperiment(pglExperimentBase):
             # Start before configure(), which may create stimulus resources.
             self._startExperimentRecording(estimatedDuration, recordFlush, recordCommands)
 
+            # Bind original source snapshots before configuring any task.
+            # Source problems must not prevent acquisition or partial saving.
+            sourceErrors = []
+            for task in self.tasks:
+                self._attemptRunAction(
+                    f"capture source for task {task.settings.taskName}",
+                    task.captureSource,
+                    sourceErrors,
+                )
+
             # A failed configuration is not a successfully initialized task.
             # Propagate it through the same partial-save recovery path.
             for task in self.tasks: task.configure(self)
-
+            
             self.state.openScreen = True
 
         except (Exception, KeyboardInterrupt, SystemExit) as error:
@@ -1606,8 +1616,11 @@ class pglExperiment(pglExperimentBase):
     def save(self, includeEyeTracker=True):
         """Save available run contents, continuing after component failures.
 
-        Repeated calls reuse this run's directory. Experiment recording buffers
-        are automatically released after HDF5 and its JSON reference are saved.
+        Repeated calls reuse this run's directory. Each acquisition task saves
+        its original defining module or notebook cell alongside its data.
+
+        Experiment recording buffers are automatically released only after
+        HDF5 and its JSON reference are successfully saved.
 
         The bundle is not atomic, although recording.h5 is published through
         its own temporary-file replacement.
@@ -1615,6 +1628,9 @@ class pglExperiment(pglExperimentBase):
         errors = []
         dataPath = getattr(self, "_runSavePath", None)
 
+        ################################################################
+        # Choose and retain this run's destination
+        ################################################################
         if dataPath is None:
             # Failed aborted-run classification must not prevent saving.
             aborted = False
@@ -1655,13 +1671,16 @@ class pglExperiment(pglExperimentBase):
         pglMessages.message(f"Saving experiment data to: {dataPath}", messageType='experiment')
         self.data.saveStatus = "inProgress"
 
-        # Save essential local data before HDF5 export or device operations.
+        ################################################################
+        # Save essential experiment components before device operations
+        ################################################################
         components = (
             ("experiment data", self.data, "data.json"),
             ("experiment state", self.state, "state.json"),
             ("experiment settings", self.experimentSettings, "experimentSettings.json"),
             ("settings", self.settings, "settings.json"),
         )
+
         for label, component, filename in components:
             self._attemptRunAction(
                 f"save {label}",
@@ -1677,7 +1696,9 @@ class pglExperiment(pglExperimentBase):
                 errors,
             )
 
-        # Save task components independently.
+        ################################################################
+        # Save each task's source, data, state, settings, and parameters
+        ################################################################
         for taskIndex, task in enumerate(self.tasks):
             try:
                 taskPath = dataPath / task._getTaskDirectoryName()
@@ -1687,6 +1708,16 @@ class pglExperiment(pglExperimentBase):
                 self._recordRunError(f"create task {taskIndex + 1} directory", error)
                 continue
 
+            # Write the definition-time snapshot, not the current source file
+            # or latest notebook cell. A source failure must not prevent saving
+            # this task's acquired data or its remaining components.
+            self._attemptRunAction(
+                f"save task {taskIndex + 1} source",
+                lambda task=task, taskPath=taskPath: task.saveSourceStrict(taskPath),
+                errors,
+            )
+
+            # Attempt each task component independently.
             for componentName in ("data", "state", "settings"):
                 self._attemptRunAction(
                     f"save task {taskIndex + 1} {componentName}",
@@ -1695,6 +1726,8 @@ class pglExperiment(pglExperimentBase):
                     errors,
                 )
 
+            # Parameters have their own settings/state/data bundles, including
+            # nested parameter bundles and saved random-number-generator state.
             parameterPath = taskPath / "parameters"
             if self._attemptRunAction(
                 f"create task {taskIndex + 1} parameters directory",
@@ -1709,10 +1742,14 @@ class pglExperiment(pglExperimentBase):
                         errors,
                     )
 
+        ################################################################
+        # Save cached PGL state and the experiment recording
+        ################################################################
+
         # Cached PGL state does not require a renderer query.
         self._attemptRunAction("save PGL state", lambda: self.pgl.saveStrict(dataPath / "pgl.json"), errors)
 
-        # HDF5 failure must not prevent the other experiment files above.
+        # HDF5 failure must not prevent saving the other experiment files.
         # Repeated saves after release reuse the existing recording artifact.
         if getattr(self, "_recordingId", None) is not None:
             saved = self._attemptRunAction(
@@ -1720,11 +1757,16 @@ class pglExperiment(pglExperimentBase):
                 lambda: self._saveExperimentRecording(dataPath),
                 errors,
             )
+
             if not saved:
                 reference = dict(getattr(self.data, "recording", {}))
                 reference["recordingId"] = self._recordingId
                 reference["saveStatus"] = "failed"
                 self.data.recording = reference
+
+        ################################################################
+        # Optionally retrieve eye-tracker data
+        ################################################################
 
         # Direct save() callers retain EDF retrieval. run() postpones it until
         # local saving and screen/device cleanup have been attempted.
@@ -1736,19 +1778,25 @@ class pglExperiment(pglExperimentBase):
             saved = self._attemptRunAction("save eye tracker", saveEyeTracker, errors)
             self.data.eyeTrackerSaveStatus = "complete" if saved else "failed"
 
-        # Persist the recording reference before releasing its only RAM copy.
+        ################################################################
+        # Persist save status and recording reference before releasing RAM
+        ################################################################
         self.data.saveStatus = "failed" if errors else "complete"
         referenceSaved = self._attemptRunAction(
             "save final save status",
             lambda: self.data.saveStrict(dataPath / "data.json"),
             errors,
         )
-        if not referenceSaved:
-            self.data.saveStatus = "failed"
+        if not referenceSaved: self.data.saveStatus = "failed"
 
+        # Release only after data.json successfully records a complete HDF5
+        # reference. Other component failures do not invalidate that artifact.
         reference = getattr(self.data, "recording", {})
-        if (referenceSaved and getattr(self, "_recordingId", None) is not None
-                and reference.get("saveStatus") == "complete"):
+        if (
+            referenceSaved
+            and getattr(self, "_recordingId", None) is not None
+            and reference.get("saveStatus") == "complete"
+        ):
             if not self._attemptRunAction(
                 "release saved experiment recording",
                 self._releaseExperimentRecording,
@@ -1763,6 +1811,7 @@ class pglExperiment(pglExperimentBase):
                     errors,
                 )
 
+        # Report the first failure only after all independent saves were tried.
         if errors: raise errors[0]
         return dataPath
     
@@ -2345,6 +2394,11 @@ class pglTaskBase(pglTraitSettings):
     state = Instance(pglTaskState, allow_none=True, help="State of task")
     data = Instance(pglTaskData, allow_none=True, help="Data of task")
     parameters = List(Instance(pglParameter), default_value=[], help="parameters of task")
+    
+    # Runtime-only location of saved acquisition source. Reading is deferred
+    # until printSource() is called; these references are never serialized.
+    _taskSourceFilesystem = Instance(fsspec.AbstractFileSystem, allow_none=True, default_value=None).tag(serialize=False)
+    _taskSourcePath = Unicode(default_value=None, allow_none=True).tag(serialize=False)
   
     def save(self, dataPath, filesystem=None, filesystemPrefix=None):
         """Save current task contents, including parameters, through fsspec.
@@ -2446,43 +2500,62 @@ class pglTaskBase(pglTraitSettings):
     
     @classmethod
     def load(cls, dataPath, filesystem=None):
-        '''
-        Load the task data.
-        '''
+        """Load task components and attach deferred access to saved source.
+
+        Source files are not read during loading. printSource() reads and
+        verifies them through the same filesystem when explicitly requested.
+        Older task bundles without source files remain loadable.
+        """
         pglMessages.message(f"Loading task data from: {dataPath}", messageType='detailed')
 
-        # validate filesystem
+        # Resolve the filesystem and task directory.
         filesystem, taskPath, _ = pglStorage.validateFilesystem(filesystem, dataPath)
-
-        # load settings, state and data
-        try:
-            settings = pglSerialize.load(filename=f"{taskPath}{filesystem.sep}settings.json", filesystem=filesystem)
-            state = pglSerialize.load(filename=f"{taskPath}{filesystem.sep}state.json", filesystem=filesystem)
-            data = pglSerialize.load(filename=f"{taskPath}{filesystem.sep}data.json", filesystem=filesystem)
-        except Exception as e:
-            pglMessages.warning(f"Could not load task data from {taskPath}: {e}")
+        if filesystem is None:
+            pglMessages.warning(f"Could not resolve task filesystem: {dataPath}")
             return None
 
-        # load parameters
+        ################################################################
+        # Load settings, state, and data
+        ################################################################
+        try:
+            settings = pglSerialize.load(filename=posixpath.join(taskPath, "settings.json"), filesystem=filesystem)
+            state = pglSerialize.load(filename=posixpath.join(taskPath, "state.json"), filesystem=filesystem)
+            data = pglSerialize.load(filename=posixpath.join(taskPath, "data.json"), filesystem=filesystem)
+        except Exception as error:
+            pglMessages.warning(f"Could not load task data from {taskPath}: {error}")
+            return None
+
+        ################################################################
+        # Load parameter bundles
+        ################################################################
         parameters = []
-        parametersDir = f"{taskPath}{filesystem.sep}parameters"
+        parametersDir = posixpath.join(taskPath, "parameters")
+
         try:
-            for paramDir in filesystem.ls(parametersDir, detail=False):
-                param = pglParameter.from_file(paramDir, filesystem=filesystem)
-                if param is None:
-                    pglMessages.warning(f"Skipping parameter that failed to load: {paramDir}")
+            for parameterDir in filesystem.ls(parametersDir, detail=False):
+                parameter = pglParameter.from_file(parameterDir, filesystem=filesystem)
+                if parameter is None:
+                    pglMessages.warning(f"Skipping parameter that failed to load: {parameterDir}")
                     continue
-                parameters.append(param)
-        except Exception as e:
-            pglMessages.warning(f"Could not load task parameters from {parametersDir}: {e}")
+                parameters.append(parameter)
+        except Exception as error:
+            pglMessages.warning(f"Could not load task parameters from {parametersDir}: {error}")
             return None
 
-        # instantiate class
+        ################################################################
+        # Construct the task and attach its original source location
+        ################################################################
         obj = cls()
         obj.settings = settings
         obj.state = state
         obj.data = data
         obj.parameters = parameters
+
+        # Keep runtime backing only. Do not capture analysis-class source,
+        # load source eagerly, or execute the saved Python code.
+        obj._taskSourceFilesystem = filesystem
+        obj._taskSourcePath = str(taskPath)
+
         return obj
 
     def display(self, ax=None):
@@ -2536,7 +2609,102 @@ class pglTaskBase(pglTraitSettings):
                 pglMessages.print(f"Trial {iTrial+1} at {trialStart:.2f}s: " + ', '.join(f"{key}={value}" for key, value in params.items()))
             else:
                 pglMessages.print(f"Trial {iTrial+1} at {trialStart:.2f}s (vol={trialVolume}): " + ', '.join(f"{key}={value}" for key, value in params.items()))
-                          
+    
+    def printSource(self):
+        """Print and return the task's original defining module or notebook cell.
+
+        Acquisition tasks use their captured source snapshot.
+        Loaded tasks read saved source through their attached filesystem.
+
+        Source is verified against its recorded SHA-256 before printing.
+        Missing source warns and returns None; malformed metadata, integrity
+        failures, and storage-read errors raise.
+
+        Never executes source or reconstructs historical source from the
+        currently installed task implementation.
+        """
+        import hashlib
+        import json
+
+        ################################################################
+        # Loaded tasks must use their saved acquisition artifacts
+        ################################################################
+        if self._taskSourcePath is not None:
+            filesystem = self._taskSourceFilesystem
+            if filesystem is None: raise RuntimeError("Task source has a saved path but no filesystem.")
+
+            sourcePath = posixpath.join(self._taskSourcePath, "taskSource.py")
+            metadataPath = posixpath.join(self._taskSourcePath, "taskSource.json")
+            hasSource = filesystem.isfile(sourcePath)
+            hasMetadata = filesystem.isfile(metadataPath)
+
+            # Older runs may legitimately have no source artifacts.
+            if not hasSource and not hasMetadata:
+                pglMessages.warning(f"No saved task source is available in {self._taskSourcePath}")
+                return None
+
+            # A source file without provenance cannot be hash-verified.
+            if not hasMetadata: raise ValueError(f"Task source metadata is missing: {metadataPath}")
+
+            with filesystem.open(metadataPath, "rt", encoding="utf-8") as sourceFile:
+                metadata = json.load(sourceFile)
+
+            if not isinstance(metadata, dict): raise ValueError(f"Invalid task source metadata: {metadataPath}")
+
+            # Failed capture is an explicit recorded outcome, not an excuse
+            # to inspect the current Python environment for replacement code.
+            if metadata.get("captureStatus") == "failed":
+                if hasSource: raise ValueError(f"Task source exists despite failed capture metadata: {sourcePath}")
+                pglMessages.warning(f"Task source capture failed: {metadata.get('captureError', 'Unknown error')}")
+                return None
+
+            if metadata.get("captureStatus") != "complete":
+                raise ValueError(f"Unknown task source capture status: {metadataPath}")
+            if not hasSource: raise FileNotFoundError(f"Recorded task source is missing: {sourcePath}")
+
+            with filesystem.open(sourcePath, "rb") as sourceFile:
+                sourceBytes = sourceFile.read()
+
+        ################################################################
+        # Acquisition tasks use their original in-memory snapshot
+        ################################################################
+        else:
+            snapshot = getattr(self, "_taskSourceSnapshot", None)
+
+            # captureSource() only binds the definition-time class snapshot.
+            # It does not inspect current module files or notebook history.
+            if snapshot is None:
+                captureSource = getattr(self, "captureSource", None)
+                if callable(captureSource): snapshot = captureSource()
+
+            if snapshot is None:
+                pglMessages.warning("No captured task source or saved source location is available.")
+                return None
+
+            metadata = snapshot["metadata"]
+            source = snapshot["source"]
+
+            if metadata.get("captureStatus") == "failed":
+                pglMessages.warning(f"Task source capture failed: {metadata.get('captureError', 'Unknown error')}")
+                return None
+
+            if metadata.get("captureStatus") != "complete" or not isinstance(source, str):
+                raise ValueError("Invalid captured task source snapshot.")
+
+            sourceBytes = source.encode("utf-8")
+
+        ################################################################
+        # Verify before displaying; return the same text for convenience
+        ################################################################
+        expectedHash = metadata.get("sha256")
+        actualHash = hashlib.sha256(sourceBytes).hexdigest()
+        if not isinstance(expectedHash, str) or actualHash != expectedHash:
+            raise ValueError(f"Task source SHA-256 mismatch for {metadata.get('className', 'unknown task')}.")
+
+        source = sourceBytes.decode("utf-8")
+        print(source, end="" if source.endswith("\n") else "\n")
+        return source
+                              
 ##############################################
 # Task class
 ##############################################
@@ -2796,7 +2964,228 @@ class pglTask(pglTaskBase):
         '''
         # set current segment length to 0 to force jump
         self._thisTrialSeglen[self.state.currentSegment] = 0
+        
+    ################################################################
+    # Automatically capture source when an acquisition task is defined
+    ################################################################
+    def __init_subclass__(cls, **kwargs):
+        """Capture the defining module or notebook cell for each task class."""
+        super().__init_subclass__(**kwargs)
 
+        import inspect
+
+        currentFrame = inspect.currentframe()
+        definingFrame = None
+
+        try:
+            definingFrame = currentFrame.f_back if currentFrame is not None else None
+
+            # Skip cooperative subclass hooks and locate the defining caller.
+            while definingFrame is not None:
+                if (
+                    definingFrame.f_globals.get("__name__") == cls.__module__
+                    and definingFrame.f_code.co_name != "__init_subclass__"
+                ):
+                    break
+                definingFrame = definingFrame.f_back
+
+            cls._captureClassSource(definingFrame=definingFrame)
+
+        finally:
+            # Do not retain execution frames or their notebook variables.
+            del definingFrame
+            del currentFrame
+
+    ################################################################
+    # Capture a class-specific source snapshot
+    ################################################################
+    @classmethod
+    def _captureClassSource(cls, definingFrame=None):
+        """Cache the defining source on this particular task class.
+
+        Notebook source comes from the defining execution frame's source
+        cache, not the latest notebook-history entry.
+
+        Module source includes the complete module, including imports and
+        module-level helpers. Imported dependencies are not bundled.
+
+        Capture failures are recorded and warned about without preventing
+        class definition or acquisition.
+        """
+        import hashlib
+        import inspect
+        import linecache
+        import sys
+
+        # Only inspect this class's dictionary. Never reuse a parent's source.
+        existingSnapshot = cls.__dict__.get("_taskClassSourceSnapshot")
+        if existingSnapshot is not None: return existingSnapshot
+
+        metadata = {
+            "filename": "taskSource.py",
+            "module": cls.__module__,
+            "className": cls.__qualname__,
+            "sourceScope": None,
+            "sourceFile": None,
+            "capturedDateTime": datetime.now().astimezone().isoformat(),
+            "sha256": None,
+            "captureStatus": "failed",
+            "captureError": None,
+        }
+        source = None
+
+        try:
+            try:
+                from IPython import get_ipython
+                shell = get_ipython()
+            except ImportError:
+                shell = None
+
+            # Imported modules execute in their own namespace, even when
+            # imported from a notebook.
+            isNotebookSource = (
+                shell is not None
+                and definingFrame is not None
+                and definingFrame.f_globals is shell.user_ns
+            )
+
+            if isNotebookSource:
+                sourceFile = definingFrame.f_code.co_filename
+                metadata["sourceScope"] = "notebookCell"
+                metadata["sourceFile"] = sourceFile
+
+                # Retrieve the complete cell associated with this definition.
+                source = "".join(
+                    linecache.getlines(sourceFile, definingFrame.f_globals)
+                )
+                if not source:
+                    raise OSError(
+                        f"IPython source cache has no defining cell for "
+                        f"{sourceFile!r}."
+                    )
+
+            else:
+                module = sys.modules.get(cls.__module__)
+                if module is None:
+                    raise OSError(
+                        f"Could not locate defining module {cls.__module__!r}."
+                    )
+
+                metadata["sourceScope"] = "module"
+                metadata["sourceFile"] = inspect.getsourcefile(module)
+
+                # Include imports and helper functions from the same module.
+                source = inspect.getsource(module)
+                if not source:
+                    raise OSError("The defining module has no available source.")
+
+            metadata["sha256"] = hashlib.sha256(
+                source.encode("utf-8")
+            ).hexdigest()
+            metadata["captureStatus"] = "complete"
+
+        except Exception as error:
+            source = None
+            metadata["captureError"] = f"{type(error).__name__}: {error}"
+
+            # Reporting a source problem must not prevent task definition.
+            try:
+                pglMessages.warning(
+                    f"Could not capture source for "
+                    f"{cls.__module__}.{cls.__qualname__}: {error}"
+                )
+            except Exception:
+                pass
+
+        snapshot = {
+            "source": source,
+            "metadata": metadata,
+        }
+
+        # Assignment creates an entry on this class rather than its parent.
+        cls._taskClassSourceSnapshot = snapshot
+        return snapshot
+
+    ################################################################
+    # Bind the class snapshot to this acquisition task
+    ################################################################
+    def captureSource(self):
+        """Bind this instance to its definition-time source snapshot.
+
+        Never recover source from current notebook history or current module
+        files during saving: those may no longer match the original class.
+        """
+        import copy
+
+        snapshot = getattr(self, "_taskSourceSnapshot", None)
+        if snapshot is not None: return snapshot
+
+        # Do not silently inherit a parent class's source snapshot.
+        classSnapshot = type(self).__dict__.get("_taskClassSourceSnapshot")
+        if classSnapshot is None:
+            raise RuntimeError(
+                f"No definition-time source snapshot exists for "
+                f"{type(self).__module__}.{type(self).__qualname__}. "
+                "Reload its module or rerun its defining notebook cell. "
+                "If an intermediate class overrides __init_subclass__(), "
+                "it must call super().__init_subclass__()."
+            )
+
+        self._taskSourceSnapshot = copy.deepcopy(classSnapshot)
+        return self._taskSourceSnapshot
+
+    ################################################################
+    # Save the original source with this task's acquisition data
+    ################################################################
+    def saveSourceStrict(self, taskPath):
+        """Write source and provenance into a local acquisition task directory.
+
+        taskPath is the task directory, not the parent run directory.
+
+        Failed source capture still writes explanatory metadata, then raises.
+        The experiment's independent-save logic can continue saving task data.
+        """
+        import hashlib
+        import json
+
+        snapshot = self.captureSource()
+        metadata = snapshot["metadata"]
+        source = snapshot["source"]
+
+        taskPath = Path(taskPath)
+        taskPath.mkdir(parents=True, exist_ok=True)
+
+        if metadata["captureStatus"] == "complete" and source is not None:
+            sourceBytes = source.encode("utf-8")
+
+            # Detect accidental modification of the cached snapshot.
+            if hashlib.sha256(sourceBytes).hexdigest() != metadata["sha256"]:
+                raise ValueError(
+                    f"Cached task source hash mismatch for "
+                    f"{metadata['className']}."
+                )
+
+            # Write exactly the bytes used for the recorded hash.
+            (taskPath / "taskSource.py").write_bytes(sourceBytes)
+
+        (taskPath / "taskSource.json").write_text(
+            json.dumps(metadata, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        if metadata["captureStatus"] != "complete" or source is None:
+            raise RuntimeError(
+                f"Task source was not captured for {metadata['className']}: "
+                f"{metadata['captureError']}"
+            )
+
+        return taskPath / "taskSource.py"
+
+################################################################
+# Capture the base acquisition task itself.
+# Subclasses capture their own source through __init_subclass__().
+################################################################
+pglTask._captureClassSource()
 
 ##############################################
 # small class to carry information about digital IO words
