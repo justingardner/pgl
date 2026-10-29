@@ -29,7 +29,7 @@ class pglFixationTaskLeftRight(pglTask):
             fixSize = 10.0
             slowDownFactor = 5
         else:
-            fixSize = 10.0
+            fixSize = 1.0
             slowDownFactor = 1
         
         # task name
@@ -83,18 +83,17 @@ class pglFixationTaskLeftRight(pglTask):
         
         # draw disc blocking stimulus
         self.pgl.arc(0, 0, 0, self.settings.config.fixSize / 2, 0, 2 * np.pi, color=self.e.settings.backgroundColor)
-        self.pgl.arc(0, 0, 0, self.settings.config.fixSize / 2, 0, 2 * np.pi, color=0.5)
-        #if self.state.currentSegment==1:
+        if self.state.currentSegment==1:
             # draw the left side
-            #self.pgl.line(-self.settings.config.fixSize/2, 0, 0, 0, self.leftColor)
+            self.pgl.line(-self.settings.config.fixSize/2, 0, 0, 0, self.leftColor)
             # draw the right side
-            #self.pgl.line(0, 0, self.settings.config.fixSize/2, 0, self.rightColor)
-        #else:
+            self.pgl.line(0, 0, self.settings.config.fixSize/2, 0, self.rightColor)
+        else:
             # just draw the horizotnal line
-            #self.pgl.line(-self.settings.config.fixSize/2, 0, self.settings.config.fixSize/2, 0, self.horizontalColor)
+            self.pgl.line(-self.settings.config.fixSize/2, 0, self.settings.config.fixSize/2, 0, self.horizontalColor)
 
         # draw the vertical line
-        #self.pgl.line(0, -self.settings.config.fixSize/2, 0, self.settings.config.fixSize/2, self.verticalColor)    
+        self.pgl.line(0, -self.settings.config.fixSize/2, 0, self.settings.config.fixSize/2, self.verticalColor)    
         
     ########################
     def handleSubjectResponse(self, response, updateTime):
