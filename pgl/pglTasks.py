@@ -17,12 +17,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 #############
-# Fuxaton task: 2AFC on which arm of the fixation cross dims
+# Fixation task: 2AFC on which arm of the fixation cross dims
 #############
 class pglFixationTaskLeftRight(pglTask):    
     ########################
     def __init__(self, pgl, demo=False):
-        super().__init__()
+        super().__init__(pgl)
         
         # for demo make fixSie large, and slow dowin timing
         if demo:
@@ -36,14 +36,14 @@ class pglFixationTaskLeftRight(pglTask):
         self.settings.taskName = "Fixation Task Left Right"
         
         # keep fixed parameters in settings (so they get saved)
-        self.settings.fixedParameters = {
-            'fixSize':fixSize,
-            'slowDownFactor':slowDownFactor
-        }
-        self.fixSize = self.settings.fixedParameters['fixSize']
+        self.settings.config.fixSize = fixSize
+        self.settings.config.slowDownFactor = slowDownFactor
         
         # segments. Fixation, Stimulus, Response
         self.settings.seglen = (slowDownFactor * np.array([0.5, 0.2, 3.0])).tolist()
+        
+        # do not print messages while running
+        self.settings.verbose = False
         
         # add a parameter for which side of the fixation cross dims
         self.addParameter(pglParameter('side',(-1,1)))
@@ -82,18 +82,18 @@ class pglFixationTaskLeftRight(pglTask):
     def updateScreen(self):
         
         # draw disc blocking stimulus
-        self.pgl.arc(0, 0, 0, self.fixSize/2, 0, 2*np.pi, color=self.pgl.clearScreenColor)
+        self.pgl.arc(0, 0, 0, self.settings.config.fixSize/2, 0, 2*np.pi, color=self.pgl.clearScreenColor)
         if self.state.currentSegment==1:
             # draw the left side
-            self.pgl.line(-self.fixSize/2, 0, 0, 0, self.leftColor)
+            self.pgl.line(-self.settings.config.fixSize/2, 0, 0, 0, self.leftColor)
             # draw the right side
-            self.pgl.line(0, 0, self.fixSize/2, 0, self.rightColor)
+            self.pgl.line(0, 0, self.settings.config.fixSize/2, 0, self.rightColor)
         else:
             # just draw the horizotnal line
-            self.pgl.line(-self.fixSize/2, 0, self.fixSize/2, 0, self.horizontalColor)
+            self.pgl.line(-self.settings.config.fixSize/2, 0, self.settings.config.fixSize/2, 0, self.horizontalColor)
 
         # draw the vertical line
-        self.pgl.line(0, -self.fixSize/2, 0, self.fixSize/2, self.verticalColor)    
+        self.pgl.line(0, -self.settings.config.fixSize/2, 0, self.settings.config.fixSize/2, self.verticalColor)    
         
     ########################
     def handleSubjectResponse(self, response, updateTime):
@@ -124,116 +124,218 @@ class pglFixationTaskLeftRight(pglTask):
 class pglBarTask(pglTask):
     
     ########################
-    def __init__(self, pgl, volumePeriod=1.0, barSweepPeriod=24.0,sweepWidth=None,sweepHeight=None,randomSeed=None):
-        super().__init__()
-        
-        # set task parameters, these will automatically be saved in the settings file
+    def __init__(self, pgl, volumePeriod=1.0, barSweepPeriod=24.0, sweepWidth=None, sweepHeight=None, randomSeed=None):
+        super().__init__(pgl)
+
         self.settings.taskName = "Bar Mapping Task"
-        
-        # make barSweepPeriod a multiple of volumePeriod
-        nVolumesPerSweep = round(barSweepPeriod/volumePeriod)
+
+        # Validate timing independently of the screen, so runDuration is
+        # available before initScreen() for recording-capacity estimates.
+        volumePeriod = float(volumePeriod)
+        barSweepPeriod = float(barSweepPeriod)
+        if not np.isfinite(volumePeriod) or volumePeriod <= 0: raise ValueError("volumePeriod must be finite and greater than zero.")
+        if not np.isfinite(barSweepPeriod) or barSweepPeriod <= 0: raise ValueError("barSweepPeriod must be finite and greater than zero.")
+
+        # Require at least two volumes so a half-length catch is nonempty.
+        nVolumesPerSweep = round(barSweepPeriod / volumePeriod)
+        if nVolumesPerSweep < 2: raise ValueError("barSweepPeriod must round to at least two scanner volumes.")
         barSweepPeriod = nVolumesPerSweep * volumePeriod
 
-        # set seglens
-        self.settings.seglen = [volumePeriod/2] * (nVolumesPerSweep)
-        # ensure we wait for volume trigger at end of last segment
-        self.settings.waitUntilVolumeTrigger[:] = [True] * (nVolumesPerSweep)
-        # set number of directions
-        directions = np.arange(0,360,45)
-        nDirections = len(directions)
+        # set as main task for detecting aborted runs
+        self.settings.isMainTask = True
         
-        # display how long this is expected to take
-        totalTime = nDirections * barSweepPeriod
-        totalVolumes = nDirections * nVolumesPerSweep
-        print(f"(pglBarTask) Total expected task time: {totalTime//60:.0f} minutes {totalTime%60:.1f} seconds, {totalVolumes} volumes  ({nDirections} directions, {barSweepPeriod:.1f} seconds/sweep, {nVolumesPerSweep} volumes/sweep)")
-        
-        # fixed parameters, these will automatically be saved in the settings file
-        self.settings.fixedParameters = {
-            'barWidth':2,
-            'directions':np.arange(0,360,45),
-            'volumePeriod':volumePeriod,
-            'nVolumesPerSweep':nVolumesPerSweep,
-            'barSweepPeriod':barSweepPeriod,
-            'sweepWidth':sweepWidth if sweepWidth is not None else pgl.screenWidth.deg,
-            'sweepHeight':sweepHeight if sweepHeight is not None else pgl.screenHeight.deg
-        }        
-        p = self.settings.fixedParameters
+        # Every segment runs for half a nominal volume period, then waits
+        # for the next scanner trigger.
+        self.settings.seglen = [volumePeriod / 2] * nVolumesPerSweep
+        self.settings.waitUntilVolumeTrigger = [True] * nVolumesPerSweep
 
-        # direction of bars
-        dirParam = pglParameter('directions',p['directions'], randomSeed=randomSeed)
+        # Store stimulus settings, but do not read screen dimensions yet.
+        # None means configure() will use the initialized screen dimensions.
+        config = self.settings.config
+        config.barWidth = 2
+        config.directions = np.arange(0, 360, 45)
+        config.volumePeriod = volumePeriod
+        config.nVolumesPerSweep = nVolumesPerSweep
+        config.barSweepPeriod = barSweepPeriod
+        config.sweepWidth = sweepWidth
+        config.sweepHeight = sweepHeight
+
+        # Catch duration rounds down for odd sweep lengths.
+        config.nVolumesForBlankCatchTrial = nVolumesPerSweep // 2
+
+        # One planned run contains every direction once and one blank catch.
+        # These estimates do not change the task's trial limit.
+        config.nTrialsPerRun = len(config.directions) + 1
+        config.nVolumesPerRun = len(config.directions) * config.nVolumesPerSweep + config.nVolumesForBlankCatchTrial
+        config.runDuration = config.nVolumesPerRun * config.volumePeriod
+
+        # Report nominal duration, excluding calibration and pre-start waiting.
+        catchDuration = config.nVolumesForBlankCatchTrial * config.volumePeriod
+        print(f"(pglBarTask) Planned run: {config.nTrialsPerRun} trials ({len(config.directions)} stimulus sweeps + 1 blank catch), {config.runDuration // 60:.0f} minutes {config.runDuration % 60:.1f} seconds, {config.nVolumesPerRun} volumes.")
+        print(f"  Stimulus sweep: {config.barSweepPeriod:.1f} seconds, {config.nVolumesPerSweep} volumes.")
+        print(f"  Blank catch: {catchDuration:.1f} seconds, {config.nVolumesForBlankCatchTrial} volumes.")
+
+        # Insert a randomly positioned catch without consuming a direction.
+        dirParam = pglParameter('directions', config.directions, randomSeed=randomSeed, catchTrialEvery=config.nTrialsPerRun)
         self.addParameter(dirParam)
         self.settings.randomSeed = dirParam.settings.randomSeed
+
+        # set the number of trials to run for
+        self.settings.nTrials = self.settings.config.nTrialsPerRun
         
-        # initalize stimulus
-        self.bars = pgl.bar(width=p['barWidth'], nVolumesPerSweep=p['nVolumesPerSweep'], sweepWidth=p['sweepWidth'], sweepHeight=p['sweepHeight'])
-    
+        # Stimulus creation is deferred until the screen has been initialized.
+        self.bars = None
+        
+    ########################
+    def configure(self, e):
+        """Resolve screen-dependent dimensions and create the bar stimulus.
+
+        Called by initScreen() after the screen and visual-angle coordinates
+        are initialized. Resolved dimensions remain in config for saving and
+        subsequent stimulus reconstruction.
+        """
+        super().configure(e)
+
+        if not self.pgl.isOpen(): raise RuntimeError("The screen must be open before configuring the bar task.")
+        if self.pgl.coordinateFrame != "visualAngle": raise RuntimeError("The bar task requires visual-angle coordinates.")
+
+        config = self.settings.config
+
+        # Resolve defaults only now, never from stale or uninitialized screen
+        # dimensions during task construction.
+        sweepWidth = self.pgl.screenWidth.deg if config.sweepWidth is None else config.sweepWidth
+        sweepHeight = self.pgl.screenHeight.deg if config.sweepHeight is None else config.sweepHeight
+        sweepWidth = float(sweepWidth)
+        sweepHeight = float(sweepHeight)
+
+        # Reject invalid geometry here instead of crashing during acquisition
+        # when the checkerboard attempts to index an empty coordinate array.
+        if not np.isfinite(sweepWidth) or sweepWidth <= 0: raise ValueError(f"Bar sweep width must be finite and positive; got {sweepWidth}.")
+        if not np.isfinite(sweepHeight) or sweepHeight <= 0: raise ValueError(f"Bar sweep height must be finite and positive; got {sweepHeight}.")
+
+        config.sweepWidth = sweepWidth
+        config.sweepHeight = sweepHeight
+
+        # Construct the checkerboard only after its dimensions are valid.
+        self.bars = self.pgl.bar(width=config.barWidth, nVolumesPerSweep=config.nVolumesPerSweep, sweepWidth=config.sweepWidth, sweepHeight=config.sweepHeight)
+        if self.bars is None: raise RuntimeError("Could not create the bar stimulus.")
+        
+    ########################
+    def modifyTrialSegments(self, seglen):
+        """Shorten blank catches to the configured number of scanner volumes."""
+        if self.currentParams['directions'] is None:
+            return seglen[:self.settings.config.nVolumesForBlankCatchTrial]
+        return seglen
+                
+    ########################
+    def startTrial(self, startTime):
+        ''' print header to make it easier to read trial conditions'''
+        self.pgl.printHeader()
+        super().startTrial(startTime)
+        
     ########################
     def updateScreen(self):
-        self.bars.display(dir=self.currentParams['directions'], volumeNumber=self.e.state.volumeNumber)
+        
+        # draw the bars (but if the dir is None then this is a catch trial)
+        dir = self.currentParams['directions']
+        if dir is not None: self.bars.display(dir=dir, volumeNumber=self.e.state.volumeNumber)
         
     ########################
     def getStimulusFrames(self, pgl, events, settings, screenWidth=800, screenHeight=600):
-        p = self.settings.fixedParameters
-        
-        print(f"(pglBarTask:getStimulusFrames) Initializing bar stimulus with width={p['barWidth']}, nVolumesPerSweep={p['nVolumesPerSweep']}, sweepWidth={p['sweepWidth']}, sweepHeight={p['sweepHeight']}")
-        self.bars = pgl.bar(width=p['barWidth'], nVolumesPerSweep=p['nVolumesPerSweep'], sweepWidth=p['sweepWidth'], sweepHeight=p['sweepHeight'])
-        
-        # initialize volume and trial number
-        volumeNumber = 0
-        trialNumber = 0
-        dir = 0
-        
-        # combine experiment and task events
-        events = sorted(events + self.data.events, key=lambda event: event.timestamp)
+        """Reconstruct stimulus and blank frames from recorded segment starts.
 
-        # pre-allocate frames array
-        nVols = len([e for e in events if e.type == 'volumeTrigger'])
+        Catch duration comes from the recorded events, so shortened catches
+        need no special timing calculation here.
+
+        Requires scanner volume triggers. Volumes with no segment start
+        remain zero-filled, matching the existing reconstruction behavior.
+        """
+        config = self.settings.config
+
+        print(
+            f"(pglBarTask:getStimulusFrames) Initializing bar stimulus with "
+            f"width={config.barWidth}, nVolumesPerSweep={config.nVolumesPerSweep}, "
+            f"sweepWidth={config.sweepWidth}, sweepHeight={config.sweepHeight}"
+        )
+
+        self.bars = pgl.bar(
+            width=config.barWidth,
+            nVolumesPerSweep=config.nVolumesPerSweep,
+            sweepWidth=config.sweepWidth,
+            sweepHeight=config.sweepHeight,
+        )
+
+        # Merge scanner events and task boundaries without modifying inputs.
+        combinedEvents = sorted(list(events) + list(self.data.events), key=lambda event: event.timestamp)
+        volumeTimestamps = [event.timestamp for event in combinedEvents if event.type == 'volumeTrigger']
+        nVols = len(volumeTimestamps)
+        if nVols == 0: raise ValueError("Cannot reconstruct volume-indexed frames without volume triggers.")
+
         frames = np.zeros((nVols, screenHeight, screenWidth, 4))
+        timeStamps = [timestamp - volumeTimestamps[0] for timestamp in volumeTimestamps]
         print(f"(pglBarTask:getStimulusFrames) Capturing {nVols} frames")
 
-        # compute x and y coordinates
+        # Preserve the existing pixel-to-visual-angle coordinate calculation.
         y, x = np.indices((screenHeight, screenWidth))
-        xDeg = np.degrees(2*np.arctan(((x - screenWidth/2)*(settings.displayWidth/screenWidth))/(2*settings.displayDistance)))
-        yDeg = np.degrees(2*np.arctan(((y - screenHeight/2)*(settings.displayHeight/screenHeight))/(2*settings.displayDistance)))        
-        
-        # compute time in seconds
-        timeStamps = [e.timestamp for e in events if e.type == 'volumeTrigger']
-        timeStamps = [t - timeStamps[0] for t in timeStamps]
-        
-        # open screen for off screen rendering
-        pgl.open(0,screenWidth,screenHeight)
-        pgl.visualAngle(settings.displayDistance, settings.displayWidth, settings.displayHeight)
-        pgl.clearScreen(0.5)
-        pgl.frameGrabInit()
-        pgl.flush()
+        xDeg = np.degrees(2 * np.arctan(((x - screenWidth / 2) * (settings.displayWidth / screenWidth)) / (2 * settings.displayDistance)))
+        yDeg = np.degrees(2 * np.arctan(((y - screenHeight / 2) * (settings.displayHeight / screenHeight)) / (2 * settings.displayDistance)))
 
-        # cycle over events
-        for e in events:
-            # find volume trigger events
-            if e.type == 'volumeTrigger':
-                volumeNumber += 1
-            # Find trial start events
-            if e.type == 'trial' and e.eventType == 'start':
-                #if (trialNumber == 0): startVolumeNumber = volumeNumber
-                # get the current direction for this trial
-                dir = self.data.params[trialNumber].get('directions',0)
-                # update trial number
-                trialNumber += 1
-            # for each segment start, draw the bar stimulus
-            if e.type == 'segment' and e.eventType == 'start':
-                # draw the bar stimulus
-                self.bars.display(dir=dir, volumeNumber=volumeNumber)
-                pgl.flush()
-                # capture the frame
-                frames[volumeNumber-1] = pgl.frameGrab()
-                # print what frame we got
-                print(f"(pglBarTask:getStimulusFrames) Captured frame for dir={dir} segmentNum = {e.segmentNum} volumeNumber={volumeNumber}/{nVols} phase: {volumeNumber-self.bars.volumeNumber})")
-            
-        # close screen        
-        pgl.frameGrabEnd()
-        pgl.close()
-        
-        # return frames
+        volumeNumber = 0
+        trialNumber = 0
+        direction = None
+        screenOpened = False
+        captureStarted = False
+
+        try:
+            # Initialize the standalone reconstruction screen.
+            pgl.open(0, screenWidth, screenHeight)
+            screenOpened = pgl.isOpen()
+            if not screenOpened: raise RuntimeError("Could not open the reconstruction screen.")
+
+            pgl.visualAngle(settings.displayDistance, settings.displayWidth, settings.displayHeight)
+            pgl.clearScreen(0.5)
+            pgl.frameGrabInit()
+            captureStarted = True
+            pgl.flush()
+
+            for event in combinedEvents:
+                if event.type == 'volumeTrigger': volumeNumber += 1
+
+                if event.type == 'trial' and event.eventType == 'start':
+                    if trialNumber >= len(self.data.params):
+                        raise ValueError("Recorded trial starts exceed saved parameter entries.")
+
+                    # None explicitly denotes a catch; a missing key is an error.
+                    direction = self.data.params[trialNumber]['directions']
+                    trialNumber += 1
+
+                if event.type == 'segment' and event.eventType == 'start':
+                    if trialNumber == 0: raise ValueError("Segment start occurred before any trial start.")
+                    if not 1 <= volumeNumber <= nVols:
+                        raise ValueError("Segment start has no valid scanner-volume index.")
+
+                    # Clear explicitly so a catch cannot retain the prior bars.
+                    # This is standalone reconstruction, not concurrent tasks.
+                    pgl.clearScreen(0.5)
+                    if direction is not None: self.bars.display(dir=direction, volumeNumber=volumeNumber)
+
+                    pgl.flush()
+                    frames[volumeNumber - 1] = pgl.frameGrab()
+
+                    # Do not access bar sweep state during a blank catch.
+                    print(
+                        f"(pglBarTask:getStimulusFrames) Captured frame for "
+                        f"dir={direction} segmentNum={event.segmentNum} "
+                        f"volumeNumber={volumeNumber}/{nVols}"
+                    )
+
+        finally:
+            # Attempt screen closure even if stopping frame capture fails.
+            try:
+                if captureStarted: pgl.frameGrabEnd()
+            finally:
+                if screenOpened: pgl.close()
+
         return frames, xDeg, yDeg, timeStamps
     
 ##############################################

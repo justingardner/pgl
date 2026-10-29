@@ -1116,70 +1116,69 @@ class pglStimulusBar(_pglStimulus):
             self.volumeNumber = None
         
     def display(self, dir=0, volumeNumber=0):
-        '''
-        Display the bar stimulus.
-        '''
+        """Display the bar, restarting completed sweeps when drawing resumes.
+
+        Volume-based drawing may pause during blank catch trials. Restart
+        when the previous sweep has reached or passed its final boundary,
+        rather than requiring a display call at exactly that boundary.
+        """
         # Initialize the first pass in either time-based or volume-based mode.
         if self.volumeNumber is None:
             self.initPass(volumeNumber=volumeNumber)
 
-        # In volume-based mode only, restart after a completed sweep.
-        elif (self.nVolumesPerSweep is not None and
-            (volumeNumber - self.volumeNumber) == self.nVolumesPerSweep):
-            self.initPass(volumeNumber=volumeNumber) 
-            
-        # rotate coordinate frame accordingly
+        # Drawing can skip the exact boundary during a catch. Anchor the next
+        # sweep to the current volume so it starts at the beginning, not midway.
+        elif self.nVolumesPerSweep is not None and volumeNumber - self.volumeNumber >= self.nVolumesPerSweep:
+            self.initPass(volumeNumber=volumeNumber)
+
+        # Rotate the bar into the requested sweep direction.
         self.pgl.setTransformRotation(dir)
 
-        # Update the bar stimulus position 
+        # Position relative to this sweep's starting volume or starting time.
         if self.nVolumesPerSweep is not None:
-            # update position in steps based on volume number
             self.barStimulus.x = self.passStartX + self.stepSizePerVolume * (volumeNumber - self.volumeNumber)
         elif self.stepPosition:
-            # only update, every time the stimulus moves a full width
+            # Time-based stepped motion advances by approximately a bar width.
             self.thisX = self.passStartX + self.speed * (self.pgl.getSecs() - self.passStartTime)
-            if self.thisX - self.barStimulus.x > self.width:
-                self.barStimulus.x = self.thisX
+            if self.thisX - self.barStimulus.x > self.width: self.barStimulus.x = self.thisX
         else:
-            # smoothly move
+            # Time-based continuous motion.
             self.barStimulus.x = self.passStartX + self.speed * (self.pgl.getSecs() - self.passStartTime)
 
-        # display the bar
+        # Draw the checkerboard bar and restore the coordinate rotation.
         self.barStimulus.display()
-        
-        # rotate coordinate frame back
         self.pgl.setTransformRotation(0)
 
-        # handle for modes in which passes are not synced to volumes
+        # Time-based sweeps restart after moving beyond the sweep area.
         if self.nVolumesPerSweep is None and self.barStimulus.x > self.passEndX:
-            # reset for next pass
             self.initPass(volumeNumber=volumeNumber)
 
                   
     def initPass(self, volumeNumber=0):
-        '''
-        Initialize the pass parameters for the bar stimulus.
-        '''
-        # save direction
-        self.passDir = self.dir
+        """Initialize a sweep with the bar inside its first and last boundaries.
 
-        # set time
+        Positions refer to the bar's center in its unrotated coordinate frame.
+        The first and last bars lie fully inside the configured sweep width.
+        """
+        self.passDir = self.dir
         self.passStartTime = self.pgl.getSecs()
         self.volumeNumber = volumeNumber
-        
-        # set the x, y start and end positions
-        self.passStartX = -self.sweepWidth/2 - self.width/2
-        self.passEndX = self.sweepWidth/2 + self.width/2
+
+        # Inset the center by half a bar width so the first and last positions
+        # contain a full bar rather than placing it entirely outside the sweep.
+        self.passStartX = -self.sweepWidth / 2 + self.width / 2
+        self.passEndX = self.sweepWidth / 2 - self.width / 2
         self.passStartY = 0
         self.passEndY = 0
-        
-        # set the bar stimulus start position            
+
+        # Initialize the checkerboard at the beginning of the sweep.
         self.barStimulus.x = self.passStartX
         self.barStimulus.y = self.passStartY
-        
-        # if volumesPerSweepPeriod is set, calculate step size accordingly
+
+        # Distribute scanner-driven positions evenly between both endpoints.
         if self.nVolumesPerSweep is not None:
-            self.stepSizePerVolume = (self.passEndX-self.passStartX)/(self.nVolumesPerSweep-1)
+            if self.nVolumesPerSweep < 2: raise ValueError("Volume-based bar sweeps require at least two volumes.")
+            self.stepSizePerVolume = (self.passEndX - self.passStartX) / (self.nVolumesPerSweep - 1)
             
 ################################################################
 # videoTransform which specifies preferred orientation of movies

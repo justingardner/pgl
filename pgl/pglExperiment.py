@@ -1593,22 +1593,44 @@ class pglExperiment(pglExperimentBase):
                 self.startPhase(phaseNum=self.state.phaseNums[self.state.currentPhaseIndex])
 
     def isAbortedRun(self):
-        '''
-        heuristics to reutnr true/false on aborted runs
-        '''
-        aborted = False
-        for task in self.tasks:
-            if task.settings.nTrials != np.inf:
-                # if less trials than nTrials were run, then it is aborted
-                if task.state.currentTrial+1 < task.settings.nTrials:
-                    pglMessages.message(f"Detected aborted task with {task.state.currentTrial+1}/{task.settings.nTrials} trials run: {task.settings.taskSaveName}", messageType='experiment')
-                    aborted=True
-            else:
-                # if less than 10 trials were run it is aborted
-                if task.state.currentTrial < 10:
-                    pglMessages.message(f"Detected aborted task with less than 10 trials: {task.settings.taskSaveName}",messageType='experiment')
-                    aborted=True
-        return aborted
+        """Decide whether this run should be saved under trash.
+
+        Explicitly marked main tasks take precedence. If none are marked,
+        all tasks are candidates. A run is retained if any candidate has
+        enough recorded trial starts.
+
+        Finite tasks require their configured nTrials. Infinite tasks retain
+        the existing minimum of ten trials.
+
+        This is a trial-count heuristic, not a completion or data-quality
+        check. It does not change acquisition error reporting.
+        """
+        # Background tasks cannot disqualify a run when main tasks are marked.
+        mainTasks = [task for task in self.tasks if getattr(task.settings, "isMainTask", False)]
+        candidates = mainTasks if mainTasks else list(self.tasks)
+
+        if not candidates:
+            pglMessages.message("Detected aborted run: no tasks are available for trial-count classification.", messageType='experiment')
+            return True
+
+        shortfalls = []
+
+        for task in candidates:
+            # Count recorded trial starts rather than interpreting currentTrial,
+            # which also changes when a finite task completes.
+            nTrialsRun = task.data.nTrials
+            configuredTrials = task.settings.nTrials
+            requiredTrials = 10 if np.isinf(configuredTrials) else configuredTrials
+
+            # Any qualifying candidate is sufficient to retain the run.
+            if nTrialsRun >= requiredTrials: return False
+
+            shortfalls.append(f"{task.settings.taskSaveName}: {nTrialsRun}/{requiredTrials:g} trials started")
+
+        # Report failure only after checking every candidate.
+        candidateType = "main tasks" if mainTasks else "candidate tasks"
+        pglMessages.message(f"Detected aborted run: none of the {candidateType} reached its trial threshold. " + "; ".join(shortfalls), messageType='experiment')
+        return True
     
     ################################################################
     # Save experiment components independently
@@ -2138,7 +2160,9 @@ class pglTaskSettings(pglTraitSettings):
     config = Instance(SimpleNamespace,args=(),kw={},help="Place for configuration variables")
     saveEyeTracker = Bool(False, help="Whether to save eye tracker events this task (if we have an eye tracker).")    
     taskID = Int(0, help="Numeric identifier for the task, used for pglExperiment to keep track of tasks.")
-
+    verbose = Bool(True, help="Print routine task messages and trial parameters. Does not suppress warnings or errors.")
+    isMainTask = Bool(False, help="Use this task to judge whether enough trials ran. If no tasks are marked, all tasks are candidates.")
+    
     # make sure that any settings that the experimenter writes into settings get saved
     _serializeUnregisteredFields = True
 
@@ -2783,68 +2807,121 @@ class pglTask(pglTaskBase):
         pass
 
     def _startSegment(self, updateTime):
-        '''
-        Internal control logic for advancing to the next segment or ending the trial.
-        Not meant to be overridden — override startSegment() instead for custom
-        per-segment behavior.
-        '''
+        """Advance a segment or end the trial using its finalized segment list.
+
+        Called by the existing timing and scanner-trigger logic.
+        Override startSegment() for per-segment stimulus behavior, or
+        modifyTrialSegments() to customize timing before the trial begins.
+        """
+        # Preserve the elapsed duration of a segment explicitly jumped
+        # by setting its runtime length to zero.
         if self.state.currentSegment >= 0 and self._thisTrialSeglen[self.state.currentSegment] == 0:
             self._thisTrialSeglen[self.state.currentSegment] = updateTime - self.state.segmentStartTime
 
-        if (self.state.currentSegment + 1) >= self.settings.nSegments:
+        # Use this trial's segment count, not the configured default count.
+        if self.state.currentSegment + 1 >= len(self._thisTrialSeglen):
             self.endTrial(updateTime)
+
             if self.done(self.state.currentTrial + 1):
                 self.state.currentTrial += 1
             else:
-                self.startTrial(updateTime)   # recurses into _startSegment internally, not startSegment
+                self.startTrial(updateTime)
+
         else:
+            # Record the new segment before invoking the subclass callback.
             self.state.currentSegment += 1
             self.state.segmentStartTime = updateTime
             self.data.events.append(pglEventSegment(self.state.currentSegment, updateTime))
 
             if self.settings.saveEyeTracker:
-                self.e.saveEyeTrackerEvent(eventType="segment", taskID=self.settings.taskID,
-                    trialNum=self.state.currentTrial, segmentNum=self.state.currentSegment,
-                    timestamp=updateTime, phaseNum=self.settings.phaseNum)
+                self.e.saveEyeTrackerEvent(
+                    eventType="segment",
+                    taskID=self.settings.taskID,
+                    trialNum=self.state.currentTrial,
+                    segmentNum=self.state.currentSegment,
+                    timestamp=updateTime,
+                    phaseNum=self.settings.phaseNum,
+                )
 
             self.waitUntilVolumeTrigger = False
             self.startSegment(updateTime)
             
     def startTrial(self, startTime):
-        '''
-        Start a trial.
-        '''
+        """Initialize trial parameters and timing, then start the first segment."""
+        from numbers import Real
+
         self.state.currentTrial += 1
         self.state.currentSegment = -1
         self.data.events.append(pglEventTrial(self.state.currentTrial, startTime))
         self.state.trialStartTime = startTime
 
         if self.settings.saveEyeTracker:
-            self.e.saveEyeTrackerEvent(eventType="trial", taskID=self.settings.taskID,
-                trialNum=self.state.currentTrial, segmentNum=self.state.currentSegment,
-                timestamp=startTime, phaseNum=self.settings.phaseNum)
+            self.e.saveEyeTrackerEvent(eventType="trial", taskID=self.settings.taskID, trialNum=self.state.currentTrial, segmentNum=self.state.currentSegment, timestamp=startTime, phaseNum=self.settings.phaseNum)
 
-        # parameters and trial variables
+        ################################################################
+        # Generate parameters using this task's verbosity
+        ################################################################
         self.data.params.append({})
         self.currentParams = self.data.params[-1]
+
         for parameter in self.parameters:
-            self.data.params[-1].update(parameter.get())
+            # Apply before get(), which can generate and announce a new block.
+            # Recursive propagation also handles nested parameter blocks.
+            parameter.setVerbose(self.settings.verbose)
+            self.currentParams.update(parameter.get())
+
         self.data.trialVariables.append({})
 
-        # draw segment lengths before any segment starts
-        self._thisTrialSeglen = [
-            float('inf') if math.isinf(min_val) or math.isinf(max_val)
-            else random.uniform(min_val, max_val)
-            for min_val, max_val in zip(self.settings.segmin, self.settings.segmax)
+        ################################################################
+        # Randomize timing, then allow trial-specific modifications
+        ################################################################
+        if not (len(self.settings.segmin) == len(self.settings.segmax) == len(self.settings.waitUntilVolumeTrigger) == self.settings.nSegments):
+            raise ValueError("Segment bounds and scanner-wait flags must match settings.nSegments.")
+
+        proposedSeglen = [
+            float('inf') if math.isinf(minVal) or math.isinf(maxVal)
+            else random.uniform(minVal, maxVal)
+            for minVal, maxVal in zip(self.settings.segmin, self.settings.segmax)
         ]
 
-        # print trial header before the segment hook can print anything
-        pglMessages.print(f"({self.settings.taskName}) Trial {self.state.currentTrial+1}: ", end='', messageType='experiment')
-        for name, value in self.data.params[-1].items():
-            pglMessages.print(f'{name}={value}', end=' ', messageType='experiment')
-        pglMessages.print("", messageType='experiment')
+        # Parameters and trial variables are available to the callback.
+        # Call once per trial, before any segment starts.
+        modifiedSeglen = self.modifyTrialSegments(proposedSeglen)
 
-        # now start the first segment (currentSegment -1 -> 0)
+        ################################################################
+        # Validate and copy the finalized segment lengths
+        ################################################################
+        if not isinstance(modifiedSeglen, (list, tuple, np.ndarray)):
+            raise TypeError("modifyTrialSegments() must return a list, tuple, or one-dimensional NumPy array.")
+        if isinstance(modifiedSeglen, np.ndarray) and modifiedSeglen.ndim != 1:
+            raise ValueError("modifyTrialSegments() must return a one-dimensional sequence.")
+        if not 1 <= len(modifiedSeglen) <= self.settings.nSegments:
+            raise ValueError("modifyTrialSegments() must return between one and settings.nSegments lengths.")
+
+        trialSeglen = []
+        for segmentIndex, duration in enumerate(modifiedSeglen):
+            if isinstance(duration, (bool, np.bool_)) or not isinstance(duration, Real):
+                raise TypeError(f"Segment {segmentIndex} duration must be a real number.")
+
+            duration = float(duration)
+            if math.isnan(duration) or duration < 0:
+                raise ValueError(f"Segment {segmentIndex} duration must be nonnegative and not NaN.")
+
+            # Zero and positive infinity retain their existing timing behavior.
+            trialSeglen.append(duration)
+
+        # Keep a separate list so callback-owned data cannot alter live timing.
+        self._thisTrialSeglen = trialSeglen
+
+        ################################################################
+        # Print routine trial information only when requested
+        ################################################################
+        if self.settings.verbose:
+            pglMessages.print(f"({self.settings.taskName}) Trial {self.state.currentTrial + 1}: ", end='', messageType='experiment')
+            for name, value in self.currentParams.items(): pglMessages.print(f'{name}={value}', end=' ', messageType='experiment')
+            pglMessages.print("", messageType='experiment')
+
+        # Start segment zero using this trial's finalized timing.
         self._startSegment(startTime)
 
     def endTrial(self, endTime):
@@ -2964,6 +3041,20 @@ class pglTask(pglTaskBase):
         '''
         # set current segment length to 0 to force jump
         self._thisTrialSeglen[self.state.currentSegment] = 0
+        
+    def modifyTrialSegments(self, seglen):
+        """Modify randomized segment lengths before the first segment starts.
+
+        currentParams already contains this trial's parameter values.
+        seglen is a fresh list; changing it does not change task settings.
+
+        Return a nonempty sequence of nonnegative durations, optionally
+        shortened. Positive infinity is allowed for indefinite segments.
+        Adding more segments than configured is not supported.
+
+        Scanner-wait flags remain associated with their original indices.
+        """
+        return seglen
         
     ################################################################
     # Automatically capture source when an acquisition task is defined

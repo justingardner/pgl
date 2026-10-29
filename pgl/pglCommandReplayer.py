@@ -696,85 +696,36 @@ class pglCommandReplayer:
     # Finalize and save the current recording session
     ################################################################
     def recordingSave(self, filename, outcome="completed"):
-        """Stop capture, analyze, and save while retaining buffers for retry.
+        """Stop capture and save raw recording data without consistency analysis.
 
         A previously stopped session keeps its original outcome and stop time.
-        Analysis is diagnostic: failure must not prevent raw recording saving.
-        Saving does not establish that every command is supported by replay.
+        Recording analysis is deferred until explicitly requested during analysis.
+
+        Save failures propagate, and buffers remain available for retry.
+        Successful saving does not establish timing quality or replay support.
         """
         from .pglRecordingFile import pglRecordingFile
-        from .pglMessages import pglMessages
 
+        # Require an available session and a recognized acquisition outcome.
         state = getattr(self, "_recordingState", None)
-        if state not in ("active", "stopped"):
-            raise RuntimeError("No recording session is available to save.")
-        if outcome not in ("completed", "aborted", "error", "interrupted"):
-            raise ValueError("Unknown recording outcome.")
+        if state not in ("active", "stopped"): raise RuntimeError("No recording session is available to save.")
+        if outcome not in ("completed", "aborted", "error", "interrupted"): raise ValueError("Unknown recording outcome.")
 
-        # Low-level capture must not have been restarted outside the session.
+        # Prevent exporting a stopped session whose low-level capture was
+        # restarted independently of the recording-session lifecycle.
         if state == "stopped" and (self.commandRecording or self.flushRecording):
             raise RuntimeError("Capture was restarted after the session stopped.")
 
+        # Stop active capture; leave an already stopped session unchanged.
         if state == "active": self.recordingStop(outcome=outcome)
 
-        # Export outside presentation. Exported metadata is independent of
-        # the live session; analysis does not modify the captured buffers.
+        # Export raw capture outside presentation. Do not run analyze() here:
+        # timing diagnostics and replay-completeness checks belong in analysis.
         data = self.recordingData()
-        warningMessage = None
 
-        try:
-            report = dict(pglRecordingFile.analyze(data))
-            report["status"] = "completed"
-
-            # Check report serialization inside the analysis failure boundary.
-            # An unserializable report must not block saving the raw capture.
-            pglRecordingFile._encodeMetadata({"analysis": report}, ())
-
-            warningFindings = [
-                finding for finding in report["findings"]
-                if finding["severity"] == "warning"
-            ]
-            if warningFindings:
-                details = "; ".join(
-                    f"{finding['code']}={finding['count']}"
-                    for finding in warningFindings[:5]
-                )
-                if len(warningFindings) > 5:
-                    details += f"; {len(warningFindings) - 5} additional categories"
-                warningMessage = f"Recording analysis: {details}. See metadata['analysis'] for details."
-
-        except Exception as error:
-            # Preserve a small, serializable diagnostic instead of allowing
-            # optional analysis to prevent essential raw recording storage.
-            report = {
-                "status": "failed",
-                "replayCompleteness": "notEstablished",
-                "error": {
-                    "module": type(error).__module__,
-                    "type": type(error).__name__,
-                    "message": str(error),
-                },
-            }
-            warningMessage = (
-                f"Recording analysis failed ({type(error).__name__}: {error}). "
-                "Raw recording was saved with analysis failure metadata."
-            )
-
-        data["metadata"]["analysis"] = report
-
-        # HDF5 failures still propagate normally. Buffers remain available
-        # for retry, and no successful publication is reported prematurely.
-        savedFilename = pglRecordingFile.save(filename, **data)
-
-        # Diagnostic output must not turn a successful publication into a
-        # reported save failure, including when warning handling is customized.
-        if warningMessage:
-            try:
-                pglMessages.warning(warningMessage)
-            except Exception:
-                pass
-
-        return savedFilename
+        # Publish through the existing file writer, preserving its validation
+        # and write-error handling. Do not clear buffers or hide save failures.
+        return pglRecordingFile.save(filename, **data)
     
     ################################################################
     # Prepare drawing reconstruction without touching the renderer

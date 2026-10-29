@@ -175,24 +175,21 @@ class pglParameter(pglStateDataSettings):
         return (paramNames, parameterBlock)
 
     def startBlock(self):
-        '''
-        Start a block.
-        '''
-        # get randomization of parameters
-        (paramNames, parameterBlock) = self.getParameterBlock()
-        
-        # append to the data lists
+        """Generate and record the next parameter block."""
+        paramNames, parameterBlock = self.getParameterBlock()
+
+        # Record the block regardless of whether routine messages are enabled.
         self.data.parameterNames.append(paramNames)
         self.data.parameterBlocks.append(parameterBlock)
         self.data.blockLengths.append(len(parameterBlock))
-        
-        # increment block number and reset trial in block
+
+        # Start at the first entry of the new block.
         self.state.blockNum += 1
         self.state.currentTrialInBlock = 0
-        
-        # display block information        
-        pglMessages.message(f"Block {self.state.blockNum+1}: {len(parameterBlock)} trials randomized over: {paramNames}", messageType='parameter')
 
+        # Default to verbose for older settings without this field.
+        if getattr(self.settings, "verbose", True): pglMessages.message(f"Block {self.state.blockNum + 1}: {len(parameterBlock)} trials randomized over: {paramNames}", messageType='parameter')
+        
     def print(self):
         """
         Print the details of the pglParameter instance.
@@ -335,6 +332,16 @@ class pglParameter(pglStateDataSettings):
         self.state.randomNumberGeneratorState = self._rng.bit_generator.state
         parameterPath = posixpath.join(str(dataPath), self.settings.name)
         return super().saveBundleStrict(dataPath=parameterPath, filesystem=filesystem, filesystemPrefix=filesystemPrefix)
+    
+    def setVerbose(self, verbose=True):
+        """Set routine-message verbosity for this parameter and its children.
+
+        Explicit print() calls and warnings remain available.
+        """
+        self.settings.verbose = bool(verbose)
+
+        # Block and nested-block parameters keep their children in settings.
+        for parameter in getattr(self.settings, "parameters", []): parameter.setVerbose(verbose)
 ##########################
 # Parameter batch class
 ##########################
@@ -617,6 +624,7 @@ class pglParameterSettings(pglSerialize):
     randomSeed: int = 0
     catchTrialEvery: int | None = None
     catchBatchEvery: int | None = None
+    verbose: bool = True
 
 @dataclass
 class pglParameterSettingsBatch(pglParameterSettings):
