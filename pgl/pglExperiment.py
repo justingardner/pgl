@@ -651,6 +651,7 @@ class pglExperiment(pglExperimentBase):
                     f"capture source for task {task.settings.taskName}",
                     task.captureSource,
                     sourceErrors,
+                    reportProgress=False
                 )
 
             # A failed configuration is not a successfully initialized task.
@@ -889,48 +890,173 @@ class pglExperiment(pglExperimentBase):
     ################################################################
     # Attempt an independent save or cleanup operation
     ################################################################
-    def _attemptRunAction(self, operation, action, errors):
-        """Collect failures so other independent operations can still run."""
+    def _attemptRunAction(self, operation, action, errors, reportProgress=True):
+        """Report routine progress only during saving; always report failures."""
+        import time
+
+        started = time.monotonic()
+
+        # Only save() enables detailed progress. Initialization and cleanup
+        # remain quiet unless an operation fails.
+        showProgress = (
+            reportProgress
+            and getattr(self, "_saveProgressActive", False)
+        )
+
+        if showProgress:
+            self._reportRunProgress(f"START: {operation}")
+
         try:
             result = action()
-            if result is False: raise RuntimeError(f"{operation} returned False.")
-            return True
+            if result is False:
+                raise RuntimeError(f"{operation} returned False.")
 
         except (Exception, KeyboardInterrupt, SystemExit) as error:
-            # Interrupts during finalization are deferred, not treated as
-            # success. The caller raises an error after the remaining attempts.
+            # The interrupted operation is not resumed. Remaining independent
+            # operations are still attempted, and the caller later raises.
             errors.append(error)
+            elapsed = time.monotonic() - started
+            outcome = (
+                "INTERRUPTED"
+                if isinstance(error, (KeyboardInterrupt, SystemExit))
+                else "FAILED"
+            )
+
+            # Always report failures, including during initialization/cleanup.
+            self._reportRunProgress(
+                f"{outcome}: {operation} ({elapsed:.2f}s): "
+                f"{type(error).__name__}: {error}"
+            )
+
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                self._reportRunProgress(
+                    "This operation did not return successfully. "
+                    "Continuing remaining independent attempts."
+                )
+
             self._recordRunError(operation, error)
             return False
 
+        if showProgress:
+            self._reportRunProgress(
+                f"DONE: {operation} ({time.monotonic() - started:.2f}s)"
+            )
+
+        return True
+
+    ################################################################
+    # Report finalization separately from the main local save pass
+    ################################################################
+    def _finalizeRun(self):
+        """Finalize acquisition with separate save and cleanup reporting."""
+        #self._reportRunProgress(
+        #    "FINALIZATION STARTED: stop capture, save locally, then clean up. "
+        #    "Final metadata will be updated after cleanup."
+        #)
+
+        try:
+            self._finalizeRunContents()
+
+        except (Exception, KeyboardInterrupt, SystemExit):
+            self._reportRunProgress(
+                "FINALIZATION DID NOT COMPLETE SUCCESSFULLY."
+            )
+            self._reportRunProgress(
+                f"Local save: {getattr(self.data, 'saveStatus', 'unknown')} | "
+                f"Cleanup: {getattr(self.data, 'cleanupStatus', 'unknown')} | "
+                f"Eye tracker: {getattr(self.data, 'eyeTrackerSaveStatus', 'unknown')}"
+            )
+
+            if getattr(self.data, "saveStatus", None) != "complete":
+                self._reportSaveRecovery()
+            else:
+                self._reportRunProgress(
+                    "The local save is marked complete. "
+                    "Review the failed stage: a cleanup or eye-tracker failure "
+                    "does not by itself mean the local data save failed."
+                )
+
+            raise
+
+        self._reportRunProgress(
+            f"Experiment finished run and saved to: {getattr(self, '_runSavePath', None)}"
+        )
     ################################################################
     # Finalize successful or interrupted acquisition
     ################################################################
-    def _finalizeRun(self):
-        """Stop owned capture, attempt local saving, then clean up devices."""
+    ################################################################
+    # Finalize successful or interrupted acquisition
+    ################################################################
+    def _finalizeRunContents(self):
+        """Stop owned capture, attempt local saving, then clean up devices.
+
+        No task/result display is performed here.
+
+        Local saving is attempted before screen/device cleanup and eye-tracker
+        transfer. Final experiment metadata is updated after those operations.
+        """
         errors = []
 
         def stopRecording():
             metadata = self._getExperimentRecording()
             if metadata is not None:
-                self.pgl.recordingStop(outcome=getattr(self, "_recordingOutcome", "error"))
+                self.pgl.recordingStop(
+                    outcome=getattr(self, "_recordingOutcome", "error")
+                )
+
+        ################################################################
+        # Stop capture and attempt local saving first
+        ################################################################
 
         # Stop before any save or cleanup command can enter the recording.
-        self._attemptRunAction("stop experiment recording", stopRecording, errors)
+        self._attemptRunAction(
+            "stop experiment recording",
+            stopRecording,
+            errors,
+        )
 
         # Attempt local saving before potentially blocking device operations.
-        if not self._attemptRunAction("save experiment", lambda: self.save(includeEyeTracker=False), errors):
+        # The save() wrapper reports whether this save pass completed.
+        if not self._attemptRunAction(
+            "save experiment",
+            lambda: self.save(includeEyeTracker=False),
+            errors,
+        ):
             self.data.saveStatus = "failed"
 
-        # Normal acquisition already cleared/flushed the display. Recovery
-        # must not send drawing commands on a potentially interrupted socket.
-        cleanupErrorCount = len(errors)
-        self._attemptRunAction("close experiment screen", lambda: self.endScreen(clearScreen=False), errors)
-        self._attemptRunAction("close digital IO", self.endDigitalIO, errors)
-        self._attemptRunAction("close experiment devices", self.endDevices, errors)
-        self.data.cleanupStatus = "failed" if len(errors) > cleanupErrorCount else "complete"
+        ################################################################
+        # Attempt screen and device cleanup after the local save attempt
+        ################################################################
 
-        # Essential local files have been attempted before EyeLink transfer.
+        # Local saving has been attempted. Avoid extra drawing commands during
+        # cleanup, especially after an interrupted renderer exchange.
+        #
+        # If closeScreenOnEnd=False, this does not blank the final stimulus.
+        cleanupErrorCount = len(errors)
+
+        self._attemptRunAction(
+            "close experiment screen",
+            lambda: self.endScreen(clearScreen=False),
+            errors,
+        )
+        self._attemptRunAction(
+            "close digital IO",
+            self.endDigitalIO,
+            errors,
+        )
+        self._attemptRunAction(
+            "close experiment devices",
+            self.endDevices,
+            errors,
+        )
+
+        self.data.cleanupStatus = (
+            "failed" if len(errors) > cleanupErrorCount else "complete"
+        )
+
+        ################################################################
+        # Retrieve eye-tracker data after essential local save attempts
+        ################################################################
         if self.eyeTracker is not None:
             eyeTrackerErrorCount = len(errors)
             dataPath = getattr(self, "_runSavePath", None)
@@ -940,9 +1066,18 @@ class pglExperiment(pglExperimentBase):
                     filename = dataPath / self.settings.eyetracker[0].lower()
                     return self.eyeTracker.save(filename)
 
-                self._attemptRunAction("save eye tracker", saveEyeTracker, errors)
+                self._attemptRunAction(
+                    "save eye tracker",
+                    saveEyeTracker,
+                    errors,
+                )
+
             else:
-                self._attemptRunAction("stop eye tracker", self.eyeTracker.stop, errors)
+                self._attemptRunAction(
+                    "stop eye tracker",
+                    self.eyeTracker.stop,
+                    errors,
+                )
 
             self.data.eyeTrackerSaveStatus = (
                 "failed" if len(errors) > eyeTrackerErrorCount
@@ -950,23 +1085,45 @@ class pglExperiment(pglExperimentBase):
                 else "notSaved"
             )
 
-        # Persist final outcome metadata without repeating task or EDF saves.
+        ################################################################
+        # Persist final outcome metadata without repeating large saves
+        ################################################################
+
+        # These writes update cleanup/eye-tracker outcomes without repeating
+        # task, recording, or EDF saves.
+        #
+        # Their interruption safety depends on the implementation of
+        # saveStrict(); successful return alone does not prove fsync durability.
         dataPath = getattr(self, "_runSavePath", None)
+
         if dataPath is not None:
-            if not self._attemptRunAction("update final experiment state", lambda: self.state.saveStrict(dataPath / "state.json"), errors):
+            if not self._attemptRunAction(
+                "update final experiment state",
+                lambda: self.state.saveStrict(dataPath / "state.json"),
+                errors,
+            ):
                 self.data.saveStatus = "failed"
-            if not self._attemptRunAction("update final experiment data", lambda: self.data.saveStrict(dataPath / "data.json"), errors):
+
+            if not self._attemptRunAction(
+                "update final experiment data",
+                lambda: self.data.saveStrict(dataPath / "data.json"),
+                errors,
+            ):
                 self.data.saveStatus = "failed"
 
         # run() preserves an earlier acquisition error. Otherwise this exposes
         # the first finalization failure after all independent attempts.
-        if errors: raise errors[0]
+        if errors:
+            raise errors[0]
     
     def _run(self):
         '''
         Execute the experiment.
 
         The public run() method handles saving, exception recovery, and cleanup.
+        No final screen-clear/flush is performed before returning to that save
+        path. Task-ending hooks still run during acquisition so their finalized
+        data can be included in the save.
         '''
         # Default to error; the public wrapper marks successful acquisition.
         self.state.runFinishedWithError = True
@@ -976,10 +1133,15 @@ class pglExperiment(pglExperimentBase):
             return
 
         # Start eye tracker recording if we have an eye tracker.
-        if self.eyeTracker is not None: self.eyeTracker.start()
+        if self.eyeTracker is not None:
+            self.eyeTracker.start()
 
         # Calculate the distinct phases that we will need to cover.
-        self.state.phaseNums = sorted({task.settings.phaseNum for task in self.tasks if task.settings.phaseNum is not None}) or None
+        self.state.phaseNums = sorted({
+            task.settings.phaseNum
+            for task in self.tasks
+            if task.settings.phaseNum is not None
+        }) or None
         self.state.currentPhaseIndex = 0
 
         # Initialize variables.
@@ -993,21 +1155,35 @@ class pglExperiment(pglExperimentBase):
         ignoreInitialVolumes = self.settings.ignoreInitialVolumes
 
         # See whether we need to run eye calibration.
-        if self.settings.eyetracker is not None: self.calibrateEyeTracker()
+        if self.settings.eyetracker is not None:
+            self.calibrateEyeTracker()
 
         # Disabled keys must not accidentally match an event with keyCode=None.
         def matchesKey(event, keyCode, keydownOnly=False):
-            return keyCode is not None and event.type == "keyboard" and event.keyCode == keyCode and (not keydownOnly or event.eventType == "keydown")
+            return (
+                keyCode is not None
+                and event.type == "keyboard"
+                and event.keyCode == keyCode
+                and (not keydownOnly or event.eventType == "keydown")
+            )
 
-        # Wait for a start key or scanner trigger only when configured.
+        ################################################################
+        # Wait for a start key or scanner trigger when configured
+        ################################################################
         if self.state.startKeyCode is not None or self.settings.startOnVolumeTrigger:
             while not self.state.experimentStarted:
                 if manualPreStart:
-                    self.pgl.text(f"Press {self.settings.startKey} key to make experiment start", y=0)
+                    self.pgl.text(
+                        f"Press {self.settings.startKey} key to make experiment start",
+                        y=0,
+                    )
                 elif self.settings.startOnVolumeTrigger:
                     self.pgl.text("Waiting for volume trigger to start experiment", y=0)
                 else:
-                    self.pgl.text(f"Press {self.settings.startKey} key to start experiment", y=0)
+                    self.pgl.text(
+                        f"Press {self.settings.startKey} key to start experiment",
+                        y=0,
+                    )
 
                 # Flush to display text, then poll for events.
                 self.pgl.flush()
@@ -1015,10 +1191,16 @@ class pglExperiment(pglExperimentBase):
                 self.data.events.extend(events)
 
                 # Match the configured start key.
-                if any(matchesKey(event, self.state.startKeyCode, keydownOnly=True) for event in events):
+                if any(
+                    matchesKey(event, self.state.startKeyCode, keydownOnly=True)
+                    for event in events
+                ):
                     if manualPreStart:
                         manualPreStart = False
-                        pglMessages.message(f"Manual pre-start ended after {manualPreStartVolumes} volumes.", messageType='experiment')
+                        pglMessages.message(
+                            f"Manual pre-start ended after {manualPreStartVolumes} volumes.",
+                            messageType='experiment',
+                        )
                     else:
                         self.state.experimentStarted = True
 
@@ -1031,10 +1213,15 @@ class pglExperiment(pglExperimentBase):
                             elif ignoreInitialVolumes > 0:
                                 ignoreInitialVolumes -= 1
                             else:
-                                pglMessages.message(f"Ignored {self.settings.ignoreInitialVolumes} initial volumes.", messageType='experiment')
+                                pglMessages.message(
+                                    f"Ignored {self.settings.ignoreInitialVolumes} initial volumes.",
+                                    messageType='experiment',
+                                )
                                 self.state.experimentStarted = True
                                 self.state.volumeNumber += 1
-                                self.data.events.append(pglEventVolumeTrigger(timestamp=event.timestamp))
+                                self.data.events.append(
+                                    pglEventVolumeTrigger(timestamp=event.timestamp)
+                                )
 
                 # Allow aborting before any tasks have started.
                 if any(matchesKey(event, self.state.endKeyCode) for event in events):
@@ -1045,13 +1232,22 @@ class pglExperiment(pglExperimentBase):
             # No start gate: begin immediately.
             self.state.experimentStarted = True
 
-        # An abort at the waiting screen must not start tasks.
+        ################################################################
+        # Save a pre-start abort without another renderer exchange
+        ################################################################
         if self.state.experimentDone:
-            self.pgl.clearScreen(self.settings.backgroundColor)
-            self.pgl.flush()
+            # An abort at the waiting screen must not start tasks.
+            # Do not clear/flush here: renderer communication could block
+            # before the public run() wrapper gets a chance to save.
             self.data.endTime = self.pgl.getSecs()
-            pglMessages.message("Experiment ended before tasks started.", messageType='experiment')
+            self._reportRunProgress(
+                "Experiment ended before tasks started; proceeding to save."
+            )
             return
+
+        ################################################################
+        # Start acquisition
+        ################################################################
 
         # Start the experiment before invoking task start hooks, so a failure
         # in a start hook still has an experiment start timestamp.
@@ -1070,9 +1266,11 @@ class pglExperiment(pglExperimentBase):
             self.data.events.extend(events)
 
             # End all running tasks when the configured end key is received.
+            # Task-ending hooks may finalize data, so retain them before saving.
             if any(matchesKey(event, self.state.endKeyCode) for event in events):
                 self.state.experimentDone = True
-                for task in self.currentTasks: task.end()
+                for task in self.currentTasks:
+                    task.end()
                 continue
 
             # Check for volume trigger key.
@@ -1082,7 +1280,9 @@ class pglExperiment(pglExperimentBase):
                     # keyboard event is already retained in experiment data.
                     events.pop(iEvent)
                     self.state.volumeNumber += 1
-                    self.data.events.append(pglEventVolumeTrigger(timestamp=event.timestamp))
+                    self.data.events.append(
+                        pglEventVolumeTrigger(timestamp=event.timestamp)
+                    )
                     break
 
             # Match response keys and preserve their original event timestamps.
@@ -1099,6 +1299,7 @@ class pglExperiment(pglExperimentBase):
             # Update tasks in the current phase.
             phaseDone = False
             updateTime = self.pgl.getSecs()
+
             for task in self.currentTasks:
                 task.update(
                     updateTime=updateTime,
@@ -1107,29 +1308,37 @@ class pglExperiment(pglExperimentBase):
                     tasks=self.currentTasks,
                     events=events,
                 )
-                if task.done(): phaseDone = True
+                if task.done():
+                    phaseDone = True
 
-            # Update the screen.
-            if self.flush: self.pgl.flush()
+            # Preserve normal acquisition presentation timing.
+            if self.flush:
+                self.pgl.flush()
 
             # Go to the next phase or end the experiment.
             if phaseDone:
-                for task in self.currentTasks: task.end()
+                for task in self.currentTasks:
+                    task.end()
 
                 if self.state.currentPhaseIndex >= len(self.state.phaseNums) - 1:
                     self.state.experimentDone = True
                 else:
                     self.state.currentPhaseIndex += 1
-                    self.startPhase(phaseNum=self.state.phaseNums[self.state.currentPhaseIndex])
+                    self.startPhase(
+                        phaseNum=self.state.phaseNums[self.state.currentPhaseIndex]
+                    )
 
-        # Clear the screen after normal acquisition.
-        self.pgl.clearScreen(self.settings.backgroundColor)
-        self.pgl.flush()
+        ################################################################
+        # Return directly to saving without a final renderer exchange
+        ################################################################
 
-        # Mark acquisition end before saving or device cleanup.
+        # Record acquisition end before saving or device cleanup.
+        # Do not clear/flush the screen here. The public run() wrapper calls
+        # _finalizeRun(), which attempts local saving before screen cleanup.
         self.data.endTime = self.pgl.getSecs()
-        pglMessages.message("Experiment done.", messageType='experiment')
-        pglMessages.printHeader(messageType='experiment')
+        #self._reportRunProgress(
+        #    "Acquisition ended; proceeding to save before screen/device cleanup."
+        #)
     
     def initDigitalIO(self):
         '''
@@ -1635,7 +1844,7 @@ class pglExperiment(pglExperimentBase):
     ################################################################
     # Save experiment components independently
     ################################################################
-    def save(self, includeEyeTracker=True):
+    def _saveRunContents(self, includeEyeTracker=True):
         """Save available run contents, continuing after component failures.
 
         Repeated calls reuse this run's directory. Each acquisition task saves
@@ -2141,6 +2350,163 @@ class pglExperiment(pglExperimentBase):
 
         self.pgl.recordingClear()
         self._recordingReleased = True
+        
+    ################################################################
+    # Report save/cleanup progress without relying on message filters
+    ################################################################
+    def _reportRunProgress(self, message):
+        """Print timestamped progress without allowing output errors to abort saving."""
+        try:
+            print(f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] {message}", flush=True)
+        except (Exception, KeyboardInterrupt):
+            # A failed output channel must not prevent the actual save.
+            # An interrupt delivered during this brief print is ignored.
+            pass
+        
+    ################################################################
+    # Explain how to retry without rerunning acquisition
+    ################################################################
+    def _reportSaveRecovery(self):
+        """Report the destination and recovery instructions for the live object."""
+        dataPath = getattr(self, "_runSavePath", None)
+        saveStatus = getattr(self.data, "saveStatus", "unknown")
+
+        self._reportRunProgress(f"Current local save status: {saveStatus}")
+        self._reportRunProgress(
+            f"Run directory: {dataPath if dataPath is not None else 'not allocated yet'}"
+        )
+        self._reportRunProgress(
+            "Experiment/task data objects remain attached to this experiment. "
+            "Keep this object and kernel alive; do not rerun acquisition."
+        )
+
+        if getattr(self, "_recordingReleased", False):
+            self._reportRunProgress(
+                "Recording buffers were released after the recording and its "
+                "JSON reference were reported saved. Retry uses recording.h5."
+            )
+        elif getattr(self, "_recordingId", None) is not None:
+            self._reportRunProgress(
+                "Recording release is not confirmed. Retain the PGL object too; "
+                "do not call recordingClear(). Recording availability will be "
+                "checked when retrying."
+            )
+
+        self._reportRunProgress(
+            "After this cell returns, retry local saving with "
+            "e.savePendingData() — replace e with your experiment variable."
+        )
+        self._reportRunProgress(
+            "This retry excludes eye-tracker transfer and device cleanup."
+        )
+
+    ################################################################
+    # Public save entry point with explicit completion reporting
+    ################################################################
+    def save(self, includeEyeTracker=True):
+        """Enable detailed progress during saving, then restore quiet cleanup."""
+        previousProgress = getattr(self, "_saveProgressActive", False)
+
+        try:
+            self._saveProgressActive = True
+
+            # Decorative output must not prevent saving.
+            try:
+                print(
+                    "\n"
+                    "================================================================\n"
+                    "  SAVING EXPERIMENT DATA\n"
+                    "================================================================",
+                    flush=True,
+                )
+            except (Exception, KeyboardInterrupt):
+                pass
+
+            self._reportRunProgress(
+                "SAVE STARTED "
+                f"(eye-tracker transfer {'included if present' if includeEyeTracker else 'excluded'})."
+            )
+
+            try:
+                dataPath = self._saveRunContents(
+                    includeEyeTracker=includeEyeTracker
+                )
+
+            except (Exception, KeyboardInterrupt, SystemExit):
+                # Also catch failures outside the per-component helper,
+                # such as interruption while creating the run directory.
+                self.data.saveStatus = "failed"
+                self._reportRunProgress(
+                    "SAVE CALL FAILED OR WAS INTERRUPTED. "
+                    "Some components may have saved successfully; "
+                    "the complete requested save is not confirmed."
+                )
+                self._reportSaveRecovery()
+                raise
+
+            self._reportRunProgress(f"SAVE PASS COMPLETE: {dataPath}")
+
+            if not includeEyeTracker:
+                self._reportRunProgress(
+                    "Local save operations returned successfully. "
+                    "Eye-tracker transfer was not included."
+                )
+
+            # Only print the finished header after a successful save pass.
+            try:
+                print(
+                    "\n"
+                    "================================================================\n"
+                    "  FINISHED SAVING EXPERIMENT DATA\n"
+                    "================================================================",
+                    flush=True,
+                )
+            except (Exception, KeyboardInterrupt):
+                pass
+
+            return dataPath
+
+        finally:
+            # Restore even after a failed/interrupted save so subsequent
+            # cleanup does not emit routine START/DONE messages.
+            self._saveProgressActive = previousProgress
+    
+    ################################################################
+    # Retry local saving without rerunning tasks or device cleanup
+    ################################################################
+    def savePendingData(self):
+        """Retry local saving after acquisition/finalization has stopped.
+
+        Call only after the original run cell has returned.
+        Does not run task-ending hooks, display results, close devices,
+        or retrieve eye-tracker data.
+        """
+        errors = []
+
+        def stopOwnedRecording():
+            metadata = self._getExperimentRecording()
+            if metadata is not None and self.pgl._recordingState == "active":
+                return self.pgl.recordingStop(
+                    outcome=getattr(self, "_recordingOutcome", "error")
+                )
+
+        # A stop failure must not prevent attempting the experiment/task JSON.
+        self._attemptRunAction(
+            "stop owned recording for save retry",
+            stopOwnedRecording,
+            errors,
+        )
+
+        dataPath = self.save(includeEyeTracker=False)
+
+        if errors:
+            self._reportRunProgress(
+                "The save pass returned, but the recording-stop attempt failed. "
+                "Review the error before considering recovery complete."
+            )
+            raise errors[0]
+
+        return dataPath
 
 ##############################################
 # Settings for pglTask
