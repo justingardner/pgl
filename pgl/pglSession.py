@@ -3118,3 +3118,54 @@ class pglSession(pglActionable):
         from .pglBehavior import pglBehavior
 
         return pglBehavior.getBehaviorTable(self.getBehaviorData(), taskName=taskName, **options)
+    
+    ################################################################
+    # Display an existing stimulus movie
+    ################################################################
+    def displayStimulus(self, runIndex=0, *, cacheDirectory=None):
+        """Open a registered stimulus movie in the OS default application.
+
+        runIndex is a zero-based behavioral run index.
+        Saved movies are retrieved into the local cache when necessary.
+
+        Missing attachments warn and return None. Missing or corrupt
+        registered payloads raise through getDerivedFile(); they are never
+        silently regenerated.
+
+        Returns the local movie Path after a successful launch request.
+        Does not generate movies or save a database checkpoint.
+        """
+        import os
+        import subprocess
+        import sys
+
+        if type(runIndex) is not int:
+            raise TypeError("runIndex must be an integer.")
+        if not 0 <= runIndex < len(self.runs or []):
+            raise ValueError("runIndex is outside this session's runs.")
+
+        name = f"stimulusMovie.run{runIndex:06d}"
+        moviePath = self.getDerivedFile(name, cacheDirectory=cacheDirectory)
+
+        if moviePath is None:
+            pglMessages.warning(
+                f"No stimulus movie is attached for run {runIndex}. "
+                "Run pglActions.makeStimulusMovie first "
+                f"(configure runIndices=[{runIndex}], or None for all runs)."
+            )
+            return None
+
+        # Pass the filename directly, without shell interpolation.
+        # Cache files remain available after the external application opens.
+        filename = str(moviePath)
+
+        if sys.platform == "darwin":
+            subprocess.run(["open", filename], check=True)
+        elif os.name == "nt":
+            os.startfile(filename)
+        elif sys.platform.startswith("linux"):
+            subprocess.run(["xdg-open", filename], check=True)
+        else:
+            raise NotImplementedError(f"Default movie launching is unsupported on {sys.platform!r}.")
+
+        return moviePath
