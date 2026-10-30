@@ -1178,7 +1178,13 @@ class pglExperiment(pglExperimentBase):
                         y=0,
                     )
                 elif self.settings.startOnVolumeTrigger:
-                    self.pgl.text("Waiting for volume trigger to start experiment", y=0)
+                    if self.settings.startScreen[0] == "blank":
+                        self.pgl.clearScreen(self.settings.backgroundColor)
+                    elif self.settings.startScreen[0] == "fixation cross":
+                        self.pgl.clearScreen(self.settings.backgroundColor)
+                        self.pgl.fixationCross()
+                    elif self.settings.startScreen[0] == "waiting message":
+                        self.pgl.text("Waiting for volume trigger to start experiment", y=0)
                 else:
                     self.pgl.text(
                         f"Press {self.settings.startKey} key to start experiment",
