@@ -1292,6 +1292,7 @@ class pglSettings(pglTraitSettings):
     ignoreInitialVolumes = Int(0, min=0, step=1, help="Number of initial volumes to ignore")
     eatKeys = Bool(True, help="Whether to eat keypresses so they don't propagate to the OS. Will only eat the keys specified above.")
     startOnVolumeTrigger = Bool(False, help="Whether to start the experiment on the volume trigger key")
+    startScreen = List(Unicode(), default_value=["fixation cross", "blank", "waiting message"],help="What to show on the screen before the experiment starts.")
     manualPreStart = Bool(False, help="Whether to manually start the experiment before the volume trigger")
     closeScreenOnEnd = Bool(True, help="Whether to close the screen when the experiment ends")
     verbose = Bool(False, help="Typically set to False so that only essential messages and warnings are printed during experiment run")
