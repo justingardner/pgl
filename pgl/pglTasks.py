@@ -229,10 +229,15 @@ class pglBarTask(pglTask):
                 
     ########################
     def startTrial(self, startTime):
-        ''' print header to make it easier to read trial conditions'''
-        self.pgl.printHeader()
+        """Restart the bar for each new trial."""
         super().startTrial(startTime)
-        
+
+        # Each trial starts a fresh sweep, independently of how many scanner
+        # triggers arrived during the previous trial. Initialize on the next
+        # actual draw so the sweep uses that frame's current volume number.
+        # Blank catches do not draw, so initialization remains deferred.
+        if self.bars is not None: self.bars.volumeNumber = None
+                
     ########################
     def updateScreen(self):
         
@@ -308,6 +313,8 @@ class pglBarTask(pglTask):
                     # None explicitly denotes a catch; a missing key is an error.
                     direction = self.data.params[trialNumber]['directions']
                     trialNumber += 1
+                    # Match acquisition: each trial begins a fresh bar sweep.
+                    self.bars.volumeNumber = None
 
                 if event.type == 'segment' and event.eventType == 'start':
                     if trialNumber == 0: raise ValueError("Segment start occurred before any trial start.")
