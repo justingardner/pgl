@@ -175,6 +175,278 @@ class pglActions():
             # and return
             return session
         
+        
+    ################################################################
+    # makeStimulusMovie
+    ################################################################
+    class makeStimulusMovie(pglAction):
+        """Generate and attach one stimulus-preview movie per selected run.
+
+        None runIndices selects every behavioral run. Explicit indices are
+        zero-based and processed in the supplied order.
+
+        Movies are timestamp-sampled visual previews, not lossless archives
+        or independent verification of physical display visibility.
+
+        Existing attachment records and their files remain unchanged until
+        every selected movie has been generated successfully.
+
+        Does not open a movie or save a database checkpoint.
+        """
+
+        runIndices = List(Int(), default_value=None, allow_none=True, help="Zero-based run indices; None selects all runs.")
+        fps = Float(default_value=60.0, allow_none=True, help="Movie sampling rate; None infers the recorded rate.")
+        sampling = Enum(["nearest", "previous"], default_value="nearest", help="Recorded presentation timestamp sampling policy.")
+        allowAmbiguous = Bool(False, help="Explicitly accept excluded untimed frames and last-flush selection at duplicate timestamps.")
+        overwrite = Bool(False, help="Replace existing stimulus-movie attachments, without overwriting their original files.")
+        cacheDirectory = Unicode(default_value=None, allow_none=True, help="Local cache override; None uses default database settings.cacheDir.")
+
+        ################################################################
+        # Configure generation settings
+        ################################################################
+        def configure(self, **kwargs):
+            self.configureTraits(**kwargs)
+            self._validateOptions()
+            super().configure()
+
+        def _validateOptions(self):
+            """Validate again at execution because traits can be edited later."""
+            import math
+
+            if self.fps is not None and (not math.isfinite(self.fps) or self.fps <= 0):
+                raise ValueError("fps must be positive and finite, or None.")
+
+            if self.runIndices is not None:
+                if not self.runIndices: raise ValueError("runIndices must not be empty; use None for all runs.")
+                if any(type(index) is not int or index < 0 for index in self.runIndices):
+                    raise ValueError("runIndices must contain nonnegative integer indices.")
+                if len(set(self.runIndices)) != len(self.runIndices):
+                    raise ValueError("runIndices must not contain duplicates.")
+
+            if self.cacheDirectory is not None and not self.cacheDirectory.strip():
+                raise ValueError("cacheDirectory must be a nonblank local path or None.")
+
+        ################################################################
+        # Resolve the current computer's cache
+        ################################################################
+        def _cacheRoot(self):
+            from pathlib import Path
+            from .pglDatabase import pglDatabase
+
+            directory = self.cacheDirectory
+
+            if directory is None:
+                settings = pglDatabase.getSettings()
+                if settings is None: raise RuntimeError("Database settings are unavailable.")
+                directory = settings.cacheDir
+
+            if directory is None or not str(directory).strip():
+                raise ValueError("No local cache directory is configured.")
+            if "://" in str(directory):
+                raise ValueError("Stimulus movie generation requires a local cache directory.")
+
+            return Path(directory).expanduser().resolve() / "stimulusMovies"
+
+        ################################################################
+        # Construct a closed renderer; recordingMovie owns open/close
+        ################################################################
+        @staticmethod
+        def _createRenderer():
+            from pgl import pgl
+            return pgl()
+
+        ################################################################
+        # Materialize one recording through its existing filesystem
+        ################################################################
+        @staticmethod
+        def _downloadRecording(run, sourcePath, destination, label):
+            """Stream into private local staging before opening the HDF5 file.
+
+            Uses the supplied run filesystem, retaining any verification
+            implemented by that filesystem. Does not bypass it with a
+            guessed local storage path.
+            """
+            from .pglProgress import pglProgress
+
+            details = run.filesystem.info(sourcePath)
+            size = details.get("size")
+            totalBytes = int(size) if size is not None and size > 0 else None
+            copiedBytes = 0
+
+            with pglProgress(label) as progress:
+                progress(0, "Downloading recording")
+
+                with run.filesystem.open(sourcePath, "rb") as source, destination.open("xb") as target:
+                    while True:
+                        block = source.read(1024 * 1024)
+                        if not block: break
+                        if target.write(block) != len(block):
+                            raise OSError(f"Incomplete recording write: {destination}")
+
+                        copiedBytes += len(block)
+                        fraction = None if totalBytes is None else min(copiedBytes / totalBytes, 0.99)
+                        progress(fraction, f"Downloading recording — {copiedBytes / 1024**2:.1f} MiB")
+
+                # Finish after both streams close, including any source-side
+                # verification performed on close.
+                if totalBytes is not None and copiedBytes != totalBytes:
+                    raise ValueError(f"Recording size changed during download: {sourcePath}")
+
+                progress.finish("Recording downloaded")
+
+        ################################################################
+        # Generate movies, then attach completed outputs
+        ################################################################
+        def _run(self, session: pglSession) -> pglSession:
+            import posixpath
+            import shutil
+            import tempfile
+            from copy import deepcopy
+            from pathlib import Path
+            from .pglRecordingFile import pglRecordingFile
+
+            self._validateOptions()
+
+            if not isinstance(session, pglSession):
+                self.setError("makeStimulusMovie requires a pglSession.")
+                return None
+
+            runs = list(session.runs or [])
+            if not runs:
+                self.setError("Session has no behavioral runs.")
+                return None
+
+            indices = list(range(len(runs))) if self.runIndices is None else list(self.runIndices)
+            if any(index >= len(runs) for index in indices):
+                self.setError(f"runIndices is outside this session's {len(runs)} runs.")
+                return None
+
+            # Preflight every selection before downloading or encoding.
+            # Missing source files are not silently skipped or replaced by
+            # recordings guessed from another checkpoint.
+            jobs = []
+
+            for runIndex in indices:
+                run = runs[runIndex]
+                name = f"stimulusMovie.run{runIndex:06d}"
+
+                if name in session.derivedFiles and not self.overwrite:
+                    self.setError(f"{name!r} is already attached; use overwrite=True to replace it.")
+                    return None
+
+                if run.filesystem is None or run.fullDataPath is None:
+                    self.setError(f"Run {runIndex} has no recording filesystem source.")
+                    return None
+
+                sourcePath = posixpath.join(run.fullDataPath, "recording.h5")
+
+                if not run.filesystem.isfile(sourcePath):
+                    self.setError(
+                        f"Run {runIndex} does not expose recording.h5 at {sourcePath!r}. "
+                        "Its acquisition recording must be made available before movie generation."
+                    )
+                    return None
+
+                jobs.append({
+                    "runIndex": runIndex,
+                    "run": run,
+                    "name": name,
+                    "sourcePath": sourcePath,
+                })
+
+            # Snapshot metadata, not payloads. Concurrent session mutation
+            # remains unsupported, but detectable changes are not overwritten.
+            originalAttachments = deepcopy(session.derivedFiles)
+            cacheRoot = self._cacheRoot()
+            cacheRoot.mkdir(parents=True, exist_ok=True)
+            outputDirectory = Path(tempfile.mkdtemp(prefix="generation-", dir=str(cacheRoot)))
+            registrationStarted = False
+
+            try:
+                for position, job in enumerate(jobs):
+                    runIndex = job["runIndex"]
+                    label = f"Stimulus movie {position + 1}/{len(jobs)} — run {runIndex}"
+                    pglMessages.message(label)
+
+                    # Keep at most one loaded command recording at a time.
+                    # Successful movies stay in outputDirectory; downloaded
+                    # source recordings are removed after each run.
+                    with tempfile.TemporaryDirectory(prefix=".recording-", dir=str(outputDirectory)) as directory:
+                        localRecording = Path(directory) / "recording.h5"
+                        self._downloadRecording(job["run"], job["sourcePath"], localRecording, label)
+                        recording = pglRecordingFile.load(localRecording)
+
+                        try:
+                            renderer = self._createRenderer()
+                            outputPath = outputDirectory / f"stimulusMovie.run{runIndex:06d}.mp4"
+
+                            # Always create a new physical file. overwrite
+                            # controls attachment replacement, not modification
+                            # of an existing attachment's payload.
+                            renderer.recordingMovie(
+                                recording,
+                                outputPath,
+                                fps=self.fps,
+                                sampling=self.sampling,
+                                allowAmbiguous=self.allowAmbiguous,
+                                overwrite=False,
+                            )
+
+                            if renderer.isOpen() or renderer.renderTarget is not None:
+                                raise RuntimeError(f"Run {runIndex}: movie export left renderer resources active.")
+                            if not outputPath.is_file() or outputPath.stat().st_size == 0:
+                                raise RuntimeError(f"Run {runIndex}: movie export produced no nonempty MP4.")
+
+                            job["outputPath"] = outputPath
+
+                        finally:
+                            # recordingMovie owns renderer cleanup. Do not send
+                            # additional cleanup commands after a failed exchange.
+                            del recording
+
+                if session.derivedFiles != originalAttachments:
+                    raise RuntimeError("Session attachments changed during movie generation.")
+
+                # All encoders, renderers, and temporary recording directories
+                # have finished before installing any attachment.
+                registrationStarted = True
+
+                for job in jobs:
+                    session.addDerivedFile(
+                        job["name"],
+                        job["outputPath"],
+                        runIndex=job["runIndex"],
+                        mediaType="video/mp4",
+                        overwrite=self.overwrite,
+                    )
+
+            except BaseException as error:
+                # Restore metadata if hashing/registration fails partway.
+                # This is not a transaction for arbitrary trait-observer side
+                # effects; concurrent mutation is not supported.
+                safeToRemove = True
+
+                if registrationStarted:
+                    try:
+                        session.derivedFiles = originalAttachments
+                    except BaseException as rollbackError:
+                        safeToRemove = False
+                        if hasattr(error, "add_note"):
+                            error.add_note(f"Attachment rollback failed; generated files retained: {rollbackError}")
+
+                if safeToRemove:
+                    try:
+                        shutil.rmtree(outputDirectory)
+                    except BaseException as cleanupError:
+                        if hasattr(error, "add_note"):
+                            error.add_note(f"Generated-file cleanup failed: {cleanupError}")
+
+                raise
+
+            # Successful cache files remain available for display and saving.
+            # Replaced attachment files are not deleted: other sessions or
+            # applications may still be using them.
+            return session
      
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
     # action stub
