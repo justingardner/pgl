@@ -844,7 +844,15 @@ class pglDatabase:
         from .pglPostgres import pglPostgres
 
         pglPostgres.validateTimeouts(lockTimeoutSeconds=lockTimeoutSeconds, ioTimeoutSeconds=ioTimeoutSeconds, connectTimeoutSeconds=connectTimeoutSeconds)
-        pglStorage.requireSafeSave(session)
+        
+        # Refuse unsafe saves without turning an expected rejection into
+        # a notebook traceback. Keep the failure marker and history intact.
+        try:
+            pglStorage.requireSafeSave(session)
+        except ValueError as error:
+            pglMessages.warning(str(error))
+            return None
+        
         cls._getCheckpointHistoryBoundary(session)
 
         resolvedParentID = session.sessionID if parentSessionID is None else parentSessionID
