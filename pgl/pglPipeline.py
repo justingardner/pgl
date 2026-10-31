@@ -1204,41 +1204,119 @@ class pglPipeline(pglAction):
         """Reserve load() for storage-managed pipeline reconstruction."""
         raise NotImplementedError("Database pipeline loading is not implemented yet.")
     
+    # ++++++++++++++++++++++++++ _resolveActionClass +++++++++++++++++++++++++
     @staticmethod
     def _resolveActionClass(moduleName, qualname):
-        """Resolve an action from already-loaded application code.
+        """Resolve a recorded action identity, loading built-in actions on demand.
 
-        Never import a module named by serialized metadata or execute saved
-        source. Only ordinary module/class namespaces are traversed.
+        Called by recipe restoration, history extraction, and serialization.
 
-        Constructors remain trusted application code, not sandboxed code.
+        Already-loaded modules:
+            Resolve the exact recorded class, including nested action classes.
+
+        Unloaded modules:
+            Automatically import immediate pglActions* modules within this
+            pipeline module's package. No per-module registry is required.
+            External action packages must be explicitly imported by the caller.
+
+        Only ordinary module/class namespaces are traversed. Class aliases,
+        mismatched identities, and objects that are not pglAction classes
+        are rejected.
+
+        Imports execute installed module initialization code. This policy
+        trusts the installed PGL package and Python import environment; it
+        is not a sandbox. Saved source text is never executed.
+
+        Does not instantiate actions, configure them, or call scientific run
+        methods. Resolution and import errors emit a pglMessages.warning
+        and return None. Callers must handle None before instantiating an action.
+
+        Examples:
+            # Public usage: required built-in action modules load automatically.
+            pipeline = session.getPipeline(name="reprocessing")
+            if pipeline is not None:
+                pipeline.print(verbose=True)
+
+            # Serialized recipe restoration uses the same resolver.
+            restored = pglPipeline.fromJSON(recipeJSON)
+
+            # External actions require an explicit trusted import first.
+            import myLab.actions
+            restored = pglPipeline.fromJSON(recipeJSON)
         """
         import sys
+        from importlib import import_module
+        from types import ModuleType
 
-        if not isinstance(moduleName, str) or not moduleName or not isinstance(qualname, str) or not qualname:
-            raise ValueError("Action identity requires a module and qualified class name.")
+        try:
+            if not isinstance(moduleName, str) or not moduleName or not isinstance(qualname, str) or not qualname:
+                raise ValueError("Action identity requires a module and qualified class name.")
 
-        current = sys.modules.get(moduleName)
+            moduleParts = moduleName.split(".")
+            classParts = qualname.split(".")
 
-        if current is None:
-            raise ValueError(f"Action module {moduleName!r} is not loaded. Import the trusted action package before loading this pipeline.")
+            # Validate the complete identity before triggering any import.
+            # Locally defined classes containing <locals> are not addressable.
+            if any(not part.isidentifier() for part in moduleParts):
+                raise ValueError(f"Invalid action module name: {moduleName!r}.")
 
-        for index, part in enumerate(qualname.split(".")):
-            if not part.isidentifier() or (index and not isinstance(current, type)):
+            if any(not part.isidentifier() for part in classParts):
                 raise ValueError(f"Action class is not addressable through its module: {moduleName}.{qualname}")
 
-            current = vars(current).get(part)
+            current = sys.modules.get(moduleName)
 
             if current is None:
-                raise ValueError(f"Action class is unavailable: {moduleName}.{qualname}")
+                parentPackage, _, moduleLeaf = moduleName.rpartition(".")
 
-        if not isinstance(current, type) or not issubclass(current, pglAction):
-            raise TypeError(f"{moduleName}.{qualname} is not a pglAction class.")
+                # Trust the installed package's existing action-module convention,
+                # not arbitrary packages named by serialized history.
+                # Exact parent matching excludes similarly named external packages
+                # and nested modules outside this convention.
+                isBuiltinActionModule = (
+                    bool(__package__)
+                    and parentPackage == __package__
+                    and moduleLeaf.startswith("pglActions")
+                )
 
-        if current.__module__ != moduleName or current.__qualname__ != qualname:
-            raise ValueError(f"Installed action identity does not match {moduleName}.{qualname}.")
+                if not isBuiltinActionModule:
+                    raise ValueError(
+                        f"Action module {moduleName!r} is not loaded and is outside "
+                        "the built-in action-module namespace. Import the trusted "
+                        "action package before loading this pipeline."
+                    )
 
-        return current
+                # Import failures are reported by the warning handler below.
+                current = import_module(moduleName)
+
+            if not isinstance(current, ModuleType):
+                raise TypeError(f"Action module {moduleName!r} is not a Python module.")
+
+            # Resolve nested collection/action classes without invoking dynamic
+            # attribute lookup or falling back to display-name searches.
+            for index, part in enumerate(classParts):
+                if index and not isinstance(current, type):
+                    raise ValueError(f"Action class is not addressable through its module: {moduleName}.{qualname}")
+
+                current = vars(current).get(part)
+
+                if current is None:
+                    raise ValueError(f"Action class is unavailable: {moduleName}.{qualname}")
+
+            if not isinstance(current, type) or not issubclass(current, pglAction):
+                raise TypeError(f"{moduleName}.{qualname} is not a pglAction class.")
+
+            if current.__module__ != moduleName or current.__qualname__ != qualname:
+                raise ValueError(f"Installed action identity does not match {moduleName}.{qualname}.")
+
+            return current
+
+        except Exception as error:
+            # Fail gracefully without swallowing KeyboardInterrupt or SystemExit.
+            pglMessages.warning(
+                f"Could not resolve action {moduleName!r}.{qualname!r}: "
+                f"{type(error).__name__}: {error}. Returning None."
+            )
+            return None
 
     def _toRecipeRecord(self, activeObjects=None):
         """Select recipe metadata without encoding individual setting values.
@@ -1570,10 +1648,11 @@ class pglPipeline(pglAction):
 
         Returns:
             An independent pglPipeline, possibly with replayInput attached.
+            None on extraction or provenance-validation failure, with an
+            informative pglMessages.warning.
 
         Does not modify source history, copy scientific payloads, or execute
-        actions. Invalid provenance, inconsistent history, and unsupported
-        extraction structures raise.
+        actions. KeyboardInterrupt and SystemExit propagate.
 
         Current database correspondence is checked later when default replay
         loads its checkpoint.
@@ -1583,74 +1662,105 @@ class pglPipeline(pglAction):
 
         from .pglDatabase import pglDatabase
 
-        if not isinstance(actionable, pglActionable):
-            raise TypeError("Pipeline extraction requires a pglActionable object.")
+        pipelineName = "extracted-pipeline" if name is None else name
 
-        history = list(actionable.actionHistory)
-        candidates = []
+        try:
+            if not isinstance(actionable, pglActionable):
+                raise TypeError("Pipeline extraction requires a pglActionable object.")
 
-        for index, entry in enumerate(history):
-            if entry.parentActionID is not None or entry.actionStatus != pglActionStatus.SUCCESS:
-                continue
+            history = list(actionable.actionHistory)
+            candidates = []
 
-            if entry.actionInput.get("kind") == "checkpoint":
-                candidates.append((index, entry))
+            for index, entry in enumerate(history):
+                if entry.parentActionID is not None or entry.actionStatus != pglActionStatus.SUCCESS:
+                    continue
 
-        if not candidates:
-            pipeline = cls._fromHistoryRecipe(actionable, name=name)
-            pglMessages.message("Pipeline extracted without a verified default input; supply session or sessionID when running it.")
+                if entry.actionInput.get("kind") == "checkpoint":
+                    candidates.append((index, entry))
+
+            if not candidates:
+                pipeline = cls._fromHistoryRecipe(actionable, name=name)
+
+                # The extractor has already emitted the failure warning.
+                if pipeline is None:
+                    return None
+
+                pglMessages.message("Pipeline extracted without a verified default input; supply session or sessionID when running it.")
+                return pipeline
+
+            sourceIndex, sourceEntry = candidates[0]
+            inputRecord = deepcopy(sourceEntry.actionInput)
+            pglDatabase._validatePipelineReplayInput(inputRecord)
+            boundary = inputRecord["historyCount"]
+
+            if boundary > sourceIndex:
+                raise ValueError("Recorded replay boundary lies after the execution that supplied it.")
+
+            # Checkpoint inputs are currently recorded by pipeline executions.
+            # Reject another class rather than inferring its replay semantics.
+            code = sourceEntry.actionCode
+
+            if not isinstance(code, dict) or not code.get("module") or not code.get("qualname"):
+                raise ValueError("Checkpoint-backed execution has no recorded action class identity.")
+
+            actionClass = cls._resolveActionClass(code["module"], code["qualname"])
+
+            if actionClass is None:
+                raise ValueError(
+                    f"history[{sourceIndex}]({sourceEntry.actionName}): could not "
+                    "resolve the checkpoint-backed execution class. "
+                    "See the preceding resolver warning for details."
+                )
+
+            if actionClass is not pglPipeline:
+                raise ValueError("Automatic replay input extraction currently requires a recorded pglPipeline execution.")
+
+            for index, expectedHash in enumerate(inputRecord["historyHashes"]):
+                document = json.loads(history[index].toJSON())
+                actualHash = hashlib.sha256(pglDatabase.encodeRawManifest(document)).hexdigest()
+
+                if actualHash != expectedHash:
+                    raise ValueError(f"History entry {index} does not match the recorded checkpoint input. Cannot safely exclude the checkpoint history prefix.")
+
+            # Use a lightweight history view rather than copying scientific data.
+            # The extractor reads historical entries without editing them.
+            view = pglActionable()
+            view.actionHistory = list(history[boundary:])
+            view._failedActionIDs = list(actionable._failedActionIDs)
+            pipeline = cls._fromHistoryRecipe(view, name=name)
+
+            # Do not attach replay metadata or traverse a failed extraction.
+            # The extractor has already emitted the failure warning.
+            if pipeline is None:
+                return None
+
+            # ++++++++++++++++++++ restoreHistoryIndices +++++++++++++++++++++++
+            def restoreHistoryIndices(recipe):
+                """Translate extracted suffix indices back to full-history positions."""
+                for record in recipe.stepSources.values():
+                    record["historyIndex"] += boundary
+
+                for action in recipe.actions:
+                    if isinstance(action, pglPipeline):
+                        restoreHistoryIndices(action)
+
+            restoreHistoryIndices(pipeline)
+            pipeline.replayInput = inputRecord
+
+            pglMessages.message(f"Pipeline default input: checkpoint {inputRecord['sessionID']}; excluded {boundary} history entries already represented by that checkpoint.")
             return pipeline
 
-        sourceIndex, sourceEntry = candidates[0]
-        inputRecord = deepcopy(sourceEntry.actionInput)
-        pglDatabase._validatePipelineReplayInput(inputRecord)
-        boundary = inputRecord["historyCount"]
-
-        if boundary > sourceIndex:
-            raise ValueError("Recorded replay boundary lies after the execution that supplied it.")
-
-        # Checkpoint inputs are currently recorded by pipeline executions.
-        # Reject another class rather than inferring its replay semantics.
-        code = sourceEntry.actionCode
-
-        if not isinstance(code, dict) or not code.get("module") or not code.get("qualname"):
-            raise ValueError("Checkpoint-backed execution has no recorded action class identity.")
-
-        actionClass = cls._resolveActionClass(code["module"], code["qualname"])
-
-        if actionClass is not pglPipeline:
-            raise ValueError("Automatic replay input extraction currently requires a recorded pglPipeline execution.")
-
-        for index, expectedHash in enumerate(inputRecord["historyHashes"]):
-            document = json.loads(history[index].toJSON())
-            actualHash = hashlib.sha256(pglDatabase.encodeRawManifest(document)).hexdigest()
-
-            if actualHash != expectedHash:
-                raise ValueError(f"History entry {index} does not match the recorded checkpoint input. Cannot safely exclude the checkpoint history prefix.")
-
-        # Use a lightweight history view rather than copying scientific data.
-        # The extractor reads historical entries without editing them.
-        view = pglActionable()
-        view.actionHistory = list(history[boundary:])
-        view._failedActionIDs = list(actionable._failedActionIDs)
-        pipeline = cls._fromHistoryRecipe(view, name=name)
-
-        # ++++++++++++++++++++ restoreHistoryIndices +++++++++++++++++++++++
-        def restoreHistoryIndices(recipe):
-            """Translate extracted suffix indices back to full-history positions."""
-            for record in recipe.stepSources.values():
-                record["historyIndex"] += boundary
-
-            for action in recipe.actions:
-                if isinstance(action, pglPipeline):
-                    restoreHistoryIndices(action)
-
-        restoreHistoryIndices(pipeline)
-        pipeline.replayInput = inputRecord
-
-        pglMessages.message(f"Pipeline default input: checkpoint {inputRecord['sessionID']}; excluded {boundary} history entries already represented by that checkpoint.")
-        return pipeline
+        except Exception as error:
+            # Do not return a recipe whose replay provenance failed validation.
+            pglMessages.warning(
+                f"Cannot extract pipeline {pipelineName!r}: "
+                f"{type(error).__name__}: {error} "
+                "No pipeline was returned; source history was not modified. Returning None.",
+                level=2,
+            )
+            return None
     
+    # +++++++++++++++++++++++++ _fromHistoryRecipe ++++++++++++++++++++++++++
     @classmethod
     def _fromHistoryRecipe(cls, actionable, *, name=None):
         """Extract successful execution trees into an independent recipe.
@@ -1663,275 +1773,320 @@ class pglPipeline(pglAction):
         Missing parents, duplicate IDs, cycles, and inconsistent successful
         execution records are rejected rather than guessed.
 
+        Extraction failures emit pglMessages.warning and return None for the
+        entire pipeline. No partial recipe is returned and missing settings
+        are never filled from installed defaults.
+
         Does not modify history, load checkpoints, or establish a replay input.
+        KeyboardInterrupt and SystemExit propagate.
         """
         import json
         from types import SimpleNamespace
         from .pglSerialize import pglSerialize
 
-        if not isinstance(actionable, pglActionable):
-            raise TypeError("Pipeline extraction requires a pglActionable object.")
+        pipelineName = "extracted-pipeline" if name is None else name
 
-        history = list(actionable.actionHistory)
+        try:
+            if not isinstance(actionable, pglActionable):
+                raise TypeError("Pipeline extraction requires a pglActionable object.")
 
-        if any(entry.actionStatus == pglActionStatus.RUNNING for entry in history):
-            raise ValueError("Cannot extract a pipeline while its history contains running actions.")
+            history = list(actionable.actionHistory)
 
-        name = "extracted-pipeline" if name is None else name
-        cls._validatePipelineName(name)
+            if any(entry.actionStatus == pglActionStatus.RUNNING for entry in history):
+                raise ValueError("Cannot extract a pipeline while its history contains running actions.")
 
-        # Index executions before following parent relationships. Children
-        # normally appear before their parents because history records completion.
-        indexByID = {}
+            cls._validatePipelineName(pipelineName)
 
-        for index, entry in enumerate(history):
-            actionID = entry.actionID
+            # Index executions before following parent relationships. Children
+            # normally appear before their parents because history records completion.
+            indexByID = {}
 
-            if actionID is None:
-                continue
+            for index, entry in enumerate(history):
+                actionID = entry.actionID
 
-            if not isinstance(actionID, str) or not actionID:
-                raise ValueError(f"history[{index}]: invalid execution ID.")
+                if actionID is None:
+                    continue
 
-            if actionID in indexByID:
-                raise ValueError(f"history[{index}]: duplicate execution ID {actionID!r}.")
+                if not isinstance(actionID, str) or not actionID:
+                    raise ValueError(f"history[{index}]: invalid execution ID.")
 
-            indexByID[actionID] = index
+                if actionID in indexByID:
+                    raise ValueError(f"history[{index}]: duplicate execution ID {actionID!r}.")
 
-        childrenByIndex = {index: [] for index in range(len(history))}
-        parentByIndex = {}
-        roots = []
+                indexByID[actionID] = index
 
-        for index, entry in enumerate(history):
-            parentID = entry.parentActionID
+            childrenByIndex = {index: [] for index in range(len(history))}
+            parentByIndex = {}
+            roots = []
 
-            if parentID is None:
-                roots.append(index)
-                continue
+            for index, entry in enumerate(history):
+                parentID = entry.parentActionID
 
-            if not isinstance(parentID, str) or parentID not in indexByID:
-                raise ValueError(f"history[{index}]: parent execution {parentID!r} is missing; cannot reconstruct the execution tree.")
+                if parentID is None:
+                    roots.append(index)
+                    continue
 
-            parentIndex = indexByID[parentID]
+                if not isinstance(parentID, str) or parentID not in indexByID:
+                    raise ValueError(f"history[{index}]: parent execution {parentID!r} is missing; cannot reconstruct the execution tree.")
 
-            if parentIndex == index:
-                raise ValueError(f"history[{index}]: an execution cannot be its own parent.")
+                parentIndex = indexByID[parentID]
 
-            parentByIndex[index] = parentIndex
-            childrenByIndex[parentIndex].append(index)
+                if parentIndex == index:
+                    raise ValueError(f"history[{index}]: an execution cannot be its own parent.")
 
-        # Check all records, including failed branches, before extraction.
-        # Do not allow an orphaned cycle to disappear merely because it has no root.
-        finished = set()
+                parentByIndex[index] = parentIndex
+                childrenByIndex[parentIndex].append(index)
 
-        for startIndex in range(len(history)):
-            current = startIndex
-            chain = set()
+            # Check all records, including failed branches, before extraction.
+            # Do not allow an orphaned cycle to disappear merely because it has no root.
+            finished = set()
 
-            while current not in finished:
-                if current in chain:
-                    raise ValueError("Action history contains a cycle in execution ancestry.")
+            for startIndex in range(len(history)):
+                current = startIndex
+                chain = set()
 
-                chain.add(current)
+                while current not in finished:
+                    if current in chain:
+                        raise ValueError("Action history contains a cycle in execution ancestry.")
 
-                if current not in parentByIndex:
-                    break
+                    chain.add(current)
 
-                current = parentByIndex[current]
+                    if current not in parentByIndex:
+                        break
 
-            finished.update(chain)
+                    current = parentByIndex[current]
 
-        def metadataText(value):
-            """Compare values through the shared strict metadata representation."""
-            encoded = pglSerialize.toJSON(SimpleNamespace(value=value), strict=True)
-            return json.dumps(json.loads(encoded), sort_keys=True, separators=(",", ":"), allow_nan=False)
+                finished.update(chain)
 
-        def sourceRecord(index):
-            """Preserve original provenance independently of editable settings."""
-            entry = history[index]
-            return {"historyIndex": index, "actionID": entry.actionID, "actionCode": deepcopy(entry.actionCode), "actionSettings": deepcopy(entry.actionSettings)}
+            def metadataText(value):
+                """Compare values through the shared strict metadata representation."""
+                encoded = pglSerialize.toJSON(SimpleNamespace(value=value), strict=True)
+                return json.dumps(json.loads(encoded), sort_keys=True, separators=(",", ":"), allow_nan=False)
 
-        def resolveClass(index):
-            entry = history[index]
-            code = entry.actionCode
-            path = f"history[{index}]({entry.actionName})"
+            def sourceRecord(index):
+                """Preserve original provenance independently of editable settings."""
+                entry = history[index]
+                return {"historyIndex": index, "actionID": entry.actionID, "actionCode": deepcopy(entry.actionCode), "actionSettings": deepcopy(entry.actionSettings)}
 
-            if not isinstance(code, dict) or not code.get("module") or not code.get("qualname"):
-                raise ValueError(f"{path}: this legacy entry has no recorded action class identity. It cannot be reconstructed safely from its display name alone.")
+            def resolveClass(index):
+                """Resolve an action class or stop extraction with history context."""
+                entry = history[index]
+                code = entry.actionCode
+                path = f"history[{index}]({entry.actionName})"
 
-            return cls._resolveActionClass(code["module"], code["qualname"])
+                if not isinstance(code, dict) or not code.get("module") or not code.get("qualname"):
+                    raise ValueError(f"{path}: this legacy entry has no recorded action class identity. It cannot be reconstructed safely from its display name alone.")
 
-        def restoreOrdinaryAction(index, actionClass):
-            """Restore recorded traits without interactive configuration."""
-            entry = history[index]
-            path = f"history[{index}]({entry.actionName})"
+                actionClass = cls._resolveActionClass(code["module"], code["qualname"])
 
-            if childrenByIndex[index]:
-                raise ValueError(f"{path}: this ordinary action contains child executions. An explicit extraction adapter is needed; refusing to flatten them.")
+                # The resolver warns and returns None on failure. Do not pass
+                # that result to issubclass() or attempt to instantiate it.
+                if actionClass is None:
+                    raise ValueError(
+                        f"{path}: could not resolve recorded action class "
+                        f"{code['module']}.{code['qualname']}. "
+                        "See the preceding resolver warning for details."
+                    )
 
-            action = actionClass()
-            expectedNames = set(cls._configurationNames(action))
-            suppliedNames = set(entry.actionSettings)
+                return actionClass
 
-            if suppliedNames != expectedNames:
-                missing = sorted(expectedNames - suppliedNames)
-                unknown = sorted(suppliedNames - expectedNames)
-                raise ValueError(f"{path}: installed configuration schema differs; missing={missing}, unknown={unknown}.")
+            def restoreOrdinaryAction(index, actionClass):
+                """Restore recorded traits without interactive configuration."""
+                entry = history[index]
+                path = f"history[{index}]({entry.actionName})"
 
-            try:
-                action.configureTraits(**deepcopy(entry.actionSettings))
-            except Exception as error:
-                raise ValueError(f"{path}: could not restore configuration: {error}") from error
+                if childrenByIndex[index]:
+                    raise ValueError(f"{path}: this ordinary action contains child executions. An explicit extraction adapter is needed; refusing to flatten them.")
 
-            action.name = entry.actionName
-            action.version = entry.actionVersion
-            action.status = pglActionStatus.CONFIGURED
-            action.error = None
-            action.actionHistory = []
-            action._failedActionIDs = []
-            action._checkpointBaseline = {}
+                action = actionClass()
+                expectedNames = set(cls._configurationNames(action))
+                suppliedNames = set(entry.actionSettings)
 
-            restoredSettings = {field: getattr(action, field) for field in cls._configurationNames(action)}
+                if suppliedNames != expectedNames:
+                    missing = sorted(expectedNames - suppliedNames)
+                    unknown = sorted(suppliedNames - expectedNames)
+                    raise ValueError(
+                        f"{path}: installed configuration schema differs; "
+                        f"missing={missing}, unknown={unknown}. "
+                        "'missing' lists settings required by the installed action "
+                        "but absent from the recorded configuration; 'unknown' lists "
+                        "recorded settings no longer supported by the installed action. "
+                        "Use a compatible action implementation or explicitly migrate "
+                        "the recipe; defaults will not be substituted."
+                    )
 
-            if metadataText(restoredSettings) != metadataText(entry.actionSettings):
-                raise ValueError(f"{path}: installed action changed the recorded configuration during extraction.")
+                try:
+                    action.configureTraits(**deepcopy(entry.actionSettings))
+                except Exception as error:
+                    raise ValueError(f"{path}: could not restore configuration: {error}") from error
 
-            currentCode = pglActionHistory.captureActionCode(action)
-            recordedCode = entry.actionCode
+                action.name = entry.actionName
+                action.version = entry.actionVersion
+                action.status = pglActionStatus.CONFIGURED
+                action.error = None
+                action.actionHistory = []
+                action._failedActionIDs = []
+                action._checkpointBaseline = {}
 
-            if recordedCode.get("status") == "captured" and currentCode.get("status") == "captured" and recordedCode.get("sha256") != currentCode.get("sha256"):
-                pglMessages.warning(f"{path}: installed source differs from recorded source. Extraction is allowed for editing; execution still requires an explicit mismatch override.", level=2)
+                restoredSettings = {field: getattr(action, field) for field in cls._configurationNames(action)}
+
+                if metadataText(restoredSettings) != metadataText(entry.actionSettings):
+                    raise ValueError(f"{path}: installed action changed the recorded configuration during extraction.")
 
-            return action
+                currentCode = pglActionHistory.captureActionCode(action)
+                recordedCode = entry.actionCode
 
-        def restorePipeline(index):
-            """Rebuild only the recorded selection and verify its child runs."""
-            entry = history[index]
-            path = f"history[{index}]({entry.actionName})"
-            snapshot = entry.actionSettings
-            expectedFields = {"pipelineExecutionVersion", "recipeJSON", "selection", "allowCodeMismatch", "inputMode"}
+                if recordedCode.get("status") == "captured" and currentCode.get("status") == "captured" and recordedCode.get("sha256") != currentCode.get("sha256"):
+                    pglMessages.warning(f"{path}: installed source differs from recorded source. Extraction is allowed for editing; execution still requires an explicit mismatch override.", level=2)
 
-            if set(snapshot) != expectedFields or type(snapshot["pipelineExecutionVersion"]) is not int or snapshot["pipelineExecutionVersion"] != 2:
-                raise ValueError(f"{path}: unsupported pipeline execution snapshot; expected version 2 with recipeJSON.")
+                return action
 
-            if not isinstance(snapshot["recipeJSON"], str) or type(snapshot["allowCodeMismatch"]) is not bool:
-                raise ValueError(f"{path}: malformed pipeline execution snapshot.")
+            def restorePipeline(index):
+                """Rebuild only the recorded selection and verify its child runs."""
+                entry = history[index]
+                path = f"history[{index}]({entry.actionName})"
+                snapshot = entry.actionSettings
+                expectedFields = {"pipelineExecutionVersion", "recipeJSON", "selection", "allowCodeMismatch", "inputMode"}
 
-            if snapshot["inputMode"] != "providedObject":
-                raise ValueError(f"{path}: unsupported recorded pipeline input mode.")
+                if set(snapshot) != expectedFields or type(snapshot["pipelineExecutionVersion"]) is not int or snapshot["pipelineExecutionVersion"] != 2:
+                    raise ValueError(f"{path}: unsupported pipeline execution snapshot; expected version 2 with recipeJSON.")
 
-            selection = snapshot["selection"]
+                if not isinstance(snapshot["recipeJSON"], str) or type(snapshot["allowCodeMismatch"]) is not bool:
+                    raise ValueError(f"{path}: malformed pipeline execution snapshot.")
 
-            if not isinstance(selection, dict) or set(selection) != {"start", "end", "stepKeys"}:
-                raise ValueError(f"{path}: invalid recorded selection.")
+                if snapshot["inputMode"] != "providedObject":
+                    raise ValueError(f"{path}: unsupported recorded pipeline input mode.")
 
-            first = selection["start"]
-            last = selection["end"]
-            recorded = pglPipeline.fromJSON(snapshot["recipeJSON"], strict=True)
+                selection = snapshot["selection"]
 
-            if type(first) is not int or type(last) is not int or not 0 <= first <= last < len(recorded.actions):
-                raise ValueError(f"{path}: recorded selection is outside the recipe.")
+                if not isinstance(selection, dict) or set(selection) != {"start", "end", "stepKeys"}:
+                    raise ValueError(f"{path}: invalid recorded selection.")
+
+                first = selection["start"]
+                last = selection["end"]
 
-            selectedKeys = recorded.stepKeys[first:last + 1]
+                try:
+                    recorded = pglPipeline.fromJSON(snapshot["recipeJSON"], strict=True)
+                except Exception as error:
+                    raise ValueError(f"{path}: could not restore the recorded pipeline recipe: {error}") from error
+
+                if recorded is None:
+                    raise ValueError(f"{path}: restoration of the recorded pipeline recipe returned None.")
 
-            if selection["stepKeys"] != selectedKeys:
-                raise ValueError(f"{path}: selected step identities differ from the recorded recipe.")
+                if type(first) is not int or type(last) is not int or not 0 <= first <= last < len(recorded.actions):
+                    raise ValueError(f"{path}: recorded selection is outside the recipe.")
 
-            if recorded.name != entry.actionName or recorded.version != entry.actionVersion:
-                raise ValueError(f"{path}: pipeline identity differs from its execution history.")
+                selectedKeys = recorded.stepKeys[first:last + 1]
 
-            childIndices = childrenByIndex[index]
+                if selection["stepKeys"] != selectedKeys:
+                    raise ValueError(f"{path}: selected step identities differ from the recorded recipe.")
 
-            if len(childIndices) != len(selectedKeys):
-                raise ValueError(f"{path}: successful pipeline has {len(childIndices)} child records but its selection contains {len(selectedKeys)} steps.")
-
-            restoredActions = []
-            restoredSources = {}
-
-            # The current runner is sequential. Direct children therefore have
-            # the same completion order as their selected recipe steps.
-            for offset, childIndex in enumerate(childIndices):
-                childEntry = history[childIndex]
-                expectedAction = recorded.actions[first + offset]
-                stepKey = selectedKeys[offset]
-
-                if childEntry.actionStatus != pglActionStatus.SUCCESS:
-                    raise ValueError(f"{path}: successful pipeline contains a non-successful child at history[{childIndex}].")
-
-                actualAction = restoreExecution(childIndex)
-
-                if type(actualAction) is not type(expectedAction) or actualAction.name != expectedAction.name or actualAction.version != expectedAction.version:
-                    raise ValueError(f"{path}: child history[{childIndex}] differs from selected step {first + offset}.")
-
-                if isinstance(actualAction, pglPipeline):
-                    # The current runner executes nested pipelines in full.
-                    # A partial or changed child recipe must not pass silently.
-                    actualSettings = actualAction._toRecipeRecord()
-                    expectedSettings = expectedAction._toRecipeRecord()
-                else:
-                    actualSettings = {field: getattr(actualAction, field) for field in cls._configurationNames(actualAction)}
-                    expectedSettings = {field: getattr(expectedAction, field) for field in cls._configurationNames(expectedAction)}
-
-                if metadataText(actualSettings) != metadataText(expectedSettings):
-                    raise ValueError(f"{path}: child history[{childIndex}] configuration differs from the selected recipe step.")
-
-                restoredActions.append(actualAction)
-                restoredSources[stepKey] = sourceRecord(childIndex)
-
-            extracted = pglPipeline(name=recorded.name, description=recorded.description)
-            extracted.version = recorded.version
-            extracted.actions = restoredActions
-            extracted.stepKeys = list(selectedKeys)
-            extracted.stepSources = restoredSources
-            extracted._validateStructure()
-            return extracted
-
-        def restoreExecution(index):
-            """Dispatch by recorded class identity, never by display name."""
-            actionClass = resolveClass(index)
-
-            if issubclass(actionClass, pglPipeline):
-                if actionClass is not pglPipeline:
-                    raise TypeError(f"history[{index}]: pipeline subclasses require an explicit extraction adapter.")
-
-                return restorePipeline(index)
-
-            return restoreOrdinaryAction(index, actionClass)
-
-        actions = []
-        stepKeys = []
-        stepSources = {}
-        omitted = []
-
-        # Only root executions become top-level recipe steps. Descendants are
-        # incorporated by restorePipeline(), never appended a second time.
-        for index in roots:
-            entry = history[index]
-
-            if entry.actionStatus != pglActionStatus.SUCCESS:
-                omitted.append((index, entry.actionName, entry.actionStatus.name))
-                continue
-
-            action = restoreExecution(index)
-            stepKey = str(uuid4())
-            actions.append(action)
-            stepKeys.append(stepKey)
-            stepSources[stepKey] = sourceRecord(index)
-
-        pipeline = cls(name=name)
-        pipeline.actions = actions
-        pipeline.stepKeys = stepKeys
-        pipeline.stepSources = stepSources
-        pipeline._validateStructure()
-
-        if omitted:
-            details = ", ".join(f"[{index}] {actionName}: {status}" for index, actionName, status in omitted)
-            pglMessages.warning(f"Extraction omitted non-successful top-level attempts and their child executions: {details}. Partial effects from those attempts are not reproduced.", level=2)
-
-        if actionable._failedActionIDs:
-            pglMessages.warning("The source working object contains unresolved failed attempts. Run the edited recipe on a clean input, not the failed working object.", level=2)
-
-        return pipeline
+                if recorded.name != entry.actionName or recorded.version != entry.actionVersion:
+                    raise ValueError(f"{path}: pipeline identity differs from its execution history.")
+
+                childIndices = childrenByIndex[index]
+
+                if len(childIndices) != len(selectedKeys):
+                    raise ValueError(f"{path}: successful pipeline has {len(childIndices)} child records but its selection contains {len(selectedKeys)} steps.")
+
+                restoredActions = []
+                restoredSources = {}
+
+                # The current runner is sequential. Direct children therefore have
+                # the same completion order as their selected recipe steps.
+                for offset, childIndex in enumerate(childIndices):
+                    childEntry = history[childIndex]
+                    expectedAction = recorded.actions[first + offset]
+                    stepKey = selectedKeys[offset]
+
+                    if childEntry.actionStatus != pglActionStatus.SUCCESS:
+                        raise ValueError(f"{path}: successful pipeline contains a non-successful child at history[{childIndex}].")
+
+                    actualAction = restoreExecution(childIndex)
+
+                    if type(actualAction) is not type(expectedAction) or actualAction.name != expectedAction.name or actualAction.version != expectedAction.version:
+                        raise ValueError(f"{path}: child history[{childIndex}] differs from selected step {first + offset}.")
+
+                    if isinstance(actualAction, pglPipeline):
+                        # The current runner executes nested pipelines in full.
+                        # A partial or changed child recipe must not pass silently.
+                        actualSettings = actualAction._toRecipeRecord()
+                        expectedSettings = expectedAction._toRecipeRecord()
+                    else:
+                        actualSettings = {field: getattr(actualAction, field) for field in cls._configurationNames(actualAction)}
+                        expectedSettings = {field: getattr(expectedAction, field) for field in cls._configurationNames(expectedAction)}
+
+                    if metadataText(actualSettings) != metadataText(expectedSettings):
+                        raise ValueError(f"{path}: child history[{childIndex}] configuration differs from the selected recipe step.")
+
+                    restoredActions.append(actualAction)
+                    restoredSources[stepKey] = sourceRecord(childIndex)
+
+                extracted = pglPipeline(name=recorded.name, description=recorded.description)
+                extracted.version = recorded.version
+                extracted.actions = restoredActions
+                extracted.stepKeys = list(selectedKeys)
+                extracted.stepSources = restoredSources
+                extracted._validateStructure()
+                return extracted
+
+            def restoreExecution(index):
+                """Dispatch by recorded class identity, never by display name."""
+                actionClass = resolveClass(index)
+
+                if issubclass(actionClass, pglPipeline):
+                    if actionClass is not pglPipeline:
+                        raise TypeError(f"history[{index}]: pipeline subclasses require an explicit extraction adapter.")
+
+                    return restorePipeline(index)
+
+                return restoreOrdinaryAction(index, actionClass)
+
+            actions = []
+            stepKeys = []
+            stepSources = {}
+            omitted = []
+
+            # Only root executions become top-level recipe steps. Descendants are
+            # incorporated by restorePipeline(), never appended a second time.
+            for index in roots:
+                entry = history[index]
+
+                if entry.actionStatus != pglActionStatus.SUCCESS:
+                    omitted.append((index, entry.actionName, entry.actionStatus.name))
+                    continue
+
+                action = restoreExecution(index)
+                stepKey = str(uuid4())
+                actions.append(action)
+                stepKeys.append(stepKey)
+                stepSources[stepKey] = sourceRecord(index)
+
+            pipeline = cls(name=pipelineName)
+            pipeline.actions = actions
+            pipeline.stepKeys = stepKeys
+            pipeline.stepSources = stepSources
+            pipeline._validateStructure()
+
+            if omitted:
+                details = ", ".join(f"[{index}] {actionName}: {status}" for index, actionName, status in omitted)
+                pglMessages.warning(f"Extraction omitted non-successful top-level attempts and their child executions: {details}. Partial effects from those attempts are not reproduced.", level=2)
+
+            if actionable._failedActionIDs:
+                pglMessages.warning("The source working object contains unresolved failed attempts. Run the edited recipe on a clean input, not the failed working object.", level=2)
+
+            return pipeline
+
+        except Exception as error:
+            # Stop the entire extraction; never return a partially restored recipe.
+            # KeyboardInterrupt and SystemExit are intentionally not caught.
+            pglMessages.warning(
+                f"Cannot extract pipeline {pipelineName!r}: "
+                f"{type(error).__name__}: {error} "
+                "No pipeline was returned; source history was not modified. Returning None.",
+                level=2,
+            )
+            return None
     
     def _resolveRunRange(self, start=None, end=None):
         """Resolve an inclusive top-level range before any scientific execution."""

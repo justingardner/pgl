@@ -3619,6 +3619,8 @@ class pglDatabase:
         # The tested execution-tree extractor rejects a boundary that splits
         # a parent/child execution tree rather than silently flattening it.
         pipeline = pglPipeline._fromHistoryRecipe(view, name=name)
+        if pipeline is None:
+            return None
 
         # +++++++++++++++++++++++++ restoreHistoryIndices +++++++++++++++++++++++++
         # Local implementation within getSessionPipeline.
