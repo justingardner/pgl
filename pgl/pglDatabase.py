@@ -2358,12 +2358,29 @@ class pglDatabase:
     # User-facing database API. See the docstring for configuration, side effects, and return
     # conventions.
     @staticmethod
-    def print(details=None, postgres=None, *, settings=None, settingsName=None, sessionID=None, summary=False, datasets=False, nRows=10, maxWidth=48, sslRootCert=None, includeDeleted=False, storageOptionsByBackend=None):
+    def print(details=None, postgres=None, *, settings=None, settingsName=None, sessionID=None, summary=False, datasets=False, nRows=10, maxWidth=48, sslRootCert=None, includeDeleted=False, storageOptionsByBackend=None, experimentName=None, subjectID=None, dateRange=None, checkpointDateRange=None):
         """Select a session listing, dataset listing, or database report.
 
         Default:
             List visible sessions grouped by root experiment and subject,
             displaying actual parent-child relationships.
+
+        Session listing filters:
+            experimentName:
+                Exact root experiment label.
+            subjectID:
+                Exact root subject label.
+            dateRange:
+                Inclusive UTC calendar-date range for root acquisition time.
+            checkpointDateRange:
+                Inclusive UTC calendar-date range for checkpoint creation time.
+
+            Date ranges are (start, end), using ISO date strings or Python
+            date objects. Either endpoint may be None.
+
+            Supplied filters combine with AND. Experiment and subject must
+            match the same root label pair. Visible ancestors of matching
+            checkpoints are retained as explicitly marked context.
 
         datasets=True:
             List visible dataset checkpoints grouped by dataset name.
@@ -2380,6 +2397,7 @@ class pglDatabase:
             Show one table, an iterable of tables, or "all".
 
         datasets, summary, sessionID, and details are mutually exclusive.
+        Session listing filters cannot be used with those selections.
         nRows limits table detail views only, not readable listings.
 
         includeDeleted includes soft-deleted checkpoints.
@@ -2403,8 +2421,15 @@ class pglDatabase:
         if type(maxWidth) is not int or maxWidth < 8:
             raise ValueError("maxWidth must be an integer of at least 8.")
 
-        if sum((details is not None, sessionID is not None, summary, datasets)) > 1:
+        selectedModes = sum((details is not None, sessionID is not None, summary, datasets))
+
+        if selectedModes > 1:
             raise ValueError("Supply only one of details, sessionID, summary=True, or datasets=True.")
+
+        hasSessionFilters = any(value is not None for value in (experimentName, subjectID, dateRange, checkpointDateRange))
+
+        if selectedModes and hasSessionFilters:
+            raise ValueError("experimentName, subjectID, dateRange, and checkpointDateRange apply only to the session listing.")
 
         if datasets:
             return pglDatabase.printDatasets(postgres=postgres, settings=settings, settingsName=settingsName, sslRootCert=sslRootCert, includeDeleted=includeDeleted)
@@ -2415,11 +2440,271 @@ class pglDatabase:
         if details is not None or summary:
             return pglDatabase.printTables(details=details, postgres=postgres, settings=settings, settingsName=settingsName, nRows=nRows, maxWidth=maxWidth, sslRootCert=sslRootCert, includeDeleted=includeDeleted)
 
-        return pglDatabase.printSessions(postgres=postgres, settings=settings, settingsName=settingsName, sslRootCert=sslRootCert, includeDeleted=includeDeleted, storageOptionsByBackend=storageOptionsByBackend)
+        return pglDatabase.printSessions(postgres=postgres, settings=settings, settingsName=settingsName, sslRootCert=sslRootCert, includeDeleted=includeDeleted, storageOptionsByBackend=storageOptionsByBackend, experimentName=experimentName, subjectID=subjectID, dateRange=dateRange, checkpointDateRange=checkpointDateRange)
+
+    # ++++++++++++++++++++++++++++++ printSession +++++++++++++++++++++++++++++
+    # User-facing database API.
+    # Direct callers in this module: print.
+    @staticmethod
+    def printSession(sessionID, postgres=None, *, settings=None, settingsName=None, sslRootCert=None, includeDeleted=False):
+        """Print one checkpoint's metadata, linked subjects, and linked files.
+
+        Shows:
+            All session-row metadata and creator labels.
+            Distinct subject IDs recorded on visible file links.
+            One preferred registered location per logical file.
+            The number of other visible registered locations.
+
+        Subjects are collected from file links, not reconstructed sessions.
+        Registered locations are catalog paths, not caller-resolved SSH paths.
+        Location eligibility describes recorded metadata only; it does not
+        establish current accessibility or successful session reconstruction.
+
+        Reads database metadata in one consistent, read-only snapshot.
+        Does not reconstruct sessions, open payloads, verify bytes, or modify
+        database records. Full file paths are printed without truncation.
+
+        includeDeleted permits historical inspection without restoring records.
+
+        Returns:
+            True after printing the report.
+            False for unavailable configuration, connection cancellation,
+            or an absent/deletion-filtered session.
+            Other errors propagate.
+
+        Examples:
+            # Inspect one checkpoint through the main print interface.
+            pglDatabase.print(sessionID=77)
+
+            # Call the single-checkpoint report directly.
+            pglDatabase.printSession(77)
+
+            # Include soft-deleted session/file/location records.
+            pglDatabase.printSession(77, includeDeleted=True)
+
+            # Use a caller-supplied PostgreSQL configuration.
+            pglDatabase.printSession(77, postgres=postgres)
+
+            # Use a named settings configuration.
+            pglDatabase.printSession(77, settingsName="mySettings")
+        """
+        from psycopg.rows import tuple_row
+
+        if type(sessionID) is not int or not 0 <= sessionID <= 9223372036854775807:
+            raise ValueError("sessionID must be a nonnegative PostgreSQL bigint.")
+
+        if type(includeDeleted) is not bool:
+            raise ValueError("includeDeleted must be a boolean.")
+
+        postgres = pglDatabase._printPostgres(postgres, settings=settings, settingsName=settingsName)
+
+        if postgres is None:
+            return False
+
+        sessionsTable = sql.Identifier(postgres.databaseSchema, "session")
+        usersTable = sql.Identifier(postgres.databaseSchema, "users")
+        linksTable = sql.Identifier(postgres.databaseSchema, "session_files")
+        filesTable = sql.Identifier(postgres.databaseSchema, "files")
+        locationsTable = sql.Identifier(postgres.databaseSchema, "storage_locations")
+        backendsTable = sql.Identifier(postgres.databaseSchema, "storage_backends")
+
+        sessionRecord = None
+        sessionFiles = {}
+        locationsByFile = {}
+
+        with postgres.connect(sslRootCert=sslRootCert) as connection:
+            if connection is None:
+                return False
+
+            with connection.transaction():
+                connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+
+                with connection.cursor(row_factory=tuple_row) as cursor:
+                    cursor.execute("SELECT current_database(), transaction_timestamp()")
+                    databaseName, snapshotTime = cursor.fetchone()
+
+                    statement = sql.SQL("""
+                        SELECT checkpoint.*,
+                               creator.username AS creator_username,
+                               creator.display_name AS creator_display_name
+                        FROM {} AS checkpoint
+                        LEFT JOIN {} AS creator
+                          ON creator.user_id = checkpoint.created_by
+                        WHERE checkpoint.session_id = %s
+                          AND (%s OR checkpoint.deleted_at IS NULL)
+                    """).format(sessionsTable, usersTable)
+                    cursor.execute(statement, (sessionID, includeDeleted))
+                    row = cursor.fetchone()
+
+                    if row is not None:
+                        sessionRecord = dict(zip((column.name for column in cursor.description), row))
+
+                        statement = sql.SQL("""
+                            SELECT link.name,
+                                   link.role,
+                                   link.subject_id,
+                                   content.file_id,
+                                   content.sha256,
+                                   content.size_bytes,
+                                   link.deleted_at,
+                                   content.deleted_at
+                            FROM {} AS link
+                            JOIN {} AS content ON content.file_id = link.file_id
+                            WHERE link.session_id = %s
+                              AND (%s OR (link.deleted_at IS NULL AND content.deleted_at IS NULL))
+                            ORDER BY link.name
+                        """).format(linksTable, filesTable)
+                        cursor.execute(statement, (sessionID, includeDeleted))
+
+                        for name, role, subjectID, fileID, digest, size, linkDeleted, contentDeleted in cursor.fetchall():
+                            sessionFiles[name] = {
+                                "role": role,
+                                "subject_id": subjectID,
+                                "file_id": fileID,
+                                "sha256": digest,
+                                "size_bytes": size,
+                                "link_deleted_at": linkDeleted,
+                                "content_deleted_at": contentDeleted,
+                            }
+
+                        fileIDs = sorted({record["file_id"] for record in sessionFiles.values()})
+
+                        if fileIDs:
+                            statement = sql.SQL("""
+                                SELECT location.file_id,
+                                       location.object_key,
+                                       backend.backend_id,
+                                       backend.name,
+                                       backend.url_prefix,
+                                       backend.is_active,
+                                       location.status,
+                                       location.priority,
+                                       location.verified_at,
+                                       location.deleted_at
+                                FROM {} AS location
+                                JOIN {} AS backend
+                                  ON backend.backend_id = location.backend_id
+                                WHERE location.file_id = ANY(%s::bigint[])
+                                  AND (%s OR location.deleted_at IS NULL)
+                                ORDER BY location.file_id,
+                                         location.priority,
+                                         backend.backend_id,
+                                         location.object_key
+                            """).format(locationsTable, backendsTable)
+                            cursor.execute(statement, (fileIDs, includeDeleted))
+
+                            for fileID, key, backendID, backendName, root, active, status, priority, verifiedAt, deletedAt in cursor.fetchall():
+                                locationsByFile.setdefault(fileID, []).append({
+                                    "object_key": key,
+                                    "backend_id": backendID,
+                                    "backend_name": backendName,
+                                    "root": root,
+                                    "active": active,
+                                    "status": status,
+                                    "priority": priority,
+                                    "verified_at": verifiedAt,
+                                    "deleted_at": deletedAt,
+                                })
+
+        if sessionRecord is None:
+            pglMessages.warning(f"No visible session {sessionID} found in {databaseName}.{postgres.databaseSchema}; it may be absent or excluded by the deletion filter.", level=0)
+            return False
+
+        # ++++++++++++++++++++++++++++++ expectedKey ++++++++++++++++++++++++++++++
+        def expectedKey(name):
+            """Prefer a checkpoint-local alias when one is registered.
+
+            This is only a display preference. Shared content can legitimately
+            have its preferred location in another run or session.
+            """
+            if sessionRecord["contract_version"] == "pgl.raw.behavior.v1":
+                parts = name.split("/", 2)
+
+                if len(parts) == 3 and parts[0] == "runs" and parts[1].isascii() and parts[1].isdigit():
+                    return f"session{sessionID:06d}/run{int(parts[1]):05d}/{parts[2]}"
+
+            return f"session{sessionID:06d}/{name}"
+
+        # ++++++++++++++++++++++++++++++++ eligible +++++++++++++++++++++++++++++++
+        def eligible(location):
+            """Evaluate recorded location eligibility without accessing storage."""
+            return location["active"] and location["status"] == "present" and location["verified_at"] is not None and (includeDeleted or location["deleted_at"] is None)
+
+        deletionLabel = " [DELETED]" if sessionRecord["deleted_at"] is not None else ""
+        pglMessages.printHeader(f"Session {sessionID}{deletionLabel}")
+        pglMessages.message(f"Database: {databaseName}.{postgres.databaseSchema}", wrapText=False)
+        pglMessages.message(f"Snapshot transaction started: {snapshotTime}", wrapText=False)
+        pglMessages.print()
+        pglMessages.printHeader("Session metadata", fillChar="-")
+        labelWidth = max(len(name) for name in sessionRecord)
+
+        for name, value in sessionRecord.items():
+            pglMessages.print(f"  {name:<{labelWidth}} : {pglDatabase._printValue(value)}")
+
+        subjects = sorted({record["subject_id"] for record in sessionFiles.values() if record["subject_id"] is not None})
+        pglMessages.print()
+        pglMessages.printHeader("Subjects from file links", fillChar="-")
+        pglMessages.print("  " + (", ".join(pglDatabase._printValue(subject) for subject in subjects) if subjects else "(none linked)"))
+
+        pglMessages.print()
+        pglMessages.printHeader(f"Files and locations: {len(sessionFiles)} linked files", fillChar="-")
+        pglMessages.print("  One recorded content location per file; shared files may resolve into another run or session.")
+        pglMessages.print("  Status and eligibility are recorded metadata; payloads and caller access have not been checked.")
+        pglMessages.print("  Locations are registered paths, not caller-resolved SSH paths.")
+        pglMessages.print("  Registered aliases/copies are paths, not necessarily separate physical byte copies.")
+
+        if includeDeleted:
+            pglMessages.print("  Including deleted records. Location eligibility below assumes this inspection override.")
+
+        if not sessionFiles:
+            pglMessages.print("  (no linked files)")
+
+        for name, record in sessionFiles.items():
+            preferredKey = expectedKey(name)
+            candidates = locationsByFile.get(record["file_id"], [])
+            ordered = sorted(candidates, key=lambda location: (
+                not eligible(location),
+                location["object_key"] != preferredKey,
+                location["priority"],
+                location["backend_id"],
+                location["object_key"],
+            ))
+
+            pglMessages.print()
+            pglMessages.print(f"  {pglDatabase._printValue(name)}")
+            pglMessages.print(f"    file_id: {record['file_id']} | bytes: {record['size_bytes']} | role: {pglDatabase._printValue(record['role'])}")
+
+            if includeDeleted:
+                linkState = "DELETED" if record["link_deleted_at"] is not None else "active"
+                contentState = "DELETED" if record["content_deleted_at"] is not None else "active"
+                pglMessages.print(f"    File link: {linkState} | shared content identity: {contentState}")
+
+            if not ordered:
+                pglMessages.print("    No visible registered storage location.")
+                continue
+
+            location = ordered[0]
+            separator = "" if location["root"].endswith("/") else "/"
+            fullLocation = location["root"] + separator + location["object_key"]
+
+            pglMessages.print(f"    Location: {pglDatabase._printValue(fullLocation)}")
+            pglMessages.print(f"    Backend: {location['backend_id']} | status: {pglDatabase._printValue(location['status'])} | active: {location['active']} | catalog-eligible location: {eligible(location)}")
+            pglMessages.print(f"    Last verified: {pglDatabase._printValue(location['verified_at'])}")
+
+            if includeDeleted:
+                locationState = "DELETED" if location["deleted_at"] is not None else "active"
+                pglMessages.print(f"    Location deletion state: {locationState}")
+
+            if len(ordered) > 1:
+                pglMessages.print(f"    Other visible registered aliases/copies: {len(ordered) - 1}")
+
+        pglMessages.printHeader()
+        return True
 
     # +++++++++++++++++++++++++++++ printSessions +++++++++++++++++++++++++++
+    # +++++++++++++++++++++++++++++ printSessions +++++++++++++++++++++++++++
     @staticmethod
-    def printSessions(postgres=None, *, settings=None, settingsName=None, sslRootCert=None, includeDeleted=False, storageOptionsByBackend=None):
+    def printSessions(postgres=None, *, settings=None, settingsName=None, sslRootCert=None, includeDeleted=False, storageOptionsByBackend=None, experimentName=None, subjectID=None, dateRange=None, checkpointDateRange=None):
         """Print sessions grouped by root experiment and subject.
 
         Called directly or by print() with its default selection.
@@ -2427,6 +2712,28 @@ class pglDatabase:
         Parentless roots display acquisition sessionName values in brackets.
         Descendants display database checkpoint names in parentheses.
         Descriptions are omitted; actual parent-child relationships are shown.
+
+        Filters:
+            experimentName / subjectID:
+                Exact matches against the same root grouping-label pair.
+                Only matching groups are displayed.
+
+            dateRange:
+                Inclusive UTC calendar dates for the root's acquired_at.
+                Descendants inherit this original acquisition timestamp.
+
+            checkpointDateRange:
+                Inclusive UTC calendar dates for each checkpoint's created_at.
+
+            Date ranges accept (start, end), with ISO date strings or Python
+            date objects. None endpoints are open. Missing timestamps do not
+            match a supplied date range, including (None, None).
+
+            All supplied filters combine with AND. Visible ancestors of
+            matching checkpoints are retained and marked [context].
+            Nonmatching descendants are not included automatically.
+
+        Timezone-naive database timestamps are interpreted as UTC.
 
         Reads catalog metadata in a consistent SQL snapshot. After SQL closes,
         reads verified root experiment-settings files through caller-resolved
@@ -2442,10 +2749,49 @@ class pglDatabase:
         modify records. Returns False for unavailable configuration or
         connection cancellation; other errors propagate.
         """
+        from datetime import date, datetime, timezone
         from psycopg.rows import tuple_row
 
         if type(includeDeleted) is not bool:
             raise ValueError("includeDeleted must be a boolean.")
+
+        for fieldName, value in (("experimentName", experimentName), ("subjectID", subjectID)):
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ValueError(f"{fieldName} must be a nonblank string or None.")
+
+        dateRange = pglDatabase._printDateRange(dateRange, "dateRange")
+        checkpointDateRange = pglDatabase._printDateRange(checkpointDateRange, "checkpointDateRange")
+        hasFilters = any(value is not None for value in (experimentName, subjectID, dateRange, checkpointDateRange))
+
+        # +++++++++++++++++++++++++++ matchesDate +++++++++++++++++++++++++++
+        def matchesDate(timestamp, bounds):
+            """Compare a database timestamp using its UTC calendar date."""
+            if bounds is None:
+                return True
+
+            if timestamp is None:
+                return False
+
+            if isinstance(timestamp, datetime):
+                if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+                    timestamp = timestamp.replace(tzinfo=timezone.utc)
+
+                calendarDate = timestamp.astimezone(timezone.utc).date()
+            elif isinstance(timestamp, date):
+                calendarDate = timestamp
+            else:
+                raise ValueError("Database acquisition/creation timestamps must be datetime or date values.")
+
+            startDate, endDate = bounds
+            return (startDate is None or calendarDate >= startDate) and (endDate is None or calendarDate <= endDate)
+
+        # +++++++++++++++++++++++++++ rangeLabel ++++++++++++++++++++++++++++
+        def rangeLabel(bounds):
+            """Format inclusive calendar-date boundaries for the report."""
+            startDate, endDate = bounds
+            startLabel = startDate.isoformat() if startDate is not None else "unbounded"
+            endLabel = endDate.isoformat() if endDate is not None else "unbounded"
+            return f"{startLabel} through {endLabel} (inclusive UTC dates)"
 
         postgres = pglDatabase._printPostgres(postgres, settings=settings, settingsName=settingsName)
 
@@ -2459,6 +2805,8 @@ class pglDatabase:
         backendsTable = sql.Identifier(postgres.databaseSchema, "storage_backends")
 
         records = {}
+        recordsByRoot = {}
+        matchingIDsByRoot = {}
         groupsByRoot = {}
         settingsByRoot = {}
         identities = {}
@@ -2475,11 +2823,30 @@ class pglDatabase:
                     cursor.execute("SELECT current_database(), transaction_timestamp()")
                     databaseName, snapshotTime = cursor.fetchone()
 
-                    statement = sql.SQL("SELECT session_id, parent_session_id, root_session_id, origin, status, deleted_at, meta, checkpoint_name FROM {} WHERE (%s OR deleted_at IS NULL) ORDER BY session_id").format(sessionsTable)
+                    # Original acquisition time comes from the root, not the
+                    # descendant's creation time or any overridden timestamp.
+                    # Reading a deleted root's date does not display that root.
+                    statement = sql.SQL("""
+                        SELECT checkpoint.session_id,
+                               checkpoint.parent_session_id,
+                               checkpoint.root_session_id,
+                               checkpoint.origin,
+                               checkpoint.status,
+                               checkpoint.deleted_at,
+                               checkpoint.meta,
+                               checkpoint.checkpoint_name,
+                               checkpoint.created_at,
+                               root.acquired_at
+                        FROM {sessions} AS checkpoint
+                        LEFT JOIN {sessions} AS root
+                          ON root.session_id = checkpoint.root_session_id
+                        WHERE (%s OR checkpoint.deleted_at IS NULL)
+                        ORDER BY checkpoint.session_id
+                    """).format(sessions=sessionsTable)
                     cursor.execute(statement, (includeDeleted,))
 
-                    for sessionID, parentID, rootID, origin, status, deletedAt, meta, checkpointName in cursor.fetchall():
-                        records[sessionID] = {
+                    for sessionID, parentID, rootID, origin, status, deletedAt, meta, checkpointName, createdAt, acquiredAt in cursor.fetchall():
+                        record = {
                             "session_id": sessionID,
                             "parent_session_id": parentID,
                             "root_session_id": rootID,
@@ -2488,13 +2855,21 @@ class pglDatabase:
                             "deleted_at": deletedAt,
                             "meta": meta,
                             "checkpoint_name": checkpointName,
+                            "created_at": createdAt,
+                            "acquired_at": acquiredAt,
                             "session_names": [],
                         }
+                        records[sessionID] = record
+                        recordsByRoot.setdefault(rootID, {})[sessionID] = record
 
-                    rootIDs = {record["root_session_id"] for record in records.values()}
+                        if matchesDate(acquiredAt, dateRange) and matchesDate(createdAt, checkpointDateRange):
+                            matchingIDsByRoot.setdefault(rootID, set()).add(sessionID)
+
+                    # Only date-eligible families need grouping/settings reads.
+                    rootIDs = sorted(matchingIDsByRoot)
                     visibleRootIDs = []
 
-                    for rootID in sorted(rootIDs):
+                    for rootID in rootIDs:
                         record = records.get(rootID)
 
                         if record is None:
@@ -2514,8 +2889,8 @@ class pglDatabase:
                                 for label in metadata["labels"]
                             }
 
-                    # All visible behavioral roots need acquisition settings
-                    # for sessionName, even when grouping labels are mirrored.
+                    # Eligible visible behavioral roots need acquisition
+                    # settings for sessionName, even with mirrored labels.
                     if visibleRootIDs:
                         statement = sql.SQL("""
                             SELECT link.session_id, link.name, content.file_id,
@@ -2550,22 +2925,27 @@ class pglDatabase:
                         cursor.execute(statement, (sorted(identities), includeDeleted))
 
                         for fileID, backendID, root, key in cursor.fetchall():
-                            locationsByFile.setdefault(fileID, []).append({"backend_id": backendID, "url_prefix": root, "object_key": key})
+                            locationsByFile.setdefault(fileID, []).append({
+                                "backend_id": backendID,
+                                "url_prefix": root,
+                                "object_key": key,
+                            })
 
         # SQL is closed. No deferred reader escapes this report, so its access
         # context can be closed after collecting the verified settings.
         settingsByFile = {}
 
-        with pglDatabaseAccess(postgres, storageOptionsByBackend) as access:
-            for fileID, identity in identities.items():
-                candidates = locationsByFile.get(fileID, [])
+        if identities:
+            with pglDatabaseAccess(postgres, storageOptionsByBackend) as access:
+                for fileID, identity in identities.items():
+                    candidates = locationsByFile.get(fileID, [])
 
-                if not candidates:
-                    raise FileNotFoundError(f"Experiment-settings file {fileID} has no eligible registered location.")
+                    if not candidates:
+                        raise FileNotFoundError(f"Experiment-settings file {fileID} has no eligible registered location.")
 
-                settingsByFile[fileID] = pglDatabase._readPrintExperimentSettings(identity, candidates, accessContext=access)
+                    settingsByFile[fileID] = pglDatabase._readPrintExperimentSettings(identity, candidates, accessContext=access)
 
-        for rootID in sorted(rootIDs):
+        for rootID in rootIDs:
             record = records.get(rootID)
 
             if record is None:
@@ -2598,10 +2978,49 @@ class pglDatabase:
                 groupsByRoot[rootID] = pairs or {("Unknown", "Unknown")}
 
         grouped = {}
+        displayedIDs = set()
+        matchedIDs = set()
 
-        for sessionID, record in records.items():
-            for experiment, subject in groupsByRoot[record["root_session_id"]]:
-                grouped.setdefault(experiment, {}).setdefault(subject, {})[sessionID] = record
+        for rootID in rootIDs:
+            # Test experiment and subject together against each saved pair.
+            # A root with (experimentA, subject1) and (experimentB, subject2)
+            # must not match experimentA + subject2.
+            matchingPairs = {
+                (experiment, subject)
+                for experiment, subject in groupsByRoot[rootID]
+                if (experimentName is None or experiment == experimentName)
+                and (subjectID is None or subject == subjectID)
+            }
+
+            if not matchingPairs:
+                continue
+
+            rootRecords = recordsByRoot[rootID]
+            rootMatches = matchingIDsByRoot[rootID]
+            includedIDs = set(rootMatches)
+
+            # Preserve actual parent-child relationships. Stop at hidden or
+            # missing parents instead of drawing artificial ancestor arrows.
+            # The formatter performs the final lineage cycle validation.
+            for sessionID in sorted(rootMatches):
+                parentID = rootRecords[sessionID]["parent_session_id"]
+
+                while parentID in rootRecords and parentID not in includedIDs:
+                    includedIDs.add(parentID)
+                    parentID = rootRecords[parentID]["parent_session_id"]
+
+            selectedRecords = {}
+
+            for sessionID in sorted(includedIDs):
+                record = dict(rootRecords[sessionID])
+                record["filter_context"] = sessionID not in rootMatches
+                selectedRecords[sessionID] = record
+
+            for experiment, subject in matchingPairs:
+                grouped.setdefault(experiment, {}).setdefault(subject, {}).update(selectedRecords)
+
+            displayedIDs.update(includedIDs)
+            matchedIDs.update(rootMatches)
 
         # +++++++++++++++++++++++++++ groupOrder ++++++++++++++++++++++++++++
         def groupOrder(value):
@@ -2623,17 +3042,36 @@ class pglDatabase:
         pglMessages.message(f"Database: {databaseName}.{postgres.databaseSchema}", wrapText=False)
         pglMessages.message(f"Metadata snapshot: {snapshotTime}", wrapText=False)
         pglMessages.print("  Including deleted sessions." if includeDeleted else "  Deleted sessions excluded.")
+
+        if experimentName is not None:
+            pglMessages.print(f"  Experiment filter: {pglDatabase._printValue(experimentName)}")
+
+        if subjectID is not None:
+            pglMessages.print(f"  Subject filter: {pglDatabase._printValue(subjectID)}")
+
+        if dateRange is not None:
+            pglMessages.print(f"  Original acquisition: {rangeLabel(dateRange)}")
+
+        if checkpointDateRange is not None:
+            pglMessages.print(f"  Checkpoint creation: {rangeLabel(checkpointDateRange)}")
+
+        if hasFilters:
+            contextCount = len(displayedIDs - matchedIDs)
+            pglMessages.print(f"  Matching checkpoints: {len(matchedIDs)} | Context ancestors: {contextCount}")
+
+            if contextCount:
+                pglMessages.print("  [context] marks ancestors shown for lineage only; they do not match all filters.")
+
         pglMessages.print()
 
-        if not records:
-            pglMessages.print("  (no visible sessions)")
+        if not grouped:
+            pglMessages.print("  (no matching visible sessions)" if hasFilters else "  (no visible sessions)")
         else:
             for line in output:
                 pglMessages.print(line)
 
         pglMessages.printHeader()
         return True
-
     # +++++++++++++++++++++++++++++ printDatasets +++++++++++++++++++++++++++++
     # User-facing database API. See the docstring for configuration, side effects, and return
     # conventions.
@@ -3011,7 +3449,59 @@ class pglDatabase:
         pglMessages.printHeader()
         return True
 
+    # +++++++++++++++++++++++++++ _printDateRange +++++++++++++++++++++++++++
+    @staticmethod
+    def _printDateRange(value, fieldName):
+        """Validate an inclusive calendar-date range used by session reports.
 
+        Accepts None or a two-item tuple/list containing ISO date strings,
+        Python date objects, or None for an open endpoint.
+
+        Datetime endpoints are rejected: these filters intentionally operate
+        on whole UTC calendar days, not timestamp intervals.
+        """
+        from datetime import date, datetime
+
+        if value is None:
+            return None
+
+        if not isinstance(value, (tuple, list)) or len(value) != 2:
+            raise ValueError(f"{fieldName} must be a (start, end) tuple or list.")
+
+        endpoints = []
+
+        for endpoint in value:
+            if endpoint is None:
+                endpoints.append(None)
+                continue
+
+            if isinstance(endpoint, datetime):
+                raise ValueError(f"{fieldName} endpoints must be dates, not datetime values.")
+
+            if isinstance(endpoint, date):
+                endpoints.append(endpoint)
+                continue
+
+            if isinstance(endpoint, str):
+                try:
+                    parsed = date.fromisoformat(endpoint)
+                except ValueError as error:
+                    raise ValueError(f"{fieldName} endpoints must use YYYY-MM-DD dates.") from error
+
+                if parsed.isoformat() != endpoint:
+                    raise ValueError(f"{fieldName} endpoints must use YYYY-MM-DD dates.")
+
+                endpoints.append(parsed)
+                continue
+
+            raise ValueError(f"{fieldName} endpoints must be YYYY-MM-DD strings, date objects, or None.")
+
+        startDate, endDate = endpoints
+
+        if startDate is not None and endDate is not None and startDate > endDate:
+            raise ValueError(f"{fieldName} start date must not be after its end date.")
+
+        return startDate, endDate
     # -------------------------------------------------------------------------
     # Pipeline extraction
     # -------------------------------------------------------------------------
@@ -9805,6 +10295,8 @@ class pglDatabase:
 
     # ++++++++++++++++++++++++++ _sessionLineageLines +++++++++++++++++++++++++
     # Direct callers in this module: printSessions.
+    # ++++++++++++++++++++++++++ _sessionLineageLines +++++++++++++++++++++++++
+    # Direct callers in this module: printSessions.
     @staticmethod
     def _sessionLineageLines(records):
         """Format visible session lineage without descriptions.
@@ -9814,6 +10306,8 @@ class pglDatabase:
 
         Descendants use database checkpoint names:
             95 (checkpointName)
+
+        Ancestors retained only to explain filtered lineage use [context].
 
         Hidden/missing parents are not bypassed by artificial arrows.
         Iterative traversal avoids Python recursion limits.
@@ -9856,6 +10350,9 @@ class pglDatabase:
 
             if record["status"] != "complete":
                 label += f" [{pglDatabase._printValue(record['status'])}]"
+
+            if record.get("filter_context", False):
+                label += " [context]"
 
             return label
 
