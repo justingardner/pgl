@@ -818,7 +818,7 @@ class pglDatabase:
             closeFailedLoad()
             raise
 
-        pglMessages.message(f"Loaded {checkpoint[0]} checkpoint {sessionID}; scientific payload values remain deferred.")
+        session.print()
         return session
 
     # ++++++++++++++++++++++++++++++ saveSession ++++++++++++++++++++++++++++++
