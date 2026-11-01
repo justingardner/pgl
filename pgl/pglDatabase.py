@@ -845,6 +845,15 @@ class pglDatabase:
 
         pglPostgres.validateTimeouts(lockTimeoutSeconds=lockTimeoutSeconds, ioTimeoutSeconds=ioTimeoutSeconds, connectTimeoutSeconds=connectTimeoutSeconds)
         
+        # Never save only the behavioral portion of an MRI session.
+        if getattr(session, "mri", None) is not None:
+            pglMessages.warning(
+                "Session was not saved: MRI checkpoint persistence is "
+                "not implemented yet. No database or payload writes were "
+                "attempted; the working session is unchanged."
+            )
+            return None
+        
         # Refuse unsafe saves without turning an expected rejection into
         # a notebook traceback. Keep the failure marker and history intact.
         try:
@@ -1007,6 +1016,15 @@ class pglDatabase:
         # Reject invalid timeout arguments before source reads or connections.
         pglPostgres.validateTimeouts(lockTimeoutSeconds=lockTimeoutSeconds, ioTimeoutSeconds=ioTimeoutSeconds, connectTimeoutSeconds=connectTimeoutSeconds)
 
+        # Refuse partial publication until MRI checkpoint persistence exists.
+        if getattr(session, "mri", None) is not None:
+            pglMessages.warning(
+                "Raw session was not saved: MRI checkpoint persistence is "
+                "not implemented yet. No database or payload writes were "
+                "attempted; the working session is unchanged."
+            )
+            return None
+        
         sessionID = None
         commitAttempted = False
         commitConfirmed = False

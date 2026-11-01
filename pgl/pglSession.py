@@ -31,6 +31,7 @@ import posixpath
 import matplotlib.pyplot as plt
 from traitlets import observe
 from .pglLazyLoad import pglLazyLoad, pglFsspecBacking
+from .pglMRI import pglMRI
 
 ##################################
 # pglRun
@@ -2385,6 +2386,7 @@ class pglSession(pglActionable):
     checkpointName = Unicode(default_value=None, allow_none=True, help="Short checkpoint label carried forward by saveSession; an empty string clears it.", serialize=False)
     runs = List(Instance(pglRun), allow_none=True, help="List of behavioral runs")
     mne = Instance(pglMNE, allow_none=True, help="MEG/EEG data")
+    mri = Instance(pglMRI, allow_none=True, default_value=None, help="MRI data", serialize=False)
     dataMatrices = Dict(default_value={}, help="Named scientific matrices owned by this working session; persisted explicitly through session checkpoint integration", serialize=False)
     derivedFiles = Dict(default_value={}, help="Named derived file attachments; persisted explicitly through session checkpoint integration", serialize=False)
     
@@ -2527,14 +2529,16 @@ class pglSession(pglActionable):
         self._subjectID = self._normalizeSessionLabel(value, "subjectID")
 
     def add(self, data):
-        """Attach a supported data object to this session."""
+        """Attach supported modality contents independently of behavior."""
         if isinstance(data, pglMNE):
             self.mne = data
+        elif isinstance(data, pglMRI):
+            self.mri = data
         else:
             pglMessages.warning(f"Unknown data type: {type(data).__name__}")
 
     def get(self, dataName):
-        """Return attached MNE contents or the current Raw."""
+        """Return attached modality contents or the current MNE Raw."""
         if dataName.lower() == "mneraw":
             contents = self.get("mne")
             return contents.raw if contents is not None else None
@@ -2544,6 +2548,13 @@ class pglSession(pglActionable):
                 return self.mne
 
             pglMessages.warning("No mne data loaded", level=1)
+            return None
+
+        if dataName.lower() == "mri":
+            if self.mri is not None:
+                return self.mri
+
+            pglMessages.warning("No MRI data loaded", level=1)
             return None
 
         pglMessages.warning(f"Unknown data type: {dataName}")
@@ -2622,7 +2633,7 @@ class pglSession(pglActionable):
         information["Runs"] = len(self.runs or [])
         information["Filesystem"] = protocol or "Not set"
         information["MEG/EEG data"] = "Attached" if self.mne is not None else "None"
-
+        information["MRI data"] = (f"{len(self.mri.scans)} scans" if self.mri is not None else "None")
         labelWidth = max(len(label) for label in information)
 
         for label, value in information.items():
