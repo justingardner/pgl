@@ -1070,7 +1070,7 @@ class pglDatabase:
                 except Exception as diagnosticError:
                     pglMessages.warning(f"Lock inspection was unavailable ({type(diagnosticError).__name__}). Restore connectivity and run pglDatabase.inspectPostgresLocks() with the same database settings.", level=1)
 
-                pglMessages.message("For a confirmed abandoned owner, use pglDatabase.terminatePostgresLockOwner(PID). Administrator authorization and confirmation are required. Current holders are not necessarily the original blocker.", wrapText=False)
+                pglMessages.message("For a confirmed abandoned owner, use pglDatabase.terminatePostgresLock(PID). Administrator authorization and confirmation are required. Current holders are not necessarily the original blocker.", wrapText=False)
             else:
                 pglMessages.message("Check VPN/network and database/storage availability. After restoring connectivity, run pglDatabase.inspectPostgres() before retrying.", wrapText=False)
 
@@ -5978,170 +5978,6 @@ class pglDatabase:
 
                 return sessionID
     
-    @classmethod
-    def registerStagedRawCheckpoint(cls, connection, postgres, createdBy, backendID, manifest, staged, storedManifest, storageOptions=None, *, sessionID=None, accessContext=None, progress=None):
-        """Register a staged behavioral archive without completing or committing.
-
-        Validates staged identities, reads verified acquisition labels,
-        verifies/registers stored payloads, and attaches checkpoint file links.
-
-        A supplied access context is borrowed. Otherwise this method owns and
-        closes one temporary context.
-
-        Optional progress weights registration verification by file size.
-        Repeated identical payload/location registrations are verified once.
-        All existing publication and integrity checks remain in place.
-        """
-        from contextlib import ExitStack
-
-        if type(backendID) is not int or not 0 <= backendID <= 9223372036854775807:
-            raise ValueError("backendID must be a nonnegative PostgreSQL bigint.")
-
-        if storageOptions is not None and not isinstance(storageOptions, dict):
-            raise TypeError("storageOptions must be a dictionary or None.")
-
-        if accessContext is not None:
-            if not isinstance(accessContext, pglDatabaseAccess):
-                raise TypeError("accessContext must be a pglDatabaseAccess instance.")
-
-            if storageOptions:
-                raise ValueError("Configure storage options on accessContext, not on both arguments.")
-
-            if cls._checkpointDatabaseIdentity(accessContext._postgres) != cls._checkpointDatabaseIdentity(postgres):
-                raise ValueError("The supplied payload context belongs to a different configured database.")
-
-        if progress is not None:
-            progress(0, "Validating staged file inventory")
-
-        cls.validateRawManifest(manifest)
-        expectedByName = {record["name"]: record for record in manifest["files"]}
-        stagedByName = {record["name"]: record for record in staged}
-
-        if len(expectedByName) != len(manifest["files"]) or len(stagedByName) != len(staged):
-            raise ValueError("Duplicate logical filenames are not allowed.")
-
-        if set(expectedByName) != set(stagedByName):
-            raise ValueError("Staged files do not match the manifest filenames.")
-
-        if "manifest.json" in expectedByName:
-            raise ValueError("manifest.json is reserved for the checkpoint manifest.")
-
-        for name, expected in expectedByName.items():
-            actual = stagedByName[name]
-
-            if actual["sha256"] != expected["sha256"] or actual["size_bytes"] != expected["size_bytes"]:
-                raise ValueError(f"Staged identity differs from manifest: {name}")
-
-        manifestBytes = cls.encodeRawManifest(manifest)
-
-        if storedManifest["sha256"] != hashlib.sha256(manifestBytes).hexdigest() or storedManifest["size_bytes"] != len(manifestBytes):
-            raise ValueError("Stored manifest identity does not match the supplied manifest.")
-
-        backendsTable = sql.Identifier(postgres.databaseSchema, "storage_backends")
-        statement = sql.SQL("SELECT url_prefix, is_active FROM {} WHERE backend_id = %s").format(backendsTable)
-        backend = connection.execute(statement, (backendID,)).fetchone()
-
-        if backend is None or not backend[1]:
-            raise ValueError(f"Storage backend is missing or inactive: {backendID}")
-
-        registeredRoot = backend[0]
-
-        with ExitStack() as resources:
-            if accessContext is None:
-                access = resources.enter_context(pglDatabaseAccess(postgres, {backendID: storageOptions or {}}))
-            else:
-                access = accessContext
-
-            fileLocations = {
-                name: {
-                    "sha256": record["sha256"],
-                    "size_bytes": record["size_bytes"],
-                    "locations": [{
-                        "backend_id": backendID,
-                        "url_prefix": registeredRoot,
-                        "object_key": record["object_key"],
-                    }],
-                }
-                for name, record in stagedByName.items()
-            }
-
-            archive = pglCheckpointFilesystem(manifest, fileLocations, accessContext=access, ownsAccess=False)
-            resources.callback(archive.close)
-
-            if progress is not None:
-                progress(0, "Verifying archived acquisition labels")
-
-            metadata = cls._behaviorLabelMetadata(manifest, archive)
-            subjectsByRun = {run["path"]: metadata["labels"][run["index"]]["subjectID"] for run in manifest["runs"]}
-            subjectsByName = {}
-
-            for name in expectedByName:
-                matchingRuns = [path for path in subjectsByRun if name.startswith(path + "/")]
-
-                if len(matchingRuns) != 1:
-                    raise ValueError(f"File does not belong to exactly one run: {name}")
-
-                subjectsByName[name] = subjectsByRun[matchingRuns[0]]
-
-            if progress is not None:
-                progress(None, "Validating unpublished checkpoint")
-
-            if sessionID is None:
-                checkpointID = cls.createRawCheckpoint(connection, postgres, createdBy)
-            else:
-                sessionsTable = sql.Identifier(postgres.databaseSchema, "session")
-                linksTable = sql.Identifier(postgres.databaseSchema, "session_files")
-
-                statement = sql.SQL("SELECT status, origin, contract_version, created_by, deleted_at FROM {} WHERE session_id = %s FOR UPDATE").format(sessionsTable)
-                checkpoint = connection.execute(statement, (sessionID,)).fetchone()
-
-                if checkpoint != ("in_progress", "raw", "pgl.raw.behavior.v1", createdBy, None):
-                    raise ValueError("Checkpoint must be an active in-progress raw behavioral checkpoint owned by the supplied creator.")
-
-                statement = sql.SQL("SELECT 1 FROM {} WHERE session_id = %s LIMIT 1").format(linksTable)
-
-                if connection.execute(statement, (sessionID,)).fetchone() is not None:
-                    raise ValueError("Checkpoint already has file links.")
-
-                checkpointID = sessionID
-
-            cls._recordSessionLabelMetadata(connection, postgres, checkpointID, metadata)
-            registeredPayloads = {}
-
-            def registerPayload(record, fileProgress=None):
-                """Verify/register each distinct identity and location once."""
-                identity = (record["sha256"], record["size_bytes"], record["object_key"])
-
-                if identity not in registeredPayloads:
-                    if fileProgress is not None:
-                        fileProgress(0, "Resolving content identity")
-
-                    fileID = cls.getOrCreateFile(connection, postgres, record["sha256"], record["size_bytes"])
-                    cls.verifyAndRegisterStorageLocation(connection, postgres, fileID, backendID, record["object_key"], accessContext=access, progress=fileProgress)
-                    registeredPayloads[identity] = fileID
-                elif fileProgress is not None:
-                    fileProgress(1, "Reusing verification from this registration")
-
-                return registeredPayloads[identity]
-
-            records = [stagedByName[name] for name in sorted(expectedByName)]
-            records.append({**storedManifest, "name": "manifest.json"})
-            fileRange = progress.section(0.05, 1) if progress is not None else None
-
-            for record, fileProgress in pglProgress.fileSections(records, fileRange):
-                name = record["name"]
-                fileID = registerPayload(record, fileProgress)
-
-                if fileProgress is not None:
-                    fileProgress(None, "Attaching checkpoint file")
-
-                if name == "manifest.json":
-                    cls.attachCheckpointFile(connection, postgres, checkpointID, name, fileID, role="manifest")
-                else:
-                    cls.attachCheckpointFile(connection, postgres, checkpointID, name, fileID, role="acquisition", subjectID=subjectsByName[name])
-
-            return checkpointID
-
     # +++++++++++++++++++++++++ _checkRawSessionLabels ++++++++++++++++++++++++
     # Direct callers in this module: saveRawSession.
     @classmethod
@@ -11126,6 +10962,101 @@ class pglDatabase:
     # ++++++++++++++++++++++++ _SessionLifecycleBlocked +++++++++++++++++++++++
     class _SessionLifecycleBlocked(ValueError):
         """Lifecycle operation was refused without making changes."""
+        
+    @classmethod
+    def _handleCheckpointSaveFailure(cls, error, *, checkpointKind, checkpointID, operation, commitAttempted, commitConfirmed):
+        """Warn for recognized operational failures after resource cleanup.
+
+        Returns True when handled, False when the caller should re-raise.
+        Does not retry, connect for diagnostics, terminate sessions, or delete
+        payloads. Avoids exposing backend exception text or signed URLs.
+
+        Authentication/host-key failures, integrity failures, and programming
+        errors are not intentionally suppressed.
+        """
+        from paramiko import SSHException
+        from paramiko.ssh_exception import AuthenticationException, BadHostKeyException
+
+        lockFailure = False
+
+        if isinstance(error, (AuthenticationException, BadHostKeyException)):
+            return False
+
+        if isinstance(error, psycopg.errors.LockNotAvailable):
+            reason = "a required PostgreSQL lock could not be acquired"
+            lockFailure = True
+        elif isinstance(error, TimeoutError):
+            reason = "a lock wait, connection attempt, or I/O operation timed out"
+            lockFailure = True
+        elif isinstance(error, SSHException):
+            message = str(error).strip().lower()
+            dropped = message.startswith("server connection dropped:") or message in {
+                "socket is closed",
+                "socket is closed.",
+                "server connection dropped",
+                "ssh session not active",
+                "no existing session",
+            }
+
+            if not dropped:
+                return False
+
+            reason = "the SSH/SFTP connection was lost"
+        elif isinstance(error, (psycopg.OperationalError, psycopg.InterfaceError)):
+            # Explicit authentication/authorization failures remain visible.
+            if getattr(error, "sqlstate", None) in {"28000", "28P01", "42501"}:
+                return False
+
+            reason = "a PostgreSQL connection or operational failure occurred"
+        elif isinstance(error, ConnectionError):
+            reason = "a network connection failed"
+        else:
+            return False
+
+        label = checkpointKind if checkpointID is None else f"{checkpointKind} {checkpointID}"
+
+        if commitConfirmed:
+            outcome = (
+                f"The transaction for {label} committed, but subsequent cleanup failed. "
+                "The committed checkpoint was not rolled back. "
+                "The working object's checkpoint bookkeeping was not updated."
+            )
+        elif commitAttempted:
+            outcome = (
+                f"The failure occurred during commit for {label}. "
+                "The outcome is not confirmed by this client; the checkpoint may "
+                "already have been saved. Inspect the database before retrying."
+            )
+        else:
+            outcome = (
+                "The final checkpoint commit was not attempted. "
+                "Transaction and connection cleanup were attempted. "
+                "If PostgreSQL is unreachable, its transaction and locks may remain "
+                "until the server detects the disconnected client."
+            )
+
+        inspection = (
+            "Run pglDatabase.inspectPostgresLocks() with the same settings to inspect "
+            "current lock-related sessions. For table-lock blockers, inspect live "
+            "activity while the wait is occurring; a timed-out waiter may already "
+            "have disappeared. Idle database state does not prove abandonment."
+            if lockFailure else
+            "Restore VPN/network access and check pglDatabase.inspectPostgres() "
+            "with the same settings before retrying."
+        )
+
+        report = "pglDatabase.print(datasets=True)" if checkpointKind == "Dataset checkpoint" else "pglDatabase.print()"
+
+        pglMessages.warning(
+            f"{checkpointKind} save stopped while {operation}: {reason} ({type(error).__name__}).\n"
+            f"{outcome}\n"
+            f"{inspection}\n"
+            f"Inspect saved checkpoints with {report}. "
+            "Partial or unregistered files/matrix bundles may remain. "
+            "No automatic retry, connection termination, or payload deletion occurred.",
+            level=2,
+        )
+        return True
 
 # =========================================================================
 # RUNTIME PAYLOAD ACCESS CONTEXT
@@ -11686,98 +11617,5 @@ class pglCheckpointFilesystem(AbstractFileSystem):
         if self._ownsAccess and self._accessContext is not None:
             self._accessContext.close()
 
-    @classmethod
-    def _handleCheckpointSaveFailure(cls, error, *, checkpointKind, checkpointID, operation, commitAttempted, commitConfirmed):
-        """Warn for recognized operational failures after resource cleanup.
 
-        Returns True when handled, False when the caller should re-raise.
-        Does not retry, connect for diagnostics, terminate sessions, or delete
-        payloads. Avoids exposing backend exception text or signed URLs.
-
-        Authentication/host-key failures, integrity failures, and programming
-        errors are not intentionally suppressed.
-        """
-        from paramiko import SSHException
-        from paramiko.ssh_exception import AuthenticationException, BadHostKeyException
-
-        lockFailure = False
-
-        if isinstance(error, (AuthenticationException, BadHostKeyException)):
-            return False
-
-        if isinstance(error, psycopg.errors.LockNotAvailable):
-            reason = "a required PostgreSQL lock could not be acquired"
-            lockFailure = True
-        elif isinstance(error, TimeoutError):
-            reason = "a lock wait, connection attempt, or I/O operation timed out"
-            lockFailure = True
-        elif isinstance(error, SSHException):
-            message = str(error).strip().lower()
-            dropped = message.startswith("server connection dropped:") or message in {
-                "socket is closed",
-                "socket is closed.",
-                "server connection dropped",
-                "ssh session not active",
-                "no existing session",
-            }
-
-            if not dropped:
-                return False
-
-            reason = "the SSH/SFTP connection was lost"
-        elif isinstance(error, (psycopg.OperationalError, psycopg.InterfaceError)):
-            # Explicit authentication/authorization failures remain visible.
-            if getattr(error, "sqlstate", None) in {"28000", "28P01", "42501"}:
-                return False
-
-            reason = "a PostgreSQL connection or operational failure occurred"
-        elif isinstance(error, ConnectionError):
-            reason = "a network connection failed"
-        else:
-            return False
-
-        label = checkpointKind if checkpointID is None else f"{checkpointKind} {checkpointID}"
-
-        if commitConfirmed:
-            outcome = (
-                f"The transaction for {label} committed, but subsequent cleanup failed. "
-                "The committed checkpoint was not rolled back. "
-                "The working object's checkpoint bookkeeping was not updated."
-            )
-        elif commitAttempted:
-            outcome = (
-                f"The failure occurred during commit for {label}. "
-                "The outcome is not confirmed by this client; the checkpoint may "
-                "already have been saved. Inspect the database before retrying."
-            )
-        else:
-            outcome = (
-                "The final checkpoint commit was not attempted. "
-                "Transaction and connection cleanup were attempted. "
-                "If PostgreSQL is unreachable, its transaction and locks may remain "
-                "until the server detects the disconnected client."
-            )
-
-        inspection = (
-            "Run pglDatabase.inspectPostgresLocks() with the same settings to inspect "
-            "current lock-related sessions. For table-lock blockers, inspect live "
-            "activity while the wait is occurring; a timed-out waiter may already "
-            "have disappeared. Idle database state does not prove abandonment."
-            if lockFailure else
-            "Restore VPN/network access and check pglDatabase.inspectPostgres() "
-            "with the same settings before retrying."
-        )
-
-        report = "pglDatabase.print(datasets=True)" if checkpointKind == "Dataset checkpoint" else "pglDatabase.print()"
-
-        pglMessages.warning(
-            f"{checkpointKind} save stopped while {operation}: {reason} ({type(error).__name__}).\n"
-            f"{outcome}\n"
-            f"{inspection}\n"
-            f"Inspect saved checkpoints with {report}. "
-            "Partial or unregistered files/matrix bundles may remain. "
-            "No automatic retry, connection termination, or payload deletion occurred.",
-            level=2,
-        )
-        return True
     
