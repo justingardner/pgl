@@ -19,7 +19,7 @@ import numpy as np
 from numbers import Integral
 import matplotlib.pyplot as plt
 from fsspec import AbstractFileSystem
-from traitlets import HasTraits, Enum, Float, Int, List, Tuple, TraitError, Unicode, Dict, default, link, Bool, TraitType, Instance
+from traitlets import Any, HasTraits, Enum, Float, Int, List, Tuple, TraitError, Unicode, Dict, default, link, Bool, TraitType, Instance
 import pandas as pd
 from .pglExperiment import pglEventTrial, pglEventSegment
 import matplotlib
@@ -490,4 +490,228 @@ class pglActions():
                 return None
 
             # and return
+            return session
+        
+    ################################################################
+    # Load a deferred Flywheel MRI session
+    ################################################################
+    class loadFlywheelSession(pglAction):
+        """Choose Flywheel MRI files and return a deferred acquisition session.
+
+        Configuration reads source metadata and pins file versions.
+        Execution attaches source references without downloading NIfTI files.
+
+        Use saveRawSession() later to stream acquisition bytes into storage.
+        This is an ingestion action returning a new session, not a processing
+        action that modifies a supplied session.
+
+        History stores pinned metadata and labels, never the SDK client or
+        caller-local cache configuration. Source metadata may identify subjects.
+
+        Restored/copied actions require runtime access supplied again through
+        run(flywheel=..., cacheDirectory=...). They do not reconnect silently.
+        Analysis replay should normally begin at the saved raw checkpoint,
+        excluding this ingestion action through the recorded history boundary.
+        """
+
+        selectedScans = List(Dict(), help="Ordered scan names and pinned source metadata")
+        experimentName = Unicode("", help="Explicit PGL experiment label")
+        subjectID = Unicode("", help="Session subject label")
+
+        # These resources must not enter action history or pipeline recipes.
+        _client = Any(default_value=None, allow_none=True).tag(serialize=False)
+        _cacheDirectory = Unicode("").tag(serialize=False)
+
+        def configure(self, flywheel=None, *, cacheDirectory=None, experimentName=None, subjectID=None, choose=True):
+            """Choose one session and capture pinned source metadata.
+
+            choose=False uses the connection's already accepted selection.
+            Cancel or invalid input leaves this action unconfigured.
+            No NIfTI payload is downloaded and no cache directory is created.
+
+            experimentName is explicit; a Flywheel project is not automatically
+            assumed to be a PGL experiment. Unset labels remain unset and are
+            subject to the ordinary saveRawSession() metadata checks.
+            """
+            import os
+            from pathlib import Path
+
+            from .pglFlywheel import pglFlywheel
+            from .pglMRI import pglMRIScan
+            from .pglPipeline import pglActionStatus
+            from .pglSession import pglSession
+
+            # Reconfiguration must not retain an earlier accepted selection
+            # or credentials when the new selection is cancelled.
+            self.status = pglActionStatus.INITIALIZED
+            self.error = None
+            self.selectedScans = []
+            self.experimentName = ""
+            self.subjectID = ""
+            self._client = None
+            self._cacheDirectory = ""
+
+            try:
+                if not isinstance(flywheel, pglFlywheel) or flywheel.fw is None:
+                    raise ValueError("Supply a working pglFlywheel instance as flywheel.")
+
+                if type(choose) is not bool:
+                    raise ValueError("choose must be a boolean.")
+
+                cacheText = os.fspath(cacheDirectory)
+                if (
+                    not isinstance(cacheText, str)
+                    or not cacheText.strip()
+                    or "://" in cacheText
+                    or "::" in cacheText
+                    or any(character in cacheText for character in ("\x00", "\n", "\r"))
+                ):
+                    raise ValueError("cacheDirectory must be an ordinary local path.")
+
+                cachePath = str(Path(cacheText).expanduser().absolute())
+                experimentLabel = pglSession._normalizeSessionLabel(experimentName, "experimentName")
+                subjectLabel = pglSession._normalizeSessionLabel(subjectID, "subjectID")
+
+            except (TypeError, ValueError) as error:
+                pglMessages.warning(f"Flywheel loading was not configured: {error}", level=0)
+                return
+
+            if choose and flywheel.choose() is None: return
+
+            # Reuse the tested standalone API for metadata collection,
+            # single-session validation, and version pinning.
+            mri = flywheel.toMRI(cacheDirectory=cachePath)
+            if mri is None: return
+
+            if subjectID is None:
+                subjects = {
+                    pglSession._normalizeSessionLabel(
+                        scan.sourceMetadata["selection"]["subjectID"],
+                        "Flywheel subjectID",
+                    )
+                    for scan in mri.scans
+                }
+                if len(subjects) != 1:
+                    pglMessages.warning(
+                        "Flywheel loading was not configured: selected scans "
+                        "do not share one subject label.",
+                        level=0,
+                    )
+                    return
+                subjectLabel = next(iter(subjects))
+
+            records = [
+                {
+                    "name": scan.name,
+                    "sourceMetadata": pglMRIScan._copyMetadata(scan.sourceMetadata),
+                }
+                for scan in mri.scans
+            ]
+
+            # Persist only portable metadata. Do not retain the temporary MRI
+            # collection: each execution constructs independent working scans.
+            self.selectedScans = records
+            self.experimentName = experimentLabel or ""
+            self.subjectID = subjectLabel or ""
+            self._client = flywheel.fw
+            self._cacheDirectory = cachePath
+            super().configure()
+
+        def _run(self, *, flywheel=None, cacheDirectory=None):
+            """Return a new session with pinned, unopened MRI sources.
+
+            Runtime overrides allow direct execution of a restored/copied
+            action without repeating interactive selection or repinning files.
+
+            No SDK requests occur here. Actual source availability and hash
+            verification are checked when payloads are subsequently read.
+            """
+            import os
+            from pathlib import Path
+
+            from .pglFlywheel import pglFlywheel, pglFlywheelMRIBacking
+            from .pglMRI import pglMRI, pglMRIScan
+            from .pglSession import pglSession
+
+            client = self._client
+            if flywheel is not None:
+                if not isinstance(flywheel, pglFlywheel) or flywheel.fw is None:
+                    self.setError("Supply a working pglFlywheel instance.")
+                    return None
+                client = flywheel.fw
+
+            if client is None:
+                self.setError(
+                    "Flywheel runtime access is missing. Use "
+                    "action.run(flywheel=flywheel, cacheDirectory=...) "
+                    "for a restored/copied ingestion action."
+                )
+                return None
+
+            try:
+                cacheValue = self._cacheDirectory if cacheDirectory is None else cacheDirectory
+                cacheText = os.fspath(cacheValue)
+                if (
+                    not isinstance(cacheText, str)
+                    or not cacheText.strip()
+                    or "://" in cacheText
+                    or "::" in cacheText
+                    or any(character in cacheText for character in ("\x00", "\n", "\r"))
+                ):
+                    raise ValueError("A local cacheDirectory is required.")
+
+                cachePath = str(Path(cacheText).expanduser().absolute())
+                if not self.selectedScans:
+                    raise ValueError("No pinned scans are configured.")
+
+                records = [
+                    pglMRIScan._copyMetadata(record)
+                    for record in self.selectedScans
+                ]
+
+                # Recheck persisted configuration, including recipes edited
+                # through configureTraits() rather than configure().
+                sessionKeys = set()
+                scans = []
+
+                for record in records:
+                    if set(record) != {"name", "sourceMetadata"}:
+                        raise ValueError("Invalid configured scan record.")
+
+                    provenance = record["sourceMetadata"]
+                    selection = provenance["selection"]
+                    fileMetadata = provenance["file"]
+                    sessionKeys.add((selection["projectID"], selection["sessionID"]))
+
+                    if fileMetadata["name"] != selection["fileName"]:
+                        raise ValueError("Pinned filename differs from selection metadata.")
+
+                    backing = pglFlywheelMRIBacking(
+                        client,
+                        selection["acquisitionID"],
+                        selection["fileName"],
+                        version=fileMetadata["version"],
+                        sizeBytes=fileMetadata["size"],
+                        sourceHash=fileMetadata["hash"],
+                    )
+
+                    scan = pglMRIScan(name=record["name"], sourceMetadata=provenance)
+                    if scan.attachBacking(backing, cacheDirectory=cachePath) is None:
+                        raise ValueError("Could not attach the configured MRI source.")
+                    scans.append(scan)
+
+                if len(sessionKeys) != 1:
+                    raise ValueError("Configured scans must belong to one Flywheel session.")
+
+                session = pglSession()
+                session.experimentName = self.experimentName
+                session.subjectID = self.subjectID
+
+            except (TypeError, ValueError, KeyError) as error:
+                self.setError(f"Flywheel session was not loaded: {error}")
+                return None
+
+            mri = pglMRI()
+            mri.scans = scans
+            session.add(mri)
             return session
