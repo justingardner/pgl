@@ -15,7 +15,7 @@ from traitlets import Bool, Instance, List, Unicode
 
 from .pglMessages import pglMessages
 from .pglSettings import pglTraitSettings
-
+from .pglMRI import pglMRIFileBacking
 
 ################################################################
 # Process-local clients
@@ -185,6 +185,172 @@ class pglFlywheelChoose(pglTraitSettings):
         help="Flywheel projects to load data from",
     )
 
+
+################################################################
+# Deferred, version-pinned MRI source
+################################################################
+class pglFlywheelMRIBacking(pglMRIFileBacking):
+    """Stream one pinned Flywheel file version without local staging.
+
+    Inherits MRI materialization support. Overrides filesystem opening with
+    an SDK stream that verifies the recorded size and SHA-384 at EOF.
+
+    Construction performs no network access.
+    The SDK client is runtime-only and must never enter serialized metadata.
+
+    Header-only reads may close early without full verification.
+    Complete materialization/export must read through EOF to verify identity.
+    """
+
+    def __init__(self, client, acquisitionID, fileName, *, version, sizeBytes, sourceHash):
+        import re
+
+        if not callable(getattr(
+            getattr(client, "acquisitions_api", None),
+            "download_file_from_acquisition_with_http_info",
+            None,
+        )):
+            raise TypeError("A connected Flywheel SDK client is required.")
+
+        if not isinstance(acquisitionID, str) or re.fullmatch(r"[0-9a-fA-F]{24}", acquisitionID) is None:
+            raise ValueError("Invalid Flywheel acquisition ID.")
+
+        if (
+            not isinstance(fileName, str)
+            or not fileName.strip()
+            or fileName in (".", "..")
+            or any(character in fileName for character in ("/", "\\", "\x00", "\n", "\r"))
+            or not fileName.lower().endswith((".nii", ".nii.gz"))
+        ):
+            raise ValueError("Flywheel MRI filename must be a single .nii or .nii.gz filename.")
+
+        if type(version) is not int or version < 1:
+            raise ValueError("Flywheel file version must be a positive integer.")
+
+        if type(sizeBytes) is not int or not 0 <= sizeBytes <= 9223372036854775807:
+            raise ValueError("Invalid Flywheel file size.")
+
+        if not isinstance(sourceHash, str) or re.fullmatch(r"v0-sha384-[0-9a-f]{96}", sourceHash) is None:
+            raise ValueError("Expected a Flywheel v0-sha384 source hash.")
+
+        self._client = client
+        self._acquisitionID = acquisitionID
+        self._fileName = fileName
+        self._version = version
+        self._sourceSize = sizeBytes
+        self._sourceHash = sourceHash
+
+        # Inherited materialization uses path for the format extension.
+        # Flywheel has supplied SHA-384, not a PGL SHA-256 identity. Do not
+        # put the remote digest into expectedIdentity under the wrong algorithm.
+        self.path = fileName
+        self._sha256 = None
+        self._sizeBytes = None
+
+    def open(self):
+        """Return a context-managed, forward-only binary source stream.
+
+        Each opening requests the recorded version.
+        Full reads verify source identity before returning EOF.
+
+        Early close releases the response without draining the remaining file.
+        No full-verification claim is made for a header-only read.
+
+        SDK errors are reported without exposing authenticated URLs.
+        The client remains caller-owned.
+        """
+        import hashlib
+        import io
+        from contextlib import contextmanager
+
+        backing = self
+
+        class VerifiedStream(io.RawIOBase):
+            """Adapt SDK chunks to bounded-memory binary reads."""
+
+            def __init__(self, response):
+                super().__init__()
+                self._chunks = iter(response.iter_content(chunk_size=65536))
+                self._pending = memoryview(b"")
+                self._digest = hashlib.sha384()
+                self._received = 0
+                self._verified = False
+
+            def readable(self): return True
+
+            def readinto(self, buffer):
+                if self.closed: raise ValueError("Flywheel source stream is closed.")
+                if not len(buffer): return 0
+                if self._verified: return 0
+
+                while not len(self._pending):
+                    try:
+                        chunk = next(self._chunks)
+                    except StopIteration:
+                        if self._received != backing._sourceSize:
+                            raise ValueError("Flywheel source size mismatch.")
+
+                        actualHash = f"v0-sha384-{self._digest.hexdigest()}"
+                        if actualHash != backing._sourceHash:
+                            raise ValueError("Flywheel source SHA-384 mismatch.")
+
+                        self._verified = True
+                        return 0
+
+                    except Exception:
+                        raise RuntimeError(
+                            "Flywheel source transfer failed while reading "
+                            "the pinned file version."
+                        ) from None
+
+                    if not chunk: continue
+
+                    self._received += len(chunk)
+                    if self._received > backing._sourceSize:
+                        raise ValueError("Flywheel source exceeds its recorded size.")
+
+                    self._digest.update(chunk)
+                    self._pending = memoryview(chunk)
+
+                count = min(len(buffer), len(self._pending))
+                buffer[:count] = self._pending[:count]
+                self._pending = self._pending[count:]
+                return count
+
+        @contextmanager
+        def openStream():
+            response = None
+            stream = None
+
+            try:
+                try:
+                    response = backing._client.acquisitions_api.download_file_from_acquisition_with_http_info(
+                        backing._acquisitionID,
+                        backing._fileName,
+                        version=backing._version,
+                        _return_http_data_only=True,
+                        _preload_content=False,
+                    )
+                except Exception:
+                    raise RuntimeError(
+                        "Could not open the pinned Flywheel file version."
+                    ) from None
+
+                if response is None:
+                    raise RuntimeError("Flywheel returned no source response.")
+
+                # BufferedReader supplies read(size) for gzip/header readers
+                # and export loops. It does not materialize the whole file.
+                stream = io.BufferedReader(VerifiedStream(response), buffer_size=65536)
+                yield stream
+
+            finally:
+                try:
+                    if stream is not None: stream.close()
+                finally:
+                    if response is not None: response.close()
+
+        return openStream()
 
 ################################################################
 # Flywheel connection
@@ -726,3 +892,176 @@ class pglFlywheel:
             progress.finish(f"Downloaded {len(downloaded)} files to {destination}")
 
         return downloaded
+    
+    def toMRI(self, *, cacheDirectory):
+        """Build deferred MRI scans from the currently accepted selection.
+
+        Reads project/session/acquisition/file metadata, not NIfTI payloads.
+        Pins the file versions observed during this call.
+
+        Requires exactly one selected Flywheel session.
+        Does not open a dialog, create cache directories, or publish records.
+
+        Returns pglMRI, or None with a warning for expected refusals.
+        Unsupported metadata serialization and unexpected errors propagate.
+
+        Source metadata contains no SDK client or authentication configuration.
+        Backings retain the caller's runtime SDK client.
+
+        Metadata requests are separate, not an atomic Flywheel snapshot.
+        Groups, standalone subject records, analyses, jobs, and sidecars
+        are not separately retrieved in this implementation.
+        """
+        import json
+        import os
+        from datetime import date, datetime
+        from pathlib import Path
+
+        from .pglMRI import pglMRI, pglMRIScan
+        from .pglProgress import pglProgress
+
+        if self.fw is None:
+            pglMessages.warning("Create a working Flywheel connection first.", level=0)
+            return None
+
+        selected = self.getSelectedScans()
+        if not selected:
+            pglMessages.warning("No scans are selected. Call flywheel.choose() first.", level=0)
+            return None
+
+        sessionKeys = {(scan["projectID"], scan["sessionID"]) for scan in selected}
+        if len(sessionKeys) != 1:
+            pglMessages.warning(
+                "MRI scans were not attached: select files from one Flywheel "
+                "session at a time. Different sessions were not combined.",
+                level=0,
+            )
+            return None
+
+        try:
+            cacheText = os.fspath(cacheDirectory)
+            if (
+                not isinstance(cacheText, str)
+                or not cacheText.strip()
+                or "://" in cacheText
+                or "::" in cacheText
+                or any(character in cacheText for character in ("\x00", "\n", "\r"))
+            ):
+                raise ValueError("cacheDirectory must be an ordinary local path.")
+
+            cachePath = str(Path(cacheText).expanduser().absolute())
+
+        except (TypeError, ValueError) as error:
+            pglMessages.warning(f"MRI scans were not attached: {error}", level=0)
+            return None
+
+        def encodeValue(value):
+            if isinstance(value, (datetime, date)): return value.isoformat()
+            raise TypeError(f"Unsupported Flywheel metadata type: {type(value).__name__}")
+
+        def snapshot(value):
+            """Copy SDK metadata into strict JSON-compatible values."""
+            document = value.to_dict()
+            if not isinstance(document, dict):
+                raise TypeError("Flywheel metadata must be a dictionary.")
+            return json.loads(json.dumps(document, default=encodeValue, allow_nan=False))
+
+        def fetch(method, identifier, kind):
+            """Keep SDK exception text and authenticated URLs out of warnings."""
+            try:
+                return method(identifier)
+            except Exception:
+                pglMessages.warning(
+                    f"Could not read Flywheel {kind} metadata. "
+                    "No MRI collection was returned.",
+                    level=0,
+                )
+                return None
+
+        projectID, sessionID = next(iter(sessionKeys))
+        acquisitions = {}
+        scans = []
+
+        with pglProgress("Preparing deferred Flywheel MRI scans") as progress:
+            progress(0, "Reading project metadata")
+            project = fetch(self.fw.get_project, projectID, "project")
+            if project is None: return None
+            projectMetadata = snapshot(project)
+
+            progress(None, "Reading session metadata")
+            session = fetch(self.fw.get_session, sessionID, "session")
+            if session is None: return None
+            sessionMetadata = snapshot(session)
+
+            for index, selectedScan in enumerate(selected):
+                acquisitionID = selectedScan["acquisitionID"]
+                filename = selectedScan["fileName"]
+                progress(index / len(selected), f"Reading metadata: {filename}")
+
+                if acquisitionID not in acquisitions:
+                    acquisition = fetch(
+                        self.fw.get_acquisition, acquisitionID, "acquisition"
+                    )
+                    if acquisition is None: return None
+                    acquisitions[acquisitionID] = (acquisition, snapshot(acquisition))
+
+                acquisition, acquisitionMetadata = acquisitions[acquisitionID]
+                matches = [
+                    file for file in acquisition.files or []
+                    if file.name == filename
+                ]
+
+                if len(matches) != 1:
+                    pglMessages.warning(
+                        f"MRI scans were not attached: selected file "
+                        f"{filename!r} is missing or ambiguous.",
+                        level=0,
+                    )
+                    return None
+
+                file = matches[0]
+                fileMetadata = snapshot(file)
+
+                # Pin the version observed now. Future reads request this
+                # version explicitly and verify its recorded size/SHA-384.
+                try:
+                    backing = pglFlywheelMRIBacking(
+                        self.fw,
+                        acquisitionID,
+                        filename,
+                        version=fileMetadata.get("version"),
+                        sizeBytes=fileMetadata.get("size"),
+                        sourceHash=fileMetadata.get("hash"),
+                    )
+                except (TypeError, ValueError) as error:
+                    pglMessages.warning(
+                        f"MRI scans were not attached: {filename!r}: {error}",
+                        level=0,
+                    )
+                    return None
+
+                provenance = pglMRIScan._copyMetadata({
+                    "provider": "flywheel",
+                    "selection": dict(selectedScan),
+                    "versionPinnedAt": "toMRI",
+                    "project": projectMetadata,
+                    "session": sessionMetadata,
+                    "acquisition": acquisitionMetadata,
+                    "file": fileMetadata,
+                })
+
+                scan = pglMRIScan(
+                    name=selectedScan["name"],
+                    sourceMetadata=provenance,
+                )
+                if scan.attachBacking(backing, cacheDirectory=cachePath) is None:
+                    return None
+
+                scans.append(scan)
+
+            # Install only after every selected source has been validated.
+            mri = pglMRI()
+            mri.scans = scans
+            progress.finish(f"Prepared {len(scans)} MRI scans; no NIfTI payloads downloaded")
+
+        return mri
