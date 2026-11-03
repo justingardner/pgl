@@ -58,6 +58,8 @@ _EXPORTS = {
  'pglDisplaySettingsList': ('.pglSettings', 'pglDisplaySettingsList'),
  'pglDisplayModeSettings': ('.pglSettings', 'pglDisplayModeSettings'),
  'pglSettings': ('.pglSettings', 'pglSettings'),
+ 'pglImportSettings': ('.pglSettings', 'pglImportSettings'),
+ 'pglImportSettingsList': ('.pglSettings', 'pglImportSettingsList'),
  'pglTraitSettings': ('.pglSettings', 'pglTraitSettings'),
  'pglDatabaseSettings': ('.pglDatabase', 'pglDatabaseSettings'),
  'pglDatabaseSettingsList': ('.pglDatabase', 'pglDatabaseSettingsList'),

@@ -24,6 +24,7 @@ import pandas as pd
 from .pglExperiment import pglEventTrial, pglEventSegment
 import matplotlib
 from tqdm.auto import tqdm
+from .pglSettings import pglImportSettings
 
 #################################
 # Collection of predefined actions
@@ -42,7 +43,7 @@ class pglActions():
         ################################
         # configure
         ################################
-        def configure(self, fullDataPath: str=None, settings: pglSettings=None, settingsName: str=None, experimentName: str=None, subjectID: str=None, sessionName: str=None, runName: str=None, filesystem: AbstractFileSystem=None, filesystemPrefix: str=None, dataPath: str=None, sortByAcquisitionTime: bool=True) -> None:
+        def configure(self, fullDataPath: str=None, settings: pglImportSettings=None, settingsName: str=None, experimentName: str=None, subjectID: str=None, sessionName: str=None, runName: str=None, filesystem: AbstractFileSystem=None, filesystemPrefix: str=None, dataPath: str=None, sortByAcquisitionTime: bool=True) -> None:
             """Choose valid runs and optionally sort oldest first.
 
             Uses startDateTime when every selected run has a valid,

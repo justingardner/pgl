@@ -41,34 +41,53 @@ class pglSettingsManager:
     def __init__(self):   
         pass
     
-    def settings(self):
+    @classmethod
+    def settings(cls):
         """
-        Edit pgl settings. Brings up widget interface to edit settings
+        Edit pgl settings without requiring an instance.
         """
         # get settings list
-        settingsList = self.getSettings(returnSettingsList=True)
+        settingsList = cls.getSettings(returnSettingsList=True)
 
         # keep original
-        original = pglSettingsList(settingsList)    
-        
+        original = pglSettingsList(settingsList)
+
         # bring up dialog
         modified = pglDialogs.traitsDialog(original)
-        
+
         # and save
-        self._saveModifiedSettings(modified, original)
-                
-    def displaySettings(self):
+        cls._saveModifiedSettings(modified, original)
+
+    @classmethod
+    def displaySettings(cls):
         """
-        Edit pgl display settings. Brings up widget interface to edit display settings
+        Edit display settings without requiring an instance.
         """
         # get the display infos
-        original = pglDisplaySettingsList(self.getDisplaySettings())
+        original = pglDisplaySettingsList(cls.getDisplaySettings())
 
         # display the settings
         modified = pglDialogs.traitsDialog(original)
-        
+
         # and save
-        self._saveModifiedSettings(modified, original)
+        cls._saveModifiedSettings(modified, original)
+
+    @classmethod
+    def importSettings(cls):
+        """
+        Edit import settings without requiring an instance.
+        """
+        # get settings list
+        settingsList = cls.getImportSettings(returnSettingsList=True)
+
+        # keep original
+        original = pglImportSettingsList(settingsList)
+
+        # bring up dialog
+        modified = pglDialogs.traitsDialog(original)
+
+        # and save
+        cls._saveModifiedSettings(modified, original)
 
     def eyeTrackerSettings(self, eyeTracker=None, settings=None, settingsName=None):
         '''
@@ -116,54 +135,178 @@ class pglSettingsManager:
                 return pglEyelinkSettings.load(filename=dataPath)
             else:
                 return pglEyelinkSettings()
-                        
-    def isShiftPressed(self):
+        
+    @classmethod
+    def isShiftPressed(cls):
         import Quartz
         flags = Quartz.CGEventSourceFlagsState(Quartz.kCGEventSourceStateHIDSystemState)
         return bool(flags & Quartz.kCGEventFlagMaskShift) 
     
-    def _saveModifiedSettings(self, modifiedSettingsList, originalSettingsList):
-        '''
-        Save only modified settings from a settings list (could be either  pglDispalySettingsList or pglSettingsLIst)
-        '''
+    @classmethod
+    def getImportSettingsDir(cls):
+        """
+        Get the directory where import settings are stored.
+
+        Returns:
+            Path: The directory path where import settings are stored.
+        """
+        # get the import settings directory
+        importSettingsDir = cls.getPGLSettingsDir() / "importSettings"
+
+        # check if it exists, create if not
+        importSettingsDir.mkdir(parents=True, exist_ok=True)
+
+        return importSettingsDir
+
+    @classmethod
+    def getImportSettings(cls, settingsName=None, settings=None, returnSettingsList=False):
+        """
+        Get import settings.
+
+        If settings is supplied, return it unchanged.
+        Otherwise, load the named settings or return the default settings.
+
+        Args:
+            settingsName (str): Name of the saved import settings to load.
+            settings (pglImportSettings): Settings instance to use instead.
+            returnSettingsList (bool): If True, ignore other arguments and
+                return all settings with the default first.
+
+        Returns:
+            pglImportSettings, list[pglImportSettings], or None.
+        """
+        if not returnSettingsList:
+            # explicitly supplied settings take precedence
+            if settings is not None:
+                if not isinstance(settings, pglImportSettings):
+                    pglMessages.warning("Import settings must be pglImportSettings")
+                    return None
+                return settings
+
+            # load a particular named configuration
+            if settingsName is not None:
+                settingsPath = cls.getImportSettingsDir() / f"{pglStorage.makeValidFilename(settingsName)}.json"
+
+                if not settingsPath.is_file():
+                    pglMessages.warning(f"Import settings file '{settingsPath}' not found.")
+                    return None
+
+                return pglImportSettings.load(filename=settingsPath)
+
+        # load all saved import settings
+        settingsList = []
+        for settingsPath in sorted(cls.getImportSettingsDir().glob("*.json")):
+            loadedSettings = pglImportSettings.load(filename=settingsPath)
+
+            if loadedSettings is None:
+                pglMessages.warning(f"Could not load import settings from '{settingsPath}'")
+                continue
+
+            settingsList.append(loadedSettings)
+
+        # if no saved settings, make a default one
+        if not settingsList:
+            pglMessages.message("No saved import settings found, creating default settings.")
+            defaultSettings = pglImportSettings()
+            defaultSettings.isDefault = True
+            defaultSettings.save()
+            settingsList = [defaultSettings]
+        else:
+            # find the default settings
+            defaultSettings = next((s for s in settingsList if s.isDefault), None)
+
+            if defaultSettings is None:
+                defaultSettings = settingsList[0]
+                defaultSettings.isDefault = True
+                defaultSettings.save()
+                pglMessages.message(f"No default import settings found, using: {defaultSettings.name}")
+
+            # put the default first
+            settingsList.insert(0, settingsList.pop(settingsList.index(defaultSettings)))
+
+            # keep only one default
+            extraDefaults = [s for s in settingsList[1:] if s.isDefault]
+            if extraDefaults:
+                pglMessages.warning("Multiple default import settings found, keeping only the first one")
+                for otherSettings in extraDefaults:
+                    otherSettings.isDefault = False
+                    otherSettings.save()
+
+        return settingsList if returnSettingsList else settingsList[0]
+    
+    @classmethod
+    def _saveModifiedSettings(cls, modifiedSettingsList, originalSettingsList):
+        """
+        Save new or modified settings and move deleted settings to trash.
+
+        Display settings rename their containing directory so calibrations
+        move with them. Other settings rename their individual JSON file.
+        """
+        # nothing to save if the user cancelled
+        if modifiedSettingsList is None: return
 
         # save all settings if shift is pressed
-        saveAll = False
-        if self.isShiftPressed():
-            saveAll = True
+        saveAll = cls.isShiftPressed()
+        if saveAll:
             pglMessages.message("Shift key pressed, saving all settings")
-            
-        # save the settings if user clicked OK
-        if modifiedSettingsList is not None:
-            # for each display in modified list
-            for modifiedSettings in modifiedSettingsList.settingsList:
-                # compare to original
-                matchingOriginalSettings = next((originalSettings for originalSettings in originalSettingsList.settingsList if originalSettings == modifiedSettings), None)
-                if matchingOriginalSettings is not None:
-                    # and if it is not equal (field by field) then save it
-                    if saveAll or not matchingOriginalSettings.equals(modifiedSettings):
-                        # if the name changed, we need to change the name of the directory
-                        if modifiedSettings.name != matchingOriginalSettings.name:
-                            oldPath = matchingOriginalSettings.saveDir().parent
-                            newPath = modifiedSettings.saveDir().parent
-                            try:
-                                # rename to the new path
-                                if oldPath.exists(): oldPath.rename(newPath)
-                            except OSError as e:
-                                # if it did not work, provide an error
-                                pglMessages.warning("Could not change directory name from {oldPath.name} to {newPath.name}, keeping {oldPath.name}")
-                                modifiedSettings.name = matchingOriginalSettings.name
-                        # save the modified display
-                        modifiedSettings.save()
-                else:
-                    # if it is not in the original list, then save it
-                    pglMessages.message(f"Saving new settings {modifiedSettings.name}")
-                    modifiedSettings.save()
-            # for each display that was in original, but not in modified, delete it
-            for originalSettings in originalSettingsList.settingsList:
-                if not any(modifiedSettings == originalSettings for modifiedSettings in modifiedSettingsList.settingsList):
-                    pglMessages.message(f"Deleting settings {originalSettings.name}")
-                    self.moveToTrash(originalSettings.saveDir())
+
+        # save new or modified settings
+        for modifiedSettings in modifiedSettingsList.settingsList:
+            # match by settings identity
+            matchingOriginalSettings = next(
+                (
+                    originalSettings
+                    for originalSettings in originalSettingsList.settingsList
+                    if originalSettings == modifiedSettings
+                ),
+                None,
+            )
+
+            # save new settings
+            if matchingOriginalSettings is None:
+                pglMessages.message(f"Saving new settings {modifiedSettings.name}")
+                modifiedSettings.save()
+                continue
+
+            # skip unchanged settings unless saving all
+            if not saveAll and matchingOriginalSettings.equals(modifiedSettings):
+                continue
+
+            # rename the saved file or display directory if the name changed
+            if modifiedSettings.name != matchingOriginalSettings.name:
+                oldPath = matchingOriginalSettings.saveDir()
+                newPath = modifiedSettings.saveDir()
+
+                # display directories also contain their calibrations
+                if isinstance(modifiedSettings, pglDisplaySettings):
+                    oldPath = oldPath.parent
+                    newPath = newPath.parent
+
+                if oldPath != newPath:
+                    try:
+                        # do not overwrite an existing destination
+                        if newPath.exists():
+                            raise FileExistsError(f"Destination already exists: {newPath}")
+
+                        if oldPath.exists(): oldPath.rename(newPath)
+                    except OSError as e:
+                        pglMessages.warning(
+                            f"Could not rename {oldPath.name} to {newPath.name}: {e}. "
+                            f"Keeping {matchingOriginalSettings.name}"
+                        )
+                        modifiedSettings.name = matchingOriginalSettings.name
+
+            # save modified settings
+            modifiedSettings.save()
+
+        # move deleted settings to trash
+        for originalSettings in originalSettingsList.settingsList:
+            if not any(
+                modifiedSettings == originalSettings
+                for modifiedSettings in modifiedSettingsList.settingsList
+            ):
+                pglMessages.message(f"Deleting settings {originalSettings.name}")
+                cls.moveToTrash(originalSettings.saveDir())
     
     @classmethod
     def getDisplaySettings(cls, displayName=None):
@@ -355,7 +498,7 @@ class pglSettingsManager:
         displayNames = ['Windowed']
 
         # get names from gpuInfo
-        if not cls.gpuInfo:
+        if not getattr(cls, "gpuInfo", None):
             return displayNames
 
         for gpuData in cls.gpuInfo.values():
@@ -874,6 +1017,52 @@ class pglTraitSettings(HasTraits, pglSerialize):
         """
         return "unsupported"
 
+##################################################
+# Import settings
+##################################################
+class pglImportSettings(pglTraitSettings):
+
+    name = Unicode("default", help="Display name for these import settings")
+    experimentPath = Unicode("~/data", help="Root directory containing experiment data", isPath=True)
+
+    # Add import-specific traits here.
+
+    def save(self, filename=None, filesystem=None, filesystemPrefix=None):
+        """
+        Save import settings.
+
+        Args:
+            filename: Destination filename. If omitted, use saveDir().
+            filesystem: Optional filesystem used for saving.
+            filesystemPrefix: Optional filesystem protocol prefix.
+        """
+        # get the filename
+        if filename is None: filename = self.saveDir()
+
+        return super().save(filename=filename, filesystem=filesystem, filesystemPrefix=filesystemPrefix)
+
+    def saveDir(self):
+        return pglSettingsManager.getImportSettingsDir() / f"{pglStorage.makeValidFilename(self.name)}.json"
+
+
+##################################################
+# Import settings dialog list
+##################################################
+class pglImportSettingsList(pglTraitSettings):
+
+    settingsList = List(
+        Instance(pglImportSettings),
+        buttons=True,
+        setDefault=True,
+        settingsListKey="name",
+        traitDisplayName="Choose import settings",
+        help="List of import settings",
+    )
+
+    def __init__(self, settingsList=None):
+        super().__init__()
+        if settingsList is not None: self.settingsList = settingsList
+        
 class pglStateDataSettings(pglTraitSettings):
     '''
     Base class for classes like experiments, parameters, staircases etc which

@@ -488,131 +488,105 @@ class pglChoose():
 
     @classmethod
     def getExperimentPath(cls, fullDataPath=None, settings=None, settingsName=None, experimentName=None, subjectID=None, sessionName=None, runName=None, filesystem=None, filesystemPrefix=None, dataPath=None, allowMultipleRuns=False):
-        '''
-        get the directory of the experiment. Many ways to call this to make it easy to get the correct experiemnt dir
-        
-        If you want to browse the full experiments:
-        
-            # use default settings to find dataDir
-            pglChoose.getExperimentPath()
-            
-            # use settings name to find dataDir:
-            pglChoose.getExperimentPath(settingsName='windowed')
+        """
+        Choose experiment runs using import settings.
 
-            # or, call directly with the setting:
-            s = pglSettingsManager.getSettings(settingsName='windowed')
-            pglChoose.getExperimentPath(settings=s)
-            
-            # or, pass in an explicit path
-            pglChoose.getExperimentPath(dataPath='/path/to/experiments')
+        Path precedence:
+            1. fullDataPath: direct path to a run, without a dialog.
+            2. dataPath: explicit experiment hierarchy root.
+            3. settings.experimentPath: supplied or saved import settings.
 
-        If you know the exact path:
-            pglChoose.getExperimentPath('/data/experimentDir/subjectDir/sessionDir/runDir')
-            
-        If you want to browse runs for a particular experiment:
-            pglChoose.getExperimentPath(experimentName='experimentName')
-            
-        
+        settingsName selects saved import settings. If neither settings nor
+        settingsName is supplied, the default import settings are used.
+
+        Expected hierarchy:
+            experimentPath/experiment/subject/session/run
+
         Returns:
-            A tuple consisting of:
-                (filesystem, fullDataPath, filesystemPrefix)
-            where:
-                filesystem: fsspec filesystem for the path
-                fullDataPath: path within in filesystem
-                filesystemPrefix: Any filesystem prefix (e.g. ssh://gru.stanford.edu/) this is NOT needed
-                    to access the path, it is returned in case the calling function wants to save it
-                    so that the same path can be accessed again
-        
-        '''
-        from .pglStorage import pglStorage
-        if fullDataPath:
-            # validate and return
-            filesystem, fullDataPath, filesystemPrefix = pglStorage.validateFilesystem(filesystem=filesystem, dataPath=fullDataPath, filesystemPrefix=filesystemPrefix)
-            return (filesystem, fullDataPath, filesystemPrefix)
-            
-        # if not fullDatadir passed in, construct it from arguments
-        else:
-            if not dataPath: 
-                if not settings:
-                    # get the default settings
-                    settings = pglSettingsManager.getSettings(settingsName=settingsName)
-                    if settings is None:
-                        pglMessages.warning(f"Could not find settings {settingsName}")
-                        return (None, None, None)
-                if settings:
-                    # set dataPath to where settings tells us it is
-                    dataPath= settings.dataPath
+            (filesystem, selectedPaths, filesystemPrefix)
 
-            # expand user
-            fullDataPath = Path(dataPath).expanduser()
-            
-            # now that we have the start of a path, validate the filesystem
-            filesystem, fullDataPath, filesystemPrefix = pglStorage.validateFilesystem(filesystem=filesystem, dataPath=fullDataPath, filesystemPrefix=filesystemPrefix)
+            selectedPaths is a list when allowMultipleRuns=True, otherwise
+            a single path. On cancellation or failure, filesystem is None.
+        """
+        import posixpath
+
+        # An explicit full path identifies a run directly.
+        if fullDataPath:
+            filesystem, fullDataPath, filesystemPrefix = pglStorage.validateFilesystem(
+                filesystem=filesystem,
+                dataPath=str(fullDataPath),
+                filesystemPrefix=filesystemPrefix,
+            )
+
             if filesystem is None:
-                pglMessages.warning("Could not find dataPath: {fullDataPath}")
                 return (None, None, None)
-            
-            # add on experiment name
-            if experimentName:
-                fullDataPath = Path(fullDataPath) / experimentName
-                # check that experimentName exists
-                if not filesystem.exists(fullDataPath):
-                    pglMessages.warning(f"Experiment directory {fullDataPath} does not exist")
-                    return (None, fullDataPath, filesystemPrefix)
-            else:
-                # choose based on subject experiment names
-                (filesystem, fullDataPath) = cls._chooseDialog(fullDataPath=fullDataPath, chooseLevel='experimentNames', filesystem=filesystem, allowMultipleRuns=allowMultipleRuns)
-                if filesystem is None: 
-                    return (None, None, None)
-                else: 
-                    return (filesystem, fullDataPath, filesystemPrefix)
-           
-            # add a subjectID
-            if subjectID:
-                fullDataPath = fullDataPath / subjectID
-                # check the subjectID 
-                if not filesystem.exists(fullDataPath):
-                    pglMessages.warning(f"Subject directory {fullDataPath} does not exist")
-                    return (None, fullDataPath, filesystemPrefix)
-            else:
-                # choose based on subject IDs
-                (filesystem, fullDataPath) = cls._chooseDialog(fullDataPath=fullDataPath, chooseLevel='subjectIDs', filesystem=filesystem, allowMultipleRuns=allowMultipleRuns)
-                if filesystem is None: 
-                    return (None, None, None)
-                else: 
-                    return (filesystem, fullDataPath, filesystemPrefix)
-                
-            # add a sessionName
-            if sessionName:
-                fullDataPath = fullDataPath / sessionName
-                # check the sessionName 
-                if not filesystem.exists(fullDataPath):
-                    pglMessages.warning(f"Session directory {fullDataPath} does not exist")
-                    return (None, fullDataPath, filesystemPrefix)
-            else:
-                # choose based on session names
-                (filesystem, fullDataPath) = cls._chooseDialog(fullDataPath=fullDataPath, chooseLevel='sessionNames', filesystem=filesystem, allowMultipleRuns=allowMultipleRuns)
-                if filesystem is None: 
-                    return (None, None, None)
-                else: 
-                    return (filesystem, fullDataPath, filesystemPrefix)
-                
-            # add a runName
-            if runName:
-                fullDataPath = fullDataPath / runName
-                # check the runName
-                if not filesystem.exists(fullDataPath):
-                    pglMessages.warning(f"Run directory {fullDataPath} does not exist")
-                    return (None, fullDataPath, filesystemPrefix)
-                else:
-                    # choose based on run names
-                    (filesystem, fullDataPath) = cls._chooseDialog(fullDataPath=fullDataPath, chooseLevel='runNames', filesystem=filesystem, allowMultipleRuns=allowMultipleRuns)
-                    if filesystem is None: 
-                        return (None, None, None)
-                    else: 
-                        return (filesystem, fullDataPath, filesystemPrefix)
-              
-        return (filesystem, fullDataPath, filesystemPrefix)
+
+            fullDataPath = str(fullDataPath)
+            if not filesystem.isdir(fullDataPath):
+                pglMessages.warning(f"Run directory {fullDataPath} does not exist")
+                return (None, None, filesystemPrefix)
+
+            selectedPaths = [fullDataPath] if allowMultipleRuns else fullDataPath
+            return (filesystem, selectedPaths, filesystemPrefix)
+
+        # Fall back to import settings when no explicit root was supplied.
+        if not dataPath:
+            settings = pglSettingsManager.getImportSettings(settingsName=settingsName, settings=settings)
+            if settings is None:
+                pglMessages.warning(f"Could not find import settings {settingsName}")
+                return (None, None, None)
+
+            dataPath = settings.experimentPath
+
+        if not dataPath:
+            pglMessages.warning("No experimentPath configured in import settings")
+            return (None, None, None)
+
+        # Let the storage layer normalize local and remote paths.
+        filesystem, fullDataPath, filesystemPrefix = pglStorage.validateFilesystem(
+            filesystem=filesystem,
+            dataPath=str(dataPath),
+            filesystemPrefix=filesystemPrefix,
+        )
+
+        if filesystem is None:
+            pglMessages.warning(f"Could not access experiment path: {fullDataPath}")
+            return (None, None, None)
+
+        fullDataPath = str(fullDataPath)
+
+        # Descend through explicitly supplied levels. At the first missing
+        # level, open the chooser for that level and its descendants.
+        levels = (
+            (experimentName, "experimentNames", "Experiment"),
+            (subjectID, "subjectIDs", "Subject"),
+            (sessionName, "sessionNames", "Session"),
+            (runName, "runNames", "Run"),
+        )
+
+        for name, chooseLevel, label in levels:
+            if not name:
+                selectedFilesystem, selectedPaths = cls._chooseDialog(
+                    fullDataPath=fullDataPath,
+                    filesystem=filesystem,
+                    chooseLevel=chooseLevel,
+                    allowMultipleRuns=allowMultipleRuns,
+                )
+
+                if selectedFilesystem is None:
+                    return (None, None, filesystemPrefix)
+
+                return (selectedFilesystem, selectedPaths, filesystemPrefix)
+
+            fullDataPath = posixpath.join(fullDataPath, str(name))
+
+            if not filesystem.isdir(fullDataPath):
+                pglMessages.warning(f"{label} directory {fullDataPath} does not exist")
+                return (None, None, filesystemPrefix)
+
+        # All levels were supplied, including the run.
+        selectedPaths = [fullDataPath] if allowMultipleRuns else fullDataPath
+        return (filesystem, selectedPaths, filesystemPrefix)
 
     @classmethod
     def getFieldline(
@@ -659,29 +633,21 @@ class pglChoose():
         )
 
     @classmethod
-    def _getRecordings(
-        cls,
-        chooserClass,
-        formatName,
-        fullDataPath=None,
-        settings=None,
-        settingsName=None,
-        filesystem=None,
-        filesystemPrefix=None,
-        dataPath=None,
-    ):
+    def _getRecordings(cls, chooserClass, formatName, fullDataPath=None, settings=None, settingsName=None, filesystem=None, filesystemPrefix=None, dataPath=None):
         """
-        Display a recording chooser using the supplied hierarchy class.
+        Display a recording chooser using import settings.
 
         Expected structure:
-            dataPath/experiment/s#####/session/recording
+            experimentPath/experiment/s#####/session/recording
 
         fullDataPath is an alternate name for the hierarchy root,
         not a direct path to an individual recording.
 
-        Returns
-        -------
-        tuple
+        Explicit fullDataPath or dataPath overrides settings.experimentPath.
+        settingsName selects saved import settings; otherwise the default
+        import settings are used.
+
+        Returns:
             (filesystem, recordingPaths, filesystemPrefix)
 
             recordingPaths is:
@@ -689,37 +655,33 @@ class pglChoose():
                 [] if no recordings are found or selected.
                 None if canceled or filesystem setup fails.
         """
-
         # Explicit fullDataPath takes precedence over dataPath.
         if fullDataPath is not None:
             dataPath = fullDataPath
 
-        # Fall back to settings when no explicit root was supplied.
+        # Fall back to import settings when no explicit root was supplied.
         if not dataPath:
-            if settings is None:
-                settings = pglSettingsManager.getSettings(
-                    settingsName=settingsName
-                )
+            settings = pglSettingsManager.getImportSettings(settingsName=settingsName, settings=settings)
 
             if settings is None:
-                pglMessages.warning(
-                    f"Could not find settings {settingsName}"
-                )
+                pglMessages.warning(f"Could not find import settings {settingsName}")
                 return (None, None, None)
 
-            dataPath = settings.dataPath
+            dataPath = settings.experimentPath
+
+        if not dataPath:
+            pglMessages.warning("No experimentPath configured in import settings")
+            return (None, None, None)
 
         # Validate once; all descendant nodes reuse this filesystem.
         filesystem, dataPath, filesystemPrefix = pglStorage.validateFilesystem(
             filesystem=filesystem,
-            dataPath=dataPath,
+            dataPath=str(dataPath),
             filesystemPrefix=filesystemPrefix,
         )
 
         if filesystem is None:
-            pglMessages.warning(
-                f"Could not access {formatName} data path: {dataPath}"
-            )
+            pglMessages.warning(f"Could not access {formatName} data path: {dataPath}")
             return (None, None, None)
 
         # Discover recordings without loading their signal data.
@@ -730,25 +692,19 @@ class pglChoose():
         )
 
         if not chooser.childList:
-            pglMessages.message(
-                f"No {formatName} recordings found below {dataPath}"
-            )
+            pglMessages.message(f"No {formatName} recordings found below {dataPath}")
             return (filesystem, [], filesystemPrefix)
 
         chooser = pglDialogs.traitsDialog(chooser)
 
         if chooser is None:
-            pglMessages.message(
-                f"No {formatName} recordings selected"
-            )
+            pglMessages.message(f"No {formatName} recordings selected")
             return (None, None, filesystemPrefix)
 
         recordingPaths = cls.walkInstances(chooser)
 
         if not recordingPaths:
-            pglMessages.message(
-                f"No {formatName} recordings selected"
-            )
+            pglMessages.message(f"No {formatName} recordings selected")
             return (filesystem, [], filesystemPrefix)
 
         return (filesystem, recordingPaths, filesystemPrefix)
