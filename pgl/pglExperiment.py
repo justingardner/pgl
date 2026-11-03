@@ -388,66 +388,76 @@ class pglExperiment(pglExperimentBase):
     def __init__(self, pgl=None, settingsName=None, settings=None, displayName=None, displaySettings=None, subjectID="s0000", experimentName=None, sessionName=None, runName=None):
         '''
         Initialize the pglExperiment class.
-        
+
         Args:
             pgl (pgl): An instance of the pgl class.
-            settingsName (str): The name of the settings to use. If not set (and settings not set), will use default settings
-            settings (pglSettings): An instance of the pglSettings class. If set, will supersede settingsName.
-            displayName (str): The name of the display to use. If set, will be incorporated into settings (and supersede any
-                conflicting settings). If there is no settings/settingsName will use default settings
-            displaySettings (pglDisplaySettings): The settings of the dispaly to use, will supersed the displayName if set and
-                behave in a similar fashion
-            subjectID (str): The identifier for the subject participating in the experiment.
+            settingsName (str): Settings name; defaults are used when neither
+                settingsName nor settings is supplied.
+            settings (pglSettings): Explicit settings, superseding settingsName.
+            displayName (str): Display name incorporated into the settings.
+            displaySettings (pglDisplaySettings): Explicit display settings,
+                superseding displayName.
+            subjectID (str): Subject identifier. Unconventional naming warns
+                but does not prevent initialization.
+            experimentName (str): Experiment name.
+            sessionName (str): Session name; defaults to session_YYYY-MM-DD.
+            runName (str): Run name; defaults to run_HH-MM-SS.
+
+        Genuine initialization failures propagate to the caller instead of
+        silently returning a partially initialized experiment.
         '''
-        try:
-            # init super
-            super().__init__()
-            self.tasks = []
+        # Initialize the base object and runtime defaults.
+        super().__init__()
+        self.isInitialized = False
+        self.tasks = []
 
-            # clear the text screen
-            #clear_output(wait=True)
-        
-            self.isInitialized=False
+        # Set to flush the screen during acquisition.
+        self.flush = True
 
-            if not pgl:
-                pglMessages.warning("Need to pass in valid pgl")
-                return
-            
-            # save pgl
-            self.pgl = pgl
+        # Clear the text screen.
+        #clear_output(wait=True)
 
-            # load settings
-            self.settings = pgl.getSettings(settingsName=settingsName, settings=settings, displaySettings=displaySettings, displayName=displayName)
-            if self.settings is None: return
+        # Missing dependencies are actual initialization failures.
+        if pgl is None:
+            raise ValueError("Need to pass in a valid pgl instance.")
 
-            # initialize experiment state and data
-            self.state = pglExperimentState()
-            self.data = pglExperimentData()
-            
-            # get experiment settings
-            self.experimentSettings = pglExperimentSettings()
-            if experimentName:
-                self.experimentSettings.experimentName = experimentName
-            if sessionName:
-                self.experimentSettings.sessionName = sessionName
-            else:
-                # default session name is session_YYYY-MM-DD
-                self.experimentSettings.sessionName = f"session_{datetime.now().strftime("%Y-%m-%d")}"
-            if runName:
-                self.experimentSettings.runName = runName
-            else:
-                # default run name is run_HH-MM-DD
-                self.experimentSettings.runName = f"run_{datetime.now().strftime("%H-%M-%S")}"
-                
-            self.experimentSettings.subjectID = subjectID
-            self.isInitialized=True
-            
-            # set to flush screen
-            self.flush = True
+        # Save pgl.
+        self.pgl = pgl
 
-        except Exception as e:
-            pglMessages.warning(f"Could not initialize experiment. Error {type(e).__name__}: {e}")    
-            return
+        # Load settings.
+        self.settings = pgl.getSettings(
+            settingsName=settingsName,
+            settings=settings,
+            displaySettings=displaySettings,
+            displayName=displayName,
+        )
+        if self.settings is None:
+            raise RuntimeError("Could not initialize experiment: no settings were loaded.")
+
+        # Initialize experiment state and data.
+        self.state = pglExperimentState()
+        self.data = pglExperimentData()
+
+        # Get experiment settings.
+        self.experimentSettings = pglExperimentSettings()
+        if experimentName:
+            self.experimentSettings.experimentName = experimentName
+
+        # Default session name is session_YYYY-MM-DD.
+        self.experimentSettings.sessionName = (
+            sessionName or f"session_{datetime.now().strftime('%Y-%m-%d')}"
+        )
+
+        # Default run name is run_HH-MM-SS.
+        self.experimentSettings.runName = (
+            runName or f"run_{datetime.now().strftime('%H-%M-%S')}"
+        )
+
+        # Naming-convention warnings do not interrupt initialization.
+        self.experimentSettings.subjectID = subjectID
+
+        # Mark successful initialization only after all setup completes.
+        self.isInitialized = True
 
         
     def __repr__(self):
@@ -466,7 +476,17 @@ class pglExperiment(pglExperimentBase):
         Movie timing is retained independently of the two recording flags.
         Existing recordings must be explicitly saved/exported and cleared.
         '''
+        
+        # Never operate on an incompletely initialized experiment.
+        if not getattr(self, "isInitialized", False):
+            pglMessages.warning(
+                "Experiment initialization did not complete. "
+                "Create a new experiment before opening the screen or running."
+            )
+            return
+
         from .pglKeyboardMouse import pglKeyboardMouse
+
 
         if self.settings is None: raise RuntimeError("No settings found to open screen.")
         if not isinstance(recordFlush, bool) or not isinstance(recordCommands, bool):
@@ -801,6 +821,15 @@ class pglExperiment(pglExperimentBase):
     ################################################################
     def run(self):
         """Run acquisition, save partial data on failure, and preserve its error."""
+        # Never operate on an incompletely initialized experiment.
+        if not getattr(self, "isInitialized", False):
+            pglMessages.warning(
+                "Experiment initialization did not complete. "
+                "Create a new experiment before opening the screen or running."
+            )
+            return
+
+        
         if getattr(self, "_recordingReleased", False):
             raise RuntimeError("This experiment's recording was already saved and released. Create a new experiment.")
 
@@ -3703,17 +3732,24 @@ class pglExperimentSettings(pglTraitSettings):
     
     @validate("subjectID")
     def _validateSubjectID(self, proposal):
+        """Warn about unconventional subject IDs without rejecting the assignment."""
         value = proposal["value"]
 
-        if (
-            not isinstance(value, str)
-            or len(value) < 2
-            or value[0] != "s"
-            or not value[1:].isdigit()
+        # Accept either capitalization and one or more digits.
+        # Preserve the supplied ID, including capitalization and leading zeros.
+        if not (
+            len(value) >= 2
+            and value[0].lower() == "s"
+            and value[1:].isdigit()
         ):
-            raise TraitError("(experimentSettings) ❌ Error: subjectID must be in format 'sXXXX' where X is a digit.")
-        return value           
+            pglMessages.warning(
+                f"Unconventional subjectID {value!r}. Expected 's' or 'S' "
+                "followed by one or more digits, such as 's1' or 'S00012'. "
+                "Continuing with the supplied subjectID.",
+                level=2,
+            )
 
+        return value
 ##############################################
 # Data for pglExperiment
 ##############################################
