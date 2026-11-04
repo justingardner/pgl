@@ -2044,47 +2044,173 @@ class pglPostgres(pglTraitSettings):
         pglMessages.message(f"Initialized PostgreSQL data directory: {dataDirectory}")
         return True
 
-    # ------------------------------------------------------------
-    # Local server lifecycle
-    # ------------------------------------------------------------
+    # +++++++++++++++++++++ _requireLocalManagementTarget +++++++++++++++++++++
+    def _requireLocalManagementTarget(self):
+        """Reject client configurations that do not target the managed server.
 
-    def start(self):
-        """Start the managed server, leaving an already-running server unchanged."""
+        A locally saved configuration may still describe a remote database.
+        Configuration-file locality alone does not authorize local management.
+
+        Does not connect, start software, or change configuration.
+        """
+        self._requireLocalConfiguration()
+        self._validateValues()
+
+        if (
+            self.connectionTransport != "direct"
+            or self.connectionHost != self.postgresHost
+            or self.connectionPort != self.postgresPort
+        ):
+            raise RuntimeError(
+                "Local PostgreSQL management requires the managed server's "
+                "direct local endpoint. This configuration describes another "
+                "connection. Run server management on the installation machine "
+                "using its local server configuration."
+            )
+
+    # +++++++++++++++++++++++++++++++ status +++++++++++++++++++++++++++++++++
+    def status(self):
+        """Display local server process status without opening a SQL connection.
+
+        Returns:
+            True: pg_ctl reports this instance running.
+            False: pg_ctl reports this instance stopped.
+
+        Inspection/configuration errors propagate rather than being reported
+        as stopped. Does not request passwords, initialize data, or start
+        PostgreSQL. A running process does not establish application access.
+
+        Local management currently supports macOS/Homebrew only.
+        """
+        self._requireLocalManagementTarget()
         self._validateLocalEnvironment()
         pgCtl = self._requireExecutable("pg_ctl")
         self._checkDataDirectory()
 
-        status = self._runCommand([pgCtl, "-D", self.dataDirectory, "status"], capture=True, check=False)
+        # Inspect the configured data directory, not merely the TCP port.
+        result = self._runCommand(
+            [pgCtl, "-D", self.dataDirectory, "status"],
+            capture=True,
+            check=False,
+        )
+
+        if result.returncode not in (0, 3):
+            detail = result.stdout.strip()
+            raise RuntimeError(
+                f"Could not inspect PostgreSQL; pg_ctl exited with "
+                f"status {result.returncode}."
+                + (f"\n{detail}" if detail else "")
+            )
+
+        running = result.returncode == 0
+        pglMessages.message(f"PostgreSQL is {'running' if running else 'stopped'}.")
+        pglMessages.message(f"Data directory: {self.dataDirectory}")
+        pglMessages.message(f"Configured endpoint: {self.postgresHost}:{self.postgresPort}")
+        pglMessages.message(f"Server log: {self.logFile}")
+
+        return running
+    # ------------------------------------------------------------
+    # Local server lifecycle
+    # ------------------------------------------------------------
+
+    # +++++++++++++++++++++++++++++++ start ++++++++++++++++++++++++++++++++++
+    def start(self):
+        """Start the managed server, leaving a running instance unchanged.
+
+        Returns True when already running or startup succeeds.
+        Returns False when the port is unavailable or pg_ctl startup fails.
+
+        Startup command failures display the recent server log.
+        Configuration, missing-installation, and inspection errors propagate.
+
+        Does not initialize data, migrate schemas, or verify SQL access.
+        """
+        self._requireLocalManagementTarget()
+        self._validateLocalEnvironment()
+        pgCtl = self._requireExecutable("pg_ctl")
+        self._checkDataDirectory()
+
+        status = self._runCommand(
+            [pgCtl, "-D", self.dataDirectory, "status"],
+            capture=True,
+            check=False,
+        )
 
         if status.returncode == 0:
             pglMessages.message("This Postgres instance is already running.")
+            pglMessages.message(f"Server log: {self.logFile}")
+            return True
 
-        elif status.returncode == 3:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-                try:
-                    probe.bind((self.postgresHost, self.postgresPort))
-                except OSError as error:
-                    raise RuntimeError(f"Port {self.postgresPort} is unavailable.") from error
+        if status.returncode != 3:
+            raise RuntimeError(
+                f"Could not inspect Postgres; pg_ctl exited with "
+                f"status {status.returncode}."
+            )
 
-            options = shlex.join(["-h", self.postgresHost, "-p", str(self.postgresPort), "-k", ""])
-
+        # Refuse startup when the configured port cannot be bound.
+        # This probe is advisory; pg_ctl still handles any subsequent race.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
             try:
-                self._runCommand([pgCtl, "-D", self.dataDirectory, "-l", self.logFile, "-o", options, "-t", self.startupTimeoutSeconds, "-w", "start"])
-            except subprocess.CalledProcessError as error:
-                raise RuntimeError(f"Postgres startup failed or timed out. Check {self.logFile}") from error
+                probe.bind((self.postgresHost, self.postgresPort))
+            except OSError as error:
+                pglMessages.warning(
+                    f"Cannot start PostgreSQL: port {self.postgresPort} "
+                    f"on {self.postgresHost} is unavailable ({error}).\n"
+                    "No startup command was issued. Check for another server "
+                    "or process using this port.",
+                    level=0,
+                )
+                return False
 
-            pglMessages.message(f"Postgres started at {self.postgresHost}:{self.postgresPort}.")
+        options = shlex.join([
+            "-h", self.postgresHost,
+            "-p", str(self.postgresPort),
+            "-k", "",
+        ])
 
-        else:
-            raise RuntimeError(f"Could not inspect Postgres; pg_ctl exited with status {status.returncode}.")
+        # Inspect the exit code rather than creating a CalledProcessError
+        # traceback for an expected server startup failure.
+        result = self._runCommand(
+            [
+                pgCtl,
+                "-D", self.dataDirectory,
+                "-l", self.logFile,
+                "-o", options,
+                "-t", self.startupTimeoutSeconds,
+                "-w", "start",
+            ],
+            capture=True,
+            check=False,
+        )
 
+        if result.returncode != 0:
+            pglMessages.warning(
+                f"PostgreSQL startup failed or timed out "
+                f"(pg_ctl exit status {result.returncode}).\n"
+                "Recent server log entries follow; check their timestamps "
+                "because the log also contains earlier startup attempts.\n"
+                "A timeout does not necessarily mean the server is stopped. "
+                "Check status before retrying. Do not reinitialize the database "
+                "or delete its files to resolve this error.",
+                level=2,
+            )
+
+            if result.stdout and result.stdout.strip():
+                pglMessages.message(result.stdout.strip(), wrapText=False)
+
+            self.showLog()
+            return False
+
+        pglMessages.message(f"Postgres started at {self.postgresHost}:{self.postgresPort}.")
         pglMessages.message(f"Server log: {self.logFile}")
+        return True
 
     def stop(self):
         """Stop the local server cleanly without deleting data.
 
         Disconnects clients and rolls back active transactions.
         """
+        self._requireLocalManagementTarget()
         self._validateLocalEnvironment()
         pgCtl = self._requireExecutable("pg_ctl")
         self._checkDataDirectory()
@@ -2106,6 +2232,37 @@ class pglPostgres(pglTraitSettings):
         pglMessages.message("Postgres stopped.")
 
 
+    # +++++++++++++++++++++++++++++ showLog ++++++++++++++++++++++++++++++++++
+    def showLog(self, nLines=60):
+        """Display the end of the local PostgreSQL log without changing it.
+
+        Returns True when read successfully, False when unavailable.
+        Reads incrementally rather than loading the complete log into memory.
+        """
+        from collections import deque
+
+        if type(nLines) is not int or nLines <= 0:
+            raise ValueError("nLines must be a positive integer.")
+
+        self._requireLocalManagementTarget()
+        logFile = self.logFile
+
+        try:
+            with logFile.open("rt", encoding="utf-8", errors="replace") as source:
+                lines = deque(source, maxlen=nLines)
+        except OSError as error:
+            pglMessages.warning(f"Could not read PostgreSQL log {logFile}: {error}", level=0)
+            return False
+
+        pglMessages.message(f"PostgreSQL log: {logFile} (last {nLines} lines)", wrapText=False)
+
+        if not lines:
+            pglMessages.message("The log file is empty.")
+        else:
+            for line in lines:
+                pglMessages.print(line.rstrip("\r\n"))
+
+        return True
     # ------------------------------------------------------------
     # Local role/database/schema creation
     # ------------------------------------------------------------

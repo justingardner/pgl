@@ -30,6 +30,45 @@ from .pglSettings import pglSettingsManager
 from .pglDialog import pglDialogs
 from .pglProgress import pglProgress
 
+# -------------------------------------------------------------------------
+# Public read-only PostgreSQL availability handling
+# -------------------------------------------------------------------------
+
+def _postgresReadAvailability(function):
+    """Warn and return False when a read-only report loses database access.
+
+    Apply only to reporting methods whose failure return convention is False.
+    Does not handle writes, retry operations, or suppress unrelated errors.
+    """
+    from functools import wraps
+    from inspect import signature
+
+    functionSignature = signature(function)
+
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        try:
+            return function(*args, **kwargs)
+
+        except psycopg.OperationalError as error:
+            if not pglDatabase._isPostgresUnavailable(error):
+                raise
+
+            # Bind positional and keyword arguments so recovery instructions
+            # retain the caller's selected configuration.
+            arguments = functionSignature.bind(*args, **kwargs).arguments
+
+            pglDatabase._warnPostgresUnavailable(
+                error,
+                operation=function.__name__,
+                postgres=arguments.get("postgres"),
+                settings=arguments.get("settings"),
+                settingsName=arguments.get("settingsName"),
+            )
+            return False
+
+    return wrapped
+
 ##################################################
 # Database settings
 ##################################################
@@ -634,7 +673,8 @@ class pglDatabase:
             if postgres.init() is False:
                 return False
 
-            postgres.start()
+            if postgres.start() is False:
+                return False
 
             if not postgres.createDatabase():
                 return False
@@ -2385,6 +2425,7 @@ class pglDatabase:
     # User-facing database API. See the docstring for configuration, side effects, and return
     # conventions.
     @staticmethod
+    @_postgresReadAvailability
     def print(details=None, postgres=None, *, settings=None, settingsName=None, sessionID=None, summary=False, datasets=False, nRows=10, maxWidth=48, sslRootCert=None, includeDeleted=False, storageOptionsByBackend=None, experimentName=None, subjectID=None, dateRange=None, checkpointDateRange=None):
         """Select a session listing, dataset listing, or database report.
 
@@ -2473,6 +2514,7 @@ class pglDatabase:
     # User-facing database API.
     # Direct callers in this module: print.
     @staticmethod
+    @_postgresReadAvailability
     def printSession(sessionID, postgres=None, *, settings=None, settingsName=None, sslRootCert=None, includeDeleted=False):
         """Print one checkpoint's metadata, linked subjects, and linked files.
 
@@ -2731,6 +2773,7 @@ class pglDatabase:
     # +++++++++++++++++++++++++++++ printSessions +++++++++++++++++++++++++++
     # +++++++++++++++++++++++++++++ printSessions +++++++++++++++++++++++++++
     @staticmethod
+    @_postgresReadAvailability
     def printSessions(postgres=None, *, settings=None, settingsName=None, sslRootCert=None, includeDeleted=False, storageOptionsByBackend=None, experimentName=None, subjectID=None, dateRange=None, checkpointDateRange=None):
         """Print sessions grouped by root experiment and subject.
 
@@ -3103,7 +3146,6 @@ class pglDatabase:
     # User-facing database API. See the docstring for configuration, side effects, and return
     # conventions.
     # Direct callers in this module: print.
-    @staticmethod
     def printDatasets(postgres=None, *, settings=None, settingsName=None, sslRootCert=None, includeDeleted=False):
         """Print saved dataset checkpoints grouped by name.
 
@@ -3355,6 +3397,7 @@ class pglDatabase:
     # User-facing database API. See the docstring for configuration, side effects, and return
     # conventions.
     # Direct callers in this module: print.
+    @_postgresReadAvailability
     @staticmethod
     def printTables(details=None, postgres=None, *, settings=None, settingsName=None, nRows=10, maxWidth=48, sslRootCert=None, includeDeleted=False):
         """Print database table counts/statuses or selected table contents.
@@ -11788,6 +11831,166 @@ class pglDatabase:
 
         # The caller still must commit its outer transaction and finish cleanup.
         return sessionID
+    
+    # -------------------------------------------------------------------------
+    # PostgreSQL server management
+    # -------------------------------------------------------------------------
+
+    # +++++++++++++++++++++++++++ postgresStatus ++++++++++++++++++++++++++++++
+    @classmethod
+    def postgresStatus(cls, postgres=None, *, settings=None, settingsName=None):
+        """Display process status for the locally managed PostgreSQL server.
+
+        Uses the default database settings unless another configuration is
+        supplied. Does not connect to SQL or request a database password.
+
+        Returns True when running, False when stopped, or None when the
+        configuration is unavailable. Inspection errors propagate.
+
+        Local management currently supports macOS/Homebrew only.
+        Remote configurations are refused, not interpreted as local servers.
+        """
+        postgres = cls._printPostgres(postgres, settings=settings, settingsName=settingsName)
+
+        if postgres is None:
+            return None
+
+        return postgres.status()
+
+    # ++++++++++++++++++++++++++++ postgresStart ++++++++++++++++++++++++++++++
+    # ++++++++++++++++++++++++++++ postgresStart ++++++++++++++++++++++++++++++
+    @classmethod
+    def postgresStart(cls, postgres=None, *, settings=None, settingsName=None):
+        """Start the locally managed PostgreSQL server if stopped.
+
+        Returns True when running/startup succeeds, False for a handled
+        startup failure, or None when configuration is unavailable.
+
+        Startup failures warn and display recent server log entries.
+        Configuration and inspection errors propagate.
+        """
+        postgres = cls._printPostgres(postgres, settings=settings, settingsName=settingsName)
+
+        if postgres is None:
+            return None
+
+        return postgres.start()
+    
+    # +++++++++++++++++++++++ _isPostgresUnavailable ++++++++++++++++++++++++++
+    @staticmethod
+    def _isPostgresUnavailable(error):
+        """Identify operational availability failures, not arbitrary SQL errors.
+
+        Authentication and TLS-policy failures remain visible exceptions.
+        Does not infer that an unreachable server is necessarily stopped.
+        """
+        if not isinstance(error, psycopg.OperationalError):
+            return False
+
+        message = str(error).lower()
+
+        # Some connection failures have no SQLSTATE. Preserve recognizable
+        # authentication/security errors rather than suggesting a restart.
+        securityMessages = (
+            "password authentication failed",
+            "no password supplied",
+            "no pg_hba.conf entry",
+            "certificate",
+            "ssl error",
+            "tls error",
+            "does not support ssl",
+            "ssl is required",
+            "authentication method",
+        )
+
+        if any(text in message for text in securityMessages):
+            return False
+
+        sqlState = error.sqlstate
+
+        if sqlState is None:
+            # libpq commonly supplies no SQLSTATE for refused connections,
+            # DNS/socket failures, connection timeouts, and connection loss.
+            return True
+
+        return sqlState.startswith("08") or sqlState in {
+            "57P01",  # Administrator shutdown.
+            "57P02",  # Crash shutdown.
+            "57P03",  # Cannot connect now, e.g. startup/recovery.
+            "53300",  # Too many connections.
+        }
+
+    # +++++++++++++++++++++++ _warnPostgresUnavailable ++++++++++++++++++++++++
+    @classmethod
+    def _warnPostgresUnavailable(cls, error, *, operation, postgres=None, settings=None, settingsName=None):
+        """Explain an availability failure without reconnecting or retrying.
+
+        Retains configuration selection in suggested commands.
+        Does not resolve settings again, prompt, or administer the server.
+        """
+        if postgres is not None:
+            arguments = "postgres=postgres"
+            selectionNote = (
+                "\nIn the commands below, postgres means the same configuration "
+                "object supplied to the failed operation."
+            )
+        elif settings is not None:
+            arguments = "settings=settings"
+            selectionNote = (
+                "\nIn the commands below, settings means the same settings "
+                "object supplied to the failed operation."
+            )
+        elif settingsName is not None:
+            arguments = f"settingsName={settingsName!r}"
+            selectionNote = ""
+        else:
+            arguments = ""
+            selectionNote = ""
+
+        endpoint = (
+            f" at {postgres.connectionHost}:{postgres.connectionPort}"
+            if postgres is not None else ""
+        )
+
+        knownRemote = postgres is not None and (
+            getattr(postgres, "_configurationLoadedRemotely", False)
+            or postgres.connectionTransport != "direct"
+            or postgres.connectionHost != postgres.postgresHost
+            or postgres.connectionPort != postgres.postgresPort
+        )
+
+        if knownRemote:
+            instructions = (
+                "Check SSH/VPN/network access and the configured database endpoint. "
+                "Inspect or start PostgreSQL on its installation machine using "
+                "that machine's local server configuration. "
+                "Do not start an unrelated server on this client."
+            )
+        else:
+            localQualifier = "For a locally managed database, " if postgres is None else ""
+            instructions = (
+                f"{localQualifier}inspect the server with:\n"
+                f"    pglDatabase.postgresStatus({arguments})\n"
+                "If it is stopped, start it with:\n"
+                f"    pglDatabase.postgresStart({arguments})\n"
+                "If it is already running, inspect its server log and connection "
+                "settings before considering a restart."
+            )
+
+            if postgres is None:
+                instructions += (
+                    "\nFor a remote database, check SSH/VPN/network access and "
+                    "inspect the server on its installation machine instead."
+                )
+
+        pglMessages.warning(
+            f"Could not complete {operation}: PostgreSQL is unavailable{endpoint}.\n"
+            "The server may be stopped, starting, overloaded, or unreachable; "
+            "this error alone does not establish which.\n"
+            f"{instructions}{selectionNote}\n"
+            "No automatic start, restart, or retry was performed.",
+            level=2,
+        )
 
 # =========================================================================
 # RUNTIME PAYLOAD ACCESS CONTEXT
