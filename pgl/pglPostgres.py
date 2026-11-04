@@ -1002,13 +1002,27 @@ class pglPostgres(pglTraitSettings):
 
         return brew
 
-    def _runCommand(self, arguments, *, capture=False, check=True):
+    def _runCommand(self, arguments, *, capture=False, check=True, environmentOverrides=None):
+        """Run a local management command with optional environment overrides.
+
+        Overrides apply only to this subprocess and its descendants.
+        The Python process's environment is never modified.
+        """
         self._requireLocalConfiguration()
         environment = os.environ.copy()
         environment["PATH"] = f"{self._findBrew().parent}{os.pathsep}{environment.get('PATH', '')}"
 
-        return subprocess.run([str(argument) for argument in arguments], check=check, text=True, stdout=subprocess.PIPE if capture else None, env=environment)
+        if environmentOverrides is not None:
+            environment.update(environmentOverrides)
 
+        return subprocess.run(
+            [str(argument) for argument in arguments],
+            check=check,
+            text=True,
+            stdout=subprocess.PIPE if capture else None,
+            env=environment,
+        )
+        
     @contextmanager
     def _localConnect(self, *, user=None, database=None, password=None):
         """Open a verified local connection, or yield None on cancellation.
@@ -2168,8 +2182,10 @@ class pglPostgres(pglTraitSettings):
             "-k", "",
         ])
 
-        # Inspect the exit code rather than creating a CalledProcessError
-        # traceback for an expected server startup failure.
+        # Explicit locale avoids the macOS startup failure:
+        # "postmaster became multithreaded during startup".
+        # Scope this to pg_ctl start and its server child; do not change
+        # the notebook environment or the locale used by initdb.
         result = self._runCommand(
             [
                 pgCtl,
@@ -2181,8 +2197,9 @@ class pglPostgres(pglTraitSettings):
             ],
             capture=True,
             check=False,
+            environmentOverrides={"LC_ALL": "C"},
         )
-
+        
         if result.returncode != 0:
             pglMessages.warning(
                 f"PostgreSQL startup failed or timed out "
