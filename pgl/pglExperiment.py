@@ -50,6 +50,7 @@ class Stats:
     std: float
     min: float
     max: float
+    last: float
 
 ##############################################s
 # Experiment base class
@@ -3857,6 +3858,7 @@ class pglExperimentData(pglTraitSettings):
         timeline.addLegend(legend)
         
         if not ax: timeline.show()
+    
     def getTriggerStats(self):
         '''
         Get the median time between volume triggers.
@@ -3873,7 +3875,8 @@ class pglExperimentData(pglTraitSettings):
             median=np.median(diffs) if len(diffs) > 0 else None,
             std=np.std(diffs) if len(diffs) > 0 else None,
             min=np.min(diffs) if len(diffs) > 0 else None,
-            max=np.max(diffs) if len(diffs) > 0 else None
+            max=np.max(diffs) if len(diffs) > 0 else None,
+            last=diffs[-1] if len(diffs) > 0 else None
         )
     
 ##############################################
