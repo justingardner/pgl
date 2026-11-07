@@ -354,25 +354,25 @@ class pglTestTask(pglTask):
         # put upt the bulls eye
         self.pgl.bullseye()
         # display how to end
-        self.pgl.text("Press 'ESC' to quit",xAlign=1)
+        self.pgl.text("Press 'ESC' to quit", line=1, xAlign=-1, x=-self.pgl.screenWidth.deg/2)
         # and text for what trial we are on 
         # This will just update every trial
-        self.pgl.text(f"Trial {self.state.currentTrial+1}",xAlign=1)
+        self.pgl.text(f"Trial {self.state.currentTrial+1}", line=2, xAlign=-1, x=-self.pgl.screenWidth.deg/2)
         if self.e is not None:
-            self.pgl.text(f"Volume {self.e.state.volumeNumber}",xAlign=1)
+            self.pgl.text(f"Volume {self.e.state.volumeNumber}", line=3, xAlign=-1, x=-self.pgl.screenWidth.deg/2)
             elapsed = self.pgl.getSecs() - self.e.data.startTime
             minutes = int(elapsed // 60)
             seconds = int(elapsed % 60)
-            self.pgl.text(f"{minutes:02d}:{seconds:02d}",xAlign=1)
+            self.pgl.text(f"{minutes:02d}:{seconds:02d}", line=4, xAlign=-1, x=-self.pgl.screenWidth.deg/2)
             if self.responseText != "":
-                self.pgl.text(self.responseText,xAlign=1)
+                self.pgl.text(self.responseText, line=5, xAlign=-1, x=-self.pgl.screenWidth.deg/2)
             # add some more info about experiemnt
             if self.e.state.display.luminanceCalibration[0] == "None":
-                self.pgl.text(f"No luminance calibration", line=-1, xAlign=-1)
+                self.pgl.text(f"No luminance calibration", line=-1, xAlign=1, x=self.pgl.screenWidth.deg/2)
             elif self.e.settings.calibrateForGamma[0] == 0:
-                self.pgl.text(f"Using default gamma table", line=-1, xAlign=-1)
+                self.pgl.text(f"Using default gamma table", line=-1, xAlign=1, x=self.pgl.screenWidth.deg/2)
             else:
-                self.pgl.text(f"gamma: {self.e.settings.calibrateForGamma[0]} using calibration: {self.e.state.display.luminanceCalibration[0]}", line=-1, xAlign=-1)
+                self.pgl.text(f"gamma: {self.e.settings.calibrateForGamma[0]} using calibration: {self.e.state.display.luminanceCalibration[0]}", line=-1, xAlign=1, x=self.pgl.screenWidth.deg/2)
     
     def handleSubjectResponse(self, response, updateTime):
         self.responseText = f"Subject response received: {response} at {updateTime - self.e.data.startTime:.2f} seconds"
