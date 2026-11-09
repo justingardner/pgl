@@ -138,9 +138,22 @@ class pglSettingsManager:
         
     @classmethod
     def isShiftPressed(cls):
-        import Quartz
-        flags = Quartz.CGEventSourceFlagsState(Quartz.kCGEventSourceStateHIDSystemState)
-        return bool(flags & Quartz.kCGEventFlagMaskShift) 
+        """Check Shift on macOS or Windows; otherwise use normal save behavior."""
+        import sys
+
+        # macOS: read the current keyboard modifier flags.
+        if sys.platform == "darwin":
+            import Quartz
+            flags = Quartz.CGEventSourceFlagsState(Quartz.kCGEventSourceStateHIDSystemState)
+            return bool(flags & Quartz.kCGEventFlagMaskShift)
+
+        # Windows: the high bit indicates whether Shift is currently pressed.
+        if sys.platform == "win32":
+            import ctypes
+            return bool(ctypes.windll.user32.GetAsyncKeyState(0x10) & 0x8000)
+
+        # Other platforms: save only new or modified settings.
+        return False    
     
     @classmethod
     def getImportSettingsDir(cls):
@@ -1024,16 +1037,10 @@ class pglImportSettings(pglTraitSettings):
 
     name = Unicode("default", help="Display name for these import settings")
     experimentPath = Unicode("~/data", help="Root directory containing experiment data", isPath=True)
-
+    cacheDir = Unicode("~/data/pgl/cache", isPath=True, help="Local directory for materialized import data, including deferred Flywheel MRI files. Cached files are not automatically deleted.")
     # The dialog sends transient input directly to storeFlywheelApiKey().
     # The actual key must never be assigned to this settings trait.
-    flywheelApiKey = Unicode(
-        "",
-        hasSetButton=True,
-        buttonFunction="storeFlywheelApiKey",
-        buttonLabel="Store in keychain",
-        isPassword=True,
-        transientInput=True,
+    flywheelApiKey = Unicode("", hasSetButton=True, buttonFunction="storeFlywheelApiKey", buttonLabel="Store in keychain", isPassword=True, transientInput=True,
         help=(
             "Enter the complete Flywheel API key, including its server hostname, "
             "then click Store in keychain to verify and save it securely. "
