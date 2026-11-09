@@ -1453,6 +1453,23 @@ class pglMRI(pglActionable):
             rounded = float(f"{value:.1g}")
             return f"{rounded:,.0f} {unit}" if rounded >= 1 or rounded == 0 else f"{rounded:g} {unit}"
         
+        def formatAcquisitionTime(scan):
+            """Format acquisition time without changing its recorded timezone."""
+            from datetime import datetime
+
+            # Use the scan acquisition timestamp, not database creation time.
+            acquisition = scan.sourceMetadata.get("acquisition", {})
+            timestamp = acquisition.get("timestamp") if isinstance(acquisition, dict) else None
+            if not isinstance(timestamp, str) or not timestamp.strip(): return "unknown"
+
+            # Accept ISO timestamps, including UTC timestamps ending in Z.
+            try:
+                acquired = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            except ValueError:
+                return "unknown"
+
+            return acquired.strftime("%H:%M %m/%d/%Y")
+        
         # Preserve collection order and number scans starting at one.
         for index, scan in enumerate(self.scans, start=1):
             summary = scan.getScanSummary(readHeaders=readHeaders)
@@ -1463,7 +1480,7 @@ class pglMRI(pglActionable):
 
             # Keep the ordinary summary on one line without hiding higher axes.
             extra = f" extraDims={formatVector(summary['extraDims'])}" if summary["extraDims"] else ""
-            print(f"{index}: {label} dims={dims} voxelDims={voxelDims} mm fov={fov} mm size={formatFileSize(scan)}{extra}")
+            print(f"{index}: {label} {formatAcquisitionTime(scan)} dims={dims} voxelDims={voxelDims}mm fov={fov}mm size={formatFileSize(scan)}{extra}")
 
             # Show both header transforms only when verbose output is requested.
             if verbose:
