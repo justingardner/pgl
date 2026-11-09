@@ -1180,6 +1180,100 @@ class pglMRIScan(pglTraitSettings):
             progress.finish("Original MRI source exported and verified")
 
         return identity
+    
+    def getScanSummary(self, *, readHeaders=True):
+        """Summarize NIfTI geometry without loading voxel arrays.
+
+        Uses an already-open working image, stored header metadata, or an
+        optional source-header read. Does not access self.data or modify metadata.
+
+        scanDims contains the first four dimensions, padded with ones.
+        Higher dimensions are reported separately rather than collapsed.
+
+        voxelDims and fov are converted to millimeters when spatial units
+        are recognized. Affine matrices retain their original header units.
+
+        A transform code of zero means the corresponding matrix is uncoded
+        and should not be treated as an authoritative spatial transform.
+        """
+        import math
+
+        # Prefer the working image's actual header when it is already open.
+        # This snapshot does not read voxel values.
+        snapshot = None
+        if self._data is not None:
+            snapshot = pglMRINiftiMetadata.fromData(self._data)
+        else:
+            snapshot = self.metadata.get("nifti")
+            if snapshot is None: snapshot = self.sourceMetadata.get("nifti")
+
+        # Read only a missing header, never materialize through self.data.
+        # A backing filesystem may independently spool or verify its payload.
+        if snapshot is None and readHeaders:
+            if self._backing is not None:
+                snapshot = pglMRINiftiMetadata.readBacking(self._backing)
+            elif self.localPath:
+                snapshot = pglMRINiftiMetadata.read(self.localPath)
+
+        summary = {
+            "scanDims": None,
+            "extraDims": [],
+            "voxelDims": None,
+            "fov": None,
+            "spatialUnits": "unknown",
+            "qform_code": None,
+            "qform": None,
+            "sform_code": None,
+            "sform": None,
+        }
+        if snapshot is None: return summary
+        if not isinstance(snapshot, dict): raise ValueError("Invalid NIfTI header snapshot.")
+
+        fields = snapshot.get("fields", {})
+        transforms = snapshot.get("transforms", {})
+        if not isinstance(fields, dict) or not isinstance(transforms, dict):
+            raise ValueError("Invalid NIfTI header fields or transforms.")
+
+        # Extract active dimensions and pad absent axes with one.
+        # Do not reinterpret higher axes as additional time volumes.
+        dimensions = fields.get("dim")
+        if isinstance(dimensions, list) and dimensions:
+            count = dimensions[0]
+            if type(count) is int and 1 <= count <= 7 and len(dimensions) > count:
+                shape = dimensions[1:count + 1]
+                if all(type(size) is int and size > 0 for size in shape):
+                    summary["scanDims"] = (shape + [1, 1, 1, 1])[:4]
+                    summary["extraDims"] = shape[4:]
+
+        # NIfTI's low three unit bits encode spatial units.
+        # Do not assume millimeters when the header declares unknown units.
+        units = fields.get("xyzt_units")
+        millimetersPerUnit = None
+        if type(units) is int:
+            spatialCode = units & 0x07
+            summary["spatialUnits"] = {1: "m", 2: "mm", 3: "um"}.get(spatialCode, "unknown")
+            millimetersPerUnit = {1: 1000.0, 2: 1.0, 3: 0.001}.get(spatialCode)
+
+        # Voxel spacing comes from pixdim, not affine translation or rotation.
+        pixelDimensions = fields.get("pixdim")
+        if millimetersPerUnit is not None and isinstance(pixelDimensions, list) and len(pixelDimensions) >= 4:
+            spacing = pixelDimensions[1:4]
+            if all(type(value) in (int, float) and math.isfinite(value) and value > 0 for value in spacing):
+                summary["voxelDims"] = [float(value) * millimetersPerUnit for value in spacing]
+
+        # FOV spans complete voxels along each image axis.
+        # This is not the distance between the first and last voxel centers.
+        if summary["scanDims"] is not None and summary["voxelDims"] is not None:
+            summary["fov"] = [count * spacing for count, spacing in zip(summary["scanDims"][:3], summary["voxelDims"])]
+
+        # Preserve both header transforms without selecting or reconciling them.
+        # The matrices remain in the original header's coordinate units.
+        for form in ("qform", "sform"):
+            code = fields.get(f"{form}_code", transforms.get(f"{form}_code"))
+            summary[f"{form}_code"] = code if type(code) is int else None
+            summary[form] = deepcopy(transforms.get(form))
+
+        return summary
 
 
 ################################################################
@@ -1247,6 +1341,139 @@ class pglMRI(pglActionable):
     def loadAcquisitionBundle(cls, dataPath, *, filesystem=None, cacheDirectory):
         """Restore acquisition metadata and deferred MRI file references."""
         return pglMRIBundle.loadAcquisition(dataPath, filesystem=filesystem, cacheDirectory=cacheDirectory)
+    
+    def print(self, *, verbose=False, readHeaders=True):
+        """Print one geometry summary line per scan.
+
+        Uses the original filename and Flywheel acquisition label when available.
+        verbose=True adds qform/sform codes and matrices below each summary.
+        readHeaders=False avoids opening source files.
+
+        Voxel dimensions and FOV use millimeters.
+        Transform matrices retain the original header's spatial units.
+        """
+        import math
+
+        if not self.scans:
+            print("No MRI scans.")
+            return
+
+        def formatNumber(value):
+            """Format finite numbers without unnecessary trailing zeros."""
+            if type(value) not in (int, float) or not math.isfinite(value): return "unknown"
+            return f"{value:.6g}"
+
+        def formatVector(values):
+            return "unknown" if values is None else "[" + ", ".join(formatNumber(value) for value in values) + "]"
+
+        def getScanLabel(scan):
+            """Resolve the original filename and acquisition label."""
+            filename = None
+            label = None
+
+            # Prefer explicit Flywheel provenance over parsing the display name.
+            selection = scan.sourceMetadata.get("selection", {})
+            if isinstance(selection, dict):
+                value = selection.get("fileName")
+                if isinstance(value, str) and value.strip(): filename = value
+
+            acquisition = scan.sourceMetadata.get("acquisition", {})
+            if isinstance(acquisition, dict):
+                value = acquisition.get("label")
+                if isinstance(value, str) and value.strip(): label = value
+
+            # File metadata can also preserve the original filename.
+            fileMetadata = scan.sourceMetadata.get("file", {})
+            if filename is None and isinstance(fileMetadata, dict):
+                value = fileMetadata.get("name")
+                if isinstance(value, str) and value.strip(): filename = value
+
+            # Older display names use "acquisition label: filename".
+            # Strip only an exact known filename suffix when one is available.
+            if filename is not None and label is None:
+                suffix = f": {filename}"
+                if scan.name.endswith(suffix): label = scan.name[:-len(suffix)]
+
+            if filename is None:
+                prefix, separator, suffix = scan.name.rpartition(": ")
+                if separator and suffix.lower().endswith((".nii", ".nii.gz")):
+                    filename = suffix
+                    if label is None: label = prefix
+
+            # Local scans use their filename; other scans retain their name.
+            if filename is None:
+                if scan._backing is None and scan.localPath:
+                    filename = Path(scan.localPath).name
+                else:
+                    filename = scan.name or "unnamed"
+
+            return f"{filename} ({label})" if label else filename
+
+        def printMatrix(matrix):
+            """Print a 4x4 matrix with aligned columns."""
+            if not isinstance(matrix, list) or len(matrix) != 4:
+                print("      unknown")
+                return
+            if any(not isinstance(row, list) or len(row) != 4 for row in matrix):
+                print("      unknown")
+                return
+
+            rows = [[formatNumber(value) for value in row] for row in matrix]
+            widths = [max(len(row[column]) for row in rows) for column in range(4)]
+
+            for row in rows:
+                columns = "  ".join(value.rjust(width) for value, width in zip(row, widths))
+                print(f"      [{columns}]")
+                
+        def formatFileSize(scan):
+            """Format stored file size in MB or GB with one significant digit."""
+            size = None
+
+            # Prefer the backing's recorded byte count when available.
+            if scan._backing is not None:
+                identity = scan._backing.expectedIdentity
+                if identity is not None: size = identity["size_bytes"]
+
+            # Flywheel preserves the source size in its file metadata.
+            if size is None:
+                fileMetadata = scan.sourceMetadata.get("file", {})
+                if isinstance(fileMetadata, dict): size = fileMetadata.get("size")
+
+            # Local files require only a filesystem stat, not a payload read.
+            if size is None and scan.localPath:
+                try:
+                    size = Path(scan.localPath).expanduser().stat().st_size
+                except OSError:
+                    pass
+
+            if type(size) is not int or size < 0: return "unknown"
+
+            # Use decimal units and round to one significant digit.
+            value, unit = (size / 1_000_000, "MB") if size < 1_000_000_000 else (size / 1_000_000_000, "GB")
+            rounded = float(f"{value:.1g}")
+            return f"{rounded:,.0f} {unit}" if rounded >= 1 or rounded == 0 else f"{rounded:g} {unit}"
+        
+        # Preserve collection order and number scans starting at one.
+        for index, scan in enumerate(self.scans, start=1):
+            summary = scan.getScanSummary(readHeaders=readHeaders)
+            label = getScanLabel(scan)
+            dims = formatVector(summary["scanDims"])
+            voxelDims = formatVector(summary["voxelDims"])
+            fov = formatVector(summary["fov"])
+
+            # Keep the ordinary summary on one line without hiding higher axes.
+            extra = f" extraDims={formatVector(summary['extraDims'])}" if summary["extraDims"] else ""
+            print(f"{index}: {label} dims={dims} voxelDims={voxelDims} mm fov={fov} mm size={formatFileSize(scan)}{extra}")
+
+            # Show both header transforms only when verbose output is requested.
+            if verbose:
+                for form in ("qform", "sform"):
+                    code = summary[f"{form}_code"]
+                    codeText = "unknown" if code is None else str(code)
+                    note = " (uncoded; not an authoritative transform)" if code == 0 else ""
+                    print(f"   {form}_code={codeText}{note}")
+                    print(f"   {form} (header spatial units: {summary['spatialUnits']}):")
+                    printMatrix(summary[form])
     
 ################################################################
 # MRI acquisition bundles
