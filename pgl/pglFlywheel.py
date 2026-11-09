@@ -192,26 +192,29 @@ class pglFlywheelChoose(pglTraitSettings):
 class pglFlywheelMRIBacking(pglMRIFileBacking):
     """Stream one pinned Flywheel file version without local staging.
 
-    Inherits MRI materialization support. Overrides filesystem opening with
-    an SDK stream that verifies the recorded size and SHA-384 at EOF.
+    Inherits MRI materialization support. Complete reads verify the recorded
+    size and, when available, Flywheel's source SHA-384 checksum.
+
+    Missing source checksums are allowed and remain None in source metadata.
+    Version pinning and size checks do not substitute for checksum verification.
 
     Construction performs no network access.
     The SDK client is runtime-only and must never enter serialized metadata.
 
-    Header-only reads may close early without full verification.
-    Complete materialization/export must read through EOF to verify identity.
+    Header-only reads may close before full-file checks.
+    Complete materialization/export must read through EOF.
     """
 
     def __init__(self, client, acquisitionID, fileName, *, version, sizeBytes, sourceHash):
+        """Record a pinned source with an optional SHA-384 checksum."""
         import re
 
-        if not callable(getattr(
-            getattr(client, "acquisitions_api", None),
-            "download_file_from_acquisition_with_http_info",
-            None,
-        )):
+        # Require a runtime SDK client capable of streaming acquisition files.
+        downloadMethod = getattr(getattr(client, "acquisitions_api", None), "download_file_from_acquisition_with_http_info", None)
+        if not callable(downloadMethod):
             raise TypeError("A connected Flywheel SDK client is required.")
 
+        # Validate the acquisition and filename before constructing a source.
         if not isinstance(acquisitionID, str) or re.fullmatch(r"[0-9a-fA-F]{24}", acquisitionID) is None:
             raise ValueError("Invalid Flywheel acquisition ID.")
 
@@ -224,37 +227,53 @@ class pglFlywheelMRIBacking(pglMRIFileBacking):
         ):
             raise ValueError("Flywheel MRI filename must be a single .nii or .nii.gz filename.")
 
+        # Version and size remain mandatory even when the checksum is absent.
         if type(version) is not int or version < 1:
             raise ValueError("Flywheel file version must be a positive integer.")
 
         if type(sizeBytes) is not int or not 0 <= sizeBytes <= 9223372036854775807:
             raise ValueError("Invalid Flywheel file size.")
 
-        if not isinstance(sourceHash, str) or re.fullmatch(r"v0-sha384-[0-9a-f]{96}", sourceHash) is None:
-            raise ValueError("Expected a Flywheel v0-sha384 source hash.")
+        # Normalize supported checksum representations for the stream verifier.
+        # None means no checksum; other unsupported values are still rejected.
+        normalizedHash = None
+        if sourceHash is not None:
+            if not isinstance(sourceHash, str):
+                raise ValueError("Flywheel source hash must be a SHA-384 string or None.")
 
+            if re.fullmatch(r"[0-9a-fA-F]{96}", sourceHash):
+                normalizedHash = f"v0-sha384-{sourceHash.lower()}"
+            elif re.fullmatch(r"v0-sha384-[0-9a-fA-F]{96}", sourceHash):
+                normalizedHash = sourceHash.lower()
+            else:
+                raise ValueError("Expected a bare SHA-384 digest, a v0-sha384 source hash, or None.")
+
+        # Keep the authenticated client runtime-only.
+        # Original source metadata remains unchanged; normalization is internal.
         self._client = client
         self._acquisitionID = acquisitionID
         self._fileName = fileName
         self._version = version
         self._sourceSize = sizeBytes
-        self._sourceHash = sourceHash
+        self._sourceHash = normalizedHash
 
-        # Inherited materialization uses path for the format extension.
-        # Flywheel has supplied SHA-384, not a PGL SHA-256 identity. Do not
-        # put the remote digest into expectedIdentity under the wrong algorithm.
+        # Inherited materialization uses path to identify the format.
+        # A Flywheel SHA-384 hash is not a PGL SHA-256 identity.
         self.path = fileName
         self._sha256 = None
         self._sizeBytes = None
 
     def open(self):
-        """Return a context-managed, forward-only binary source stream.
+        """Return a context-managed stream for the recorded file version.
 
-        Each opening requests the recorded version.
-        Full reads verify source identity before returning EOF.
+        Complete reads verify the recorded size and, when supplied,
+        Flywheel's SHA-384 checksum before returning EOF.
 
-        Early close releases the response without draining the remaining file.
-        No full-verification claim is made for a header-only read.
+        Without a source checksum, only version pinning and size checking
+        are available; no source-checksum verification is claimed.
+
+        Early close releases the response without draining the file.
+        Header-only reads therefore do not perform full-file verification.
 
         SDK errors are reported without exposing authenticated URLs.
         The client remains caller-owned.
@@ -266,52 +285,57 @@ class pglFlywheelMRIBacking(pglMRIFileBacking):
         backing = self
 
         class VerifiedStream(io.RawIOBase):
-            """Adapt SDK chunks to bounded-memory binary reads."""
+            """Adapt SDK chunks to bounded-memory reads with EOF checks."""
 
             def __init__(self, response):
                 super().__init__()
+
+                # Hash only when a remote checksum is available for comparison.
                 self._chunks = iter(response.iter_content(chunk_size=65536))
                 self._pending = memoryview(b"")
-                self._digest = hashlib.sha384()
+                self._digest = hashlib.sha384() if backing._sourceHash is not None else None
                 self._received = 0
-                self._verified = False
+                self._eofChecked = False
 
             def readable(self): return True
 
             def readinto(self, buffer):
                 if self.closed: raise ValueError("Flywheel source stream is closed.")
                 if not len(buffer): return 0
-                if self._verified: return 0
+                if self._eofChecked: return 0
 
+                # Request another chunk only after consuming the pending bytes.
                 while not len(self._pending):
                     try:
                         chunk = next(self._chunks)
                     except StopIteration:
+                        # Every complete read must match the recorded size.
                         if self._received != backing._sourceSize:
                             raise ValueError("Flywheel source size mismatch.")
 
-                        actualHash = f"v0-sha384-{self._digest.hexdigest()}"
-                        if actualHash != backing._sourceHash:
-                            raise ValueError("Flywheel source SHA-384 mismatch.")
+                        # Compare a checksum only when Flywheel supplied one.
+                        if self._digest is not None:
+                            actualHash = f"v0-sha384-{self._digest.hexdigest()}"
+                            if actualHash != backing._sourceHash:
+                                raise ValueError("Flywheel source SHA-384 mismatch.")
 
-                        self._verified = True
+                        self._eofChecked = True
                         return 0
 
                     except Exception:
-                        raise RuntimeError(
-                            "Flywheel source transfer failed while reading "
-                            "the pinned file version."
-                        ) from None
+                        raise RuntimeError("Flywheel source transfer failed while reading the pinned file version.") from None
 
                     if not chunk: continue
 
+                    # Reject oversized responses immediately.
                     self._received += len(chunk)
                     if self._received > backing._sourceSize:
                         raise ValueError("Flywheel source exceeds its recorded size.")
 
-                    self._digest.update(chunk)
+                    if self._digest is not None: self._digest.update(chunk)
                     self._pending = memoryview(chunk)
 
+                # Copy only what fits; retain the remainder for the next read.
                 count = min(len(buffer), len(self._pending))
                 buffer[:count] = self._pending[:count]
                 self._pending = self._pending[count:]
@@ -323,28 +347,22 @@ class pglFlywheelMRIBacking(pglMRIFileBacking):
             stream = None
 
             try:
+                # Always request the pinned version, never the current latest.
+                # Suppress SDK exception details that could expose credentials.
                 try:
-                    response = backing._client.acquisitions_api.download_file_from_acquisition_with_http_info(
-                        backing._acquisitionID,
-                        backing._fileName,
-                        version=backing._version,
-                        _return_http_data_only=True,
-                        _preload_content=False,
-                    )
+                    response = backing._client.acquisitions_api.download_file_from_acquisition_with_http_info(backing._acquisitionID, backing._fileName, version=backing._version, _return_http_data_only=True, _preload_content=False)
                 except Exception:
-                    raise RuntimeError(
-                        "Could not open the pinned Flywheel file version."
-                    ) from None
+                    raise RuntimeError("Could not open the pinned Flywheel file version.") from None
 
                 if response is None:
                     raise RuntimeError("Flywheel returned no source response.")
 
-                # BufferedReader supplies read(size) for gzip/header readers
-                # and export loops. It does not materialize the whole file.
+                # Buffer reads without materializing the entire file.
                 stream = io.BufferedReader(VerifiedStream(response), buffer_size=65536)
                 yield stream
 
             finally:
+                # Release both resources, including after an early header-only read.
                 try:
                     if stream is not None: stream.close()
                 finally:
@@ -1049,7 +1067,8 @@ class pglFlywheel:
                 fileMetadata = snapshot(file)
 
                 # Pin the version observed now. Future reads request this
-                # version explicitly and verify its recorded size/SHA-384.
+                # version explicitly and verify its recorded size.
+                # SHA-384 is also checked when Flywheel supplies a checksum.
                 try:
                     backing = pglFlywheelMRIBacking(
                         self.fw,
