@@ -356,56 +356,82 @@ class pglFlywheelMRIBacking(pglMRIFileBacking):
 # Flywheel connection
 ################################################################
 class pglFlywheel:
-    def __init__(self, apikey):
-        """Connect to Flywheel and load only the project list."""
+    def __init__(self, *, settingsName=None, settings=None):
+        """Connect using an import profile's keychain credential.
+
+        Uses the default profile when neither argument is supplied.
+        Explicit settings take precedence over settingsName.
+        API-key arguments, fallback credential sources, and API-key prompts
+        are not supported.
+        """
+        from .pglSettings import pglSettingsManager
+
+        # Start disconnected so failed initialization cannot be used for browsing.
         self.selection = pglFlywheelChoose()
         self.fw = None
 
-        # Load library
+        # Load the SDK before resolving credentials.
         try:
             import flywheel
         except ImportError:
-            pglMessages.warning(
-                "Unable to import flywheel library. "
-                "Install using: pip install flywheel-sdk"
-            )
+            pglMessages.warning("Unable to import flywheel library. Install using: pip install flywheel-sdk")
             return
 
-        # Initiate connection and verify login.
-        # Avoid logging SDK exception details that might contain credentials.
+        # Resolve the requested import profile, or use the default profile.
+        importSettings = pglSettingsManager.getImportSettings(settingsName=settingsName, settings=settings)
+        if importSettings is None: return
+
+        # Retrieve credentials only from this profile's OS keychain entry.
         try:
-            fw = flywheel.Client(apikey)
-            user = fw.get_current_user()
-        except Exception:
-            pglMessages.warning("Could not connect or log in to Flywheel.")
+            apikey = importSettings._readSavedFlywheelApiKey()
+        except (RuntimeError, ValueError) as error:
+            # These helpers return credential-free error messages.
+            pglMessages.warning(str(error), level=0)
             return
 
-        pglMessages.message(
-            f"Logged in as: {user.firstname} {user.lastname} ({user.email})"
-        )
-
-        # Fetch projects only; do not walk their sessions or acquisitions.
         try:
-            flywheelProjects = list(fw.projects())
-        except Exception:
-            pglMessages.warning("Could not load Flywheel projects.")
-            return
+            # Connect and verify the saved key.
+            # Never include SDK exception details in warnings.
+            try:
+                fw = flywheel.Client(apikey)
+                user = fw.get_current_user()
+                if user is None:
+                    raise RuntimeError("No authenticated Flywheel user returned.")
+            except Exception:
+                pglMessages.warning(
+                    "Could not connect or log in to Flywheel. "
+                    "Check your network connection or update the saved API key "
+                    "through importSettings()."
+                )
+                return
 
-        # A unique environment variable keeps different connections separate.
-        # The subprocess inherits its value; JSON stores only its name.
-        connectionEnv = f"PGL_FLYWHEEL_API_KEY_{uuid4().hex}"
-        os.environ[connectionEnv] = apikey
-        _flywheelClients[connectionEnv] = fw
+            pglMessages.message(f"Logged in as: {user.firstname} {user.lastname} ({user.email})")
 
-        self.fw = fw
-        self.selection.projects = [
-            pglFlywheelProject(
-                name=project.label,
-                id=project.id,
-                _connectionEnv=connectionEnv,
-            )
-            for project in flywheelProjects
-        ]
+            # Load projects only. Sessions and acquisitions remain lazy-loaded.
+            try:
+                flywheelProjects = list(fw.projects())
+            except Exception:
+                pglMessages.warning("Could not load Flywheel projects.")
+                return
+
+            # Preserve the existing runtime credential handoff to the dialog.
+            # Its subprocess inherits the key through this environment variable.
+            # Serialized selection settings contain only the variable's name.
+            connectionEnv = f"PGL_FLYWHEEL_API_KEY_{uuid4().hex}"
+            os.environ[connectionEnv] = apikey
+            _flywheelClients[connectionEnv] = fw
+
+            # Publish the connected client and the initial project selection.
+            self.fw = fw
+            self.selection.projects = [
+                pglFlywheelProject(name=project.label, id=project.id, _connectionEnv=connectionEnv)
+                for project in flywheelProjects
+            ]
+
+        finally:
+            # The SDK and subprocess handoff still retain runtime credentials.
+            # Clearing this local reference does not securely erase memory.
+            apikey = None
 
     def choose(self):
         """Browse Flywheel and return selected-file records.

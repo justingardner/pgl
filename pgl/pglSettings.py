@@ -1025,24 +1025,165 @@ class pglImportSettings(pglTraitSettings):
     name = Unicode("default", help="Display name for these import settings")
     experimentPath = Unicode("~/data", help="Root directory containing experiment data", isPath=True)
 
-    # Add import-specific traits here.
+    # The dialog sends transient input directly to storeFlywheelApiKey().
+    # The actual key must never be assigned to this settings trait.
+    flywheelApiKey = Unicode(
+        "",
+        hasSetButton=True,
+        buttonFunction="storeFlywheelApiKey",
+        buttonLabel="Store in keychain",
+        isPassword=True,
+        transientInput=True,
+        help=(
+            "Enter the complete Flywheel API key, including its server hostname, "
+            "then click Store in keychain to verify and save it securely. "
+            "Unsubmitted input is discarded. "
+            "Cancel does not undo a successful keychain write."
+        ),
+    )
 
     def save(self, filename=None, filesystem=None, filesystemPrefix=None):
-        """
-        Save import settings.
-
-        Args:
-            filename: Destination filename. If omitted, use saveDir().
-            filesystem: Optional filesystem used for saving.
-            filesystemPrefix: Optional filesystem protocol prefix.
-        """
-        # get the filename
+        """Save import settings, using saveDir() when filename is omitted."""
+        # Resolve the destination, then use the existing settings serializer.
         if filename is None: filename = self.saveDir()
-
         return super().save(filename=filename, filesystem=filesystem, filesystemPrefix=filesystemPrefix)
 
     def saveDir(self):
         return pglSettingsManager.getImportSettingsDir() / f"{pglStorage.makeValidFilename(self.name)}.json"
+
+    @staticmethod
+    def _flywheelCredentialStore():
+        """Return a supported OS credential store, or None.
+
+        Follows the PostgreSQL credential-store policy without depending
+        on PostgreSQL. Rejects plaintext, encrypted-file, and unknown backends.
+        """
+        try:
+            import keyring
+
+            # Accept only the explicitly supported OS credential stores.
+            backend = keyring.get_keyring()
+            backendType = (type(backend).__module__, type(backend).__name__)
+            supported = {
+                ("keyring.backends.macOS", "Keyring"),
+                ("keyring.backends.Windows", "WinVaultKeyring"),
+                ("keyring.backends.SecretService", "Keyring"),
+            }
+
+            if backendType not in supported:
+                raise RuntimeError("Unsupported credential backend.")
+
+            return backend
+
+        except Exception:
+            # Do not expose backend exception details or use a fallback store.
+            pglMessages.oneTimeWarning(
+                "Secure Flywheel credential storage is unavailable. "
+                "Install keyring and configure macOS Keychain, Windows "
+                "Credential Manager, or Linux Secret Service. "
+                "No fallback credential source will be used.",
+                level=0,
+            )
+            return None
+
+    def _flywheelCredentialIdentity(self):
+        """Use the profile UUID so renaming settings preserves access."""
+        # Validate and normalize the UUID before using it as a keychain account.
+        try:
+            profileID = str(uuid.UUID(self.uuid))
+        except (ValueError, TypeError, AttributeError):
+            raise ValueError("Import settings require a valid UUID.") from None
+
+        return "pgl.flywheel.v1", profileID
+
+    def storeFlywheelApiKey(self, apiKey):
+        """Verify and securely store transient dialog input.
+
+        Never assigns the key to a settings trait.
+        Failed verification leaves any previously saved key unchanged.
+        Returns "" after successful storage so the dialog clears its input.
+        Cancel does not undo a completed keychain write.
+        """
+        try:
+            # Validate input without including the supplied value in errors.
+            if not isinstance(apiKey, str) or not apiKey.strip():
+                raise ValueError("Enter a nonempty Flywheel API key.")
+
+            if any(character in apiKey for character in ("\n", "\r", "\x00")):
+                raise ValueError("Flywheel API keys must contain no newline or NUL characters.")
+
+            if apiKey != apiKey.strip():
+                raise ValueError("Remove leading or trailing whitespace from the Flywheel API key.")
+
+            # Resolve this profile's keychain entry and require secure storage.
+            service, account = self._flywheelCredentialIdentity()
+            store = self._flywheelCredentialStore()
+            if store is None:
+                raise RuntimeError("Secure Flywheel credential storage is unavailable.")
+
+            # Load the SDK only when a Flywheel key is being configured.
+            try:
+                import flywheel
+            except ImportError:
+                raise RuntimeError("Install the Flywheel SDK using: pip install flywheel-sdk") from None
+
+            # Verify only the supplied key. SDK exception details may contain
+            # credentials or authenticated URLs, so replace them with safe text.
+            client = None
+            try:
+                client = flywheel.Client(apiKey)
+                user = client.get_current_user()
+                if user is None:
+                    raise RuntimeError("No authenticated Flywheel user returned.")
+            except Exception:
+                raise RuntimeError(
+                    "Could not verify the Flywheel API key. "
+                    "Check the complete key and your network connection."
+                ) from None
+            finally:
+                # Release this reference; this is not secure memory erasure.
+                client = None
+
+            # Write to the keychain only after verification succeeds.
+            try:
+                store.set_password(service, account, apiKey)
+            except Exception:
+                raise RuntimeError("The Flywheel API key was verified but could not be saved securely.") from None
+
+            # Returning an empty string instructs the dialog to clear its input.
+            pglMessages.message("Flywheel API key verified and saved in the OS credential store.")
+            return ""
+
+        finally:
+            # Clearing a local reference does not guarantee secure memory erasure.
+            apiKey = None
+
+    def _readSavedFlywheelApiKey(self):
+        """Retrieve this profile's key without prompting for an API key.
+
+        The OS may request permission to access its credential store.
+        There is no environment-variable or file fallback.
+        """
+        # Resolve the same identity used when storing the key.
+        service, account = self._flywheelCredentialIdentity()
+        store = self._flywheelCredentialStore()
+        if store is None:
+            raise RuntimeError("Secure Flywheel credential storage is unavailable.")
+
+        # Read only from the approved OS credential store.
+        try:
+            apiKey = store.get_password(service, account)
+        except Exception:
+            raise RuntimeError("Could not read the saved Flywheel API key from the OS credential store.") from None
+
+        # Missing credentials must be configured through importSettings().
+        if not isinstance(apiKey, str) or not apiKey:
+            raise RuntimeError(
+                "No Flywheel API key is saved for these import settings. "
+                "Open importSettings(), select this profile, and use 'Store in keychain'."
+            )
+
+        return apiKey
 
 
 ##################################################
