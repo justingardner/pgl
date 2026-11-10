@@ -202,6 +202,48 @@ class pglChooseLevel(pglTraitSettings):
                 children.append(child)
 
         return children
+    
+    @classmethod
+    def fromJSONdict(cls, data, type="all", filename=None):
+        """Restore a chooser using its serialized source prefix.
+
+        Reestablish filesystem access in the receiving process.
+        Restore the serialized child hierarchy without rediscovering it.
+        """
+        if not isinstance(data, dict):
+            raise TypeError("Chooser restoration requires a dictionary.")
+
+        dataPath = data.get("dataPath")
+        filesystemPrefix = data.get("filesystemPrefix") or ""
+
+        if not isinstance(dataPath, str) or not dataPath:
+            raise ValueError("Cannot restore a chooser without its dataPath.")
+
+        filesystem, resolvedPath, resolvedPrefix = pglStorage.validateFilesystem(
+            filesystem=None,
+            dataPath=dataPath,
+            filesystemPrefix=filesystemPrefix,
+        )
+        if filesystem is None:
+            raise ValueError(f"Could not restore chooser source: {dataPath!r}")
+
+        # Empty entries prevent directory discovery during construction.
+        restored = cls(
+            name=data.get("name", ""),
+            dataPath=resolvedPath,
+            filesystem=filesystem,
+            filesystemPrefix=resolvedPrefix,
+            entries=[],
+        )
+
+        # Preserve normal trait restoration, including child selections.
+        restoredData = dict(data)
+        restoredData["dataPath"] = str(resolvedPath)
+        restoredData["fullDataPath"] = str(resolvedPath)
+        restoredData["filesystemPrefix"] = resolvedPrefix or filesystemPrefix
+        restored.updateTraitsFromDict(restoredData, filename=filename)
+
+        return restored
 
 
 ################################################################################
@@ -259,7 +301,6 @@ class pglChooseRun(pglChooseLevel):
     def display(self, fig=None):
         """Called by the existing traits-dialog display button."""
         self.run.display(fig=fig)
-
 
 class pglChooseSession(pglChooseLevel):
     """
@@ -569,6 +610,7 @@ class pglChoose():
                 selectedFilesystem, selectedPaths = cls._chooseDialog(
                     fullDataPath=fullDataPath,
                     filesystem=filesystem,
+                    filesystemPrefix=filesystemPrefix,
                     chooseLevel=chooseLevel,
                     allowMultipleRuns=allowMultipleRuns,
                 )
@@ -818,55 +860,52 @@ class pglChoose():
 
         return selectedValues
 
-    @ classmethod
-    def _chooseDialog(cls, fullDataPath, filesystem=None, chooseLevel=None, allowMultipleRuns=False):
-        '''
-        Function that will put up a dialog to choose an experiment for loading
-        '''
-        # put up dialog
-        if chooseLevel == 'experimentNames':
-            s = pglChooseData(dataPath=fullDataPath, filesystem=filesystem)
-            s = pglDialogs.traitsDialog(s)
-            if s is None:
-                pglMessages.message("No runs selected")
-                return (None, None)
-        elif chooseLevel == 'subjectIDs':
-            s = pglChooseExperiment(dataPath=fullDataPath, filesystem=filesystem)
-            s = pglDialogs.traitsDialog(s)
-            if s is None:
-                pglMessages.message("No runs selected")
-                return (None, None)
-        elif chooseLevel == 'sessionNames':
-            s = pglChooseSubject(dataPath=fullDataPath, filesystem=filesystem)
-            s = pglDialogs.traitsDialog(s)
-            if s is None:
-                pglMessages.message("No runs selected")
-                return (None, None)
-        elif chooseLevel == 'runNames':
-            s = pglChooseSession(dataPath=fullDataPath, filesystem=filesystem)
-            s = pglDialogs.traitsDialog(s)
-            if s is None:
-                pglMessages.message("No runs selected")
-                return (None, None)
-        else:
-            pglMessages.warning(f"Unkown choose level: {chooseLevel}")
+    @classmethod
+    def _chooseDialog(cls, fullDataPath, filesystem=None, chooseLevel=None,
+                      allowMultipleRuns=False, filesystemPrefix=None):
+        """Choose runs while preserving the source prefix across the dialog.
+
+        The dialog runs in a separate process. The prefix is serialized;
+        the live filesystem remains owned by this parent process.
+        """
+        chooserClasses = {
+            "experimentNames": pglChooseData,
+            "subjectIDs": pglChooseExperiment,
+            "sessionNames": pglChooseSubject,
+            "runNames": pglChooseSession,
+        }
+
+        chooserClass = chooserClasses.get(chooseLevel)
+        if chooserClass is None:
+            pglMessages.warning(f"Unknown choose level: {chooseLevel}")
             return (None, None)
-        
-        # walk structure to get runs that are selected
-        runNames = cls.walkInstances(s)
+
+        # Children inherit this prefix, so every serialized run retains
+        # the information needed to reconnect for its preview.
+        chooser = chooserClass(
+            dataPath=fullDataPath,
+            filesystem=filesystem,
+            filesystemPrefix=filesystemPrefix,
+        )
+        chooser = pglDialogs.traitsDialog(chooser)
+
+        if chooser is None:
+            pglMessages.message("No runs selected")
+            return (None, None)
+
+        # Extract selections, but keep the parent's original filesystem.
+        runNames = cls.walkInstances(chooser)
         if not runNames:
             pglMessages.message("No runs selected")
             return (None, None)
-        elif len(runNames)>1:
-            if not allowMultipleRuns:
-                pglMessages.message(f"Multiple runs selecting, using {runNames[0]}")
-            else:
-                return (filesystem, runNames)
 
-        if allowMultipleRuns is False:
-            return (filesystem, runNames[0])
-        else:
+        if allowMultipleRuns:
             return (filesystem, runNames)
+
+        if len(runNames) > 1:
+            pglMessages.message(f"Multiple runs selected, using {runNames[0]}")
+
+        return (filesystem, runNames[0])
 
     # walk the structure to get to the leaves (which have runs)        
     @classmethod
