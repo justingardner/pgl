@@ -1182,7 +1182,7 @@ class pglMRIScan(pglTraitSettings):
         return identity
     
     def getScanSummary(self, *, readHeaders=True):
-        """Summarize NIfTI geometry without loading voxel arrays.
+        """Summarize NIfTI geometry and TR without loading voxel arrays.
 
         Uses an already-open working image, stored header metadata, or an
         optional source-header read. Does not access self.data or modify metadata.
@@ -1193,10 +1193,15 @@ class pglMRIScan(pglTraitSettings):
         voxelDims and fov are converted to millimeters when spatial units
         are recognized. Affine matrices retain their original header units.
 
+        trSeconds is the fourth-axis spacing converted to seconds.
+        Requires a fourth dimension and recognized temporal units.
+        Missing, invalid, unknown-unit, or frequency-domain spacing returns None.
+
         A transform code of zero means the corresponding matrix is uncoded
         and should not be treated as an authoritative spatial transform.
         """
         import math
+        from copy import deepcopy
 
         # Prefer the working image's actual header when it is already open.
         # This snapshot does not read voxel values.
@@ -1221,6 +1226,7 @@ class pglMRIScan(pglTraitSettings):
             "voxelDims": None,
             "fov": None,
             "spatialUnits": "unknown",
+            "trSeconds": None,
             "qform_code": None,
             "qform": None,
             "sform_code": None,
@@ -1236,6 +1242,7 @@ class pglMRIScan(pglTraitSettings):
 
         # Extract active dimensions and pad absent axes with one.
         # Do not reinterpret higher axes as additional time volumes.
+        hasTimeDimension = False
         dimensions = fields.get("dim")
         if isinstance(dimensions, list) and dimensions:
             count = dimensions[0]
@@ -1244,6 +1251,7 @@ class pglMRIScan(pglTraitSettings):
                 if all(type(size) is int and size > 0 for size in shape):
                     summary["scanDims"] = (shape + [1, 1, 1, 1])[:4]
                     summary["extraDims"] = shape[4:]
+                    hasTimeDimension = count >= 4
 
         # NIfTI's low three unit bits encode spatial units.
         # Do not assume millimeters when the header declares unknown units.
@@ -1261,10 +1269,35 @@ class pglMRIScan(pglTraitSettings):
             if all(type(value) in (int, float) and math.isfinite(value) and value > 0 for value in spacing):
                 summary["voxelDims"] = [float(value) * millimetersPerUnit for value in spacing]
 
+        # Temporal units occupy bits 3–5, independently of spatial units.
+        # Accept seconds, milliseconds, and microseconds only.
+        # Unknown and frequency-domain units cannot establish a TR.
+        secondsPerUnit = None
+        if type(units) is int:
+            temporalCode = units & 0x38
+            secondsPerUnit = {8: 1.0, 16: 0.001, 24: 0.000001}.get(temporalCode)
+
+        if (
+            hasTimeDimension
+            and secondsPerUnit is not None
+            and isinstance(pixelDimensions, list)
+            and len(pixelDimensions) >= 5
+        ):
+            temporalSpacing = pixelDimensions[4]
+            if (
+                type(temporalSpacing) in (int, float)
+                and math.isfinite(temporalSpacing)
+                and temporalSpacing > 0
+            ):
+                summary["trSeconds"] = float(temporalSpacing) * secondsPerUnit
+
         # FOV spans complete voxels along each image axis.
         # This is not the distance between the first and last voxel centers.
         if summary["scanDims"] is not None and summary["voxelDims"] is not None:
-            summary["fov"] = [count * spacing for count, spacing in zip(summary["scanDims"][:3], summary["voxelDims"])]
+            summary["fov"] = [
+                count * spacing
+                for count, spacing in zip(summary["scanDims"][:3], summary["voxelDims"])
+            ]
 
         # Preserve both header transforms without selecting or reconciling them.
         # The matrices remain in the original header's coordinate units.

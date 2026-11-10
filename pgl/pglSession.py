@@ -2389,6 +2389,7 @@ class pglSession(pglActionable):
     mri = Instance(pglMRI, allow_none=True, default_value=None, help="MRI data", serialize=False)
     dataMatrices = Dict(default_value={}, help="Named scientific matrices owned by this working session; persisted explicitly through session checkpoint integration", serialize=False)
     derivedFiles = Dict(default_value={}, help="Named derived file attachments; persisted explicitly through session checkpoint integration", serialize=False)
+    selectedFilesystem = Instance(AbstractFileSystem,allow_none=True,default_value=None,help="Filesystem used to load the selected behavioral runs", serialize=False)
     
     # Explicit labels apply only when there are no behavioral runs.
     # Checkpoint persistence will handle these explicitly rather than relying

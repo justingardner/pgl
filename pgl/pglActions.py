@@ -64,6 +64,7 @@ class pglActions():
             self.status = pglActionStatus.INITIALIZED
             self.selectedPaths = []
             self.filesystemPrefix = ""
+            self.selectedFilesystem = None
 
             if type(sortByAcquisitionTime) is not bool:
                 raise ValueError("sortByAcquisitionTime must be True or False.")
@@ -153,29 +154,59 @@ class pglActions():
                 validPaths = [record["path"] for record in runTimes]
 
             # Record the actual loading order.
+            # Record the actual loading order and source filesystem.
             self.selectedPaths = validPaths
+            self.selectedFilesystem = filesystem
             self.filesystemPrefix = filesystemPrefix or ""
             super().configure()
             
         ################################
         # run
         ################################
-        def _run(self):
-            '''
-            Run the action to load the session
-            
+        def _run(self, session=None):
+            """Load behavioral runs into a new or existing session.
+
+            Args:
+                session (pglSession or None): Existing session to append to.
+                    If None, create and return a new session.
+
             Returns:
-                pglSession: The loaded session (or None if )
-            '''
-            # import session
+                pglSession: The new session or the same supplied session.
+
+            Existing runs retain their order. Incoming runs are appended in
+            configured order. Repeated loading can append duplicate runs.
+
+            MRI, MNE, checkpoint information, and other existing session
+            contents are preserved.
+            """
             from .pglSession import pglSession
-            
-            # just create the session variable
-            session = pglSession(filesystemPrefix=self.filesystemPrefix, runList = self.selectedPaths)
-            
-            # and return
+
+            if session is not None and not isinstance(session, pglSession):
+                raise TypeError("session must be a pglSession or None.")
+
+            if not self.selectedPaths:
+                raise ValueError("No runs selected. Configure loadSession before running it.")
+
+            if self.selectedFilesystem is None:
+                raise ValueError("No source filesystem configured. Configure loadSession before running it.")
+
+            # Construct all incoming run objects before changing an existing
+            # session. Run contents remain lazy, as in normal session loading.
+            incomingSession = pglSession(
+                filesystem=self.selectedFilesystem,
+                filesystemPrefix=self.filesystemPrefix,
+                runList=self.selectedPaths
+            )
+
+            if session is None:
+                return incomingSession
+
+            # Each incoming run retains its own source filesystem.
+            # Do not replace the existing session's filesystem or modalities.
+            # Assign a new list so trait observers receive the change.
+            session.runs = list(session.runs or []) + list(incomingSession.runs or [])
+
             return session
-        
         
     ################################################################
     # makeStimulusMovie
