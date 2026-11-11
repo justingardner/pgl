@@ -238,7 +238,7 @@ class pglDigitalBrainMemoryTask(pglTask):
         self.state.gotResponse = True
         
         condition = self.mdb.stimuli[self.currentParams['movieNum']].condition
-        if condition.lower().startswith("new"):
+        if condition.lower().startswith("new") or condition.lower().startswith("foil"):
             # if not a new response then make it incorrect
             if response not in {0,1}: response += 5
         else:
