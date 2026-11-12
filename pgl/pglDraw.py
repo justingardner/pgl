@@ -32,56 +32,89 @@ class pglDraw:
             "foregroundColor": (1.0, 1.0, 1.0, 1.0),
             "backgroundColor": (0.0, 0.0, 0.0, 0.0)
         }
+        
+        # Default clearScreen behavior. Experiment apertures temporarily
+        # enable quad clearing so the render-pass background stays black.
+        self.clearScreenDrawQuad = False
 
     ################################################################
     # clearScreen
     ################################################################
-    def clearScreen(self, color):
+    def clearScreen(self, color, drawQuad=None):
         """
-        Clear the screen with a specified color.
+        Set the render-pass clear color or draw a full-screen background quad.
 
         Args:
-            color (list or tuple): RGB color values as a list or tuple of three floats in the range [0, 1]. Scalar
-                values will be converted to grayscale.
-
+            color: RGB values in [0, 1], or a scalar grayscale value.
+            drawQuad (bool or None): None uses self.clearScreenDrawQuad.
+                False sets the renderer's clear color.
+                True draws a full-screen quad through the current stencil
+                without changing the renderer's clear color.
         Returns:
-            bool: True if the screen was cleared successfully, False otherwise.
+            bool: True after submitting the requested operation,
+                False if disconnected or the clear-color command fails.
+
+        Notes:
+            Setting the clear color affects render passes created afterward;
+            it does not retroactively clear a pass already in progress.
+
+            The quad uses an identity transform to cover the screen, then
+            restores the cached drawing transform. Stencil testing remains
+            active throughout.
         """
-        # Print what we are doing
-        if self.verbose > 1: print(f"(pgl:clearScreen) Clearing screen with color {color}")
+        
+        # Explicit arguments override the current instance default.
+        if drawQuad is None: drawQuad = self.clearScreenDrawQuad
+        
+        # Print what we are doing.
+        if self.verbose > 1:
+            print(f"(pgl:clearScreen) Clearing screen with color {color}, drawQuad={drawQuad}")
 
-        # Validate the color
-        color = self.validateColor(color,withAlpha = False)
+        # Validate the color.
+        color = self.validateColor(color, withAlpha=False)
 
-        # Check if the socket is connected
+        # Check if the socket is connected.
         if not self.s:
             print("(pgl:clearScreen) ❌ Not connected to socket")
             return False
-        
-        # Send the clear command
-        self.s.writeCommand("mglSetClearColor")
-        
-        # send the color data
-        self.s.write(np.array(color, dtype=np.float32))
-        
-        # Read the command results
-        self.commandResults = self.s.readCommandResults()
-        
-        # keep background coor
+
+        if drawQuad:
+            # Cover the screen independently of visual-angle calibration,
+            # display flips, or the current coordinate transform.
+            fullScreenQuad = np.array([
+                [-1, -1],
+                [ 1, -1],
+                [ 1,  1],
+                [-1,  1]
+            ], dtype=np.float32)
+
+            savedTransform = np.array(self.xform, copy=True)
+
+            try:
+                # setTransform() sends the matrix without changing self.xform.
+                self.setTransform(np.eye(4))
+                self.quad(fullScreenQuad, color=color, units="device")
+            finally:
+                self.setTransform(savedTransform)
+
+        else:
+            # Set the background color used when a render pass begins.
+            if not self.s.writeCommand("mglSetClearColor"): return False
+
+            self.s.write(np.array(color, dtype=np.float32))
+            self.commandResults = self.s.readCommandResults()
+
+            if self.commandResults is None: return False
+            success = self.commandResults.get("success")
+            if success is None or not np.all(np.asarray(success) != 0):
+                pglMessages.warning("Could not set the render background color.")
+                return False
+
+        # Remember the requested background color in either mode.
+        # In quad mode, this is not necessarily the renderer's clear color.
         self.clearScreenColor = color.flatten().tolist()
-        
-        # FIX: FIX: FIX, this draws a quad because clearScreen is not functioning properly
-        #w = self.screenWidth.pix
-        #h = self.screenHeight.pix
-        #fullScreenQuad = np.array([
-        #    [0, 0],   # bottom-left
-        #    [w, 0],   # bottom-right
-        #    [w, h],   # top-right
-        #    [0, h],   # top-left
-        # ])
-        #self.quad(fullScreenQuad, color= self.clearScreenColor, units="pix")
-        #self.oneTimeWarning("Need to fix clearScreen which is not functioning properly, drawing a full screen quad instead.",level=0)
-        
+        return True
+         
     ################################################################
     # dots
     ################################################################
@@ -767,7 +800,229 @@ class pglDraw:
             pglMessages.warning("Could not select stencil.")
             return None
 
-        return self.commandResults            
+        return self.commandResults        
+    
+    ################################################################
+    # triangulatePolygon
+    ################################################################
+    @staticmethod
+    def triangulatePolygon(vertices):
+        """
+        Triangulate a simple polygon using ear clipping.
+
+        Args:
+            vertices: Numeric n x 2 coordinates, ordered around the perimeter.
+                Clockwise and counterclockwise order are both accepted.
+                Repeating the first vertex at the end is optional.
+
+        Returns:
+            np.ndarray or None: Triangle coordinates with shape (nTriangles, 3, 2),
+                or None when the polygon is invalid.
+
+        Supports concave polygons, but not self-intersections or holes.
+        Collinear intermediate vertices are removed.
+        """
+        def invalidPolygon(message):
+            pglMessages.warning(f"Could not triangulate polygon: {message}")
+            return None
+
+        # Convert and check coordinates before doing geometric operations.
+        try:
+            vertices = np.asarray(vertices, dtype=np.float64)
+        except (TypeError, ValueError, OverflowError):
+            return invalidPolygon("coordinates must be numeric x/y pairs.")
+
+        if vertices.ndim != 2 or vertices.shape[1] != 2 or len(vertices) < 3:
+            return invalidPolygon("at least three x/y pairs are required.")
+
+        if not np.all(np.isfinite(vertices)):
+            return invalidPolygon("coordinates must be finite.")
+
+        vertices = vertices.copy()
+
+        # Normalize geometry for dimensionless tolerance checks.
+        # Returned triangles still use the original coordinates.
+        with np.errstate(over="ignore", invalid="ignore"):
+            extent = np.ptp(vertices, axis=0)
+            scale = np.max(extent)
+            points = (vertices - vertices[0]) / scale if scale > 0 else None
+
+        if points is None or not np.isfinite(scale) or not np.all(np.isfinite(points)):
+            return invalidPolygon("coordinates have zero or unsupported extent.")
+
+        tolerance = 1e-10
+
+        def cross(a, b, c):
+            return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+        # Accept an explicitly closed polygon.
+        if np.max(np.abs(points[-1] - points[0])) <= tolerance:
+            points = points[:-1]
+            vertices = vertices[:-1]
+
+        if len(points) < 3:
+            return invalidPolygon("at least three distinct vertices are required.")
+
+        # Repeated vertices create ambiguous or degenerate boundaries.
+        for index in range(len(points)):
+            if np.any(np.max(np.abs(points[index + 1:] - points[index]), axis=1) <= tolerance):
+                return invalidPolygon("vertices must not repeat, except for an optional closing vertex.")
+
+        # Remove straight-through intermediate points. Reject edges that
+        # reverse direction and overlap along the same line.
+        remaining = list(range(len(points)))
+
+        while len(remaining) > 3:
+            removed = False
+
+            for position, current in enumerate(remaining):
+                previous = remaining[position - 1]
+                following = remaining[(position + 1) % len(remaining)]
+                a, b, c = points[[previous, current, following]]
+
+                if abs(cross(a, b, c)) <= tolerance:
+                    if np.dot(b - a, c - b) < 0:
+                        return invalidPolygon("adjacent edges overlap or reverse direction.")
+
+                    remaining.pop(position)
+                    removed = True
+                    break
+
+            if not removed: break
+
+        def onSegment(a, b, point):
+            return (
+                abs(cross(a, b, point)) <= tolerance
+                and np.all(point >= np.minimum(a, b) - tolerance)
+                and np.all(point <= np.maximum(a, b) + tolerance)
+            )
+
+        def segmentsIntersect(a, b, c, d):
+            abC, abD = cross(a, b, c), cross(a, b, d)
+            cdA, cdB = cross(c, d, a), cross(c, d, b)
+
+            # Proper crossing.
+            if (
+                ((abC > tolerance and abD < -tolerance) or
+                 (abC < -tolerance and abD > tolerance))
+                and
+                ((cdA > tolerance and cdB < -tolerance) or
+                 (cdA < -tolerance and cdB > tolerance))
+            ):
+                return True
+
+            # Also reject touching or overlapping nonadjacent edges.
+            return (
+                onSegment(a, b, c) or onSegment(a, b, d)
+                or onSegment(c, d, a) or onSegment(c, d, b)
+            )
+
+        # Check that nonadjacent edges never intersect.
+        count = len(remaining)
+
+        for first in range(count):
+            a = points[remaining[first]]
+            b = points[remaining[(first + 1) % count]]
+
+            for second in range(first + 1, count):
+                # Adjacent edges are allowed to share their endpoint.
+                if second == first + 1 or (first == 0 and second == count - 1):
+                    continue
+
+                c = points[remaining[second]]
+                d = points[remaining[(second + 1) % count]]
+
+                if segmentsIntersect(a, b, c, d):
+                    return invalidPolygon("nonadjacent edges intersect or touch.")
+
+        # Determine winding and reject polygons with effectively zero area.
+        boundary = points[remaining]
+        twiceArea = np.sum(
+            boundary[:, 0] * np.roll(boundary[:, 1], -1)
+            - boundary[:, 1] * np.roll(boundary[:, 0], -1)
+        )
+
+        if abs(twiceArea) <= tolerance:
+            return invalidPolygon("polygon area is zero or too small.")
+
+        winding = 1 if twiceArea > 0 else -1
+        triangles = []
+
+        # An ear is a convex corner whose triangle contains no other vertex.
+        while len(remaining) > 3:
+            foundEar = False
+
+            for position, current in enumerate(remaining):
+                previous = remaining[position - 1]
+                following = remaining[(position + 1) % len(remaining)]
+                a, b, c = points[[previous, current, following]]
+
+                if winding * cross(a, b, c) <= tolerance:
+                    continue
+
+                containsVertex = False
+
+                for candidate in remaining:
+                    if candidate in (previous, current, following): continue
+                    point = points[candidate]
+
+                    if (
+                        winding * cross(a, b, point) >= -tolerance
+                        and winding * cross(b, c, point) >= -tolerance
+                        and winding * cross(c, a, point) >= -tolerance
+                    ):
+                        containsVertex = True
+                        break
+
+                if containsVertex: continue
+
+                triangles.append([previous, current, following])
+                remaining.pop(position)
+                foundEar = True
+                break
+
+            if not foundEar:
+                return invalidPolygon("could not find a nondegenerate triangulation.")
+
+        a, b, c = points[remaining]
+        if winding * cross(a, b, c) <= tolerance:
+            return invalidPolygon("final triangle is degenerate.")
+
+        triangles.append(remaining.copy())
+        return vertices[np.asarray(triangles, dtype=np.intp)]    
+    
+    ################################################################
+    # polygon
+    ################################################################
+    def polygon(self, vertices, color=None, units=None):
+        """
+        Draw a filled simple polygon, including concave polygons.
+
+        Args:
+            vertices: Numeric n x 2 coordinates ordered around the perimeter.
+            color: RGB color or grayscale scalar.
+            units: None or "deg" for visual-angle coordinates, "pix" for
+                pixels, or "device" to skip Python coordinate conversion.
+
+        Returns:
+            bool: False if validation fails; True after submitting drawing.
+                True does not independently verify GPU completion.
+        """
+        if not self.isOpen():
+            pglMessages.warning("No screen is open.")
+            return False
+
+        # Triangulate before sending any drawing commands.
+        triangles = self.triangulatePolygon(vertices)
+        if triangles is None: return False
+
+        # quad() treats None as visual-angle coordinates.
+        if isinstance(units, str) and units.lower() == "deg": units = None
+
+        # One real triangle and one degenerate triangle per quad.
+        quadVertices = triangles[:, [0, 1, 2, 0], :]
+        self.quad(quadVertices, color=color, units=units)
+        return True
             
 
     ####################################################

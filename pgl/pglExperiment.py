@@ -665,6 +665,12 @@ class pglExperiment(pglExperimentBase):
             # Start before configure(), which may create stimulus resources.
             self._startExperimentRecording(estimatedDuration, recordFlush, recordCommands)
 
+            # Record mask creation so command replay can recreate the stencil.
+            # Visual-angle coordinates and display flips are already configured.
+            if not self.initStencil(backgroundColor=backgroundColor):
+                pglMessages.warning("Could not initialize the experiment stencil.")
+                return
+
             # Bind original source snapshots before configuring any task.
             # Source problems must not prevent acquisition or partial saving.
             sourceErrors = []
@@ -697,7 +703,7 @@ class pglExperiment(pglExperimentBase):
                     self._finalizeRun()
                 else:
                     # No recording was started. Attempt independent cleanup.
-                    self._attemptRunAction("close experiment screen", lambda: self.endScreen(clearScreen=False), errors)
+                    self._attemptRunAction("close experiment screen",lambda: self.endScreen(clearScreen=False, resetStencil=False),errors)
                     self._attemptRunAction("close digital IO", self.endDigitalIO, errors)
                     self._attemptRunAction("close experiment devices", self.endDevices, errors)
             except (Exception, KeyboardInterrupt, SystemExit) as finalizationError:
@@ -738,10 +744,11 @@ class pglExperiment(pglExperimentBase):
     ################################################################
     # Restore and close the screen with independent cleanup attempts
     ################################################################
-    def endScreen(self, clearScreen=True):
+    def endScreen(self, clearScreen=True, resetStencil=True):
         """Restore display settings and close this experiment's screen.
 
-        clearScreen=False avoids drawing commands after an interrupted exchange.
+        clearScreen=False avoids a final blank frame.
+        resetStencil=False avoids stencil commands after an interrupted exchange.
         Failures propagate after the other cleanup operations are attempted.
         """
         from .pglKeyboardMouse import pglKeyboardMouse
@@ -758,6 +765,16 @@ class pglExperiment(pglExperimentBase):
 
         for keyboardDevice in keyboardDevices:
             self._attemptRunAction("stop keyboard/mouse device", keyboardDevice.stop, errors)
+
+        # Disable the experiment mask even when the window remains open.
+        # Recovery paths must not send commands into an interrupted exchange.
+        if resetStencil:
+            self._attemptRunAction("disable experiment stencil", self.endStencil, errors)
+        elif not self.settings.closeScreenOnEnd and getattr(self, "_experimentStencilNumber", None) is not None:
+            pglMessages.warning(
+                "Renderer recovery skipped stencil reset. The open display may "
+                "still have masking enabled; close/reopen it before reuse."
+            )
 
         if self.settings.closeScreenOnEnd:
             # Normal callers can request a final blank. Recovery callers skip
@@ -793,9 +810,16 @@ class pglExperiment(pglExperimentBase):
 
             def closeDisplay():
                 if self.pgl.close() is False: raise RuntimeError("PGL could not close its renderer.")
+                self._experimentStencilNumber = None
                 self.state.openScreen = False
 
             self._attemptRunAction("close renderer connection", closeDisplay, errors)
+
+        # Restore local clearing behavior even when recovery skipped renderer
+        # commands, or when disabling the stencil failed.
+        if getattr(self, "_stencilClearModeChanged", False):
+            self.pgl.clearScreenDrawQuad = self._stencilPreviousDrawQuad
+            self._stencilClearModeChanged = False
 
         self._attemptRunAction("restore verbosity", self.endVerbose, errors)
 
@@ -1065,9 +1089,14 @@ class pglExperiment(pglExperimentBase):
         # If closeScreenOnEnd=False, this does not blank the final stimulus.
         cleanupErrorCount = len(errors)
 
+        # Normal completion disables masking without presenting another frame.
+        # Error recovery avoids additional renderer exchanges.
         self._attemptRunAction(
             "close experiment screen",
-            lambda: self.endScreen(clearScreen=False),
+            lambda: self.endScreen(
+                clearScreen=False,
+                resetStencil=not self.state.runFinishedWithError,
+            ),
             errors,
         )
         self._attemptRunAction(
@@ -2544,6 +2573,149 @@ class pglExperiment(pglExperimentBase):
             raise errors[0]
 
         return dataPath
+    
+    ################################################################
+    # initStencil
+    ################################################################
+    def initStencil(self, backgroundColor=None):
+        """
+        Create and select the experiment's stencil.
+
+        Uses plane 1. Enabled circle and polygon regions are combined by union.
+        Coordinates are in visual-angle units. Symbolic x/y values resolve to
+        half the screen width/height in degrees.
+
+        Call after visual-angle setup and after command recording starts.
+        """
+        self._experimentStencilNumber = None
+        
+        # Preserve the caller's clearing behavior for experiment cleanup.
+        self._stencilPreviousDrawQuad = self.pgl.clearScreenDrawQuad
+        self._stencilClearModeChanged = False
+
+        # No selection, or the explicit no-stencil option.
+        presets = getattr(self.settings, "stencil", [])
+        if not presets: return True
+        preset = presets[0]
+        if preset.uuid == "pgl-stencil-none": return True
+
+        # Invalid trait values warn and reset to their defaults.
+        preset.validateSettings()
+
+        # Both shapes disabled means no experiment mask.
+        if not preset.useCircle and not preset.usePolygon: return True
+
+        if backgroundColor is None:
+            backgroundColor = self.settings.backgroundColor
+
+        # Resolve screen-edge symbols in the current visual-angle coordinates.
+        halfWidth = float(self.pgl.screenWidth.deg) / 2
+        halfHeight = float(self.pgl.screenHeight.deg) / 2
+
+        if not all(np.isfinite(value) and value > 0 for value in (halfWidth, halfHeight)):
+            pglMessages.warning("Cannot create stencil without valid visual-angle screen dimensions.")
+            return False
+
+        edgeValues = {
+            "x": halfWidth,
+            "-x": -halfWidth,
+            "y": halfHeight,
+            "-y": -halfHeight,
+        }
+
+        # Prepare all geometry BEFORE changing renderer state.
+        radius = None
+        if preset.useCircle:
+            radius = preset.parseRadius(preset.radius)
+            if radius is None:
+                pglMessages.warning("Could not resolve the stencil circle radius.")
+                return False
+            if isinstance(radius, str): radius = edgeValues[radius]
+
+        polygonTriangles = None
+        if preset.usePolygon:
+            coordinates = preset.parsePolygonCoordinates(preset.polygonCoordinates)
+            if coordinates is None:
+                pglMessages.warning("Could not resolve the stencil polygon coordinates.")
+                return False
+
+            vertices = np.array([
+                [
+                    edgeValues[value] if isinstance(value, str) else value
+                    for value in pair
+                ]
+                for pair in coordinates
+            ], dtype=np.float64)
+
+            polygonTriangles = self.pgl.triangulatePolygon(vertices)
+            if polygonTriangles is None: return False
+
+        # Establish a render-pass boundary before creating the stencil.
+        if self.pgl.stencilSelect(0) is None: return False
+        self.pgl.flush()
+
+        stencilNumber = 1
+        if self.pgl.stencilCreateBegin(stencilNumber) is None: return False
+
+        # Drawing both shapes into the same plane produces their union.
+        if preset.useCircle:
+            self.pgl.circle(
+                radius=radius,
+                x=preset.centerX,
+                y=preset.centerY,
+                numSegments=180,
+                fill=True,
+                color=1,
+            )
+
+        if polygonTriangles is not None:
+            # Geometry was triangulated before stencil creation began.
+            self.pgl.quad(
+                polygonTriangles[:, [0, 1, 2, 0], :],
+                color=1,
+            )
+
+        if self.pgl.stencilCreateEnd() is None: return False
+
+        # Set the actual render-pass background explicitly. Everything
+        # outside the aperture must start black on every frame.
+        if not self.pgl.clearScreen(0, drawQuad=False): return False
+
+        # Track ownership before selecting the experiment mask.
+        self._experimentStencilNumber = stencilNumber
+        if self.pgl.stencilSelect(stencilNumber) is None: return False
+
+        # Existing clearScreen(color) calls now paint through the stencil
+        # without changing the black render-pass background.
+        self.pgl.clearScreenDrawQuad = True
+        self._stencilClearModeChanged = True
+
+        if not self.pgl.clearScreen(backgroundColor): return False
+        self.pgl.flush()
+        return True
+    
+    ################################################################
+    # endStencil
+    ################################################################
+    def endStencil(self):
+        """
+        Disable the experiment stencil and restore its clearing default.
+
+        Does not flush or change the last presented frame.
+        Only call when renderer communication is safe.
+        """
+        if getattr(self, "_experimentStencilNumber", None) is not None:
+            if self.pgl.isOpen():
+                if self.pgl.stencilSelect(0) is None: return False
+
+            self._experimentStencilNumber = None
+
+        # Restore the Python-side default without presenting another frame.
+        if getattr(self, "_stencilClearModeChanged", False):
+            self.pgl.clearScreenDrawQuad = self._stencilPreviousDrawQuad
+            self._stencilClearModeChanged = False
+
+        return True
 
 ##############################################
 # Settings for pglTask
@@ -3880,9 +4052,6 @@ class pglExperimentData(pglTraitSettings):
             last=diffs[-1] if len(diffs) > 0 else None
         )
     
-##############################################
-# State for pglExperiment
-##############################################
 ##############################################
 # State for pglExperiment
 ##############################################
