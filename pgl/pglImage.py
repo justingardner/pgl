@@ -25,7 +25,20 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from contextlib import contextmanager
 import h5py
+from numbers import Integral
+from datetime import datetime, timezone
+from traitlets import Bool
+import hashlib
+import io
+import json
+import os
+import posixpath
+import tempfile
+import uuid
+from pathlib import Path
 
+import numpy as np
+from traitlets import Dict
 
 #############
 # Image class
@@ -388,7 +401,9 @@ class pglStimulusFile(pglTraitSettings):
     caption = Unicode(default_value="", help="Image caption")
     condition = Unicode(default_value="", help="condition")
     conditionNum = Int(allow_none=True, default_value=None, help="conditionNum")
-
+    # Preserve image identity and original provenance across run export/reload.
+    stimulusId = Unicode(default_value="", help="Stable stimulus identifier")
+    sourceInfo = Dict(default_value={}, help="Original stimulus source provenance")
 
 ################################################
 # pglImageFile
@@ -807,6 +822,46 @@ class pglMovieFile(pglStimulusFile):
         ax.axis("off")
 
 ################################################
+# Trial stimulus conventions
+################################################
+blankStimulusNum = -1
+
+
+################################################
+# pglStimulusTrial
+################################################
+class pglStimulusTrial:
+
+    def __init__(self, trialNum, stimulusNum, stimulus=None, metadata=None):
+        '''
+        Represent one planned presentation.
+
+        Trial numbers are zero-based. The initial trial ID equals the trial
+        number; it identifies this presentation, not the underlying image.
+        '''
+        self.trialNum = trialNum
+        self.trialId = trialNum
+        self.stimulusNum = stimulusNum
+        self.stimulus = stimulus
+        self.metadata = {} if metadata is None else dict(metadata)
+        self.status = "pending"
+        self.completedAt = None
+
+    @property
+    def isBlank(self):
+        return self.stimulusNum == blankStimulusNum
+
+    @property
+    def img(self):
+        '''
+        Retrieve an image lazily through the referenced image stimulus.
+
+        Blank trials have no image. For other stimulus types, use stimulus
+        and its corresponding loading interface instead.
+        '''
+        return None if self.isBlank else self.stimulus.img
+    
+################################################
 # pglStimulusDaabase
 ################################################
 class pglStimulusDatabase(pglTraitSettings):
@@ -816,6 +871,9 @@ class pglStimulusDatabase(pglTraitSettings):
     dataPath = Unicode(allow_none=True, default_value="", help="Full path to stimuli", visible=False)
     filesystemPrefix = Unicode(allow_none=True, default_value="", help="Prefix like ssh:// used for accessing filesystem", visible=False)
     stimuli = List(Instance(pglStimulusFile), default_value=[], settingsListKey="name", traitDisplayName="Choose stimulus", hasPlotButton=True, buttonFunction="display", help="List of stimuli in database")
+    # Trial objects are runtime state; explicit run export/reload will handle persistence.
+    trials = List(Instance(pglStimulusTrial), default_value=[], serialize=False, visible=False, help="Ordered trial presentations")
+    _runStarted = Bool(default_value=False, serialize=False, visible=False, help="Whether run tracking has started")
     nStimuli = Int(0, help="Number of stimuli", enable=False)
     
     def __init__(self, dataPath=None, knownFileExtensions=None, filesystem=None, stimulusFileClass=pglStimulusFile):
@@ -977,6 +1035,137 @@ class pglStimulusDatabase(pglTraitSettings):
         '''
         pass
     
+    @property
+    def nTrials(self):
+        return len(self.trials)
+
+    def setTrialOrder(self, imageOrder, metadata=None):
+        '''
+        Set a planned trial sequence without rearranging the stimulus inventory.
+
+        Args:
+            imageOrder: Iterable of zero-based stimulus numbers; -1 means blank.
+            metadata: Optional iterable of dictionaries, one per trial.
+
+        Calling this method replaces the previous trial sequence and resets
+        trial status. Invalid input leaves the existing sequence unchanged.
+        '''
+        # Do not silently discard an unfinished run.
+        if self._runStarted and any(trial.status == "pending" for trial in self.trials):
+            pglMessages.warning("Cannot replace trial order during an unfinished run")
+            return
+        
+        imageOrder = list(imageOrder)
+
+        # Each trial gets its own metadata dictionary, including repeated images.
+        if metadata is None:
+            trialMetadata = [{} for _ in imageOrder]
+        else:
+            trialMetadata = list(metadata)
+            if len(trialMetadata) != len(imageOrder):
+                raise ValueError("metadata must contain one dictionary per trial")
+
+        # Build locally so validation failures do not partially replace trials.
+        trials = []
+        for trialNum, (stimulusNum, trialInfo) in enumerate(zip(imageOrder, trialMetadata)):
+            if isinstance(stimulusNum, bool) or not isinstance(stimulusNum, Integral):
+                raise TypeError(f"Trial {trialNum}: stimulusNum must be an integer, got {stimulusNum!r}")
+
+            stimulusNum = int(stimulusNum)
+            if stimulusNum != blankStimulusNum and not 0 <= stimulusNum < len(self.stimuli):
+                raise ValueError(
+                    f"Trial {trialNum}: stimulusNum={stimulusNum} must be "
+                    f"{blankStimulusNum} or in [0, {len(self.stimuli)})"
+                )
+
+            if not isinstance(trialInfo, dict):
+                raise TypeError(f"Trial {trialNum}: metadata must be a dictionary")
+
+            # Handle the blank sentinel before indexing: -1 must never select an image.
+            stimulus = None if stimulusNum == blankStimulusNum else self.stimuli[stimulusNum]
+            trials.append(pglStimulusTrial(
+                trialNum=trialNum,
+                stimulusNum=stimulusNum,
+                stimulus=stimulus,
+                metadata=trialInfo
+            ))
+
+        self.trials = trials
+        self._runStarted = False
+
+    def getTrial(self, trialNum):
+        '''
+        Return a trial by its zero-based position without advancing progress.
+
+        Retrieving the trial does not load pixels; accessing trial.img does.
+        '''
+        if isinstance(trialNum, bool) or not isinstance(trialNum, Integral):
+            raise TypeError("trialNum must be an integer")
+
+        trialNum = int(trialNum)
+        if not 0 <= trialNum < self.nTrials:
+            raise IndexError(f"trialNum={trialNum} out of range [0, {self.nTrials})")
+
+        return self.trials[trialNum]
+    
+    def startRun(self, reset=False):
+        '''
+        Start or restart tracking the configured trial sequence.
+
+        Restarting clears completion status and timestamps. Warn unless
+        reset=True explicitly acknowledges that progress will be discarded.
+        '''
+        if not self.trials:
+            raise RuntimeError("Set a nonempty trial order before starting a run")
+
+        if self._runStarted and not reset:
+            pglMessages.warning("Restarting trial sequence; previous completion status and timestamps will be cleared")
+
+        for trial in self.trials:
+            trial.status = "pending"
+            trial.completedAt = None
+
+        self._runStarted = True
+        
+    def nextTrial(self):
+        '''
+        Return the first pending trial without advancing or loading its image.
+
+        Return None when the run has no pending trials.
+        '''
+        if not self._runStarted:
+            raise RuntimeError("Call startRun() before requesting the next trial")
+
+        return next((trial for trial in self.trials if trial.status == "pending"), None)
+
+    def completeTrial(self, trialId):
+        '''
+        Complete the current pending trial and record its UTC completion time.
+
+        Reject duplicate, out-of-order, and invalid completion requests.
+        Return the completed trial without loading its image.
+        '''
+        if not self._runStarted:
+            raise RuntimeError("Call startRun() before completing a trial")
+        if isinstance(trialId, bool) or not isinstance(trialId, Integral):
+            raise TypeError("trialId must be an integer")
+
+        trialId = int(trialId)
+        trial = next((trial for trial in self.trials if trial.trialId == trialId), None)
+        if trial is None:
+            raise ValueError(f"Unknown trialId={trialId}")
+        if trial.status != "pending":
+            raise RuntimeError(f"Trial {trialId} is already {trial.status}")
+
+        pendingTrial = self.nextTrial()
+        if trial is not pendingTrial:
+            raise RuntimeError(f"Cannot complete trial {trialId}; next pending trial is {pendingTrial.trialId}")
+
+        # Advancing is implicit: nextTrial() now finds the next pending record.
+        trial.completedAt = datetime.now(timezone.utc).isoformat()
+        trial.status = "completed"
+        return trial    
+    
     def display(self, ax=None):
         ''' 
         display a representation of stimulus database. define in subclass
@@ -1128,6 +1317,405 @@ class pglImageDatabase(pglStimulusDatabase):
 
     def __exit__(self, exceptionType, exceptionValue, traceback):
         self.close()
+        
+    @staticmethod
+    def _manifestJsonDefault(value):
+        '''
+        Convert NumPy values commonly found in trial metadata to JSON values.
+
+        Unsupported objects raise rather than being silently converted to text.
+        '''
+        if isinstance(value, np.ndarray): return value.tolist()
+        if isinstance(value, np.generic): return value.item()
+        raise TypeError(f"Cannot save {type(value).__name__} in stimulus metadata")
+
+    @staticmethod
+    def _writeRunFile(filename, contents):
+        '''
+        Write a local file through a temporary file in the same directory.
+
+        Replacement prevents readers from seeing a partially written file.
+        This is not a transaction covering the entire stimulus bundle.
+        '''
+        filename = Path(filename)
+        filename.parent.mkdir(parents=True, exist_ok=True)
+        temporaryPath = None
+
+        try:
+            with tempfile.NamedTemporaryFile(dir=filename.parent, prefix=".pgl-", delete=False) as fileHandle:
+                temporaryPath = Path(fileHandle.name)
+                fileHandle.write(contents)
+                fileHandle.flush()
+                os.fsync(fileHandle.fileno())
+
+            os.replace(temporaryPath, filename)
+        finally:
+            if temporaryPath is not None and temporaryPath.exists(): temporaryPath.unlink()
+
+    def saveRun(self, taskDirectory):
+        '''
+        Export a self-contained stimulus bundle into a local task directory.
+
+        Save all referenced images, including pending trials. Repeated trials
+        share one stimulus entry and image file. Blank trials have no image.
+
+        Use readable filenames and retain SHA-256 hashes in the manifest.
+        Publish the manifest last; never overwrite an existing image with
+        different contents.
+
+        Return the manifest path. Errors propagate for experiment recovery.
+        '''
+        taskDirectory = Path(taskDirectory).expanduser()
+        bundlePath = taskDirectory / "stimuli"
+        imagePath = bundlePath / "images"
+
+        stimulusRecords = []
+        trialRecords = []
+        referencedStimuli = {}
+
+        # Validate trial references before writing anything.
+        for trialNum, trial in enumerate(self.trials):
+            if trial.trialNum != trialNum:
+                raise ValueError("Trial numbers must match their positions in the sequence")
+            if trial.status not in ("pending", "completed"):
+                raise ValueError(f"Unsupported status for trial {trialNum}: {trial.status}")
+
+            if trial.isBlank:
+                if trial.stimulus is not None:
+                    raise ValueError(f"Blank trial {trialNum} unexpectedly references a stimulus")
+            else:
+                stimulusNum = trial.stimulusNum
+                if not 0 <= stimulusNum < len(self.stimuli):
+                    raise ValueError(f"Trial {trialNum} references an invalid stimulus")
+                if trial.stimulus is not self.stimuli[stimulusNum]:
+                    raise ValueError("Stimulus inventory changed after trial ordering was configured")
+                referencedStimuli[stimulusNum] = trial.stimulus
+
+            trialRecords.append({
+                "trialNum": trial.trialNum,
+                "trialId": trial.trialId,
+                "stimulusNum": trial.stimulusNum,
+                "status": trial.status,
+                "completedAt": trial.completedAt,
+                "metadata": trial.metadata
+            })
+
+        trialIds = [record["trialId"] for record in trialRecords]
+        if len(set(trialIds)) != len(trialIds):
+            raise ValueError("Trial IDs must be unique")
+
+        # Prepare one inventory entry per referenced stimulus.
+        for stimulusNum, stimulus in sorted(referencedStimuli.items()):
+            if not stimulus.stimulusId: stimulus.stimulusId = uuid.uuid4().hex
+
+            sourceInfo = dict(stimulus.sourceInfo)
+            if not sourceInfo:
+                sourceInfo = {
+                    "filename": stimulus.filename,
+                    "filesystemPrefix": stimulus.filesystemPrefix,
+                    "originalStimulusNum": stimulusNum
+                }
+                if isinstance(stimulus, pglImageFileH5):
+                    sourceInfo.update({
+                        "datasetPath": stimulus.datasetPath,
+                        "imageIndex": stimulus.imageIndex,
+                        "imageAxis": stimulus.imageAxis
+                    })
+
+            stimulusRecords.append({
+                "stimulusNum": stimulusNum,
+                "stimulusId": stimulus.stimulusId,
+                "name": stimulus.name,
+                "caption": stimulus.caption,
+                "condition": stimulus.condition,
+                "conditionNum": stimulus.conditionNum,
+                "sourceInfo": sourceInfo
+            })
+
+        stimulusIds = [record["stimulusId"] for record in stimulusRecords]
+        if len(set(stimulusIds)) != len(stimulusIds):
+            raise ValueError("Referenced stimulus inventory contains duplicate stimulus IDs")
+
+        manifest = {
+            "formatName": "pglImageDatabaseRun",
+            "formatVersion": 2,
+            "runStarted": self._runStarted,
+            "stimuli": stimulusRecords,
+            "trials": trialRecords
+        }
+
+        # Validate metadata before reading pixels or writing image files.
+        json.dumps(manifest, default=self._manifestJsonDefault, allow_nan=False)
+        imagePath.mkdir(parents=True, exist_ok=True)
+
+        # Track names case-insensitively for portable exports.
+        existingNames = {filename.name.casefold(): filename for filename in imagePath.iterdir()}
+
+        for record in stimulusRecords:
+            stimulusNum = record["stimulusNum"]
+            stimulus = referencedStimuli[stimulusNum]
+            img = stimulus.img
+
+            if img.mode not in ("L", "RGB", "RGBA"):
+                raise ValueError(f"Cannot export image mode {img.mode!r} losslessly with this exporter")
+
+            with io.BytesIO() as buffer:
+                img.save(buffer, format="PNG")
+                imageBytes = buffer.getvalue()
+
+            imageHash = hashlib.sha256(imageBytes).hexdigest()
+            preferredName = self._getRunImageFilename(stimulus, stimulusNum)
+            imageStem = posixpath.splitext(preferredName)[0]
+            candidateName = preferredName
+            suffix = 2
+
+            # Reuse matching files; preserve differing files with a numeric suffix.
+            while True:
+                existingPath = existingNames.get(candidateName.casefold())
+                if existingPath is None:
+                    filename = imagePath / candidateName
+                    self._writeRunFile(filename, imageBytes)
+                    existingNames[candidateName.casefold()] = filename
+                    break
+
+                if existingPath.is_file() and hashlib.sha256(existingPath.read_bytes()).hexdigest() == imageHash:
+                    filename = existingPath
+                    break
+
+                candidateName = f"{imageStem}_{suffix}.png"
+                suffix += 1
+
+            record.update({
+                "filename": f"images/{filename.name}",
+                "sha256": imageHash,
+                "size": list(img.size),
+                "mode": img.mode
+            })
+
+        # Publish only after all referenced images are available.
+        manifestBytes = (
+            json.dumps(manifest, indent=2, default=self._manifestJsonDefault, allow_nan=False) + "\n"
+        ).encode("utf-8")
+        manifestPath = bundlePath / "manifest.json"
+        self._writeRunFile(manifestPath, manifestBytes)
+
+        pglMessages.message(
+            f"Saved {len(trialRecords)} trials and {len(stimulusRecords)} referenced stimuli to {bundlePath}"
+        )
+        return manifestPath
+
+    @classmethod
+    def fromRun(cls, taskDirectory, filesystem=None, filesystemPrefix=None):
+        '''
+        Load a saved stimulus bundle without accessing the original image source.
+
+        Read the manifest and check image-file existence, but leave image pixels
+        unloaded. Exported stimulus numbers are mapped to a compact local inventory.
+        '''
+        filesystem, taskDirectory, filesystemPrefix = pglStorage.validateFilesystem(
+            filesystem=filesystem,
+            dataPath=str(taskDirectory),
+            filesystemPrefix=filesystemPrefix
+        )
+        if filesystem is None:
+            raise ValueError(f"Could not resolve task directory: {taskDirectory}")
+
+        bundlePath = posixpath.join(taskDirectory, "stimuli")
+        manifestPath = posixpath.join(bundlePath, "manifest.json")
+        with filesystem.open(manifestPath, "rt", encoding="utf-8") as fileHandle:
+            manifest = json.load(fileHandle)
+
+        if not isinstance(manifest, dict):
+            raise ValueError("Stimulus manifest must be a JSON object")
+        if manifest.get("formatName") != "pglImageDatabaseRun" or manifest.get("formatVersion") not in (1, 2):
+            raise ValueError("Unsupported stimulus manifest format or version")
+
+        stimulusRecords = manifest.get("stimuli")
+        trialRecords = manifest.get("trials")
+        runStarted = manifest.get("runStarted")
+        if not isinstance(stimulusRecords, list) or not isinstance(trialRecords, list):
+            raise ValueError("Stimulus manifest must contain stimulus and trial lists")
+        if not isinstance(runStarted, bool):
+            raise ValueError("Manifest runStarted must be Boolean")
+
+        database = cls()
+        database.filesystem = filesystem
+        database.dataPath = bundlePath
+        database.filesystemPrefix = filesystemPrefix
+
+        stimuli = []
+        localNumBySavedNum = {}
+        stimulusIds = set()
+
+        for record in stimulusRecords:
+            savedNum = record["stimulusNum"]
+            if type(savedNum) is not int or savedNum < 0 or savedNum in localNumBySavedNum:
+                raise ValueError(f"Invalid or duplicate saved stimulus number: {savedNum}")
+
+            stimulusId = record["stimulusId"]
+            if not isinstance(stimulusId, str) or not stimulusId or stimulusId in stimulusIds:
+                raise ValueError("Stimulus IDs must be unique nonempty strings")
+            stimulusIds.add(stimulusId)
+
+            # Both versions retain hashes; version 2 permits readable filenames.
+            imageHash = record["sha256"]
+            if not isinstance(imageHash, str) or len(imageHash) != 64 or any(c not in "0123456789abcdef" for c in imageHash):
+                raise ValueError("Invalid image SHA-256")
+
+            relativePath = record["filename"]
+            if not isinstance(relativePath, str):
+                raise ValueError("Exported image path must be a string")
+
+            # Only allow a direct PNG child of images/, never arbitrary paths.
+            pathParts = relativePath.split("/")
+            if (
+                len(pathParts) != 2
+                or pathParts[0] != "images"
+                or not pathParts[1].lower().endswith(".png")
+                or "\\" in relativePath
+                or "\x00" in relativePath
+                or ":" in pathParts[1]
+            ):
+                raise ValueError("Invalid exported image path")
+
+            if manifest["formatVersion"] == 1 and relativePath != f"images/{imageHash}.png":
+                raise ValueError("Invalid version 1 exported image path")
+
+            filename = posixpath.join(bundlePath, relativePath)
+            if not filesystem.isfile(filename):
+                raise FileNotFoundError(f"Exported image is missing: {filename}")
+
+            localNumBySavedNum[savedNum] = len(stimuli)
+            stimuli.append(pglImageFile(
+                name=record["name"],
+                filename=filename,
+                filesystem=filesystem,
+                filesystemPrefix=filesystemPrefix,
+                stimulusId=stimulusId,
+                sourceInfo=record["sourceInfo"],
+                caption=record["caption"],
+                condition=record["condition"],
+                conditionNum=record["conditionNum"]
+            ))
+
+        database.stimuli = stimuli
+        database.nStimuli = len(stimuli)
+
+        imageOrder = []
+        metadata = []
+        trialIds = set()
+
+        for trialNum, record in enumerate(trialRecords):
+            if type(record["trialNum"]) is not int or record["trialNum"] != trialNum:
+                raise ValueError("Saved trial numbers must be consecutive and zero-based")
+
+            trialId = record["trialId"]
+            if type(trialId) is not int or trialId < 0 or trialId in trialIds:
+                raise ValueError("Trial IDs must be unique nonnegative integers")
+            trialIds.add(trialId)
+
+            savedNum = record["stimulusNum"]
+            if type(savedNum) is not int:
+                raise ValueError("Saved stimulus numbers must be integers")
+            if savedNum == blankStimulusNum:
+                imageOrder.append(blankStimulusNum)
+            elif savedNum in localNumBySavedNum:
+                imageOrder.append(localNumBySavedNum[savedNum])
+            else:
+                raise ValueError(f"Trial {trialNum} references an unknown stimulus")
+
+            status = record["status"]
+            completedAt = record["completedAt"]
+            if status not in ("pending", "completed"):
+                raise ValueError(f"Unsupported trial status: {status}")
+            if status == "pending" and completedAt is not None:
+                raise ValueError("Pending trials must not have completion timestamps")
+            if status == "completed":
+                if not runStarted or not isinstance(completedAt, str):
+                    raise ValueError("Completed trials require a started run and completion timestamp")
+                datetime.fromisoformat(completedAt)
+
+            metadata.append(record["metadata"])
+
+        # Restore trial relationships, then restore progress without calling startRun().
+        database.setTrialOrder(imageOrder, metadata=metadata)
+        for trial, record in zip(database.trials, trialRecords):
+            trial.trialId = record["trialId"]
+            trial.status = record["status"]
+            trial.completedAt = record["completedAt"]
+
+        database._runStarted = runStarted
+        return database
+    @staticmethod
+    def _getRunImageFilename(stimulus, stimulusNum):
+        '''
+        Choose a readable PNG filename.
+
+        Keep ordinary image filenames where possible. Container images use
+        their original image index, displayed as a one-based number.
+        '''
+        sourceInfo = stimulus.sourceInfo
+        isContainerImage = isinstance(stimulus, pglImageFileH5) or "datasetPath" in sourceInfo
+
+        if isContainerImage:
+            imageIndex = sourceInfo.get("imageIndex", getattr(stimulus, "imageIndex", stimulusNum))
+            return f"image{imageIndex + 1:04d}.png"
+
+        # For reloaded exports, use original provenance rather than the export path.
+        originalFilename = sourceInfo.get("filename") or stimulus.filename
+        originalName = str(originalFilename).replace("\\", "/").rsplit("/", 1)[-1]
+        imageStem = posixpath.splitext(originalName)[0]
+
+        # Replace characters that are unsuitable for portable filenames.
+        imageStem = "".join(
+            "_" if ord(character) < 32 or character in '<>:"/\\|?*' else character
+            for character in imageStem
+        ).strip(" .")
+
+        if not imageStem: imageStem = f"image{stimulusNum + 1:04d}"
+
+        # Avoid reserved Windows device filenames.
+        reservedNames = {"CON", "PRN", "AUX", "NUL"}
+        reservedNames.update(f"{prefix}{number}" for prefix in ("COM", "LPT") for number in range(1, 10))
+        if imageStem.split(".")[0].upper() in reservedNames: imageStem = f"image_{imageStem}"
+
+        return f"{imageStem}.png"@staticmethod
+    
+    @staticmethod
+    def _getRunImageFilename(stimulus, stimulusNum):
+        '''
+        Choose a readable PNG filename.
+
+        Keep ordinary image filenames where possible. Container images use
+        their original image index, displayed as a one-based number.
+        '''
+        sourceInfo = stimulus.sourceInfo
+        isContainerImage = isinstance(stimulus, pglImageFileH5) or "datasetPath" in sourceInfo
+
+        if isContainerImage:
+            imageIndex = sourceInfo.get("imageIndex", getattr(stimulus, "imageIndex", stimulusNum))
+            return f"image{imageIndex + 1:04d}.png"
+
+        # For reloaded exports, use original provenance rather than the export path.
+        originalFilename = sourceInfo.get("filename") or stimulus.filename
+        originalName = str(originalFilename).replace("\\", "/").rsplit("/", 1)[-1]
+        imageStem = posixpath.splitext(originalName)[0]
+
+        # Replace characters that are unsuitable for portable filenames.
+        imageStem = "".join(
+            "_" if ord(character) < 32 or character in '<>:"/\\|?*' else character
+            for character in imageStem
+        ).strip(" .")
+
+        if not imageStem: imageStem = f"image{stimulusNum + 1:04d}"
+
+        # Avoid reserved Windows device filenames.
+        reservedNames = {"CON", "PRN", "AUX", "NUL"}
+        reservedNames.update(f"{prefix}{number}" for prefix in ("COM", "LPT") for number in range(1, 10))
+        if imageStem.split(".")[0].upper() in reservedNames: imageStem = f"image_{imageStem}"
+
+        return f"{imageStem}.png"
+
 
     def display(self, ax=None):
         '''

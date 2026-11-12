@@ -2023,6 +2023,14 @@ class pglExperiment(pglExperimentBase):
                     errors,
                 )
 
+            # Stimulus export is independent of task JSON and parameter saving.
+            # Failures are recorded, and savePendingData() can retry this step.
+            self._attemptRunAction(
+                f"save task {taskIndex + 1} stimuli",
+                lambda task=task, taskPath=taskPath: task.saveStimuliStrict(taskPath),
+                errors
+            )
+
             # Parameters have their own settings/state/data bundles, including
             # nested parameter bundles and saved random-number-generator state.
             parameterPath = taskPath / "parameters"
@@ -3064,42 +3072,37 @@ class pglTaskBase(pglTraitSettings):
     data = Instance(pglTaskData, allow_none=True, help="Data of task")
     parameters = List(Instance(pglParameter), default_value=[], help="parameters of task")
     
+    # Keep live image caches and HDF5 handles out of task JSON.
+    stimulusDatabase = Instance(f"{__package__}.pglImage.pglStimulusDatabase",allow_none=True,default_value=None,serialize=False,help="Stimulus database associated with this task")
+    
     # Runtime-only location of saved acquisition source. Reading is deferred
     # until printSource() is called; these references are never serialized.
     _taskSourceFilesystem = Instance(fsspec.AbstractFileSystem, allow_none=True, default_value=None).tag(serialize=False)
     _taskSourcePath = Unicode(default_value=None, allow_none=True).tag(serialize=False)
   
     def save(self, dataPath, filesystem=None, filesystemPrefix=None):
-        """Save current task contents, including parameters, through fsspec.
+        '''
+        Save current task contents, parameters, and attached stimuli.
 
-        dataPath is the destination run directory.
-        Does not read or copy original acquisition files.
-        """
+        dataPath is the destination run directory. Stimulus export currently
+        requires a local filesystem; tasks without stimuli retain remote support.
+        Does not read or copy original acquisition source files.
+        '''
         filesystem, dataPath, _ = pglStorage.validateFilesystem(
             filesystem=filesystem,
             dataPath=dataPath,
             filesystemPrefix=filesystemPrefix,
-            create=True,
+            create=True
         )
-
         if filesystem is None:
-            raise ValueError("Could not resolve the task destination filesystem.")
+            raise ValueError("Could not resolve the task destination filesystem")
 
         taskPath = posixpath.join(dataPath, self._getTaskDirectoryName())
         filesystem.makedirs(taskPath, exist_ok=True)
 
-        self.settings.save(
-            filename=posixpath.join(taskPath, "settings.json"),
-            filesystem=filesystem,
-        )
-        self.state.save(
-            filename=posixpath.join(taskPath, "state.json"),
-            filesystem=filesystem,
-        )
-        self.data.save(
-            filename=posixpath.join(taskPath, "data.json"),
-            filesystem=filesystem,
-        )
+        self.settings.save(filename=posixpath.join(taskPath, "settings.json"), filesystem=filesystem)
+        self.state.save(filename=posixpath.join(taskPath, "state.json"), filesystem=filesystem)
+        self.data.save(filename=posixpath.join(taskPath, "data.json"), filesystem=filesystem)
 
         parameterPath = posixpath.join(taskPath, "parameters")
         filesystem.makedirs(parameterPath, exist_ok=True)
@@ -3107,16 +3110,19 @@ class pglTaskBase(pglTraitSettings):
         for parameter in self.parameters:
             parameter.save(dataPath=parameterPath, filesystem=filesystem)
 
-        pglMessages.message(
-            f"Saved task {self.settings.taskName} to {taskPath}"
-        )
+        # Do not serialize the live database; export its portable bundle instead.
+        self.saveStimuliStrict(taskPath, filesystem=filesystem)
+
+        pglMessages.message(f"Saved task {self.settings.taskName} to {taskPath}")
+        return taskPath
 
     def saveBundleStrict(self, dataPath, filesystem=None, filesystemPrefix=None):
-        """Strictly save current task components and parameter bundles.
+        '''
+        Strictly save task components, parameters, and attached stimuli.
 
-        dataPath is the destination run directory.
-        Errors propagate; previously written output may remain.
-        """
+        dataPath is the destination run directory. Errors propagate;
+        previously written output may remain.
+        '''
         components = {}
         for name in ("settings", "state", "data"):
             component = getattr(self, name, None)
@@ -3135,7 +3141,7 @@ class pglTaskBase(pglTraitSettings):
             filesystem=filesystem,
             dataPath=dataPath,
             filesystemPrefix=filesystemPrefix,
-            create=True,
+            create=True
         )
         if filesystem is None: raise ValueError("Could not resolve task destination filesystem")
 
@@ -3151,7 +3157,39 @@ class pglTaskBase(pglTraitSettings):
         for parameter in parameters:
             parameter.saveBundleStrict(dataPath=parameterPath, filesystem=filesystem)
 
+        # Strict export failures propagate to the caller.
+        self.saveStimuliStrict(taskPath, filesystem=filesystem)
         return taskPath
+    
+    def saveStimuliStrict(self, taskPath, filesystem=None, filesystemPrefix=None):
+        '''
+        Export this task's stimulus database into its task directory.
+
+        Tasks without a stimulus database require no export. The current
+        image exporter supports local destinations only; remote destinations
+        raise explicitly rather than being interpreted as local paths.
+
+        Errors propagate so experiment saving can report and retry failures.
+        '''
+        if self.stimulusDatabase is None: return None
+
+        saveRun = getattr(self.stimulusDatabase, "saveRun", None)
+        if not callable(saveRun):
+            raise TypeError("Attached stimulus database does not implement saveRun()")
+
+        filesystem, taskPath, _ = pglStorage.validateFilesystem(
+            filesystem=filesystem,
+            dataPath=str(taskPath),
+            filesystemPrefix=filesystemPrefix
+        )
+        if filesystem is None:
+            raise ValueError("Could not resolve the stimulus export destination")
+
+        from fsspec.implementations.local import LocalFileSystem
+        if not isinstance(filesystem, LocalFileSystem):
+            raise NotImplementedError("Stimulus export currently supports local task directories only")
+
+        return saveRun(taskPath)
 
     def _getTaskDirectoryName(self):
         """Return the directory name used to save this task."""
@@ -3169,16 +3207,19 @@ class pglTaskBase(pglTraitSettings):
     
     @classmethod
     def load(cls, dataPath, filesystem=None):
-        """Load task components and attach deferred access to saved source.
+        '''
+        Load task components, optional stimuli, and deferred source access.
 
-        Source files are not read during loading. printSource() reads and
-        verifies them through the same filesystem when explicitly requested.
-        Older task bundles without source files remain loadable.
-        """
-        pglMessages.message(f"Loading task data from: {dataPath}", messageType='detailed')
+        Stimulus manifests load immediately; image pixels remain lazy-loaded.
+        Older tasks without a stimulus directory remain supported.
+
+        Saved source is never executed. Source text is read only when
+        printSource() is called.
+        '''
+        pglMessages.message(f"Loading task data from: {dataPath}", messageType="detailed")
 
         # Resolve the filesystem and task directory.
-        filesystem, taskPath, _ = pglStorage.validateFilesystem(filesystem, dataPath)
+        filesystem, taskPath, filesystemPrefix = pglStorage.validateFilesystem(filesystem, dataPath)
         if filesystem is None:
             pglMessages.warning(f"Could not resolve task filesystem: {dataPath}")
             return None
@@ -3220,10 +3261,28 @@ class pglTaskBase(pglTraitSettings):
         obj.data = data
         obj.parameters = parameters
 
-        # Keep runtime backing only. Do not capture analysis-class source,
-        # load source eagerly, or execute the saved Python code.
+        # Runtime backing only; do not capture or execute analysis-class source.
         obj._taskSourceFilesystem = filesystem
         obj._taskSourcePath = str(taskPath)
+
+        ################################################################
+        # Restore an optional self-contained stimulus bundle
+        ################################################################
+        stimulusPath = posixpath.join(taskPath, "stimuli")
+        if filesystem.exists(stimulusPath):
+            from .pglImage import pglImageDatabase
+
+            # An incomplete/corrupt bundle is not equivalent to an older task
+            # with no stimulus bundle. Preserve the task data but report failure.
+            try:
+                obj.stimulusDatabase = pglImageDatabase.fromRun(
+                    taskDirectory=taskPath,
+                    filesystem=filesystem,
+                    filesystemPrefix=filesystemPrefix
+                )
+            except Exception as error:
+                pglMessages.warning(f"Could not load task stimuli from {stimulusPath}: {error}")
+                raise
 
         return obj
 
