@@ -1835,10 +1835,14 @@ class _pglTraitsDialog(QDialog):
             # keep the dialog alive on a bad value
             print(f"(pglTraitsDialog:_commit) Could not set {traitName}: {e}")
             
-    def _onOk(self):       
+    def _onOk(self):
+        """Validate edits, reset invalid values to defaults, and accept."""
+        validator = getattr(self.settings, "validateSettings", None)
+        if callable(validator): validator()
+
         self.accepted_ = True
         self.accept()
-
+        
     def _onCancel(self):
         self.accepted_ = False
         self.reject()

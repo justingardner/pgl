@@ -60,6 +60,8 @@ _EXPORTS = {
  'pglSettings': ('.pglSettings', 'pglSettings'),
  'pglImportSettings': ('.pglSettings', 'pglImportSettings'),
  'pglImportSettingsList': ('.pglSettings', 'pglImportSettingsList'),
+ 'pglStencilSettingsList': ('.pglSettings', 'pglStencilSettingsList'),
+ 'pglStencilSettings': ('.pglSettings', 'pglStencilSettings'),
  'pglTraitSettings': ('.pglSettings', 'pglTraitSettings'),
  'pglDatabaseSettings': ('.pglDatabase', 'pglDatabaseSettings'),
  'pglDatabaseSettingsList': ('.pglDatabase', 'pglDatabaseSettingsList'),

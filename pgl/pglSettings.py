@@ -29,6 +29,7 @@ from os.path import exists, join
 from copy import deepcopy
 import getpass
 from traitlets import default
+import ast
 
 
 #######################################
@@ -890,6 +891,101 @@ class pglSettingsManager:
             settings.reloadDisplays(selected=displaySettings, overwrite=True)
 
         return(settings)
+    
+    ################################################################
+    # getStencilSettingsDir
+    ################################################################
+    @classmethod
+    def getStencilSettingsDir(cls):
+        """Get the directory containing saved stencil presets."""
+        stencilDir = cls.getPGLSettingsDir() / "stencils"
+        stencilDir.mkdir(parents=True, exist_ok=True)
+        return stencilDir
+
+    ################################################################
+    # getStencilSettings
+    ################################################################
+    @classmethod
+    def getStencilSettings(cls, stencilName=None):
+        """
+        Load saved stencil presets.
+
+        Args:
+            stencilName (str or None): Load one named preset when supplied;
+                otherwise return all presets.
+
+        Returns:
+            list, pglStencilSettings, or None: All presets, the named preset,
+                or None when a requested preset cannot be loaded.
+        """
+        stencilDir = cls.getStencilSettingsDir()
+
+        # Load one requested preset.
+        if stencilName is not None:
+            filename = stencilDir / f"{pglStorage.makeValidFilename(stencilName)}.json"
+
+            if not filename.is_file():
+                pglMessages.warning(f"Stencil preset '{stencilName}' was not found.")
+                return None
+
+            return pglStencilSettings.load(filename=filename)
+
+        # Load all saved presets. An empty directory returns an empty list.
+        settingsList = []
+        for filename in sorted(stencilDir.glob("*.json")):
+            settings = pglStencilSettings.load(filename=filename)
+
+            if not isinstance(settings, pglStencilSettings):
+                pglMessages.warning(f"Could not load stencil preset from '{filename}'.")
+                continue
+
+            settingsList.append(settings)
+
+        return settingsList
+
+    ################################################################
+    # stencilSettings
+    ################################################################
+    @classmethod
+    def stencilSettings(cls):
+        """Edit named stencil presets using New, Copy, and Delete."""
+        savedSettings = cls.getStencilSettings()
+        original = pglStencilSettingsList(savedSettings)
+
+        # The list editor requires one entry. When no presets exist, its
+        # starter entry is only a draft and should not be saved on Cancel.
+        modified = pglDialogs.traitsDialog(original)
+        if modified is None: return
+
+        # Preset names become filenames. Prevent duplicate destinations
+        # from silently overwriting another preset.
+        filenames = set()
+        for settings in modified.settingsList:
+            filename = pglStorage.makeValidFilename(settings.name)
+
+            if not filename or filename.casefold() == "none":
+                pglMessages.warning(
+                    "Stencil presets need a nonempty filename-compatible name "
+                    "other than 'None'. No presets were saved."
+                )
+                return
+
+            if filename.casefold() in filenames:
+                pglMessages.warning(
+                    f"Stencil preset name '{settings.name}' conflicts with another "
+                    "preset filename. Give each preset a distinct name. "
+                    "No presets were saved."
+                )
+                return
+
+            filenames.add(filename.casefold())
+
+        # If the editor started with a draft, there were no original saved
+        # entries. Mark it as new even if the user accepted it unchanged.
+        if not savedSettings:
+            original.settingsList = []
+
+        cls._saveModifiedSettings(modified, original)
 
 
 ##################################################
@@ -1029,6 +1125,282 @@ class pglTraitSettings(HasTraits, pglSerialize):
         This is an analysis projection, not a serialization method.
         """
         return "unsupported"
+    
+    ################################################################
+    # validateSettings
+    ################################################################
+    def validateSettings(self):
+        """
+        Validate traits using member-function callbacks named in metadata.
+
+        Example:
+            polygonCoordinates = Unicode(
+                "",
+                validate="validatePolygonCoordinates"
+            )
+
+        The callback receives the current value and returns True when valid,
+        False otherwise. Invalid values are reset to their trait defaults.
+
+        Visits all nested settings, including unselected list entries.
+
+        Returns:
+            bool: True if no values needed resetting, False otherwise.
+        """
+        visited = set()
+        allValid = True
+
+        def validateValue(value, path):
+            nonlocal allValid
+
+            # Traverse settings and containers, not arbitrary runtime attributes.
+            if not isinstance(value, (HasTraits, list, tuple, dict)): return
+
+            objectID = id(value)
+            if objectID in visited: return
+            visited.add(objectID)
+
+            if isinstance(value, HasTraits):
+                settingsName = getattr(value, "name", "")
+                objectPath = f"{path} ({settingsName})" if settingsName else path
+
+                # Preserve definition order where available.
+                getOrderedTraits = getattr(value, "_getOrderedTraits", None)
+                traits = getOrderedTraits() if callable(getOrderedTraits) else value.traits()
+
+                for traitName, trait in traits.items():
+                    fieldPath = f"{objectPath}.{traitName}"
+                    callbackName = trait.metadata.get("validate")
+                    traitValue = getattr(value, traitName)
+
+                    if callbackName:
+                        # A missing or failing callback is also a validation
+                        # failure, but must not interrupt the dialog.
+                        try:
+                            callback = getattr(value, callbackName, None)
+                            valid = callable(callback) and bool(callback(traitValue))
+                        except Exception:
+                            valid = False
+
+                        if not valid:
+                            allValid = False
+
+                            try:
+                                # Copy mutable defaults so settings do not share
+                                # lists or nested default objects.
+                                defaultValue = deepcopy(value.trait_defaults(traitName))
+                                setattr(value, traitName, defaultValue)
+                                pglMessages.warning(
+                                    f"{fieldPath}: invalid value; reset to its default."
+                                )
+                            except Exception:
+                                pglMessages.warning(
+                                    f"{fieldPath}: invalid value; could not restore its default."
+                                )
+
+                    # Read again because validation may have reset the trait.
+                    validateValue(getattr(value, traitName), fieldPath)
+
+            elif isinstance(value, dict):
+                for key, child in value.items():
+                    validateValue(child, f"{path}[{key!r}]")
+
+            else:
+                for index, child in enumerate(value):
+                    validateValue(child, f"{path}[{index}]")
+
+        validateValue(self, type(self).__name__)
+        return allValid
+
+##################################################
+# Stencil settings
+##################################################
+class pglStencilSettings(pglTraitSettings):
+
+    name = Unicode("New stencil", help="Name of this stencil preset")
+
+    useCircle = Bool(False, help="Include a filled circle in this stencil")
+    centerX = Float(0.0, help="Circle center x coordinate", validate="validateFiniteNumber")
+    centerY = Float(0.0, help="Circle center y coordinate", validate="validateFiniteNumber")
+    radius = Unicode(
+        "y",
+        help=(
+            "Positive numeric radius, or x for half the screen width, "
+            "or y for half the screen height."
+        ),
+        validate="validateRadius",
+    )
+
+    usePolygon = Bool(False, help="Include a filled polygon in this stencil")
+    polygonCoordinates = Unicode(
+        "[-x,-y], [x,-y], [x,y], [-x,y]",
+        help=(
+            "At least three coordinate pairs, for example: "
+            "[0,1], [2,2], [5,10]. "
+            "Use -x/x for the left/right edges and -y/y for the bottom/top edges. "
+            "An enclosing list is also accepted. "
+            "The polygon closes automatically."
+        ),
+        validate="validatePolygonCoordinates",
+    )
+
+    ################################################################
+    # validateFiniteNumber
+    ################################################################
+    def validateFiniteNumber(self, value): return bool(np.isfinite(value))
+
+    ################################################################
+    # parseRadius
+    ################################################################
+    @staticmethod
+    def parseRadius(value):
+        """
+        Parse a positive numeric radius or the exact tokens x and y.
+
+        Returns:
+            float, str, or None: Positive radius, symbolic token, or None
+                when invalid. Symbols represent screen half-dimensions.
+        """
+        if not isinstance(value, str): return None
+        value = value.strip()
+
+        if value in ("x", "y"): return value
+
+        try:
+            radius = float(value)
+            return radius if np.isfinite(radius) and radius > 0 else None
+        except (ValueError, OverflowError):
+            return None
+
+    ################################################################
+    # validateRadius
+    ################################################################
+    def validateRadius(self, value): return self.parseRadius(value) is not None
+
+    ################################################################
+    # parsePolygonCoordinates
+    ################################################################
+    @staticmethod
+    def parsePolygonCoordinates(value):
+        """
+        Parse polygon text without executing expressions.
+
+        Accepted examples:
+            [0,1], [2,2], [5,10]
+            [[0,1], [2,2], [5,10]]
+            [-x,-y], [x,-y], [x,y], [-x,y]
+
+        Each coordinate must be a finite number or one of:
+            -x, x, -y, y
+
+        Returns:
+            list or None: Pairs containing floats or symbolic strings.
+                Returns None when invalid.
+
+        Checks coordinate structure, not self-intersections or other
+        geometric properties. Symbolic values are resolved at drawing time.
+        """
+        if not isinstance(value, str) or not value.strip(): return None
+
+        def parseCoordinate(node):
+            # Accept numeric literals, but not booleans or quoted strings.
+            if isinstance(node, ast.Constant) and type(node.value) in (int, float):
+                number = float(node.value)
+                return number if np.isfinite(number) else None
+
+            # Accept only the exact symbolic names x and y.
+            if isinstance(node, ast.Name) and node.id in ("x", "y"):
+                return node.id
+
+            # Accept signed numeric literals and the edge tokens -x/-y.
+            if isinstance(node, ast.UnaryOp):
+                if isinstance(node.op, ast.USub):
+                    if isinstance(node.operand, ast.Name) and node.operand.id in ("x", "y"):
+                        return "-" + node.operand.id
+
+                if isinstance(node.op, (ast.USub, ast.UAdd)):
+                    operand = node.operand
+                    if isinstance(operand, ast.Constant) and type(operand.value) in (int, float):
+                        number = float(operand.value)
+                        if isinstance(node.op, ast.USub): number = -number
+                        return number if np.isfinite(number) else None
+
+            # Reject arithmetic, calls, attributes, and all other expressions.
+            return None
+
+        try:
+            # Parse syntax only. Never compile or evaluate this tree.
+            vertices = ast.parse(value.strip(), mode="eval").body
+
+            if not isinstance(vertices, (ast.List, ast.Tuple)) or len(vertices.elts) < 3:
+                return None
+
+            coordinates = []
+            for vertex in vertices.elts:
+                if not isinstance(vertex, (ast.List, ast.Tuple)) or len(vertex.elts) != 2:
+                    return None
+
+                pair = [parseCoordinate(node) for node in vertex.elts]
+                if any(coordinate is None for coordinate in pair): return None
+                coordinates.append(pair)
+
+            return coordinates
+
+        except Exception:
+            return None
+
+    ################################################################
+    # validatePolygonCoordinates
+    ################################################################
+    def validatePolygonCoordinates(self, value):
+        """
+        Allow empty text only when the polygon is disabled.
+
+        Nonempty text is validated even when the polygon is disabled.
+        The general validator warns and restores defaults on failure.
+        """
+        if not isinstance(value, str): return False
+        if not value.strip(): return not self.usePolygon
+        return self.parsePolygonCoordinates(value) is not None
+    
+    ################################################################
+    # save
+    ################################################################
+    def save(self, filename=None, filesystem=None, filesystemPrefix=None):
+        """Save this stencil preset, using its name when no path is supplied."""
+        if filename is None: filename = self.saveDir()
+        return super().save(
+            filename=filename,
+            filesystem=filesystem,
+            filesystemPrefix=filesystemPrefix,
+        )
+
+    ################################################################
+    # saveDir
+    ################################################################
+    def saveDir(self):
+        """Return the JSON path for this named stencil preset."""
+        return pglSettingsManager.getStencilSettingsDir() / f"{pglStorage.makeValidFilename(self.name)}.json"
+
+
+##################################################
+# Stencil settings dialog list
+##################################################
+class pglStencilSettingsList(pglTraitSettings):
+
+    settingsList = List(
+        Instance(pglStencilSettings),
+        buttons=True,
+        settingsListKey="name",
+        traitDisplayName="Choose stencil",
+        help="Add, copy, delete, and edit named stencil presets",
+    )
+
+    def __init__(self, settingsList=None):
+        super().__init__()
+
+        # The existing list editor requires at least one entry.
+        self.settingsList = list(settingsList) if settingsList else [pglStencilSettings()]
 
 ##################################################
 # Import settings
@@ -1635,14 +2007,20 @@ class pglSettings(pglTraitSettings):
     verbose = Bool(False, help="Typically set to False so that only essential messages and warnings are printed during experiment run")
     saveAbortedRunsToTrash = Bool(True, help="When a run is detected as aborted, saves that run into trash of the session directory")
     backgroundColor = List(trait=Float(min=0.0, max=1.0), default_value=[0.5, 0.5, 0.5],minlen=3,maxlen=3,help="Background color as a list of RGB values").tag(isRGB=True)
+    stencil = List(Instance(pglStencilSettings),settingsListKey="name",highlightSelector=False,hideAll=True,traitDisplayName="stencil",help="Stencil preset to use. Edit presets with pgl.stencilSettings(). None disables masking.")
     _digitalIO = List(Instance(pglItem), default_value=[pglItem(name='DATAPixx'),pglItem(name='LabJack')], settingsListKey="name", multiSelect=True, style="dropdown", traitDisplayName="digitalIO", help='Select which devices to use for digital IO',visible=True)
     _devices = List(Instance(pglItem), default_value=[pglItem(name='RESPONSEPixx')], settingsListKey="name", multiSelect=True, style="dropdown", traitDisplayName="devices", help='Select which devices to use for digital IO', visible=True)
     eyetracker = List(Unicode(), default_value=['None', 'Eyelink', 'TRACKPixx'], help="Eyetracker")
     
     def __init__(self, refreshDisplays=True):
         super().__init__()
-        if refreshDisplays: self.reloadDisplays()
-    
+
+        # Keep refreshDisplays=False free of environment discovery.
+        # fromJSONdict() uses this when restoring recorded settings.
+        if refreshDisplays:
+            self.reloadDisplays()
+            self.reloadStencils()
+            
     @property
     def digitalIO(self):
         return [d.name for d in self._digitalIO if d.isSelected]
@@ -1661,6 +2039,7 @@ class pglSettings(pglTraitSettings):
 
         if refresh:
             obj.reloadDisplays()
+            obj.reloadStencils()
             obj.reconcileDefaults('_digitalIO')
             obj.reconcileDefaults('_devices')
             obj.reconcileDefaults('eyetracker')
@@ -1803,6 +2182,67 @@ class pglSettings(pglTraitSettings):
                 self.displays.insert(0, selected)
             else:
                 self.displays.insert(0, selected)
+                
+    ################################################################
+    # Default stencil selection
+    ################################################################
+    @default("stencil")
+    def _defaultStencil(self):
+        # A fixed identity distinguishes the no-stencil option from presets.
+        # Construct a fresh object for each settings instance.
+        return [
+            pglStencilSettings(
+                name="None",
+                uuid="pgl-stencil-none",
+                useCircle=False,
+                usePolygon=False,
+            )
+        ]
+
+    ################################################################
+    # reloadStencils
+    ################################################################
+    def reloadStencils(self):
+        """
+        Refresh available stencil presets while preserving the selection.
+
+        Match by UUID so renaming a preset preserves its selection.
+        If a selected preset was deleted, retain its saved definition rather
+        than silently removing the experiment's mask.
+        """
+        # Preserve the currently selected preset.
+        selected = self.stencil[0] if self.stencil else None
+
+        # Build a fresh no-stencil option and load current saved presets.
+        noneStencil = self._defaultStencil()[0]
+        available = [noneStencil] + pglSettingsManager.getStencilSettings()
+
+        if selected is None:
+            self.stencil = available
+            return
+
+        # Refresh the selected definition from disk when it still exists.
+        matchingIndex = next(
+            (
+                index
+                for index, preset in enumerate(available)
+                if preset.uuid == selected.uuid
+            ),
+            None,
+        )
+
+        if matchingIndex is not None:
+            available.insert(0, available.pop(matchingIndex))
+        else:
+            # Keep the recorded definition available if its source was removed.
+            available.insert(0, selected)
+            pglMessages.warning(
+                f"Stencil preset '{selected.name}' is no longer in the preset "
+                "directory. Keeping its saved definition in these settings."
+            )
+
+        # Selected-first order is the dialog's existing selection convention.
+        self.stencil = available
                         
 class pglSettingsList(pglTraitSettings):
 
