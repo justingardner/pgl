@@ -404,6 +404,8 @@ class pglStimulusFile(pglTraitSettings):
     # Preserve image identity and original provenance across run export/reload.
     stimulusId = Unicode(default_value="", help="Stable stimulus identifier")
     sourceInfo = Dict(default_value={}, help="Original stimulus source provenance")
+    # Complete image-level manifest row, separate from presentation-specific metadata.
+    metadata = Dict(default_value={}, help="Complete stimulus manifest metadata")
 
 ################################################
 # pglImageFile
@@ -909,94 +911,130 @@ class pglStimulusDatabase(pglTraitSettings):
             pglMessages.message(f"Found {self.nStimuli} stimulus files in {dataPath}")
 
     def useManifest(self, filenameColumn="filename", indexColumn="index", captionColumn=None, conditionColumn=None, conditionNumColumn=None):
-        """
-        Load stimulus ordering and optional metadata from a CSV manifest.
+        '''
+        Load image ordering and complete image metadata from a CSV manifest.
 
-        The manifest must contain filenameColumn and indexColumn. Optional
-        caption, condition, and conditionNum columns are copied onto each
-        stimulus object.
-        """
+        Every CSV column is retained in stimulus.metadata, including filename
+        and index. Optional columns also populate the existing convenience
+        fields: caption, condition, and conditionNum.
 
-        # Filenames of stimuli that were actually loaded
-        filenames = [stimulus.name for stimulus in self.stimuli]
-
-        # Find a CSV manifest
-        self.manifest = None
-        
-        csvFilenames=self.filesystem.glob(os.path.join(self.dataPath, "*.csv"))
-        if len(csvFilenames) == 0:
-            pglMessages.warning(f"Could not find a manifest in {self.dataPath}. Must be a file with .csv extension")
-            return
-        elif len(csvFilenames) > 1:
-            pglMessages.warning(f"Found multiple manifests in {self.dataPath}. Must be ONLY ONE file with .csv extension")
+        Call before setTrialOrder(), because this method sorts the inventory.
+        Invalid input leaves the existing inventory and metadata unchanged.
+        '''
+        # Reordering would invalidate the numeric references already assigned to trials.
+        if self.trials:
+            pglMessages.warning("Load the image manifest before setting trial order; existing trials were left unchanged")
             return
 
-        for csvFilename in csvFilenames:
-            try:
-                with self.filesystem.open(csvFilename) as f:
-                    dataFrame = pd.read_csv(f)
+        if self.filesystem is None or not self.dataPath:
+            pglMessages.warning("Cannot load an image manifest without a filesystem and dataPath")
+            return
 
-                # Check required columns
-                if filenameColumn not in dataFrame.columns or indexColumn not in dataFrame.columns:
-                    pglMessages.message(
-                        f"Could not find {filenameColumn} and/or {indexColumn} "
-                        f"in {csvFilename}. Using alphabetical sort order"
-                    )
-                    return
+        # This method handles directory-backed CSV manifests, not container trial order.
+        if not self.filesystem.isdir(self.dataPath):
+            pglMessages.warning("useManifest() requires an image directory containing one CSV manifest")
+            return
 
-                # Make sure the manifest contains exactly the loaded stimuli
-                manifestFilenames = dataFrame[filenameColumn]
+        csvFilenames = self.filesystem.glob(os.path.join(self.dataPath, "*.csv"))
+        if len(csvFilenames) != 1:
+            pglMessages.warning(
+                f"Expected exactly one CSV manifest in {self.dataPath}; found {len(csvFilenames)}"
+            )
+            return
 
-                if set(manifestFilenames) != set(filenames):
-                    pglMessages.message(
-                        f"Manifest {csvFilename} does not contain exactly the "
-                        f"loaded stimulus files. Using alphabetical sort order"
-                    )
-                    return
+        csvFilename = csvFilenames[0]
 
-                # Keep the manifest
-                self.manifest = dataFrame
+        try:
+            # Preserve filename strings, including numeric-looking names.
+            with self.filesystem.open(csvFilename, "rb") as fileHandle:
+                dataFrame = pd.read_csv(fileHandle, dtype={filenameColumn: str})
 
-                # Sort stimuli according to the manifest index
-                indexByFilename = dict(
-                    zip(manifestFilenames, dataFrame[indexColumn])
-                )
+            requiredColumns = [filenameColumn, indexColumn]
+            requiredColumns.extend(
+                column for column in (captionColumn, conditionColumn, conditionNumColumn)
+                if column is not None
+            )
+            missingColumns = [column for column in requiredColumns if column not in dataFrame.columns]
+            if missingColumns:
+                raise ValueError(f"Missing manifest columns: {missingColumns}")
 
-                self.stimuli.sort(
-                    key=lambda stimulus: indexByFilename[stimulus.name]
-                )
+            filenames = [stimulus.name for stimulus in self.stimuli]
+            manifestFilenames = dataFrame[filenameColumn]
 
-                # Create lookup table by filename
-                manifestByFilename = dataFrame.set_index(filenameColumn)
+            # A unique manifest row must correspond to each unique stimulus name.
+            if len(set(filenames)) != len(filenames):
+                raise ValueError("Loaded stimulus names are not unique")
+            if manifestFilenames.isna().any() or manifestFilenames.duplicated().any():
+                raise ValueError("Manifest filenames must be present and unique")
+            if set(manifestFilenames) != set(filenames):
+                raise ValueError("Manifest must contain exactly the loaded stimulus filenames")
+            if dataFrame[indexColumn].isna().any():
+                raise ValueError("Manifest ordering indices must not be missing")
 
-                # Copy optional metadata onto each stimulus
-                for stimulus in self.stimuli:
-                    row = manifestByFilename.loc[stimulus.name]
+            # Convert each parsed row to plain scalar values suitable for JSON.
+            # to_dict('records') avoids the cross-column coercion of iterrows().
+            metadataByFilename = {}
+            for row in dataFrame.to_dict(orient="records"):
+                metadata = {}
+                for key, value in row.items():
+                    if pd.isna(value):
+                        value = None
+                    elif isinstance(value, np.generic):
+                        value = value.item()
+                    metadata[key] = value
 
-                    if captionColumn is not None:
-                        stimulus.caption = row[captionColumn]
+                metadataByFilename[metadata[filenameColumn]] = metadata
 
-                    if conditionColumn is not None:
-                        stimulus.condition = row[conditionColumn]
+            # Prepare convenience fields and validate them before changing objects.
+            preparedUpdates = []
+            for stimulus in self.stimuli:
+                metadata = metadataByFilename[stimulus.name]
+                convenienceFields = {}
 
-                    if conditionNumColumn is not None:
-                        value = row[conditionNumColumn]
-                        stimulus.conditionNum = (
-                            None if pd.isna(value) else int(value)
-                        )
+                if captionColumn is not None:
+                    value = metadata[captionColumn]
+                    convenienceFields["caption"] = "" if value is None else str(value)
 
-                pglMessages.message(
-                    f"Sorted and loaded stimulus metadata from "
-                    f"{os.path.basename(csvFilename)}"
-                )
+                if conditionColumn is not None:
+                    value = metadata[conditionColumn]
+                    convenienceFields["condition"] = "" if value is None else str(value)
 
-                return
+                if conditionNumColumn is not None:
+                    value = metadata[conditionNumColumn]
+                    if value is None:
+                        convenienceFields["conditionNum"] = None
+                    else:
+                        conditionNum = int(value)
+                        if not isinstance(value, str) and conditionNum != value:
+                            raise ValueError(f"Noninteger condition number for {stimulus.name}: {value}")
+                        convenienceFields["conditionNum"] = conditionNum
 
-            except Exception as e:
-                pglMessages.warning(
-                    f"Error loading manifest {csvFilename}: {e}",
-                    level=1
-                )   
+                preparedUpdates.append((stimulus, metadata, convenienceFields))
+
+            # Calculate ordering before committing metadata or inventory changes.
+            sortedStimuli = sorted(
+                self.stimuli,
+                key=lambda stimulus: metadataByFilename[stimulus.name][indexColumn]
+            )
+
+        except Exception as error:
+            pglMessages.warning(f"Could not load manifest {csvFilename}: {error}", level=1)
+            return
+
+        # Commit only after parsing and validation have succeeded.
+        for stimulus, metadata, convenienceFields in preparedUpdates:
+            stimulus.metadata = metadata
+            for fieldName, value in convenienceFields.items():
+                setattr(stimulus, fieldName, value)
+
+        self.stimuli = sortedStimuli
+        self.nStimuli = len(sortedStimuli)
+        self.manifest = dataFrame
+
+        pglMessages.message(
+            f"Sorted {self.nStimuli} stimuli and retained all {len(dataFrame.columns)} "
+            f"manifest columns from {os.path.basename(csvFilename)}"
+        )
 
     def validateStimulusNum(self, stimulusNum):
         '''
@@ -1426,6 +1464,7 @@ class pglImageDatabase(pglStimulusDatabase):
                 "stimulusNum": stimulusNum,
                 "stimulusId": stimulus.stimulusId,
                 "name": stimulus.name,
+                "metadata": dict(stimulus.metadata),
                 "caption": stimulus.caption,
                 "condition": stimulus.condition,
                 "conditionNum": stimulus.conditionNum,
@@ -1588,6 +1627,7 @@ class pglImageDatabase(pglStimulusDatabase):
             localNumBySavedNum[savedNum] = len(stimuli)
             stimuli.append(pglImageFile(
                 name=record["name"],
+                metadata=record.get("metadata", {}),
                 filename=filename,
                 filesystem=filesystem,
                 filesystemPrefix=filesystemPrefix,
