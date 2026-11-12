@@ -23,6 +23,8 @@ import pandas as pd
 import imageio.v2 as imageio
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
+from contextlib import contextmanager
+import h5py
 
 
 #############
@@ -480,7 +482,261 @@ class pglImageFile(pglStimulusFile):
         ax.set_title(repr(self))
         ax.axis("off")
         return ax
+
+################################################
+# pglHdf5Source
+################################################
+class pglH5Source:
+
+    def __init__(self, filename, filesystem=None, filesystemPrefix=""):
+        '''
+        Own a shared filesystem stream and HDF5 handle.
+
+        Opening is lazy. After close(), a subsequent open() reopens the source.
+        Live source objects must not be shared across worker processes.
+        '''
+        self.filename = filename
+        self.filesystem = filesystem
+        self.filesystemPrefix = filesystemPrefix
+        self._fileHandle = None
+        self._hdfFile = None
+
+    @property
+    def isOpen(self):
+        '''Whether this source currently owns an open HDF5 handle.'''
+        return self._hdfFile is not None and bool(self._hdfFile.id.valid)
+
+    def open(self):
+        '''
+        Return the shared HDF5 handle, opening it only when necessary.
+
+        Callers borrow this handle; only the source owner should close it.
+        '''
+        if self.isOpen: return self._hdfFile
+
+        # Clear any stale resources before opening a new stream.
+        self.close()
+        filesystem, filename, _ = pglStorage.validateFilesystem(
+            filesystem=self.filesystem,
+            dataPath=self.filename,
+            filesystemPrefix=self.filesystemPrefix
+        )
+        if filesystem is None: raise ValueError(f"Could not resolve HDF5 file: {self.filename}")
+
+        fileHandle = filesystem.open(filename, "rb")
+        try:
+            hdfFile = h5py.File(fileHandle, "r")
+        except Exception:
+            # A failed HDF5 open must not leave the filesystem stream open.
+            fileHandle.close()
+            raise
+
+        self._fileHandle = fileHandle
+        self._hdfFile = hdfFile
+        return self._hdfFile
+
+    def close(self):
+        '''
+        Release both handles in the required order.
+
+        Safe to call repeatedly. Already loaded PIL images remain usable.
+        '''
+        hdfFile, fileHandle = self._hdfFile, self._fileHandle
+        self._hdfFile = None
+        self._fileHandle = None
+
+        try:
+            if hdfFile is not None: hdfFile.close()
+        finally:
+            if fileHandle is not None: fileHandle.close()
+
+    def __enter__(self):
+        self.open()
+        return self
+
+    def __exit__(self, exceptionType, exceptionValue, traceback):
+        self.close()
+
+################################################
+# pglImageFileH5
+################################################
+class pglImageFileH5(pglImageFile):
+
+    # Identify one image inside an HDF5 dataset.
+    datasetPath = Unicode(default_value="", help="Dataset path inside the HDF5 file")
+    imageIndex = Int(default_value=0, min=0, help="Zero-based image index inside the dataset")
+    imageAxis = Int(default_value=0, min=0, help="Dataset axis that indexes images")
+    # Optional shared runtime source; retain existing locator fields for serialization.
+    source = Instance(pglH5Source, allow_none=True, default_value=None, serialize=False, visible=False, help="Shared HDF5 source")
     
+    @contextmanager
+    def _openDataset(self):
+        '''
+        Borrow a dataset from a shared source, or open a temporary source.
+
+        Shared handles remain open between image reads. Standalone images
+        retain per-operation cleanup. Dataset handles must not escape this
+        context; read pixels into memory before returning.
+        '''
+        if not self.datasetPath: raise ValueError("datasetPath must identify an HDF5 image dataset")
+
+        # A standalone image owns its temporary source; shared images do not.
+        ownsSource = self.source is None
+        source = self.source if self.source is not None else pglH5Source(
+            filename=self.filename,
+            filesystem=self.filesystem,
+            filesystemPrefix=self.filesystemPrefix
+        )
+
+        try:
+            hdfFile = source.open()
+            if self.datasetPath not in hdfFile:
+                raise KeyError(f"Dataset '{self.datasetPath}' not found in {source.filename}")
+
+            dataset = hdfFile[self.datasetPath]
+            if not isinstance(dataset, h5py.Dataset):
+                raise TypeError(f"'{self.datasetPath}' is not an HDF5 dataset")
+
+            yield dataset
+        finally:
+            # Only the owner closes a shared source, not individual images.
+            if ownsSource: source.close()
+
+    def _getImageMetadata(self, dataset):
+        '''
+        Validate the default layout and return PIL-compatible size and mode.
+
+        Removing imageAxis must leave (height, width), (height, width, 3),
+        or (height, width, 4). Subclasses can override this layout hook.
+        '''
+        if self.imageAxis >= dataset.ndim:
+            raise ValueError(f"imageAxis={self.imageAxis} is invalid for dataset shape {dataset.shape}")
+
+        nImages = dataset.shape[self.imageAxis]
+        if not 0 <= self.imageIndex < nImages:
+            raise IndexError(f"imageIndex={self.imageIndex} out of range [0, {nImages})")
+
+        # Inspect shape and dtype only; do not read image pixels.
+        imageShape = dataset.shape[:self.imageAxis] + dataset.shape[self.imageAxis + 1:]
+        if dataset.dtype.name != "uint8":
+            raise TypeError(f"Default HDF5 image loading requires uint8 data, got {dataset.dtype}")
+
+        if len(imageShape) == 2:
+            mode = "L"
+        elif len(imageShape) == 3 and imageShape[2] in (3, 4):
+            mode = "RGB" if imageShape[2] == 3 else "RGBA"
+        else:
+            raise ValueError(f"Unsupported image shape {imageShape}; expected (H, W), (H, W, 3), or (H, W, 4)")
+
+        if any(dimension == 0 for dimension in imageShape):
+            raise ValueError(f"Image dimensions must be nonzero, got {imageShape}")
+
+        # PIL reports size as (width, height), not array order.
+        return (imageShape[1], imageShape[0]), mode
+
+    def _readImage(self, dataset):
+        '''
+        Read only the selected image.
+
+        Subclasses can override this hook for axis reordering or decoding.
+        '''
+        selection = [slice(None)] * dataset.ndim
+        selection[self.imageAxis] = self.imageIndex
+        return dataset[tuple(selection)]
+
+    def _loadMetadata(self):
+        '''Cache image metadata without loading image pixels.'''
+        pglMessages.message(f"Loading HDF5 image metadata: {self.filename}:{self.datasetPath}[{self.imageIndex}]")
+
+        with self._openDataset() as dataset:
+            size, mode = self._getImageMetadata(dataset)
+
+        self._size = size
+        self._mode = mode
+        self._format = "HDF5"
+
+    def _loadImage(self):
+        '''Read one image and cache it as a PIL image, matching pglImageFile.'''
+        pglMessages.message(f"Loading HDF5 image: {self.filename}:{self.datasetPath}[{self.imageIndex}]")
+
+        with self._openDataset() as dataset:
+            size, mode = self._getImageMetadata(dataset)
+            imageData = self._readImage(dataset)
+
+        # imageData is now in memory and independent of the closed HDF5 file.
+        img = Image.fromarray(imageData)
+        if img.size != size or img.mode != mode:
+            raise ValueError(f"Decoded image does not match expected size={size}, mode={mode}")
+
+        self._img = img
+        self._size = img.size
+        self._mode = img.mode
+        self._format = "HDF5"
+
+    def __repr__(self):
+        return f"{os.path.basename(self.filename)}:{self.datasetPath}[{self.imageIndex}] {self.size[0]}x{self.size[1]} {self.mode}"
+
+
+################################################
+# pglImageFileNSD-mini
+################################################
+class pglImageFileNSDMini(pglImageFileH5):
+
+    # NSDmini stores images in this dataset by default.
+    datasetPath = Unicode(default_value="imgBrick", help="NSDmini image dataset path")
+
+    def _getImageMetadata(self, dataset):
+        '''
+        Validate NSDmini's (image, height, width, RGB channel) layout.
+
+        Do not hardcode image count or spatial dimensions.
+        '''
+        if self.imageAxis != 0:
+            raise ValueError("NSDmini images must use imageAxis=0")
+
+        if dataset.ndim != 4 or dataset.shape[-1] != 3:
+            raise ValueError(f"Expected NSDmini dataset shape (N, H, W, 3), got {dataset.shape}")
+
+        return super()._getImageMetadata(dataset)
+    
+    @classmethod
+    def discoverImages(cls, source, datasetPath=None):
+        '''
+        Create unloaded image objects sharing one HDF5 source.
+
+        The selected class supplies dataset defaults and layout validation.
+        The caller owns the source and is responsible for closing it.
+        '''
+        imageSettings = {
+            "filename": source.filename,
+            "filesystem": source.filesystem,
+            "filesystemPrefix": source.filesystemPrefix,
+            "source": source
+        }
+        if datasetPath is not None: imageSettings["datasetPath"] = datasetPath
+
+        # Use a temporary image object to apply this class's format knowledge.
+        probe = cls(imageIndex=0, **imageSettings)
+        with probe._openDataset() as dataset:
+            # Validate the layout and first image without loading pixels.
+            # Empty datasets are rejected because they contain no valid first image.
+            probe._getImageMetadata(dataset)
+            nImages = dataset.shape[probe.imageAxis]
+
+        # Stable names and source indices are independent of later trial ordering.
+        namePrefix = probe.datasetPath.strip("/").replace("/", "_")
+        indexWidth = max(4, len(str(nImages - 1)))
+
+        return [
+            cls(
+                name=f"{namePrefix}_{imageIndex:0{indexWidth}d}",
+                imageIndex=imageIndex,
+                **imageSettings
+            )
+            for imageIndex in range(nImages)
+        ]
+
+
 ################################################
 # pglMovieFile
 ################################################
@@ -769,46 +1025,113 @@ class pglMovieDatabase(pglStimulusDatabase):
         self.stimuli[stimulusNum].display(ax=ax)
 
 ############################################
-# pglImageDatabse
+# pglImageDatabase
 ############################################
 class pglImageDatabase(pglStimulusDatabase):
-    def __init__(self, dataPath=None, filesystem=None):
-        '''
-        Initialize an image database
-        '''
-        # get known image extensions
-        Image.init()
-        imageExtensions = set(Image.registered_extensions().keys())
-            
-        # call super
-        super().__init__(dataPath=dataPath, knownFileExtensions=imageExtensions, filesystem=filesystem, stimulusFileClass=pglImageFile)
 
-    def preload(self,stimulusNum=None):
+    # Runtime resource only; open handles must never be serialized.
+    _h5Source = Instance(pglH5Source, allow_none=True, default_value=None, serialize=False, visible=False, help="Shared HDF5 source")
+
+    def __init__(self, dataPath=None, filesystem=None, stimulusFileClass=None, datasetPath=None):
         '''
-        preloadImage from database. This will preload the image into memory
+        Initialize from an image directory or an HDF5 container.
+
+        Directories retain the existing behavior. For HDF5 containers, select
+        an HDF5 image class; format-specific subclasses supply sensible defaults.
+        '''
+        if stimulusFileClass is None: stimulusFileClass = pglImageFile
+        if not issubclass(stimulusFileClass, pglImageFile):
+            raise TypeError("stimulusFileClass must inherit from pglImageFile")
+
+        # Preserve construction of an empty database.
+        if not dataPath:
+            super().__init__()
+            return
+
+        isH5Class = issubclass(stimulusFileClass, pglImageFileH5)
+
+        if not isH5Class:
+            if datasetPath is not None:
+                raise ValueError("datasetPath requires an HDF5 image class")
+
+            # Preserve ordinary image-directory discovery and alphabetical ordering.
+            Image.init()
+            imageExtensions = set(Image.registered_extensions().keys())
+            super().__init__(
+                dataPath=dataPath,
+                knownFileExtensions=imageExtensions,
+                filesystem=filesystem,
+                stimulusFileClass=stimulusFileClass
+            )
+            return
+
+        # Initialize without invoking directory discovery for a container file.
+        super().__init__()
+        self.filesystem, self.dataPath, self.filesystemPrefix = pglStorage.validateFilesystem(
+            filesystem=filesystem,
+            dataPath=dataPath
+        )
+        if self.filesystem is None:
+            raise ValueError(f"Could not resolve HDF5 path: {dataPath}")
+        if not self.filesystem.isfile(self.dataPath):
+            raise ValueError(f"Expected an HDF5 container file: {dataPath}")
+
+        source = pglH5Source(
+            filename=self.dataPath,
+            filesystem=self.filesystem,
+            filesystemPrefix=self.filesystemPrefix
+        )
+
+        try:
+            # Discovery reads metadata only; all images share this source.
+            stimuli = stimulusFileClass.discoverImages(source, datasetPath=datasetPath)
+            self.stimuli = stimuli
+            self.nStimuli = len(stimuli)
+            self._h5Source = source
+        except Exception:
+            # Constructor failures must not leak the shared file handles.
+            source.close()
+            raise
+
+        # Keep dataset index order rather than applying directory-style sorting.
+        pglMessages.message(f"Found {self.nStimuli} images in {dataPath}")
+
+    def preload(self, stimulusNum=None):
+        '''
+        Preload one image, or all images when stimulusNum is omitted.
         '''
         if stimulusNum is None:
-            for stimulusNum in range(self.nStimuli):
-                self.preload(stimulusNum)
+            for stimulusNum in range(self.nStimuli): self.preload(stimulusNum)
             return
 
         if not self.validateStimulusNum(stimulusNum): return
         return self.stimuli[stimulusNum].img
-        
-    def get(self,stimulusNum):
+
+    def get(self, stimulusNum):
         '''
-        get image stimulus from database.
-        
-        Args:
-            stimulusNum (int): number of stimulus to get
+        Get a PIL image by its zero-based database stimulus number.
         '''
         if not self.validateStimulusNum(stimulusNum): return
-        return(self.stimuli[stimulusNum].img)
-    
+        return self.stimuli[stimulusNum].img
+
+    def close(self):
+        '''
+        Close the shared source without clearing cached images.
+
+        Accessing an uncached image later will reopen the source.
+        Directory-backed databases have no persistent source to close.
+        '''
+        if self._h5Source is not None: self._h5Source.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exceptionType, exceptionValue, traceback):
+        self.close()
+
     def display(self, ax=None):
-        ''' 
-        display a representation of stimulus at top of stimulus list. define in subclass
+        '''
+        Display a representation of the database; not implemented yet.
         '''
         pass
-    
 
