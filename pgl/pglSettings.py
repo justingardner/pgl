@@ -1220,8 +1220,8 @@ class pglStencilSettings(pglTraitSettings):
     name = Unicode("New stencil", help="Name of this stencil preset")
 
     useCircle = Bool(False, help="Include a filled circle in this stencil")
-    centerX = Float(0.0, help="Circle center x coordinate", validate="validateFiniteNumber")
-    centerY = Float(0.0, help="Circle center y coordinate", validate="validateFiniteNumber")
+    centerX = Float(0.0, help="Circle center x coordinate", validate="validateFiniteNumber", contingentOn="useCircle",)
+    centerY = Float(0.0, help="Circle center y coordinate", validate="validateFiniteNumber", contingentOn="useCircle",)
     radius = Unicode(
         "y",
         help=(
@@ -1229,6 +1229,7 @@ class pglStencilSettings(pglTraitSettings):
             "or y for half the screen height."
         ),
         validate="validateRadius",
+        contingentOn="useCircle",
     )
 
     usePolygon = Bool(False, help="Include a filled polygon in this stencil")
@@ -1242,6 +1243,7 @@ class pglStencilSettings(pglTraitSettings):
             "The polygon closes automatically."
         ),
         validate="validatePolygonCoordinates",
+        contingentOn="usePolygon",
     )
     
     useExcludePolygon = Bool(
@@ -1250,7 +1252,7 @@ class pglStencilSettings(pglTraitSettings):
     )
 
     excludePolygonCoordinates = Unicode(
-        "[-1,-1], [1,-1], [1,1], [-1,1]",
+        "[-x,-y], [x,-y], [x,y], [-x,y]",
         help=(
             "Polygon to remove from the aperture, in visual-angle units. "
             "Use coordinate pairs such as [-1,-1], [1,-1], [1,1], [-1,1]. "
@@ -1259,6 +1261,7 @@ class pglStencilSettings(pglTraitSettings):
             "from the full screen."
         ),
         validate="validateExcludePolygonCoordinates",
+        contingentOn="useExcludePolygon",
     )
     
     ################################################################

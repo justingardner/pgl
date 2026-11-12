@@ -82,6 +82,10 @@ class _pglTraitsDialog(QDialog):
 
             # maps traitName -> {'widget', 'row', 'label'} for the trait API
             self.traitWidgets = {}
+            
+            # Fields whose enabled state depends on another Boolean trait.
+            self._contingentFields = []
+            self._contingentWarnings = set()
 
             # keep track of whether we are pushing values into widgets so that
             # we do not create feedback loops when the trait observer fires
@@ -391,7 +395,24 @@ class _pglTraitsDialog(QDialog):
 
         # Enum
         elif isinstance(trait, Enum):
-            self._addEnum(traitName, trait, current, helpText, settingsObject, layout, settingsKey)        
+            self._addEnum(traitName, trait, current, helpText, settingsObject, layout, settingsKey)    
+            
+        # Register optional Boolean dependencies after the widget exists.
+        if trait.metadata.get("contingentOn"):
+            key = settingsKey if settingsKey is not None else ("root",)
+            entry = self.traitWidgets.get(key, {}).get(traitName)
+
+            # Some composite controls register their outer row at root.
+            if entry is None:
+                entry = self.traitWidgets.get(("root",), {}).get(traitName)
+
+            if entry is not None:
+                self._contingentFields.append({
+                    "owner": settingsObject,
+                    "traitName": traitName,
+                    "widget": entry["row"],
+                })
+                self._refreshContingencies()    
     #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
     # ----- Multi-select list -----
     #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
@@ -461,6 +482,9 @@ class _pglTraitsDialog(QDialog):
                 
             finally:
                 self._updatingWidget = False
+
+                # Proxies now point at the newly displayed settings objects.
+                self._refreshContingencies()
 
         # Give a row the highlighted / non-highlighted look
         #------------------------------
@@ -830,6 +854,9 @@ class _pglTraitsDialog(QDialog):
 
             finally:
                 self._updatingWidget = False
+
+                # Proxies now point at the newly displayed settings objects.
+                self._refreshContingencies()
 
         # set visible turns on off the settings list and all its children and buttons
         #------------------------------
@@ -1824,16 +1851,23 @@ class _pglTraitsDialog(QDialog):
         """Push a widget change into the settings copy."""
         try:
             writeName = traitName
-            # look up property= metadata if the object exposes traits
+
+            # Look up property metadata if the object exposes traits.
             try:
                 trait = settingsObject.trait(traitName)
                 writeName = trait.metadata.get("property", traitName)
             except Exception:
                 pass
+
             setattr(settingsObject, writeName, value)
-        except Exception as e:
-            # keep the dialog alive on a bad value
-            print(f"(pglTraitsDialog:_commit) Could not set {traitName}: {e}")
+
+        except Exception as error:
+            # Keep the dialog alive on a bad value.
+            print(f"(pglTraitsDialog:_commit) Could not set {traitName}: {error}")
+
+        finally:
+            # Checkbox changes immediately update dependent fields.
+            self._refreshContingencies()
             
     def _onOk(self):
         """Validate edits, reset invalid values to defaults, and accept."""
@@ -2124,6 +2158,60 @@ class _pglTraitsDialog(QDialog):
         self.raise_()
         self.activateWindow()
 
+
+    ################################################################
+    # Refresh Boolean-dependent fields
+    ################################################################
+    def _refreshContingencies(self):
+        """
+        Apply contingentOn metadata to registered fields.
+
+        The controlling trait must be a Boolean on the same settings object.
+        Missing or invalid dependencies warn once per object/field and are
+        ignored. Explicit enabled=False metadata always takes precedence.
+        """
+        for field in self._contingentFields:
+            owner = field["owner"]
+
+            # Resolve the actual preset currently displayed by this proxy.
+            if isinstance(owner, _RetargetableProxy):
+                owner = object.__getattribute__(owner, "_target")
+
+            traitName = field["traitName"]
+            trait = owner.traits().get(traitName)
+            if trait is None: continue
+
+            # Start from the field's ordinary enabled setting.
+            enabled = bool(trait.metadata.get("enabled", True))
+            controllerName = trait.metadata.get("contingentOn")
+            problem = None
+
+            if controllerName:
+                if not isinstance(controllerName, str):
+                    problem = "contingentOn must name a Boolean trait."
+                else:
+                    controller = owner.traits().get(controllerName)
+
+                    if controller is None:
+                        problem = f"controlling trait '{controllerName}' does not exist."
+                    elif not isinstance(controller, Bool):
+                        problem = f"controlling trait '{controllerName}' is not Boolean."
+                    else:
+                        enabled = enabled and bool(getattr(owner, controllerName))
+
+            if problem is not None:
+                # Ignore the invalid dependency, preserving ordinary behavior.
+                warningKey = (id(owner), traitName, problem)
+
+                if warningKey not in self._contingentWarnings:
+                    self._contingentWarnings.add(warningKey)
+                    settingsName = getattr(owner, "name", type(owner).__name__)
+                    pglMessages.warning(
+                        f"{settingsName}.{traitName}: {problem} "
+                        "Ignoring contingentOn."
+                    )
+
+            field["widget"].setEnabled(enabled)
 #####################################################################
 # Helper class uses by settingsList which retargets fields
 #####################################################################
