@@ -1243,6 +1243,36 @@ class pglStencilSettings(pglTraitSettings):
         ),
         validate="validatePolygonCoordinates",
     )
+    
+    useExcludePolygon = Bool(
+        False,
+        help="Remove the exclusion polygon from the stencil",
+    )
+
+    excludePolygonCoordinates = Unicode(
+        "[-1,-1], [1,-1], [1,1], [-1,1]",
+        help=(
+            "Polygon to remove from the aperture, in visual-angle units. "
+            "Use coordinate pairs such as [-1,-1], [1,-1], [1,1], [-1,1]. "
+            "Screen-edge tokens -x, x, -y, y are also accepted. "
+            "If neither inclusion shape is enabled, this polygon is removed "
+            "from the full screen."
+        ),
+        validate="validateExcludePolygonCoordinates",
+    )
+    
+    ################################################################
+    # validateExcludePolygonCoordinates
+    ################################################################
+    def validateExcludePolygonCoordinates(self, value):
+        """
+        Allow empty text only when the exclusion polygon is disabled.
+
+        Uses the same coordinate parser as the inclusion polygon.
+        """
+        if not isinstance(value, str): return False
+        if not value.strip(): return not self.useExcludePolygon
+        return self.parsePolygonCoordinates(value) is not None
 
     ################################################################
     # validateFiniteNumber
@@ -1396,12 +1426,67 @@ class pglStencilSettingsList(pglTraitSettings):
         help="Add, copy, delete, and edit named stencil presets",
     )
 
+    buttons = [("Test", "testStencil")]
+
     def __init__(self, settingsList=None):
         super().__init__()
 
         # The existing list editor requires at least one entry.
         self.settingsList = list(settingsList) if settingsList else [pglStencilSettings()]
 
+    ################################################################
+    # testStencil
+    ################################################################
+    def testStencil(self):
+        """
+        Test the currently displayed stencil using default experiment settings.
+
+        Uses copies so unsaved dialog edits are available to the test without
+        changing the saved stencil or default settings.
+        """
+        # Imports stay local to avoid circular dependencies.
+        from pgl import pgl
+        from .pglExperiment import pglExperiment
+        from .pglTasks import pglTestTask
+
+        if not self.settingsList:
+            pglMessages.warning("No stencil is available to test.")
+            return
+
+        try:
+            # The dialog keeps the currently displayed preset first.
+            stencil = deepcopy(self.settingsList[0])
+
+            # Invalid values warn and reset on the test copy only.
+            stencil.validateSettings()
+
+            # Load default settings without changing the saved selection.
+            defaultSettings = pgl.getSettings()
+            if defaultSettings is None:
+                pglMessages.warning("Could not load default settings for the stencil test.")
+                return
+
+            testSettings = deepcopy(defaultSettings)
+            testSettings.stencil = [stencil]
+
+            # Always close the test display when the test finishes.
+            # This changes only the temporary settings copy.
+            testSettings.closeScreenOnEnd = True
+
+            # Use the existing experiment test workflow so initScreen()
+            # creates the stencil and normal finalization handles cleanup.
+            display = pgl()
+            experiment = pglExperiment(display, settings=testSettings)
+            experiment.addTask(pglTestTask(display))
+
+            experiment.initScreen()
+            experiment.run()
+
+        except Exception as error:
+            # initScreen() and run() already handle their recovery paths.
+            pglMessages.warning(
+                f"Could not test stencil: {type(error).__name__}: {error}"
+            )
 ##################################################
 # Import settings
 ##################################################

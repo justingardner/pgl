@@ -2579,16 +2579,22 @@ class pglExperiment(pglExperimentBase):
     ################################################################
     def initStencil(self, backgroundColor=None):
         """
-        Create and select the experiment's stencil.
+        Create and select the experiment's stencil using plane 1.
 
-        Uses plane 1. Enabled circle and polygon regions are combined by union.
-        Coordinates are in visual-angle units. Symbolic x/y values resolve to
+        Aperture:
+            (circle union polygon) minus exclusion polygon
+
+        If neither inclusion shape is enabled, an enabled exclusion polygon
+        is removed from the full screen. With all shapes disabled, no mask
+        is created.
+
+        Coordinates are visual-angle units. Symbolic x/y values resolve to
         half the screen width/height in degrees.
 
         Call after visual-angle setup and after command recording starts.
         """
         self._experimentStencilNumber = None
-        
+
         # Preserve the caller's clearing behavior for experiment cleanup.
         self._stencilPreviousDrawQuad = self.pgl.clearScreenDrawQuad
         self._stencilClearModeChanged = False
@@ -2596,19 +2602,24 @@ class pglExperiment(pglExperimentBase):
         # No selection, or the explicit no-stencil option.
         presets = getattr(self.settings, "stencil", [])
         if not presets: return True
+
         preset = presets[0]
         if preset.uuid == "pgl-stencil-none": return True
 
         # Invalid trait values warn and reset to their defaults.
         preset.validateSettings()
 
-        # Both shapes disabled means no experiment mask.
-        if not preset.useCircle and not preset.usePolygon: return True
+        useCircle = preset.useCircle
+        usePolygon = preset.usePolygon
+        useExcludePolygon = preset.useExcludePolygon
+        hasInclusion = useCircle or usePolygon
+
+        if not hasInclusion and not useExcludePolygon: return True
 
         if backgroundColor is None:
             backgroundColor = self.settings.backgroundColor
 
-        # Resolve screen-edge symbols in the current visual-angle coordinates.
+        # Resolve screen-edge symbols in visual-angle coordinates.
         halfWidth = float(self.pgl.screenWidth.deg) / 2
         halfHeight = float(self.pgl.screenHeight.deg) / 2
 
@@ -2623,21 +2634,12 @@ class pglExperiment(pglExperimentBase):
             "-y": -halfHeight,
         }
 
-        # Prepare all geometry BEFORE changing renderer state.
-        radius = None
-        if preset.useCircle:
-            radius = preset.parseRadius(preset.radius)
-            if radius is None:
-                pglMessages.warning("Could not resolve the stencil circle radius.")
-                return False
-            if isinstance(radius, str): radius = edgeValues[radius]
-
-        polygonTriangles = None
-        if preset.usePolygon:
-            coordinates = preset.parsePolygonCoordinates(preset.polygonCoordinates)
+        # Resolve and triangulate before starting any stencil exchange.
+        def preparePolygon(text, label):
+            coordinates = preset.parsePolygonCoordinates(text)
             if coordinates is None:
-                pglMessages.warning("Could not resolve the stencil polygon coordinates.")
-                return False
+                pglMessages.warning(f"Could not resolve {label} coordinates.")
+                return None
 
             vertices = np.array([
                 [
@@ -2647,50 +2649,118 @@ class pglExperiment(pglExperimentBase):
                 for pair in coordinates
             ], dtype=np.float64)
 
-            polygonTriangles = self.pgl.triangulatePolygon(vertices)
+            triangles = self.pgl.triangulatePolygon(vertices)
+            if triangles is None:
+                pglMessages.warning(f"Could not prepare {label} for stencil '{preset.name}'.")
+
+            return triangles
+
+        # Prepare the circle.
+        radius = None
+        if useCircle:
+            radius = preset.parseRadius(preset.radius)
+            if radius is None:
+                pglMessages.warning("Could not resolve the stencil circle radius.")
+                return False
+
+            if isinstance(radius, str): radius = edgeValues[radius]
+
+        # Prepare the inclusion polygon.
+        polygonTriangles = None
+        if usePolygon:
+            polygonTriangles = preparePolygon(
+                preset.polygonCoordinates,
+                "inclusion polygon",
+            )
             if polygonTriangles is None: return False
+
+        # Prepare the exclusion polygon.
+        excludeTriangles = None
+        if useExcludePolygon:
+            excludeTriangles = preparePolygon(
+                preset.excludePolygonCoordinates,
+                "exclusion polygon",
+            )
+            if excludeTriangles is None: return False
 
         # Establish a render-pass boundary before creating the stencil.
         if self.pgl.stencilSelect(0) is None: return False
         self.pgl.flush()
 
         stencilNumber = 1
-        if self.pgl.stencilCreateBegin(stencilNumber) is None: return False
 
-        # Drawing both shapes into the same plane produces their union.
-        if preset.useCircle:
-            self.pgl.circle(
-                radius=radius,
-                x=preset.centerX,
-                y=preset.centerY,
-                numSegments=180,
-                fill=True,
-                color=1,
-            )
+        if hasInclusion:
+            # Initialize to blocked everywhere, then write the included union.
+            if self.pgl.stencilCreateBegin(stencilNumber) is None: return False
 
-        if polygonTriangles is not None:
-            # Geometry was triangulated before stencil creation began.
+            if useCircle:
+                self.pgl.circle(
+                    radius=radius,
+                    x=preset.centerX,
+                    y=preset.centerY,
+                    numSegments=180,
+                    fill=True,
+                    color=1,
+                )
+
+            if polygonTriangles is not None:
+                # One real triangle and one degenerate triangle per quad.
+                self.pgl.quad(
+                    polygonTriangles[:, [0, 1, 2, 0], :],
+                    color=1,
+                )
+
+            if self.pgl.stencilCreateEnd() is None: return False
+
+            if useExcludePolygon:
+                # Start a second pass that writes zero into the selected bit.
+                # Do NOT call stencilCreateBegin() here: its full-screen
+                # initialization would overwrite the union we just created.
+                if not self.pgl.s.writeCommand("mglStartStencilCreation"):
+                    return False
+
+                ackTime = self.pgl.s.readAck()
+                if ackTime is None: return False
+
+                self.pgl.s.write(np.uint32(stencilNumber))
+                self.pgl.s.write(np.uint32(1))  # Inverted creation writes zero.
+                self.pgl.commandResults = self.pgl.s.readCommandResults(ackTime)
+
+                if self.pgl.commandResults is None: return False
+                success = self.pgl.commandResults.get("success")
+                if success is None or not np.all(np.asarray(success) != 0):
+                    pglMessages.warning("Could not start stencil exclusion pass.")
+                    return False
+
+        else:
+            # Exclusion-only mask: initialize to allowed everywhere and
+            # leave creation configured to write zero inside the polygon.
+            if self.pgl.stencilCreateBegin(stencilNumber, invert=True) is None:
+                return False
+
+        # Remove the exclusion polygon from the included region.
+        if useExcludePolygon:
             self.pgl.quad(
-                polygonTriangles[:, [0, 1, 2, 0], :],
+                excludeTriangles[:, [0, 1, 2, 0], :],
                 color=1,
             )
 
-        if self.pgl.stencilCreateEnd() is None: return False
+            if self.pgl.stencilCreateEnd() is None: return False
 
-        # Set the actual render-pass background explicitly. Everything
-        # outside the aperture must start black on every frame.
+        # All creation passes are finished, with no stencil selected.
+        # Future passes start black everywhere, including excluded regions.
         if not self.pgl.clearScreen(0, drawQuad=False): return False
 
         # Track ownership before selecting the experiment mask.
         self._experimentStencilNumber = stencilNumber
         if self.pgl.stencilSelect(stencilNumber) is None: return False
 
-        # Existing clearScreen(color) calls now paint through the stencil
-        # without changing the black render-pass background.
+        # Ordinary task clearScreen() calls now paint only inside the aperture.
         self.pgl.clearScreenDrawQuad = True
         self._stencilClearModeChanged = True
 
         if not self.pgl.clearScreen(backgroundColor): return False
+
         self.pgl.flush()
         return True
     
