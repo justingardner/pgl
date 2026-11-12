@@ -71,16 +71,16 @@ class pglDraw:
         self.clearScreenColor = color.flatten().tolist()
         
         # FIX: FIX: FIX, this draws a quad because clearScreen is not functioning properly
-        w = self.screenWidth.pix
-        h = self.screenHeight.pix
-        fullScreenQuad = np.array([
-            [0, 0],   # bottom-left
-            [w, 0],   # bottom-right
-            [w, h],   # top-right
-            [0, h],   # top-left
-        ])
-        self.quad(fullScreenQuad, color= self.clearScreenColor, units="pix")
-        self.oneTimeWarning("Need to fix clearScreen which is not functioning properly, drawing a full screen quad instead.",level=0)
+        #w = self.screenWidth.pix
+        #h = self.screenHeight.pix
+        #fullScreenQuad = np.array([
+        #    [0, 0],   # bottom-left
+        #    [w, 0],   # bottom-right
+        #    [w, h],   # top-right
+        #    [0, h],   # top-left
+        # ])
+        #self.quad(fullScreenQuad, color= self.clearScreenColor, units="pix")
+        #self.oneTimeWarning("Need to fix clearScreen which is not functioning properly, drawing a full screen quad instead.",level=0)
         
     ################################################################
     # dots
@@ -603,7 +603,171 @@ class pglDraw:
         vertices = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32)
         self.quad(vertices, color=color, units=units)
             
-            
+    ################################################################
+    # stencilCreateBegin
+    ################################################################
+    def stencilCreateBegin(self, stencilNumber=1, invert=False):
+        """
+        Initialize a stencil plane and begin drawing its mask.
+
+        Call at a render-pass boundary, after flushing any previous drawing.
+        Subsequent drawing defines the mask until stencilCreateEnd().
+
+        Args:
+            stencilNumber (int): Stencil plane number, from 1 through 7.
+            invert (bool or int): False/0 allows drawing inside the mask;
+                True/1 allows drawing outside it.
+
+        Returns:
+            dict or None: Final command results, or None on failure.
+
+        Notes:
+            Initialization includes a flush. Resizing the display invalidates
+            existing masks when the renderer recreates its stencil texture.
+        """
+        # Make sure that a screen is open.
+        if not self.isOpen():
+            pglMessages.warning("No screen is open.")
+            return None
+
+        # Validate arguments before sending any commands.
+        if not isinstance(stencilNumber, (int, np.integer)) or not 1 <= stencilNumber <= 7:
+            pglMessages.warning("stencilNumber must be an integer from 1 through 7.")
+            return None
+
+        if not isinstance(invert, (bool, np.bool_, int, np.integer)) or invert not in (0, 1):
+            pglMessages.warning("invert must be False/0 or True/1.")
+            return None
+
+        # Preserve the current transform for drawing the caller's mask.
+        savedTransform = np.array(self.xform, copy=True)
+
+        # Cover the screen in normalized coordinates, with an extra margin.
+        fullScreenQuad = np.array([
+            [-2, -2],
+            [ 2, -2],
+            [ 2,  2],
+            [-2,  2]
+        ], dtype=np.float32)
+
+        # First initialize the plane with the opposite value, then begin
+        # writing the requested mask value.
+        for initializing in (True, False):
+            passInvert = not bool(invert) if initializing else bool(invert)
+
+            # Start creation before any drawing command opens the render pass.
+            if not self.s.writeCommand("mglStartStencilCreation"): return None
+            ackTime = self.s.readAck()
+            if ackTime is None: return None
+
+            self.s.write(np.uint32(stencilNumber))
+            self.s.write(np.uint32(passInvert))
+            self.commandResults = self.s.readCommandResults(ackTime)
+
+            # Do not continue if the renderer did not accept the command.
+            if self.commandResults is None: return None
+            success = self.commandResults.get("success")
+            if success is None or not np.all(np.asarray(success) != 0):
+                pglMessages.warning("Could not start stencil creation.")
+                return None
+
+            if initializing:
+                # Use identity coordinates only for the initialization quad.
+                # setTransform() sends the matrix without changing self.xform.
+                try:
+                    self.setTransform(np.eye(4))
+                    self.quad(fullScreenQuad, color=1, units="device")
+                finally:
+                    # Restore INSIDE the initialization pass, before flushing.
+                    # Restoring after stencilCreateEnd() would open a new pass
+                    # with stencil creation disabled.
+                    self.setTransform(savedTransform)
+
+                # Store the initialized stencil plane and end creation.
+                if self.stencilCreateEnd() is None: return None
+
+        return self.commandResults
+
+    ################################################################
+    # stencilCreateEnd
+    ################################################################
+    def stencilCreateEnd(self):
+        """
+        Finish drawing a stencil mask and disable stencil creation.
+
+        Flushes the render pass so Metal stores the updated stencil buffer,
+        then returns to ordinary drawing with no stencil selected.
+
+        Returns:
+            dict or None: Finish-command results, or None on failure.
+        """
+        # Make sure that a screen is open.
+        if not self.isOpen():
+            pglMessages.warning("No screen is open.")
+            return None
+
+        # Complete the render pass that writes the stencil buffer.
+        # flush() returns a presentation timestamp, not a success boolean.
+        self.flush()
+        if self.commandResults is None: return None
+        success = self.commandResults.get("success")
+        if success is None or not np.all(np.asarray(success) != 0):
+            pglMessages.warning("Could not flush stencil creation.")
+            return None
+
+        # Return to ordinary drawing with no stencil selected.
+        if not self.s.writeCommand("mglFinishStencilCreation"): return None
+        ackTime = self.s.readAck()
+        if ackTime is None: return None
+
+        self.commandResults = self.s.readCommandResults(ackTime)
+        if self.commandResults is None: return None
+        success = self.commandResults.get("success")
+        if success is None or not np.all(np.asarray(success) != 0):
+            pglMessages.warning("Could not finish stencil creation.")
+            return None
+
+        return self.commandResults
+
+    ################################################################
+    # stencilSelect
+    ################################################################
+    def stencilSelect(self, stencilNumber=0):
+        """
+        Select a stencil mask for subsequent drawing.
+
+        Args:
+            stencilNumber (int): Stencil plane number, or 0 to disable masking.
+                The supported upper limit depends on the renderer.
+
+        Returns:
+            dict or None: Command results, or None on failure.
+        """
+        # Make sure that a screen is open.
+        if not self.isOpen():
+            pglMessages.warning("No screen is open.")
+            return None
+
+        # Zero disables masking; positive values select a stencil plane.
+        if not isinstance(stencilNumber, (int, np.integer)) or not 0 <= stencilNumber <= np.iinfo(np.uint32).max:
+            pglMessages.warning("stencilNumber must be a nonnegative uint32 integer.")
+            return None
+
+        # Select the requested stencil.
+        if not self.s.writeCommand("mglSelectStencil"): return None
+        ackTime = self.s.readAck()
+        if ackTime is None: return None
+
+        self.s.write(np.uint32(stencilNumber))
+        self.commandResults = self.s.readCommandResults(ackTime)
+
+        if self.commandResults is None: return None
+        success = self.commandResults.get("success")
+        if success is None or not np.all(np.asarray(success) != 0):
+            pglMessages.warning("Could not select stencil.")
+            return None
+
+        return self.commandResults            
             
 
     ####################################################
