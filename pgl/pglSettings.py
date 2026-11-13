@@ -2088,7 +2088,7 @@ class pglSettings(pglTraitSettings):
     responseKeys = Unicode("1234", help="Keys used for subject responses. Can be a string like \"1234\" or a comma-separated list like 'left,right,up,down' and will map to response 0,1,2,etc")
     ignoreInitialVolumes = Int(0, min=0, step=1, help="Number of initial volumes to ignore")
     eatKeys = Bool(True, help="Whether to eat keypresses so they don't propagate to the OS. Will only eat the keys specified above.")
-    startOnVolumeTrigger = Bool(False, help="Whether to start the experiment on the volume trigger key")
+    startOnVolumeTrigger = Bool(False, help="Whether to start the experiment on a keyboard or digital scanner-volume trigger")
     startScreen = List(Unicode(), default_value=["fixation cross", "blank", "waiting message"],help="What to show on the screen before the experiment starts.")
     manualPreStart = Bool(False, help="Whether to manually start the experiment before the volume trigger")
     closeScreenOnEnd = Bool(True, help="Whether to close the screen when the experiment ends")
@@ -2097,7 +2097,11 @@ class pglSettings(pglTraitSettings):
     backgroundColor = List(trait=Float(min=0.0, max=1.0), default_value=[0.5, 0.5, 0.5],minlen=3,maxlen=3,help="Background color as a list of RGB values").tag(isRGB=True)
     stencil = List(Instance(pglStencilSettings),settingsListKey="name",highlightSelector=False,hideAll=True,traitDisplayName="stencil",help="Stencil preset to use. Edit presets with pgl.stencilSettings(). None disables masking.")
     _digitalIO = List(Instance(pglItem), default_value=[pglItem(name='DATAPixx'),pglItem(name='LabJack')], settingsListKey="name", multiSelect=True, style="dropdown", traitDisplayName="digitalIO", help='Select which devices to use for digital IO',visible=True)
-    _devices = List(Instance(pglItem), default_value=[pglItem(name='RESPONSEPixx')], settingsListKey="name", multiSelect=True, style="dropdown", traitDisplayName="devices", help='Select which devices to use for digital IO', visible=True)
+    _devices = List(Instance(pglItem), settingsListKey="name", multiSelect=True, style="dropdown", traitDisplayName="devices", help="Select input devices for responses and scanner triggers", visible=True)
+
+    # Scanner-trigger configuration for the selected digital trigger device.
+    volumeTriggerChannel = Unicode("FIO0", traitDisplayName="Volume trigger channel", help="Physical digital input connected to the scanner trigger. Use the selected device's channel naming convention, for example FIO0 or EIO0 for LabJack.")
+    volumeTriggerEdge = List(Unicode(), default_value=["rising", "falling"], traitDisplayName="Volume trigger edge", help="Rising detects LOW to HIGH; falling detects HIGH to LOW. Choose the pulse's active edge so each pulse counts once.")    
     eyetracker = List(Unicode(), default_value=['None', 'Eyelink', 'TRACKPixx'], help="Eyetracker")
     
     def __init__(self, refreshDisplays=True):
@@ -2331,6 +2335,15 @@ class pglSettings(pglTraitSettings):
 
         # Selected-first order is the dialog's existing selection convention.
         self.stencil = available
+        
+    ################################################################
+    # Default input-device choices
+    ################################################################
+    @default("_devices")
+    def _defaultDevices(self):
+        """Create fresh device-selection objects for each settings instance."""
+        # Avoid sharing mutable selection objects between settings instances.
+        return [pglItem(name="RESPONSEPixx"), pglItem(name="LabJack digital trigger")]
                         
 class pglSettingsList(pglTraitSettings):
 

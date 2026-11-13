@@ -629,12 +629,11 @@ class pglExperiment(pglExperimentBase):
             self.state.endKeyCode = getControlKeyCode(self.settings.endKey, "endKey")
             self.state.volumeTriggerKeyCode = getControlKeyCode(self.settings.volumeTriggerKey, "volumeTriggerKey")
 
-            # Waiting for keyboard synchronization requires configured keys.
-            if self.settings.startOnVolumeTrigger and self.state.volumeTriggerKeyCode is None:
-                raise ValueError("startOnVolumeTrigger requires a volumeTriggerKey.")
+            # Manual pre-start still requires a keyboard key.
+            # Validate scanner synchronization after digital devices initialize.
             if self.settings.manualPreStart and self.state.startKeyCode is None:
                 raise ValueError("manualPreStart requires a startKey.")
-
+            
             # If eatKeys is set, include only configured keys.
             if self.settings.eatKeys:
                 eatKeyCodes = self.state.responseKeyCodesList.copy()
@@ -661,6 +660,9 @@ class pglExperiment(pglExperimentBase):
             # Set up digital IO and other devices.
             self.initDigitalIO()
             self.initDevices()
+            
+            # Require a usable trigger source, not merely a selected device.
+            self._validateVolumeTriggerSource()
 
             # Start before configure(), which may create stimulus resources.
             self._startExperimentRecording(estimatedDuration, recordFlush, recordCommands)
@@ -1184,6 +1186,9 @@ class pglExperiment(pglExperimentBase):
         No final screen-clear/flush is performed before returning to that save
         path. Task-ending hooks still run during acquisition so their finalized
         data can be included in the save.
+
+        Keyboard and configured digital edges share scanner-trigger handling.
+        Every accepted trigger in a poll is counted.
         '''
         # Default to error; the public wrapper marks successful acquisition.
         self.state.runFinishedWithError = True
@@ -1193,8 +1198,7 @@ class pglExperiment(pglExperimentBase):
             return
 
         # Start eye tracker recording if we have an eye tracker.
-        if self.eyeTracker is not None:
-            self.eyeTracker.start()
+        if self.eyeTracker is not None: self.eyeTracker.start()
 
         # Calculate the distinct phases that we will need to cover.
         self.state.phaseNums = sorted({
@@ -1215,8 +1219,19 @@ class pglExperiment(pglExperimentBase):
         ignoreInitialVolumes = self.settings.ignoreInitialVolumes
 
         # See whether we need to run eye calibration.
-        if self.settings.eyetracker is not None:
-            self.calibrateEyeTracker()
+        if self.settings.eyetracker is not None: self.calibrateEyeTracker()
+
+        # Check again because acquisition may have failed during task setup
+        # or eye calibration after initScreen() completed.
+        self._validateVolumeTriggerSource()
+
+        # Retain, but do not count, digital events already queued before the
+        # experiment's start gate. Do not discard pending keyboard events.
+        #
+        # This drains the software event queue, not the device/LJM buffers.
+        # A later-delivered event can still describe an earlier physical edge.
+        for device in getattr(self, "_experimentInputDevices", []):
+            self.data.events.extend(device.poll())
 
         # Disabled keys must not accidentally match an event with keyCode=None.
         def matchesKey(event, keyCode, keydownOnly=False):
@@ -1226,6 +1241,22 @@ class pglExperiment(pglExperimentBase):
                 and event.keyCode == keyCode
                 and (not keydownOnly or event.eventType == "keydown")
             )
+
+        def pollEvents():
+            # PGL collects devices in registration order. Sort timestamped
+            # events within this poll while retaining every original event.
+            #
+            # Digital timestamps are estimated, and sorting one batch cannot
+            # guarantee global ordering across delayed deliveries.
+            events = list(self.pgl.poll())
+
+            def eventTime(event):
+                timestamp = getattr(event, "timestamp", None)
+                return timestamp if timestamp is not None else float("inf")
+
+            events.sort(key=eventTime)
+            self.data.events.extend(events)
+            return events
 
         ################################################################
         # Wait for a start key or scanner trigger when configured
@@ -1253,46 +1284,46 @@ class pglExperiment(pglExperimentBase):
 
                 # Flush to display text, then poll for events.
                 self.pgl.flush()
-                events = self.pgl.poll()
-                self.data.events.extend(events)
+                events = pollEvents()
 
-                # Match the configured start key.
-                if any(
-                    matchesKey(event, self.state.startKeyCode, keydownOnly=True)
-                    for event in events
-                ):
-                    if manualPreStart:
-                        manualPreStart = False
-                        pglMessages.message(
-                            f"Manual pre-start ended after {manualPreStartVolumes} volumes.",
-                            messageType='experiment',
-                        )
-                    else:
-                        self.state.experimentStarted = True
-
-                # Handle scanner triggers while waiting to start.
-                if self.settings.startOnVolumeTrigger:
-                    for event in events:
-                        if matchesKey(event, self.state.volumeTriggerKeyCode, keydownOnly=True):
-                            if manualPreStart:
-                                manualPreStartVolumes += 1
-                            elif ignoreInitialVolumes > 0:
-                                ignoreInitialVolumes -= 1
-                            else:
-                                pglMessages.message(
-                                    f"Ignored {self.settings.ignoreInitialVolumes} initial volumes.",
-                                    messageType='experiment',
-                                )
-                                self.state.experimentStarted = True
-                                self.state.volumeNumber += 1
-                                self.data.events.append(
-                                    pglEventVolumeTrigger(timestamp=event.timestamp)
-                                )
-
-                # Allow aborting before any tasks have started.
+                # Preserve pre-start abort priority: do not start tasks when
+                # the end key is present in the same poll as a start event.
                 if any(matchesKey(event, self.state.endKeyCode) for event in events):
                     self.state.experimentStarted = True
                     self.state.experimentDone = True
+                    break
+
+                # Process start keys and scanner triggers in timestamp order
+                # within this batch. Do not drop additional triggers after
+                # the first one opens the start gate.
+                for event in events:
+                    if matchesKey(event, self.state.startKeyCode, keydownOnly=True):
+                        if manualPreStart:
+                            manualPreStart = False
+                            pglMessages.message(
+                                f"Manual pre-start ended after {manualPreStartVolumes} volumes.",
+                                messageType='experiment',
+                            )
+                        else:
+                            # Preserve the existing start-key override.
+                            self.state.experimentStarted = True
+
+                    if not self.settings.startOnVolumeTrigger: continue
+                    if not self._isVolumeTrigger(event): continue
+
+                    if manualPreStart:
+                        manualPreStartVolumes += 1
+                    elif ignoreInitialVolumes > 0:
+                        ignoreInitialVolumes -= 1
+                    else:
+                        if not self.state.experimentStarted:
+                            pglMessages.message(
+                                f"Ignored {self.settings.ignoreInitialVolumes} initial volumes.",
+                                messageType='experiment',
+                            )
+
+                        self.state.experimentStarted = True
+                        self._recordVolumeTrigger(event)
 
         else:
             # No start gate: begin immediately.
@@ -1328,28 +1359,25 @@ class pglExperiment(pglExperimentBase):
 
         while not self.state.experimentDone:
             # Poll for events.
-            events = self.pgl.poll()
-            self.data.events.extend(events)
+            events = pollEvents()
 
             # End all running tasks when the configured end key is received.
             # Task-ending hooks may finalize data, so retain them before saving.
             if any(matchesKey(event, self.state.endKeyCode) for event in events):
                 self.state.experimentDone = True
-                for task in self.currentTasks:
-                    task.end()
+                for task in self.currentTasks: task.end()
                 continue
 
-            # Check for volume trigger key.
-            for iEvent, event in enumerate(events):
-                if matchesKey(event, self.state.volumeTriggerKeyCode, keydownOnly=True):
-                    # Remove it from the response-processing list. The original
-                    # keyboard event is already retained in experiment data.
-                    events.pop(iEvent)
-                    self.state.volumeNumber += 1
-                    self.data.events.append(
-                        pglEventVolumeTrigger(timestamp=event.timestamp)
-                    )
-                    break
+            # Count every scanner trigger, not only the first in this poll.
+            # Source events are already retained in experiment data. Remove
+            # accepted triggers only from response/task-event processing.
+            taskEvents = []
+            for event in events:
+                if self._isVolumeTrigger(event):
+                    self._recordVolumeTrigger(event)
+                else:
+                    taskEvents.append(event)
+            events = taskEvents
 
             # Match response keys and preserve their original event timestamps.
             subjectResponses = [
@@ -1374,17 +1402,14 @@ class pglExperiment(pglExperimentBase):
                     tasks=self.currentTasks,
                     events=events,
                 )
-                if task.done():
-                    phaseDone = True
+                if task.done(): phaseDone = True
 
             # Preserve normal acquisition presentation timing.
-            if self.flush:
-                self.pgl.flush()
+            if self.flush: self.pgl.flush()
 
             # Go to the next phase or end the experiment.
             if phaseDone:
-                for task in self.currentTasks:
-                    task.end()
+                for task in self.currentTasks: task.end()
 
                 if self.state.currentPhaseIndex >= len(self.state.phaseNums) - 1:
                     self.state.experimentDone = True
@@ -1407,47 +1432,77 @@ class pglExperiment(pglExperimentBase):
         #)
     
     def initDigitalIO(self):
-        '''
-        initialize digital IO device if settings calls for them to be initialized
-        '''
-        
-        # end (just in case digitalIO was already started)
+        """
+        Initialize experiment-owned digital hardware.
+
+        A LabJack selected for input, output, or both is opened exactly once.
+        Input-only LabJacks also live in digitalIODevices for shared ownership;
+        opening a device does not configure any output pins.
+        """
+        from .pglLabJack import pglLabJack
+
+        # End existing experiment-owned hardware before replacing its references.
+        # This also stops and unregisters any input reader sharing that hardware.
         self.endDigitalIO()
-        
-        # clear any existing configuration
+
+        # Clear any existing configuration.
         self.state.digitalIODevices = []
         self.state.triggerWords = {}
         self.state.triggers = {}
         self.settings.digitalIOWords = []
         self.settings.digitalIOChannels = []
+        self._experimentInputDevices = []
 
-        for digitalIODevice in self.settings.digitalIO:
-            if digitalIODevice.lower() == "labjack":
-                
-                # try to initialize labjack device
-                from .pglLabJack import pglLabJack
+        outputNames = list(self.settings.digitalIO)
+        inputNames = {name.casefold() for name in self.settings.devices}
+        needsLabJackInput = "labjack digital trigger" in inputNames
+
+        # Preserve output-device ordering. Append input-only hardware afterward.
+        requestedNames = list(outputNames)
+        if needsLabJackInput and not any(name.casefold() == "labjack" for name in requestedNames):
+            requestedNames.append("LabJack")
+
+        initializedNames = set()
+
+        for deviceName in requestedNames:
+            normalizedName = deviceName.casefold()
+            if normalizedName in initializedNames: continue
+            initializedNames.add(normalizedName)
+
+            if normalizedName == "labjack":
+                # Do not silently open a second connection alongside a separately
+                # registered LabJack whose lifetime this experiment does not own.
+                existingDevices = self.pgl.devicesGet(pglLabJack)
+                if any(device.isActive for device in existingDevices):
+                    raise RuntimeError(
+                        "A LabJack is already registered outside this experiment. "
+                        "Stop, close, and unregister it before initializing the experiment."
+                    )
+
                 labJack = pglLabJack()
-                
-                # if it is working add it
+
+                # Keep ownership immediately so initialization recovery can close it.
                 if labJack.isActive:
                     self.state.digitalIODevices.append(labJack)
                     pglMessages.message("LabJack initialized")
+                elif needsLabJackInput:
+                    raise RuntimeError("The selected LabJack scanner-trigger device did not initialize")
                 else:
                     pglMessages.message("LabJack did not initialize")
-                                        
-            elif digitalIODevice.lower() == "datapixx":
-                
-                # try to initialize datapixx
+
+            elif normalizedName == "datapixx":
+                # Try to initialize the selected digital output device.
                 from .pglVPixx import pglDataPixx
                 dataPixx = pglDataPixx()
-                
+
                 if dataPixx.isActive:
                     self.state.digitalIODevices.append(dataPixx)
                     pglMessages.message("DataPixx initialized")
                 else:
                     pglMessages.message("DataPixx did not initialize")
+
             else:
-                pglMessages.warning(f"Unknown digitalIO device: {digitalIODevice}")       
+                pglMessages.warning(f"Unknown digitalIO device: {deviceName}") 
         
 
     def getDigitalIODevice(self, digitalIODevice = None):
@@ -1714,14 +1769,32 @@ class pglExperiment(pglExperimentBase):
         return timestamp    
     
     def endDigitalIO(self):
-        """Close each digital IO device independently, retaining failed devices."""
+        """Stop shared inputs and close each experiment-owned hardware device."""
         errors = []
         failedDevices = []
 
+        # Input shutdown must precede closing the shared hardware connection.
+        # A reported acquisition error must not prevent other cleanup attempts.
+        self._attemptRunAction("stop experiment input devices", self.endDevices, errors)
+
         # One device failure must not prevent closing the others.
-        for digitalIODevice in self.state.digitalIODevices:
-            if not self._attemptRunAction("close digital IO device", digitalIODevice.close, errors):
+        for digitalIODevice in list(self.state.digitalIODevices):
+            closed = self._attemptRunAction(
+                "close digital IO device",
+                digitalIODevice.close,
+                errors,
+            )
+
+            if not closed:
                 failedDevices.append(digitalIODevice)
+                continue
+
+            # Successful close means this object must no longer be polled.
+            self.pgl.devicesRemove(digitalIODevice)
+            self._experimentInputDevices = [
+                device for device in getattr(self, "_experimentInputDevices", [])
+                if device is not digitalIODevice
+            ]
 
         # Retain failed devices so cleanup can be retried.
         self.state.digitalIODevices = failedDevices
@@ -1733,20 +1806,106 @@ class pglExperiment(pglExperimentBase):
         return True
             
     def initDevices(self):
-        '''
-        initialize devices
-        '''
-        if self.settings.devices:
-            pglMessages.warning('Devices not implemented yet')
+        """
+        Start selected experiment inputs and register them for normal polling.
 
+        LabJack input reuses the instance owned by initDigitalIO().
+        No additional hardware connection is opened here.
+        """
+        from .pglLabJack import pglLabJack
+
+        # Stop any previous input acquisition without closing shared hardware.
+        self.endDevices()
+        self._experimentInputDevices = []
+
+        selectedNames = {name.casefold() for name in self.settings.devices}
+
+        for deviceName in self.settings.devices:
+            if deviceName.casefold() != "labjack digital trigger":
+                pglMessages.warning(f"Input device is not implemented yet: {deviceName}", level=1)
+
+        if "labjack digital trigger" not in selectedNames: return
+
+        labJack = self.getDigitalIODevice(pglLabJack)
+        if labJack is None or not labJack.isActive:
+            raise RuntimeError("LabJack digital trigger was selected, but no initialized LabJack is available")
+
+        if not self.settings.volumeTriggerEdge:
+            raise ValueError("Select a volumeTriggerEdge")
+
+        edge = self.settings.volumeTriggerEdge[0]
+        if edge not in {"rising", "falling"}:
+            raise ValueError("Volume trigger edge must be rising or falling")
+
+        # Track ownership before startup so initialization recovery can stop
+        # a partially started acquisition.
+        self._experimentInputDevices.append(labJack)
+
+        # These acquisition defaults become settings in a later step.
+        # FIO_STATE capture currently supports only FIO0–FIO7 / DIO0–DIO7.
+        actualRate = labJack.startDigitalRead(
+            channels=self.settings.volumeTriggerChannel,
+            edge=edge,
+            scanRate=100000.0,
+            scansPerRead=100,
+        )
+
+        # Do not silently accept a slower capture rate for these brief pulses.
+        if not np.isclose(actualRate, 100000.0, rtol=1e-6, atol=0):
+            raise RuntimeError(f"Scanner-trigger capture requested 100 kHz but received {actualRate:g} Hz")
+
+        # poll() now retrieves the events from this same shared LabJack instance.
+        if not self.pgl.devicesAdd(labJack):
+            raise RuntimeError("Could not register LabJack input for polling")
+
+        pglMessages.message("LabJack scanner-trigger input initialized")
             
 
     def endDevices(self):
-        '''
-        end digitalIO devices
-        '''
-        pass
-        
+        """
+        Stop and unregister experiment input devices without closing hardware.
+
+        Retain devices whose workers have not stopped so cleanup can be retried.
+        Pending events remain on their device; this method does not consume them.
+        """
+        errors = []
+        failedDevices = []
+
+        for device in list(getattr(self, "_experimentInputDevices", [])):
+            self._attemptRunAction(
+                "stop experiment digital input",
+                device.stopDigitalRead,
+                errors,
+            )
+
+            # A latched acquisition error may be reported even after the worker
+            # stopped. Unregister stopped workers, but retain a running worker
+            # or an unsuccessfully stopped hardware stream for retry.
+            try:
+                status = device.getDigitalReadStatus()
+            except Exception as error:
+                errors.append(error)
+                self._recordRunError("inspect digital input shutdown", error)
+                failedDevices.append(device)
+                continue
+
+            if status["running"] or status["streamActive"]:
+                failedDevices.append(device)
+                continue
+
+            self.pgl.devicesRemove(device)
+
+        # Snapshot before dropping input-device references. Finalization's
+        # existing final data.json write persists these post-shutdown values.
+        self._attemptRunAction(
+            "snapshot digital input diagnostics",
+            self._snapshotDigitalInputStatus,
+            errors,
+        )
+
+        self._experimentInputDevices = failedDevices
+        if errors: raise errors[0]
+        return True
         
     def initEyeTracker(self):
         '''Initialize eye tracker if we have an eye tracker.'''
@@ -1968,9 +2127,13 @@ class pglExperiment(pglExperimentBase):
         pglMessages.message(f"Saving experiment data to: {dataPath}", messageType='experiment')
         self.data.saveStatus = "inProgress"
 
+
         ################################################################
         # Save essential experiment components before device operations
         ################################################################
+        # Capture diagnostics before saving, without waiting for device shutdown.
+        self._attemptRunAction("snapshot digital input diagnostics", self._snapshotDigitalInputStatus, errors)
+
         components = (
             ("experiment data", self.data, "data.json"),
             ("experiment state", self.state, "state.json"),
@@ -2793,6 +2956,145 @@ class pglExperiment(pglExperimentBase):
             self.pgl.clearScreenDrawQuad = self._stencilPreviousDrawQuad
             self._stencilClearModeChanged = False
 
+        return True
+    
+    ################################################################
+    # Validate scanner-trigger availability after device initialization
+    ################################################################
+    def _validateVolumeTriggerSource(self):
+        """Allow keyboard-only, digital-only, or combined trigger sources."""
+        selectedNames = {name.casefold() for name in self.settings.devices}
+        digitalSelected = "labjack digital trigger" in selectedNames
+
+        if digitalSelected:
+            devices = [
+                device for device in getattr(self, "_experimentInputDevices", [])
+                if device.deviceType == "LabJack"
+            ]
+            if len(devices) != 1:
+                raise RuntimeError("LabJack scanner input was selected but exactly one input device was not initialized")
+
+            status = devices[0].getDigitalReadStatus()
+            if status["error"] is not None:
+                raise RuntimeError(f"LabJack scanner input failed: {status['error']}")
+            if not status["running"] or not status["streamActive"]:
+                raise RuntimeError("LabJack scanner input is not acquiring")
+
+        if self.settings.startOnVolumeTrigger and self.state.volumeTriggerKeyCode is None and not digitalSelected:
+            raise ValueError("startOnVolumeTrigger requires a volumeTriggerKey or an initialized digital trigger device.")
+
+    ################################################################
+    # Match keyboard or configured digital scanner triggers
+    ################################################################
+    def _isVolumeTrigger(self, event):
+        """
+        Match one scanner-trigger source event.
+
+        Keyboard triggers require keydown.
+        Digital triggers require the selected device, physical pin, and edge.
+        This does not deduplicate a physical pulse delivered by two interfaces.
+        """
+        if event.type == "keyboard":
+            return (
+                self.state.volumeTriggerKeyCode is not None
+                and event.keyCode == self.state.volumeTriggerKeyCode
+                and event.eventType == "keydown"
+            )
+
+        if event.type != "digitalInput": return False
+        if "labjack digital trigger" not in {name.casefold() for name in self.settings.devices}:
+            return False
+        if getattr(event, "deviceType", None) != "LabJack": return False
+
+        # The LabJack reader emits canonical FIO names, including when the
+        # settings used the equivalent DIO0–DIO7 alias.
+        channel = self.settings.volumeTriggerChannel.strip().upper()
+        if channel.startswith("DIO"): channel = "FIO" + channel[3:]
+
+        return (
+            event.channel == channel
+            and bool(self.settings.volumeTriggerEdge)
+            and event.eventType == self.settings.volumeTriggerEdge[0]
+        )
+
+    ################################################################
+    # Record an accepted scanner trigger without changing its source event
+    ################################################################
+    def _recordVolumeTrigger(self, event):
+        """Increment the volume count and retain source timing provenance."""
+        volumeEvent = pglEventVolumeTrigger(timestamp=event.timestamp)
+
+        # Preserve the existing canonical volumeTrigger event while adding
+        # plain metadata identifying its source and timestamp interpretation.
+        volumeEvent.sourceType = event.type
+
+        if event.type == "digitalInput":
+            volumeEvent.deviceType = event.deviceType
+            volumeEvent.channel = event.channel
+            volumeEvent.edge = event.eventType
+            volumeEvent.sampleIndex = event.sampleIndex
+            volumeEvent.scanRate = event.scanRate
+            volumeEvent.sampleTime = event.sampleTime
+            volumeEvent.timestampMethod = event.timestampMethod
+            volumeEvent.readCompletedTimestamp = getattr(event, "readCompletedTimestamp", None)
+
+        self.state.volumeNumber += 1
+        self.data.events.append(volumeEvent)
+        
+    ################################################################
+    # Snapshot digital acquisition diagnostics into experiment data
+    ################################################################
+    def _snapshotDigitalInputStatus(self):
+        """
+        Copy plain digital acquisition diagnostics into experiment data.
+
+        Retains previous snapshots after devices have been unregistered.
+        Does not poll events, access hardware, or stop acquisition.
+        """
+        snapshots = dict(getattr(self.data, "digitalInputDiagnostics", {}))
+        devices = list(getattr(self, "_experimentInputDevices", []))
+
+        # Include shared hardware so diagnostics remain available after input
+        # unregistration but before the hardware ownership list is cleared.
+        for device in self.state.digitalIODevices:
+            if not any(existing is device for existing in devices):
+                devices.append(device)
+
+        errors = []
+
+        for device in devices:
+            getStatus = getattr(device, "getDigitalReadStatus", None)
+            if not callable(getStatus): continue
+
+            deviceKey = str(device.uuid)
+
+            try:
+                status = getStatus()
+
+                # An output-only LabJack has no digital acquisition to report.
+                if status.get("scanRate") is None and status.get("error") is None:
+                    continue
+
+                snapshots[deviceKey] = {
+                    "deviceType": device.deviceType,
+                    "deviceDescription": device.deviceDescription,
+                    "serialNumber": getattr(device, "serialNumber", None),
+                    "snapshotTimestamp": pglTimestamp.getSecs(),
+                    "configuredChannel": self.settings.volumeTriggerChannel,
+                    "configuredEdge": self.settings.volumeTriggerEdge[0] if self.settings.volumeTriggerEdge else None,
+                    "status": status,
+                }
+
+            except Exception as error:
+                # Preserve any earlier successful snapshot and record the
+                # snapshot failure without retaining its traceback object.
+                record = dict(snapshots.get(deviceKey, {}))
+                record["snapshotError"] = f"{type(error).__name__}: {error}"
+                snapshots[deviceKey] = record
+                errors.append(error)
+
+        self.data.digitalInputDiagnostics = snapshots
+        if errors: raise errors[0]
         return True
 
 ##############################################
@@ -4037,19 +4339,18 @@ class pglExperimentSettings(pglTraitSettings):
     @validate("subjectID")
     def _validateSubjectID(self, proposal):
         """Warn about unconventional subject IDs without rejecting the assignment."""
+        import re
+
         value = proposal["value"]
 
-        # Accept either capitalization and one or more digits.
+        # Accept a nonempty prefix containing at least one nondigit,
+        # followed by one or more digits.
         # Preserve the supplied ID, including capitalization and leading zeros.
-        if not (
-            len(value) >= 2
-            and value[0].lower() == "s"
-            and value[1:].isdigit()
-        ):
+        if not re.fullmatch(r".*[^0-9][0-9]+", value):
             pglMessages.warning(
-                f"Unconventional subjectID {value!r}. Expected 's' or 'S' "
-                "followed by one or more digits, such as 's1' or 'S00012'. "
-                "Continuing with the supplied subjectID.",
+                f"Unconventional subjectID {value!r}. Expected a text prefix "
+                "followed by one or more digits, such as 's1', 'subject00001', "
+                "or 'sdbp_nsdmini_0001'. Continuing with the supplied subjectID.",
                 level=2,
             )
 

@@ -142,16 +142,37 @@ class pglDevices:
 
     def devicesAdd(self, device):
         """
-        Add a pglDevice instance to the list of devices.
+        Register a device once, using object identity rather than settings UUID.
 
-        Args:
-            device (pglDevice): The device to add.
+        Registration does not start acquisition or transfer hardware ownership.
+
+        Returns:
+            bool: True when registered or already present, False for invalid input.
         """
-        if isinstance(device, pglDevice):
-            self.devices.append(device)
-            pglMessages.message(f"Added device: {device.deviceType}")
-        else:
+        if not isinstance(device, pglDevice):
             pglMessages.warning("Device must be an instance of pglDevice.")
+            return False
+
+        # The same hardware object may serve several experiment roles.
+        if any(existing is device for existing in self.devices): return True
+
+        self.devices.append(device)
+        pglMessages.message(f"Added device: {device.deviceType}")
+        return True
+
+    def devicesRemove(self, device):
+        """
+        Unregister a device without stopping or closing it.
+
+        The owner is responsible for acquisition shutdown and hardware cleanup.
+        Removes all registrations of this exact object, including old duplicates.
+
+        Returns:
+            bool: True if a registration was removed.
+        """
+        originalCount = len(self.devices)
+        self.devices[:] = [existing for existing in self.devices if existing is not device]
+        return len(self.devices) != originalCount
 
     def devicesGet(self, deviceType):
         '''

@@ -18,6 +18,7 @@ from .pglDevice import pglDigitalIODevice, pglAnalogInputDevice, pglAnalogTraceD
 import matplotlib.pyplot as plt
 from .pglMessages import pglMessages
 import time
+from .pglEvent import pglEventDigitalInput
 
 class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
     def __init__(self):
@@ -36,6 +37,10 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
 
         self.digitalOutputConfigured = False
         self.analogInputConfigured = False
+        
+        # Initialize digital acquisition before any hardware operation can fail.
+        self._initDigitalInput()
+        
         super().__init__(deviceType="LabJack")
         
         # import library, checking for errors
@@ -166,6 +171,11 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
                     pglMessages.warning("LabJack is not connected")
                     return False
 
+                # Never turn a monitored scanner input into an output.
+                if dioBit in self._digitalChannelBits.values():
+                    pglMessages.warning(f"{channelName} is currently reserved for digital input")
+                    return False
+
                 # Writing the individual pin LOW also sets it as an output.
                 self.ljm.eWriteAddress(self.h, channelAddress, channelType, 0)
 
@@ -212,6 +222,17 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
                 return None
           
     def startAnalogRead(self, duration=2, channels=[0], scanRate=1000, scansPerRead=1000, voltageRange=10.0):
+        """Start analog acquisition only when no digital stream owns the device."""
+        with self._streamControlLock:
+            thread = self._digitalThread
+            if self._digitalStreamActive or (thread is not None and thread.is_alive()):
+                raise RuntimeError("Cannot start analog acquisition while digital acquisition is active")
+            if self.acquisitionThread is not None and self.acquisitionThread.is_alive():
+                raise RuntimeError("Analog acquisition is already active")
+
+            return self._startAnalogRead(duration, channels, scanRate, scansPerRead, voltageRange)
+          
+    def _startAnalogRead(self, duration=2, channels=[0], scanRate=1000, scansPerRead=1000, voltageRange=10.0):
         '''
         Start analog input reading from specified channels.
         
@@ -382,26 +403,42 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
         return pglAnalogTraceData(time=sampleTimes, data=data, channelNames=self.channels)            
               
     def __del__(self):
-        """
-        Clean up the labJack instance
-        """
-        self.close()
-            
-    def close(self):
-        """Stop acquisition, wait for word output to finish, and close the device."""
-        self.stopEvent.set()
-
-        thread = self.acquisitionThread
-        if thread is not None and thread is not threading.current_thread() and thread.is_alive():
-            thread.join()
-
-        with self._wordPulseLock:
-            with self._digitalIOLock:
-                if self.h is not None:
-                    self.ljm.close(self.h)
-                    self.h = None
-                    self.digitalOutputConfigured = False
+        """Attempt cleanup; explicit close() remains required for reliable shutdown."""
+        try:
+            if getattr(self, "h", None) is not None: self.close()
+        except Exception:
+            # Explicit close() reports failures. Destructors cannot reliably
+            # report them, especially during interpreter shutdown.
+            pass            
         
+    def close(self):
+        """Stop acquisition, wait for word output, and close the shared device."""
+        with self._streamControlLock:
+            self._digitalStopEvent.set()
+            self.stopEvent.set()
+
+            # Join without holding locks required by acquisition workers.
+            for thread in (self._digitalThread, self.acquisitionThread):
+                if thread is threading.current_thread():
+                    raise RuntimeError("An acquisition worker cannot close its own LabJack")
+                if thread is not None and thread.is_alive(): thread.join(timeout=5.0)
+                if thread is not None and thread.is_alive():
+                    raise TimeoutError("Acquisition worker did not stop; refusing to close its active handle")
+
+            # Preserve the existing word-output / digital-IO lock order.
+            with self._wordPulseLock:
+                with self._digitalIOLock:
+                    if self.h is not None:
+                        self.ljm.close(self.h)
+                        self.h = None
+
+                    self._digitalStreamActive = False
+                    self._digitalChannelBits = {}
+                    self.digitalOutputConfigured = False
+                    self.analogInputConfigured = False
+
+            return True
+                
     def setupDigitalOutputWord(self, channels=None, **kwargs):
         """
         Configure T7 word channels in lowest-to-highest bit order.
@@ -595,3 +632,439 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
 
         finally:
             self._wordPulseLock.release()
+    
+    ################################################################
+    # Convert sampled digital states into timestamped edge events
+    ################################################################
+    @staticmethod
+    def _digitalEventsFromSamples(states, channelBits, previousState, firstSampleIndex, scanRate, streamStartTimestamp, edge="rising"):
+        """
+        Detect digital edges in one batch of decoded state bitmasks.
+
+        Args:
+            states: One-dimensional sequence of nonnegative integer bitmasks.
+            channelBits (dict): Physical channel names mapped to DIO bit indices.
+            previousState (int or None): Last state from the preceding batch.
+            firstSampleIndex (int): Zero-based acquisition index of this batch.
+            scanRate (float): Actual scan rate returned by the device.
+            streamStartTimestamp (float): Estimated host-clock time of sample zero.
+            edge (str): rising, falling, or both.
+
+        Returns:
+            tuple: (events, lastState), with events ordered by sample index.
+
+        The first sample establishes the baseline when previousState is None.
+        An input already active at acquisition start does not create an edge.
+        Missing or malformed samples raise rather than inventing transitions.
+        """
+        # Validate timing and configuration before processing the batch.
+        if edge not in {"rising", "falling", "both"}:
+            raise ValueError("edge must be rising, falling, or both")
+        if isinstance(firstSampleIndex, bool) or not isinstance(firstSampleIndex, (int, np.integer)) or firstSampleIndex < 0:
+            raise ValueError("firstSampleIndex must be a nonnegative integer")
+        if not np.isfinite(scanRate) or scanRate <= 0:
+            raise ValueError("scanRate must be finite and positive")
+        if not np.isfinite(streamStartTimestamp):
+            raise ValueError("streamStartTimestamp must be finite")
+        if not channelBits:
+            raise ValueError("At least one digital input channel is required")
+
+        for channel, bit in channelBits.items():
+            if not isinstance(channel, str) or not channel:
+                raise ValueError("Each channel name must be a nonempty string")
+            if isinstance(bit, bool) or not isinstance(bit, (int, np.integer)) or not 0 <= bit < 23:
+                raise ValueError("Each T7 DIO bit index must be an integer from 0 through 22")
+
+        if len(set(channelBits.values())) != len(channelBits):
+            raise ValueError("Multiple channel names refer to the same physical input")
+
+        # LJM returns numeric samples; accept integral floats but reject missing-data markers.
+        stateValues = np.asarray(states, dtype=np.float64)
+        if stateValues.ndim != 1:
+            raise ValueError("Digital states must be a one-dimensional sequence")
+        if not np.all(np.isfinite(stateValues)):
+            raise ValueError("Digital stream contains nonfinite samples")
+        if np.any((stateValues < 0) | (stateValues > (1 << 23) - 1) | (stateValues != np.floor(stateValues))):
+            raise ValueError("Digital stream contains missing or invalid state samples")
+
+        if previousState is not None:
+            if isinstance(previousState, bool) or not isinstance(previousState, (int, np.integer)) or not 0 <= previousState < (1 << 23):
+                raise ValueError("previousState must be a valid DIO bitmask or None")
+
+        if stateValues.size == 0:
+            return [], previousState
+
+        # Carry the previous batch's final sample into this batch's edge comparison.
+        currentStates = stateValues.astype(np.uint32)
+        previousStates = np.empty_like(currentStates)
+        previousStates[0] = currentStates[0] if previousState is None else previousState
+        previousStates[1:] = currentStates[:-1]
+
+        # Compare only monitored bits; changes on other pins do not create events.
+        monitoredMask = sum(1 << int(bit) for bit in channelBits.values())
+        changedBits = (currentStates ^ previousStates) & np.uint32(monitoredMask)
+        changedRows = np.flatnonzero(changedBits)
+
+        # Iterate only over samples containing changes, not every acquired sample.
+        events = []
+        for row in changedRows:
+            sampleIndex = int(firstSampleIndex) + int(row)
+            timestamp = float(streamStartTimestamp + sampleIndex / scanRate)
+            state = int(currentStates[row])
+            changed = int(changedBits[row])
+
+            # Simultaneous channel changes share a timestamp and follow channel order.
+            for channel, bit in channelBits.items():
+                mask = 1 << int(bit)
+                if not changed & mask:
+                    continue
+
+                eventType = "rising" if state & mask else "falling"
+                if edge != "both" and eventType != edge:
+                    continue
+
+                events.append(pglEventDigitalInput(channel=channel, eventType=eventType, timestamp=timestamp, sampleIndex=sampleIndex, scanRate=float(scanRate), deviceType="LabJack"))
+
+        return events, int(currentStates[-1])
+    
+    ################################################################
+    # Initialize runtime-only digital acquisition state
+    ################################################################
+    def _initDigitalInput(self):
+        """Initialize stream lifecycle, event buffering, and diagnostics."""
+        self._streamControlLock = threading.RLock()
+        self._digitalEventLock = threading.Lock()
+        self._digitalStopEvent = threading.Event()
+        self._digitalThread = None
+        self._digitalStreamActive = False
+        self._digitalChannelBits = {}
+        self._digitalEvents = []
+        self._digitalError = None
+        self._digitalStats = {}
+        self._digitalUnknownReported = 0
+        self._digitalMaxEvents = 10000
+        
+    ################################################################
+    # Start digital acquisition on the existing LabJack connection
+    ################################################################
+    def startDigitalRead(self, channels=("FIO0",), edge="rising", scanRate=100000.0, scansPerRead=100):
+        """
+        Start continuous FIO acquisition using the existing device handle.
+
+        Supports FIO0–FIO7 and equivalent DIO0–DIO7 names.
+        Events use canonical FIO names.
+
+        Only one analog or digital stream may run on this device.
+        Pending events must be polled before restarting acquisition.
+
+        Host timestamps use the midpoint of the stream-start call as an
+        estimated sample-zero time. This is not calibrated synchronization.
+
+        Returns:
+            float: Actual scan rate returned by LJM.
+
+        Raises:
+            Exception: Invalid configuration, conflicts, or startup failure.
+        """
+        import re
+
+        channels = [channels] if isinstance(channels, str) else list(channels)
+        if not channels: raise ValueError("At least one digital input is required")
+        if edge not in {"rising", "falling", "both"}:
+            raise ValueError("edge must be rising, falling, or both")
+        if isinstance(scanRate, (bool, np.bool_)):
+            raise ValueError("scanRate must be finite and positive")
+        scanRate = float(scanRate)
+        if not np.isfinite(scanRate) or scanRate <= 0:
+            raise ValueError("scanRate must be finite and positive")
+        if isinstance(scansPerRead, bool) or not isinstance(scansPerRead, int) or scansPerRead <= 0:
+            raise ValueError("scansPerRead must be a positive integer")
+
+        # Normalize physical aliases before checking for input/output conflicts.
+        channelBits = {}
+        for channel in channels:
+            if not isinstance(channel, str): raise ValueError("Channels must be physical pin names")
+            match = re.fullmatch(r"(FIO|DIO)([0-7])", channel.strip().upper())
+            if match is None: raise ValueError("Digital capture currently supports only FIO0–FIO7 / DIO0–DIO7")
+            bit = int(match.group(2))
+            name = f"FIO{bit}"
+            if name in channelBits: raise ValueError(f"Duplicate physical input: {name}")
+            channelBits[name] = bit
+
+        with self._streamControlLock:
+            if self.h is None: raise RuntimeError("LabJack is not connected")
+            if self.type != "T7": raise RuntimeError("This digital reader currently supports T7 only")
+            if self._digitalThread is not None and self._digitalThread.is_alive():
+                raise RuntimeError("Digital acquisition is already running")
+            if self._digitalStreamActive:
+                raise RuntimeError("Previous digital stream did not stop successfully; close and reopen the device")
+            if self.isReading or (self.acquisitionThread is not None and self.acquisitionThread.is_alive()):
+                raise RuntimeError("Cannot start digital acquisition while analog acquisition is active")
+
+            with self._digitalEventLock:
+                if self._digitalEvents:
+                    raise RuntimeError("Poll pending digital events before starting another acquisition")
+
+            # Match the existing output lock order. Configuration and stream
+            # startup must not race a pin-output configuration.
+            with self._wordPulseLock:
+                with self._digitalIOLock:
+                    outputBits = {config["dioBit"] for config in self.digitalChannels.values()}
+                    conflicts = outputBits.intersection(channelBits.values())
+                    if conflicts:
+                        raise RuntimeError(f"Digital inputs overlap configured output pins: {sorted(conflicts)}")
+
+                    with self._digitalEventLock:
+                        self._digitalError = None
+                        self._digitalUnknownReported = 0
+                        self._digitalStats = {
+                            "requestedScanRate": scanRate,
+                            "scanRate": None,
+                            "scansPerRead": scansPerRead,
+                            "samplesProcessed": 0,
+                            "eventsDetected": 0,
+                            "unknownSamples": 0,
+                            "firstUnknownIndices": [],
+                            "maxDeviceBacklog": 0,
+                            "maxLJMBacklog": 0,
+                            "maxReadDuration": 0.0,
+                            "startCallBefore": None,
+                            "startCallAfter": None,
+                            "timestampMethod": "streamStartMidpointEstimate",
+                        }
+
+                    self._digitalChannelBits = channelBits
+                    self._digitalStopEvent.clear()
+
+                    try:
+                        # Configure only selected pins as inputs.
+                        for bit in channelBits.values(): self.ljm.eReadName(self.h, f"DIO{bit}")
+
+                        self.ljm.eWriteName(self.h, "STREAM_TRIGGER_INDEX", 0)
+                        self.ljm.eWriteName(self.h, "STREAM_CLOCK_SOURCE", 0)
+                        address = self.ljm.nameToAddress("FIO_STATE")[0]
+
+                        before = pglTimestamp.getSecs()
+                        actualScanRate = self.ljm.eStreamStart(self.h, scansPerRead, 1, [address], scanRate)
+                        self._digitalStreamActive = True
+                        after = pglTimestamp.getSecs()
+
+                        if not np.isfinite(actualScanRate) or actualScanRate <= 0:
+                            raise RuntimeError(f"Invalid actual scan rate: {actualScanRate}")
+
+                        with self._digitalEventLock:
+                            self._digitalStats.update({
+                                "scanRate": float(actualScanRate),
+                                "startCallBefore": before,
+                                "startCallAfter": after,
+                            })
+
+                        # Pass immutable acquisition configuration to the worker.
+                        self._digitalThread = threading.Thread(
+                            target=self._digitalReadThread,
+                            args=(dict(channelBits), edge, float(actualScanRate), (before + after) / 2),
+                            name="pglLabJackDigitalInput",
+                            daemon=True,
+                        )
+                        self._digitalThread.start()
+
+                    except BaseException:
+                        # If thread startup failed, there is no worker to stop
+                        # the hardware stream. Preserve the original exception.
+                        if self._digitalStreamActive:
+                            try:
+                                self.ljm.eStreamStop(self.h)
+                                self._digitalStreamActive = False
+                            except Exception as cleanupError:
+                                self._setDigitalReadError(f"Startup cleanup failed: {cleanupError}")
+
+                        if not self._digitalStreamActive: self._digitalChannelBits = {}
+                        raise
+
+            pglMessages.message(f"LabJack digital input: {', '.join(channelBits)}, {edge}, actual scan rate {actualScanRate:g} Hz")
+            return float(actualScanRate)
+
+    ################################################################
+    # Read digital samples and queue timestamped edges
+    ################################################################
+    def _digitalReadThread(self, channelBits, edge, scanRate, streamStartTimestamp):
+        """Acquire on the existing handle; never mutate experiment data."""
+        previousState = None
+        firstSampleIndex = 0
+
+        try:
+            while not self._digitalStopEvent.is_set():
+                # Serialize hardware calls with existing digital output calls.
+                # Do not hold the event-buffer lock during a native read.
+                with self._digitalIOLock:
+                    if self._digitalStopEvent.is_set(): break
+                    readBefore = time.perf_counter()
+                    values, deviceBacklog, ljmBacklog = self.ljm.eStreamRead(self.h)
+                    readDuration = time.perf_counter() - readBefore
+                    readCompletedTimestamp = pglTimestamp.getSecs()
+
+                batch = np.asarray(values, dtype=np.float64)
+                if batch.ndim != 1 or batch.size == 0:
+                    raise RuntimeError("LJM returned an empty or malformed digital batch")
+
+                with self._digitalEventLock:
+                    stats = self._digitalStats
+                    stats["maxReadDuration"] = max(stats["maxReadDuration"], readDuration)
+                    stats["maxDeviceBacklog"] = max(stats["maxDeviceBacklog"], int(deviceBacklog))
+                    stats["maxLJMBacklog"] = max(stats["maxLJMBacklog"], int(ljmBacklog))
+
+                # Fail explicitly on skipped/malformed samples. Never remove
+                # markers and compress the acquisition timeline.
+                skipped = np.flatnonzero(batch == -9999)
+                if skipped.size:
+                    raise RuntimeError(f"LJM skipped-sample marker at index {firstSampleIndex + int(skipped[0])}")
+
+                invalid = ~np.isfinite(batch) | (batch < 0) | (batch > 65535) | (batch != np.floor(batch))
+                if np.any(invalid):
+                    row = int(np.flatnonzero(invalid)[0])
+                    raise RuntimeError(f"Invalid digital sample at index {firstSampleIndex + row}: {batch[row]}")
+
+                # Provisional workaround: upper-bit words are uncertain, not
+                # triggers. Keep their positions and reset comparison across gaps.
+                unknownRows = np.flatnonzero(batch > 255)
+                if unknownRows.size:
+                    with self._digitalEventLock:
+                        self._digitalStats["unknownSamples"] += int(unknownRows.size)
+                        savedIndices = self._digitalStats["firstUnknownIndices"]
+                        remaining = max(0, 100 - len(savedIndices))
+                        savedIndices.extend(int(firstSampleIndex + row) for row in unknownRows[:remaining])
+
+                events = []
+                spanStart = 0
+
+                for spanEnd in list(unknownRows) + [batch.size]:
+                    spanEnd = int(spanEnd)
+
+                    if spanEnd > spanStart:
+                        spanEvents, previousState = self._digitalEventsFromSamples(
+                            batch[spanStart:spanEnd], channelBits, previousState,
+                            firstSampleIndex + spanStart, scanRate,
+                            streamStartTimestamp, edge=edge,
+                        )
+                        events.extend(spanEvents)
+
+                    if spanEnd < batch.size:
+                        previousState = None
+                        spanStart = spanEnd + 1
+
+                for event in events:
+                    event.timestampMethod = "streamStartMidpointEstimate"
+                    event.readCompletedTimestamp = readCompletedTimestamp
+
+                with self._digitalEventLock:
+                    self._digitalStats["eventsDetected"] += len(events)
+                    if len(self._digitalEvents) + len(events) > self._digitalMaxEvents:
+                        raise RuntimeError("Digital event buffer overflow; incoming events were not queued")
+
+                    self._digitalEvents.extend(events)
+                    firstSampleIndex += batch.size
+                    self._digitalStats["samplesProcessed"] = firstSampleIndex
+
+        except Exception as error:
+            self._setDigitalReadError(f"{type(error).__name__}: {error}")
+
+        finally:
+            # Stop the stream, but do not close the shared input/output handle.
+            try:
+                with self._digitalIOLock:
+                    if self._digitalStreamActive:
+                        self.ljm.eStreamStop(self.h)
+                        self._digitalStreamActive = False
+                    self._digitalChannelBits = {}
+            except Exception as error:
+                self._setDigitalReadError(f"Digital stream stop failed: {type(error).__name__}: {error}")
+
+    ################################################################
+    # Retain worker failures without retaining traceback objects
+    ################################################################
+    def _setDigitalReadError(self, message):
+        with self._digitalEventLock:
+            if self._digitalError is None: self._digitalError = str(message)
+            else: self._digitalError += f"; {message}"
+
+    ################################################################
+    # Poll completed input events without touching hardware
+    ################################################################
+    def poll(self):
+        """
+        Drain queued digital events and warn once per acquisition about gaps.
+
+        All uncertain samples remain counted in getDigitalReadStatus().
+        Already-acquired events are returned before a latched error is raised
+        on a subsequent empty poll. stopDigitalRead() also reports that error.
+        """
+        with self._digitalEventLock:
+            events = self._digitalEvents
+            self._digitalEvents = []
+            error = self._digitalError
+            unknownCount = self._digitalStats.get("unknownSamples", 0)
+
+            # Avoid repeated warning output in the experiment's polling loop.
+            # startDigitalRead() resets this counter for each acquisition.
+            reportUnknown = unknownCount > 0 and self._digitalUnknownReported == 0
+            self._digitalUnknownReported = unknownCount
+
+        if reportUnknown:
+            pglMessages.warning(
+                "LabJack digital input encountered uncertain samples. "
+                "They are excluded from edge detection; triggers at these gaps "
+                "may be missed. Further occurrences are counted in "
+                "getDigitalReadStatus() without repeating this warning.", level=1
+            )
+
+        if events: return events
+        if error is not None: raise RuntimeError(f"LabJack digital acquisition failed: {error}")
+        return []
+
+    ################################################################
+    # Snapshot acquisition diagnostics
+    ################################################################
+    def getDigitalReadStatus(self):
+        """Return plain diagnostic values, not live buffers or locks."""
+        with self._digitalEventLock:
+            status = dict(self._digitalStats)
+            status["firstUnknownIndices"] = list(status.get("firstUnknownIndices", []))
+            status["pendingEvents"] = len(self._digitalEvents)
+            status["error"] = self._digitalError
+
+        thread = self._digitalThread
+        status["running"] = thread is not None and thread.is_alive()
+        status["streamActive"] = self._digitalStreamActive
+        return status
+
+    ################################################################
+    # Stop digital acquisition while preserving queued events
+    ################################################################
+    def stopDigitalRead(self, timeout=5.0):
+        """
+        Stop the worker without closing the shared connection.
+
+        Pending events remain available through poll().
+        A timeout leaves the handle open because the worker may still use it.
+        """
+        if not np.isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout must be finite and positive")
+
+        with self._streamControlLock:
+            self._digitalStopEvent.set()
+            thread = self._digitalThread
+
+            if thread is threading.current_thread():
+                raise RuntimeError("The acquisition worker cannot join itself")
+
+            if thread is not None and thread.is_alive(): thread.join(timeout=timeout)
+            if thread is not None and thread.is_alive():
+                raise TimeoutError("Digital worker did not stop; the LabJack handle remains open")
+
+            status = self.getDigitalReadStatus()
+            if status["error"] is not None:
+                raise RuntimeError(f"LabJack digital acquisition failed: {status['error']}")
+            if self._digitalStreamActive:
+                raise RuntimeError("Digital hardware stream did not stop successfully")
+
+            return status

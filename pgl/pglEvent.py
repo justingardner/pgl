@@ -204,3 +204,39 @@ class pglEventKeyboard(pglEvent):
         if self.cmd: modifierStr += "Cmd "
         return f"(pglEventKeyboard) Key: {self.keyChar}, KeyCode: {self.keyCode}, Timestamp: {self.timestamp}, Modifiers: {modifierStr.strip()}, Event Type: {self.eventType}"
 
+#################################################################
+# Digital input event
+#################################################################
+class pglEventDigitalInput(pglEvent):
+    """An acquired digital edge with sample timing and a host-clock timestamp."""
+
+    def __init__(self, channel=None, eventType=None, timestamp=None, sampleIndex=None, scanRate=None, deviceType=None, timestampMethod="streamEstimate"):
+        """
+        Args:
+            channel (str): Physical input name, such as FIO0.
+            eventType (str): rising or falling.
+            timestamp (float): Estimated edge time in the pglTimestamp clock domain.
+            sampleIndex (int): Zero-based scan index within this acquisition.
+            scanRate (float): Actual scan rate returned by the device.
+            deviceType (str): Device that acquired the event.
+            timestampMethod (str): How the host-clock timestamp was obtained.
+
+        The timestamp identifies the first sample showing the new state.
+        Sample resolution and absolute host-clock alignment are separate.
+        """
+        super().__init__(type="digitalInput")
+
+        # Physical source and edge polarity.
+        self.channel = channel
+        self.eventType = eventType
+        self.deviceType = deviceType
+
+        # Preserve sample timing independently of the estimated host-clock mapping.
+        self.sampleIndex = sampleIndex
+        self.scanRate = scanRate
+        self.sampleTime = sampleIndex / scanRate if sampleIndex is not None and scanRate is not None else None
+        self.timestamp = timestamp
+        self.timestampMethod = timestampMethod
+
+    def __repr__(self):
+        return f"<pglEventDigitalInput channel={self.channel!r} edge={self.eventType!r} timestamp={self.timestamp} sampleIndex={self.sampleIndex}>"
