@@ -1686,6 +1686,7 @@ class pglImageDatabase(pglStimulusDatabase):
 
         database._runStarted = runStarted
         return database
+    
     @staticmethod
     def _getRunImageFilename(stimulus, stimulusNum):
         '''

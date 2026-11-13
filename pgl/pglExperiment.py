@@ -2814,6 +2814,7 @@ class pglTaskSettings(pglTraitSettings):
     saveEyeTracker = Bool(False, help="Whether to save eye tracker events this task (if we have an eye tracker).")    
     taskID = Int(0, help="Numeric identifier for the task, used for pglExperiment to keep track of tasks.")
     verbose = Bool(True, help="Print routine task messages and trial parameters. Does not suppress warnings or errors.")
+    trialPrintNewline = Bool(True, help="Print a newline after each trial's parameters.")
     isMainTask = Bool(False, help="Use this task to judge whether enough trials ran. If no tasks are marked, all tasks are candidates.")
     
     # make sure that any settings that the experimenter writes into settings get saved
@@ -3623,7 +3624,7 @@ class pglTask(pglTaskBase):
         if self.settings.verbose:
             pglMessages.print(f"({self.settings.taskName}) Trial {self.state.currentTrial + 1}: ", end='', messageType='experiment')
             for name, value in self.currentParams.items(): pglMessages.print(f'{name}={value}', end=' ', messageType='experiment')
-            pglMessages.print("", messageType='experiment')
+            pglMessages.print("", end="\n" if self.settings.trialPrintNewline else " ", messageType='experiment')
 
         # Start segment zero using this trial's finalized timing.
         self._startSegment(startTime)
