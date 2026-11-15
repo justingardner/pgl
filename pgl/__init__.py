@@ -102,7 +102,9 @@ _EXPORTS = {
  'pglVWFATask': ('.pglVWFA', 'pglVWFATask'),
  'pglEyelink': ('.pglEyelink', 'pglEyelink'),
  'pgl': ('._graphics', 'pgl'),
- 'pglInfo': ('.pglInfo', 'pglInfo')}
+ 'pglInfo': ('.pglInfo', 'pglInfo'),
+ 'pglAFNI': ('.pglExternalTools', 'pglAFNI')
+}
 
 _resolved_exports = {}
 __all__ = list(_EXPORTS)

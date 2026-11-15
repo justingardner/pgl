@@ -1905,8 +1905,8 @@ No existing installation stage will be silently overwritten or retried.
         pglMessages.print(details)
 
         if not pglDialogs.confirm(
-            "Install AFNI: administrator setup",
             "Review the official scripts and system changes. Administrator setup requires a reboot afterward.",
+            title="Install AFNI: administrator setup",
             details=details,
             confirmButtonText="Run in Terminal",
             copyText="Copy instructions",
@@ -2806,8 +2806,8 @@ sys.exit(exitCode)
             acknowledgment += "\nHave you also completed the required restart?"
 
         if not pglDialogs.confirm(
-            "AFNI installation prerequisites",
             acknowledgment,
+            title="AFNI installation prerequisites",
             confirmButtonText="Prerequisites completed",
         ):
             return None
@@ -3012,8 +3012,8 @@ PREPARED SCRIPT
         pglMessages.print(details)
 
         if not pglDialogs.confirm(
-            "Install AFNI: user setup",
             "Review the installation script, destinations, and environment before launching Terminal.",
+            title="Install AFNI: user setup",
             details=details,
             confirmButtonText="Run in Terminal",
             copyText="Copy instructions",
@@ -3237,8 +3237,8 @@ PREPARED SCRIPT
         pglMessages.print(details)
 
         if not pglDialogs.confirm(
-            "Review AFNI installation",
             "Have you reviewed these diagnostics and resolved issues required for your intended use?",
+            title="Review AFNI installation",
             details=details,
             confirmButtonText="Accept diagnostics",
             copyText="Copy reports",
