@@ -1,0 +1,3297 @@
+################################################################
+#   filename: pglExternalTools.py
+#    purpose: External-tool execution context and provenance
+#         by: JLG
+#       date: Nov 15, 2026
+################################################################
+
+#############
+# Imports
+#############
+from contextlib import contextmanager
+from contextvars import ContextVar
+from copy import deepcopy
+from datetime import datetime, timezone
+import math
+import time
+from uuid import uuid4
+
+
+# Track execution ownership without passing a recorder through every call.
+# Nested actions temporarily replace this value and then restore their parent.
+_activeExecutionRecorder = ContextVar("pglActiveExecutionRecorder", default=None)
+
+
+################################################################
+# Get the current execution recorder
+################################################################
+def getExecutionRecorder(): return _activeExecutionRecorder.get()
+
+
+################################################################
+# Validate and copy portable provenance
+################################################################
+def _copyProvenance(value):
+    """Return independent JSON-compatible metadata without coercing values.
+
+    Accepts built-in dictionaries, lists, strings, finite numbers, Booleans,
+    and None. Rejects cycles, non-string keys, and arbitrary runtime objects.
+
+    Validation happens before records are installed in a recorder.
+    """
+    active = set()
+
+    def validate(item):
+        if item is None or type(item) in (str, bool, int): return
+
+        if type(item) is float:
+            if not math.isfinite(item): raise ValueError("Provenance numbers must be finite.")
+            return
+
+        if type(item) not in (dict, list):
+            raise TypeError(f"Unsupported provenance type: {type(item).__name__}.")
+
+        identity = id(item)
+        if identity in active: raise ValueError("Provenance must not contain circular references.")
+
+        active.add(identity)
+
+        try:
+            if type(item) is dict:
+                for key, child in item.items():
+                    if type(key) is not str: raise TypeError("Provenance dictionary keys must be strings.")
+                    validate(child)
+            else:
+                for child in item: validate(child)
+        finally:
+            active.remove(identity)
+
+    validate(value)
+    return deepcopy(value)
+
+
+################################################################
+# Capture baseline runtime information
+################################################################
+def getRuntimeEnvironment():
+    """Capture baseline runtime metadata without launching external tools.
+
+    Reads OS information and installed Python distribution metadata.
+    Does not import those distributions, inspect credentials, record the
+    hostname/username, dump environment variables, or create files.
+
+    Installed distribution versions are an inventory, not proof of which
+    packages were imported or of their exact source contents.
+
+    Tool builds, effective tool environments, containers, GPU libraries,
+    and source-control state require additional capture in later adapters.
+    Their absence is explicitly recorded rather than inferred.
+
+    Every call takes a fresh snapshot. No process-wide inventory cache hides
+    packages installed or changed between executions.
+    """
+    import importlib.metadata
+    import platform
+    import struct
+    import sys
+
+    environment = {
+        "schemaVersion": 1,
+        "capturedAt": datetime.now(timezone.utc).isoformat(),
+        "operatingSystem": {},
+        "python": {
+            "version": sys.version,
+            "implementation": sys.implementation.name,
+            "cacheTag": sys.implementation.cache_tag,
+            "pointerBits": struct.calcsize("P") * 8,
+        },
+        "packages": {
+            "status": "captured",
+            "distributions": [],
+            "errors": [],
+        },
+        "notCaptured": [
+            "External executable identities and builds",
+            "Effective external-tool environment and execution controls",
+            "Container image identity",
+            "GPU and numerical backend runtime details",
+            "Source-control revision and local modifications",
+        ],
+    }
+
+    # Do not use platform.platform() or record uname.node: the hostname is
+    # unnecessary for scientific reproducibility and may identify a machine.
+    try:
+        system = platform.uname()
+        environment["operatingSystem"] = {
+            "status": "captured",
+            "system": system.system,
+            "release": system.release,
+            "version": system.version,
+            "machine": system.machine,
+        }
+
+        if system.system == "Darwin":
+            environment["operatingSystem"]["macOSVersion"] = platform.mac_ver()[0]
+
+        if system.system == "Linux":
+            try:
+                release = platform.freedesktop_os_release()
+                environment["operatingSystem"]["distribution"] = {
+                    key: release[key]
+                    for key in ("ID", "ID_LIKE", "NAME", "VERSION_ID", "VERSION", "PRETTY_NAME")
+                    if key in release
+                }
+            except Exception as error:
+                environment["operatingSystem"]["distribution"] = {
+                    "status": "unavailable",
+                    "errorType": type(error).__name__,
+                }
+
+    except Exception as error:
+        environment["operatingSystem"] = {
+            "status": "unavailable",
+            "errorType": type(error).__name__,
+        }
+
+    packages = environment["packages"]
+
+    try:
+        for distribution in importlib.metadata.distributions():
+            try:
+                name = distribution.metadata.get("Name")
+                version = distribution.version
+
+                if not isinstance(name, str) or not name.strip():
+                    raise ValueError("Distribution has no usable name.")
+                if not isinstance(version, str) or not version.strip():
+                    raise ValueError("Distribution has no usable version.")
+
+                # Retain repeated distribution records rather than silently
+                # selecting one of several installations with the same name.
+                packages["distributions"].append({"name": name, "version": version})
+
+            except Exception as error:
+                packages["errors"].append({
+                    "errorType": type(error).__name__,
+                    "description": "Could not identify an installed distribution.",
+                })
+
+    except Exception as error:
+        packages["status"] = "partial" if packages["distributions"] else "unavailable"
+        packages["errors"].append({
+            "errorType": type(error).__name__,
+            "description": "Could not complete the installed distribution inventory.",
+        })
+
+    if packages["errors"] and packages["status"] == "captured":
+        packages["status"] = "partial"
+
+    packages["distributions"].sort(key=lambda item: (item["name"].casefold(), item["version"]))
+    return _copyProvenance(environment)
+
+
+################################################################
+# Execution recorder
+################################################################
+class pglExecutionRecorder:
+    """Collect portable provenance for one action or standalone execution.
+
+    actionID:
+        UUID of the owning action execution, or None for standalone use.
+
+    Construction captures baseline environment information unless an explicit
+    environment snapshot is supplied.
+
+    activate() installs this recorder only for the enclosed execution context.
+    close() freezes recording and marks unfinished invocations incomplete.
+
+    Records are private. Export methods return independent copies so callers
+    cannot accidentally mutate execution provenance through returned values.
+
+    This initial implementation records invocation metadata only. It does not
+    execute commands, publish files, or implement the artifact registry.
+
+    Concurrent mutation of one recorder is unsupported. Worker threads and
+    processes will need explicit execution-context/record-merging support.
+    """
+
+    def __init__(self, actionID=None, *, environment=None):
+        if actionID is not None:
+            if not isinstance(actionID, str) or not actionID.strip():
+                raise ValueError("actionID must be a nonblank string or None.")
+
+        snapshot = getRuntimeEnvironment() if environment is None else _copyProvenance(environment)
+        if type(snapshot) is not dict: raise TypeError("environment must be a dictionary.")
+
+        self._actionID = actionID
+        self._environment = snapshot
+        self._invocations = []
+        self._openInvocations = {}
+        self._active = False
+        self._closed = False
+
+    @property
+    def actionID(self): return self._actionID
+
+    @property
+    def isClosed(self): return self._closed
+
+    ################################################################
+    # Activate recording for this execution context
+    ################################################################
+    @contextmanager
+    def activate(self):
+        """Activate this recorder and restore the previous one on every exit."""
+        self._requireOpen()
+        if self._active: raise RuntimeError("This recorder is already active.")
+
+        token = _activeExecutionRecorder.set(self)
+        self._active = True
+
+        try:
+            yield self
+        finally:
+            try:
+                _activeExecutionRecorder.reset(token)
+            finally:
+                self._active = False
+
+    def _requireOpen(self):
+        if self._closed: raise RuntimeError("This execution recorder is closed.")
+
+    ################################################################
+    # Begin an invocation before attempting execution
+    ################################################################
+    def beginInvocation(self, specification):
+        """Record an invocation attempt and return its UUID.
+
+        specification is a JSON-compatible dictionary prepared by a tool
+        adapter. It will describe executable identity, parameters, arguments,
+        declared inputs/outputs, and relevant effective environment.
+
+        The caller must redact secrets before supplying metadata. This generic
+        recorder cannot infer which arbitrary argument values are sensitive.
+        """
+        self._requireOpen()
+        specification = _copyProvenance(specification)
+        if type(specification) is not dict: raise TypeError("specification must be a dictionary.")
+
+        invocationID = str(uuid4())
+        record = {
+            "schemaVersion": 1,
+            "invocationID": invocationID,
+            "actionID": self._actionID,
+            "specification": specification,
+            "status": "running",
+            "startedAt": datetime.now(timezone.utc).isoformat(),
+            "endedAt": None,
+            "durationSeconds": None,
+            "result": {},
+            "error": None,
+        }
+
+        self._invocations.append(record)
+        self._openInvocations[invocationID] = (record, time.perf_counter())
+        return invocationID
+
+    ################################################################
+    # Complete an invocation
+    ################################################################
+    def finishInvocation(self, invocationID, *, status="success", result=None, error=None):
+        """Finalize one attempt after execution and output validation.
+
+        status is success, failed, or interrupted.
+        result holds portable execution/output details.
+        error is an explicitly prepared, JSON-compatible diagnostic dictionary.
+
+        Tool adapters decide whether a result is successful. A subprocess
+        exiting zero alone does not establish scientific output validity.
+        """
+        self._requireOpen()
+
+        if status not in ("success", "failed", "interrupted"):
+            raise ValueError("Invocation status must be success, failed, or interrupted.")
+
+        if not isinstance(invocationID, str) or invocationID not in self._openInvocations:
+            raise ValueError("Invocation is unknown or has already been finalized.")
+
+        result = {} if result is None else _copyProvenance(result)
+        error = None if error is None else _copyProvenance(error)
+
+        if type(result) is not dict: raise TypeError("result must be a dictionary.")
+        if error is not None and type(error) is not dict: raise TypeError("error must be a dictionary or None.")
+        if status == "success" and error is not None:
+            raise ValueError("A successful invocation must not have an error record.")
+
+        record, started = self._openInvocations[invocationID]
+        record.update({
+            "status": status,
+            "endedAt": datetime.now(timezone.utc).isoformat(),
+            "durationSeconds": max(0.0, time.perf_counter() - started),
+            "result": result,
+            "error": error,
+        })
+        del self._openInvocations[invocationID]
+
+    ################################################################
+    # Validate completion before reporting action success
+    ################################################################
+    def requireComplete(self):
+        """Reject an execution that left tool attempts without outcomes."""
+        self._requireOpen()
+        if self._openInvocations:
+            raise RuntimeError(f"{len(self._openInvocations)} tool invocation(s) were not finalized.")
+
+    ################################################################
+    # Freeze recording
+    ################################################################
+    def close(self):
+        """Freeze records, retaining unfinished attempts as incomplete.
+
+        Incomplete means no verified outcome was supplied. It does not claim
+        that an external process was stopped or that its files were removed.
+        """
+        if self._closed: return
+
+        for record, started in self._openInvocations.values():
+            record.update({
+                "status": "incomplete",
+                "endedAt": datetime.now(timezone.utc).isoformat(),
+                "durationSeconds": max(0.0, time.perf_counter() - started),
+                "error": {
+                    "kind": "missingOutcome",
+                    "message": "Recording ended before this invocation supplied a verified outcome.",
+                },
+            })
+
+        self._openInvocations.clear()
+        self._closed = True
+
+    ################################################################
+    # Export independent metadata snapshots
+    ################################################################
+    def exportEnvironment(self): return deepcopy(self._environment)
+
+    def exportInvocations(self): return deepcopy(self._invocations)
+    
+    ################################################################
+# External-tool execution result
+################################################################
+class pglToolResult:
+    """One external-command result with its execution provenance.
+
+    Log files remain available after execution, including failed execution.
+    The caller owns their retention until managed artifact integration exists.
+
+    provenance returns an independent snapshot. Local paths are diagnostic
+    runtime locations, not portable checkpoint payload references.
+    """
+
+    def __init__(self, invocationID, *, logDirectory=None):
+        self.invocationID = invocationID
+        self.returnCode = None
+        self.status = "running"
+        self.logDirectory = logDirectory
+        self.stdoutPath = None
+        self.stderrPath = None
+        self._provenance = {}
+
+    @property
+    def provenance(self): return deepcopy(self._provenance)
+
+    def print(self):
+        """Print a short execution summary without dumping command output."""
+        from .pglMessages import pglMessages
+
+        pglMessages.print(f"Tool execution: {self.status}, return code: {self.returnCode}")
+        if self.stdoutPath is not None: pglMessages.print(f"stdout: {self.stdoutPath}")
+        if self.stderrPath is not None: pglMessages.print(f"stderr: {self.stderrPath}")
+
+    def saveProvenance(self, filename):
+        """Write provenance to a new JSON file without overwriting."""
+        import json
+        from pathlib import Path
+
+        path = Path(filename).expanduser().absolute()
+        content = json.dumps(self._provenance, sort_keys=True, indent=2, allow_nan=False)
+
+        with path.open("x", encoding="utf-8") as target:
+            target.write(content)
+
+        return path
+
+
+################################################################
+# External-tool execution error
+################################################################
+class pglToolExecutionError(RuntimeError):
+    """Execution failure carrying the failed result and retained log paths."""
+
+    def __init__(self, message, result):
+        super().__init__(message)
+        self.result = result
+
+
+################################################################
+# Shared external-tool runner
+################################################################
+class pglExternalTool:
+    """Execute external commands with automatic execution provenance.
+
+    executable:
+        Optional default command name or executable path.
+
+    directory:
+        Optional explicit installation executable directory. Bare command
+        names are resolved only within this directory when it is supplied.
+
+    Package adapters will add version probes, command definitions, scientific
+    output validation, and installation procedures.
+
+    This base runner does not:
+        Interpret arbitrary arguments as scientific inputs/outputs.
+        Validate scientific results.
+        Install missing tools.
+        Execute through a shell.
+        Register logs or outputs as session-derived artifacts.
+
+    Commands and log contents may contain sensitive information. Do not pass
+    credentials in arguments. Package adapters must implement redaction before
+    supporting commands with sensitive parameters.
+
+    Concurrent commands must not share one active recorder. Parallel execution
+    requires explicit per-execution contexts and record aggregation.
+    """
+
+    # Record only relevant, explicitly selected environment controls.
+    # Never dump the complete environment, PATH, or authentication variables.
+    recordedEnvironmentNames = (
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS",
+        "LANG",
+        "LC_ALL",
+        "LC_NUMERIC",
+    )
+
+    def __init__(self, executable=None, *, directory=None):
+        import os
+        from pathlib import Path
+
+        if executable is not None:
+            executable = os.fspath(executable)
+            if not isinstance(executable, str) or not executable.strip() or "\x00" in executable:
+                raise ValueError("executable must be a nonblank command or path without NUL.")
+
+        if directory is not None:
+            directory = os.fspath(directory)
+            if not isinstance(directory, str) or not directory.strip() or "\x00" in directory:
+                raise ValueError("directory must be a nonblank local path without NUL.")
+            directory = str(Path(directory).expanduser().absolute())
+
+        self.executable = executable
+        self.directory = directory
+
+    ################################################################
+    # Identify executable or log bytes
+    ################################################################
+    @staticmethod
+    def _fileIdentity(filename):
+        """Hash a regular local file without loading its contents into RAM."""
+        import hashlib
+        import os
+        import stat
+        from pathlib import Path
+
+        digest = hashlib.sha256()
+        size = 0
+
+        with Path(filename).open("rb") as source:
+            if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                raise ValueError("Expected a regular file.")
+
+            while True:
+                block = source.read(1024 * 1024)
+                if not block: break
+                digest.update(block)
+                size += len(block)
+
+        return {"sha256": digest.hexdigest(), "size_bytes": size}
+
+    ################################################################
+    # Resolve the actual executable
+    ################################################################
+    def _resolveExecutable(self, commandName, environment):
+        """Resolve without silently falling back from an explicit installation."""
+        import os
+        import shutil
+        from pathlib import Path
+
+        expanded = os.path.expanduser(commandName)
+        containsPath = os.path.isabs(expanded) or bool(os.path.dirname(expanded))
+
+        if containsPath:
+            candidate = str(Path(expanded).absolute())
+            resolved = shutil.which(candidate)
+        elif self.directory is not None:
+            candidate = str(Path(self.directory) / expanded)
+            resolved = shutil.which(candidate)
+        else:
+            resolved = shutil.which(expanded, path=environment.get("PATH", os.defpath))
+
+        if resolved is None:
+            location = f" in {self.directory!r}" if self.directory is not None and not containsPath else ""
+            raise FileNotFoundError(f"Executable {commandName!r} was not found or is not executable{location}.")
+
+        resolved = Path(resolved).resolve()
+
+        # Windows command scripts need shell semantics. Do not silently invoke
+        # a command processor when the public contract promises shell=False.
+        if os.name == "nt" and resolved.suffix.lower() in (".bat", ".cmd"):
+            raise ValueError("Windows batch files require an explicit, separately supported shell adapter.")
+
+        return resolved
+
+    ################################################################
+    # Run a command with user-facing failure handling
+    ################################################################
+    def runCommand(self, commandName=None, *, arguments=None, cwd=None, timeout=None, environment=None, cacheDirectory=None):
+        """Execute a command, warning instead of raising for freeform failures.
+
+        Returns:
+            pglToolResult on success.
+            None on an ordinary failure outside an action.
+
+        Inside an action:
+            Propagates failures internally to pglAction.run(), which warns,
+            marks the action failed, and returns None. This immediately stops
+            the scientific action rather than continuing after a failed tool.
+
+        Outside an action:
+            Warns and returns None. Subsequent caller statements are not
+            automatically stopped; callers should check the returned value.
+
+        lastResult:
+            Retains the most recent successful or failed pglToolResult.
+            None when validation/preparation failed before a result existed.
+            Replaced at the start of each call; use action history or retain
+            results explicitly when inspecting multiple executions.
+
+        KeyboardInterrupt and SystemExit propagate intentionally.
+
+        Arguments:
+            commandName: executable name/path; None uses the configured one.
+            arguments: argument list, never a shell command string.
+            cwd: working directory; None uses the current directory.
+            timeout: subprocess timeout in seconds; None disables the limit.
+            environment: explicit string environment overrides.
+            cacheDirectory: optional parent directory for retained logs.
+
+        Generic command success does not establish scientific output validity.
+        This wrapper does not install tools or generate missing dependencies.
+
+        Examples:
+            result = tool.runCommand(arguments=["--version"])
+            if result is not None:
+                result.print()
+
+            # After a failed freeform call:
+            if tool.lastResult is not None:
+                tool.lastResult.print()
+        """
+        from .pglMessages import pglMessages
+
+        self.lastResult = None
+
+        try:
+            self.lastResult = self._runCommand(
+                commandName,
+                arguments=arguments,
+                cwd=cwd,
+                timeout=timeout,
+                environment=environment,
+                cacheDirectory=cacheDirectory,
+            )
+            return self.lastResult
+
+        except Exception as error:
+            if isinstance(error, pglToolExecutionError):
+                self.lastResult = error.result
+
+            recorder = getExecutionRecorder()
+
+            # Stop _run() immediately. The owning action runner emits the
+            # warning and performs its existing failure/history bookkeeping.
+            # Do not warn here as well, producing duplicate diagnostics.
+            if recorder is not None and recorder.actionID is not None:
+                raise
+
+            # Freeform use has no action boundary to catch the exception.
+            # Retain the failed result and logs, but return without a traceback.
+            pglMessages.warning(
+                f"External command was not completed: "
+                f"{type(error).__name__}: {error}",
+            )
+            return None
+    ################################################################
+    # Execute one command
+    ################################################################
+    def _runCommand(self, commandName=None, *, arguments=None, cwd=None, timeout=None, environment=None, cacheDirectory=None):
+        """Execute a command and automatically retain its provenance.
+
+        commandName:
+            Command name/path; None uses this instance's executable.
+
+        arguments:
+            List/tuple of strings or path-like arguments, excluding the
+            executable. No shell parsing, wildcard expansion, or quoting
+            removal is performed.
+
+        cwd:
+            Working directory; None uses the caller's current directory.
+
+        timeout:
+            Maximum subprocess execution time in seconds; None has no limit.
+            Does not limit environment capture, executable hashing, or log
+            hashing. Process creation itself may not be interruptible.
+
+        environment:
+            Explicit string environment overrides. Effective values of only
+            the allowlisted variables enter provenance.
+
+        cacheDirectory:
+            Optional local parent directory for retained execution logs.
+            None uses the OS temporary directory. Successful and failed logs
+            are retained; no automatic cache eviction is performed.
+
+        Returns:
+            pglToolResult on zero exit status.
+
+        Raises:
+            pglToolExecutionError on launch failure, timeout, or nonzero exit.
+            The exception carries the failed result.
+            KeyboardInterrupt/SystemExit are recorded and propagated.
+
+        A zero exit status is command success, not scientific validation.
+
+        Timeout/interruption cleanup stops and waits for the direct child.
+        Descendant-process cleanup is not guaranteed by this initial runner;
+        adapters launching process trees need an explicit lifecycle strategy.
+        """
+        import os
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        commandName = self.executable if commandName is None else commandName
+        if commandName is None: raise ValueError("Supply commandName or configure a default executable.")
+
+        commandName = os.fspath(commandName)
+        if not isinstance(commandName, str) or not commandName.strip() or "\x00" in commandName:
+            raise ValueError("commandName must be a nonblank string without NUL.")
+
+        if arguments is None: arguments = []
+        if not isinstance(arguments, (list, tuple)):
+            raise TypeError("arguments must be a list or tuple, not a shell command string.")
+
+        argumentList = []
+        for argument in arguments:
+            value = os.fspath(argument) if isinstance(argument, os.PathLike) else argument
+            if not isinstance(value, str) or "\x00" in value:
+                raise TypeError("Each argument must be a string or path-like value without NUL.")
+            argumentList.append(value)
+
+        if timeout is not None:
+            if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+                raise ValueError("timeout must be positive and finite, or None.")
+
+        if environment is None: environment = {}
+        if type(environment) is not dict: raise TypeError("environment must be a dictionary or None.")
+
+        for name, value in environment.items():
+            if not isinstance(name, str) or not name or "=" in name or "\x00" in name:
+                raise ValueError("Environment variable names must be nonempty strings without '=' or NUL.")
+            if not isinstance(value, str) or "\x00" in value:
+                raise ValueError("Environment variable values must be strings without NUL.")
+
+        effectiveEnvironment = dict(os.environ)
+        effectiveEnvironment.update(environment)
+        workingDirectory = Path.cwd() if cwd is None else Path(cwd).expanduser().absolute()
+
+        cacheRoot = None
+        if cacheDirectory is not None:
+            cacheText = os.fspath(cacheDirectory)
+            if (
+                not isinstance(cacheText, str)
+                or not cacheText.strip()
+                or "://" in cacheText
+                or "::" in cacheText
+                or any(character in cacheText for character in ("\x00", "\n", "\r"))
+            ):
+                raise ValueError("cacheDirectory must be an ordinary local path.")
+            cacheRoot = Path(cacheText).expanduser().absolute()
+
+        specification = {
+            "adapter": f"{type(self).__module__}.{type(self).__qualname__}",
+            "requestedExecutable": commandName,
+            "installationDirectory": self.directory,
+            "arguments": argumentList,
+            "workingDirectory": str(workingDirectory),
+            "timeoutSeconds": timeout,
+            "environment": {
+                name: effectiveEnvironment[name]
+                for name in self.recordedEnvironmentNames
+                if name in effectiveEnvironment
+            },
+            "unrecordedEnvironmentOverrideNames": sorted(
+                name for name in environment if name not in self.recordedEnvironmentNames
+            ),
+            "dependencyCapture": {
+                "status": "incomplete",
+                "reason": "Generic command: scientific inputs, outputs, implicit resources, and tool build are not yet interpreted.",
+            },
+            "processCleanupScope": "directChild",
+        }
+
+        # Freeform calls retain equivalent provenance without fabricating an
+        # action execution or installing a lasting active context.
+        recorder = getExecutionRecorder()
+        standalone = recorder is None
+        if standalone: recorder = pglExecutionRecorder()
+
+        invocationID = recorder.beginInvocation(specification)
+        result = pglToolResult(invocationID)
+        executionDetails = {
+            "resolvedExecutable": None,
+            "executableIdentity": None,
+            "returnCode": None,
+            "logs": {},
+        }
+        executionError = None
+        failureRecord = None
+
+        try:
+            if not workingDirectory.is_dir():
+                raise NotADirectoryError(f"Working directory is unavailable: {workingDirectory}")
+
+            # Resolve and identify before launch. This identifies the executable
+            # file, not all its shared libraries or script dependencies.
+            executable = self._resolveExecutable(commandName, effectiveEnvironment)
+            executionDetails["resolvedExecutable"] = str(executable)
+            executionDetails["executableIdentity"] = self._fileIdentity(executable)
+
+            if cacheRoot is not None: cacheRoot.mkdir(parents=True, exist_ok=True)
+
+            logDirectory = Path(tempfile.mkdtemp(
+                prefix="pgl-tool-",
+                dir=None if cacheRoot is None else str(cacheRoot),
+            ))
+            result.logDirectory = logDirectory
+            result.stdoutPath = logDirectory / "stdout.log"
+            result.stderrPath = logDirectory / "stderr.log"
+
+            # File-backed output avoids retaining potentially large tool logs
+            # in memory. stdin is closed so unattended tools cannot hang on a
+            # hidden prompt; interactive tools need a separate adapter.
+            with result.stdoutPath.open("xb") as stdout, result.stderrPath.open("xb") as stderr:
+                completed = subprocess.run(
+                    [str(executable), *argumentList],
+                    cwd=str(workingDirectory),
+                    env=effectiveEnvironment,
+                    stdin=subprocess.DEVNULL,
+                    stdout=stdout,
+                    stderr=stderr,
+                    shell=False,
+                    timeout=timeout,
+                    check=False,
+                )
+
+            result.returnCode = completed.returncode
+            executionDetails["returnCode"] = completed.returncode
+
+            if completed.returncode != 0:
+                raise RuntimeError(f"Command exited with return code {completed.returncode}.")
+
+            result.status = "success"
+
+        except BaseException as error:
+            executionError = error
+            result.status = "interrupted" if isinstance(error, (KeyboardInterrupt, SystemExit)) else "failed"
+            failureRecord = {
+                "errorType": type(error).__name__,
+                "message": str(error),
+                "timedOut": isinstance(error, subprocess.TimeoutExpired),
+            }
+
+        finally:
+            # Logs survive scientific failure. If hashing a log fails, retain
+            # its diagnostic path and explicitly report unavailable identity.
+            for name, path in (("stdout", result.stdoutPath), ("stderr", result.stderrPath)):
+                if path is None: continue
+
+                record = {"localPath": str(path)}
+                try:
+                    record.update(self._fileIdentity(path))
+                    record["identityStatus"] = "captured"
+                except Exception as error:
+                    record["identityStatus"] = "unavailable"
+                    record["errorType"] = type(error).__name__
+
+                    if executionError is None:
+                        executionError = error
+                        result.status = "failed"
+                        failureRecord = {
+                            "errorType": type(error).__name__,
+                            "message": "Could not establish the identity of an execution log.",
+                            "timedOut": False,
+                        }
+
+                executionDetails["logs"][name] = record
+
+            recorder.finishInvocation(
+                invocationID,
+                status=result.status,
+                result=executionDetails,
+                error=failureRecord,
+            )
+
+            if standalone: recorder.close()
+
+            # A result contains only this invocation, not unrelated calls made
+            # by the same action. Action history receives the complete list.
+            invocation = next(
+                record for record in recorder.exportInvocations()
+                if record["invocationID"] == invocationID
+            )
+            result._provenance = {
+                "schemaVersion": 1,
+                "environment": recorder.exportEnvironment(),
+                "invocation": invocation,
+            }
+
+        if executionError is not None:
+            if not isinstance(executionError, Exception):
+                raise executionError
+
+            logHint = f" Logs: {result.logDirectory}" if result.logDirectory is not None else ""
+            raise pglToolExecutionError(
+                f"{commandName!r} failed: {failureRecord['message']}{logHint}",
+                result,
+            ) from executionError
+
+        return result
+    
+################################################################
+# AFNI tools
+################################################################
+class pglAFNI(pglExternalTool):
+    """AFNI command access and installation diagnostics.
+
+    directory:
+        Optional directory containing AFNI executables.
+        When omitted, the initial AFNI executable is discovered through PATH.
+
+    Availability checks:
+        Launch afni -ver to identify the installation.
+        Optionally launch a requested command with -help.
+        Require the requested command to come from the same executable
+        directory as the identified AFNI installation.
+
+    Checks establish executable availability, not scientific correctness or
+    completeness of every optional AFNI dependency.
+
+    Installation and typed scientific command adapters are not implemented yet.
+    """
+
+    installationURL = "https://afni.nimh.nih.gov/pub/dist/doc/htmldoc/background_install/main_toc.html"
+
+    def __init__(self, *, directory=None):
+        super().__init__(executable="afni", directory=directory)
+        self.lastResult = None
+        self.lastAvailability = None
+
+    ################################################################
+    # Check availability, including managed installation progress
+    ################################################################
+    def checkAvailable(self, commandName=None, *, timeout=10.0, cacheDirectory=None, installPath="~/proj/afni"):
+        """Check the selected installation without advancing setup.
+
+        Incomplete managed setup warns with continuation instructions and
+        returns False. Finding another AFNI on PATH cannot hide that state.
+
+        Verified managed setup is probed at installPath/abin.
+        When no state exists, an existing installPath/abin directory is checked
+        before falling back to ordinary PATH discovery.
+
+        An explicitly configured directory outside installPath/abin checks
+        that separate installation without consulting this root's state.
+
+        The check does not modify the instance's executable directory,
+        install files, mark verification complete, or run installation stages.
+        """
+        from pathlib import Path
+
+        from .pglMessages import pglMessages
+
+        self.lastResult = None
+        self.lastAvailability = None
+
+        try:
+            installation = pglAFNIInstallation(installPath)
+            managedDirectory = installation.root / "abin"
+            explicitDirectory = None if self.directory is None else Path(self.directory).expanduser().resolve()
+
+            selectedManaged = explicitDirectory is None or explicitDirectory == managedDirectory.resolve()
+
+            if not selectedManaged:
+                return self._checkAvailable(
+                    commandName,
+                    timeout=timeout,
+                    cacheDirectory=cacheDirectory,
+                )
+
+            state = installation.readState()
+
+            if state is not None and state["status"] != "verified":
+                message = installation.continuationMessage(state)
+                self.lastAvailability = {
+                    "schemaVersion": 1,
+                    "tool": "AFNI",
+                    "requestedCommand": commandName,
+                    "available": False,
+                    "installationStatus": state["status"],
+                    "installPath": str(installation.root),
+                    "error": {"message": message},
+                }
+                pglMessages.warning(message)
+                return False
+
+            # Existing managed content is not silently bypassed in favor of
+            # another installation on PATH, even if its executable is missing.
+            if state is not None or managedDirectory.exists():
+                probe = pglAFNI(directory=str(managedDirectory))
+                available = probe._checkAvailable(
+                    commandName,
+                    timeout=timeout,
+                    cacheDirectory=cacheDirectory,
+                )
+                self.lastResult = probe.lastResult
+                self.lastAvailability = deepcopy(probe.lastAvailability)
+
+                if self.lastAvailability is not None:
+                    self.lastAvailability["installPath"] = str(installation.root)
+                    self.lastAvailability["installationStatus"] = None if state is None else state["status"]
+
+                return available
+
+            return self._checkAvailable(
+                commandName,
+                timeout=timeout,
+                cacheDirectory=cacheDirectory,
+            )
+
+        except Exception as error:
+            self.lastAvailability = {
+                "schemaVersion": 1,
+                "tool": "AFNI",
+                "requestedCommand": commandName,
+                "available": False,
+                "error": {
+                    "errorType": type(error).__name__,
+                    "message": str(error),
+                },
+            }
+            pglMessages.warning(f"AFNI availability could not be established: {type(error).__name__}: {error}")
+            return False
+    
+    ################################################################
+    # Check AFNI installation and optional command availability
+    ################################################################
+    def _checkAvailable(self, commandName=None, *, timeout=10.0, cacheDirectory=None):
+        """Check AFNI without opening images or modifying its installation.
+
+        None checks the installation using afni -ver.
+        A command name, for example "3dvolreg", additionally runs -help.
+
+        Returns True when the probes succeed.
+        Ordinary failures warn at the default level and return False.
+        KeyboardInterrupt and SystemExit propagate.
+
+        lastAvailability records the outcome, reported version, executable
+        directory, and probe provenance. lastResult holds the latest probe
+        result, including a failed probe when available.
+
+        Probe logs are retained through the shared runner. Inside an action,
+        probes also enter its invocation history automatically.
+
+        This is an explicit diagnostic method: failure returns False even
+        inside an action. Scientific execution must not ignore that result.
+        Automatic AFNI preflight for scientific commands is a later step.
+
+        No automatic installation or PATH/shell-profile modification occurs.
+
+        Examples:
+            afni = pglAFNI()
+            available = afni.checkAvailable()
+            available = afni.checkAvailable("3dvolreg")
+        """
+        import math
+        import os
+        import sys
+        from pathlib import Path
+
+        from .pglMessages import pglMessages
+
+        self.lastResult = None
+        self.lastAvailability = {
+            "schemaVersion": 1,
+            "tool": "AFNI",
+            "requestedCommand": None,
+            "available": False,
+            "reportedVersion": None,
+            "executableDirectory": None,
+            "probes": [],
+            "error": None,
+        }
+
+        def runProbe(executable, arguments):
+            """Use the recording engine without duplicate public warnings."""
+            try:
+                result = self._runCommand(
+                    executable,
+                    arguments=arguments,
+                    timeout=timeout,
+                    cacheDirectory=cacheDirectory,
+                )
+            except pglToolExecutionError as error:
+                self.lastResult = error.result
+                self.lastAvailability["probes"].append(error.result.provenance)
+                raise
+
+            self.lastResult = result
+            self.lastAvailability["probes"].append(result.provenance)
+            return result
+
+        def readProbeText(result, limit=16384):
+            """Read bounded diagnostic text without loading arbitrary log sizes."""
+            sections = []
+
+            for path in (result.stdoutPath, result.stderrPath):
+                if path is None: continue
+
+                with path.open("rb") as source:
+                    content = source.read(limit + 1)
+
+                text = content[:limit].decode("utf-8", errors="replace").strip()
+                if len(content) > limit: text += "\n[Diagnostic text truncated]"
+                if text: sections.append(text)
+
+            return "\n".join(sections)
+
+        try:
+            if commandName is not None:
+                if not isinstance(commandName, str) or not commandName.strip():
+                    raise ValueError("commandName must be a nonblank executable name or None.")
+
+                # Package selection belongs to directory, not a second path
+                # silently pointing to another installation.
+                if (
+                    commandName != commandName.strip()
+                    or commandName.startswith("-")
+                    or commandName in (".", "..")
+                    or any(character in commandName for character in ("/", "\\", "\x00", "\n", "\r"))
+                ):
+                    raise ValueError("Supply an executable name such as '3dvolreg'; use directory to select an installation.")
+
+                self.lastAvailability["requestedCommand"] = commandName
+
+            if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+                raise ValueError("timeout must be positive and finite.")
+
+            # Resolve once, then invoke the explicitly resolved executable.
+            # Keep its invocation directory for sibling command discovery;
+            # the base runner separately records the resolved target identity.
+            effectiveEnvironment = dict(os.environ)
+
+            if self.directory is not None:
+                invocationDirectory = Path(self.directory)
+                afniExecutable = self._resolveExecutable("afni", effectiveEnvironment)
+            else:
+                import shutil
+
+                discovered = shutil.which("afni", path=effectiveEnvironment.get("PATH", os.defpath))
+                if discovered is None:
+                    # Route missing executable attempts through the recorder.
+                    runProbe("afni", ["-ver"])
+                    raise RuntimeError("AFNI discovery returned inconsistent results.")
+
+                invocationDirectory = Path(discovered).absolute().parent
+                afniExecutable = self._resolveExecutable(str(Path(discovered).absolute()), effectiveEnvironment)
+
+            self.lastAvailability["executableDirectory"] = str(invocationDirectory)
+
+            versionResult = runProbe(str(afniExecutable), ["-ver"])
+            versionText = readProbeText(versionResult)
+
+            if not versionText:
+                raise RuntimeError("AFNI exited successfully but returned no version information.")
+
+            self.lastAvailability["reportedVersion"] = versionText
+
+            # Do not identify one AFNI installation and then quietly check a
+            # command from a different installation farther down PATH.
+            if commandName is not None and commandName != "afni":
+                commandPath = invocationDirectory / commandName
+                helpResult = runProbe(str(commandPath), ["-help"])
+
+                if not readProbeText(helpResult):
+                    raise RuntimeError(f"{commandName!r} exited successfully but returned no help information.")
+
+            self.lastAvailability["available"] = True
+            pglMessages.message(
+                f"AFNI is available: {invocationDirectory}"
+                + (f"\nCommand checked: {commandName}" if commandName is not None else "")
+                + f"\n{versionText}"
+            )
+            return True
+
+        except Exception as error:
+            self.lastAvailability["error"] = {
+                "errorType": type(error).__name__,
+                "message": str(error),
+            }
+
+            details = str(error)
+
+            # Include actual loader/library diagnostics, not just the exit
+            # code. Preserve the complete logs for further inspection.
+            if self.lastResult is not None and self.lastResult.status != "success":
+                try:
+                    probeText = readProbeText(self.lastResult, limit=4000)
+                    if probeText: details += f"\n\nProbe output:\n{probeText}"
+                except OSError:
+                    details += "\nProbe logs could not be read."
+
+            platformNote = ""
+            if sys.platform == "win32":
+                platformNote = (
+                    "\n\nNative Windows execution is not an established AFNI "
+                    "backend here. Use AFNI's supported Linux/WSL guidance. "
+                    "This adapter does not translate Windows paths into WSL "
+                    "paths or automatically launch commands through WSL."
+                )
+
+            pglMessages.warning(
+                f"AFNI availability check failed.\n\n{details}\n\n"
+                f"Official installation instructions:\n{self.installationURL}\n\n"
+                "If AFNI is already installed, supply its executable directory:\n"
+                "    afni = pglAFNI(directory='/path/to/afni/bin')\n"
+                "    afni.checkAvailable()\n\n"
+                "A launch failure can indicate missing system libraries or "
+                "an incompatible executable architecture, even when the file exists."
+                f"{platformNote}"
+            )
+            return False
+        
+    ################################################################
+    # Describe the supported installation procedure
+    ################################################################
+    def installPlan(self, installPath="~/proj/afni"):
+        """Print and return the AFNI installation plan without making changes.
+
+        installPath is the installation root, not the executable directory.
+        Defaults to ~/proj/afni.
+
+        Returns a JSON-compatible plan dictionary, or None with a warning
+        for unsupported platforms or invalid paths.
+
+        This initial planner supports macOS 12+ on Apple Silicon.
+        Other platform adapters can be added without changing the public API.
+
+        Does not download scripts, create directories, alter configuration,
+        probe external commands, or request confirmation.
+
+        Describes the complete procedure, not the current installation stage.
+        The installation coordinator will resolve saved progress separately.
+
+        The plan is descriptive, not an executable command specification.
+        Exact staged scripts and their identities must be reviewed before
+        execution is offered.
+
+        Usage:
+            plan = afni.installPlan()
+            plan = afni.installPlan(installPath="~/tools/afni")
+        """
+        import os
+        import platform
+        from pathlib import Path
+
+        from .pglMessages import pglMessages
+
+        try:
+            pathText = os.fspath(installPath)
+            if not isinstance(pathText, str) or not pathText.strip():
+                raise ValueError("installPath must be a nonblank local path.")
+
+            if (
+                "://" in pathText
+                or "::" in pathText
+                or any(character in pathText for character in ("\x00", "\n", "\r"))
+            ):
+                raise ValueError("installPath must be an ordinary local path without NUL or newlines.")
+
+            # Expand and normalize without creating the destination.
+            root = Path(pathText).expanduser().resolve()
+            home = Path.home().resolve()
+
+            if root == Path(root.anchor) or root == home:
+                raise ValueError("Choose a dedicated installation directory, not the filesystem root or your home directory.")
+
+            if root.exists() and not root.is_dir():
+                raise ValueError(f"installPath exists but is not a directory: {root}")
+
+            system = platform.system()
+            machine = platform.machine()
+            macOSVersion = platform.mac_ver()[0] if system == "Darwin" else None
+
+            if system != "Darwin" or machine.lower() != "arm64":
+                raise ValueError(
+                    f"Automated installation planning is not implemented for "
+                    f"{system} / {machine}. No changes were made.\n"
+                    f"Use the official platform instructions:\n{self.installationURL}"
+                )
+
+            try:
+                majorVersion = int(macOSVersion.split(".", 1)[0])
+            except (AttributeError, ValueError):
+                raise ValueError("Could not establish the macOS version.") from None
+
+            if majorVersion < 12:
+                raise ValueError("This installation procedure requires macOS 12 or newer.")
+
+            executableDirectory = root / "abin"
+            buildDirectory = root / "build"
+            installationDirectory = root / "install"
+
+            for directory in (executableDirectory, buildDirectory, installationDirectory):
+                if directory.is_symlink():
+                    raise ValueError(f"Installation subdirectories must not be symlinks: {directory}")
+                if directory.exists() and not directory.is_dir():
+                    raise ValueError(f"Installation subdirectory is occupied by a file: {directory}")
+
+            # These are the official procedure sources supplied and reviewed.
+            # Their mutable URLs do not establish a pinned installer identity.
+            sourceRoot = "https://raw.githubusercontent.com/afni/afni/master/src/other_builds"
+            scriptNames = (
+                "OS_notes.macos_12_ARM_a_admin_pt1.zsh",
+                "OS_notes.macos_12_ARM_a_admin_pt2.zsh",
+                "OS_notes.macos_12_ARM_b_user.tcsh",
+                "OS_notes.macos_12_b_user.tcsh",
+            )
+
+            sources = [
+                {"filename": name, "url": f"{sourceRoot}/{name}"}
+                for name in scriptNames
+            ]
+
+            sourceText = "\n".join(f"  {item['filename']}\n    {item['url']}" for item in sources)
+            existingText = (
+                "The executable directory already exists. Its contents must be "
+                "inspected before installation is offered; this plan does not "
+                "authorize overwriting them."
+                if executableDirectory.exists()
+                else "The executable directory does not currently exist."
+            )
+
+            details = f"""AFNI INSTALLATION PLAN
+======================
+
+Platform
+--------
+System: macOS {macOSVersion}
+Architecture: {machine}
+Installation procedure: official macOS Apple Silicon setup, with explicit
+user-level destination adaptations.
+
+Locations
+---------
+Installation root: {root}
+AFNI executables and resources: {executableDirectory}
+Build workspace and AFNI-managed backups: {buildDirectory}
+Installation scripts, records, and logs: {installationDirectory}
+
+{existingText}
+
+STAGE 1 — ADMINISTRATOR SETUP
+----------------------------
+Run the official administrator scripts in Terminal, in this order:
+
+  zsh OS_notes.macos_12_ARM_a_admin_pt1.zsh
+  zsh OS_notes.macos_12_ARM_a_admin_pt2.zsh
+
+The reviewed procedure:
+- Runs the official Homebrew installer.
+- Adds Homebrew initialization to shell startup files.
+- Disables Homebrew analytics.
+- Installs Python, compilers, and AFNI build dependencies through Homebrew.
+- Installs XQuartz.
+- Adds Homebrew Python paths to shell startup files.
+- Downloads and installs R 4.5.2 system-wide.
+
+Package managers and downloaded installers can make additional dependency
+changes. Administrator passwords are entered directly in Terminal.
+PGL does not collect passwords.
+
+STAGE 2 — RESTART THE MAC
+------------------------
+The official procedure requires a reboot after administrator setup.
+PGL will not restart the machine automatically.
+
+After reboot, reopen Python or your notebook and call:
+
+  afni = pglAFNI()
+  afni.install()
+
+For a nondefault installation root, pass the same installPath when resuming.
+
+The installation coordinator will use its saved record to offer the next
+stage. It must not silently repeat administrator setup or mistake a restarted
+Python process for a rebooted computer.
+
+STAGE 3 — USER INSTALLATION
+--------------------------
+Follow the official user-level setup, adapting destination references to
+the locations above.
+
+The reviewed procedure:
+- Sets Terminal/XQuartz focus-following preferences.
+- Bootstraps AFNI supporting scripts and atlases.
+- Updates bash, zsh, and tcsh startup files and command completion.
+- Builds package macos_13_ARM using /usr/bin/gcc.
+- Installs the build into the selected executable directory.
+- Configures R_LIBS when unset and installs AFNI R packages.
+- Adds /opt/X11/bin to shell paths when needed.
+- Creates missing AFNI/SUMA user configuration.
+- Generates AFNI command help information.
+
+Destination adaptations:
+- Bootstrap with -bindir pointing to the selected executable directory.
+- Configure shell paths with init_user_dotfiles.py -dir_bin for that directory.
+- Build with explicit -abin and -build_root destinations.
+- Replace other hard-coded ~/abin references consistently.
+- Resolve subsequent AFNI commands from this installation.
+
+The exact adapted scripts must be shown before approval. They are derived
+from the official procedure, not byte-for-byte official scripts.
+
+Homebrew, XQuartz, system R, shell startup files, user configuration, and
+R libraries retain their normal locations outside the installation root.
+HOME is not changed and no hidden ~/abin symlink is created.
+
+EXISTING INSTALLATIONS AND BACKUPS
+---------------------------------
+AFNI's builder can back up and replace an existing executable installation.
+It can also remove older AFNI-managed backups.
+Build workspaces may be updated or replaced on subsequent builds.
+Repeating an installation stage requires renewed approval.
+
+VERIFICATION
+------------
+Check AFNI's reported version and required command availability.
+Run afni_system_check.py -check_all and retain its diagnostics.
+Review its recommendations and separately test AFNI/SUMA GUI functionality.
+
+A script exiting zero or printing "setup is complete" does not establish
+that all dependencies and scientific commands work.
+
+The running notebook does not inherit shell-profile changes automatically.
+A new terminal/kernel may be required.
+
+CONSENT AND RECOVERY
+-------------------
+This method only describes the procedure. Nothing has been installed.
+Before execution, PGL will print and display the actual stage plan and ask
+for confirmation.
+
+Cancelling before launch makes no installation changes.
+Cancelling after launch does not undo completed changes.
+Installation is not a transaction.
+
+Official scripts download additional scripts, packages, and source code.
+Recording the initial script hashes does not pin all downstream downloads.
+
+Optional Bootcamp data are not included.
+
+OFFICIAL PROCEDURE SOURCES
+--------------------------
+{sourceText}
+
+Installation documentation:
+  {self.installationURL}
+"""
+
+            plan = {
+                "schemaVersion": 1,
+                "kind": "installationOverview",
+                "tool": "AFNI",
+                "platform": {
+                    "system": system,
+                    "machine": machine,
+                    "version": macOSVersion,
+                },
+                "installPath": str(root),
+                "executableDirectory": str(executableDirectory),
+                "buildDirectory": str(buildDirectory),
+                "installationDirectory": str(installationDirectory),
+                "sources": sources,
+                "details": details,
+            }
+
+        except (TypeError, ValueError, OSError, RuntimeError) as error:
+            pglMessages.warning(f"AFNI installation plan was not created: {error}")
+            return None
+
+        pglMessages.print(details)
+        return plan
+    
+    ################################################################
+    # Start or resume a staged AFNI installation
+    ################################################################
+    def install(self, installPath="~/proj/afni", *, stage="auto"):
+        """Start, resume, review, or check a managed AFNI installation.
+
+        installPath:
+            Installation root; defaults to ~/proj/afni.
+
+        stage:
+            auto: select from saved progress.
+            admin: request initial administrator setup.
+            user: request user setup, allowing separately installed
+                prerequisites after explicit acknowledgment.
+
+        Normal progression:
+            administrator setup → reboot → user setup
+            → diagnostic review → verified installation
+
+        Returns:
+            A stage/state dictionary when launch was requested or installation
+            verification succeeded.
+            None on cancellation, refusal, or ordinary failure.
+
+        Terminal launch is not installation success.
+        Failed/interrupted/uncertain stages require explicit recovery review;
+        they are not silently retried.
+
+        After successful verification, this instance uses installPath/abin.
+        Existing scientific session data and action history are not modified.
+
+        Ordinary failures warn without escaping to the caller.
+        KeyboardInterrupt and SystemExit propagate.
+        """
+        from .pglMessages import pglMessages
+
+        try:
+            installation = pglAFNIInstallation(installPath)
+            decision = installation.getResumeStatus(stage=stage)
+            nextStage = decision["nextStage"]
+
+            if nextStage is None:
+                state = installation.readState()
+                message = installation.continuationMessage(state) if state is not None else decision["message"]
+                pglMessages.warning(message)
+                return None
+
+            if nextStage == "admin":
+                return installation.launchAdmin()
+
+            if nextStage == "user":
+                return installation.launchUser(stage=stage)
+
+            if nextStage == "review":
+                state = installation.reviewInstallation()
+                if state is not None:
+                    self.directory = str(installation.root / "abin")
+                return state
+
+            if nextStage == "check":
+                if not self.checkAvailable(
+                    "3dvolreg",
+                    installPath=installation.root,
+                ):
+                    return None
+
+                # Do not let an explicitly selected unrelated installation
+                # stand in for verification of the requested installPath.
+                target = str(installation.root / "abin")
+                if self.directory is not None:
+                    from pathlib import Path
+
+                    if Path(self.directory).expanduser().resolve() != installation.root / "abin":
+                        probe = pglAFNI(directory=target)
+                        if not probe._checkAvailable("3dvolreg"): return None
+                        self.lastResult = probe.lastResult
+                        self.lastAvailability = deepcopy(probe.lastAvailability)
+
+                self.directory = target
+                pglMessages.message(f"AFNI is ready at {target}. No installation commands were run.")
+                return installation.readState()
+
+            raise ValueError(f"Unsupported installation continuation: {nextStage!r}")
+
+        except Exception as error:
+            pglMessages.warning(f"AFNI installation did not advance: {type(error).__name__}: {error}")
+            return None
+    
+################################################################
+# AFNI installation state and administrator-stage launcher
+################################################################
+class pglAFNIInstallation:
+    """Coordinate the supported macOS ARM administrator installation stage.
+
+    Persistent records live under installPath/install.
+
+    This initial coordinator:
+        Reviews and launches the two official administrator scripts.
+        Preserves the exact downloaded script bytes and their identities.
+        Records progress and the boot identifier.
+        Provides explicit instructions for rebooting and resuming.
+
+    It does not:
+        Run the user installation stage yet.
+        Collect administrator passwords.
+        Reboot the computer.
+        Treat script completion as verified dependency installation.
+        Automatically retry an interrupted or failed installation.
+
+    State files are local installation bookkeeping, not scientific provenance.
+    The installation directory must be trusted and user-owned.
+    """
+
+    scriptNames = (
+        "OS_notes.macos_12_ARM_a_admin_pt1.zsh",
+        "OS_notes.macos_12_ARM_a_admin_pt2.zsh",
+    )
+    sourceRoot = "https://raw.githubusercontent.com/afni/afni/master/src/other_builds"
+
+    def __init__(self, installPath="~/proj/afni"):
+        import os
+        from pathlib import Path
+
+        value = os.fspath(installPath)
+        if (
+            not isinstance(value, str)
+            or not value.strip()
+            or "://" in value
+            or "::" in value
+            or any(character in value for character in ("\x00", "\n", "\r"))
+        ):
+            raise ValueError("installPath must be an ordinary nonblank local path.")
+
+        self.root = Path(value).expanduser().resolve()
+        if self.root in (Path(self.root.anchor), Path.home().resolve()):
+            raise ValueError("Use a dedicated installation directory.")
+
+        self.directory = self.root / "install"
+        self.statePath = self.directory / "state.json"
+
+        for path in (self.root, self.directory):
+            if path.is_symlink(): raise ValueError(f"Installation directory must not be a symlink: {path}")
+            if path.exists() and not path.is_dir(): raise ValueError(f"Installation path is not a directory: {path}")
+
+    ################################################################
+    # Identify the current boot without changing system state
+    ################################################################
+    @staticmethod
+    def getBootID():
+        """Return macOS's boot-session UUID, or None when unavailable."""
+        import platform
+        import subprocess
+
+        if platform.system() != "Darwin": return None
+
+        try:
+            result = subprocess.run(
+                ["/usr/sbin/sysctl", "-n", "kern.bootsessionuuid"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            value = result.stdout.strip()
+            if result.returncode != 0 or not value: return None
+
+            from uuid import UUID
+            return str(UUID(value))
+
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return None
+
+    ################################################################
+    # Read existing state without creating installation files
+    ################################################################
+    def readState(self):
+        """Read installation progress without accessing scientific payloads.
+
+        Missing state returns None. Malformed or unreadable state raises
+        rather than silently treating an existing installation as new.
+
+        Recognizes administrator, user-installation, diagnostic-review, and
+        verified states. A verified record is historical installation status,
+        not proof that executables remain available today.
+        """
+        import json
+        from pathlib import Path
+        from uuid import UUID
+
+        if self.statePath.is_symlink():
+            raise ValueError("Installation state must not be a symlink.")
+        if not self.statePath.exists(): return None
+
+        def uniqueKeys(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result: raise ValueError(f"Duplicate installation-state key: {key!r}")
+                result[key] = value
+            return result
+
+        with self.statePath.open("rb") as source:
+            content = source.read(1024 * 1024 + 1)
+
+        if len(content) > 1024 * 1024:
+            raise ValueError("Installation state exceeds its size limit.")
+
+        state = json.loads(content, object_pairs_hook=uniqueKeys)
+
+        if not isinstance(state, dict) or type(state.get("schemaVersion")) is not int or state["schemaVersion"] != 1:
+            raise ValueError("Unsupported installation-state record.")
+
+        if state.get("tool") != "AFNI" or state.get("installPath") != str(self.root):
+            raise ValueError("Installation state does not belong to this installation.")
+
+        allowed = {
+            "launchPending", "adminRunning", "rebootPending",
+            "failed", "interrupted",
+            "userLaunchPending", "userRunning", "userFailed", "userInterrupted",
+            "verificationPending", "verified",
+        }
+        if state.get("status") not in allowed:
+            raise ValueError(f"Unknown installation status: {state.get('status')!r}.")
+
+        identifier = state.get("installationID")
+        if not isinstance(identifier, str):
+            raise ValueError("Installation state has no execution identity.")
+
+        try:
+            if str(UUID(identifier)) != identifier:
+                raise ValueError("Installation identity must use canonical UUID formatting.")
+        except ValueError:
+            raise ValueError("Invalid installation execution identity.") from None
+
+        # The worker records this only after completing its probes.
+        # Do not permit a restored record to redirect verification elsewhere.
+        if state["status"] in ("verificationPending", "verified"):
+            expectedDirectory = str(self.root / "abin")
+            if state.get("executableDirectory") != expectedDirectory:
+                raise ValueError("Installation executable directory differs from installPath/abin.")
+
+            logValue = state.get("systemCheckLog")
+            if not isinstance(logValue, str) or not logValue:
+                raise ValueError("Completed user setup has no system-check log reference.")
+
+            logPath = Path(logValue)
+            if not logPath.is_absolute() or self.directory not in logPath.resolve().parents:
+                raise ValueError("System-check log must be beneath the installation records directory.")
+
+        return state
+
+    ################################################################
+    # Explain recorded installation progress
+    ################################################################
+    def continuationMessage(self, state):
+        """Describe recorded status and the explicit continuation command.
+
+        Does not advance installation or infer successful completion.
+        Uses the default short command for the default installation root.
+        """
+        from pathlib import Path
+
+        defaultRoot = (Path.home() / "proj" / "afni").resolve()
+        resume = "afni.install()" if self.root == defaultRoot else f"afni.install(installPath={str(self.root)!r})"
+        status = state["status"]
+
+        if status in ("launchPending", "adminRunning", "userLaunchPending", "userRunning"):
+            stageName = "user" if status.startswith("user") else "administrator"
+            message = (
+                f"AFNI {stageName} installation is pending or running in Terminal.\n"
+                "Check that window before starting another installation. "
+                "If it closed unexpectedly, completion is uncertain."
+            )
+
+        elif status == "rebootPending":
+            previousBoot = state.get("completedBootID")
+            currentBoot = self.getBootID()
+
+            if previousBoot is not None and currentBoot is not None:
+                rebootMessage = (
+                    "Restart your Mac before continuing."
+                    if previousBoot == currentBoot
+                    else "A new boot session was detected; user setup is next."
+                )
+            else:
+                rebootMessage = (
+                    "PGL cannot verify the reboot. Confirm that you restarted "
+                    "after administrator setup before continuing."
+                )
+
+            message = (
+                "AFNI installation is incomplete: administrator scripts finished, "
+                "but user setup has not run.\n"
+                f"{rebootMessage}"
+            )
+
+        elif status in ("failed", "interrupted", "userFailed", "userInterrupted"):
+            stageName = "user" if status.startswith("user") else "administrator"
+            message = (
+                f"AFNI {stageName} setup did not finish successfully "
+                f"(status={status}).\n"
+                f"Diagnostic: {state.get('error') or 'See the Terminal output.'}\n"
+                "Completed changes were not rolled back. Automatic retry is "
+                "disabled until the partial installation is reviewed."
+            )
+
+        elif status == "verificationPending":
+            message = (
+                "AFNI setup and executable probes completed, but diagnostic "
+                "review is still pending.\n"
+                f"System check: {state['systemCheckLog']}\n"
+                "Reviewing diagnostics must not rerun the installation."
+            )
+
+        elif status == "verified":
+            message = (
+                "AFNI installation was previously verified and reviewed.\n"
+                "Current executable availability still requires a fresh check."
+            )
+
+        else:
+            raise ValueError(f"Unknown installation status: {status!r}.")
+
+        return (
+            f"{message}\n\n"
+            f"Continue or inspect installation status using:\n    {resume}\n\n"
+            f"Installation records: {self.directory}"
+        )
+
+    ################################################################
+    # Launch the reviewed administrator scripts
+    ################################################################
+    def launchAdmin(self):
+        """Download for review, request approval, then launch Terminal.
+
+        Downloads are read-only network requests before confirmation.
+        No installation directory is created until approval.
+
+        Returns a launch-state dictionary, or None if the user cancels.
+        Operational errors propagate to the public install() warning boundary.
+
+        Script stdout/stderr and password prompts remain in Terminal.
+        This version stores script identities and stage outcomes, but does not
+        record a complete Terminal transcript or password input.
+
+        Exact downloaded administrator scripts are retained and executed.
+        Their downstream downloads are not pinned by these hashes.
+        """
+        import hashlib
+        import json
+        import os
+        import platform
+        import shlex
+        import subprocess
+        import sys
+        import urllib.request
+        from pathlib import Path
+        from uuid import uuid4
+
+        from .pglDialog import pglDialogs
+        from .pglMessages import pglMessages
+
+        if platform.system() != "Darwin" or platform.machine().lower() != "arm64":
+            raise ValueError("This installer stage currently supports native macOS Apple Silicon only.")
+
+        version = platform.mac_ver()[0]
+        if not version or int(version.split(".", 1)[0]) < 12:
+            raise ValueError("This installer stage requires macOS 12 or newer.")
+
+        if self.readState() is not None:
+            raise ValueError("An installation record already exists. Review it before launching another installation.")
+
+        scripts = []
+
+        for name in self.scriptNames:
+            url = f"{self.sourceRoot}/{name}"
+
+            with urllib.request.urlopen(url, timeout=30) as response:
+                content = response.read(2 * 1024 * 1024 + 1)
+
+            if not content or len(content) > 2 * 1024 * 1024:
+                raise ValueError(f"Unexpected installer script size: {name}")
+
+            text = content.decode("utf-8")
+            if "\x00" in text: raise ValueError(f"Installer contains NUL: {name}")
+
+            scripts.append({
+                "name": name,
+                "url": url,
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "size_bytes": len(content),
+                "content": content,
+                "text": text,
+            })
+
+        installationID = str(uuid4())
+        stageDirectory = self.directory / installationID
+        resume = f"afni.install(installPath={str(self.root)!r})"
+
+        details = f"""AFNI ADMINISTRATOR INSTALLATION
+================================
+
+Platform: macOS {version}, Apple Silicon
+Installation root: {self.root}
+This stage's scripts and records: {stageDirectory}
+Installer working directory: {Path.home()}
+
+The following official scripts will run unchanged, in order, in Terminal:
+  zsh OS_notes.macos_12_ARM_a_admin_pt1.zsh
+  zsh OS_notes.macos_12_ARM_a_admin_pt2.zsh
+
+Known effects from the reviewed procedure:
+- Install/configure Homebrew and disable Homebrew analytics.
+- Install Python, compilers, build libraries, and XQuartz.
+- Modify shell startup files.
+- Download and install system-wide R.
+- Prompt for administrator authorization in Terminal.
+
+The script bodies below are authoritative for this request.
+They can download and run additional installers and change dependencies.
+Their downstream downloads are not pinned by the displayed script hashes.
+
+PGL will not collect passwords or reboot your Mac.
+Terminal output is not captured as a transcript in this implementation.
+Installation is not transactional; stopping does not undo completed changes.
+A zero script exit status does not establish that every internal step worked.
+
+AFTER BOTH SCRIPTS FINISH:
+Review their Terminal output, restart your Mac, then reopen Python and run:
+    from pgl.pglExternalTools import pglAFNI
+    afni = pglAFNI()
+    {resume}
+
+No existing installation stage will be silently overwritten or retried.
+"""
+
+        for script in scripts:
+            details += (
+                f"\n\n{'=' * 72}\n"
+                f"FILE: {script['name']}\n"
+                f"SOURCE: {script['url']}\n"
+                f"SHA-256: {script['sha256']}\n"
+                f"{'=' * 72}\n\n{script['text']}"
+            )
+
+        pglMessages.print(details)
+
+        if not pglDialogs.confirm(
+            "Install AFNI: administrator setup",
+            "Review the official scripts and system changes. Administrator setup requires a reboot afterward.",
+            details=details,
+            confirmButtonText="Run in Terminal",
+            copyText="Copy instructions",
+        ):
+            return None
+
+        # An exclusive claim prevents two cooperating PGL callers from starting
+        # installation after simultaneously reviewing the same empty state.
+        self.directory.mkdir(parents=True, exist_ok=True)
+        claimPath = self.directory / ".installation-claim"
+
+        try:
+            claimPath.mkdir()
+        except FileExistsError:
+            raise RuntimeError("Another installation has claimed this directory. Review its state before proceeding.") from None
+
+        state = {
+            "schemaVersion": 1,
+            "tool": "AFNI",
+            "installationID": installationID,
+            "installPath": str(self.root),
+            "status": "launchPending",
+            "createdAt": datetime.now(timezone.utc).isoformat(),
+            "completedBootID": None,
+            "scripts": [
+                {key: script[key] for key in ("name", "url", "sha256", "size_bytes")}
+                for script in scripts
+            ],
+            "steps": [],
+            "error": None,
+        }
+
+        def writeState():
+            """Publish current state atomically within the installation directory."""
+            temporary = self.directory / f".state-{uuid4().hex}.json"
+            try:
+                with temporary.open("x", encoding="utf-8") as target:
+                    json.dump(state, target, indent=2, sort_keys=True, allow_nan=False)
+                    target.flush()
+                    os.fsync(target.fileno())
+                os.replace(temporary, self.statePath)
+            finally:
+                if temporary.exists(): temporary.unlink()
+
+        try:
+            # Recheck after obtaining the claim. Existing records are not
+            # discarded merely because another caller started meanwhile.
+            if self.readState() is not None:
+                raise RuntimeError("Installation state changed while confirmation was open.")
+
+            stageDirectory.mkdir()
+            (stageDirectory / "approved-plan.txt").write_text(details, encoding="utf-8")
+
+            for script in scripts:
+                with (stageDirectory / script["name"]).open("xb") as target:
+                    target.write(script["content"])
+
+            # The launcher uses only the standard library and runs outside the
+            # notebook. It verifies scripts before execution and writes state
+            # even when the parent Python session is no longer present.
+            launcher = r'''
+import hashlib
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from uuid import UUID, uuid4
+
+statePath = Path(sys.argv[1])
+stageDirectory = Path(sys.argv[2])
+expectedID = sys.argv[3]
+state = json.loads(statePath.read_text(encoding="utf-8"))
+
+if state["installationID"] != expectedID or state["status"] != "launchPending":
+    raise RuntimeError("Installation launch identity/status mismatch.")
+
+def saveState():
+    temporary = statePath.parent / (".state-" + uuid4().hex + ".json")
+    try:
+        with temporary.open("x", encoding="utf-8") as target:
+            json.dump(state, target, sort_keys=True, indent=2, allow_nan=False)
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(temporary, statePath)
+    finally:
+        if temporary.exists(): temporary.unlink()
+
+def bootID():
+    try:
+        result = subprocess.run(
+            ["/usr/sbin/sysctl", "-n", "kern.bootsessionuuid"],
+            capture_output=True, text=True, timeout=5, check=True,
+        )
+        return str(UUID(result.stdout.strip()))
+    except Exception:
+        return None
+
+exitCode = 1
+try:
+    state["status"] = "adminRunning"
+    state["startedAt"] = datetime.now(timezone.utc).isoformat()
+    saveState()
+
+    for script in state["scripts"]:
+        path = stageDirectory / script["name"]
+        content = path.read_bytes()
+        if len(content) != script["size_bytes"] or hashlib.sha256(content).hexdigest() != script["sha256"]:
+            raise RuntimeError("Installer script changed after approval: " + script["name"])
+
+        print("\n=== Running " + script["name"] + " ===\n", flush=True)
+        completed = subprocess.run(
+            ["/bin/zsh", str(path)],
+            cwd=str(Path.home()),
+            check=False,
+        )
+        state["steps"].append({
+            "script": script["name"],
+            "returnCode": completed.returncode,
+            "endedAt": datetime.now(timezone.utc).isoformat(),
+        })
+        saveState()
+
+        if completed.returncode != 0:
+            raise RuntimeError(script["name"] + " exited with code " + str(completed.returncode))
+
+    state["status"] = "rebootPending"
+    state["completedBootID"] = bootID()
+    state["endedAt"] = datetime.now(timezone.utc).isoformat()
+    saveState()
+    exitCode = 0
+
+    print("\nAFNI administrator scripts have finished.")
+    print("Review the output above: script completion does not verify every dependency.")
+    print("\nRestart your Mac before continuing.")
+    print("After restarting, reopen Python or your notebook and run:\n")
+    print("    from pgl.pglExternalTools import pglAFNI")
+    print("    afni = pglAFNI()")
+    print("    afni.install(installPath=" + repr(state["installPath"]) + ")")
+
+except BaseException as error:
+    state["status"] = "interrupted" if isinstance(error, (KeyboardInterrupt, SystemExit)) else "failed"
+    state["error"] = type(error).__name__ + ": " + str(error)
+    state["endedAt"] = datetime.now(timezone.utc).isoformat()
+    saveState()
+    print("\nAFNI setup did not finish: " + state["error"])
+    print("Completed system changes have NOT been rolled back.")
+
+print("\nInstallation state: " + str(statePath), flush=True)
+try:
+    input("\nPress Return to close this launcher...")
+except (EOFError, KeyboardInterrupt):
+    pass
+
+sys.exit(exitCode)
+'''
+            launcherPath = stageDirectory / "run-admin.py"
+            launcherPath.write_text(launcher, encoding="utf-8")
+
+            # A .command file lets Terminal own the interactive terminal and
+            # password prompts. Quoting protects paths containing spaces.
+            commandPath = stageDirectory / "run-admin.command"
+            command = [
+                sys.executable,
+                str(launcherPath),
+                str(self.statePath),
+                str(stageDirectory),
+                installationID,
+            ]
+            commandPath.write_text(
+                "#!/bin/zsh\nexec " + " ".join(shlex.quote(value) for value in command) + "\n",
+                encoding="utf-8",
+            )
+            commandPath.chmod(0o700)
+            writeState()
+
+            result = subprocess.run(
+                ["/usr/bin/open", "-a", "Terminal", str(commandPath)],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.strip() or "Terminal launch was refused.")
+
+        except BaseException as error:
+            # Leave the claim in place: partial files or a launched Terminal
+            # must not permit an accidental second installation.
+            # Never overwrite progress written by a launcher that has started.
+            existing = self.readState()
+            if existing is None or (
+                existing.get("installationID") == installationID
+                and existing.get("status") == "launchPending"
+            ):
+                state["status"] = "interrupted" if isinstance(error, (KeyboardInterrupt, SystemExit)) else "failed"
+                state["error"] = f"{type(error).__name__}: {error}"
+                writeState()
+            raise
+
+        pglMessages.message(
+            "AFNI administrator installation was requested in Terminal.\n"
+            "This is not confirmation that installation succeeded.\n"
+            "Follow the Terminal prompts and reboot instructions."
+        )
+        return state
+    
+    ################################################################
+    # Determine the next installation stage without changing state
+    ################################################################
+    def getResumeStatus(self, *, stage="auto"):
+        """Return a read-only installation decision.
+
+        stage:
+            auto: select from recorded progress.
+            admin: request initial administrator setup.
+            user: request user setup, including separately installed prerequisites.
+
+        nextStage:
+            admin, user, review, check, or None.
+
+        canOffer indicates that the coordinator may offer the next step.
+        It is not permission to execute or approval of the installation.
+
+        review displays diagnostics without reinstalling.
+        check performs fresh executable checks without reinstalling.
+
+        Failed, interrupted, and uncertain running stages require reviewed
+        recovery. They are never silently retried or bypassed.
+        """
+        from uuid import UUID
+
+        if stage not in ("auto", "admin", "user"):
+            raise ValueError("stage must be 'auto', 'admin', or 'user'.")
+
+        state = self.readState()
+        decision = {
+            "schemaVersion": 1,
+            "installPath": str(self.root),
+            "installationID": None if state is None else state["installationID"],
+            "recordedStatus": None if state is None else state["status"],
+            "status": None,
+            "nextStage": None,
+            "canOffer": False,
+            "requiresPrerequisiteConfirmation": False,
+            "requiresRebootConfirmation": False,
+            "message": "",
+        }
+
+        def setDecision(status, message, *, nextStage=None, prerequisites=False, reboot=False):
+            decision.update({
+                "status": status,
+                "nextStage": nextStage,
+                "canOffer": nextStage is not None,
+                "requiresPrerequisiteConfirmation": prerequisites,
+                "requiresRebootConfirmation": reboot,
+                "message": message,
+            })
+            return decision
+
+        if state is None:
+            if stage == "user":
+                return setDecision(
+                    "externalPrerequisites",
+                    "No PGL administrator-stage record exists. Before user setup, "
+                    "confirm that the official administrator prerequisites are "
+                    "installed and any required restart has been completed.",
+                    nextStage="user",
+                    prerequisites=True,
+                    reboot=True,
+                )
+
+            return setDecision(
+                "newInstallation",
+                "No installation record exists. Review and approve administrator "
+                "setup before it is launched in Terminal.",
+                nextStage="admin",
+            )
+
+        recordedStatus = state["status"]
+
+        # A running record is not proof that its Terminal/process is still
+        # alive. Uncertain completion must not trigger another installation.
+        if recordedStatus in ("launchPending", "adminRunning", "userLaunchPending", "userRunning"):
+            stageName = "user" if recordedStatus.startswith("user") else "administrator"
+            return setDecision(
+                "runningOrUncertain",
+                f"AFNI {stageName} setup is recorded as pending or running. "
+                "Check its Terminal window. If Terminal closed or the machine "
+                "stopped unexpectedly, completion is uncertain. PGL will not "
+                "launch another installer or skip ahead.",
+            )
+
+        if recordedStatus in ("failed", "interrupted", "userFailed", "userInterrupted"):
+            stageName = "user" if recordedStatus.startswith("user") else "administrator"
+            return setDecision(
+                "recoveryRequired",
+                f"AFNI {stageName} setup did not finish successfully "
+                f"(status={recordedStatus}). Completed changes were not rolled "
+                "back. Review the installation records and Terminal output "
+                "before selecting a recovery procedure. Automatic retry is disabled.",
+            )
+
+        if recordedStatus == "verificationPending":
+            return setDecision(
+                "reviewRequired",
+                "AFNI user setup and executable probes completed. Installation "
+                "still requires review of the system-check diagnostics. "
+                "Reviewing these results does not rerun installation.",
+                nextStage="review",
+            )
+
+        if recordedStatus == "verified":
+            return setDecision(
+                "previouslyVerified",
+                "This installation was previously verified and reviewed. "
+                "Check current executable availability without reinstalling.",
+                nextStage="check",
+            )
+
+        if recordedStatus != "rebootPending":
+            raise ValueError(f"Unsupported resume status: {recordedStatus!r}.")
+
+        if stage == "admin":
+            return setDecision(
+                "adminAlreadyCompleted",
+                "The administrator scripts have finished. PGL will not repeat "
+                "them implicitly. Restart if required, then use afni.install() "
+                "to continue toward user setup.",
+            )
+
+        def normalizeBootID(value):
+            if value is None: return None
+            if not isinstance(value, str):
+                raise ValueError("Boot identity must be a UUID string or None.")
+            try:
+                return str(UUID(value))
+            except ValueError:
+                raise ValueError("Invalid installation boot identity.") from None
+
+        previousBoot = normalizeBootID(state.get("completedBootID"))
+        currentBoot = normalizeBootID(self.getBootID())
+
+        if previousBoot is not None and currentBoot is not None:
+            if previousBoot == currentBoot:
+                return setDecision(
+                    "restartRequired",
+                    "The Mac is still in the boot session in which administrator "
+                    "setup finished. Restart your Mac, reopen Python or your "
+                    "notebook, and run afni.install() again. Restarting Python "
+                    "alone does not satisfy this requirement.",
+                )
+
+            return setDecision(
+                "userStageReady",
+                "A restart after administrator-script completion was detected. "
+                "Confirm that the administrator prerequisites installed "
+                "successfully before approving user setup. Reboot detection "
+                "does not verify dependencies.",
+                nextStage="user",
+                prerequisites=True,
+            )
+
+        return setDecision(
+            "restartUnverified",
+            "PGL cannot verify the restart. Before approving user setup, "
+            "confirm that administrator prerequisites were installed and "
+            "the Mac was restarted afterward.",
+            nextStage="user",
+            prerequisites=True,
+            reboot=True,
+        )
+
+    ################################################################
+    # Prepare the official user script for this installation root
+    ################################################################
+    def prepareUserScript(self, sourceText):
+        """Adapt AFNI installation destinations without executing the script.
+
+        Identifies the bootstrap, shell-configuration, and build commands.
+        Checks only the destination options needed for safe relocation.
+        Comments, whitespace, and unrelated command options may change.
+
+        Returns original/adapted identities, script text, and a reviewable diff.
+
+        Does not download files, create directories, or execute commands.
+        Preparation errors propagate to the installation coordinator, which
+        warns and stops before offering execution.
+
+        Installation paths remain restricted because the upstream procedure
+        contains unquoted shell-path expressions. This is not a shell parser
+        or a security audit of the official installer.
+        """
+        import difflib
+        import hashlib
+        import re
+        import shlex
+
+        if not isinstance(sourceText, str) or not sourceText.strip():
+            raise ValueError("sourceText must contain the official user script.")
+        if "\x00" in sourceText:
+            raise ValueError("Installer text must not contain NUL.")
+
+        executableDirectory = str(self.root / "abin")
+        buildDirectory = str(self.root / "build")
+        installationDirectory = str(self.directory)
+
+        # Quoting our launcher alone cannot fix unquoted expressions inside
+        # the upstream scripts and builder.
+        if re.fullmatch(r"/[A-Za-z0-9_./-]+", str(self.root)) is None:
+            raise ValueError(
+                "This AFNI installation procedure currently requires a path "
+                "without spaces or shell metacharacters."
+            )
+
+        # Normalize line endings for the generated Unix shell script.
+        # sourceIdentity below still describes the exact supplied text.
+        adapted = sourceText.replace("\r\n", "\n")
+        if "\r" in adapted: raise ValueError("Unsupported carriage return in installer text.")
+
+        # Relocate known home-relative destinations, including references in
+        # conditions, commands, messages, and comments. Match whole path
+        # components so names such as ~/abin_backup are not changed.
+        for name, destination in (("abin", executableDirectory), ("afni_build", buildDirectory)):
+            pattern = rf"(?:\$HOME/|\$\{{HOME\}}/|~/){name}(?![A-Za-z0-9_.-])"
+            adapted = re.sub(pattern, lambda match: destination, adapted)
+
+        # Group continued command lines while preserving their formatting.
+        blocks = []
+        pending = ""
+
+        for line in adapted.splitlines(keepends=True):
+            pending += line
+            if line.rstrip("\n").endswith("\\"): continue
+            blocks.append(pending)
+            pending = ""
+
+        if pending: blocks.append(pending)
+
+        found = {"bootstrap": 0, "shellConfiguration": 0, "build": 0}
+        preparedBlocks = []
+
+        def requireOption(tokens, option, expected):
+            """Require one unambiguous destination option on a relevant command."""
+            positions = [index for index, token in enumerate(tokens) if token == option]
+            if len(positions) != 1:
+                raise ValueError(f"Cannot relocate installer: expected one {option} option on a relevant command.")
+
+            index = positions[0]
+            if index + 1 >= len(tokens) or tokens[index + 1] != expected:
+                raise ValueError(f"Cannot relocate installer: {option} does not identify {expected!r}.")
+
+        for block in blocks:
+            stripped = block.lstrip()
+            if not stripped or stripped.startswith("#"):
+                preparedBlocks.append(block)
+                continue
+
+            # Only parse relevant simple commands. Leave the rest of the
+            # official tcsh procedure unchanged.
+            firstWord = stripped.split(None, 1)[0].strip("\"'")
+            commandLeaf = firstWord.rsplit("/", 1)[-1]
+
+            if commandLeaf not in ("tcsh", "init_user_dotfiles.py", "build_afni.py"):
+                preparedBlocks.append(block)
+                continue
+
+            tokens = shlex.split(block.replace("\\\n", " "), comments=True, posix=True)
+            if not tokens:
+                preparedBlocks.append(block)
+                continue
+
+            if commandLeaf == "tcsh":
+                isBootstrap = any(
+                    token.rsplit("/", 1)[-1] == "@update.afni.binaries"
+                    for token in tokens[1:]
+                )
+                if not isBootstrap:
+                    preparedBlocks.append(block)
+                    continue
+
+                found["bootstrap"] += 1
+                requireOption(tokens, "-bindir", executableDirectory)
+
+            elif commandLeaf == "init_user_dotfiles.py":
+                found["shellConfiguration"] += 1
+                requireOption(tokens, "-dir_bin", executableDirectory)
+
+                # Select this installation before invoking its helpers.
+                # The official dotfile updates remain intact.
+                indent = block[:len(block) - len(stripped)]
+                setup = (
+                    f"{indent}# Use this AFNI installation in the current installer shell.\n"
+                    f"{indent}set path = ( {executableDirectory} $path )\n"
+                    f"{indent}rehash\n"
+                )
+
+                block = re.sub(
+                    r"^([ \t]*)\S+",
+                    lambda match: f"{match.group(1)}{executableDirectory}/init_user_dotfiles.py",
+                    block,
+                    count=1,
+                )
+                block = setup + block
+
+            else:
+                found["build"] += 1
+                requireOption(tokens, "-build_root", buildDirectory)
+
+                # Preserve compiler/package/options supplied upstream.
+                # Explicit -abin prevents PATH from selecting another target.
+                if "-abin" in tokens:
+                    requireOption(tokens, "-abin", executableDirectory)
+                    installOption = ""
+                else:
+                    installOption = f" -abin {executableDirectory}"
+
+                block = re.sub(
+                    r"^([ \t]*)\S+",
+                    lambda match: f"{match.group(1)}{executableDirectory}/build_afni.py{installOption}",
+                    block,
+                    count=1,
+                )
+
+            preparedBlocks.append(block)
+
+        # Missing or duplicated essential commands make relocation ambiguous.
+        # Do not impose conditions on comments or unrelated setup operations.
+        for name, count in found.items():
+            if count != 1:
+                raise ValueError(
+                    f"Cannot prepare AFNI user setup: found {count} {name} "
+                    "commands; expected one. Review the installer structure."
+                )
+
+        adapted = "".join(preparedBlocks)
+
+        def identity(text):
+            content = text.encode("utf-8")
+            return {"sha256": hashlib.sha256(content).hexdigest(), "size_bytes": len(content)}
+
+        difference = "".join(difflib.unified_diff(
+            sourceText.splitlines(keepends=True),
+            adapted.splitlines(keepends=True),
+            fromfile="official/OS_notes.macos_12_b_user.tcsh",
+            tofile="prepared/OS_notes.macos_12_b_user.tcsh",
+        ))
+
+        return {
+            "schemaVersion": 1,
+            "tool": "AFNI",
+            "kind": "preparedUserScript",
+            "installPath": str(self.root),
+            "executableDirectory": executableDirectory,
+            "buildDirectory": buildDirectory,
+            "installationDirectory": installationDirectory,
+            "sourceFilename": "OS_notes.macos_12_b_user.tcsh",
+            "sourceIdentity": identity(sourceText),
+            "preparedIdentity": identity(adapted),
+            "changes": [
+                {
+                    "kind": "destination",
+                    "description": "Relocate official abin and build-root references.",
+                    "executableDirectory": executableDirectory,
+                    "buildDirectory": buildDirectory,
+                },
+                {
+                    "kind": "executableSelection",
+                    "description": "Select this installation for helper commands and explicitly invoke its builder.",
+                    "destination": executableDirectory,
+                },
+                {
+                    "kind": "destination",
+                    "description": "Ensure the builder has an explicit -abin destination.",
+                    "destination": executableDirectory,
+                },
+            ],
+            "scriptText": adapted,
+            "diff": difference,
+            "executionRequirements": [
+                "Display and approve the prepared script before execution.",
+                "Verify staged bytes against preparedIdentity before launch.",
+                "Use a separate stage working directory for downloads and logs.",
+                "Preserve the official ARM wrapper's Homebrew initialization.",
+                "Use an explicitly prepared build environment.",
+                "Independently verify the selected installation after completion.",
+            ],
+        }
+        
+    ################################################################
+    # Execute an approved user stage in the Terminal worker
+    ################################################################
+    @staticmethod
+    def runUserStage(requestFilename):
+        """Execute one staged, approved user installation request.
+
+        Internal worker entry point, not a user-facing installation API.
+        The coordinator must obtain approval and stage the request first.
+
+        The request identifies:
+            The installation state and execution UUID.
+            The prepared script and its expected identity.
+            The working and executable directories.
+            Explicit environment removals and overrides.
+            Whether prerequisite/reboot acknowledgment was obtained.
+
+        Script output is inherited by Terminal. Verification output is saved
+        in the stage directory. Administrator passwords are not collected.
+
+        Returns:
+            0 when the script and executable probes succeed. State becomes
+              verificationPending, not verified.
+            1 on ordinary failure, with diagnostics and preserved state.
+
+        KeyboardInterrupt/SystemExit record interruption and propagate.
+        No rollback or automatic retry is attempted.
+
+        The request and installation directory are trusted local inputs.
+        Hashes detect changed script bytes; they do not authenticate a request
+        or protect against a malicious concurrent writer.
+        """
+        import hashlib
+        import json
+        import os
+        import platform
+        import subprocess
+        from datetime import datetime, timezone
+        from pathlib import Path
+        from uuid import uuid4
+
+        state = None
+        statePath = None
+        ownsState = False
+
+        def readJSON(path):
+            with path.open("r", encoding="utf-8") as source:
+                value = json.load(source)
+            if not isinstance(value, dict): raise ValueError("Expected a JSON object.")
+            return value
+
+        def saveState():
+            """Publish only while the worker still owns this installation."""
+            current = readJSON(statePath)
+            if current.get("installationID") != state["installationID"]:
+                raise RuntimeError("Installation ownership changed; state was not overwritten.")
+
+            temporary = statePath.parent / f".state-{uuid4().hex}.json"
+
+            try:
+                with temporary.open("x", encoding="utf-8") as target:
+                    json.dump(state, target, sort_keys=True, indent=2, allow_nan=False)
+                    target.flush()
+                    os.fsync(target.fileno())
+                os.replace(temporary, statePath)
+            finally:
+                if temporary.exists(): temporary.unlink()
+
+        def saveFailure(error):
+            """Preserve the original failure even if state publication fails."""
+            if not ownsState: return
+
+            state["status"] = "userInterrupted" if isinstance(error, (KeyboardInterrupt, SystemExit)) else "userFailed"
+            state["error"] = f"{type(error).__name__}: {error}"
+            state["endedAt"] = datetime.now(timezone.utc).isoformat()
+
+            try:
+                saveState()
+            except Exception as stateError:
+                print(f"Could not save installation failure state: {stateError}", flush=True)
+
+        try:
+            requestPath = Path(requestFilename).expanduser().absolute()
+            request = readJSON(requestPath)
+
+            if request.get("schemaVersion") != 1:
+                raise ValueError("Unsupported user-stage request version.")
+            if request.get("approved") is not True:
+                raise ValueError("User-stage request has not been approved.")
+            if request.get("prerequisitesConfirmed") is not True:
+                raise ValueError("Administrator prerequisites/reboot were not acknowledged.")
+
+            if platform.system() != "Darwin" or platform.machine().lower() != "arm64":
+                raise ValueError("This user-stage worker supports native macOS Apple Silicon only.")
+
+            statePath = Path(request["statePath"])
+            state = readJSON(statePath)
+
+            if (
+                state.get("installationID") != request.get("installationID")
+                or state.get("status") != "userLaunchPending"
+                or state.get("tool") != "AFNI"
+            ):
+                raise ValueError("User-stage request does not match pending installation state.")
+
+            ownsState = True
+
+            root = Path(state["installPath"]).resolve()
+            stageDirectory = Path(request["stageDirectory"]).resolve()
+            executableDirectory = root / "abin"
+            scriptPath = stageDirectory / "user-setup.tcsh"
+
+            if root / "install" not in stageDirectory.parents:
+                raise ValueError("User-stage directory must be beneath installPath/install.")
+            if not stageDirectory.is_dir():
+                raise ValueError("The staged working directory is unavailable.")
+            if scriptPath.is_symlink():
+                raise ValueError("The prepared installer must not be a symlink.")
+
+            content = scriptPath.read_bytes()
+            actualIdentity = {
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "size_bytes": len(content),
+            }
+            if actualIdentity != request.get("scriptIdentity"):
+                raise ValueError("User installer bytes changed after approval.")
+
+            # These choices must appear in the approved plan. Do not silently
+            # inherit a notebook's Conda/Python environment for compilation.
+            removals = request.get("environmentRemove")
+            overrides = request.get("environmentOverrides")
+
+            if not isinstance(removals, list) or not isinstance(overrides, dict):
+                raise ValueError("Missing explicit user-stage environment configuration.")
+            if any(not isinstance(name, str) or not name or "\x00" in name for name in removals):
+                raise ValueError("Invalid environment-removal name.")
+
+            environment = dict(os.environ)
+            for name in removals: environment.pop(name, None)
+
+            for name, value in overrides.items():
+                if (
+                    not isinstance(name, str) or not name or "=" in name or "\x00" in name
+                    or not isinstance(value, str) or "\x00" in value
+                ):
+                    raise ValueError("Invalid user-stage environment override.")
+                environment[name] = value
+
+            if not environment.get("PATH"):
+                raise ValueError("The user-stage environment requires PATH.")
+
+            state.update({
+                "status": "userRunning",
+                "startedAt": datetime.now(timezone.utc).isoformat(),
+                "error": None,
+                "userScriptIdentity": actualIdentity,
+                "userStageDirectory": str(stageDirectory),
+                "userSteps": [],
+            })
+            saveState()
+
+            print("\n=== Running approved AFNI user setup ===", flush=True)
+            print(f"Working directory: {stageDirectory}", flush=True)
+            print(f"AFNI executable directory: {executableDirectory}", flush=True)
+
+            # Matches the reviewed user wrapper's tcsh flags. Password/input
+            # handling remains in Terminal, not the scientific command runner.
+            completed = subprocess.run(
+                ["/bin/tcsh", "-xef", str(scriptPath)],
+                cwd=str(stageDirectory),
+                env=environment,
+                check=False,
+            )
+
+            state["userSteps"].append({
+                "name": "userSetup",
+                "returnCode": completed.returncode,
+                "endedAt": datetime.now(timezone.utc).isoformat(),
+            })
+            saveState()
+
+            if completed.returncode != 0:
+                raise RuntimeError(f"AFNI user setup exited with code {completed.returncode}.")
+
+            # Environment edits inside tcsh do not propagate back into Python.
+            # Explicitly select the newly installed programs for verification.
+            verificationEnvironment = dict(environment)
+            verificationEnvironment["PATH"] = str(executableDirectory) + os.pathsep + environment["PATH"]
+
+            probes = (
+                ("afniVersion", "afni", ["-ver"], 30),
+                ("motionCommand", "3dvolreg", ["-help"], 30),
+                ("systemCheck", "afni_system_check.py", ["-check_all"], 300),
+            )
+
+            for name, command, arguments, timeout in probes:
+                executable = executableDirectory / command
+                logPath = stageDirectory / f"{name}.log"
+
+                if not executable.is_file() or not os.access(executable, os.X_OK):
+                    raise RuntimeError(f"Expected installed executable is unavailable: {executable}")
+
+                print(f"\n=== Checking {command} ===", flush=True)
+
+                with logPath.open("xb") as output:
+                    completed = subprocess.run(
+                        [str(executable), *arguments],
+                        cwd=str(stageDirectory),
+                        env=verificationEnvironment,
+                        stdin=subprocess.DEVNULL,
+                        stdout=output,
+                        stderr=subprocess.STDOUT,
+                        timeout=timeout,
+                        check=False,
+                    )
+
+                state["userSteps"].append({
+                    "name": name,
+                    "returnCode": completed.returncode,
+                    "logPath": str(logPath),
+                    "endedAt": datetime.now(timezone.utc).isoformat(),
+                })
+                saveState()
+
+                if completed.returncode != 0:
+                    raise RuntimeError(
+                        f"{command} verification exited with code {completed.returncode}. "
+                        f"Read {logPath}"
+                    )
+                if logPath.stat().st_size == 0:
+                    raise RuntimeError(f"{command} produced no verification output. Read {logPath}")
+
+            state.update({
+                "status": "verificationPending",
+                "endedAt": datetime.now(timezone.utc).isoformat(),
+                "executableDirectory": str(executableDirectory),
+                "systemCheckLog": str(stageDirectory / "systemCheck.log"),
+            })
+            saveState()
+
+            print("\nAFNI user setup and executable probes completed.", flush=True)
+            print("Installation is awaiting diagnostic review—not yet marked verified.", flush=True)
+            print(f"System check: {state['systemCheckLog']}", flush=True)
+            print("Review its recommendations and test AFNI/SUMA GUI operation.", flush=True)
+            print("\nThen reopen Python and run:", flush=True)
+            print(f"    afni.install(installPath={str(root)!r})", flush=True)
+            return 0
+
+        except (KeyboardInterrupt, SystemExit) as error:
+            saveFailure(error)
+            raise
+
+        except Exception as error:
+            saveFailure(error)
+            print(f"\nAFNI user setup stopped: {type(error).__name__}: {error}", flush=True)
+            print("Completed changes have not been rolled back.", flush=True)
+            return 1
+        
+    ################################################################
+    # Prepare, confirm, and launch the user installation stage
+    ################################################################
+    def launchUser(self, *, stage="auto"):
+        """Offer the user stage and launch its approved worker in Terminal.
+
+        Downloads the official general user script for review, adapts its
+        destination paths, and includes the reviewed ARM Homebrew setup.
+
+        No installation directories are created until approval.
+        Requests are recorded before Terminal launch.
+        Terminal launch is not treated as installation completion.
+
+        Returns the pending launch record, or None after cancellation/refusal.
+        Operational errors propagate to the public install() warning boundary.
+
+        This method does not retry failed or uncertain stages automatically.
+        """
+        import hashlib
+        import inspect
+        import json
+        import os
+        import platform
+        import shlex
+        import subprocess
+        import sys
+        import textwrap
+        import urllib.request
+        from pathlib import Path
+        from uuid import uuid4
+
+        from .pglDialog import pglDialogs
+        from .pglMessages import pglMessages
+
+        if platform.system() != "Darwin" or platform.machine().lower() != "arm64":
+            raise ValueError("This installation stage supports native macOS Apple Silicon only.")
+
+        decision = self.getResumeStatus(stage=stage)
+        if decision["nextStage"] != "user":
+            pglMessages.warning(decision["message"])
+            return None
+
+        originalState = self.readState()
+
+        # Acknowledgment is explicit rather than hidden in a long script.
+        acknowledgment = decision["message"]
+        acknowledgment += "\n\nDid the required administrator setup finish successfully?"
+        if decision["requiresRebootConfirmation"]:
+            acknowledgment += "\nHave you also completed the required restart?"
+
+        if not pglDialogs.confirm(
+            "AFNI installation prerequisites",
+            acknowledgment,
+            confirmButtonText="Prerequisites completed",
+        ):
+            return None
+
+        sourceURL = f"{self.sourceRoot}/OS_notes.macos_12_b_user.tcsh"
+
+        with urllib.request.urlopen(sourceURL, timeout=30) as response:
+            sourceBytes = response.read(2 * 1024 * 1024 + 1)
+
+        if not sourceBytes or len(sourceBytes) > 2 * 1024 * 1024:
+            raise ValueError("Unexpected AFNI user-script download size.")
+
+        sourceText = sourceBytes.decode("utf-8")
+        prepared = self.prepareUserScript(sourceText)
+
+        # Preserve the ARM wrapper's Homebrew startup-file setup. The general
+        # script is fetched and reviewed above instead of downloaded again by
+        # the official wrapper after confirmation.
+        #
+        # Always initialize this process's Homebrew environment: an existing
+        # shellenv line does not prove this Terminal worker has evaluated it.
+        brewSetup = r'''
+# PGL launch preparation: retain the reviewed ARM Homebrew setup.
+if ( ! -x /opt/homebrew/bin/brew ) then
+    echo "** Homebrew is unavailable. Complete administrator setup first."
+    exit 1
+endif
+
+set FOUND = 0
+if ( -f "$HOME/.zshrc" ) then
+    set FOUND = `grep shellenv "$HOME/.zshrc" | grep brew | wc -l`
+endif
+
+if ( ! $FOUND ) then
+    echo "++ setup login shells with brew path"
+    (echo; echo 'eval "$(/opt/homebrew/bin/brew shellenv)"')      >> $HOME/.zprofile
+    (echo; echo 'eval "$(/opt/homebrew/bin/brew shellenv)"')      >> $HOME/.zshrc
+    (echo; echo 'eval "$(/opt/homebrew/bin/brew shellenv bash)"') >> $HOME/.bashrc
+    (echo; echo 'eval `/opt/homebrew/bin/brew shellenv tcsh`')    >> $HOME/.login
+endif
+
+eval `/opt/homebrew/bin/brew shellenv`
+if ( $status ) then
+    echo "** Could not initialize the Homebrew environment."
+    exit 1
+endif
+
+'''
+        scriptText = "#!/bin/tcsh\n" + brewSetup + prepared["scriptText"]
+        scriptBytes = scriptText.encode("utf-8")
+        scriptIdentity = {
+            "sha256": hashlib.sha256(scriptBytes).hexdigest(),
+            "size_bytes": len(scriptBytes),
+        }
+
+        # The worker itself needs only the standard library. Snapshot its
+        # implementation so an installation never depends on later edits to
+        # the loaded PGL package while its Terminal is running.
+        workerSource = textwrap.dedent(inspect.getsource(type(self).runUserStage))
+        workerLines = workerSource.splitlines(keepends=True)
+        if workerLines and workerLines[0].strip() == "@staticmethod":
+            workerLines.pop(0)
+        workerSource = "".join(workerLines)
+
+        if not workerSource.startswith("def runUserStage("):
+            raise RuntimeError("Could not prepare the standalone user-stage worker.")
+
+        workerSource += r'''
+
+if __name__ == "__main__":
+    import sys
+
+    exitCode = runUserStage(sys.argv[1])
+    try:
+        input("\nPress Return to close this launcher...")
+    except (EOFError, KeyboardInterrupt):
+        pass
+    sys.exit(exitCode)
+'''
+        workerIdentity = hashlib.sha256(workerSource.encode("utf-8")).hexdigest()
+
+        # Exclude notebook environment selection and common compiler overrides.
+        # This is controlled preparation, not a claim of hermetic compilation.
+        environmentRemove = sorted({
+            name for name in os.environ
+            if name.startswith(("CONDA_", "_CONDA_", "MAMBA_", "PYTHON"))
+        } | {
+            "VIRTUAL_ENV", "VIRTUAL_ENV_PROMPT",
+            "CC", "CXX", "FC", "F77", "CFLAGS", "CXXFLAGS", "FFLAGS",
+            "CPPFLAGS", "LDFLAGS", "CPATH", "LIBRARY_PATH",
+            "CMAKE_PREFIX_PATH", "PKG_CONFIG_PATH", "SDKROOT",
+        })
+
+        environmentOverrides = {
+            "PATH": ":".join((
+                "/opt/homebrew/bin",
+                "/opt/homebrew/sbin",
+                "/opt/homebrew/opt/python/libexec/bin",
+                "/Library/Frameworks/R.framework/Resources/bin",
+                "/opt/X11/bin",
+                "/usr/local/bin",
+                "/usr/bin",
+                "/bin",
+                "/usr/sbin",
+                "/sbin",
+            )),
+        }
+
+        stageID = str(uuid4())
+        installationID = str(uuid4()) if originalState is None else originalState["installationID"]
+        stageDirectory = self.directory / stageID
+        defaultRoot = (Path.home() / "proj" / "afni").resolve()
+        resume = "afni.install()" if self.root == defaultRoot else f"afni.install(installPath={str(self.root)!r})"
+
+        details = f"""AFNI USER INSTALLATION
+======================
+
+Installation root: {self.root}
+Executables/resources: {self.root / 'abin'}
+Build workspace/backups: {self.root / 'build'}
+This stage's records/logs: {stageDirectory}
+
+Official general user script:
+{sourceURL}
+
+Downloaded source SHA-256:
+{hashlib.sha256(sourceBytes).hexdigest()}
+
+Prepared executable script SHA-256:
+{scriptIdentity['sha256']}
+
+Standalone worker SHA-256:
+{workerIdentity}
+
+EXECUTION
+---------
+Run the prepared script with:
+    /bin/tcsh -xef user-setup.tcsh
+
+Terminal displays the installation output.
+PGL does not collect passwords or reboot the machine.
+The installer can download additional scripts, packages, and source code.
+Those downstream downloads are not pinned by the hashes above.
+
+The ARM wrapper's Homebrew startup setup is included below.
+The downloaded general user script is staged now, not downloaded again
+after approval.
+
+The worker runs using:
+    {sys.executable} -I
+
+That Python runs bookkeeping only. AFNI commands and build scripts use:
+    PATH={environmentOverrides['PATH']}
+
+The following environment variables are removed from the worker's child
+process environment:
+    {', '.join(environmentRemove)}
+
+The user's HOME and existing R_LIBS are not redirected.
+Homebrew shellenv is evaluated in the installer shell.
+This is not a fully isolated or hermetic build.
+
+KNOWN EFFECTS
+-------------
+- Configure Homebrew startup initialization if absent.
+- Change Terminal/XQuartz focus-following preferences.
+- Bootstrap AFNI scripts/resources into the selected abin directory.
+- Update shell startup files and command completion.
+- Build AFNI using the official procedure and explicit destination options.
+- Configure/install AFNI R packages.
+- Create missing AFNI/SUMA configuration and command help.
+- Potentially replace existing AFNI files and prune AFNI-managed backups.
+
+The exact prepared script below is authoritative for this request.
+Cancelling before launch makes no installation changes.
+Stopping after launch does not roll back completed changes.
+
+VERIFICATION
+------------
+The worker probes this installation's afni and 3dvolreg executables and runs
+afni_system_check.py -check_all. Logs remain in this stage directory.
+
+The official script also writes out.ASC.txt from its own shell environment.
+That environment can differ from the worker's separate verification process.
+Both reports will be shown during review.
+
+Successful probes leave status verificationPending—not verified.
+After reviewing the Terminal output, continue using:
+    {resume}
+
+No complete Terminal transcript is captured by this implementation.
+
+DESTINATION DIFF
+----------------
+{prepared['diff']}
+
+PREPARED SCRIPT
+---------------
+{scriptText}
+"""
+
+        pglMessages.print(details)
+
+        if not pglDialogs.confirm(
+            "Install AFNI: user setup",
+            "Review the installation script, destinations, and environment before launching Terminal.",
+            details=details,
+            confirmButtonText="Run in Terminal",
+            copyText="Copy instructions",
+        ):
+            return None
+
+        # A reboot or another installation process may have changed the
+        # situation while the user was reviewing the plan.
+        if self.readState() != originalState:
+            raise RuntimeError("Installation state changed during review. Run afni.install() again.")
+
+        refreshed = self.getResumeStatus(stage=stage)
+        if refreshed["nextStage"] != "user":
+            raise RuntimeError(refreshed["message"])
+
+        self.directory.mkdir(parents=True, exist_ok=True)
+
+        # Persistent stage claim prevents two cooperating launchers from
+        # publishing/starting the same user stage. Recovery is explicit.
+        claimPath = self.directory / ".user-stage-claim"
+        try:
+            claimPath.mkdir()
+        except FileExistsError:
+            raise RuntimeError("The user stage has already been claimed. Review its state before launching again.") from None
+
+        state = deepcopy(originalState) if originalState is not None else {
+            "schemaVersion": 1,
+            "tool": "AFNI",
+            "installationID": installationID,
+            "installPath": str(self.root),
+            "createdAt": datetime.now(timezone.utc).isoformat(),
+        }
+
+        state.update({
+            "status": "userLaunchPending",
+            "userStageID": stageID,
+            "userStageDirectory": str(stageDirectory),
+            "userScriptIdentity": scriptIdentity,
+            "userSource": {
+                "url": sourceURL,
+                "sha256": hashlib.sha256(sourceBytes).hexdigest(),
+                "size_bytes": len(sourceBytes),
+            },
+            "userWorkerSHA256": workerIdentity,
+            "prerequisitesConfirmedAt": datetime.now(timezone.utc).isoformat(),
+            "rebootConfirmationRequired": decision["requiresRebootConfirmation"],
+            "error": None,
+        })
+
+        request = {
+            "schemaVersion": 1,
+            "approved": True,
+            "prerequisitesConfirmed": True,
+            "installationID": installationID,
+            "statePath": str(self.statePath),
+            "stageDirectory": str(stageDirectory),
+            "scriptIdentity": scriptIdentity,
+            "environmentRemove": environmentRemove,
+            "environmentOverrides": environmentOverrides,
+        }
+
+        statePublished = False
+
+        try:
+            if self.readState() != originalState:
+                raise RuntimeError("Installation state changed before staging.")
+
+            stageDirectory.mkdir()
+
+            with (stageDirectory / "official-user.tcsh").open("xb") as target:
+                target.write(sourceBytes)
+            with (stageDirectory / "user-setup.tcsh").open("xb") as target:
+                target.write(scriptBytes)
+
+            (stageDirectory / "approved-plan.txt").write_text(details, encoding="utf-8")
+            (stageDirectory / "run-user.py").write_text(workerSource, encoding="utf-8")
+            (stageDirectory / "request.json").write_text(
+                json.dumps(request, sort_keys=True, indent=2, allow_nan=False),
+                encoding="utf-8",
+            )
+
+            # Use -I so notebook PYTHONPATH/site customization does not affect
+            # the standalone bookkeeping process.
+            command = [
+                sys.executable,
+                "-I",
+                str(stageDirectory / "run-user.py"),
+                str(stageDirectory / "request.json"),
+            ]
+            commandPath = stageDirectory / "run-user.command"
+            commandPath.write_text(
+                "#!/bin/zsh\nexec " + " ".join(shlex.quote(value) for value in command) + "\n",
+                encoding="utf-8",
+            )
+            commandPath.chmod(0o700)
+
+            temporary = self.directory / f".state-{uuid4().hex}.json"
+            try:
+                with temporary.open("x", encoding="utf-8") as target:
+                    json.dump(state, target, sort_keys=True, indent=2, allow_nan=False)
+                    target.flush()
+                    os.fsync(target.fileno())
+                os.replace(temporary, self.statePath)
+                statePublished = True
+            finally:
+                if temporary.exists(): temporary.unlink()
+
+            result = subprocess.run(
+                ["/usr/bin/open", "-a", "Terminal", str(commandPath)],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.strip() or "Terminal launch was refused.")
+
+        except BaseException:
+            if statePublished:
+                # Launch failure/timeout can be ambiguous. Do not race a
+                # worker by overwriting its state or allowing a second launch.
+                pglMessages.warning(
+                    "The AFNI user-stage launch could not be confirmed. "
+                    "Check Terminal and the saved installation state before "
+                    "retrying. The pending record and staged files were retained."
+                )
+            else:
+                # No launcher was invoked. Remove only our empty claim;
+                # keep staged files for diagnosis without changing old state.
+                claimPath.rmdir()
+            raise
+
+        pglMessages.message(
+            "AFNI user setup was requested in Terminal.\n"
+            "Follow its output. Launching Terminal does not mean installation succeeded.\n"
+            f"When it finishes, run {resume} to review diagnostics."
+        )
+        return state
+    
+    ################################################################
+    # Review completed installation diagnostics
+    ################################################################
+    def reviewInstallation(self):
+        """Review reports and freshly probe the selected installation.
+
+        Returns the updated installation record after explicit acceptance and
+        successful probes. Cancellation/refusal returns None.
+
+        Does not rerun the installer, modify shell configuration, or regenerate
+        system-check reports.
+
+        'verified' means executable probes passed and the user explicitly
+        accepted the displayed diagnostics. It does not certify every optional
+        dependency, GUI operation, or scientific result.
+        """
+        import hashlib
+        import json
+        import os
+        from pathlib import Path
+        from uuid import uuid4
+
+        from .pglDialog import pglDialogs
+        from .pglMessages import pglMessages
+
+        state = self.readState()
+        if state is None or state["status"] != "verificationPending":
+            raise ValueError("Installation is not awaiting diagnostic review.")
+
+        systemCheckPath = Path(state["systemCheckLog"])
+        stageDirectory = systemCheckPath.parent
+        reports = []
+        sections = []
+
+        for label, path, required in (
+            ("Worker system check", systemCheckPath, True),
+            ("Official script system check", stageDirectory / "out.ASC.txt", False),
+        ):
+            if not path.exists():
+                if required: raise FileNotFoundError(f"Required verification report is missing: {path}")
+                sections.append(f"{label}\nNot available: {path}\n")
+                continue
+
+            if path.is_symlink() or not path.is_file():
+                raise ValueError(f"Verification report must be a regular nonsymlink file: {path}")
+
+            # Never accept a report after showing only an undisclosed prefix.
+            with path.open("rb") as source:
+                content = source.read(8 * 1024 * 1024 + 1)
+            if len(content) > 8 * 1024 * 1024:
+                raise ValueError(f"Report is too large for this review dialog. Inspect it separately: {path}")
+            if not content:
+                raise ValueError(f"Verification report is empty: {path}")
+
+            reports.append({
+                "label": label,
+                "localPath": str(path),
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "size_bytes": len(content),
+            })
+            sections.append(
+                f"{label}\nFile: {path}\n{'-' * 72}\n"
+                + content.decode("utf-8", errors="replace")
+            )
+
+        details = (
+            "AFNI INSTALLATION REVIEW\n"
+            "========================\n\n"
+            f"Installation: {self.root}\n\n"
+            "Read the recommendations in both reports, including 'Please Fix'.\n"
+            "The reports may differ because the official script and worker\n"
+            "verification run in different process environments.\n\n"
+            "Resolve problems relevant to your intended use before accepting.\n"
+            "Test AFNI/SUMA GUI functionality separately if you need those tools.\n\n"
+            "Accepting records your diagnostic review. PGL will then freshly\n"
+            "probe this installation's executables before marking it verified.\n"
+            "No installer will run.\n\n"
+            + "\n\n".join(sections)
+        )
+
+        pglMessages.print(details)
+
+        if not pglDialogs.confirm(
+            "Review AFNI installation",
+            "Have you reviewed these diagnostics and resolved issues required for your intended use?",
+            details=details,
+            confirmButtonText="Accept diagnostics",
+            copyText="Copy reports",
+        ):
+            return None
+
+        if self.readState() != state:
+            raise RuntimeError("Installation state changed during diagnostic review.")
+
+        # The user accepted these exact report bytes, not a report that changed
+        # while the dialog was open.
+        for record in reports:
+            actual = pglExternalTool._fileIdentity(record["localPath"])
+            expected = {key: record[key] for key in ("sha256", "size_bytes")}
+            if actual != expected:
+                raise ValueError("A verification report changed during review. Review the new report before accepting.")
+
+        probe = pglAFNI(directory=str(self.root / "abin"))
+
+        # Bypass the public pending-state guard: this is the coordinator's
+        # explicit verification step, not an ordinary availability query.
+        if not probe._checkAvailable("3dvolreg", cacheDirectory=stageDirectory):
+            return None
+
+        if self.readState() != state:
+            raise RuntimeError("Installation state changed during executable verification.")
+
+        updated = deepcopy(state)
+        updated.update({
+            "status": "verified",
+            "verifiedAt": datetime.now(timezone.utc).isoformat(),
+            "error": None,
+            "verification": {
+                "meaning": "Executable probes passed and the user accepted the diagnostic reports.",
+                "reports": reports,
+                "availability": deepcopy(probe.lastAvailability),
+                "guiTests": "Not automatically verified by PGL.",
+            },
+        })
+
+        temporary = self.directory / f".state-{uuid4().hex}.json"
+
+        try:
+            with temporary.open("x", encoding="utf-8") as target:
+                json.dump(updated, target, sort_keys=True, indent=2, allow_nan=False)
+                target.flush()
+                os.fsync(target.fileno())
+            os.replace(temporary, self.statePath)
+        finally:
+            if temporary.exists(): temporary.unlink()
+
+        pglMessages.message(
+            f"AFNI executable checks passed and diagnostic review was recorded.\n"
+            f"Executable directory: {self.root / 'abin'}"
+        )
+        return updated

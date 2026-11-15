@@ -60,6 +60,8 @@ class pglActionHistory(pglTraitSettings):
     endTime = Float(help="End time of the action in seconds")
     runDuration = Float(help="Time taken to run the action in seconds")
     actionInput = Dict(default_value={}, help="Explicit input provenance when recorded; empty for legacy or unspecified inputs")
+    actionEnvironment = Dict(default_value={}, help="Runtime environment captured for this execution; empty when not recorded")
+    actionInvocations = List(Dict(), help="External-tool invocation attempts recorded during this execution")
 
     def __init__(self, action=None):
         """Create an execution snapshot, or an empty restoration instance."""
@@ -135,19 +137,24 @@ class pglActionHistory(pglTraitSettings):
         self.runDuration = self.endTime - self.startTime
 
     def toJSONdict(self, type="all"):
-        """Preserve absent optional fields in previously saved history."""
+        """Preserve absent optional fields in previously saved history.
+
+        New runtime-provenance fields must not appear in legacy history merely
+        because the installed class now declares them.
+        """
         data = super().toJSONdict(type=type)
         originalFields = getattr(self, "_originalHistoryFields", None)
 
-        for name in ("actionID", "parentActionID", "actionCode", "actionInput"):
+        mappingFields = {"actionCode", "actionInput", "actionEnvironment", "actionInvocations"}
+
+        for name in ("actionID", "parentActionID", "actionCode", "actionInput", "actionEnvironment", "actionInvocations"):
             value = data.get(name)
-            empty = not value if name in ("actionCode", "actionInput") else value is None
+            empty = not value if name in mappingFields else value is None
 
             if empty and (originalFields is None or name not in originalFields):
                 data.pop(name, None)
 
-        return data
-    
+        return data    
     @classmethod
     def fromJSONdict(cls, data, type="all", filename=None):
         """Restore history without creating new execution provenance."""
@@ -330,7 +337,7 @@ class pglAction(pglActionable):
         return self.status.value >= pglActionStatus.CONFIGURED.value
         
     def run(self, *args, **kwargs):
-        """Execute an action with fresh identity, nested context, and history.
+        """Execute an action with identity, runtime provenance, and history.
 
         Successful actions attach history to their returned actionable.
         Failed actions attach history to directly supplied input actionables
@@ -339,12 +346,19 @@ class pglAction(pglActionable):
         Failure marks those working objects unsafe for checkpoint saving.
         Later successful executions do not clear that state.
 
+        Runtime environment is captured before scientific execution.
+        Tool adapters automatically record through the active execution context.
+        Nested actions receive separate recorders and restore their parent's
+        recorder when they finish.
+
         Explicit setError() failures are preserved.
         Ordinary exceptions warn and return None.
         KeyboardInterrupt and SystemExit are recorded and propagated.
 
         Scientific mutations are not rolled back.
         """
+        from .pglExternalTools import pglExecutionRecorder
+
         if getattr(self, "_executionInProgress", False):
             raise RuntimeError(f"Action {self.name} is already running. Use a separate action instance for another execution.")
 
@@ -379,6 +393,11 @@ class pglAction(pglActionable):
 
             try:
                 entry = pglActionHistory(self)
+
+                # Capture before scientific execution. Construction/restoration
+                # of history objects alone never discovers today's environment.
+                recorder = pglExecutionRecorder(actionID=entry.actionID)
+                entry.actionEnvironment = recorder.exportEnvironment()
                 self.actionHistory.append(entry)
 
             except BaseException:
@@ -389,64 +408,75 @@ class pglAction(pglActionable):
 
             contextToken = _activeActionID.set(entry.actionID)
 
-            try:
-                result = self._run(*args, **kwargs)
+            with recorder.activate():
+                try:
+                    result = self._run(*args, **kwargs)
 
-                if self.status == pglActionStatus.FAILED or self.error is not None:
+                    # A wrapper must finalize each invocation even when its
+                    # caller elects to handle the tool's failure explicitly.
+                    recorder.requireComplete()
+
+                    if self.status == pglActionStatus.FAILED or self.error is not None:
+                        self.status = pglActionStatus.FAILED
+
+                        if self.error is None:
+                            self.error = RuntimeError(f"Action {self.name} reported failure without an error description.")
+
+                    elif self.status == pglActionStatus.SKIPPED:
+                        pass
+
+                    elif result is None:
+                        self.error = RuntimeError(f"Action {self.name} returned None without reporting failure or an explicit skip.")
+                        self.status = pglActionStatus.FAILED
+                        pglMessages.warning(str(self.error), level=1)
+
+                    else:
+                        self.status = pglActionStatus.SUCCESS
+
+                except (KeyboardInterrupt, SystemExit) as error:
+                    self.error = RuntimeError(f"{type(error).__name__}: action execution was interrupted.")
                     self.status = pglActionStatus.FAILED
+                    raise
 
-                    if self.error is None:
-                        self.error = RuntimeError(f"Action {self.name} reported failure without an error description.")
-
-                elif self.status == pglActionStatus.SKIPPED:
-                    pass
-
-                elif result is None:
-                    self.error = RuntimeError(f"Action {self.name} returned None without reporting failure or an explicit skip.")
+                except Exception as error:
+                    self.error = error
                     self.status = pglActionStatus.FAILED
-                    pglMessages.warning(str(self.error), level=1)
+                    pglMessages.warning(f"Error running action {self.name}: {error}", level=1)
 
-                else:
-                    self.status = pglActionStatus.SUCCESS
+                finally:
+                    # Finalize execution-time provenance independently of the
+                    # scientific outcome. Unfinished attempts remain visible.
+                    recorder.close()
+                    entry.actionEnvironment = recorder.exportEnvironment()
+                    entry.actionInvocations = recorder.exportInvocations()
 
-            except (KeyboardInterrupt, SystemExit) as error:
-                self.error = RuntimeError(f"{type(error).__name__}: action execution was interrupted.")
-                self.status = pglActionStatus.FAILED
-                raise
+                    if self.status == pglActionStatus.FAILED:
+                        # Even an action returning None may already have mutated
+                        # its input. Mark every direct input conservatively.
+                        for owner in inputActionables:
+                            owner._recordFailedAction(entry.actionID)
 
-            except Exception as error:
-                self.error = error
-                self.status = pglActionStatus.FAILED
-                pglMessages.warning(f"Error running action {self.name}: {error}", level=1)
+                        # Ingestion may create and return a partial session without
+                        # having received an input session.
+                        if isinstance(result, pglActionable) and result is not self:
+                            result._recordFailedAction(entry.actionID)
 
-            finally:
-                if self.status == pglActionStatus.FAILED:
-                    # Even an action returning None may already have mutated
-                    # its input. Mark every direct input conservatively.
-                    for owner in inputActionables:
-                        owner._recordFailedAction(entry.actionID)
+                    entry.update(self)
 
-                    # Ingestion may create and return a partial session without
-                    # having received an input session.
-                    if isinstance(result, pglActionable) and result is not self:
-                        result._recordFailedAction(entry.actionID)
+                    if self.status == pglActionStatus.SUCCESS and isinstance(result, pglActionable):
+                        # A new returned object must not silently erase a direct
+                        # input's unresolved failure state.
+                        for owner in inputActionables:
+                            for failedActionID in owner._failedActionIDs:
+                                result._recordFailedAction(failedActionID)
 
-                entry.update(self)
-
-                if self.status == pglActionStatus.SUCCESS and isinstance(result, pglActionable):
-                    # A new returned object must not silently erase a direct
-                    # input's unresolved failure state.
-                    for owner in inputActionables:
-                        for failedActionID in owner._failedActionIDs:
-                            result._recordFailedAction(failedActionID)
-
-                    appendEntry(result)
-                else:
-                    for owner in inputActionables:
-                        appendEntry(owner)
-
-                    if isinstance(result, pglActionable):
                         appendEntry(result)
+                    else:
+                        for owner in inputActionables:
+                            appendEntry(owner)
+
+                        if isinstance(result, pglActionable):
+                            appendEntry(result)
 
             if self.status == pglActionStatus.FAILED:
                 return None
