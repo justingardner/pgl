@@ -2044,7 +2044,7 @@ class pglExperiment(pglExperimentBase):
         candidates = mainTasks if mainTasks else list(self.tasks)
 
         if not candidates:
-            pglMessages.message("Detected aborted run: no tasks are available for trial-count classification.", messageType='experiment')
+            pglMessages.message("Detected aborted run: no tasks are available for trial-count classification.", messageType='experiment', emphasize=True)
             return True
 
         shortfalls = []
@@ -2063,7 +2063,7 @@ class pglExperiment(pglExperimentBase):
 
         # Report failure only after checking every candidate.
         candidateType = "main tasks" if mainTasks else "candidate tasks"
-        pglMessages.message(f"Detected aborted run: none of the {candidateType} reached its trial threshold. " + "; ".join(shortfalls), messageType='experiment')
+        pglMessages.message(f"Detected aborted run: none of the {candidateType} reached its trial threshold. " + "; ".join(shortfalls), messageType='experiment', emphasize=True)
         return True
     
     ################################################################
