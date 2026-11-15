@@ -2633,3 +2633,242 @@ class pglDialogs:
         except Exception as e:
             pglMessages.warning(f"Error running traitsDialog: {e}")
             return None
+
+    ################################################################
+    # Display information and request explicit confirmation
+    ################################################################
+    @staticmethod
+    def confirm(summary, title="Confirm", *, details=None, confirmButtonText="Ok", copyText=None):
+        """Request confirmation in a separate PySide6 process.
+
+        summary is required nonblank string.
+        title is optional and defaults to "Confirm".
+        details optionally adds a scrollable, read-only text area.
+        confirmButtonText defaults to "Ok".
+
+        copyText optionally enables a copy button with the supplied label.
+        It copies details when supplied, otherwise summary.
+        Text remains selectable without a copy button.
+
+        Returns True only after explicit confirmation.
+        Cancel, Escape, window closure, or dialog failure returns False.
+        KeyboardInterrupt propagates without granting approval.
+
+        All displayed content is plain text. This dialog does not execute
+        commands or perform the operation being confirmed.
+
+        Uses temporary JSON files for communication, matching traitsDialog's
+        process isolation without creating Qt widgets in the caller.
+
+        Examples:
+            approved = pglDialogs.confirm(
+                "Remove intermediate image attachments from this session?",
+            )
+
+            approved = pglDialogs.confirm(
+                "Install AFNI",
+                "Review the proposed changes before installing.",
+                details=installationPlan,
+                confirmButtonText="Install",
+                copyText="Copy instructions",
+            )
+        """
+        import hashlib
+        import json
+        import subprocess
+        import sys
+        import tempfile
+        from pathlib import Path
+
+        from .pglMessages import pglMessages
+
+        for name, value in (("title", title), ("summary", summary), ("confirmButtonText", confirmButtonText)):
+            if not isinstance(value, str): raise TypeError(f"{name} must be a string.")
+            if not value.strip(): raise ValueError(f"{name} must not be blank.")
+            if "\x00" in value: raise ValueError(f"{name} must not contain NUL.")
+
+        for name, value in (("details", details), ("copyText", copyText)):
+            if value is None: continue
+            if not isinstance(value, str): raise TypeError(f"{name} must be a string or None.")
+            if not value.strip(): raise ValueError(f"{name} must be nonblank when supplied.")
+            if "\x00" in value: raise ValueError(f"{name} must not contain NUL.")
+
+        request = {
+            "title": title,
+            "summary": summary,
+            "details": details,
+            "confirmButtonText": confirmButtonText,
+            "copyText": copyText,
+        }
+
+        # Bind the response to the complete request, including button labels.
+        # Successful process exit alone is never interpreted as confirmation.
+        requestText = json.dumps(request, ensure_ascii=False, sort_keys=True)
+        requestHash = hashlib.sha256(requestText.encode("utf-8")).hexdigest()
+
+        # Qt lives entirely in the child process. User-supplied text enters
+        # through JSON, never through Python source or shell interpolation.
+        dialogScript = r'''
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QFontDatabase
+from PySide6.QtWidgets import (
+    QApplication, QDialog, QHBoxLayout, QLabel, QPlainTextEdit,
+    QPushButton, QVBoxLayout,
+)
+
+requestBytes = Path(sys.argv[1]).read_bytes()
+requestHash = hashlib.sha256(requestBytes).hexdigest()
+request = json.loads(requestBytes)
+
+# Create the application before constructing any widgets.
+app = QApplication([])
+dialog = QDialog()
+dialog.setWindowTitle(request["title"])
+dialog.setSizeGripEnabled(True)
+dialog.setStyleSheet("""
+    QDialog { background-color: #1e1f22; }
+    QLabel { color: #d6d9de; font-size: 13px; }
+    QPlainTextEdit {
+        background-color: #2b2d31;
+        color: #eaecef;
+        border: 1px solid #3a3d42;
+        border-radius: 6px;
+        padding: 8px;
+        selection-background-color: #3d6fd1;
+    }
+    QPushButton {
+        background-color: #34373c;
+        color: #eaecef;
+        border: 1px solid #3a3d42;
+        border-radius: 6px;
+        padding: 7px 20px;
+        min-width: 84px;
+    }
+    QPushButton:hover { background-color: #3f4247; }
+    QPushButton:focus { border: 1px solid #4a8cff; }
+    QPushButton:default { border: 2px solid #4a8cff; }
+""")
+
+layout = QVBoxLayout(dialog)
+layout.setContentsMargins(20, 20, 20, 16)
+layout.setSpacing(12)
+
+summaryLabel = QLabel()
+summaryLabel.setTextFormat(Qt.TextFormat.PlainText)
+summaryLabel.setText(request["summary"])
+summaryLabel.setWordWrap(True)
+summaryLabel.setTextInteractionFlags(
+    Qt.TextInteractionFlag.TextSelectableByMouse
+    | Qt.TextInteractionFlag.TextSelectableByKeyboard
+)
+layout.addWidget(summaryLabel)
+
+# Detailed content is optional; ordinary confirmations remain compact.
+hasDetails = request["details"] is not None
+
+if hasDetails:
+    detailsEditor = QPlainTextEdit()
+    detailsEditor.setReadOnly(True)
+    detailsEditor.setUndoRedoEnabled(False)
+    detailsEditor.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+    detailsEditor.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
+    detailsEditor.setPlainText(request["details"])
+    layout.addWidget(detailsEditor, 1)
+
+buttons = QHBoxLayout()
+cancelButton = QPushButton("Cancel")
+confirmButton = QPushButton(request["confirmButtonText"])
+
+# Focusing another button must not silently make it the Enter-key default.
+for button in (cancelButton, confirmButton):
+    button.setAutoDefault(False)
+    button.setDefault(False)
+
+cancelButton.setDefault(True)
+
+# Only show a copy button when the caller explicitly supplies its label.
+if request["copyText"] is not None:
+    copyButton = QPushButton(request["copyText"])
+    copyButton.setAutoDefault(False)
+    copyButton.setDefault(False)
+    copyContent = request["details"] if hasDetails else request["summary"]
+    copyButton.clicked.connect(lambda: app.clipboard().setText(copyContent))
+    buttons.addWidget(copyButton)
+
+cancelButton.clicked.connect(dialog.reject)
+confirmButton.clicked.connect(dialog.accept)
+
+buttons.addStretch(1)
+buttons.addWidget(cancelButton)
+buttons.addWidget(confirmButton)
+layout.addLayout(buttons)
+
+dialog.resize(900, 650) if hasDetails else dialog.resize(560, 200)
+
+# Keep the initial dialog within the available desktop area.
+screen = app.primaryScreen()
+if screen is not None:
+    available = screen.availableGeometry()
+    dialog.resize(
+        min(dialog.width(), max(1, available.width() - 40)),
+        min(dialog.height(), max(1, available.height() - 60)),
+    )
+    dialog.move(available.center() - dialog.rect().center())
+
+cancelButton.setFocus()
+confirmed = dialog.exec() == QDialog.DialogCode.Accepted
+
+# Return explicit confirmation bound to the request that was displayed.
+response = {"confirmed": confirmed, "requestHash": requestHash}
+Path(sys.argv[2]).write_text(json.dumps(response), encoding="utf-8")
+'''
+
+        try:
+            with tempfile.TemporaryDirectory(prefix="pgl-confirm-") as directory:
+                root = Path(directory)
+                inputFile = root / "request.json"
+                outputFile = root / "response.json"
+                inputFile.write_bytes(requestText.encode("utf-8"))
+
+                # There is no interaction timeout: users may need time to
+                # review or copy details. subprocess.run cleans up its
+                # child if execution is interrupted.
+                result = subprocess.run(
+                    [sys.executable, "-c", dialogScript, str(inputFile), str(outputFile)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
+                )
+
+                if result.returncode != 0:
+                    errorDetails = result.stderr.strip()[-4000:] or "No diagnostic output."
+                    raise RuntimeError(f"Dialog process exited with code {result.returncode}:\n{errorDetails}")
+
+                if not outputFile.is_file():
+                    raise RuntimeError("Dialog closed without a confirmation response.")
+
+                response = json.loads(outputFile.read_text(encoding="utf-8"))
+
+                if (
+                    not isinstance(response, dict)
+                    or set(response) != {"confirmed", "requestHash"}
+                    or type(response["confirmed"]) is not bool
+                    or response["requestHash"] != requestHash
+                ):
+                    raise ValueError("Invalid or mismatched confirmation response.")
+
+                return response["confirmed"]
+
+        except Exception as error:
+            # Fail closed. Never interpret a launch or decoding failure as
+            # consent, and do not silently switch confirmation interfaces.
+            pglMessages.warning(f"Confirmation was not obtained: {type(error).__name__}: {error}", level=1)
+            return False
