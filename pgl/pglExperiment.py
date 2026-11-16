@@ -3316,113 +3316,98 @@ class pglTaskData(pglTraitSettings):
                     nTrials += 1
         return nTrials
 
-    def display(self, e=None, ax=None, discrepancyMs=100.0):
+    def display(self, taskName="task", responseMapping=None, nTotalTrials=None, ax=None):
         '''
         Display the experiment data.
-
-        Use the same volume-timing diagnostics as the printed summary.
-        Put MRI volume time and diagnostic counts on the second title line.
         '''
-        if len(self.events) == 0:
-            pglMessages.print("(pglExperimentData) No events to display.")
+        # use responseMapping for displaying subject responses
+        if responseMapping is None:
+            responseMapping = self.responseMapping
+
+        # get trial timestamps
+        trialTimestamps = np.array([e.timestamp for e in self.events if isinstance(e, pglEventTrial)])
+        if len(trialTimestamps) <= 2:
+            pglMessages.message("Insufficient trial events found to display.")
             return
 
-        # get info from experiment if provided
-        if e is not None:
-            self.volumeTriggerKey = e.settings.volumeTriggerKey
-        else:
-            #settings = pglSettingsManager.getSettings()
-            #self.volumeTriggerKey = settings.volumeTriggerKey
-            self.volumeTriggerKey = "`"
-
-        # Get the time at which start the timeline, if there is a keyboard
-        # event that happens before the start of the experiment (like when the experimenter
-        # hits space to start the experiment), then adjust the start time to show that as a negative time)
-        startTime = 0
-        firstKeydownEvent = next((event for event in self.events if event.type == "keyboard" and event.eventType == "keydown"), None)
-        if firstKeydownEvent is not None:
-            if firstKeydownEvent.timestamp < self.startTime:
-                startTime = firstKeydownEvent.timestamp - self.startTime
-
-        # track number of volumes
-        nVols = 0
-        nKeys = 0
-        nOutputTriggers = 0
-        nUnsentTriggers = 0
-
-        diagnostics = self.getVolumeTimingDiagnostics(discrepancyMs=discrepancyMs)
+        # get the max trial length
+        maxTrialLength = np.diff(trialTimestamps[:-1]).max()
 
         # init timeline
-        timeline = pglTimelinePlot(ax=ax, startTime=startTime, endTime=max(self.endTime-self.startTime,10))
+        timeline = pglTimelinePlot(ax=ax, startTime=0, endTime=maxTrialLength)
+
+        # init a dict for counting the number of different responseTypes found in the events
+        responseCounts = {respType: 0 for respType in responseMapping}
+
         # for each event, add to timeline
+        trialStart = None
+        gotResponse = False
+        gotOutputTrigger = False
+        gotUnsentTrigger = False
+        nTrials = 0
+
         for event in self.events:
-            if event.type == "keyboard":
-                if event.eventType == "keydown":
-                    if event.keyChar != self.volumeTriggerKey:
-                        timeline.addTriangleMarker(time=event.timestamp - self.startTime, color='green', label=f'{event.keyChar}', direction='down')
-                        nKeys += 1
-                elif (event.keyChar == "escape"):
-                    timeline.addTriangleMarker(time=event.timestamp - self.startTime, color='red', label=f'{event.keyChar}', direction='down')
-                    nKeys += 1
-            elif event.type == "volumeTrigger":
-                nVols += 1
-                if event.timestamp is not None and np.isfinite(event.timestamp):
-                    timeline.addTriangleMarker(time=event.timestamp - self.startTime, color='blue', direction='up')
-            elif event.type == "outputTrigger":
-                if event.timestamp is not None:
-                    value = getattr(event, "value", None)
-                    label = f"{value}" if value is not None else 'x'
-                    sent = getattr(event, "triggerSent", True)
-                    if sent:
-                        nOutputTriggers += 1
-                    else:
-                        nUnsentTriggers += 1
-                    # set marker
-                    timeline.addTriangleMarker(time=event.timestamp - self.startTime, color='purple' if sent else 'orange', label=label, direction='up')
+            # if we find a new trial event, reset the beginning time
+            if isinstance(event, pglEventTrial):
+                trialStart = event.timestamp
+                if event.eventType == "start":
+                    nTrials += 1
+            elif trialStart is not None:
+                # display segment events
+                if isinstance(event, pglEventSegment) and event.eventType == pglEventSegment.boundaryType.START.value:
+                    timeline.addTriangleMarker(time=event.timestamp - trialStart, color='blue', label=f'{event.segmentNum}', direction='up')
+                # display subject response events
+                elif isinstance(event, pglEventSubjectResponse):
+                    gotResponse = True
+                    label, color = responseMapping.get(event.responseType, ('?', 'gray'))
+                    timeline.addTriangleMarker(time=event.timestamp - trialStart, color=color, label=label[0], direction='down')
+                    # update response counts
+                    if event.responseType in responseCounts:
+                        responseCounts[event.responseType] += 1
+                # display output trigger events
+                elif isinstance(event, pglEventOutputTrigger):
+                    if event.timestamp is not None:
+                        value = getattr(event, "value", None)
+                        label = f"{value}" if value is not None else 'x'
+                        sent = getattr(event, "triggerSent", True)
+                        if sent:
+                            gotOutputTrigger = True
+                        else:
+                            gotUnsentTrigger = True
+                        # display triangle
+                        timeline.addTriangleMarker(time=event.timestamp - trialStart, color='purple' if sent else 'orange', label=label, direction='down')
 
-        if self.startDateTime != "":
-            dateTime = datetime.fromisoformat(self.startDateTime)
-            readableTime = dateTime.strftime("%I:%M %p").lstrip("0")
-            title = f"Experiment Events: {dateTime:%b. %d, %Y} at {readableTime}"
+        # compute duration
+        if self.endTime is not None and self.startTime is not None:
+            duration = pglTimestamp.formatDuration(self.endTime-self.startTime)
         else:
-            title = "Experiment Events"
+            duration = ""
 
-        # Keep all volume-timing information together on the second title line.
-        if not diagnostics["valid"]:
-            title += "\nMRI volume timing unavailable"
-            pglMessages.warning(diagnostics["error"], level=1)
-        elif diagnostics["median"] is not None:
-            details = [f"MRI volume time: {diagnostics['median']:.3f} s"]
+        if nTotalTrials is not None and not np.isinf(nTotalTrials):
+            trials = f"{nTrials}/{int(nTotalTrials)}"
+        else:
+            trials = f"{nTrials}"
 
-            if diagnostics["nMissingVolumes"]:
-                details.append(f"Possible missing volumes={diagnostics['nMissingVolumes']}")
+        timeline.setTitle(f"{taskName}: {trials} trials, {duration}")
 
-            if diagnostics["timingIntervals"]:
-                details.append(f"Interval discrepancies ≥{discrepancyMs:g} ms={len(diagnostics['timingIntervals'])}")
+        # Display legend.
+        legend = [{'label': 'Segment', 'color': 'blue'}]
 
-            if diagnostics["suspectedManualFinal"] is not None:
-                details.append("Suspected manual final trigger=1 (excluded from diagnostic counts)")
+        if gotResponse:
+            totalResponses = sum(responseCounts.values())
+            for respType, (label, color) in responseMapping.items():
+                count = responseCounts.get(respType, 0)
+                if count != 0:
+                    percent = count / totalResponses * 100 if totalResponses > 0 else 0
+                    legend.append({'label': f'{label} (n={count}: {percent:.1f}%)', 'color': color})
 
-            if nVols == 2:
-                details.append("Only one interval; timing assessment limited")
+        if gotOutputTrigger:
+            legend.append({'label': 'Output trigger', 'color': 'purple'})
 
-            title += "\n" + "; ".join(details)
-
-        timeline.setTitle(title)
-
-        legend = [{'label': f'Keypress (n={nKeys})', 'color': 'green'}]
-
-        if nVols > 0:
-            legend.append({'label': f'Volumes (nVolumes={nVols})', 'color': 'blue'})
-
-        if nOutputTriggers > 0:
-            legend.append({'label': f'Output triggers (n={nOutputTriggers})', 'color': 'purple'})
-
-        if nUnsentTriggers > 0:
-            legend.append({'label': f'Unsent triggers (n={nUnsentTriggers})', 'color': 'orange'})
+        if gotUnsentTrigger:
+            legend.append({'label': 'Output trigger', 'color': 'orange'})
 
         timeline.addLegend(legend)
-
         if ax is None: timeline.show()
     
 ##############################################
@@ -4442,22 +4427,23 @@ class pglExperimentData(pglTraitSettings):
             filteredEvents = [event for event in filteredEvents if getattr(event, "keyChar", None) == keyChar]
         return len(filteredEvents)
     
-    def display(self, e=None, ax=None):
+    def display(self, e=None, ax=None, discrepancyMs=100.0):
         '''
         Display the experiment data.
 
-        Estimate MRI volume time from the median interval between recorded
-        volume triggers. Report possible missing volumes and timing errors
-        of at least 100 ms separately.
-
-        The final interval only implies a missing volume when it is within
-        100 ms of twice the median, since the final trigger may be manual.
+        Use the same volume-timing diagnostics as the printed summary.
+        Put MRI volume time and diagnostic counts on the second title line.
+        Suspected manual final triggers remain visible but are excluded
+        from missing-volume and interval-discrepancy counts.
         '''
-        import numpy as np
+        import math
+        from numbers import Real
 
         if len(self.events) == 0:
             pglMessages.print("(pglExperimentData) No events to display.")
             return
+
+        diagnostics = self.getVolumeTimingDiagnostics(discrepancyMs=discrepancyMs)
 
         # get info from experiment if provided
         if e is not None:
@@ -4467,26 +4453,49 @@ class pglExperimentData(pglTraitSettings):
             #self.volumeTriggerKey = settings.volumeTriggerKey
             self.volumeTriggerKey = "`"
 
+        # Invalid event timestamps cannot be plotted. Keep the original events
+        # untouched and report how many markers were omitted.
+        def validTimestamp(value):
+            return not isinstance(value, (bool, np.bool_)) and isinstance(value, Real) and math.isfinite(float(value))
+
+        if not validTimestamp(self.startTime) or not validTimestamp(self.endTime):
+            pglMessages.warning("Cannot display experiment events: startTime or endTime is invalid.", level=1)
+            return
+
         # Get the time at which start the timeline, if there is a keyboard
         # event that happens before the start of the experiment (like when the experimenter
         # hits space to start the experiment), then adjust the start time to show that as a negative time)
         startTime = 0
-        firstKeydownEvent = next((event for event in self.events if event.type == "keyboard" and event.eventType == "keydown"), None)
+        firstKeydownEvent = next((event for event in self.events if event.type == "keyboard" and event.eventType == "keydown" and validTimestamp(event.timestamp)), None)
         if firstKeydownEvent is not None:
             if firstKeydownEvent.timestamp < self.startTime:
                 startTime = firstKeydownEvent.timestamp - self.startTime
 
+        # Include added pre-start volumes and appended ending volumes in the
+        # visible timeline without modifying acquisition start/end times.
+        volumeTimes = [float(event.timestamp) - self.startTime for event in self.events if event.type == "volumeTrigger" and validTimestamp(event.timestamp)]
+        if volumeTimes: startTime = min(startTime, min(volumeTimes))
+        endTime = max(self.endTime - self.startTime, 10)
+        if volumeTimes: endTime = max(endTime, max(volumeTimes))
+
         # track number of volumes
-        nVols = 0
+        nVols = diagnostics["nVolumes"] - int(diagnostics["suspectedManualFinal"] is not None)
         nKeys = 0
         nOutputTriggers = 0
         nUnsentTriggers = 0
-        volumeTimes = []
+        nInvalidTimestamps = 0
 
         # init timeline
-        timeline = pglTimelinePlot(ax=ax, startTime=startTime, endTime=max(self.endTime-self.startTime,10))
+        timeline = pglTimelinePlot(ax=ax, startTime=startTime, endTime=endTime)
+
         # for each event, add to timeline
         for event in self.events:
+            if event.type not in ("keyboard", "volumeTrigger", "outputTrigger"): continue
+
+            if not validTimestamp(event.timestamp):
+                nInvalidTimestamps += 1
+                continue
+
             if event.type == "keyboard":
                 if event.eventType == "keydown":
                     if event.keyChar != self.volumeTriggerKey:
@@ -4497,19 +4506,19 @@ class pglExperimentData(pglTraitSettings):
                     nKeys += 1
             elif event.type == "volumeTrigger":
                 timeline.addTriangleMarker(time=event.timestamp - self.startTime, color='blue', direction='up')
-                nVols += 1
-                volumeTimes.append(event.timestamp)
             elif event.type == "outputTrigger":
-                if event.timestamp is not None:
-                    value = getattr(event, "value", None)
-                    label = f"{value}" if value is not None else 'x'
-                    sent = getattr(event, "triggerSent", True)
-                    if sent:
-                        nOutputTriggers += 1
-                    else:
-                        nUnsentTriggers += 1
-                    # set marker
-                    timeline.addTriangleMarker(time=event.timestamp - self.startTime, color='purple' if sent else 'orange', label=label, direction='up')
+                value = getattr(event, "value", None)
+                label = f"{value}" if value is not None else 'x'
+                sent = getattr(event, "triggerSent", True)
+                if sent:
+                    nOutputTriggers += 1
+                else:
+                    nUnsentTriggers += 1
+                # set marker
+                timeline.addTriangleMarker(time=event.timestamp - self.startTime, color='purple' if sent else 'orange', label=label, direction='up')
+
+        if nInvalidTimestamps:
+            pglMessages.warning(f"Skipped {nInvalidTimestamps} event markers with invalid timestamps.", level=1)
 
         if self.startDateTime != "":
             dateTime = datetime.fromisoformat(self.startDateTime)
@@ -4518,73 +4527,31 @@ class pglExperimentData(pglTraitSettings):
         else:
             title = "Experiment Events"
 
-        # Preserve recorded order; do not sort away duplicate or reversed timestamps.
-        if nVols > 1:
-            volumeIntervals = np.diff(np.asarray(volumeTimes, dtype=float))
+        # Keep all volume-timing information together on the second title line.
+        # Detection is shared with print(); do not duplicate its calculations here.
+        if not diagnostics["valid"]:
+            title += "\nMRI volume timing unavailable"
+            pglMessages.warning(diagnostics["error"], level=1)
+        elif diagnostics["median"] is not None:
+            details = [f"MRI volume time: {diagnostics['median']:.3f} s"]
 
-            if not np.isfinite(volumeIntervals).all() or np.any(volumeIntervals <= 0):
-                title += "\nMRI volume timing unavailable"
-                pglMessages.warning("Cannot estimate MRI volume time: volume-trigger intervals contain nonfinite, duplicate, or reversed timestamps.")
-            else:
-                medianVolumeTime = float(np.median(volumeIntervals))
-                timingThreshold = 0.100
-                missingIntervals = []
-                mistimedIntervals = []
-                nMissingVolumes = 0
+            if diagnostics["nMissingVolumes"]:
+                details.append(f"\nMissing volumes={diagnostics['nMissingVolumes']}")
 
-                for intervalIndex, interval in enumerate(volumeIntervals):
-                    # Choose the nearest positive multiple; exact ties prefer
-                    # the smaller multiple rather than infer an extra missing volume.
-                    intervalRatio = float(interval / medianVolumeTime)
-                    nExpectedIntervals = max(1, int(np.ceil(intervalRatio - 0.5)))
-                    nMissing = nExpectedIntervals - 1
-                    expectedInterval = nExpectedIntervals * medianVolumeTime
-                    timingError = float(interval - expectedInterval)
+            if diagnostics["timingIntervals"]:
+                details.append(f"\nInterval discrepancies ≥{discrepancyMs:g} ms={len(diagnostics['timingIntervals'])}")
 
-                    # The final trigger may be manual after acquisition stopped.
-                    # Only infer one missing volume when this gap is close to 2x.
-                    if intervalIndex == len(volumeIntervals) - 1:
-                        closeToDouble = abs(interval - 2 * medianVolumeTime) <= timingThreshold + 1e-9
-                        nMissing = 1 if nExpectedIntervals == 2 and closeToDouble else 0
+            if diagnostics["suspectedManualFinal"] is not None:
+                details.append("\nSuspected manual final trigger=1 (excluded from diagnostic counts)")
 
-                    if nMissing:
-                        nMissingVolumes += nMissing
-                        missingIntervals.append((intervalIndex, float(interval), nMissing))
-
-                    # Missing-volume gaps are not themselves timing errors.
-                    # Compare against their inferred expected interval instead.
-                    if abs(timingError) >= timingThreshold - 1e-9:
-                        mistimedIntervals.append((intervalIndex, float(interval), expectedInterval, timingError))
-
-                title += f"\nMRI volume time: {medianVolumeTime:.3f} s"
-                if nMissingVolumes:
-                    title += f"\nMissing volumes={nMissingVolumes}"
-                if mistimedIntervals:
-                    title += f"\nMistimed volumes (≥100 ms early/late)={len(mistimedIntervals)}"
-
-                # List missing-volume gaps separately from timing errors.
-                if missingIntervals:
-                    pglMessages.print(f"Possible missing volumes = {nMissingVolumes} (trigger numbers are 1-based):")
-                    for intervalIndex, interval, nMissing in missingIntervals:
-                        pglMessages.print(f"  Trigger {intervalIndex + 1} → {intervalIndex + 2}: interval={interval:.3f} s; possibly {nMissing} missing volume(s)")
-
-                if mistimedIntervals:
-                    pglMessages.print(f"Mistimed volumes (≥100 ms early/late) = {len(mistimedIntervals)} (trigger numbers are 1-based):")
-                    for intervalIndex, interval, expectedInterval, timingError in mistimedIntervals:
-                        direction = "late" if timingError > 0 else "early"
-                        pglMessages.print(f"  Trigger {intervalIndex + 1} → {intervalIndex + 2}: interval={interval:.3f} s; expected={expectedInterval:.3f} s; {abs(timingError) * 1000:.1f} ms {direction}")
-
-                # With two triggers there is only one interval, so no independent
-                # timing baseline exists against which to detect a delayed trigger.
-                if nVols == 2:
-                    pglMessages.print("Only one MRI volume interval is available; missing or mistimed volumes cannot be assessed reliably.")
+            title += "\n" + "; ".join(details)
 
         timeline.setTitle(title)
 
         legend = [{'label': f'Keypress (n={nKeys})', 'color': 'green'}]
 
         if nVols > 0:
-            legend.append({'label': f'Volumes (n={nVols})', 'color': 'blue'})
+            legend.append({'label': f'Volumes (nVolumes={nVols})', 'color': 'blue'})
 
         if nOutputTriggers > 0:
             legend.append({'label': f'Output triggers (n={nOutputTriggers})', 'color': 'purple'})
