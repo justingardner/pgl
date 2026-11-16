@@ -277,7 +277,7 @@ class _pglTraitsDialog(QDialog):
 
         desiredHeight = formHeight + buttonHeight + extra
 
-        self.resize(680, min(desiredHeight, maxDialogHeight))
+        self.resize(720, min(desiredHeight, maxDialogHeight))
         
         # give hint for window to stay on top
         self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
