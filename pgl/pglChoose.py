@@ -324,20 +324,14 @@ class pglChooseSession(pglChooseLevel):
 
 class pglChooseSubject(pglChooseLevel):
     """
-    Subject directory, required to have the form s#####.
+    Subject directory, without a hard subject-ID naming restriction.
     """
 
-    childList = List(
-        Instance(pglTraitSettings),
-        settingsListKey="name",
-        traitDisplayName="Choose session",
-        help="Sessions in subject directory",
-    )
+    childList = List(Instance(pglTraitSettings), settingsListKey="name", traitDisplayName="Choose session", help="Sessions in subject directory")
 
     entryType = "directory"
-    namePattern = r"^s\d+$"
+    namePattern = None
     childClass = pglChooseSession
-
 
 class pglChooseExperiment(pglChooseLevel):
     """
@@ -370,12 +364,7 @@ class pglChooseData(pglChooseLevel):
     entryType = "directory"
     childClass = pglChooseExperiment
     
-def makeRecordingChooser(
-    formatName,
-    entryType,
-    namePattern,
-    requiredFiles=(),
-):
+def makeRecordingChooser(formatName, entryType, namePattern, requiredFiles=()):
     """
     Build a recording chooser hierarchy for one format.
 
@@ -388,84 +377,43 @@ def makeRecordingChooser(
     classPrefix = f"pglChoose{formatName}"
 
     # Recording leaf: no children, even when it represents a directory.
-    recordingClass = type(
-        classPrefix,
-        (pglChooseLevel,),
-        {
-            "__module__": __name__,
-            "entryType": entryType,
-            "namePattern": namePattern,
-            "requiredFiles": tuple(requiredFiles),
-            "childClass": None,
-        },
-    )
+    recordingClass = type(classPrefix, (pglChooseLevel,), {
+        "__module__": __name__,
+        "entryType": entryType,
+        "namePattern": namePattern,
+        "requiredFiles": tuple(requiredFiles),
+        "childClass": None,
+    })
 
-    sessionClass = type(
-        f"{classPrefix}Session",
-        (pglChooseLevel,),
-        {
-            "__module__": __name__,
-            "entryType": "directory",
-            "childClass": recordingClass,
-            "childList": List(
-                Instance(pglTraitSettings),
-                settingsListKey="name",
-                traitDisplayName=f"Select {formatName} run(s)",
-                multiSelect=True,
-                maxRowsVisible=6,
-                help=f"{formatName} recordings in session directory",
-            ),
-        },
-    )
+    sessionClass = type(f"{classPrefix}Session", (pglChooseLevel,), {
+        "__module__": __name__,
+        "entryType": "directory",
+        "childClass": recordingClass,
+        "childList": List(Instance(pglTraitSettings), settingsListKey="name", traitDisplayName=f"Select {formatName} run(s)", multiSelect=True, maxRowsVisible=6, help=f"{formatName} recordings in session directory"),
+    })
 
-    subjectClass = type(
-        f"{classPrefix}Subject",
-        (pglChooseLevel,),
-        {
-            "__module__": __name__,
-            "entryType": "directory",
-            "namePattern": r"^s\d+$",
-            "childClass": sessionClass,
-            "childList": List(
-                Instance(pglTraitSettings),
-                settingsListKey="name",
-                traitDisplayName="Choose session",
-                help=f"Sessions in {formatName} subject directory",
-            ),
-        },
-    )
+    # Subject-ID conventions warn at assignment; discovery must not reject them.
+    subjectClass = type(f"{classPrefix}Subject", (pglChooseLevel,), {
+        "__module__": __name__,
+        "entryType": "directory",
+        "namePattern": None,
+        "childClass": sessionClass,
+        "childList": List(Instance(pglTraitSettings), settingsListKey="name", traitDisplayName="Choose session", help=f"Sessions in {formatName} subject directory"),
+    })
 
-    experimentClass = type(
-        f"{classPrefix}Experiment",
-        (pglChooseLevel,),
-        {
-            "__module__": __name__,
-            "entryType": "directory",
-            "childClass": subjectClass,
-            "childList": List(
-                Instance(pglTraitSettings),
-                settingsListKey="name",
-                traitDisplayName="Choose subject",
-                help=f"Subjects in {formatName} experiment directory",
-            ),
-        },
-    )
+    experimentClass = type(f"{classPrefix}Experiment", (pglChooseLevel,), {
+        "__module__": __name__,
+        "entryType": "directory",
+        "childClass": subjectClass,
+        "childList": List(Instance(pglTraitSettings), settingsListKey="name", traitDisplayName="Choose subject", help=f"Subjects in {formatName} experiment directory"),
+    })
 
-    dataClass = type(
-        f"{classPrefix}Data",
-        (pglChooseLevel,),
-        {
-            "__module__": __name__,
-            "entryType": "directory",
-            "childClass": experimentClass,
-            "childList": List(
-                Instance(pglTraitSettings),
-                settingsListKey="name",
-                traitDisplayName="Choose experiment",
-                help=f"Experiments in {formatName} data path",
-            ),
-        },
-    )
+    dataClass = type(f"{classPrefix}Data", (pglChooseLevel,), {
+        "__module__": __name__,
+        "entryType": "directory",
+        "childClass": experimentClass,
+        "childList": List(Instance(pglTraitSettings), settingsListKey="name", traitDisplayName="Choose experiment", help=f"Experiments in {formatName} data path"),
+    })
 
     return dataClass
 
