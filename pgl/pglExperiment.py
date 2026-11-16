@@ -4386,19 +4386,28 @@ class pglExperimentData(pglTraitSettings):
     def display(self, e=None, ax=None):
         '''
         Display the experiment data.
+
+        Estimate MRI volume time from the median interval between recorded
+        volume triggers. Report possible missing volumes and timing errors
+        of at least 100 ms separately.
+
+        The final interval only implies a missing volume when it is within
+        100 ms of twice the median, since the final trigger may be manual.
         '''
+        import numpy as np
+
         if len(self.events) == 0:
             pglMessages.print("(pglExperimentData) No events to display.")
             return
-        
+
         # get info from experiment if provided
         if e is not None:
             self.volumeTriggerKey = e.settings.volumeTriggerKey
         else:
             #settings = pglSettingsManager.getSettings()
-            #self.volumeTriggerKey = settings.volumeTriggerKey 
+            #self.volumeTriggerKey = settings.volumeTriggerKey
             self.volumeTriggerKey = "`"
-        
+
         # Get the time at which start the timeline, if there is a keyboard
         # event that happens before the start of the experiment (like when the experimenter
         # hits space to start the experiment), then adjust the start time to show that as a negative time)
@@ -4407,13 +4416,14 @@ class pglExperimentData(pglTraitSettings):
         if firstKeydownEvent is not None:
             if firstKeydownEvent.timestamp < self.startTime:
                 startTime = firstKeydownEvent.timestamp - self.startTime
-            
+
         # track number of volumes
         nVols = 0
         nKeys = 0
         nOutputTriggers = 0
         nUnsentTriggers = 0
-        
+        volumeTimes = []
+
         # init timeline
         timeline = pglTimelinePlot(ax=ax, startTime=startTime, endTime=max(self.endTime-self.startTime,10))
         # for each event, add to timeline
@@ -4429,6 +4439,7 @@ class pglExperimentData(pglTraitSettings):
             elif event.type == "volumeTrigger":
                 timeline.addTriangleMarker(time=event.timestamp - self.startTime, color='blue', direction='up')
                 nVols += 1
+                volumeTimes.append(event.timestamp)
             elif event.type == "outputTrigger":
                 if event.timestamp is not None:
                     value = getattr(event, "value", None)
@@ -4439,20 +4450,83 @@ class pglExperimentData(pglTraitSettings):
                     else:
                         nUnsentTriggers += 1
                     # set marker
-                    timeline.addTriangleMarker(time=event.timestamp - self.startTime, color='purple' if sent else 'orange', label=label, direction='up') 
-        
+                    timeline.addTriangleMarker(time=event.timestamp - self.startTime, color='purple' if sent else 'orange', label=label, direction='up')
+
         if self.startDateTime != "":
             dateTime = datetime.fromisoformat(self.startDateTime)
             readableTime = dateTime.strftime("%I:%M %p").lstrip("0")
-            timeline.setTitle(f"Experiment Events: {dateTime:%b. %d, %Y} at {readableTime}")
+            title = f"Experiment Events: {dateTime:%b. %d, %Y} at {readableTime}"
         else:
-            timeline.setTitle("Experiment Events")
-            
+            title = "Experiment Events"
+
+        # Preserve recorded order; do not sort away duplicate or reversed timestamps.
+        if nVols > 1:
+            volumeIntervals = np.diff(np.asarray(volumeTimes, dtype=float))
+
+            if not np.isfinite(volumeIntervals).all() or np.any(volumeIntervals <= 0):
+                title += "\nMRI volume timing unavailable"
+                pglMessages.warning("Cannot estimate MRI volume time: volume-trigger intervals contain nonfinite, duplicate, or reversed timestamps.")
+            else:
+                medianVolumeTime = float(np.median(volumeIntervals))
+                timingThreshold = 0.100
+                missingIntervals = []
+                mistimedIntervals = []
+                nMissingVolumes = 0
+
+                for intervalIndex, interval in enumerate(volumeIntervals):
+                    # Choose the nearest positive multiple; exact ties prefer
+                    # the smaller multiple rather than infer an extra missing volume.
+                    intervalRatio = float(interval / medianVolumeTime)
+                    nExpectedIntervals = max(1, int(np.ceil(intervalRatio - 0.5)))
+                    nMissing = nExpectedIntervals - 1
+                    expectedInterval = nExpectedIntervals * medianVolumeTime
+                    timingError = float(interval - expectedInterval)
+
+                    # The final trigger may be manual after acquisition stopped.
+                    # Only infer one missing volume when this gap is close to 2x.
+                    if intervalIndex == len(volumeIntervals) - 1:
+                        closeToDouble = abs(interval - 2 * medianVolumeTime) <= timingThreshold + 1e-9
+                        nMissing = 1 if nExpectedIntervals == 2 and closeToDouble else 0
+
+                    if nMissing:
+                        nMissingVolumes += nMissing
+                        missingIntervals.append((intervalIndex, float(interval), nMissing))
+
+                    # Missing-volume gaps are not themselves timing errors.
+                    # Compare against their inferred expected interval instead.
+                    if abs(timingError) >= timingThreshold - 1e-9:
+                        mistimedIntervals.append((intervalIndex, float(interval), expectedInterval, timingError))
+
+                title += f"\nMRI volume time: {medianVolumeTime:.3f} s"
+                if nMissingVolumes:
+                    title += f"\nMissing volumes={nMissingVolumes}"
+                if mistimedIntervals:
+                    title += f"\nMistimed volumes (≥100 ms early/late)={len(mistimedIntervals)}"
+
+                # List missing-volume gaps separately from timing errors.
+                if missingIntervals:
+                    pglMessages.print(f"Possible missing volumes = {nMissingVolumes} (trigger numbers are 1-based):")
+                    for intervalIndex, interval, nMissing in missingIntervals:
+                        pglMessages.print(f"  Trigger {intervalIndex + 1} → {intervalIndex + 2}: interval={interval:.3f} s; possibly {nMissing} missing volume(s)")
+
+                if mistimedIntervals:
+                    pglMessages.print(f"Mistimed volumes (≥100 ms early/late) = {len(mistimedIntervals)} (trigger numbers are 1-based):")
+                    for intervalIndex, interval, expectedInterval, timingError in mistimedIntervals:
+                        direction = "late" if timingError > 0 else "early"
+                        pglMessages.print(f"  Trigger {intervalIndex + 1} → {intervalIndex + 2}: interval={interval:.3f} s; expected={expectedInterval:.3f} s; {abs(timingError) * 1000:.1f} ms {direction}")
+
+                # With two triggers there is only one interval, so no independent
+                # timing baseline exists against which to detect a delayed trigger.
+                if nVols == 2:
+                    pglMessages.print("Only one MRI volume interval is available; missing or mistimed volumes cannot be assessed reliably.")
+
+        timeline.setTitle(title)
+
         legend = [{'label': f'Keypress (n={nKeys})', 'color': 'green'}]
-        
+
         if nVols > 0:
             legend.append({'label': f'Volumes (n={nVols})', 'color': 'blue'})
-        
+
         if nOutputTriggers > 0:
             legend.append({'label': f'Output triggers (n={nOutputTriggers})', 'color': 'purple'})
 
@@ -4460,8 +4534,8 @@ class pglExperimentData(pglTraitSettings):
             legend.append({'label': f'Unsent triggers (n={nUnsentTriggers})', 'color': 'orange'})
 
         timeline.addLegend(legend)
-        
-        if not ax: timeline.show()
+
+        if ax is None: timeline.show()
     
     def getTriggerStats(self):
         '''
