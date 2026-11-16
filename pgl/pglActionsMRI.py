@@ -13,7 +13,7 @@ from copy import deepcopy
 from .pglMessages import pglMessages
 from .pglPipeline import pglActionCollection
 
-from traitlets import Bool, Float, Instance, Int, List, Unicode
+from traitlets import Bool, Float, Instance, Int, List, Unicode, Union
 
 from .pglPipeline import pglAction, pglDeferredAction, pglProductSelector
 
@@ -750,29 +750,44 @@ class pglActionsMRI(pglActionCollection):
         }
         
     ################################################################
-    # Apply interpreted within-run motion on original acquisition grids
+    # Apply motion mappings on original acquisition grids
     ################################################################
     @staticmethod
-    def _applyWithinRunMotion(action, session, productRecord, *, outputName, cacheDirectory=None):
-        """Apply a version-2 motion product and register corrected images.
+    def _applyWithinRunMotion(action, session, productRecord, *, outputName, cacheDirectory=None, runAlignmentRecord=None):
+        """Apply within-run motion, optionally composed with run alignment.
+
+        productRecord:
+            Exact interpreted within-run motion product.
+
+        runAlignmentRecord:
+            Optional runAlignment product estimated from that exact motion
+            product. Only its selected scans are processed.
 
         Initial scope:
-            Acquisition sources only.
-            Full original volume sequence.
-            Within-run shared-grid rigid motion.
+            Original acquisition sources and full original volume sequences.
+            Rigid within-run motion and matching-grid run alignment.
             Cubic SciPy interpolation, constant-zero boundary, float32 output.
 
-        Validates all declared sources/artifacts before correction.
-        Writes new images with original acquisition geometry.
-        Does not modify original scans or replace their backing/data objects.
+        All source/product associations and required artifacts are validated
+        before image generation.
 
-        Native matrices and interpreted matrices must agree. Output geometry
-        and source identities are verified before attachment.
+        With run alignment:
+            output acquisition voxel -> common reference -> run reference
+                -> original input volume.
 
-        Returns the registered image-product record.
-        Internal errors propagate to the action runner.
+        Each original volume is sampled once. Existing corrected images are
+        neither read nor overwritten.
+
+        Output files preserve each source's acquisition geometry.
+        Returns a newly registered image-product record.
+
+        Failed staging is retained for diagnosis. Publication of multiple
+        attachments is not a general transaction; action failure marks the
+        supplied session unsafe through the ordinary runner.
         """
+        import os
         import tempfile
+        from copy import deepcopy
         from pathlib import Path
 
         import nibabel as nib
@@ -781,96 +796,247 @@ class pglActionsMRI(pglActionCollection):
 
         from .pglExternalTools import pglExternalTool
         from .pglMRI import pglMRITransforms
+        from .pglSession import pglSession
 
-        records = pglMRITransforms.validateMotionProduct(productRecord)
-        if productRecord["metadata"]["schemaVersion"] != 2:
-            raise ValueError("Application requires interpreted version-2 motion metadata.")
+        if not isinstance(session, pglSession) or session.mri is None:
+            raise ValueError("Motion application requires a session with MRI scans.")
+        if (
+            not isinstance(outputName, str) or not outputName.strip()
+            or any(character in outputName for character in ("\x00", "\n", "\r"))
+        ):
+            raise ValueError("outputName must be a nonblank string without NUL or newlines.")
 
-        # Reject a duplicate output before generating any files.
+        parent = None
+        if cacheDirectory is not None:
+            text = os.fspath(cacheDirectory)
+            if (
+                not isinstance(text, str) or not text.strip()
+                or "://" in text or "::" in text
+                or any(character in text for character in ("\x00", "\n", "\r"))
+            ):
+                raise ValueError("cacheDirectory must be an ordinary local path.")
+            parent = Path(text).expanduser().resolve()
+
         for entry in session.actionHistory:
             if any(
-                record.get("name") == outputName and record.get("recordStatus") == "committed"
+                record.get("name") == outputName
+                and record.get("recordStatus") == "committed"
                 for record in entry.actionProducts
             ):
                 raise ValueError(f"Product {outputName!r} already exists.")
 
+        motionByScan = pglMRITransforms.validateMotionProduct(productRecord)
+        if productRecord["metadata"]["schemaVersion"] != 2:
+            raise ValueError("Application requires interpreted version-2 motion.")
+
+        compositePlan = None
+        alignmentByScan = {}
+        compositeByScan = {}
+
+        if runAlignmentRecord is not None:
+            # This verifies the exact motion-product identity, source stages,
+            # reference volumes, geometry connections, and composition order.
+            compositePlan = pglMRITransforms.composeRunMotion(
+                productRecord,
+                runAlignmentRecord,
+            )
+            alignmentByScan = {
+                record["scanUUID"]: record
+                for record in runAlignmentRecord["metadata"]["scans"]
+            }
+            compositeByScan = {
+                record["scanUUID"]: record
+                for record in compositePlan["scans"]
+            }
+            selectedUUIDs = list(compositeByScan)
+        else:
+            selectedUUIDs = list(motionByScan)
+
+        verifiedArtifacts = []
+
+        def readArtifact(ownerRecord, role, expectedShape):
+            """Verify declared attachment bytes and read numerical text."""
+            artifact = ownerRecord["artifacts"][role]
+            attachment = session.derivedFiles.get(artifact["attachmentName"])
+            expected = {key: artifact[key] for key in ("sha256", "size_bytes")}
+
+            if attachment is None or any(attachment.get(key) != value for key, value in expected.items()):
+                raise ValueError(f"Motion artifact {role!r} is missing or has a different identity.")
+
+            path = session.getDerivedFile(
+                artifact["attachmentName"],
+                cacheDirectory=cacheDirectory,
+            )
+            if path is None:
+                raise ValueError(f"Motion artifact {role!r} could not be retrieved.")
+            path = Path(path)
+
+            if pglExternalTool._fileIdentity(path) != expected:
+                raise ValueError(f"Motion artifact {role!r} failed byte verification.")
+
+            values = np.loadtxt(path, comments="#", ndmin=2)
+            if values.shape != expectedShape or not np.isfinite(values).all():
+                raise ValueError(f"Motion artifact {role!r} has invalid dimensions or values.")
+
+            verifiedArtifacts.append((path, expected))
+            return values
+
         jobs = []
 
-        for scanUUID, record in records.items():
-            if record["sourceStageID"] != f"acquisition:{scanUUID}":
+        # Preflight every source and matrix before generating any output.
+        for scanUUID in selectedUUIDs:
+            motion = motionByScan[scanUUID]
+
+            if motion["sourceStageID"] != f"acquisition:{scanUUID}":
                 raise ValueError(
-                    "This initial application engine supports acquisition sources only. "
-                    "Derived source stages require explicit support."
+                    "This application engine supports original acquisition sources "
+                    "only. Derived source stages require explicit support."
                 )
 
             source = pglActionsMRI._resolveImageSource(
                 session,
                 {"schemaVersion": 1, "kind": "acquisition", "scanUUID": scanUUID},
-                expectedMotionSource=record,
+                expectedMotionSource=motion,
                 cacheDirectory=cacheDirectory,
             )
+            count = source["volumeCount"]
 
-            # Confirm registered native artifacts still match the interpreted
-            # product before using its derived sampling matrices.
-            for field, columns in (("matricesRole", 12), ("motionParametersRole", 6)):
-                artifact = productRecord["artifacts"][record[field]]
-                attachment = session.derivedFiles.get(artifact["attachmentName"])
-                expected = {key: artifact[key] for key in ("sha256", "size_bytes")}
+            matrices = readArtifact(
+                productRecord, motion["matricesRole"], (count, 12),
+            )
+            readArtifact(
+                productRecord, motion["motionParametersRole"], (count, 6),
+            )
 
-                if attachment is None or any(attachment.get(key) != value for key, value in expected.items()):
-                    raise ValueError("Motion attachment is missing or differs from the recorded product.")
-
-                path = session.getDerivedFile(artifact["attachmentName"], cacheDirectory=cacheDirectory)
-                if path is None or pglExternalTool._fileIdentity(path) != expected:
-                    raise ValueError("Motion artifact failed verification.")
-
-                values = np.loadtxt(path, comments="#", ndmin=2)
-                if values.shape != (source["volumeCount"], columns) or not np.isfinite(values).all():
-                    raise ValueError("Invalid motion artifact dimensions or values.")
-
-                if field == "matricesRole":
-                    nativeRows = np.array([
-                        np.asarray(transform["matrix"])[:3].reshape(-1)
-                        for transform in record["interpretation"]["nativeTransforms"]
-                    ])
-                    if not np.allclose(values, nativeRows, rtol=0, atol=1e-10):
-                        raise ValueError("Native matrix bytes disagree with interpreted transforms.")
+            nativeRows = np.array([
+                np.asarray(transform["matrix"])[:3].reshape(-1)
+                for transform in motion["interpretation"]["nativeTransforms"]
+            ])
+            if not np.allclose(matrices, nativeRows, rtol=0, atol=1e-10):
+                raise ValueError("Native motion matrices disagree with their interpreted records.")
 
             image = nib.load(source["localPath"])
             physical = image.get_qform(coded=True)[0]
-            interpretedFrame = record["interpretation"]["voxelFrame"]
+            sourceFrame = motion["interpretation"]["voxelFrame"]
 
+            if len(image.shape) != 4:
+                raise ValueError("Motion application requires a four-dimensional source.")
             if physical is None or image.header.get_xyzt_units()[0] != "mm":
                 raise ValueError("Application requires a coded millimeter acquisition qform.")
             if (
-                list(image.shape[:3]) != interpretedFrame["spatialShape"]
-                or not np.allclose(physical, interpretedFrame["voxelToPhysicalMM"], rtol=0, atol=0.0001)
+                list(image.shape[:3]) != sourceFrame["spatialShape"]
+                or not np.allclose(
+                    physical, sourceFrame["voxelToPhysicalMM"],
+                    rtol=0, atol=0.0001,
+                )
             ):
-                raise ValueError("Motion interpretation does not describe this source grid.")
+                raise ValueError("Motion interpretation does not describe the actual acquisition grid.")
 
-            jobs.append((record, source))
+            if compositePlan is None:
+                transforms = motion["interpretation"]["voxelTransforms"]
+                alignment = None
+            else:
+                alignment = alignmentByScan[scanUUID]
 
-        parent = None
-        if cacheDirectory is not None:
-            parent = Path(cacheDirectory).expanduser().resolve()
-            parent.mkdir(parents=True, exist_ok=True)
+                if not alignment["isReference"]:
+                    rows = readArtifact(
+                        runAlignmentRecord, alignment["matricesRole"], (1, 12),
+                    )
+                    readArtifact(
+                        runAlignmentRecord, alignment["motionParametersRole"], (1, 6),
+                    )
+                    native = np.asarray(
+                        alignment["interpretation"]["nativeTransform"]["matrix"]
+                    )
+                    if not np.allclose(rows.reshape(3, 4), native[:3], rtol=0, atol=1e-10):
+                        raise ValueError("Native run-alignment matrix disagrees with its interpreted record.")
 
+                transforms = [
+                    item["transform"]
+                    for item in compositeByScan[scanUUID]["composites"]
+                ]
+
+            if len(transforms) != count:
+                raise ValueError("There must be one sampling transform per source volume.")
+
+            for transform in transforms:
+                validated = pglMRITransforms._validateTransform(transform)
+                if (
+                    validated["purpose"] != "sampling"
+                    or validated["interpretationStatus"] != "validated"
+                    or validated["domainFrame"] != sourceFrame
+                    or validated["codomainFrame"] != sourceFrame
+                ):
+                    raise ValueError("Application mappings do not connect the original acquisition grid to itself.")
+
+            jobs.append({
+                "motion": motion,
+                "source": source,
+                "transforms": transforms,
+                "alignment": alignment,
+            })
+
+        def scanLabel(index):
+            name = session.mri.scans[index].name.replace("\n", " ").replace("\r", " ")
+            return f"scan {index} {name!r}"
+
+        currentIndices = {
+            job["source"]["scanUUID"]: job["source"]["scanIndex"]
+            for job in jobs
+        }
+
+        pglMessages.message(
+            "Applying motion corrections from original acquisition sources.\n"
+            "Each volume will be sampled once; existing corrected images are not inputs."
+        )
+
+        for job in jobs:
+            source = job["source"]
+            motion = job["motion"]
+            alignment = job["alignment"]
+
+            if alignment is None:
+                targetText = (
+                    f"its within-run reference, original volume "
+                    f"{motion['referenceVolumeIndex']}"
+                )
+            else:
+                referenceIndex = currentIndices[alignment["commonReferenceScanUUID"]]
+                targetText = (
+                    f"group {alignment['groupIndex']} reference "
+                    f"{scanLabel(referenceIndex)}, original volume "
+                    f"{alignment['commonReferenceVolumeIndex']}"
+                )
+
+            pglMessages.print(
+                f"  {scanLabel(source['scanIndex'])}: "
+                f"{source['volumeCount']} volumes → {targetText}\n"
+                "    Output grid: this scan's unchanged acquisition grid."
+            )
+
+        if parent is not None: parent.mkdir(parents=True, exist_ok=True)
         outputDirectory = Path(tempfile.mkdtemp(
             prefix="pgl-motion-applied-",
             dir=None if parent is None else str(parent),
         ))
+        pglMessages.print(f"New output directory: {outputDirectory}")
+
         completed = []
 
-        # Retain failed staging for diagnosis. No partial image product is
-        # registered; the action runner marks any failed session unsafe.
-        for record, source in jobs:
-            image = nib.load(source["localPath"])
-            shape = image.shape
-            corrected = np.empty(shape, dtype=np.float32)
+        for position, job in enumerate(jobs):
+            motion = job["motion"]
+            source = job["source"]
+            pglMessages.message(
+                f"Correcting {position + 1}/{len(jobs)}: "
+                f"{scanLabel(source['scanIndex'])}"
+            )
 
-            # Process input volumes individually; output is currently held in
-            # memory. Out-of-core output writing can be added separately.
-            for row, transform in enumerate(record["interpretation"]["voxelTransforms"]):
+            image = nib.load(source["localPath"])
+            corrected = np.empty(image.shape, dtype=np.float32)
+
+            # Read one input volume at a time. The output run is currently
+            # held in RAM; no out-of-core output claim is made here.
+            for row, transform in enumerate(job["transforms"]):
                 mapping = np.asarray(transform["matrix"])
                 volume = np.asarray(image.dataobj[..., row], dtype=np.float32)
                 if not np.isfinite(volume).all():
@@ -880,7 +1046,7 @@ class pglActionsMRI(pglActionCollection):
                     volume,
                     matrix=mapping[:3, :3],
                     offset=mapping[:3, 3],
-                    output_shape=shape[:3],
+                    output_shape=image.shape[:3],
                     order=3,
                     mode="constant",
                     cval=0,
@@ -895,79 +1061,121 @@ class pglActionsMRI(pglActionCollection):
             header.set_slope_inter(1, 0)
             output = image.__class__(corrected, image.affine.copy(), header=header)
 
-            # Geometry is specified before writing, on the grid used during
-            # sampling—not copied onto an output from a different lattice.
+            # Define the same geometry used for sampling before writing.
+            # This does not repair a differently gridded image afterward.
             output.set_qform(image.get_qform(), code=int(image.header["qform_code"]))
             output.set_sform(image.get_sform(), code=int(image.header["sform_code"]))
 
-            filename = outputDirectory / f"scan-{record['scanUUID']}.nii.gz"
+            filename = outputDirectory / f"scan-{source['scanUUID']}.nii.gz"
             nib.save(output, filename)
             stored = nib.load(filename)
 
             if (
                 stored.shape != image.shape
                 or stored.header.get_xyzt_units() != image.header.get_xyzt_units()
-                or not np.allclose(stored.header.get_zooms(), image.header.get_zooms(), rtol=0, atol=0.0001)
+                or not np.allclose(
+                    stored.header.get_zooms(), image.header.get_zooms(),
+                    rtol=0, atol=0.0001,
+                )
             ):
-                raise ValueError("Corrected image dimensions, spacing, TR, or units changed.")
+                raise ValueError("Corrected dimensions, spacing, TR, or units changed.")
 
             for form in ("qform", "sform"):
                 before, beforeCode = getattr(image, f"get_{form}")(coded=True)
                 after, afterCode = getattr(stored, f"get_{form}")(coded=True)
                 if int(beforeCode) != int(afterCode):
                     raise ValueError(f"Corrected image {form} code changed.")
-                if before is not None and (after is None or not np.allclose(before, after, rtol=0, atol=0.0001)):
+                if before is not None and (
+                    after is None or not np.allclose(before, after, rtol=0, atol=0.0001)
+                ):
                     raise ValueError(f"Corrected image {form} geometry changed.")
 
-            if pglExternalTool._fileIdentity(source["localPath"]) != source["sourceIdentity"]:
-                raise ValueError("Acquisition source changed during correction.")
+            completed.append((job, filename))
 
-            completed.append((record, filename))
+        # Recheck every source and artifact before installing attachments.
+        for job in jobs:
+            source = job["source"]
+            if pglExternalTool._fileIdentity(source["localPath"]) != source["sourceIdentity"]:
+                raise ValueError("An acquisition source changed during correction.")
+
+        for path, expected in verifiedArtifacts:
+            if pglExternalTool._fileIdentity(path) != expected:
+                raise ValueError("A transform artifact changed during correction.")
 
         files = {}
         imageStages = {}
-        operationID = action.actionHistory[-1].actionID
+        executionID = action.actionHistory[-1].actionID
 
-        for record, filename in completed:
-            role = f"scan.{record['scanUUID']}.image"
-            attachmentName = f"mri.{operationID}.{role}"
-            session.addDerivedFile(attachmentName, filename, mediaType="application/octet-stream")
+        for job, filename in completed:
+            source = job["source"]
+            role = f"scan.{source['scanUUID']}.image"
+            attachmentName = f"mri.{executionID}.{role}"
+            session.addDerivedFile(
+                attachmentName,
+                filename,
+                mediaType="application/octet-stream",
+            )
             files[role] = attachmentName
             imageStages[role] = {
-                "scanUUID": record["scanUUID"],
-                "volumeIndices": list(record["volumeIndices"]),
+                "scanUUID": source["scanUUID"],
+                "volumeIndices": list(source["volumeIndices"]),
             }
+
+        productIDs = [productRecord["productID"]]
+        metadata = {
+            "schemaVersion": 1,
+            "operation": (
+                "withinRunMotionApplication"
+                if runAlignmentRecord is None else
+                "withinAndBetweenRunMotionApplication"
+            ),
+            "imageStages": imageStages,
+            "appliedMotionProductID": productRecord["productID"],
+            "appliedProducerActionID": productRecord["producerActionID"],
+            "appliedTransformIDs": [
+                transform["transformID"]
+                for job in jobs
+                for transform in job["transforms"]
+            ],
+            "appliedScanUUIDs": list(selectedUUIDs),
+            "sources": [
+                {
+                    "scanUUID": job["source"]["scanUUID"],
+                    "sourceStageID": job["source"]["sourceStageID"],
+                    "sourceIdentity": deepcopy(job["source"]["sourceIdentity"]),
+                    "volumeIndices": list(job["source"]["volumeIndices"]),
+                }
+                for job in jobs
+            ],
+            "outputGrid": "originalAcquisition",
+            "sampling": {
+                "implementation": "scipy.ndimage.affine_transform",
+                "order": 3,
+                "mode": "constant",
+                "cval": 0.0,
+                "prefilter": True,
+                "outputDtype": "float32",
+            },
+        }
+
+        if runAlignmentRecord is not None:
+            productIDs.append(runAlignmentRecord["productID"])
+            metadata.update({
+                "appliedRunAlignmentProductID": runAlignmentRecord["productID"],
+                "appliedRunAlignmentProducerActionID": runAlignmentRecord["producerActionID"],
+                "compositePlan": compositePlan,
+                "spatialInterpolationCountPerOutput": 1,
+            })
 
         return action.registerProduct(
             outputName,
             "image",
             session=session,
             files=files,
-            inputProductIDs=[productRecord["productID"]],
-            metadata={
-                "schemaVersion": 1,
-                "operation": "withinRunMotionApplication",
-                "imageStages": imageStages,
-                "appliedMotionProductID": productRecord["productID"],
-                "appliedProducerActionID": productRecord["producerActionID"],
-                "appliedTransformIDs": [
-                    transform["transformID"]
-                    for record in records.values()
-                    for transform in record["interpretation"]["voxelTransforms"]
-                ],
-                "outputGrid": "originalAcquisition",
-                "sampling": {
-                    "implementation": "scipy.ndimage.affine_transform",
-                    "order": 3,
-                    "mode": "constant",
-                    "cval": 0.0,
-                    "prefilter": True,
-                    "outputDtype": "float32",
-                },
-            },
+            inputProductIDs=productIDs,
+            metadata=metadata,
             invocationIDs=[],
         )
-
     ################################################################
     # Present a completed motion product
     ################################################################
@@ -1188,35 +1396,592 @@ class pglActionsMRI(pglActionCollection):
     # Apply explicitly selected transforms
     ################################################################
     class mriApplyTransforms(pglAction):
-        """Apply an explicitly selected transform product.
+        """Apply explicit within-run motion, optionally with run alignment.
 
-        Initial support is interpreted within-run AFNI rigid motion only.
-        Cross-run composites, nonlinear warps, and derived source stages are
-        rejected until their application adapters are implemented.
+        transforms:
+            One rigidMotion selector, or a list containing exactly one
+            rigidMotion selector and one runAlignment selector.
 
-        Does not discover or apply unrelated pending products.
+        Composite application verifies that runAlignment was estimated from
+        the exact supplied motion product.
+
+        Always samples original acquisition data once on each acquisition grid.
+        Does not use previously corrected images or discover pending products.
+
+        Nonlinear warps, mismatched-grid application, and derived source stages
+        are not yet supported.
         """
-        transforms = Instance(pglProductSelector, default_value=None, allow_none=True, help="Required explicit transform-product selector.")
+
+        transforms = Union(
+            [Instance(pglProductSelector), List(Instance(pglProductSelector))],
+            default_value=None,
+            allow_none=True,
+            help="Explicit motion selector, or motion and run-alignment selectors.",
+        )
         outputName = Unicode("motionCorrected", help="Name of the corrected-image product.")
         cacheDirectory = Unicode(default_value=None, allow_none=True, help="Local working-cache override.")
 
         def _run(self, session):
-            """Resolve the declared product, verify it, and apply its mappings."""
+            """Resolve explicit products and apply their validated sampling maps."""
             if self.transforms is None:
-                raise ValueError("Supply transforms explicitly, for example pglProductSelector('motion').")
-            if not self.outputName.strip():
-                raise ValueError("outputName must not be blank.")
+                raise ValueError("Supply transforms explicitly.")
 
-            product = self.transforms.resolve(session)
-            if product is None: raise ValueError("Transform product could not be resolved.")
-            if product.kind != "rigidMotion":
-                raise ValueError(f"Application is not implemented for product kind {product.kind!r}.")
+            selectors = self.transforms if isinstance(self.transforms, list) else [self.transforms]
+            if len(selectors) not in (1, 2):
+                raise ValueError("Supply one motion selector, or one motion and one run-alignment selector.")
+
+            products = {}
+            for selector in selectors:
+                product = selector.resolve(session)
+                if product is None:
+                    raise ValueError("A required transform product could not be resolved.")
+                if product.kind not in ("rigidMotion", "runAlignment"):
+                    raise ValueError(f"Application is not implemented for {product.kind!r}.")
+                if product.kind in products:
+                    raise ValueError(f"More than one {product.kind!r} product was supplied.")
+                products[product.kind] = product.record
+
+            if "rigidMotion" not in products:
+                raise ValueError("Explicitly supply the within-run motion product as well as run alignment.")
 
             pglActionsMRI._applyWithinRunMotion(
                 self,
                 session,
-                product.record,
+                products["rigidMotion"],
                 outputName=self.outputName,
                 cacheDirectory=self.cacheDirectory,
+                runAlignmentRecord=products.get("runAlignment"),
             )
             return session
+        
+    ################################################################
+    # Estimate and register explicit run-reference alignments
+    ################################################################
+    @staticmethod
+    def _estimateRunAlignmentProduct(action, session, withinRunMotion, *, scanIndices=None, referenceRun="middle", outputName="runAlignment", afniDirectory=None, cacheDirectory=None, timeout=None):
+        """Estimate one fixed alignment per run within matching-grid groups.
+
+        Uses each run's reference volume recorded in the explicitly selected
+        within-run motion product. Does not choose a new reference volume.
+
+        Prints the complete resolved plan before scientific tool execution,
+        then reports each estimated pair.
+
+        Initial source support:
+            Original acquisitions with the full original volume sequence.
+            Derived source stages are explicitly refused, not substituted.
+
+        Reference scan:
+            Identity mapping; no registration fit is performed.
+
+        Other scans:
+            Estimate run-reference -> common-reference alignment.
+            Stored sampling mappings go in the reverse coordinate direction:
+            common-reference location -> run-reference sampling location.
+
+        Publishes a runAlignment product only after all estimates succeed.
+        Native files remain unchanged and are attached through derivedFiles.
+        Failed execution may retain staging/log files for diagnosis.
+
+        Returns the registered product record for immediate application by the
+        owning deferred action. The record becomes committed only when that
+        action succeeds.
+
+        This helper does not apply transformations or display figures.
+        The action's post-success hook will display its committed product.
+        """
+        import math
+        from copy import deepcopy
+        from pathlib import Path
+
+        import numpy as np
+
+        from .pglExternalTools import pglAFNI, pglExternalTool
+        from .pglMRI import pglMRITransforms
+
+        if not isinstance(outputName, str) or not outputName.strip():
+            raise ValueError("outputName must be a nonblank string.")
+        if any(character in outputName for character in ("\x00", "\n", "\r")):
+            raise ValueError("outputName must not contain NUL or newlines.")
+
+        if timeout is not None:
+            if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+                raise ValueError("timeout must be positive and finite.")
+
+        # Refuse name collisions before performing expensive work.
+        for entry in session.actionHistory:
+            if any(
+                product.get("name") == outputName
+                and product.get("recordStatus") == "committed"
+                for product in entry.actionProducts
+            ):
+                raise ValueError(f"Product {outputName!r} already exists. Choose another outputName.")
+
+        plan = pglActionsMRI._prepareRunAlignmentInputs(
+            session,
+            withinRunMotion,
+            scanIndices,
+            referenceRun=referenceRun,
+            allowGeometryMismatch=False,
+        )
+
+        # Retrieve the same exact recorded product used by preparation, never
+        # a new name lookup that could select another product.
+        motionProduct = session.getProduct(
+            productID=plan["withinRunMotion"]["productID"],
+        )
+        if motionProduct is None:
+            raise ValueError("The prepared within-run motion product is unavailable.")
+
+        motionRecord = motionProduct.record
+        if motionRecord["metadata"]["schemaVersion"] != 2:
+            raise ValueError("Run alignment requires interpreted version-2 within-run motion.")
+
+        motionByScan = pglMRITransforms.validateMotionProduct(motionRecord)
+        requirements = {
+            item["scanIndex"]: item
+            for item in plan["sourceRequirements"]
+        }
+        scans = list(session.mri.scans)
+        sources = {}
+
+        # Resolve every source before launching a fit. The source must be the
+        # exact image used for within-run estimation, not an already corrected
+        # image or a guessed image with a similar filename.
+        for scanIndex in plan["scanIndices"]:
+            requirement = requirements[scanIndex]
+            scanUUID = requirement["scanUUID"]
+            motion = motionByScan[scanUUID]
+
+            if motion["sourceStageID"] != f"acquisition:{scanUUID}":
+                raise ValueError(
+                    f"MRI scan {scanIndex} uses derived stage "
+                    f"{motion['sourceStageID']!r}. This initial run-alignment "
+                    "implementation supports acquisition sources only."
+                )
+
+            source = pglActionsMRI._resolveImageSource(
+                session,
+                {
+                    "schemaVersion": 1,
+                    "kind": "acquisition",
+                    "scanUUID": scanUUID,
+                },
+                expectedMotionSource=motion,
+                cacheDirectory=cacheDirectory,
+            )
+
+            # Match the actual source geometry to the motion interpretation.
+            # Matching source identity is necessary but does not validate
+            # arbitrary interpreted metadata stored alongside it.
+            frame = motion["interpretation"]["voxelFrame"]
+            snapshot = source["nifti"]
+            fields = snapshot["fields"]
+            if fields["xyzt_units"] & 7 != 2:
+                raise ValueError("This AFNI run-alignment adapter requires millimeter spatial units.")
+
+            actualQform = np.asarray(snapshot["transforms"]["qform"], dtype=float)
+            if (
+                list(fields["dim"][1:4]) != frame["spatialShape"]
+                or frame["geometryID"] != motion["sourceStageID"]
+                or not np.allclose(
+                    actualQform, frame["voxelToPhysicalMM"],
+                    rtol=0, atol=0.0001,
+                )
+            ):
+                raise ValueError(f"MRI scan {scanIndex}: interpreted motion geometry differs from its source.")
+
+            sources[scanIndex] = source
+
+        def scanLabel(index):
+            # Keep each report on one line even if source labels contain newlines.
+            name = scans[index].name.replace("\n", " ").replace("\r", " ")
+            return f"scan {index} {name!r}"
+
+        def volumeLabel(index):
+            requirement = requirements[index]
+            original = requirement["referenceVolumeIndex"]
+            row = requirement["referenceRow"]
+            text = f"original volume {original}"
+            if row != original:
+                text += f" (source-file volume {row})"
+            return text
+
+        pglMessages.message(
+            f"Estimating cross-run alignment from motion product {motionProduct.name!r}.\n"
+            "Scan and volume indices below are zero-based.\n"
+            "Each run uses its recorded within-run reference volume."
+        )
+
+        for group in plan["alignmentGroups"]:
+            referenceIndex = group["referenceScanIndex"]
+            pglMessages.print(f"\nCross-run alignment — group {group['groupIndex']}")
+            pglMessages.print(f"  Selected MRI scans: {group['scanIndices']}")
+            pglMessages.print(
+                f"  Common reference: {scanLabel(referenceIndex)}, "
+                f"{volumeLabel(referenceIndex)}"
+            )
+
+            for index in group["scanIndices"]:
+                if index == referenceIndex:
+                    pglMessages.print(
+                        f"  {scanLabel(index)}: common reference; "
+                        "using identity, no registration fit"
+                    )
+                else:
+                    pglMessages.print(
+                        f"  {scanLabel(index)}, {volumeLabel(index)} "
+                        f"→ {scanLabel(referenceIndex)}, {volumeLabel(referenceIndex)}"
+                    )
+
+        pglMessages.print(
+            "\nNo corrected images are generated during estimation.\n"
+            "Saved sampling maps go from the common reference to each run's reference."
+        )
+
+        afni = pglAFNI(directory=afniDirectory)
+        generated = []
+        producingInvocations = []
+        executionID = action.actionHistory[-1].actionID
+
+        for group in plan["alignmentGroups"]:
+            referenceIndex = group["referenceScanIndex"]
+            referenceSource = sources[referenceIndex]
+            referenceRequirement = requirements[referenceIndex]
+
+            # This identifies the registration group's coordinate reference.
+            # It is established explicitly for these matching acquisition grids,
+            # not inferred globally from all scans using RAS coordinates.
+            physicalSpaceID = (
+                f"runAlignment:{executionID}:group{group['groupIndex']}"
+            )
+
+            for index in group["scanIndices"]:
+                source = sources[index]
+                requirement = requirements[index]
+                output = None
+
+                if index == referenceIndex:
+                    referenceMotion = motionByScan[source["scanUUID"]]
+                    oldFrame = referenceMotion["interpretation"]["voxelFrame"]
+
+                    frame = pglMRITransforms.makeFrame(
+                        geometryID=source["sourceStageID"],
+                        physicalSpaceID=physicalSpaceID,
+                        spatialShape=oldFrame["spatialShape"],
+                        voxelToPhysicalMM=oldFrame["voxelToPhysicalMM"],
+                        representation="voxelIndices",
+                    )
+                    voxelTransform = pglMRITransforms.makeTransform(
+                        np.eye(4),
+                        domainFrame=frame,
+                        codomainFrame=frame,
+                        purpose="sampling",
+                        interpretationStatus="validated",
+                        adapter="pgl.runAlignment.referenceIdentity.v1",
+                    )
+                    alignment = None
+                    pglMessages.message(
+                        f"Group {group['groupIndex']}: {scanLabel(index)} "
+                        "is the reference; no fit needed."
+                    )
+
+                else:
+                    pglMessages.message(
+                        f"Group {group['groupIndex']}: aligning "
+                        f"{scanLabel(index)}, {volumeLabel(index)} "
+                        f"to {scanLabel(referenceIndex)}, {volumeLabel(referenceIndex)}."
+                    )
+
+                    output = afni.alignRunReference(
+                        source["localPath"],
+                        referenceSource["localPath"],
+                        inputVolume=requirement["referenceRow"],
+                        referenceVolume=referenceRequirement["referenceRow"],
+                        inputStageID=source["sourceStageID"],
+                        referenceStageID=referenceSource["sourceStageID"],
+                        physicalSpaceID=physicalSpaceID,
+                        cacheDirectory=cacheDirectory,
+                        timeout=timeout,
+                    )
+                    if output is None:
+                        raise RuntimeError(f"Run alignment failed for MRI scan {index}.")
+
+                    details = output.provenance["invocation"]["result"]
+
+                    for inputName, expectedSource in (
+                        ("moving", source),
+                        ("reference", referenceSource),
+                    ):
+                        actual = details["inputs"][inputName]
+                        if (
+                            actual["sourceStageID"] != expectedSource["sourceStageID"]
+                            or any(
+                                actual[key] != expectedSource["sourceIdentity"][key]
+                                for key in ("sha256", "size_bytes")
+                            )
+                        ):
+                            raise ValueError("Alignment tool inputs differ from the prepared source identities.")
+
+                    alignment = details["alignment"]
+                    voxelTransform = alignment["voxelTransform"]
+                    producingInvocations.append(output.invocationID)
+
+                generated.append({
+                    "groupIndex": group["groupIndex"],
+                    "scanIndex": index,
+                    "scanUUID": source["scanUUID"],
+                    "sourceStageID": source["sourceStageID"],
+                    "sourceIdentity": deepcopy(source["sourceIdentity"]),
+                    "volumeIndices": list(source["volumeIndices"]),
+                    "referenceVolumeIndex": requirement["referenceVolumeIndex"],
+                    "referenceRow": requirement["referenceRow"],
+                    "commonReferenceScanIndex": referenceIndex,
+                    "commonReferenceScanUUID": referenceSource["scanUUID"],
+                    "commonReferenceSourceStageID": referenceSource["sourceStageID"],
+                    "commonReferenceVolumeIndex": referenceRequirement["referenceVolumeIndex"],
+                    "isReference": index == referenceIndex,
+                    "voxelTransform": voxelTransform,
+                    "interpretation": alignment,
+                    "_toolResult": output,
+                })
+
+            pglMessages.message(f"Finished estimates for geometry group {group['groupIndex']}.")
+
+        # No display-time discovery of invalid transformations: check all
+        # group summaries before any product is registered.
+        summaries = []
+        for group in plan["alignmentGroups"]:
+            entries = [
+                item for item in generated
+                if item["groupIndex"] == group["groupIndex"]
+            ]
+            summaries.append(pglMRITransforms.runAlignmentSummary(
+                [item["voxelTransform"] for item in entries],
+                scanIndices=[item["scanIndex"] for item in entries],
+                referenceScanIndex=group["referenceScanIndex"],
+                scanNames=[scans[item["scanIndex"]].name for item in entries],
+            ))
+
+        # Verify all sources again, including reference-only single-run groups.
+        for source in sources.values():
+            if pglExternalTool._fileIdentity(source["localPath"]) != source["sourceIdentity"]:
+                raise ValueError("An acquisition source changed during cross-run estimation.")
+
+        files = {}
+        scanRecords = []
+
+        for item in generated:
+            output = item["_toolResult"]
+            record = {key: deepcopy(value) for key, value in item.items() if key != "_toolResult"}
+            record["matricesRole"] = None
+            record["motionParametersRole"] = None
+
+            if output is not None:
+                for toolRole, recordField in (
+                    ("matrices", "matricesRole"),
+                    ("motionParameters", "motionParametersRole"),
+                ):
+                    role = f"scan.{item['scanUUID']}.{toolRole}"
+                    attachmentName = f"mri.{executionID}.{role}"
+                    artifact = output.outputs[toolRole]
+
+                    session.addDerivedFile(
+                        attachmentName,
+                        Path(artifact["localPath"]),
+                        mediaType="text/plain",
+                    )
+                    attachment = session.derivedFiles[attachmentName]
+                    if any(
+                        attachment[key] != artifact[key]
+                        for key in ("sha256", "size_bytes")
+                    ):
+                        raise ValueError("Run-alignment output changed before registration.")
+
+                    files[role] = attachmentName
+                    record[recordField] = role
+
+            # Identity mappings are explicit records, not fabricated AFNI files.
+            scanRecords.append(record)
+
+        product = action.registerProduct(
+            outputName,
+            "runAlignment",
+            session=session,
+            files=files,
+            inputProductIDs=[motionProduct.productID],
+            metadata={
+                "schemaVersion": 1,
+                "operation": "runReferenceAlignment",
+                "backend": "AFNI",
+                "withinRunMotionProductID": motionProduct.productID,
+                "withinRunMotionProducerActionID": motionProduct.producerActionID,
+                "plan": plan,
+                "scans": scanRecords,
+                "summaries": summaries,
+                "application": "notPerformedByEstimation",
+                "description": (
+                    "One fixed alignment per run, estimated using the reference "
+                    "volume recorded by that run's within-run motion estimate. "
+                    "Each stored sampling mapping starts in the common group "
+                    "reference and ends in the corresponding run reference. "
+                    "No corrected image was generated by estimation."
+                ),
+            },
+            invocationIDs=producingInvocations,
+        )
+
+        pglMessages.message(
+            f"Registered run-alignment product {outputName!r}: "
+            f"{len(scanRecords)} scans in {len(plan['alignmentGroups'])} groups.\n"
+            "Estimation is complete; image application has not been performed by this helper."
+        )
+        return product
+    
+    ################################################################
+    # Estimate fixed run-to-reference alignment using AFNI
+    ################################################################
+    class mriEstimateRunAlignmentAFNI(pglDeferredAction):
+        """Align each run's recorded motion reference to a group reference.
+
+        Explicitly consumes a within-run motion product.
+        Uses each scan's recorded reference volume—not an assumed volume zero.
+
+        Matching acquisition grids form independent groups.
+        referenceRun selects the common scan independently within each group:
+            first, middle, last, explicit session.mri.scans index,
+            or a list with one selection per group.
+
+        Default execution estimates and applies within-run plus run alignment
+        in one interpolation from the original acquisitions.
+        deferApply=True registers alignment without generating corrected images.
+
+        Initial support is original acquisition sources and matching-grid groups.
+        Cross-geometry alignment/application is not implemented by this action.
+
+        Automatically displays alignment summaries after successful execution
+        unless showAlignment=False.
+        """
+
+        withinRunMotion = Instance(
+            pglProductSelector,
+            default_value=None,
+            allow_none=True,
+            help="Required explicit within-run motion product selector.",
+        )
+        scanIndices = List(
+            Int(),
+            default_value=None,
+            allow_none=True,
+            help="Zero-based session.mri.scans indices; None selects all.",
+        )
+        referenceRun = Union(
+            [
+                Int(),
+                Unicode(),
+                List(Union([Int(), Unicode()])),
+            ],
+            default_value="middle",
+            help="first/middle/last, explicit MRI scan index, or one choice per geometry group.",
+        )
+        outputName = Unicode("runAlignment", help="Name of the estimated run-alignment product.")
+        correctedOutputName = Unicode("motionAndRunAligned", help="Name of the composite-corrected image product.")
+        showAlignment = Bool(True, help="Display between-run alignment summaries after success.")
+        afniDirectory = Unicode(default_value=None, allow_none=True, help="AFNI executable directory.")
+        cacheDirectory = Unicode(default_value=None, allow_none=True, help="Local working-cache override.")
+        timeout = Float(default_value=None, allow_none=True, help="Timeout in seconds for each alignment fit.")
+
+        def _estimate(self, session):
+            """Estimate from explicit recorded references and retain exact inputs."""
+            from .pglSession import pglSession
+
+            self._runAlignmentRecord = None
+            self._inputMotionRecord = None
+
+            if not isinstance(session, pglSession) or session.mri is None:
+                raise ValueError("Run alignment requires a session with MRI scans.")
+            if self.withinRunMotion is None:
+                raise ValueError(
+                    "Supply withinRunMotion explicitly, for example "
+                    "pglProductSelector('motion', kind='rigidMotion')."
+                )
+            if self.outputName == self.correctedOutputName:
+                raise ValueError("Alignment and corrected-image products need different names.")
+
+            for name in (self.outputName, self.correctedOutputName):
+                if (
+                    not isinstance(name, str) or not name.strip()
+                    or any(character in name for character in ("\x00", "\n", "\r"))
+                ):
+                    raise ValueError("Product names must be nonblank and contain no NUL or newlines.")
+
+            # Refuse corrected-output collisions before estimating anything.
+            if not self.deferApply:
+                for entry in session.actionHistory:
+                    if any(
+                        record.get("name") == self.correctedOutputName
+                        and record.get("recordStatus") == "committed"
+                        for record in entry.actionProducts
+                    ):
+                        raise ValueError(f"Product {self.correctedOutputName!r} already exists.")
+
+            motion = self.withinRunMotion.resolve(session)
+            if motion is None or motion.kind != "rigidMotion":
+                raise ValueError("withinRunMotion must resolve to a rigidMotion product.")
+
+            self._inputMotionRecord = motion.record
+            self._runAlignmentRecord = pglActionsMRI._estimateRunAlignmentProduct(
+                self,
+                session,
+                self.withinRunMotion,
+                scanIndices=self.scanIndices,
+                referenceRun=self.referenceRun,
+                outputName=self.outputName,
+                afniDirectory=self.afniDirectory,
+                cacheDirectory=self.cacheDirectory,
+                timeout=self.timeout,
+            )
+
+            from .pglMRI import pglMRITransforms
+
+            # Validate the complete recorded product inside scientific
+            # execution, not for the first time in the plotting hook.
+            pglMRITransforms.validateRunAlignmentProduct(self._runAlignmentRecord)
+
+            if (
+                self._runAlignmentRecord["metadata"]["withinRunMotionProductID"]
+                != self._inputMotionRecord["productID"]
+            ):
+                raise ValueError("The resolved motion dependency changed during estimation.")
+
+            return session
+
+        def _apply(self, session):
+            """Apply this execution's alignment with its exact motion dependency."""
+            if self._runAlignmentRecord is None or self._inputMotionRecord is None:
+                raise RuntimeError("Run-alignment inputs were not prepared by this execution.")
+
+            pglActionsMRI._applyWithinRunMotion(
+                self,
+                session,
+                self._inputMotionRecord,
+                outputName=self.correctedOutputName,
+                cacheDirectory=self.cacheDirectory,
+                runAlignmentRecord=self._runAlignmentRecord,
+            )
+            return session
+
+        def _afterSuccess(self, session):
+            """Display the committed alignment product, optionally after application."""
+            if not self.showAlignment or self._runAlignmentRecord is None:
+                return
+
+            import matplotlib.pyplot as plt
+
+            product = session.getProduct(
+                productID=self._runAlignmentRecord["productID"],
+            )
+            if product is None: return
+
+            figures = product.display(cacheDirectory=self.cacheDirectory)
+            if figures: plt.show(block=False)

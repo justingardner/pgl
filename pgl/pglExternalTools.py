@@ -2243,6 +2243,434 @@ Installation documentation:
                 ) from executionError
 
             return result
+        
+    ################################################################
+    # Estimate one fixed run-reference alignment
+    ################################################################
+    def alignRunReference(self, inputImage, referenceImage, *, inputVolume=0, referenceVolume=0, inputStageID=None, referenceStageID=None, physicalSpaceID=None, cacheDirectory=None, timeout=None):
+        """Estimate one rigid mapping from a common reference to a run reference.
+
+        inputImage/referenceImage:
+            Explicit local NIfTI sources on matching acquisition grids.
+
+        inputVolume/referenceVolume:
+            Zero-based volume indices in the supplied files.
+            A 3D image supports index zero only.
+
+        Stage IDs:
+            Explicit source-stage identities supplied by the owning action.
+            Standalone calls default to content-based identities.
+
+        physicalSpaceID:
+            Shared coordinate reference established by the calling action.
+            A standalone call uses the selected reference source as its anchor.
+
+        Returns:
+            pglToolResult with native matrix/motion-parameter outputs.
+            provenance["invocation"]["result"]["alignment"] contains the
+            native and voxel-coordinate reference-to-input sampling mappings.
+
+        Runs 3dvolreg on one selected input volume with -prefix NULL.
+        Does not resample images, choose scans, group runs, or register products.
+
+        Freeform failures warn and return None.
+        Inside an action, failures propagate internally to stop execution.
+        KeyboardInterrupt/SystemExit propagate after recording.
+
+        Initial support is the tested matching-grid, millimeter NIfTI case.
+        Numerical grid agreement does not establish anatomical alignment.
+        """
+        import os
+        import shutil
+        import tempfile
+        from contextlib import nullcontext
+        from pathlib import Path
+
+        import nibabel as nib
+        import numpy as np
+
+        from .pglMessages import pglMessages
+        from .pglMRI import pglMRITransforms
+
+        self.lastResult = None
+        activeRecorder = getExecutionRecorder()
+        recorder = activeRecorder
+        standalone = recorder is None
+
+        try:
+            for name, index in (("inputVolume", inputVolume), ("referenceVolume", referenceVolume)):
+                if type(index) is not int or index < 0:
+                    raise ValueError(f"{name} must be a nonnegative integer.")
+
+            if timeout is not None:
+                if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+                    raise ValueError("timeout must be positive and finite.")
+
+            for name, value in (
+                ("inputStageID", inputStageID),
+                ("referenceStageID", referenceStageID),
+                ("physicalSpaceID", physicalSpaceID),
+            ):
+                if value is not None and (
+                    not isinstance(value, str) or not value.strip()
+                    or any(character in value for character in ("\x00", "\n", "\r"))
+                ):
+                    raise ValueError(f"{name} must be a nonblank string or None.")
+
+            def sourcePath(value):
+                path = Path(value).expanduser().resolve()
+                if not path.is_file() or not path.name.lower().endswith((".nii", ".nii.gz")):
+                    raise ValueError("Alignment inputs must be existing local NIfTI files.")
+                if any(character in str(path) for character in ("[", "]", "<", ">", "\x00", "\n", "\r")):
+                    raise ValueError("An image path contains AFNI dataset-selector characters.")
+                return path
+
+            movingPath = sourcePath(inputImage)
+            basePath = sourcePath(referenceImage)
+
+            cacheRoot = None
+            if cacheDirectory is not None:
+                text = os.fspath(cacheDirectory)
+                if (
+                    not isinstance(text, str) or not text.strip()
+                    or "://" in text or "::" in text
+                    or any(character in text for character in ("\x00", "\n", "\r"))
+                ):
+                    raise ValueError("cacheDirectory must be an ordinary local path.")
+                cacheRoot = Path(text).expanduser().resolve()
+
+            if standalone: recorder = pglExecutionRecorder()
+
+            with recorder.activate() if standalone else nullcontext():
+                invocationID = recorder.beginInvocation({
+                    "operation": "runReferenceAlignment",
+                    "adapter": "pgl.AFNI.3dvolreg.crossRunSharedGrid.v1",
+                    "inputPath": str(movingPath),
+                    "referencePath": str(basePath),
+                    "inputVolume": inputVolume,
+                    "referenceVolume": referenceVolume,
+                    "parameters": {
+                        "twoPass": True,
+                        "interpolation": "Fourier",
+                        "writeCorrectedImage": False,
+                    },
+                    "timeoutSeconds": timeout,
+                })
+                previousIDs = {
+                    record["invocationID"] for record in recorder.exportInvocations()
+                }
+                result = pglToolResult(invocationID)
+                details = {"inputs": {}, "outputs": {}, "alignment": None}
+                executionError = None
+                failureRecord = None
+
+                try:
+                    def inspectSource(path, volume):
+                        identity = self._fileIdentity(path)
+                        image = nib.load(path)
+
+                        if not isinstance(image, (nib.Nifti1Image, nib.Nifti2Image)):
+                            raise ValueError("Expected a single-file NIfTI image.")
+                        if len(image.shape) not in (3, 4):
+                            raise ValueError("Alignment sources must be 3D or 4D.")
+                        count = image.shape[3] if len(image.shape) == 4 else 1
+                        if volume >= count: raise ValueError(f"Reference volume is outside {path.name}.")
+                        if image.header.get_xyzt_units()[0] != "mm":
+                            raise ValueError("This adapter requires millimeter spatial units.")
+
+                        qform, qcode = image.get_qform(coded=True)
+                        sform, scode = image.get_sform(coded=True)
+                        if qform is None: raise ValueError("Alignment requires a coded acquisition qform.")
+                        qform = pglMRITransforms._matrix(qform, "acquisition qform")
+
+                        shape = list(image.shape[:3])
+                        corners = np.array([
+                            [x, y, z, 1.0]
+                            for x in (0, shape[0] - 1)
+                            for y in (0, shape[1] - 1)
+                            for z in (0, shape[2] - 1)
+                        ]).T
+
+                        if sform is not None:
+                            sform = pglMRITransforms._matrix(sform, "acquisition sform")
+                            error = np.linalg.norm(((sform - qform) @ corners)[:3], axis=0).max()
+                            if error > 0.001:
+                                raise ValueError("Coded qform and sform conflict.")
+
+                        spacing = np.asarray(image.header.get_zooms()[:3])
+                        if not np.allclose(
+                            spacing, np.linalg.norm(qform[:3, :3], axis=0),
+                            rtol=0, atol=0.001,
+                        ):
+                            raise ValueError("Header voxel sizes disagree with qform.")
+
+                        return identity, shape, qform, corners
+
+                    movingIdentity, movingShape, movingAffine, movingCorners = inspectSource(movingPath, inputVolume)
+                    baseIdentity, baseShape, baseAffine, baseCorners = inspectSource(basePath, referenceVolume)
+
+                    gridError = float(np.linalg.norm(
+                        ((movingAffine - baseAffine) @ baseCorners)[:3], axis=0,
+                    ).max())
+                    if movingShape != baseShape or gridError > 0.001:
+                        raise ValueError(
+                            "Cross-run estimation currently requires matching acquisition grids. "
+                            "The action must group compatible runs before invoking this adapter."
+                        )
+
+                    movingStage = inputStageID or f"image:{movingIdentity['sha256']}"
+                    baseStage = referenceStageID or f"image:{baseIdentity['sha256']}"
+                    spaceID = physicalSpaceID or f"alignmentReference:{baseStage}"
+
+                    details["inputs"] = {
+                        "moving": {
+                            "localPath": str(movingPath),
+                            "sourceStageID": movingStage,
+                            "volumeIndex": inputVolume,
+                            **movingIdentity,
+                        },
+                        "reference": {
+                            "localPath": str(basePath),
+                            "sourceStageID": baseStage,
+                            "volumeIndex": referenceVolume,
+                            **baseIdentity,
+                        },
+                    }
+                    details["gridComparisonErrorMM"] = gridError
+
+                    # Select one installation and use explicit paths afterward.
+                    selectedDirectory = None if self.directory is None else Path(self.directory).expanduser().resolve()
+                    managed = pglAFNIInstallation()
+                    managedDirectory = managed.root / "abin"
+
+                    if selectedDirectory is None or selectedDirectory == managedDirectory.resolve():
+                        state = managed.readState()
+                        if state is not None and state["status"] != "verified":
+                            raise RuntimeError(managed.continuationMessage(state))
+                        if state is not None or managedDirectory.exists():
+                            selectedDirectory = managedDirectory
+
+                    if selectedDirectory is None:
+                        discovered = shutil.which("afni")
+                        if discovered is None:
+                            raise FileNotFoundError("AFNI is unavailable. Run afni.install() or specify its executable directory.")
+                        selectedDirectory = Path(discovered).absolute().parent
+
+                    if cacheRoot is not None: cacheRoot.mkdir(parents=True, exist_ok=True)
+                    outputDirectory = Path(tempfile.mkdtemp(
+                        prefix="pgl-run-alignment-",
+                        dir=None if cacheRoot is None else str(cacheRoot),
+                    ))
+                    result.logDirectory = outputDirectory
+                    details["workingDirectory"] = str(outputDirectory)
+
+                    versionResult = self._runCommand(
+                        selectedDirectory / "afni",
+                        arguments=["-ver"],
+                        timeout=10,
+                        cacheDirectory=outputDirectory,
+                    )
+                    versionParts = []
+                    for path in (versionResult.stdoutPath, versionResult.stderrPath):
+                        with path.open("rb") as handle: content = handle.read(65537)
+                        if len(content) > 65536: raise ValueError("AFNI version output is unexpectedly large.")
+                        text = content.decode("utf-8", errors="replace").strip()
+                        if text: versionParts.append(text)
+                    version = "\n".join(versionParts)
+                    if not version: raise ValueError("AFNI returned no version information.")
+                    details["reportedVersion"] = version
+
+                    def readAttributes(path):
+                        attributes = {}
+                        for name, count in (
+                            ("ORIENT_SPECIFIC", 3), ("DELTA", 3),
+                            ("ORIGIN", 3), ("IJK_TO_DICOM_REAL", 12),
+                        ):
+                            query = self._runCommand(
+                                selectedDirectory / "3dAttribute",
+                                arguments=[name, str(path)],
+                                timeout=15,
+                                cacheDirectory=outputDirectory,
+                            )
+                            text = query.stdoutPath.read_text(encoding="utf-8", errors="replace")
+                            values = np.array([float(value) for value in text.split()])
+                            if values.shape != (count,) or not np.isfinite(values).all():
+                                raise ValueError(f"Invalid AFNI attribute {name}.")
+                            attributes[name] = values.tolist()
+                        return attributes
+
+                    # Reuse the tested frame construction through an identity
+                    # mapping. These temporary identity transforms are not
+                    # registration estimates or published products.
+                    def makeFrames(path, shape, affine, stageID):
+                        attributes = readAttributes(path)
+                        identityRow = np.eye(4)[:3].reshape(1, 12)
+                        interpreted = pglMRITransforms.interpretAFNIVolreg(
+                            identityRow,
+                            attributes=attributes,
+                            geometryID=stageID,
+                            physicalSpaceID=spaceID,
+                            spatialShape=shape,
+                            voxelToPhysicalMM=affine,
+                            volumeIndices=[0],
+                            referenceVolumeIndex=0,
+                            afniVersion=version,
+                        )
+                        return {
+                            "attributes": attributes,
+                            "native": interpreted["nativeFrame"],
+                            "voxel": interpreted["voxelFrame"],
+                        }
+
+                    movingFrames = makeFrames(movingPath, movingShape, movingAffine, movingStage)
+                    baseFrames = makeFrames(basePath, baseShape, baseAffine, baseStage)
+
+                    matrixPath = outputDirectory / "run-alignment.aff12.1D"
+                    parameterPath = outputDirectory / "run-alignment.1D"
+
+                    command = self._runCommand(
+                        selectedDirectory / "3dvolreg",
+                        arguments=[
+                            "-Fourier", "-twopass",
+                            "-base", f"{basePath}[{referenceVolume}]",
+                            "-1Dfile", str(parameterPath),
+                            "-1Dmatrix_save", str(matrixPath),
+                            "-prefix", "NULL",
+                            f"{movingPath}[{inputVolume}]",
+                        ],
+                        cwd=outputDirectory,
+                        timeout=timeout,
+                        cacheDirectory=outputDirectory,
+                    )
+                    result.returnCode = command.returnCode
+                    result.stdoutPath = command.stdoutPath
+                    result.stderrPath = command.stderrPath
+
+                    def readOutput(path, columns):
+                        if path.is_symlink() or not path.is_file():
+                            raise ValueError(f"Expected regular output file: {path}")
+                        values = np.loadtxt(path, comments="#", ndmin=2)
+                        if values.shape != (1, columns) or not np.isfinite(values).all():
+                            raise ValueError(f"{path.name} must contain one finite row of {columns} values.")
+                        return values, {
+                            "localPath": str(path),
+                            **self._fileIdentity(path),
+                            "rows": 1,
+                            "columns": columns,
+                        }
+
+                    rows, matrixOutput = readOutput(matrixPath, 12)
+                    _, parameterOutput = readOutput(parameterPath, 6)
+                    matrix = np.eye(4)
+                    matrix[:3] = rows.reshape(3, 4)
+                    linear = matrix[:3, :3]
+
+                    if (
+                        not np.allclose(linear.T @ linear, np.eye(3), rtol=0, atol=0.0001)
+                        or abs(np.linalg.det(linear) - 1) > 0.0001
+                    ):
+                        raise ValueError("Cross-run output is not a rigid transformation.")
+
+                    native = pglMRITransforms.makeTransform(
+                        matrix,
+                        domainFrame=baseFrames["native"],
+                        codomainFrame=movingFrames["native"],
+                        purpose="sampling",
+                        interpretationStatus="validated",
+                        adapter="pgl.AFNI.3dvolreg.crossRunSharedGrid.v1",
+                    )
+                    voxel = pglMRITransforms.convert(
+                        native,
+                        domainFrame=baseFrames["voxel"],
+                        codomainFrame=movingFrames["voxel"],
+                    )
+
+                    for path, identity in ((movingPath, movingIdentity), (basePath, baseIdentity)):
+                        if self._fileIdentity(path) != identity:
+                            raise ValueError("An alignment source changed during execution.")
+
+                    details["outputs"] = {
+                        "matrices": {**matrixOutput, "format": "AFNI aff12.1D"},
+                        "motionParameters": {**parameterOutput, "format": "AFNI 3dvolreg 1Dfile"},
+                    }
+                    details["alignment"] = {
+                        "schemaVersion": 1,
+                        "kind": "AFNIRunReferenceAlignment",
+                        "adapter": "pgl.AFNI.3dvolreg.crossRunSharedGrid.v1",
+                        "afniVersion": version,
+                        "inputStageID": movingStage,
+                        "referenceStageID": baseStage,
+                        "inputVolume": inputVolume,
+                        "referenceVolume": referenceVolume,
+                        "inputAttributes": movingFrames["attributes"],
+                        "referenceAttributes": baseFrames["attributes"],
+                        "nativeTransform": native,
+                        "voxelTransform": voxel,
+                        "validationScope": (
+                            "Matching acquisition grids; supported by synthetic "
+                            "cross-run rotation/translation and composition tests "
+                            "with AFNI 26.3.11 on macOS ARM. Registration quality "
+                            "must be evaluated separately."
+                        ),
+                        "description": (
+                            "One fixed alignment between run reference images. "
+                            "For a voxel location in the common reference, the "
+                            "converted matrix gives the sampling location in "
+                            "this run's reference image. No images were corrected "
+                            "or moved by generating this estimate."
+                        ),
+                    }
+                    result.status = "success"
+
+                except BaseException as error:
+                    executionError = error
+                    result.status = "interrupted" if isinstance(error, (KeyboardInterrupt, SystemExit)) else "failed"
+                    failureRecord = {"errorType": type(error).__name__, "message": str(error)}
+                    if isinstance(error, pglToolExecutionError):
+                        child = error.result
+                        result.returnCode = child.returnCode
+                        result.stdoutPath = child.stdoutPath
+                        result.stderrPath = child.stderrPath
+                        if result.logDirectory is None: result.logDirectory = child.logDirectory
+
+                finally:
+                    details["childInvocations"] = [
+                        record for record in recorder.exportInvocations()
+                        if record["invocationID"] not in previousIDs
+                    ]
+                    recorder.finishInvocation(
+                        invocationID,
+                        status=result.status,
+                        result=details,
+                        error=failureRecord,
+                    )
+                    if standalone: recorder.close()
+
+                    result._provenance = {
+                        "schemaVersion": 1,
+                        "environment": recorder.exportEnvironment(),
+                        "invocation": next(
+                            record for record in recorder.exportInvocations()
+                            if record["invocationID"] == invocationID
+                        ),
+                    }
+                    self.lastResult = result
+
+                if executionError is not None:
+                    if not isinstance(executionError, Exception): raise executionError
+                    raise pglToolExecutionError(
+                        f"Run-reference alignment failed: {failureRecord['message']}",
+                        result,
+                    ) from executionError
+
+                return result
+
+        except Exception as error:
+            if isinstance(error, pglToolExecutionError): self.lastResult = error.result
+            if activeRecorder is not None and activeRecorder.actionID is not None:
+                raise
+            pglMessages.warning(f"AFNI run-reference alignment stopped: {type(error).__name__}: {error}")
+            return None
     
 ################################################################
 # AFNI installation state and administrator-stage launcher

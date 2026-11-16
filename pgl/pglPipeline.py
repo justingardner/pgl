@@ -733,47 +733,35 @@ class pglDerivedProduct:
     def display(self, **options):
         """Display this product using its kind-specific adapter.
 
-        Uses the bound owner; no redundant session argument is required.
-        Does not automatically reload a released session.
+        Uses the bound owner without automatically reloading a session.
+        Options are validated against the adapter before payload access.
 
-        Options are forwarded to the selected adapter. Explicitly unsupported
-        arguments are rejected before owner resolution or payload access.
-        Adapters accepting **kwargs must validate those options themselves.
+        Built-in kinds:
+            rigidMotion: per-volume motion figures.
+            runAlignment: between-run summaries, one per selected group.
 
-        Built-in support:
-            rigidMotion:
-                Returns a list of Matplotlib figures, one per selected scan.
-                Supports scanIndices, showAffineComponents,
-                measurementPointRASMM, and cacheDirectory.
-
-        Other adapters may return figures, viewers, or report handles.
-        Each adapter documents its return value and presentation behavior.
-
-        This dispatcher does not guess how to display arbitrary files or
-        execute code stored in product metadata.
+        Registered runtime adapters take precedence over built-ins.
 
         Dependency, option, metadata, and integrity failures warn at the
-        default stopping level and return None. Adapters should separately
-        catch recoverable rendering failures and warn with level=1.
+        default stopping level. Adapters separately handle recoverable
+        rendering failures with level=1.
 
-        Examples:
-            motion.display()
-            motion.display(scanIndices=[0, 1])
-            motion.display(showAffineComponents=True)
+        Returns the adapter's figures/viewer/result, or None on refusal.
         """
         try:
             adapter = type(self)._displayAdapters.get(self.kind)
 
-            # Load built-in MRI support only when requested. Merely retrieving
-            # a product must not import plotting libraries or open payloads.
-            if adapter is None and self.kind == "rigidMotion":
+            if adapter is None and self.kind in ("rigidMotion", "runAlignment"):
                 from .pglMRI import pglMRITransforms
-                adapter = pglMRITransforms.displayMotionProduct
+
+                adapter = {
+                    "rigidMotion": pglMRITransforms.displayMotionProduct,
+                    "runAlignment": pglMRITransforms.displayRunAlignmentProduct,
+                }[self.kind]
 
             if adapter is None:
                 raise ValueError(f"No display adapter is registered for product kind {self.kind!r}.")
 
-            # Validate calling convention before scientific payload access.
             try:
                 inspect.signature(adapter).bind(self, **options)
             except TypeError as error:
@@ -781,12 +769,71 @@ class pglDerivedProduct:
 
             owner = self._requireOwner()
             self._findProducingAction(owner)
-
             return adapter(self, **options)
 
         except Exception as error:
             pglMessages.warning(f"Product display stopped: {type(error).__name__}: {error}")
             return None
+        
+    ################################################################
+    # Register a display implementation for a scientific product kind
+    ################################################################
+    @classmethod
+    def registerDisplayAdapter(cls, kind, adapter, *, overwrite=False):
+        """Register a trusted runtime display function for a product kind.
+
+        The adapter is called as:
+            adapter(product, **options)
+
+        The product carries its weak owner reference. The adapter handles
+        kind-specific validation, verified payload access, and presentation.
+
+        Built-in displays for rigidMotion and runAlignment need no explicit
+        registration. Replacing either requires overwrite=True, as does
+        replacing an existing custom registration.
+
+        Registration does not execute the adapter or access scientific data.
+        Functions are runtime configuration, never serialized into products.
+
+        Returns True on registration.
+        Invalid registrations warn at the default level and return False.
+        """
+        import inspect
+
+        try:
+            if (
+                not isinstance(kind, str)
+                or not kind.strip()
+                or any(character in kind for character in ("\x00", "\n", "\r"))
+            ):
+                raise ValueError("Product kind must be a nonblank string without NUL or newlines.")
+
+            if not callable(adapter):
+                raise TypeError("Display adapter must be callable.")
+
+            if type(overwrite) is not bool:
+                raise TypeError("overwrite must be Boolean.")
+
+            existing = cls._displayAdapters
+            if (kind in existing or kind in ("rigidMotion", "runAlignment")) and not overwrite:
+                raise ValueError(
+                    f"A display adapter already exists for {kind!r}; "
+                    "use overwrite=True to replace it."
+                )
+
+            # Verify that the callable exposes an inspectable signature.
+            # Its actual options are checked by display() before invocation.
+            inspect.signature(adapter)
+
+            cls._displayAdapters = {**existing, kind: adapter}
+            return True
+
+        except Exception as error:
+            pglMessages.warning(
+                f"Display adapter was not registered: "
+                f"{type(error).__name__}: {error}"
+            )
+            return False
  
 ########################
 # class pglAction

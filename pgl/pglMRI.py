@@ -3511,4 +3511,1034 @@ class pglMRITransforms:
 
         return figures
     
+    ################################################################
+    # Describe fixed run-to-reference alignments
+    ################################################################
+    @classmethod
+    def runAlignmentSummary(cls, transforms, *, scanIndices, referenceScanIndex, scanNames=None):
+        """Calculate patient-oriented movement for one shared-grid run group.
+
+        transforms:
+            One validated common-reference -> run-reference sampling map per
+            selected scan. The reference scan must also have a transform,
+            normally identity.
+
+        scanIndices:
+            Zero-based session.mri.scans indices, in the requested display order.
+            These are scan indices, not volume indices or timestamps.
+
+        referenceScanIndex:
+            Explicit common reference scan in scanIndices.
+
+        scanNames:
+            Optional display labels corresponding to scanIndices.
+
+        Initial scope:
+            Rigid run-to-reference mappings on matching acquisition grids.
+            All endpoints must use the same declared physical reference space.
+            Different grid geometries require a separately supported adapter.
+
+        Measures displacement at the common reference image's center.
+        Rotations are principal rotation-vector components in patient RAS axes.
+
+        Returns portable summary metadata. Does not read images, display
+        figures, resample data, or modify transforms.
+
+        Errors propagate to the action/display validation boundary.
+        """
+        from scipy.spatial.transform import Rotation
+
+        if not isinstance(transforms, (list, tuple)) or not transforms:
+            raise ValueError("Supply one interpreted alignment transform per scan.")
+
+        if (
+            type(scanIndices) is not list
+            or len(scanIndices) != len(transforms)
+            or any(type(index) is not int or index < 0 for index in scanIndices)
+            or len(set(scanIndices)) != len(scanIndices)
+        ):
+            raise ValueError("scanIndices must contain one unique nonnegative MRI index per transform.")
+
+        if type(referenceScanIndex) is not int or referenceScanIndex not in scanIndices:
+            raise ValueError("referenceScanIndex must identify one of the selected scans.")
+
+        if scanNames is None:
+            scanNames = [f"MRI scan {index}" for index in scanIndices]
+        elif (
+            not isinstance(scanNames, (list, tuple))
+            or len(scanNames) != len(scanIndices)
+            or any(not isinstance(name, str) for name in scanNames)
+        ):
+            raise ValueError("scanNames must contain one string per selected scan.")
+
+        records = [cls._validateTransform(transform) for transform in transforms]
+        referenceFrame = records[0]["domainFrame"]
+        referencePhysical = np.asarray(referenceFrame["voxelToPhysicalMM"])
+        centerVoxel = (np.asarray(referenceFrame["spatialShape"], dtype=float) - 1) / 2
+        center = (referencePhysical @ np.append(centerVoxel, 1.0))[:3]
+
+        def requireSharedGrid(frame):
+            """Restrict this display contract to the tested shared-grid case."""
+            if frame["physicalSpaceID"] != referenceFrame["physicalSpaceID"]:
+                raise ValueError("Alignment endpoints do not share a declared patient reference space.")
+            if frame["spatialShape"] != referenceFrame["spatialShape"]:
+                raise ValueError("This run-alignment display supports matching acquisition grids only.")
+            if not np.allclose(
+                frame["voxelToPhysicalMM"],
+                referencePhysical,
+                rtol=0,
+                atol=0.0001,
+            ):
+                raise ValueError("Alignment endpoint geometry differs from the common acquisition grid.")
+
+        def physicalFrame(frame):
+            return cls.makeFrame(
+                geometryID=frame["geometryID"],
+                physicalSpaceID=frame["physicalSpaceID"],
+                spatialShape=frame["spatialShape"],
+                voxelToPhysicalMM=frame["voxelToPhysicalMM"],
+                representation="scannerRAS",
+            )
+
+        translations = []
+        rotations = []
+
+        for record in records:
+            if record["purpose"] != "sampling":
+                raise ValueError("Run alignment requires reference-to-input sampling mappings.")
+            if record["interpretationStatus"] != "validated":
+                raise ValueError("Run alignment requires validated coordinate interpretation.")
+
+            domain = record["domainFrame"]
+            codomain = record["codomainFrame"]
+
+            if domain["geometryID"] != referenceFrame["geometryID"]:
+                raise ValueError("All run alignments must start from the same reference image geometry.")
+
+            requireSharedGrid(domain)
+            requireSharedGrid(codomain)
+
+            physical = cls.convert(
+                record,
+                domainFrame=physicalFrame(domain),
+                codomainFrame=physicalFrame(codomain),
+            )
+            matrix = np.asarray(physical["matrix"])
+            linear = matrix[:3, :3]
+
+            # Do not silently turn an affine deformation into a head-rotation
+            # plot. This first run-alignment contract is explicitly rigid.
+            if (
+                not np.allclose(linear.T @ linear, np.eye(3), rtol=0, atol=0.0001)
+                or abs(np.linalg.det(linear) - 1.0) > 0.0001
+            ):
+                raise ValueError("Run alignment contains scale, shear, or reflection instead of rigid motion.")
+
+            # Remove only numerical nonorthogonality when extracting angles.
+            left, _, rightTranspose = np.linalg.svd(linear)
+            rotation = left @ rightTranspose
+
+            translations.append((linear @ center + matrix[:3, 3] - center).tolist())
+            rotations.append(Rotation.from_matrix(rotation).as_rotvec(degrees=True).tolist())
+
+        referencePosition = scanIndices.index(referenceScanIndex)
+
+        # The reference-to-itself mapping should be identity. Report a bad
+        # association instead of visually forcing its plotted values to zero.
+        if (
+            np.max(np.abs(translations[referencePosition])) > 0.001
+            or np.max(np.abs(rotations[referencePosition])) > 0.001
+        ):
+            raise ValueError("The selected reference scan does not have an approximately identity alignment.")
+
+        return {
+            "schemaVersion": 1,
+            "kind": "runAlignmentSummary",
+            "scanIndices": list(scanIndices),
+            "scanNames": list(scanNames),
+            "referenceScanIndex": referenceScanIndex,
+            "referencePosition": referencePosition,
+            "transformIDs": [record["transformID"] for record in records],
+            "coordinateConvention": "patientRAS",
+            "measurementPointRASMM": center.tolist(),
+            "translationMM": translations,
+            "rotationVectorDegrees": rotations,
+            "axisLabels": [
+                "Left–right (+ right)",
+                "Back–front (+ toward face)",
+                "Feet–head (+ toward top of head)",
+            ],
+            "description": (
+                "One fixed alignment per run, relative to the selected common "
+                "reference run. These are between-run estimates, not the "
+                "per-volume movement within each run.\n\n"
+                "Translation measures displacement at the common reference "
+                "image's center. Rotation-vector components describe rotation "
+                "about fixed patient Right, Anterior, and Superior axes. "
+                "Positive rotation follows the right-hand rule. The components "
+                "are not three successive Euler rotations.\n\n"
+                "These plots show what registration estimated. Anatomical "
+                "overlays are still needed to evaluate whether it aligned "
+                "the images correctly."
+            ),
+        }
+
+    ################################################################
+    # Display fixed run-to-reference alignments
+    ################################################################
+    @classmethod
+    def displayRunAlignment(cls, transforms, *, scanIndices, referenceScanIndex, scanNames=None, groupLabel=None, applicationMessage=None, fig=None):
+        """Plot one geometry group's between-run translations and rotations.
+
+        Returns a Matplotlib figure, or None after a warning.
+        Does not call plt.show(), save figures, or access image payloads.
+
+        applicationMessage:
+            Optional text derived by the caller from recorded application
+            provenance. When absent, the figure makes no application claim.
+
+            Do not infer "applied" from the mere existence of transform files.
+
+        Numeric/coordinate validation occurs before clearing a supplied figure.
+        Validation failures stop with the default warning level.
+        Recoverable rendering failures warn with level=1.
+
+        Preserves selected run order. Connecting lines are visual guides,
+        not claims about continuous acquisition timing.
+        """
+        from .pglMessages import pglMessages
+
+        try:
+            for name, value in (("groupLabel", groupLabel), ("applicationMessage", applicationMessage)):
+                if value is not None and (not isinstance(value, str) or not value.strip()):
+                    raise ValueError(f"{name} must be a nonblank string or None.")
+
+            summary = cls.runAlignmentSummary(
+                transforms,
+                scanIndices=scanIndices,
+                referenceScanIndex=referenceScanIndex,
+                scanNames=scanNames,
+            )
+
+        except Exception as error:
+            pglMessages.warning(f"Run-alignment display stopped: {type(error).__name__}: {error}")
+            return None
+
+        createdFigure = False
+        plt = None
+
+        try:
+            import matplotlib.pyplot as plt
+
+            if fig is None:
+                fig = plt.figure(figsize=(11, 8), constrained_layout=True)
+                createdFigure = True
+            else:
+                fig.clear()
+                fig.set_layout_engine("constrained")
+
+            axes = fig.subplots(2, 1, sharex=True)
+            positions = np.arange(len(summary["scanIndices"]))
+            referencePosition = summary["referencePosition"]
+            colors = ("#0072B2", "#D55E00", "#009E73")
+            markers = ("o", "s", "^")
+
+            panels = (
+                (
+                    summary["translationMM"],
+                    summary["axisLabels"],
+                    "Displacement (mm)",
+                    "Movement at the common reference image center",
+                ),
+                (
+                    summary["rotationVectorDegrees"],
+                    [
+                        "About left–right axis",
+                        "About back–front axis",
+                        "About feet–head axis",
+                    ],
+                    "Rotation (degrees)",
+                    "Rotation-vector components in fixed patient axes",
+                ),
+            )
+
+            for axis, (values, labels, ylabel, heading) in zip(axes, panels):
+                values = np.asarray(values)
+                axis.axhline(0, color="0.55", linewidth=0.8, zorder=0)
+                axis.axvspan(
+                    referencePosition - 0.2,
+                    referencePosition + 0.2,
+                    color="0.5",
+                    alpha=0.15,
+                    label=f"Reference scan {referenceScanIndex}",
+                )
+
+                for component, (label, color, marker) in enumerate(zip(labels, colors, markers)):
+                    axis.plot(
+                        positions,
+                        values[:, component],
+                        color=color,
+                        marker=marker,
+                        linestyle="--",
+                        linewidth=1,
+                        markersize=5,
+                        label=label,
+                    )
+
+                axis.set_ylabel(ylabel)
+                axis.set_title(heading, fontsize=10, loc="left")
+                axis.grid(True, alpha=0.2)
+                axis.legend(loc="best", fontsize=8)
+
+            labels = [
+                f"{index}: {name}" + (" [reference]" if index == referenceScanIndex else "")
+                for index, name in zip(summary["scanIndices"], summary["scanNames"])
+            ]
+            axes[-1].set_xticks(positions)
+            axes[-1].set_xticklabels(labels, rotation=25, ha="right")
+            axes[-1].set_xlabel("MRI scans in selected order (zero-based session.mri.scans indices)")
+            axes[-1].set_xlim(-0.5, max(0.5, len(positions) - 0.5))
+
+            heading = "Between-run alignment"
+            if groupLabel is not None: heading += f" — {groupLabel}"
+            pointText = ", ".join(f"{value:.2f}" for value in summary["measurementPointRASMM"])
+
+            statusText = (
+                applicationMessage
+                if applicationMessage is not None
+                else "Estimates shown; image-application status is not specified."
+            )
+            fig.suptitle(
+                f"{heading}\n"
+                f"Common reference: MRI scan {referenceScanIndex}\n"
+                f"Measurement point: reference image center, RAS [{pointText}] mm\n"
+                f"{statusText}",
+                fontsize=10,
+            )
+            fig.supxlabel(
+                "Positive rotations follow the right-hand rule. Lines connect selected runs, not continuous time.\n"
+                "Estimated movement is not proof of anatomical alignment; inspect image overlays too.",
+                fontsize=8,
+            )
+            return fig
+
+        except Exception as error:
+            if createdFigure and plt is not None: plt.close(fig)
+            pglMessages.warning(
+                f"Run-alignment results are available, but plotting failed: "
+                f"{type(error).__name__}: {error}",
+                level=1,
+            )
+            return None
+        
+    ################################################################
+    # Validate a recorded run-alignment product
+    ################################################################
+    @classmethod
+    def validateRunAlignmentProduct(cls, record):
+        """Validate the shared-grid run-alignment product without reading files.
+
+        Checks group membership, reference associations, endpoint geometry,
+        native-to-voxel conversion, and native artifact references.
+
+        Returns an independent product metadata copy.
+
+        Cached summaries are not authoritative; summaries are recomputed from
+        the recorded transforms when displayed.
+
+        Does not establish payload availability or registration quality.
+        Composition must additionally match the exact within-run motion
+        product and verify its reference/source associations.
+        """
+        import re
+
+        from .pglExternalTools import _copyProvenance
+
+        record = _copyProvenance(record)
+        if type(record) is not dict or record.get("kind") != "runAlignment":
+            raise ValueError("Expected a runAlignment product.")
+
+        metadata = record.get("metadata")
+        artifacts = record.get("artifacts")
+        if type(metadata) is not dict or type(artifacts) is not dict:
+            raise ValueError("Run alignment requires metadata and artifact records.")
+        if type(metadata.get("schemaVersion")) is not int or metadata["schemaVersion"] != 1:
+            raise ValueError("Unsupported run-alignment metadata version.")
+        if metadata.get("operation") != "runReferenceAlignment" or metadata.get("backend") != "AFNI":
+            raise ValueError("Unsupported run-alignment operation/backend.")
+
+        motionID = metadata.get("withinRunMotionProductID")
+        producerID = metadata.get("withinRunMotionProducerActionID")
+        if not isinstance(motionID, str) or not motionID:
+            raise ValueError("Run alignment must identify its input motion product.")
+        if not isinstance(producerID, str) or not producerID:
+            raise ValueError("Run alignment must identify its input motion execution.")
+        if record.get("inputProductIDs") != [motionID]:
+            raise ValueError("Run-alignment input links disagree with its motion-product association.")
+
+        plan = metadata.get("plan")
+        entries = metadata.get("scans")
+        if type(plan) is not dict or type(entries) is not list or not entries:
+            raise ValueError("Run alignment requires a resolved plan and scan records.")
+        if plan.get("requiresExplicitOutputGrid") is not False:
+            raise ValueError("This run-alignment contract supports independent matching-grid groups only.")
+
+        plannedMotion = plan.get("withinRunMotion", {})
+        if (
+            plannedMotion.get("productID") != motionID
+            or plannedMotion.get("producerActionID") != producerID
+        ):
+            raise ValueError("The alignment plan names a different input motion product.")
+
+        groups = plan.get("alignmentGroups")
+        if type(groups) is not list or not groups:
+            raise ValueError("Run alignment has no reference groups.")
+
+        def requireText(value, label):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{label} must be a nonblank string.")
+
+        def validateIdentity(identity):
+            if (
+                type(identity) is not dict
+                or not isinstance(identity.get("sha256"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", identity["sha256"]) is None
+                or type(identity.get("size_bytes")) is not int
+                or identity["size_bytes"] <= 0
+            ):
+                raise ValueError("Invalid recorded file identity.")
+
+        byIndex = {}
+        scanUUIDs = set()
+
+        for entry in entries:
+            if type(entry) is not dict:
+                raise ValueError("Invalid run-alignment scan record.")
+
+            index = entry.get("scanIndex")
+            if type(index) is not int or index < 0 or index in byIndex:
+                raise ValueError("Recorded scan indices must be unique nonnegative integers.")
+
+            scanUUID = entry.get("scanUUID")
+            requireText(scanUUID, "scanUUID")
+            if scanUUID in scanUUIDs:
+                raise ValueError("Run alignment contains repeated acquisition UUIDs.")
+            scanUUIDs.add(scanUUID)
+
+            requireText(entry.get("sourceStageID"), "sourceStageID")
+            validateIdentity(entry.get("sourceIdentity"))
+
+            volumes = entry.get("volumeIndices")
+            referenceVolume = entry.get("referenceVolumeIndex")
+            referenceRow = entry.get("referenceRow")
+            if (
+                type(volumes) is not list or not volumes
+                or any(type(value) is not int or value < 0 for value in volumes)
+                or len(set(volumes)) != len(volumes)
+                or type(referenceVolume) is not int or referenceVolume not in volumes
+                or type(referenceRow) is not int
+                or referenceRow != volumes.index(referenceVolume)
+            ):
+                raise ValueError("Invalid run-reference volume correspondence.")
+
+            if type(entry.get("isReference")) is not bool:
+                raise ValueError("isReference must be Boolean.")
+
+            byIndex[index] = entry
+
+        usedScans = set()
+        usedGroups = set()
+        usedRoles = set()
+
+        for group in groups:
+            if type(group) is not dict:
+                raise ValueError("Invalid alignment group.")
+
+            groupIndex = group.get("groupIndex")
+            members = group.get("scanIndices")
+            referenceIndex = group.get("referenceScanIndex")
+
+            if type(groupIndex) is not int or groupIndex < 0 or groupIndex in usedGroups:
+                raise ValueError("Alignment group indices must be unique nonnegative integers.")
+            usedGroups.add(groupIndex)
+
+            if (
+                type(members) is not list or not members
+                or any(type(index) is not int for index in members)
+                or len(set(members)) != len(members)
+                or any(index not in byIndex for index in members)
+                or usedScans.intersection(members)
+                or type(referenceIndex) is not int or referenceIndex not in members
+            ):
+                raise ValueError("Alignment groups have missing, repeated, or invalid scan references.")
+
+            usedScans.update(members)
+            reference = byIndex[referenceIndex]
+            if group.get("referenceScanUUID") != reference["scanUUID"]:
+                raise ValueError("Group reference UUID disagrees with its scan record.")
+
+            voxelTransforms = []
+
+            for index in members:
+                entry = byIndex[index]
+                isReference = index == referenceIndex
+
+                if (
+                    entry.get("groupIndex") != groupIndex
+                    or entry["isReference"] != isReference
+                    or entry.get("commonReferenceScanIndex") != referenceIndex
+                    or entry.get("commonReferenceScanUUID") != reference["scanUUID"]
+                    or entry.get("commonReferenceSourceStageID") != reference["sourceStageID"]
+                    or entry.get("commonReferenceVolumeIndex") != reference["referenceVolumeIndex"]
+                ):
+                    raise ValueError("Run alignment has inconsistent common-reference associations.")
+
+                voxel = cls._validateTransform(entry["voxelTransform"])
+                if (
+                    voxel["purpose"] != "sampling"
+                    or voxel["interpretationStatus"] != "validated"
+                    or voxel["domainFrame"]["representation"] != "voxelIndices"
+                    or voxel["codomainFrame"]["representation"] != "voxelIndices"
+                    or voxel["domainFrame"]["geometryID"] != reference["sourceStageID"]
+                    or voxel["codomainFrame"]["geometryID"] != entry["sourceStageID"]
+                ):
+                    raise ValueError("Run alignment has inconsistent voxel sampling frames.")
+
+                if isReference:
+                    if (
+                        entry.get("matricesRole") is not None
+                        or entry.get("motionParametersRole") is not None
+                        or entry.get("interpretation") is not None
+                        or not np.allclose(voxel["matrix"], np.eye(4), rtol=0, atol=1e-10)
+                    ):
+                        raise ValueError("The reference scan must have an explicit identity without fabricated native files.")
+
+                else:
+                    interpretation = entry.get("interpretation")
+                    if (
+                        type(interpretation) is not dict
+                        or interpretation.get("kind") != "AFNIRunReferenceAlignment"
+                        or interpretation.get("adapter") != "pgl.AFNI.3dvolreg.crossRunSharedGrid.v1"
+                        or interpretation.get("inputStageID") != entry["sourceStageID"]
+                        or interpretation.get("referenceStageID") != reference["sourceStageID"]
+                        or interpretation.get("inputVolume") != entry["referenceRow"]
+                        or interpretation.get("referenceVolume") != reference["referenceRow"]
+                    ):
+                        raise ValueError("Unsupported or inconsistent AFNI alignment interpretation.")
+
+                    if interpretation.get("voxelTransform") != entry["voxelTransform"]:
+                        raise ValueError("Duplicate voxel-transform records disagree.")
+
+                    native = cls._validateTransform(interpretation["nativeTransform"])
+                    if (
+                        native["purpose"] != "sampling"
+                        or native["interpretationStatus"] != "validated"
+                        or native["domainFrame"]["representation"] != "toolNominal"
+                        or native["codomainFrame"]["representation"] != "toolNominal"
+                    ):
+                        raise ValueError("Invalid native AFNI alignment convention.")
+
+                    expected = cls.convert(
+                        native,
+                        domainFrame=voxel["domainFrame"],
+                        codomainFrame=voxel["codomainFrame"],
+                    )
+                    if (
+                        voxel["inputTransformIDs"] != expected["inputTransformIDs"]
+                        or not np.allclose(voxel["matrix"], expected["matrix"], rtol=0, atol=1e-8)
+                    ):
+                        raise ValueError("Voxel alignment disagrees with the native matrix conversion.")
+
+                    for field in ("matricesRole", "motionParametersRole"):
+                        role = entry.get(field)
+                        requireText(role, field)
+                        if role in usedRoles:
+                            raise ValueError("Run-alignment artifact roles must be distinct.")
+                        usedRoles.add(role)
+
+                        artifact = artifacts.get(role)
+                        if type(artifact) is not dict:
+                            raise ValueError(f"Missing alignment artifact {role!r}.")
+                        requireText(artifact.get("attachmentName"), "attachmentName")
+                        validateIdentity(artifact)
+
+                voxelTransforms.append(voxel)
+
+            # Recompute patient-coordinate values and validate rigidity/common
+            # geometry. Never rely on a cached plotting summary.
+            cls.runAlignmentSummary(
+                voxelTransforms,
+                scanIndices=members,
+                referenceScanIndex=referenceIndex,
+            )
+
+        if usedScans != set(byIndex):
+            raise ValueError("Some alignment scan records are not assigned to a group.")
+
+        return metadata
     
+    ################################################################
+    # Display a recorded run-alignment product
+    ################################################################
+    @classmethod
+    def displayRunAlignmentProduct(cls, product, *, scanIndices=None, cacheDirectory=None):
+        """Return one alignment-summary figure per selected geometry group.
+
+        Uses the product's bound session and resolves current scan positions
+        by UUID, never by an obsolete recorded collection index.
+
+        scanIndices:
+            Optional current zero-based MRI indices selecting groups to show.
+            Each selected group is displayed in full, including its reference.
+
+        Verifies native matrix/parameter files before plotting.
+        Identity-reference records require no fabricated file.
+
+        Does not apply transforms, read voxel arrays, save figures, or call
+        plt.show(). Does not infer application status from file existence.
+
+        Invalid products/dependencies raise to product.display(), which warns.
+        Recoverable plotting failures are handled by displayRunAlignment().
+        """
+        from pathlib import Path
+
+        from .pglExternalTools import pglExternalTool
+
+        owner = product._requireOwner()
+        product._findProducingAction(owner)
+        record = product.record
+        metadata = cls.validateRunAlignmentProduct(record)
+
+        if getattr(owner, "mri", None) is None:
+            raise ValueError("The owning session has no MRI collection.")
+
+        scans = list(owner.mri.scans)
+        positions = {}
+        for index, scan in enumerate(scans):
+            positions.setdefault(scan.uuid, []).append(index)
+
+        entries = {entry["scanIndex"]: entry for entry in metadata["scans"]}
+        groups = metadata["plan"]["alignmentGroups"]
+
+        if scanIndices is not None:
+            if (
+                not isinstance(scanIndices, (list, tuple)) or not scanIndices
+                or any(type(index) is not int or not 0 <= index < len(scans) for index in scanIndices)
+                or len(set(scanIndices)) != len(scanIndices)
+            ):
+                raise ValueError("scanIndices must be unique current MRI indices.")
+
+            selectedUUIDs = {scans[index].uuid for index in scanIndices}
+            availableUUIDs = {entry["scanUUID"] for entry in entries.values()}
+            if selectedUUIDs - availableUUIDs:
+                raise ValueError("The alignment product does not cover every selected scan.")
+
+            groups = [
+                group for group in groups
+                if any(entries[index]["scanUUID"] in selectedUUIDs for index in group["scanIndices"])
+            ]
+
+        def artifactValues(role, columns):
+            artifact = record["artifacts"][role]
+            attachment = owner.derivedFiles.get(artifact["attachmentName"])
+            expected = {key: artifact[key] for key in ("sha256", "size_bytes")}
+
+            if attachment is None or any(attachment.get(key) != value for key, value in expected.items()):
+                raise ValueError(f"Alignment artifact {role!r} is unavailable or its identity changed.")
+
+            path = owner.getDerivedFile(artifact["attachmentName"], cacheDirectory=cacheDirectory)
+            if path is None: raise ValueError(f"Alignment artifact {role!r} could not be retrieved.")
+            path = Path(path)
+
+            if pglExternalTool._fileIdentity(path) != expected:
+                raise ValueError(f"Alignment artifact {role!r} failed byte verification.")
+
+            values = np.loadtxt(path, comments="#", ndmin=2)
+            if values.shape != (1, columns) or not np.isfinite(values).all():
+                raise ValueError(f"Invalid alignment artifact {role!r}.")
+            return values
+
+        prepared = []
+
+        # Resolve and validate all selected groups before creating figures.
+        for group in groups:
+            groupEntries = [entries[index] for index in group["scanIndices"]]
+            currentIndices = []
+
+            for entry in groupEntries:
+                matches = positions.get(entry["scanUUID"], [])
+                if len(matches) != 1:
+                    raise ValueError("An alignment scan is absent or ambiguous in the current session.")
+                currentIndices.append(matches[0])
+
+                if not entry["isReference"]:
+                    rows = artifactValues(entry["matricesRole"], 12)
+                    artifactValues(entry["motionParametersRole"], 6)
+                    native = np.asarray(entry["interpretation"]["nativeTransform"]["matrix"])
+                    if not np.allclose(rows.reshape(3, 4), native[:3], rtol=0, atol=1e-10):
+                        raise ValueError("Native alignment file disagrees with the interpreted matrix.")
+
+            referenceUUID = entries[group["referenceScanIndex"]]["scanUUID"]
+            referenceIndex = positions[referenceUUID][0]
+            transforms = [entry["voxelTransform"] for entry in groupEntries]
+            names = [scans[index].name for index in currentIndices]
+
+            cls.runAlignmentSummary(
+                transforms,
+                scanIndices=currentIndices,
+                referenceScanIndex=referenceIndex,
+                scanNames=names,
+            )
+            prepared.append((group, transforms, currentIndices, referenceIndex, names))
+
+        figures = []
+        for group, transforms, indices, referenceIndex, names in prepared:
+            figure = cls.displayRunAlignment(
+                transforms,
+                scanIndices=indices,
+                referenceScanIndex=referenceIndex,
+                scanNames=names,
+                groupLabel=f"Geometry group {group['groupIndex']}",
+                applicationMessage=(
+                    "Alignment estimates shown. Estimation did not modify images; "
+                    "later application status is not yet resolved by this display."
+                ),
+            )
+            if figure is not None: figures.append(figure)
+
+        return figures
+    
+    ################################################################
+    # Compose recorded within-run motion and between-run alignment
+    ################################################################
+    @classmethod
+    def composeRunMotion(cls, motionProduct, alignmentProduct):
+        """Prepare composite sampling maps from explicitly matched products.
+
+        Both arguments are product-record dictionaries.
+
+        Verifies:
+            Exact input motion product and producing execution.
+            Scan UUID, source stage, content identity, and volume correspondence.
+            Recorded within-run and common-reference volumes.
+            Compatible endpoint geometry and sampling conventions.
+
+        Initial support:
+            Within-run rigid motion plus fixed shared-grid run alignment.
+            Each output retains its own acquisition grid.
+            Grids may differ only by small numerical geometry roundoff.
+
+        Sampling order:
+            Original output-grid voxel
+                -> common reference voxel
+                -> this run's reference voxel
+                -> this run's original input voxel.
+
+        For exactly matching grids:
+            composite = withinRun @ runAlignment
+
+        Explicit coordinate bridges connect separately recorded descriptions
+        of the same source grid. They do not estimate another registration.
+
+        Returns a portable application plan. All intermediate transforms
+        referenced by generated lineage are retained in derivedTransforms.
+        Original transforms remain in the explicitly linked input products.
+
+        Does not read files, resample images, publish products, or modify
+        history. The application action must still verify native artifacts
+        and source bytes before using this plan.
+
+        Staged records are permitted for immediate application within their
+        producing action. This helper does not commit an action's products.
+        """
+        from copy import deepcopy
+
+        from .pglExternalTools import _copyProvenance
+
+        motionProduct = _copyProvenance(motionProduct)
+        alignmentProduct = _copyProvenance(alignmentProduct)
+
+        motionByScan = cls.validateMotionProduct(motionProduct)
+        if motionProduct["metadata"]["schemaVersion"] != 2:
+            raise ValueError("Composition requires interpreted version-2 motion.")
+
+        alignment = cls.validateRunAlignmentProduct(alignmentProduct)
+
+        for record, label in (
+            (motionProduct, "motion"),
+            (alignmentProduct, "run alignment"),
+        ):
+            cls._text(record.get("productID"), f"{label} productID")
+            cls._text(record.get("producerActionID"), f"{label} producerActionID")
+
+        if (
+            alignment["withinRunMotionProductID"] != motionProduct["productID"]
+            or alignment["withinRunMotionProducerActionID"] != motionProduct["producerActionID"]
+        ):
+            raise ValueError(
+                "Run alignment was not estimated from this exact motion product "
+                "and producing execution. Supply the recorded input product."
+            )
+
+        entries = alignment["scans"]
+        alignmentByScan = {entry["scanUUID"]: entry for entry in entries}
+        geometryToleranceMM = 0.001
+
+        def requireMatchingGrid(left, right):
+            """Check grid locations without changing either recorded geometry."""
+            if left["spatialShape"] != right["spatialShape"]:
+                raise ValueError("Composite application requires matching spatial dimensions.")
+
+            shape = left["spatialShape"]
+            corners = np.array([
+                [x, y, z, 1.0]
+                for x in (0, shape[0] - 1)
+                for y in (0, shape[1] - 1)
+                for z in (0, shape[2] - 1)
+            ]).T
+            difference = (
+                np.asarray(left["voxelToPhysicalMM"], dtype=float)
+                - np.asarray(right["voxelToPhysicalMM"], dtype=float)
+            )
+            error = float(np.linalg.norm((difference @ corners)[:3], axis=0).max())
+
+            if error > geometryToleranceMM:
+                raise ValueError(
+                    f"Acquisition grids differ by up to {error:.6g} mm. "
+                    "Cross-grid application is not supported by this adapter."
+                )
+
+        def sameSourceBridge(sourceFrame, targetFrame):
+            """Connect coordinate descriptions of the same identified source.
+
+            The source-stage identity and physical geometry must agree.
+            Different physicalSpaceID labels are permitted only here, where
+            the product associations establish that both describe the same
+            acquisition/source stage.
+            """
+            sourceFrame = cls._validateFrame(sourceFrame)
+            targetFrame = cls._validateFrame(targetFrame)
+
+            if sourceFrame["geometryID"] != targetFrame["geometryID"]:
+                raise ValueError("A same-source bridge requires matching geometry IDs.")
+
+            if sourceFrame["spatialShape"] != targetFrame["spatialShape"]:
+                raise ValueError("Conflicting dimensions for the same source stage.")
+
+            if not np.allclose(
+                sourceFrame["voxelToPhysicalMM"],
+                targetFrame["voxelToPhysicalMM"],
+                rtol=0,
+                atol=1e-8,
+            ):
+                raise ValueError("Conflicting physical geometry for the same source stage.")
+
+            matrix = (
+                np.asarray(targetFrame["voxelToFrame"], dtype=float)
+                @ np.linalg.inv(np.asarray(sourceFrame["voxelToFrame"], dtype=float))
+            )
+            return cls.makeTransform(
+                matrix,
+                domainFrame=sourceFrame,
+                codomainFrame=targetFrame,
+                purpose="sampling",
+                interpretationStatus="validated",
+                adapter="pgl.sameSourceCoordinateBridge.v1",
+            )
+
+        # Verify all scientific associations before constructing the plan.
+        for entry in entries:
+            scanUUID = entry["scanUUID"]
+            motion = motionByScan.get(scanUUID)
+
+            if motion is None:
+                raise ValueError(f"Motion product does not cover alignment scan {scanUUID!r}.")
+
+            for field in (
+                "sourceStageID", "sourceIdentity",
+                "volumeIndices", "referenceVolumeIndex",
+            ):
+                if entry[field] != motion[field]:
+                    raise ValueError(f"Run alignment disagrees with within-run motion: {field}.")
+
+            expectedRow = motion["volumeIndices"].index(motion["referenceVolumeIndex"])
+            if entry["referenceRow"] != expectedRow:
+                raise ValueError("Run-alignment reference row disagrees with motion volume ordering.")
+
+            referenceUUID = entry["commonReferenceScanUUID"]
+            referenceMotion = motionByScan.get(referenceUUID)
+            referenceAlignment = alignmentByScan.get(referenceUUID)
+
+            if referenceMotion is None or referenceAlignment is None:
+                raise ValueError("The common reference is missing from the input products.")
+
+            if (
+                not referenceAlignment["isReference"]
+                or referenceAlignment["groupIndex"] != entry["groupIndex"]
+            ):
+                raise ValueError("The common reference is not this group's identity-reference record.")
+
+            if (
+                entry["commonReferenceSourceStageID"] != referenceMotion["sourceStageID"]
+                or entry["commonReferenceVolumeIndex"] != referenceMotion["referenceVolumeIndex"]
+            ):
+                raise ValueError("The common reference stage/volume disagrees with within-run motion.")
+
+        results = []
+
+        for entry in entries:
+            scanUUID = entry["scanUUID"]
+            motion = motionByScan[scanUUID]
+            interpretation = motion["interpretation"]
+
+            withinFrame = cls._validateFrame(interpretation["voxelFrame"])
+            runTransform = cls._validateTransform(entry["voxelTransform"])
+            commonFrame = runTransform["domainFrame"]
+            runFrame = runTransform["codomainFrame"]
+            referenceMotion = motionByScan[entry["commonReferenceScanUUID"]]
+            referenceWithinFrame = cls._validateFrame(
+                referenceMotion["interpretation"]["voxelFrame"]
+            )
+
+            if any(
+                frame["representation"] != "voxelIndices"
+                for frame in (withinFrame, runFrame, commonFrame, referenceWithinFrame)
+            ):
+                raise ValueError("Composite application requires interpreted voxel sampling maps.")
+
+            if (
+                runFrame["geometryID"] != motion["sourceStageID"]
+                or commonFrame["geometryID"] != referenceMotion["sourceStageID"]
+            ):
+                raise ValueError("Run-alignment endpoint stages disagree with the motion product.")
+
+            # Verify both representations of the common reference describe
+            # the exact same source geometry, even though their space labels
+            # were assigned by different producing executions.
+            if (
+                commonFrame["spatialShape"] != referenceWithinFrame["spatialShape"]
+                or not np.allclose(
+                    commonFrame["voxelToPhysicalMM"],
+                    referenceWithinFrame["voxelToPhysicalMM"],
+                    rtol=0,
+                    atol=1e-8,
+                )
+            ):
+                raise ValueError("Common-reference geometry differs between the input products.")
+
+            requireMatchingGrid(commonFrame, runFrame)
+
+            # The output remains this run's own acquisition grid. Give its
+            # group-coordinate description an explicit frame definition.
+            outputFrame = cls.makeFrame(
+                geometryID=withinFrame["geometryID"],
+                physicalSpaceID=commonFrame["physicalSpaceID"],
+                spatialShape=withinFrame["spatialShape"],
+                voxelToPhysicalMM=withinFrame["voxelToPhysicalMM"],
+                representation="voxelIndices",
+            )
+            requireMatchingGrid(outputFrame, commonFrame)
+
+            originalToOutput = sameSourceBridge(withinFrame, outputFrame)
+            runToWithin = sameSourceBridge(runFrame, withinFrame)
+
+            # Preserve tiny grid differences explicitly instead of replacing
+            # an acquisition header or silently assuming identical coordinates.
+            outputToCommon = cls.makeTransform(
+                np.linalg.inv(np.asarray(commonFrame["voxelToPhysicalMM"], dtype=float))
+                @ np.asarray(outputFrame["voxelToPhysicalMM"], dtype=float),
+                domainFrame=outputFrame,
+                codomainFrame=commonFrame,
+                purpose="sampling",
+                interpretationStatus="validated",
+                adapter="pgl.sharedAcquisitionGridBridge.v1",
+            )
+
+            # compose(first, second) applies first THEN second.
+            originalToCommon = cls.compose(originalToOutput, outputToCommon)
+            originalToRun = cls.compose(originalToCommon, runTransform)
+            originalToWithin = cls.compose(originalToRun, runToWithin)
+
+            derivedTransforms = [
+                originalToOutput,
+                outputToCommon,
+                runToWithin,
+                originalToCommon,
+                originalToRun,
+                originalToWithin,
+            ]
+            composites = []
+
+            for rowIndex, withinTransform in enumerate(interpretation["voxelTransforms"]):
+                withinTransform = cls._validateTransform(withinTransform)
+                final = cls.compose(originalToWithin, withinTransform)
+
+                if (
+                    final["domainFrame"] != withinFrame
+                    or final["codomainFrame"] != withinFrame
+                ):
+                    raise ValueError("Composite endpoints do not describe the original acquisition grid.")
+
+                derivedTransforms.append(final)
+                composites.append({
+                    "rowIndex": rowIndex,
+                    "originalVolumeIndex": motion["volumeIndices"][rowIndex],
+                    "withinRunTransformID": withinTransform["transformID"],
+                    "runAlignmentTransformID": runTransform["transformID"],
+                    "transform": final,
+                })
+
+            # Every generated lineage reference must resolve either to another
+            # retained derived transform or to an explicit input transform.
+            inputTransformIDs = {
+                runTransform["transformID"],
+                *(
+                    transform["transformID"]
+                    for transform in interpretation["voxelTransforms"]
+                ),
+            }
+            generatedIDs = [transform["transformID"] for transform in derivedTransforms]
+
+            if len(set(generatedIDs)) != len(generatedIDs):
+                raise ValueError("Generated transform identities are not unique.")
+
+            knownIDs = inputTransformIDs | set(generatedIDs)
+            for transform in derivedTransforms:
+                if set(transform["inputTransformIDs"]) - knownIDs:
+                    raise ValueError("Composite lineage refers to a missing transform.")
+
+            results.append({
+                "scanUUID": scanUUID,
+                "recordedScanIndex": entry["scanIndex"],
+                "groupIndex": entry["groupIndex"],
+                "sourceStageID": motion["sourceStageID"],
+                "sourceIdentity": deepcopy(motion["sourceIdentity"]),
+                "volumeIndices": list(motion["volumeIndices"]),
+                "withinRunReferenceVolumeIndex": motion["referenceVolumeIndex"],
+                "commonReferenceScanUUID": entry["commonReferenceScanUUID"],
+                "commonReferenceVolumeIndex": entry["commonReferenceVolumeIndex"],
+                "outputFrame": withinFrame,
+                "inputTransformIDs": sorted(inputTransformIDs),
+                "runAlignmentTransform": runTransform,
+                "derivedTransforms": derivedTransforms,
+                "composites": composites,
+            })
+
+        return {
+            "schemaVersion": 1,
+            "kind": "withinAndBetweenRunMotionApplicationPlan",
+            "motionProductID": motionProduct["productID"],
+            "motionProducerActionID": motionProduct["producerActionID"],
+            "alignmentProductID": alignmentProduct["productID"],
+            "alignmentProducerActionID": alignmentProduct["producerActionID"],
+            "gridToleranceMM": geometryToleranceMM,
+            "outputGrid": "eachOriginalAcquisition",
+            "scans": results,
+            "description": (
+                "For each voxel on a run's original acquisition grid, locate "
+                "the corresponding common-reference position, then the run's "
+                "reference position, then the original input-volume sampling "
+                "position. Apply this composite once to the original source. "
+                "No already-corrected image is used as input."
+            ),
+        }
