@@ -527,9 +527,6 @@ class pglActions():
     ################################################################
     # Load a deferred Flywheel MRI session
     ################################################################
-    ################################################################
-    # Load a deferred Flywheel MRI session
-    ################################################################
     class loadFlywheel(pglAction):
         """Choose Flywheel MRI files using a saved import-settings profile.
 
@@ -538,9 +535,11 @@ class pglActions():
         Execution attaches source references without downloading NIfTI files.
 
         Use saveRawSession() later to stream acquisition bytes into storage.
-        This ingestion action returns a new session rather than modifying
-        a supplied session.
-
+        
+        Execution creates a new session or attaches MRI data to a supplied
+        session without replacing its existing contents. Existing MRI data
+        causes the action to fail rather than overwrite or merge it.
+        
         History stores the settings name, pinned metadata, and labels.
         It never stores credentials, the SDK client, or caller-local cache
         configuration. Source metadata may identify subjects.
@@ -671,14 +670,21 @@ class pglActions():
             self._cacheDirectory = cachePath
             super().configure()
 
-        def _run(self, *, flywheel=None, cacheDirectory=None):
-            """Return a new session with pinned, unopened MRI sources.
+        def _run(self, session=None, *, flywheel=None, cacheDirectory=None):
+            """Attach pinned, unopened MRI sources to a new or existing session.
+
+            None session creates a new session with the configured labels.
+            An existing session retains its labels and all other contents.
+            Existing MRI data is never silently replaced or merged.
 
             Runtime overrides allow execution of a restored/copied action
             without repeating interactive selection or repinning files.
 
             No SDK requests occur here. Actual source availability and hash
             verification are checked when payloads are subsequently read.
+
+            Attaching to an existing session does not establish temporal
+            alignment between MRI scans and behavioral runs.
             """
             import os
             from pathlib import Path
@@ -686,6 +692,15 @@ class pglActions():
             from .pglFlywheel import pglFlywheel, pglFlywheelMRIBacking
             from .pglMRI import pglMRI, pglMRIScan
             from .pglSession import pglSession
+
+            if session is not None:
+                if not isinstance(session, pglSession):
+                    self.setError("session must be a pglSession or None.")
+                    return None
+
+                if session.mri is not None:
+                    self.setError("The supplied session already has MRI data. loadFlywheel will not overwrite or merge it.")
+                    return None
 
             # Use the configured runtime client unless explicitly overridden.
             client = self._client
@@ -698,24 +713,14 @@ class pglActions():
             # Restored/copied actions must receive runtime access explicitly.
             # The recorded settings name does not trigger an automatic login.
             if client is None:
-                self.setError(
-                    "Flywheel runtime access is missing. Create a connection "
-                    "with pglFlywheel(settingsName=action.settingsName), then use "
-                    "action.run(flywheel=connection, cacheDirectory=...)."
-                )
+                self.setError("Flywheel runtime access is missing. Create a connection with pglFlywheel(settingsName=action.settingsName), then use action.run(session=session, flywheel=connection, cacheDirectory=...).")
                 return None
 
             try:
                 # Resolve and validate the runtime cache path without creating it.
                 cacheValue = self._cacheDirectory if cacheDirectory is None else cacheDirectory
                 cacheText = os.fspath(cacheValue)
-                if (
-                    not isinstance(cacheText, str)
-                    or not cacheText.strip()
-                    or "://" in cacheText
-                    or "::" in cacheText
-                    or any(character in cacheText for character in ("\x00", "\n", "\r"))
-                ):
+                if not isinstance(cacheText, str) or not cacheText.strip() or "://" in cacheText or "::" in cacheText or any(character in cacheText for character in ("\x00", "\n", "\r")):
                     raise ValueError("A local cacheDirectory is required.")
 
                 cachePath = str(Path(cacheText).expanduser().absolute())
@@ -744,14 +749,7 @@ class pglActions():
 
                     # Reconstruct the recorded source version without requesting
                     # metadata again or downloading any NIfTI payload.
-                    backing = pglFlywheelMRIBacking(
-                        client,
-                        selection["acquisitionID"],
-                        selection["fileName"],
-                        version=fileMetadata["version"],
-                        sizeBytes=fileMetadata["size"],
-                        sourceHash=fileMetadata["hash"],
-                    )
+                    backing = pglFlywheelMRIBacking(client, selection["acquisitionID"], selection["fileName"], version=fileMetadata["version"], sizeBytes=fileMetadata["size"], sourceHash=fileMetadata["hash"])
 
                     scan = pglMRIScan(name=record["name"], sourceMetadata=provenance)
                     if scan.attachBacking(backing, cacheDirectory=cachePath) is None:
@@ -762,17 +760,31 @@ class pglActions():
                 if len(sessionKeys) != 1:
                     raise ValueError("Configured scans must belong to one Flywheel session.")
 
+                # Prepare the complete MRI collection before changing a supplied session.
+                mri = pglMRI()
+                mri.scans = scans
+
                 # Create a new acquisition session with the configured labels.
-                session = pglSession()
-                session.experimentName = self.experimentName
-                session.subjectID = self.subjectID
+                # Existing session labels remain authoritative, including labels
+                # derived from behavioral runs.
+                creatingSession = session is None
+                if creatingSession:
+                    session = pglSession()
+                    session.experimentName = self.experimentName
+                    session.subjectID = self.subjectID
 
             except (TypeError, ValueError, KeyError) as error:
                 self.setError(f"Flywheel session was not loaded: {error}")
                 return None
 
-            # Attach the deferred MRI collection and return the new session.
-            mri = pglMRI()
-            mri.scans = scans
+            projectID, flywheelSessionID = next(iter(sessionKeys))
+            destination = "a new session" if creatingSession else "the existing session"
+            pglMessages.message(f"Attaching {len(scans)} deferred MRI scan(s) from Flywheel project {projectID!r}, session {flywheelSessionID!r}, to {destination}.")
+
+            if not creatingSession:
+                pglMessages.message(f"Preserving {len(session.runs or [])} behavioral run(s), existing labels, and other session contents. Scan-to-run alignment is not performed.")
+
+            # Attach the deferred MRI collection and return the same supplied
+            # session, or the new session created above.
             session.add(mri)
             return session
