@@ -632,11 +632,19 @@ class _pglTraitsDialog(QDialog):
         buttonRow = QWidget()
         buttonLayout = QHBoxLayout(buttonRow)
         buttonLayout.setContentsMargins(0, 0, 0, 0)
-        
-        selectAllButton = QPushButton("select all")
+
+
         def onSelectAll():
+            # Match exact names using the list's display-key trait.
+            ignoreNames = trait.metadata.get("selectAllIgnoreNames", [])
+            if not isinstance(ignoreNames, (list, tuple)) or not all(isinstance(name, str) for name in ignoreNames):
+                raise ValueError(f"{traitName}: selectAllIgnoreNames must be a list or tuple of strings.")
+            ignoreNames = set(ignoreNames)
+
+            # Use the current list after retargeting and clear ignored selections.
             for obj in state["list"]:
-                obj.isSelected = True
+                obj.isSelected = str(getattr(obj, keyTraitName)) not in ignoreNames        
+        selectAllButton = QPushButton("select all")
         selectAllButton.clicked.connect(onSelectAll)
 
         selectNoneButton = QPushButton("select none")

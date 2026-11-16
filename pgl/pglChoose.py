@@ -307,20 +307,10 @@ class pglChooseSession(pglChooseLevel):
     Directory containing run directories.
     """
 
-    childList = List(
-        Instance(pglTraitSettings),
-        settingsListKey="name",
-        traitDisplayName="Select run(s)",
-        multiSelect=True,
-        maxRowsVisible=6,
-        hasPlotButton=True,
-        buttonFunction="display",
-        help="Runs in session directory",
-    )
+    childList = List(Instance(pglTraitSettings), settingsListKey="name", traitDisplayName="Select run(s)", multiSelect=True, maxRowsVisible=6, hasPlotButton=True, buttonFunction="display", selectAllIgnoreNames=["trash"], help="Runs in session directory")
 
     entryType = "directory"
     childClass = pglChooseRun
-
 
 class pglChooseSubject(pglChooseLevel):
     """
@@ -389,7 +379,7 @@ def makeRecordingChooser(formatName, entryType, namePattern, requiredFiles=()):
         "__module__": __name__,
         "entryType": "directory",
         "childClass": recordingClass,
-        "childList": List(Instance(pglTraitSettings), settingsListKey="name", traitDisplayName=f"Select {formatName} run(s)", multiSelect=True, maxRowsVisible=6, help=f"{formatName} recordings in session directory"),
+        "childList": List(Instance(pglTraitSettings), settingsListKey="name", traitDisplayName=f"Select {formatName} run(s)", multiSelect=True, maxRowsVisible=6, selectAllIgnoreNames=["trash"], help=f"{formatName} recordings in session directory"),
     })
 
     # Subject-ID conventions warn at assignment; discovery must not reject them.
