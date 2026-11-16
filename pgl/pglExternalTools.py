@@ -376,6 +376,173 @@ class pglExecutionRecorder:
     def exportInvocations(self): return deepcopy(self._invocations)
     
     ################################################################
+    # Register a named scientific output
+    ################################################################
+    def registerProduct(self, name, kind, *, artifacts=None, inputProductIDs=None, metadata=None, invocationIDs=None):
+        """Record a named product produced by this execution.
+
+        Does not copy files, attach payloads, or establish scientific validity.
+
+        artifacts:
+            Named references to files already attached to the working session.
+            Each entry contains attachmentName, sha256, and size_bytes.
+
+        inputProductIDs:
+            Exact upstream product identities consumed to produce this product.
+
+        metadata:
+            Portable scientific associations such as scan UUIDs, original
+            volume indices, reference identities, and transform conventions.
+
+        invocationIDs:
+            Producing tool invocations from this recorder. None selects all
+            successful invocations recorded so far. Supply an explicit list
+            when a product uses only a subset.
+
+        Returns an independent product record with automatically assigned
+        product and producer IDs.
+
+        Action completion determines whether the recorded product is committed
+        or uncommitted. A successful subprocess alone does not commit a product.
+        """
+        import re
+
+        self._requireOpen()
+
+        if self._actionID is None:
+            raise ValueError("Scientific product registration requires an action execution.")
+
+        for fieldName, value in (("name", name), ("kind", kind)):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"Product {fieldName} must be a nonblank string.")
+            if any(character in value for character in ("\x00", "\n", "\r")):
+                raise ValueError(f"Product {fieldName} must not contain NUL or newlines.")
+
+        products = getattr(self, "_products", [])
+        if any(record["name"] == name for record in products):
+            raise ValueError(f"This execution already registered product {name!r}.")
+
+        artifacts = {} if artifacts is None else _copyProvenance(artifacts)
+        metadata = {} if metadata is None else _copyProvenance(metadata)
+        inputProductIDs = [] if inputProductIDs is None else _copyProvenance(inputProductIDs)
+
+        if type(artifacts) is not dict or type(metadata) is not dict:
+            raise TypeError("artifacts and metadata must be dictionaries.")
+        if type(inputProductIDs) is not list:
+            raise TypeError("inputProductIDs must be a list.")
+
+        for identifier in inputProductIDs:
+            if not isinstance(identifier, str) or not identifier.strip():
+                raise ValueError("Input product identities must be nonblank strings.")
+        if len(set(inputProductIDs)) != len(inputProductIDs):
+            raise ValueError("Input product identities must not contain duplicates.")
+
+        for role, artifact in artifacts.items():
+            if not role.strip(): raise ValueError("Artifact roles must not be blank.")
+            if type(artifact) is not dict or set(artifact) != {"attachmentName", "sha256", "size_bytes"}:
+                raise ValueError("Artifact references require attachmentName, sha256, and size_bytes.")
+
+            attachmentName = artifact["attachmentName"]
+            if not isinstance(attachmentName, str) or not attachmentName.strip():
+                raise ValueError("Artifact attachmentName must be nonblank.")
+            if not isinstance(artifact["sha256"], str) or re.fullmatch(r"[0-9a-f]{64}", artifact["sha256"]) is None:
+                raise ValueError("Artifact identity requires a lowercase SHA-256.")
+            if type(artifact["size_bytes"]) is not int or artifact["size_bytes"] < 0:
+                raise ValueError("Artifact size_bytes must be a nonnegative integer.")
+
+        successfulInvocations = {
+            record["invocationID"]
+            for record in self._invocations
+            if record["status"] == "success"
+        }
+
+        if invocationIDs is None:
+            invocationIDs = [
+                record["invocationID"]
+                for record in self._invocations
+                if record["status"] == "success"
+            ]
+        else:
+            invocationIDs = _copyProvenance(invocationIDs)
+            if type(invocationIDs) is not list:
+                raise TypeError("invocationIDs must be a list or None.")
+            if any(not isinstance(identifier, str) for identifier in invocationIDs):
+                raise ValueError("Invocation identities must be strings.")
+            if len(set(invocationIDs)) != len(invocationIDs):
+                raise ValueError("Invocation identities must not contain duplicates.")
+            if set(invocationIDs) - successfulInvocations:
+                raise ValueError("Producing invocations must be successful calls from this execution.")
+
+        record = {
+            "schemaVersion": 1,
+            "productID": str(uuid4()),
+            "name": name,
+            "kind": kind,
+            "producerActionID": self._actionID,
+            "producerInvocationIDs": list(invocationIDs),
+            "inputProductIDs": inputProductIDs,
+            "artifacts": artifacts,
+            "metadata": metadata,
+        }
+
+        self._products = [*products, record]
+        return deepcopy(record)
+
+    ################################################################
+    # Export product metadata independently of payloads
+    ################################################################
+    def exportProducts(self):
+        """Return independent product records, including before finalization."""
+        return deepcopy(getattr(self, "_products", []))
+    
+    ################################################################
+    # Record an explicitly resolved scientific dependency
+    ################################################################
+    def recordProductInput(self, selector, product):
+        """Record exact product metadata consumed through an explicit selector.
+
+        Called by selector resolution, not manually by each scientific action.
+        Copies metadata so later caller edits cannot change provenance.
+
+        Does not read or verify payload bytes. Artifact access must still use
+        the recorded identities and the storage verification interface.
+        """
+        self._requireOpen()
+        if self._actionID is None:
+            raise ValueError("Product consumption recording requires an action execution.")
+
+        selector = _copyProvenance(selector)
+        product = _copyProvenance(product)
+
+        if type(selector) is not dict or type(product) is not dict:
+            raise TypeError("Product selection and record must be dictionaries.")
+        if product.get("recordStatus") != "committed":
+            raise ValueError("Only committed products can be consumed.")
+
+        for field in ("productID", "producerActionID", "name", "kind"):
+            if not isinstance(product.get(field), str) or not product[field].strip():
+                raise ValueError(f"Consumed product has no usable {field}.")
+
+        record = {
+            "schemaVersion": 1,
+            "selector": selector,
+            "product": product,
+        }
+        inputs = getattr(self, "_productInputs", [])
+
+        # Repeated use of the same selector/product is one declared dependency.
+        # Different selectors resolving to the same product remain explicit.
+        if record not in inputs:
+            self._productInputs = [*inputs, record]
+
+    ################################################################
+    # Export resolved product dependencies
+    ################################################################
+    def exportProductInputs(self):
+        """Return independent input records without reading payloads."""
+        return deepcopy(getattr(self, "_productInputs", []))
+    
+################################################################
 # External-tool execution result
 ################################################################
 class pglToolResult:
@@ -420,6 +587,12 @@ class pglToolResult:
             target.write(content)
 
         return path
+    
+    @property
+    def outputs(self):
+        """Return independent declared output records, or an empty dictionary."""
+        invocation = self._provenance.get("invocation", {})
+        return deepcopy(invocation.get("result", {}).get("outputs", {}))
 
 
 ################################################################
@@ -1545,6 +1718,531 @@ Installation documentation:
         except Exception as error:
             pglMessages.warning(f"AFNI installation did not advance: {type(error).__name__}: {error}")
             return None
+        
+    ################################################################
+    # Estimate and interpret within-run rigid motion
+    ################################################################
+    def volreg(self, inputImage, *, referenceVolume=0, twoPass=True, cacheDirectory=None, timeout=None, sourceStageID=None, physicalSpaceID=None):
+        """Estimate within-run motion and interpret its native AFNI matrices.
+
+        Uses the existing _volreg() execution engine, then reads AFNI geometry
+        attributes and converts matrices to explicit voxel sampling maps.
+
+        referenceVolume is a zero-based index in the supplied image.
+        This wrapper processes all supplied volumes in their existing order.
+
+        Initial interpretation support:
+            4D NIfTI, millimeter spatial units, coded qform.
+            Any coded sform must agree with the qform.
+            Reference and input share the same image grid.
+
+        sourceStageID:
+            Explicit image-stage identity supplied by a scientific action.
+            None uses a content-based identity for standalone execution.
+
+        physicalSpaceID:
+            Explicit physical reference identity. None uses a source-specific
+            identity rather than assuming unrelated scans share a frame.
+
+        Always estimates with -prefix NULL. No corrected image is generated.
+
+        Returns pglToolResult with native outputs and interpreted transforms
+        under provenance["invocation"]["result"]["interpretation"].
+
+        Freeform failures warn and return None. Within an action, failures
+        propagate internally so scientific execution stops immediately.
+        """
+        from contextlib import nullcontext
+        from pathlib import Path
+
+        import nibabel as nib
+        import numpy as np
+
+        from .pglMessages import pglMessages
+        from .pglMRI import pglMRITransforms
+
+        self.lastResult = None
+        recorder = getExecutionRecorder()
+        standalone = recorder is None
+        if standalone: recorder = pglExecutionRecorder()
+
+        context = recorder.activate() if standalone else nullcontext()
+
+        try:
+            with context:
+                source = Path(inputImage).expanduser().resolve()
+                parameters = {
+                    "referenceVolume": referenceVolume,
+                    "twoPass": twoPass,
+                    "timeout": timeout,
+                    "sourceStageID": sourceStageID,
+                    "physicalSpaceID": physicalSpaceID,
+                }
+                invocationID = recorder.beginInvocation({
+                    "operation": "interpretedWithinRunMotion",
+                    "adapter": "pgl.AFNI.3dvolreg.sharedGrid.v1",
+                    "inputPath": str(source),
+                    "parameters": parameters,
+                })
+                result = pglToolResult(invocationID)
+                details = {"outputs": {}, "interpretation": None}
+                errorRaised = None
+                errorRecord = None
+                previousIDs = {
+                    record["invocationID"] for record in recorder.exportInvocations()
+                }
+
+                try:
+                    identity = self._fileIdentity(source)
+                    image = nib.load(source)
+
+                    if not isinstance(image, (nib.Nifti1Image, nib.Nifti2Image)):
+                        raise TypeError("Expected a single-file NIfTI image.")
+                    if len(image.shape) != 4 or image.shape[3] < 2:
+                        raise ValueError("Within-run motion requires at least two volumes.")
+                    if image.header.get_xyzt_units()[0] != "mm":
+                        raise ValueError("This initial AFNI interpretation adapter requires millimeter spatial units.")
+
+                    qform, qcode = image.get_qform(coded=True)
+                    sform, scode = image.get_sform(coded=True)
+                    if qform is None:
+                        raise ValueError("A coded acquisition qform is required.")
+
+                    if sform is not None:
+                        corners = np.array([
+                            [x, y, z, 1.0]
+                            for x in (0, image.shape[0] - 1)
+                            for y in (0, image.shape[1] - 1)
+                            for z in (0, image.shape[2] - 1)
+                        ]).T
+                        difference = np.linalg.norm(((sform - qform) @ corners)[:3], axis=0).max()
+                        if difference > 0.001:
+                            raise ValueError("Coded qform and sform describe conflicting image geometry.")
+
+                    stageID = sourceStageID or f"image:{identity['sha256']}"
+                    spaceID = physicalSpaceID or f"sourcePhysical:{identity['sha256']}"
+                    details["sourceIdentity"] = identity
+                    details["sourceStageID"] = stageID
+
+                    native = self._volreg(
+                        source,
+                        referenceVolume=referenceVolume,
+                        twoPass=twoPass,
+                        cacheDirectory=cacheDirectory,
+                        timeout=timeout,
+                    )
+                    result.returnCode = native.returnCode
+                    result.logDirectory = native.logDirectory
+                    result.stdoutPath = native.stdoutPath
+                    result.stderrPath = native.stderrPath
+
+                    nativeDetails = native.provenance["invocation"]["result"]
+                    executableDirectory = Path(nativeDetails["executableDirectory"])
+                    attributes = {}
+
+                    # Query the same installation used for estimation.
+                    for name, count in (
+                        ("ORIENT_SPECIFIC", 3),
+                        ("DELTA", 3),
+                        ("ORIGIN", 3),
+                        ("IJK_TO_DICOM_REAL", 12),
+                    ):
+                        query = self._runCommand(
+                            executableDirectory / "3dAttribute",
+                            arguments=[name, str(source)],
+                            timeout=15,
+                            cacheDirectory=result.logDirectory,
+                        )
+                        text = query.stdoutPath.read_text(encoding="utf-8", errors="replace")
+                        values = np.array([float(value) for value in text.split()])
+                        if values.shape != (count,) or not np.isfinite(values).all():
+                            raise ValueError(f"Unexpected AFNI attribute {name}.")
+                        attributes[name] = values.tolist()
+
+                    rows = np.loadtxt(
+                        native.outputs["matrices"]["localPath"],
+                        comments="#",
+                        ndmin=2,
+                    )
+                    interpretation = pglMRITransforms.interpretAFNIVolreg(
+                        rows,
+                        attributes=attributes,
+                        geometryID=stageID,
+                        physicalSpaceID=spaceID,
+                        spatialShape=list(image.shape[:3]),
+                        voxelToPhysicalMM=qform,
+                        volumeIndices=list(range(image.shape[3])),
+                        referenceVolumeIndex=referenceVolume,
+                        afniVersion=nativeDetails["reportedVersion"],
+                    )
+
+                    if self._fileIdentity(source) != identity:
+                        raise ValueError("Source bytes changed during motion estimation/interpretation.")
+
+                    details.update({
+                        "outputs": native.outputs,
+                        "interpretation": interpretation,
+                        "reportedVersion": nativeDetails["reportedVersion"],
+                        "executableDirectory": str(executableDirectory),
+                        "sourceUnchanged": True,
+                    })
+                    result.status = "success"
+
+                except BaseException as error:
+                    errorRaised = error
+                    result.status = "interrupted" if isinstance(error, (KeyboardInterrupt, SystemExit)) else "failed"
+                    errorRecord = {"errorType": type(error).__name__, "message": str(error)}
+
+                    if isinstance(error, pglToolExecutionError):
+                        failed = error.result
+                        result.returnCode = failed.returnCode
+                        result.stdoutPath = failed.stdoutPath
+                        result.stderrPath = failed.stderrPath
+                        if result.logDirectory is None: result.logDirectory = failed.logDirectory
+
+                finally:
+                    details["childInvocations"] = [
+                        record for record in recorder.exportInvocations()
+                        if record["invocationID"] not in previousIDs
+                    ]
+                    recorder.finishInvocation(
+                        invocationID,
+                        status=result.status,
+                        result=details,
+                        error=errorRecord,
+                    )
+                    if standalone: recorder.close()
+
+                    invocation = next(
+                        record for record in recorder.exportInvocations()
+                        if record["invocationID"] == invocationID
+                    )
+                    result._provenance = {
+                        "schemaVersion": 1,
+                        "environment": recorder.exportEnvironment(),
+                        "invocation": invocation,
+                    }
+                    self.lastResult = result
+
+                if errorRaised is not None:
+                    if not isinstance(errorRaised, Exception): raise errorRaised
+                    raise pglToolExecutionError(
+                        f"AFNI motion estimation/interpretation failed: {errorRecord['message']}",
+                        result,
+                    ) from errorRaised
+
+                return result
+
+        except Exception as error:
+            if isinstance(error, pglToolExecutionError):
+                self.lastResult = error.result
+
+            active = getExecutionRecorder()
+            if active is not None and active.actionID is not None:
+                raise
+
+            pglMessages.warning(f"AFNI motion estimation stopped: {type(error).__name__}: {error}")
+            return None
+
+    ################################################################
+    # Recorded motion-estimation implementation
+    ################################################################
+    def _volreg(self, inputImage, *, referenceVolume=0, twoPass=True, cacheDirectory=None, timeout=None):
+        """Execute estimation and validate outputs before reporting success.
+
+        Creates one enclosing scientific-tool invocation plus the ordinary
+        version and subprocess invocation records.
+
+        Input/output hashes identify file bytes, not scientific correctness.
+        Source mutation is checked before/after execution, but concurrent
+        source/tool modification is unsupported.
+
+        Header inspection remains lazy with respect to voxel arrays.
+        The AFNI subprocess necessarily reads image data for estimation.
+        """
+        import os
+        import shutil
+        import tempfile
+        from contextlib import nullcontext
+        from pathlib import Path
+
+        import nibabel as nib
+        import numpy as np
+
+        if type(referenceVolume) is not int or referenceVolume < 0:
+            raise ValueError("referenceVolume must be a nonnegative integer.")
+        if type(twoPass) is not bool:
+            raise ValueError("twoPass must be True or False.")
+        if timeout is not None:
+            if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+                raise ValueError("timeout must be positive and finite, or None.")
+
+        source = Path(inputImage).expanduser().resolve()
+        if not source.is_file() or not source.name.lower().endswith((".nii", ".nii.gz")):
+            raise ValueError("inputImage must be an existing local .nii or .nii.gz file.")
+
+        # AFNI interprets selectors in dataset arguments. Reject ambiguous
+        # literal filenames rather than silently treating them as selectors.
+        if any(character in str(source) for character in ("[", "]", "<", ">", "\x00", "\n", "\r")):
+            raise ValueError("The image path contains characters ambiguous in an AFNI dataset argument.")
+
+        cacheRoot = None
+        if cacheDirectory is not None:
+            cacheText = os.fspath(cacheDirectory)
+            if (
+                not isinstance(cacheText, str) or not cacheText.strip()
+                or "://" in cacheText or "::" in cacheText
+                or any(character in cacheText for character in ("\x00", "\n", "\r"))
+            ):
+                raise ValueError("cacheDirectory must be an ordinary local path.")
+            cacheRoot = Path(cacheText).expanduser().resolve()
+
+        recorder = getExecutionRecorder()
+        standalone = recorder is None
+        if standalone: recorder = pglExecutionRecorder()
+
+        # Standalone version/subprocess calls share this private context.
+        # Within an action, retain the existing action recorder.
+        context = recorder.activate() if standalone else nullcontext()
+
+        with context:
+            invocationID = recorder.beginInvocation({
+                "adapter": f"{type(self).__module__}.{type(self).__qualname__}",
+                "operation": "volreg",
+                "parameters": {
+                    "referenceVolume": referenceVolume,
+                    "twoPass": twoPass,
+                    "interpolation": "Fourier",
+                    "writeCorrectedImage": False,
+                },
+                "inputPath": str(source),
+                "timeoutSeconds": timeout,
+                "dependencyCapture": {
+                    "status": "declaredInputsAndOutputs",
+                    "limitations": [
+                        "Shared-library and implicit AFNI configuration contents are not captured.",
+                        "Matrix interpretation/application is not implemented by this wrapper.",
+                    ],
+                },
+            })
+
+            result = pglToolResult(invocationID)
+            details = {
+                "inputs": {},
+                "outputs": {},
+                "childInvocationIDs": [],
+                "reportedVersion": None,
+                "workingDirectory": None,
+                "sourceUnchanged": None,
+            }
+            executionError = None
+            failureRecord = None
+
+            try:
+                # Hash before header inspection so metadata and estimation
+                # are tied to an identified source, then check again afterward.
+                sourceIdentity = self._fileIdentity(source)
+                image = nib.load(str(source), mmap=True)
+
+                if not isinstance(image, (nib.Nifti1Image, nib.Nifti2Image)):
+                    raise TypeError("Expected a single-file NIfTI image.")
+                if len(image.shape) != 4 or image.shape[3] < 2:
+                    raise ValueError("Motion estimation requires a 4D image with at least two volumes.")
+                if referenceVolume >= image.shape[3]:
+                    raise ValueError(f"referenceVolume is outside the supplied image's {image.shape[3]} volumes.")
+                if image.get_data_dtype().kind not in "iuf":
+                    raise ValueError("Motion estimation requires real-valued numerical image data.")
+
+                volumeCount = int(image.shape[3])
+                details["inputs"]["image"] = {
+                    "localPath": str(source),
+                    **sourceIdentity,
+                    "shape": list(image.shape),
+                    "referenceVolume": referenceVolume,
+                }
+
+                # No header normalization or assignment. Scientific acquisition
+                # geometry validation belongs to the consuming MRI action.
+                del image
+
+                # Match availability selection without probing one installation
+                # and subsequently executing another found through PATH.
+                managed = pglAFNIInstallation()
+                managedDirectory = managed.root / "abin"
+                selectedDirectory = None if self.directory is None else Path(self.directory).expanduser().resolve()
+
+                if selectedDirectory is None or selectedDirectory == managedDirectory.resolve():
+                    state = managed.readState()
+                    if state is not None and state["status"] != "verified":
+                        raise RuntimeError(managed.continuationMessage(state))
+                    if state is not None or managedDirectory.exists():
+                        selectedDirectory = managedDirectory
+
+                if selectedDirectory is None:
+                    discovered = shutil.which("afni")
+                    if discovered is None:
+                        raise FileNotFoundError("AFNI is unavailable. Run afni.install() or supply its executable directory.")
+                    selectedDirectory = Path(discovered).absolute().parent
+
+                # Use absolute command paths throughout this execution.
+                runtimeEnvironment = dict(os.environ)
+                afniExecutable = self._resolveExecutable(str(selectedDirectory / "afni"), runtimeEnvironment)
+                motionExecutable = self._resolveExecutable(str(selectedDirectory / "3dvolreg"), runtimeEnvironment)
+
+                if cacheRoot is not None: cacheRoot.mkdir(parents=True, exist_ok=True)
+                outputDirectory = Path(tempfile.mkdtemp(
+                    prefix="pgl-volreg-",
+                    dir=None if cacheRoot is None else str(cacheRoot),
+                ))
+                details["workingDirectory"] = str(outputDirectory)
+                result.logDirectory = outputDirectory
+
+                versionResult = self._runCommand(
+                    str(afniExecutable),
+                    arguments=["-ver"],
+                    timeout=10.0,
+                    cacheDirectory=outputDirectory,
+                )
+                details["childInvocationIDs"].append(versionResult.invocationID)
+
+                versionSections = []
+                for path in (versionResult.stdoutPath, versionResult.stderrPath):
+                    with path.open("rb") as handle:
+                        content = handle.read(65537)
+                    if len(content) > 65536:
+                        raise ValueError("AFNI version output exceeds the supported size.")
+                    text = content.decode("utf-8", errors="replace").strip()
+                    if text: versionSections.append(text)
+
+                versionText = "\n".join(versionSections)
+                if not versionText: raise ValueError("AFNI returned no version information.")
+                details["reportedVersion"] = versionText
+                details["executableDirectory"] = str(selectedDirectory)
+
+                matrixPath = outputDirectory / "motion.aff12.1D"
+                parameterPath = outputDirectory / "motion.1D"
+
+                arguments = ["-Fourier"]
+                if twoPass: arguments.append("-twopass")
+                arguments.extend([
+                    "-base", f"{source}[{referenceVolume}]",
+                    "-1Dfile", str(parameterPath),
+                    "-1Dmatrix_save", str(matrixPath),
+                    "-prefix", "NULL",
+                    str(source),
+                ])
+
+                commandResult = self._runCommand(
+                    str(motionExecutable),
+                    arguments=arguments,
+                    cwd=outputDirectory,
+                    timeout=timeout,
+                    cacheDirectory=outputDirectory,
+                )
+                details["childInvocationIDs"].append(commandResult.invocationID)
+                result.returnCode = commandResult.returnCode
+                result.stdoutPath = commandResult.stdoutPath
+                result.stderrPath = commandResult.stderrPath
+
+                # A successful process is not enough: require one finite row
+                # per supplied volume and the declared AFNI output shapes.
+                def validateOutput(path, columns):
+                    if path.is_symlink() or not path.is_file():
+                        raise ValueError(f"Expected a regular motion output: {path}")
+
+                    values = np.loadtxt(path, comments="#", ndmin=2)
+                    if values.shape != (volumeCount, columns) or not np.isfinite(values).all():
+                        raise ValueError(
+                            f"{path.name}: expected {volumeCount} finite rows with "
+                            f"{columns} columns; found shape {values.shape}."
+                        )
+
+                    return {
+                        "localPath": str(path),
+                        **self._fileIdentity(path),
+                        "rows": volumeCount,
+                        "columns": columns,
+                    }
+
+                matrices = validateOutput(matrixPath, 12)
+                parameters = validateOutput(parameterPath, 6)
+
+                actualSourceIdentity = self._fileIdentity(source)
+                details["sourceUnchanged"] = actualSourceIdentity == sourceIdentity
+                if not details["sourceUnchanged"]:
+                    raise ValueError("The source image changed during motion estimation.")
+
+                # Publish declared outputs only after all validation succeeds.
+                details["outputs"] = {
+                    "matrices": {
+                        **matrices,
+                        "format": "AFNI aff12.1D",
+                        "semantics": "Native 3dvolreg -1Dmatrix_save output; not converted.",
+                    },
+                    "motionParameters": {
+                        **parameters,
+                        "format": "AFNI 3dvolreg 1Dfile",
+                        "columnsDescription": ["roll", "pitch", "yaw", "dS", "dL", "dP"],
+                        "columnUnits": ["degree", "degree", "degree", "mm", "mm", "mm"],
+                    },
+                }
+                result.status = "success"
+
+            except BaseException as error:
+                executionError = error
+                result.status = "interrupted" if isinstance(error, (KeyboardInterrupt, SystemExit)) else "failed"
+
+                if isinstance(error, pglToolExecutionError):
+                    child = error.result
+                    if child.invocationID not in details["childInvocationIDs"]:
+                        details["childInvocationIDs"].append(child.invocationID)
+                    result.returnCode = child.returnCode
+                    result.stdoutPath = child.stdoutPath
+                    result.stderrPath = child.stderrPath
+
+                failureRecord = {
+                    "errorType": type(error).__name__,
+                    "message": str(error),
+                }
+
+            finally:
+                # Include child command identities/logs in standalone results
+                # as well as the full action recorder. Do not duplicate the
+                # enclosing invocation inside itself.
+                children = set(details["childInvocationIDs"])
+                details["childInvocations"] = [
+                    record for record in recorder.exportInvocations()
+                    if record["invocationID"] in children
+                ]
+
+                recorder.finishInvocation(
+                    invocationID,
+                    status=result.status,
+                    result=details,
+                    error=failureRecord,
+                )
+                if standalone: recorder.close()
+
+                invocation = next(
+                    record for record in recorder.exportInvocations()
+                    if record["invocationID"] == invocationID
+                )
+                result._provenance = {
+                    "schemaVersion": 1,
+                    "environment": recorder.exportEnvironment(),
+                    "invocation": invocation,
+                }
+
+            if executionError is not None:
+                if not isinstance(executionError, Exception): raise executionError
+
+                location = f" Retained working files: {result.logDirectory}" if result.logDirectory is not None else ""
+                raise pglToolExecutionError(
+                    f"Motion estimation failed: {failureRecord['message']}{location}",
+                    result,
+                ) from executionError
+
+            return result
     
 ################################################################
 # AFNI installation state and administrator-stage launcher

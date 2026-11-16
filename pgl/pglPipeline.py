@@ -21,6 +21,7 @@ import inspect
 from copy import deepcopy
 from contextvars import ContextVar
 from uuid import uuid4
+from .pglSerialize import pglSerialize
 
 # Track the active execution, not the action instance. ContextVar keeps
 # independent execution contexts separate and supports nested action calls.
@@ -62,6 +63,9 @@ class pglActionHistory(pglTraitSettings):
     actionInput = Dict(default_value={}, help="Explicit input provenance when recorded; empty for legacy or unspecified inputs")
     actionEnvironment = Dict(default_value={}, help="Runtime environment captured for this execution; empty when not recorded")
     actionInvocations = List(Dict(), help="External-tool invocation attempts recorded during this execution")
+    actionApplication = Dict(default_value={}, help="Preparation/application outcome for this execution; empty for ordinary or legacy actions")
+    actionProducts = List(Dict(), help="Products recorded by this execution, with committed/uncommitted outcome")
+    actionProductInputs = List(Dict(), help="Explicit product selectors and exact committed products resolved during execution")
 
     def __init__(self, action=None):
         """Create an execution snapshot, or an empty restoration instance."""
@@ -130,31 +134,62 @@ class pglActionHistory(pglTraitSettings):
         return snapshot
 
     def update(self, action):
-        """Update outcome and timing without changing captured provenance."""
+        """Finalize outcome, timing, application, and scientific product records.
+
+        Configuration and source snapshots remain unchanged.
+        Resolved dependencies are retained even when execution later fails.
+        Products from unsuccessful executions remain uncommitted.
+
+        This is metadata finalization, not scientific or filesystem rollback.
+        """
+        from .pglExternalTools import getExecutionRecorder
+
         self.actionStatus = action.status
         self.actionError = action.error
         self.endTime = pglTimestamp.getSecs()
         self.runDuration = self.endTime - self.startTime
 
+        application = getattr(action, "_executionApplication", None)
+        if application is not None:
+            self.actionApplication = deepcopy(application)
+
+        recorder = getExecutionRecorder()
+        if recorder is not None and recorder.actionID == self.actionID:
+            self.actionProductInputs = recorder.exportProductInputs()
+            outcome = "committed" if action.status == pglActionStatus.SUCCESS else "uncommitted"
+            self.actionProducts = [
+                {**record, "recordStatus": outcome}
+                for record in recorder.exportProducts()
+            ]
+            
     def toJSONdict(self, type="all"):
         """Preserve absent optional fields in previously saved history.
 
-        New runtime-provenance fields must not appear in legacy history merely
+        New provenance fields must not appear in legacy history merely
         because the installed class now declares them.
         """
         data = super().toJSONdict(type=type)
         originalFields = getattr(self, "_originalHistoryFields", None)
 
-        mappingFields = {"actionCode", "actionInput", "actionEnvironment", "actionInvocations"}
+        collectionFields = {
+            "actionCode", "actionInput", "actionEnvironment",
+            "actionInvocations", "actionApplication", "actionProducts",
+            "actionProductInputs",
+        }
 
-        for name in ("actionID", "parentActionID", "actionCode", "actionInput", "actionEnvironment", "actionInvocations"):
+        for name in (
+            "actionID", "parentActionID", "actionCode", "actionInput",
+            "actionEnvironment", "actionInvocations", "actionApplication",
+            "actionProducts", "actionProductInputs",
+        ):
             value = data.get(name)
-            empty = not value if name in mappingFields else value is None
+            empty = not value if name in collectionFields else value is None
 
             if empty and (originalFields is None or name not in originalFields):
                 data.pop(name, None)
 
-        return data    
+        return data
+    
     @classmethod
     def fromJSONdict(cls, data, type="all", filename=None):
         """Restore history without creating new execution provenance."""
@@ -233,7 +268,525 @@ class pglActionable(pglTraitSettings):
         Extraction does not establish a default replay input.
         """
         return pglPipeline.fromHistory(self, name=name)
+    
+    ################################################################
+    # Find a committed named scientific product
+    ################################################################
+    def getProduct(self, name=None, *, productID=None):
+        """Inspect a committed product without reading payloads.
 
+        Supply exactly one of name or productID.
+        Duplicate logical names are ambiguous; no newest-product heuristic
+        is used.
+
+        Returns pglDerivedProduct, or None after a warning.
+
+        This inspection method does not record consumption. Scientific actions
+        should resolve their declared pglProductSelector instead.
+        """
+        try:
+            return pglProductSelector(name, productID=productID)._resolve(self)
+        except Exception as error:
+            pglMessages.warning(f"Derived product was not selected: {error}")
+            return None
+
+################################################################
+# Portable scientific-product selector
+################################################################
+class pglProductSelector(pglSerialize):
+    """Explicit, portable dependency on a named or pinned product.
+
+    Name selection:
+        Resolves the named committed product in the execution's input object.
+
+    Pinned selection:
+        Resolves an exact product UUID. Useful for deliberate reuse, but that
+        UUID must exist in the input supplied during replay.
+
+    kind:
+        Optional expected semantic product type.
+
+    Construction does not search history or access payloads.
+    A missing product is diagnosed only when explicitly resolved.
+
+    Examples:
+        pglProductSelector("motion", kind="rigidMotion")
+        pglProductSelector(productID=identifier, kind="rigidMotion")
+    """
+
+    def __init__(self, name=None, *, productID=None, kind=None):
+        self.productName = name
+        self.productID = productID
+        self.kind = kind
+        self._validate()
+
+    def _validate(self):
+        """Require one explicit selection mode and portable string values."""
+        if (self.productName is None) == (self.productID is None):
+            raise ValueError("Supply exactly one product name or productID.")
+
+        for field, value in (
+            ("productName", self.productName),
+            ("productID", self.productID),
+            ("kind", self.kind),
+        ):
+            if value is None: continue
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{field} must be a nonblank string or None.")
+            if any(character in value for character in ("\x00", "\n", "\r")):
+                raise ValueError(f"{field} must not contain NUL or newlines.")
+
+    def toJSONdict(self, type="all"):
+        """Serialize intent, never resolved runtime objects."""
+        self._validate()
+        return {
+            "schemaVersion": 1,
+            "productName": self.productName,
+            "productID": self.productID,
+            "kind": self.kind,
+        }
+
+    @classmethod
+    def fromJSONdict(cls, data, type="all", filename=None):
+        """Restore selection intent without accessing scientific products."""
+        import builtins
+
+        expected = {"schemaVersion", "productName", "productID", "kind"}
+        if not isinstance(data, dict) or set(data) != expected:
+            raise ValueError("Invalid product-selector fields.")
+
+        # The serializer's type argument shadows Python's built-in type().
+        # Require an actual integer, not Boolean True.
+        if builtins.type(data["schemaVersion"]) is not int or data["schemaVersion"] != 1:
+            raise ValueError("Unsupported product-selector version.")
+
+        return cls(
+            data["productName"],
+            productID=data["productID"],
+            kind=data["kind"],
+        )
+
+    def resolve(self, owner):
+        """Resolve this dependency and record consumption inside an action.
+
+        Reads product/history metadata only, not payload files.
+
+        Inside an action:
+            Records the exact resolved product and producing execution.
+            Failures raise internally so the action stops.
+
+        Outside an action:
+            Returns the product for inspection.
+            Ordinary failures warn and return None.
+
+        Does not automatically run a producer, choose the latest product,
+        substitute another name, or regenerate discarded files.
+        """
+        from .pglExternalTools import getExecutionRecorder
+
+        recorder = getExecutionRecorder()
+
+        try:
+            product = self._resolve(owner)
+
+            if recorder is not None and recorder.actionID is not None:
+                recorder.recordProductInput(self.toJSONdict(), product.record)
+
+            return product
+
+        except Exception as error:
+            if recorder is not None and recorder.actionID is not None:
+                raise
+
+            pglMessages.warning(f"Product dependency could not be resolved: {error}")
+            return None
+
+    def _resolve(self, owner):
+        """Resolve exact committed metadata, raising on absence or ambiguity."""
+        self._validate()
+        if not isinstance(owner, pglActionable):
+            raise TypeError("Product resolution requires an object carrying PGL history.")
+
+        matches = []
+
+        for entry in owner.actionHistory:
+            if entry.actionStatus != pglActionStatus.SUCCESS: continue
+
+            for record in entry.actionProducts:
+                if record.get("recordStatus") != "committed": continue
+
+                selected = (
+                    record.get("name") == self.productName
+                    if self.productName is not None else
+                    record.get("productID") == self.productID
+                )
+                if not selected: continue
+
+                if record.get("producerActionID") != entry.actionID:
+                    raise ValueError("Product producer link disagrees with its history entry.")
+
+                matches.append(record)
+
+        label = self.productName if self.productName is not None else self.productID
+
+        if not matches:
+            raise ValueError(
+                f"Required product {label!r} is unavailable. Run its producing "
+                "action first or explicitly select a different input."
+            )
+
+        # Do not use kind as a hidden tiebreaker between duplicate names.
+        if len(matches) != 1:
+            identities = ", ".join(record["productID"] for record in matches)
+            raise ValueError(
+                f"Product {label!r} is ambiguous. Select an explicit productID: {identities}"
+            )
+
+        record = matches[0]
+        if self.kind is not None and record.get("kind") != self.kind:
+            raise ValueError(
+                f"Product {label!r} has kind {record.get('kind')!r}; "
+                f"expected {self.kind!r}."
+            )
+
+        return pglDerivedProduct(record, owner=owner)
+
+    def __repr__(self):
+        selection = f"name={self.productName!r}" if self.productName is not None else f"productID={self.productID!r}"
+        return f"pglProductSelector({selection}, kind={self.kind!r})"
+
+
+################################################################
+# Recorded derived-product view
+################################################################
+class pglDerivedProduct:
+    """Independent product metadata with a weak runtime owner reference.
+
+    Persisted provenance remains in the owning object's action history.
+    This view does not serialize its owner or keep the session alive.
+
+    The view remains pinned to its original product ID and record, not
+    whichever product later happens to have the same logical name.
+
+    A remembered sessionID is only a candidate checkpoint for reloading.
+    It does not establish that unsaved working products exist there.
+
+    Payload access remains through session.getDerivedFile(), including its
+    integrity checks and deferred storage retrieval.
+    """
+    # Runtime display adapters are not part of serialized product metadata.
+    _displayAdapters = {}
+    
+    def __init__(self, record, *, owner=None):
+        self._record = deepcopy(record)
+        self._ownerReference = None
+        self._lastSessionID = None
+        if owner is not None: self._bindOwner(owner)
+
+    @property
+    def productID(self): return self._record["productID"]
+
+    @property
+    def name(self): return self._record["name"]
+
+    @property
+    def kind(self): return self._record["kind"]
+
+    @property
+    def producerActionID(self): return self._record["producerActionID"]
+
+    @property
+    def metadata(self): return deepcopy(self._record["metadata"])
+
+    @property
+    def artifacts(self): return deepcopy(self._record["artifacts"])
+
+    @property
+    def record(self): return deepcopy(self._record)
+
+    ################################################################
+    # Bind runtime access without retaining the owning session
+    ################################################################
+    def _bindOwner(self, owner):
+        """Bind a weak reference and refresh the last-known checkpoint ID."""
+        import weakref
+
+        if not isinstance(owner, pglActionable):
+            raise TypeError("Product owner must carry PGL action history.")
+
+        self._ownerReference = weakref.ref(owner)
+        self._rememberCheckpoint(owner)
+
+    def _rememberCheckpoint(self, owner):
+        """Remember runtime checkpoint identity without claiming membership."""
+        identifier = getattr(owner, "sessionID", None)
+        if type(identifier) is int and 0 <= identifier <= 9223372036854775807:
+            self._lastSessionID = identifier
+
+    @property
+    def lastKnownSessionID(self):
+        """Return the last observed checkpoint ID, not verified product storage.
+
+        Refreshes from a live owner. If that owner was saved and released
+        without this view being accessed again, the remembered ID may be older.
+        """
+        owner = self._ownerReference() if self._ownerReference is not None else None
+        if owner is not None: self._rememberCheckpoint(owner)
+        return self._lastSessionID
+
+    ################################################################
+    # Resolve runtime ownership
+    ################################################################
+    def _requireOwner(self, owner=None):
+        """Return an explicit or live owner, without automatically loading one."""
+        if owner is None and self._ownerReference is not None:
+            owner = self._ownerReference()
+
+        if owner is not None:
+            if not isinstance(owner, pglActionable):
+                raise TypeError("Product owner must carry PGL action history.")
+            self._rememberCheckpoint(owner)
+            return owner
+
+        if self._lastSessionID is None:
+            raise RuntimeError(
+                "The owning session is no longer available or was not bound. "
+                "No checkpoint ID is known. Retrieve this product from a live "
+                "session; unsaved results cannot be restored from the database."
+            )
+
+        raise RuntimeError(
+            "The owning session is no longer available. "
+            f"Its last known checkpoint was session {self._lastSessionID}.\n"
+            "To explicitly reload and verify this product, use:\n"
+            "    session = product.reloadSession()\n"
+            "Or load the checkpoint directly with:\n"
+            f"    session = pglDatabase.loadSession({self._lastSessionID})\n"
+            "The product may be absent if it was created after that checkpoint."
+        )
+
+    ################################################################
+    # Verify the exact product/producer relationship
+    ################################################################
+    def _findProducingAction(self, owner):
+        """Resolve provenance by execution and product identity, never by name."""
+        matches = [
+            entry for entry in owner.actionHistory
+            if entry.actionID == self.producerActionID
+        ]
+        if len(matches) != 1:
+            raise ValueError("Producing execution is missing or ambiguous in this object's history.")
+
+        entry = matches[0]
+        records = [
+            record for record in entry.actionProducts
+            if record.get("productID") == self.productID
+        ]
+        if len(records) != 1 or records[0] != self._record:
+            raise ValueError("Product metadata does not match the producing execution's record.")
+
+        return entry
+
+    ################################################################
+    # Find the recorded producing execution
+    ################################################################
+    def getProducingAction(self, owner=None):
+        """Return the producing history entry using the bound owner by default.
+
+        An explicit owner remains supported for compatibility.
+        Does not reconstruct an action or execute scientific code.
+
+        Missing ownership or inconsistent provenance warns and returns None.
+        """
+        try:
+            owner = self._requireOwner(owner)
+            return self._findProducingAction(owner)
+
+        except Exception as error:
+            pglMessages.warning(f"Product producer could not be resolved: {error}")
+            return None
+
+    ################################################################
+    # Resolve a declared payload through its existing attachment
+    ################################################################
+    def getFile(self, session=None, role=None, *, cacheDirectory=None):
+        """Return a verified local artifact path using the bound session.
+
+        Preferred:
+            product.getFile("matrices")
+            product.getFile(role="matrices")
+
+        Existing explicit-session calls remain supported:
+            product.getFile(session, "matrices")
+
+        Checks producer correspondence and attachment identity before
+        delegating byte verification/retrieval to getDerivedFile().
+
+        Never reloads a session, regenerates a payload, or substitutes another
+        product automatically. Ordinary failures warn and return None.
+        """
+        try:
+            # Preserve the previous (session, role) interface while allowing
+            # the normal single-argument call to specify only the artifact role.
+            if isinstance(session, str) and role is None:
+                role, session = session, None
+
+            if not isinstance(role, str) or not role.strip():
+                raise ValueError("Supply a nonblank artifact role.")
+
+            session = self._requireOwner(session)
+            self._findProducingAction(session)
+
+            if role not in self._record["artifacts"]:
+                raise ValueError(f"Product {self.name!r} has no artifact role {role!r}.")
+
+            artifact = self._record["artifacts"][role]
+            attachment = session.derivedFiles.get(artifact["attachmentName"])
+            if attachment is None:
+                raise ValueError("The product payload is not attached; it may have been discarded.")
+
+            for field in ("sha256", "size_bytes"):
+                if attachment.get(field) != artifact[field]:
+                    raise ValueError("The attachment identity differs from the recorded product.")
+
+            path = session.getDerivedFile(
+                artifact["attachmentName"],
+                cacheDirectory=cacheDirectory,
+            )
+            if path is None: raise ValueError("The registered product payload is unavailable.")
+            return path
+
+        except Exception as error:
+            pglMessages.warning(f"Product file could not be resolved: {error}")
+            return None
+
+    ################################################################
+    # Explicitly reload and verify the owning checkpoint
+    ################################################################
+    def reloadSession(self, sessionID=None, **loadOptions):
+        """Load a checkpoint and rebind only if this exact product is present.
+
+        sessionID:
+            None uses lastKnownSessionID.
+            An explicit ID allows selecting a later checkpoint that contains
+            the product when the remembered checkpoint predates its creation.
+
+        loadOptions:
+            Forwarded to pglDatabase.loadSession(), for example settingsName,
+            cacheDirectory, or storageOptionsByBackend.
+
+        Returns the loaded session after exact product-record verification.
+        The caller must retain it because this view holds only a weak reference:
+
+            session = product.reloadSession(settingsName="desktop")
+
+        Missing products, changed records, and ordinary load failures warn and
+        return None without replacing the existing owner reference.
+
+        Does not search checkpoint ancestry, select a same-named replacement,
+        rerun estimation, or materialize the product payload.
+        """
+        try:
+            identifier = self.lastKnownSessionID if sessionID is None else sessionID
+            if type(identifier) is not int or not 0 <= identifier <= 9223372036854775807:
+                raise ValueError("No usable checkpoint ID is known. Supply sessionID explicitly.")
+
+            from .pglDatabase import pglDatabase
+
+            session = pglDatabase.loadSession(identifier, **loadOptions)
+            if session is None:
+                pglMessages.warning(f"Product session was not reloaded: checkpoint {identifier} could not be loaded.")
+                return None
+
+            # Use the raising metadata resolver to avoid duplicate warnings.
+            # Product names are not sufficiently precise for rebinding.
+            try:
+                restored = pglProductSelector(productID=self.productID)._resolve(session)
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    f"Checkpoint {identifier} does not expose this exact committed "
+                    f"product ({self.productID}). It may have been created after "
+                    "that checkpoint or never saved. No replacement was selected."
+                ) from error
+
+            if restored.record != self._record:
+                raise ValueError(
+                    f"Checkpoint {identifier} contains a different record for "
+                    "this product ID. Refusing to rebind."
+                )
+
+            self._findProducingAction(session)
+            self._bindOwner(session)
+
+            # The requested checkpoint ID remains known even if a loader or
+            # test double does not populate session.sessionID.
+            self._lastSessionID = identifier
+            return session
+
+        except Exception as error:
+            pglMessages.warning(f"Product session was not reloaded: {type(error).__name__}: {error}")
+            return None
+        
+    ################################################################
+    # Display a recorded scientific product
+    ################################################################
+    def display(self, **options):
+        """Display this product using its kind-specific adapter.
+
+        Uses the bound owner; no redundant session argument is required.
+        Does not automatically reload a released session.
+
+        Options are forwarded to the selected adapter. Explicitly unsupported
+        arguments are rejected before owner resolution or payload access.
+        Adapters accepting **kwargs must validate those options themselves.
+
+        Built-in support:
+            rigidMotion:
+                Returns a list of Matplotlib figures, one per selected scan.
+                Supports scanIndices, showAffineComponents,
+                measurementPointRASMM, and cacheDirectory.
+
+        Other adapters may return figures, viewers, or report handles.
+        Each adapter documents its return value and presentation behavior.
+
+        This dispatcher does not guess how to display arbitrary files or
+        execute code stored in product metadata.
+
+        Dependency, option, metadata, and integrity failures warn at the
+        default stopping level and return None. Adapters should separately
+        catch recoverable rendering failures and warn with level=1.
+
+        Examples:
+            motion.display()
+            motion.display(scanIndices=[0, 1])
+            motion.display(showAffineComponents=True)
+        """
+        try:
+            adapter = type(self)._displayAdapters.get(self.kind)
+
+            # Load built-in MRI support only when requested. Merely retrieving
+            # a product must not import plotting libraries or open payloads.
+            if adapter is None and self.kind == "rigidMotion":
+                from .pglMRI import pglMRITransforms
+                adapter = pglMRITransforms.displayMotionProduct
+
+            if adapter is None:
+                raise ValueError(f"No display adapter is registered for product kind {self.kind!r}.")
+
+            # Validate calling convention before scientific payload access.
+            try:
+                inspect.signature(adapter).bind(self, **options)
+            except TypeError as error:
+                raise ValueError(f"Invalid display options for product kind {self.kind!r}: {error}") from error
+
+            owner = self._requireOwner()
+            self._findProducingAction(owner)
+
+            return adapter(self, **options)
+
+        except Exception as error:
+            pglMessages.warning(f"Product display stopped: {type(error).__name__}: {error}")
+            return None
  
 ########################
 # class pglAction
@@ -279,22 +832,35 @@ class pglAction(pglActionable):
 
     @classmethod
     def execute(cls, *args, **kwargs):
-        """Route configuration and run arguments, warning about unsupported names."""
+        """Route configuration and execution arguments with explicit validation.
+
+        Scientific inputs come from _run() for ordinary actions and
+        _estimate() for deferred actions.
+
+        Names accepted by both configuration and execution are passed to both,
+        preserving existing behavior for settings such as deferApply.
+        """
         action = cls()
 
         configureNames = cls._getKeywordNames(action.configure) | set(action.traits())
-        runNames = cls._getKeywordNames(action.run) | cls._getKeywordNames(action._run)
+        runNames = action._getRunKeywordNames()
         validNames = configureNames | runNames
 
         if args:
-            pglMessages.warning(f"{cls.__name__}.execute() requires keyword arguments, but received {len(args)} positional argument(s). Pass arguments as name=value.", level=2)
+            pglMessages.warning(
+                f"{cls.__name__}.execute() requires keyword arguments, but received "
+                f"{len(args)} positional argument(s). Pass arguments as name=value."
+            )
             action.printConfiguration()
             pglMessages.print(f"Accepted execute arguments: {', '.join(sorted(validNames)) or '(none)'}")
             return None
 
         unknownNames = set(kwargs) - validNames
         if unknownNames:
-            pglMessages.warning(f"{cls.__name__}.execute() got unknown argument(s): {', '.join(sorted(unknownNames))}. Argument names are case-sensitive.", level=2)
+            pglMessages.warning(
+                f"{cls.__name__}.execute() got unknown argument(s): "
+                f"{', '.join(sorted(unknownNames))}. Argument names are case-sensitive."
+            )
             action.printConfiguration()
             pglMessages.print(f"Accepted execute arguments: {', '.join(sorted(validNames)) or '(none)'}")
             return None
@@ -352,18 +918,25 @@ class pglAction(pglActionable):
         recorder when they finish.
 
         Explicit setError() failures are preserved.
-        Ordinary exceptions warn and return None.
+        Ordinary scientific exceptions warn and return None.
         KeyboardInterrupt and SystemExit are recorded and propagated.
+
+        After successful history/product finalization, _afterSuccess() may
+        present already-validated results. Ordinary presentation failures warn
+        at level=1 without changing scientific SUCCESS.
 
         Scientific mutations are not rolled back.
         """
         from .pglExternalTools import pglExecutionRecorder
 
         if getattr(self, "_executionInProgress", False):
-            raise RuntimeError(f"Action {self.name} is already running. Use a separate action instance for another execution.")
+            pglMessages.warning(
+                f"Action {self.name} is already running. Use a separate action instance for another execution."
+            )
+            return None
 
         if not self.isConfigured():
-            pglMessages.warning(f"Action {self.name} is not yet configured.", level=1)
+            pglMessages.warning(f"Action {self.name} is not yet configured.")
             return None
 
         inputActionables = []
@@ -400,8 +973,16 @@ class pglAction(pglActionable):
                 entry.actionEnvironment = recorder.exportEnvironment()
                 self.actionHistory.append(entry)
 
-            except BaseException:
+            except Exception as error:
                 # Snapshot failure occurs before scientific execution.
+                self.status = previousStatus
+                self.error = previousError
+                pglMessages.warning(
+                    f"Action {self.name} was not started: could not capture execution provenance: {error}"
+                )
+                return None
+
+            except BaseException:
                 self.status = previousStatus
                 self.error = previousError
                 raise
@@ -420,28 +1001,34 @@ class pglAction(pglActionable):
                         self.status = pglActionStatus.FAILED
 
                         if self.error is None:
-                            self.error = RuntimeError(f"Action {self.name} reported failure without an error description.")
+                            self.error = RuntimeError(
+                                f"Action {self.name} reported failure without an error description."
+                            )
 
                     elif self.status == pglActionStatus.SKIPPED:
                         pass
 
                     elif result is None:
-                        self.error = RuntimeError(f"Action {self.name} returned None without reporting failure or an explicit skip.")
+                        self.error = RuntimeError(
+                            f"Action {self.name} returned None without reporting failure or an explicit skip."
+                        )
                         self.status = pglActionStatus.FAILED
-                        pglMessages.warning(str(self.error), level=1)
+                        pglMessages.warning(str(self.error))
 
                     else:
                         self.status = pglActionStatus.SUCCESS
 
                 except (KeyboardInterrupt, SystemExit) as error:
-                    self.error = RuntimeError(f"{type(error).__name__}: action execution was interrupted.")
+                    self.error = RuntimeError(
+                        f"{type(error).__name__}: action execution was interrupted."
+                    )
                     self.status = pglActionStatus.FAILED
                     raise
 
                 except Exception as error:
                     self.error = error
                     self.status = pglActionStatus.FAILED
-                    pglMessages.warning(f"Error running action {self.name}: {error}", level=1)
+                    pglMessages.warning(f"Error running action {self.name}: {error}")
 
                 finally:
                     # Finalize execution-time provenance independently of the
@@ -481,8 +1068,24 @@ class pglAction(pglActionable):
             if self.status == pglActionStatus.FAILED:
                 return None
 
-            if self.status == pglActionStatus.SUCCESS and not isinstance(result, pglActionable):
-                pglMessages.warning(f"Action {self.name} returned type {type(result).__name__}; execution history is retained on the action and directly supplied input actionables.", level=1)
+            if self.status == pglActionStatus.SUCCESS:
+                if not isinstance(result, pglActionable):
+                    pglMessages.warning(
+                        f"Action {self.name} returned type {type(result).__name__}; "
+                        "execution history is retained on the action and directly supplied input actionables.",
+                        level=1,
+                    )
+
+                # Products are committed and attached before presentation.
+                # This hook must not introduce new scientific processing.
+                try:
+                    self._afterSuccess(result)
+                except Exception as error:
+                    pglMessages.warning(
+                        f"Action {self.name} succeeded, but presenting its results failed: "
+                        f"{type(error).__name__}: {error}",
+                        level=1,
+                    )
 
             return result
 
@@ -520,11 +1123,15 @@ class pglAction(pglActionable):
             self.printConfiguration()
    
     def printConfiguration(self, frameworkTraits=False):
-        """Print configuration traits, explicit configure arguments, and run arguments."""
+        """Print configuration traits, configure arguments, and run arguments.
+
+        Deferred-action run arguments include scientific inputs declared by
+        _estimate(), not the internal _apply() hook.
+        """
         traits = self.traits()
         baseTraitNames = set(pglAction.class_traits())
         configureParameters = inspect.signature(self.configure).parameters
-        runNames = self._getKeywordNames(self.run) | self._getKeywordNames(self._run)
+        runNames = self._getRunKeywordNames()
 
         pglMessages.printHeader("Configuration parameters")
 
@@ -565,6 +1172,271 @@ class pglAction(pglActionable):
         frameworkTraits = set(pglAction.class_traits())
         configurationNames = [name for name, trait in self.traits().items() if name not in frameworkTraits and trait.metadata.get("serialize", True)]
         return deepcopy({name: getattr(self, name) for name in sorted(configurationNames)})
+
+    ################################################################
+    # Discover public execution arguments
+    ################################################################
+    def _getRunKeywordNames(self):
+        """Return explicitly declared execution arguments.
+
+        Ordinary actions declare scientific inputs in _run().
+        Deferred actions declare them in _estimate(); their _run() method
+        coordinates preparation and application through generic forwarding.
+
+        _apply() is an internal hook, not an additional public input interface.
+        """
+        methods = [self.run, self._run]
+
+        if isinstance(self, pglDeferredAction):
+            methods.append(self._estimate)
+
+        return set().union(*(self._getKeywordNames(method) for method in methods))
+    
+    ################################################################
+    # Register this execution's named scientific product
+    ################################################################
+    def registerProduct(self, name, kind, *, session, files=None, inputProductIDs=None, metadata=None, invocationIDs=None):
+        """Register an output using already attached session payloads.
+
+        Called inside scientific execution after output validation/attachment.
+
+        files maps scientific roles to session.derivedFiles names:
+            {"matrices": matrixAttachmentName, "motionParameters": motionName}
+
+        Input file identities are copied from registered attachment records.
+        This method does not rehash files, create attachments, or copy bytes.
+
+        Producer identity comes automatically from the active recorder.
+        Products are committed in history only if the action succeeds.
+
+        Errors propagate internally to the action runner, stopping execution.
+        """
+        from .pglExternalTools import getExecutionRecorder
+
+        recorder = getExecutionRecorder()
+
+        if (
+            not getattr(self, "_executionInProgress", False)
+            or recorder is None
+            or not self.actionHistory
+            or recorder.actionID != self.actionHistory[-1].actionID
+        ):
+            raise RuntimeError("registerProduct() must be called by its owning action during execution.")
+
+        if not isinstance(session, pglActionable) or not hasattr(session, "derivedFiles"):
+            raise TypeError("Product payloads require a session with derivedFiles.")
+
+        files = {} if files is None else files
+        if type(files) is not dict:
+            raise TypeError("files must map artifact roles to attachment names.")
+
+        # Do not silently replace a previously committed named product.
+        # Future explicit version/rebinding support can preserve old identities.
+        for entry in session.actionHistory:
+            if entry.actionStatus != pglActionStatus.SUCCESS: continue
+            if any(
+                record.get("name") == name and record.get("recordStatus") == "committed"
+                for record in entry.actionProducts
+            ):
+                raise ValueError(f"Product {name!r} already exists. Choose another outputName.")
+
+        artifacts = {}
+
+        for role, attachmentName in files.items():
+            if not isinstance(role, str) or not role.strip():
+                raise ValueError("Artifact roles must be nonblank strings.")
+            if not isinstance(attachmentName, str) or not attachmentName.strip():
+                raise ValueError("Attachment names must be nonblank strings.")
+
+            attachment = session.derivedFiles.get(attachmentName)
+            if attachment is None:
+                raise ValueError(f"Product attachment {attachmentName!r} is not registered.")
+
+            artifacts[role] = {
+                "attachmentName": attachmentName,
+                "sha256": attachment["sha256"],
+                "size_bytes": attachment["size_bytes"],
+            }
+
+        return recorder.registerProduct(
+            name,
+            kind,
+            artifacts=artifacts,
+            inputProductIDs=inputProductIDs,
+            metadata=metadata,
+            invocationIDs=invocationIDs,
+        )
+        
+    ################################################################
+    # Optional presentation after successful execution
+    ################################################################
+    def _afterSuccess(self, result):
+        """Perform optional presentation after history/products are committed.
+
+        Called only when scientific execution completed successfully.
+        Ordinary actions need not override this hook.
+
+        Use for plots or presentation of already-validated results.
+        Do not perform scientific processing, register products, mutate
+        scientific contents, or launch recorded tool commands here.
+
+        Scientific validation belongs inside _run()/_estimate()/_apply().
+        Ordinary hook errors warn at level=1 without changing scientific
+        SUCCESS. KeyboardInterrupt/SystemExit still propagate.
+
+        The hook's return value is ignored.
+        """
+        pass
+
+########################
+# class pglDeferredAction
+########################
+class pglDeferredAction(pglAction):
+    """Action with distinct preparation and application phases.
+
+    Subclasses implement:
+        _estimate(...):
+            Prepare or estimate operations, register their products, and
+            return the scientific working object.
+
+        _apply(prepared):
+            Apply this execution's explicitly identified operations and
+            return the resulting scientific working object.
+
+    Subclasses should not override _run(): it coordinates these phases.
+
+    Default behavior estimates and applies.
+    deferApply=True estimates/registers without application.
+
+    Deferral is a persistent action-specific setting, so pipeline copies,
+    serialization, and history extraction retain it through existing code.
+
+    A run-time override is captured as the effective configuration for that
+    execution, then the action's configured default is restored.
+
+    No MRI-specific behavior is implemented here. Subclasses are responsible
+    for explicit product dependencies, geometry validation, and output
+    publication. Application must never search for arbitrary pending products.
+
+    This base does not implement a public apply() operation. Applying products
+    later belongs to a separate recorded action with explicit inputs.
+    """
+
+    deferApply = Bool(False, help="Prepare operations without applying them; False prepares and applies.")
+
+    ################################################################
+    # Run using the effective application policy
+    ################################################################
+    def run(self, *args, deferApply=None, **kwargs):
+        """Prepare and optionally apply, using the ordinary action runner.
+
+        deferApply=None uses the configured trait value.
+        An explicit Boolean overrides it for this execution only.
+
+        The effective value is present before history captures actionSettings.
+        Restoring the configured default afterward does not modify history.
+
+        Invalid overrides warn and return None before scientific execution.
+        Ordinary scientific exceptions are handled by pglAction.run().
+        KeyboardInterrupt and SystemExit propagate after bookkeeping.
+        """
+        if getattr(self, "_executionInProgress", False):
+            pglMessages.warning(
+                f"Action {self.name} is already running. Use another action instance."
+            )
+            return None
+
+        if deferApply is not None and type(deferApply) is not bool:
+            pglMessages.warning("deferApply must be True, False, or None.")
+            return None
+
+        configuredDefault = self.deferApply
+        self.__dict__.pop("_executionApplication", None)
+
+        try:
+            if deferApply is not None:
+                self.deferApply = deferApply
+
+            return super().run(*args, **kwargs)
+
+        finally:
+            # The history entry has its own configuration/outcome snapshots.
+            # Runtime phase state must not leak into the next attempt.
+            self.__dict__.pop("_executionApplication", None)
+            self.deferApply = configuredDefault
+
+    ################################################################
+    # Coordinate preparation and application
+    ################################################################
+    def _run(self, *args, **kwargs):
+        """Run the two phases without creating nested action executions."""
+        self._executionApplication = {
+            "schemaVersion": 1,
+            "deferApply": self.deferApply,
+            "preparationStatus": "running",
+            "applicationStatus": "notStarted",
+        }
+
+        try:
+            prepared = self._estimate(*args, **kwargs)
+        except BaseException:
+            self._executionApplication["preparationStatus"] = "failed"
+            raise
+
+        if self.status == pglActionStatus.FAILED or self.error is not None:
+            self._executionApplication["preparationStatus"] = "failed"
+            return prepared
+
+        if self.status == pglActionStatus.SKIPPED:
+            self._executionApplication["preparationStatus"] = "skipped"
+            return prepared
+
+        if not isinstance(prepared, pglActionable) or isinstance(prepared, pglAction):
+            self._executionApplication["preparationStatus"] = "failed"
+            raise TypeError("_estimate() must return a scientific pglActionable, not an action or None.")
+
+        self._executionApplication["preparationStatus"] = "success"
+
+        if self.deferApply:
+            self._executionApplication["applicationStatus"] = "pending"
+            return prepared
+
+        self._executionApplication["applicationStatus"] = "running"
+
+        try:
+            applied = self._apply(prepared)
+        except BaseException:
+            self._executionApplication["applicationStatus"] = "failed"
+            raise
+
+        if self.status == pglActionStatus.FAILED or self.error is not None:
+            self._executionApplication["applicationStatus"] = "failed"
+            return applied
+
+        if self.status == pglActionStatus.SKIPPED:
+            self._executionApplication["applicationStatus"] = "skipped"
+            return applied
+
+        if not isinstance(applied, pglActionable) or isinstance(applied, pglAction):
+            self._executionApplication["applicationStatus"] = "failed"
+            raise TypeError("_apply() must return a scientific pglActionable, not an action or None.")
+
+        self._executionApplication["applicationStatus"] = "applied"
+        return applied
+
+    ################################################################
+    # Scientific preparation hook
+    ################################################################
+    def _estimate(self, *args, **kwargs):
+        """Subclasses estimate/register operations and return a working object."""
+        raise NotImplementedError(f"{type(self).__name__} must implement _estimate().")
+
+    ################################################################
+    # Scientific application hook
+    ################################################################
+    def _apply(self, prepared):
+        """Subclasses apply explicitly identified operations to prepared."""
+        raise NotImplementedError(f"{type(self).__name__} must implement _apply().")
                     
 class pglActionCollection:
     """Container for nested action classes, with discoverable help."""
@@ -660,7 +1532,7 @@ class pglActionCollection:
                 hasArguments = False
                 seenRunArguments = set()
 
-                for methodName in ("configure", "run", "_run"):
+                for methodName in ("configure", "run", "_estimate" if issubclass(actionClass, pglDeferredAction) else "_run"):
                     method = getattr(actionClass, methodName)
                     arguments = []
 

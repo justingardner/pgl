@@ -10,7 +10,8 @@
 #############
 from copy import deepcopy
 from pathlib import Path
-
+from uuid import uuid4
+import numpy as np
 from traitlets import Any, Dict, Instance, List, Unicode
 
 from .pglPipeline import pglActionable
@@ -2007,3 +2008,1507 @@ class pglMRIBundle:
         mri = pglMRI()
         mri.scans = scans
         return mri
+    
+################################################################
+# Coordinate-frame and linear-transform metadata
+################################################################
+class pglMRITransforms:
+    """Construct and manipulate explicit linear coordinate mappings.
+
+    Records contain JSON-compatible metadata, not image arrays or readers.
+
+    All matrices use homogeneous column vectors:
+        destination = matrix @ source
+
+    Physical geometry is represented internally as RAS millimeters:
+        positive X = Right, positive Y = Anterior, positive Z = Superior.
+
+    This module does not decide which NIfTI header is authoritative. Callers
+    must explicitly supply the acquisition geometry selected and validated by
+    the action/tool adapter.
+
+    These are internal scientific helpers. Invalid definitions raise to the
+    owning action runner, which warns and stops execution.
+
+    No file writes, source modification, resampling, or external-tool calls
+    occur here.
+    """
+
+    ################################################################
+    # Validate a homogeneous matrix
+    ################################################################
+    @staticmethod
+    def _matrix(value, label):
+        """Return a finite, invertible 4x4 matrix without caller aliases."""
+        try:
+            matrix = np.asarray(value, dtype=float)
+        except (TypeError, ValueError):
+            raise ValueError(f"{label} must contain numerical values.") from None
+
+        if matrix.shape != (4, 4) or not np.isfinite(matrix).all():
+            raise ValueError(f"{label} must be a finite 4x4 matrix.")
+        if not np.allclose(matrix[3], [0, 0, 0, 1], rtol=0, atol=1e-10):
+            raise ValueError(f"{label} must have homogeneous last row [0, 0, 0, 1].")
+
+        try:
+            np.linalg.inv(matrix[:3, :3])
+        except np.linalg.LinAlgError:
+            raise ValueError(f"{label} must be invertible.") from None
+
+        return matrix.copy()
+
+    @staticmethod
+    def _text(value, label):
+        if not isinstance(value, str) or not value.strip() or "\x00" in value:
+            raise ValueError(f"{label} must be a nonblank string without NUL.")
+        return value
+
+    ################################################################
+    # Construct a coordinate-frame record
+    ################################################################
+    @classmethod
+    def makeFrame(cls, *, geometryID, physicalSpaceID, spatialShape, voxelToPhysicalMM, representation, voxelToFrame=None, frameID=None):
+        """Describe coordinates associated with an explicitly identified grid.
+
+        geometryID:
+            Stable identity of this exact image geometry/source stage.
+            Do not generate a different identity each time it is inspected.
+
+        physicalSpaceID:
+            Identity of the physical reference used by voxelToPhysicalMM.
+            A label such as RAS or scanner is not a reference-space identity.
+            Do not assume different acquisitions share a reference merely
+            because their headers contain the same transform code.
+
+        spatialShape:
+            Three spatial dimensions in voxel-index order.
+
+        voxelToPhysicalMM:
+            Full voxel-center-index to physical-coordinate matrix, including
+            origin, orientation, and spacing. Coordinates must be RAS mm.
+
+        representation:
+            voxelIndices:
+                Zero-based voxel-center indices; voxelToFrame is identity.
+
+            scannerRAS:
+                RAS physical coordinates in mm.
+
+            scannerLPS:
+                LPS physical coordinates in mm.
+
+            toolNominal:
+                Tool-defined nominal dataset coordinates in mm.
+                Requires an explicit voxelToFrame supplied by its adapter.
+                The original acquisition angle remains separately recorded in
+                voxelToPhysicalMM.
+
+        A representation label does not prove that a tool used those coordinates.
+        Tool adapters must establish that correspondence through testing.
+        """
+        cls._text(geometryID, "geometryID")
+        cls._text(physicalSpaceID, "physicalSpaceID")
+        if frameID is not None: cls._text(frameID, "frameID")
+
+        if (
+            not isinstance(spatialShape, (list, tuple))
+            or len(spatialShape) != 3
+            or any(type(size) is not int or size <= 0 for size in spatialShape)
+        ):
+            raise ValueError("spatialShape must contain three positive integers.")
+
+        physical = cls._matrix(voxelToPhysicalMM, "voxelToPhysicalMM")
+        rasToLPS = np.diag([-1.0, -1.0, 1.0, 1.0])
+
+        if representation == "voxelIndices":
+            expected = np.eye(4)
+            units = "voxel"
+        elif representation == "scannerRAS":
+            expected = physical
+            units = "mm"
+        elif representation == "scannerLPS":
+            expected = rasToLPS @ physical
+            units = "mm"
+        elif representation == "toolNominal":
+            if voxelToFrame is None:
+                raise ValueError("toolNominal requires an explicit voxelToFrame matrix.")
+            expected = None
+            units = "mm"
+        else:
+            raise ValueError("Unsupported coordinate representation.")
+
+        mapping = expected if voxelToFrame is None else cls._matrix(voxelToFrame, "voxelToFrame")
+
+        if expected is not None and not np.allclose(mapping, expected, rtol=0, atol=1e-8):
+            raise ValueError("voxelToFrame disagrees with the declared coordinate representation.")
+
+        return {
+            "schemaVersion": 1,
+            "frameID": frameID or str(uuid4()),
+            "geometryID": geometryID,
+            "physicalSpaceID": physicalSpaceID,
+            "spatialShape": list(spatialShape),
+            "representation": representation,
+            "units": units,
+            "indexOrigin": 0,
+            "indexLocation": "voxelCenter",
+            "voxelToFrame": mapping.tolist(),
+            "voxelToPhysicalMM": physical.tolist(),
+        }
+
+    ################################################################
+    # Validate a restored frame
+    ################################################################
+    @classmethod
+    def _validateFrame(cls, frame):
+        """Validate recorded definitions without fabricating missing fields."""
+        expectedFields = {
+            "schemaVersion", "frameID", "geometryID", "physicalSpaceID",
+            "spatialShape", "representation", "units", "indexOrigin",
+            "indexLocation", "voxelToFrame", "voxelToPhysicalMM",
+        }
+        if not isinstance(frame, dict) or set(frame) != expectedFields:
+            raise ValueError("Invalid coordinate-frame fields.")
+        if type(frame["schemaVersion"]) is not int or frame["schemaVersion"] != 1:
+            raise ValueError("Unsupported coordinate-frame version.")
+        if type(frame["indexOrigin"]) is not int or frame["indexOrigin"] != 0:
+            raise ValueError("Only zero-based voxel indices are supported.")
+        if frame["indexLocation"] != "voxelCenter":
+            raise ValueError("Only voxel-center indexing is supported.")
+
+        validated = cls.makeFrame(
+            geometryID=frame["geometryID"],
+            physicalSpaceID=frame["physicalSpaceID"],
+            spatialShape=frame["spatialShape"],
+            voxelToPhysicalMM=frame["voxelToPhysicalMM"],
+            representation=frame["representation"],
+            voxelToFrame=frame["voxelToFrame"],
+            frameID=frame["frameID"],
+        )
+        if frame["units"] != validated["units"]:
+            raise ValueError("Coordinate units disagree with the representation.")
+
+        return validated
+
+    ################################################################
+    # Construct a transform record
+    ################################################################
+    @classmethod
+    def makeTransform(cls, matrix, *, domainFrame, codomainFrame, purpose="sampling", interpretationStatus="provisional", adapter="explicit", transformID=None, inputTransformIDs=None):
+        """Record an affine mapping with explicit endpoint frames.
+
+        domainFrame:
+            Coordinates accepted by the matrix.
+
+        codomainFrame:
+            Coordinates produced by the matrix.
+
+        purpose:
+            sampling: output/reference location -> input sampling location.
+            pointMapping: source point -> destination point.
+
+        interpretationStatus:
+            provisional: coordinate interpretation still needs validation.
+            validated: the supplying adapter has established the convention.
+
+        'validated' is a recorded assertion by the caller/adapter, not a test
+        performed by this constructor. Coordinate conversion cannot upgrade
+        a provisional interpretation.
+
+        All matrices are recorded as affine. A rigid physical transform may
+        have a nonorthogonal numerical matrix after conversion to differently
+        scaled voxel coordinates; do not infer rigidity from that matrix alone.
+
+        inputTransformIDs links algebraic conversions/composites to their
+        inputs. Product registration supplies action/invocation provenance
+        and references to original tool artifacts separately.
+        """
+        mapping = cls._matrix(matrix, "transform matrix")
+        domain = cls._validateFrame(domainFrame)
+        codomain = cls._validateFrame(codomainFrame)
+
+        if purpose not in ("sampling", "pointMapping"):
+            raise ValueError("purpose must be sampling or pointMapping.")
+        if interpretationStatus not in ("provisional", "validated"):
+            raise ValueError("interpretationStatus must be provisional or validated.")
+        cls._text(adapter, "adapter")
+        if transformID is not None: cls._text(transformID, "transformID")
+
+        inputs = [] if inputTransformIDs is None else list(inputTransformIDs)
+        for identifier in inputs: cls._text(identifier, "input transform identity")
+        if len(set(inputs)) != len(inputs):
+            raise ValueError("inputTransformIDs must not contain duplicates.")
+
+        if domain["frameID"] == codomain["frameID"] and domain != codomain:
+            raise ValueError("One frame ID cannot have conflicting definitions.")
+
+        return {
+            "schemaVersion": 1,
+            "transformID": transformID or str(uuid4()),
+            "transformType": "affine",
+            "matrixConvention": "homogeneousColumnVectors",
+            "matrix": mapping.tolist(),
+            "domainFrame": domain,
+            "codomainFrame": codomain,
+            "purpose": purpose,
+            "interpretationStatus": interpretationStatus,
+            "adapter": adapter,
+            "inputTransformIDs": inputs,
+        }
+
+    ################################################################
+    # Validate a restored transform
+    ################################################################
+    @classmethod
+    def _validateTransform(cls, transform):
+        expectedFields = {
+            "schemaVersion", "transformID", "transformType", "matrixConvention",
+            "matrix", "domainFrame", "codomainFrame", "purpose",
+            "interpretationStatus", "adapter", "inputTransformIDs",
+        }
+        if not isinstance(transform, dict) or set(transform) != expectedFields:
+            raise ValueError("Invalid transform fields.")
+        if type(transform["schemaVersion"]) is not int or transform["schemaVersion"] != 1:
+            raise ValueError("Unsupported transform version.")
+        if transform["transformType"] != "affine":
+            raise ValueError("This implementation supports affine matrices only.")
+        if transform["matrixConvention"] != "homogeneousColumnVectors":
+            raise ValueError("Unsupported matrix convention.")
+        if type(transform["inputTransformIDs"]) is not list:
+            raise ValueError("inputTransformIDs must be a list.")
+
+        return cls.makeTransform(
+            transform["matrix"],
+            domainFrame=transform["domainFrame"],
+            codomainFrame=transform["codomainFrame"],
+            purpose=transform["purpose"],
+            interpretationStatus=transform["interpretationStatus"],
+            adapter=transform["adapter"],
+            transformID=transform["transformID"],
+            inputTransformIDs=transform["inputTransformIDs"],
+        )
+
+    ################################################################
+    # Convert coordinate descriptions without moving image data
+    ################################################################
+    @classmethod
+    def convert(cls, transform, *, domainFrame=None, codomainFrame=None):
+        """Re-express a mapping in other coordinates of the same endpoint grids.
+
+        Does not infer registration between different images or grids.
+
+        If B maps voxel indices into a frame, conversion from frame F to G is:
+            coordinatesG = B_G @ inverse(B_F) @ coordinatesF
+
+        Therefore:
+            newMatrix =
+                B_newCodomain @ inverse(B_oldCodomain)
+                @ oldMatrix
+                @ B_oldDomain @ inverse(B_newDomain)
+
+        No voxel data are interpolated. Provisional status is preserved.
+        """
+        original = cls._validateTransform(transform)
+        oldDomain = original["domainFrame"]
+        oldCodomain = original["codomainFrame"]
+        newDomain = oldDomain if domainFrame is None else cls._validateFrame(domainFrame)
+        newCodomain = oldCodomain if codomainFrame is None else cls._validateFrame(codomainFrame)
+
+        def requireSameGeometry(old, new):
+            if (
+                old["geometryID"] != new["geometryID"]
+                or old["physicalSpaceID"] != new["physicalSpaceID"]
+                or old["spatialShape"] != new["spatialShape"]
+                or not np.allclose(old["voxelToPhysicalMM"], new["voxelToPhysicalMM"], rtol=0, atol=1e-8)
+            ):
+                raise ValueError("Coordinate conversion requires the same endpoint image geometry.")
+            if old["frameID"] == new["frameID"] and old != new:
+                raise ValueError("A changed frame definition requires a different frame ID.")
+
+        requireSameGeometry(oldDomain, newDomain)
+        requireSameGeometry(oldCodomain, newCodomain)
+
+        oldDomainMatrix = np.asarray(oldDomain["voxelToFrame"])
+        oldCodomainMatrix = np.asarray(oldCodomain["voxelToFrame"])
+        newDomainMatrix = np.asarray(newDomain["voxelToFrame"])
+        newCodomainMatrix = np.asarray(newCodomain["voxelToFrame"])
+
+        matrix = (
+            newCodomainMatrix
+            @ np.linalg.inv(oldCodomainMatrix)
+            @ np.asarray(original["matrix"])
+            @ oldDomainMatrix
+            @ np.linalg.inv(newDomainMatrix)
+        )
+
+        return cls.makeTransform(
+            matrix,
+            domainFrame=newDomain,
+            codomainFrame=newCodomain,
+            purpose=original["purpose"],
+            interpretationStatus=original["interpretationStatus"],
+            adapter="pgl.coordinateConversion.v1",
+            inputTransformIDs=[original["transformID"]],
+        )
+
+    ################################################################
+    # Compose connected mappings
+    ################################################################
+    @classmethod
+    def compose(cls, first, second):
+        """Return the mapping obtained by applying first, THEN second.
+
+        With column vectors:
+            result.matrix = second.matrix @ first.matrix
+
+        The intermediate frame identity and complete definition must match.
+        Convert coordinate descriptions explicitly before composition if needed.
+
+        Does not sample images. Any provisional input keeps the result
+        provisional.
+        """
+        first = cls._validateTransform(first)
+        second = cls._validateTransform(second)
+
+        if first["codomainFrame"] != second["domainFrame"]:
+            raise ValueError("Transform endpoints do not connect. Resolve/convert the intermediate frame explicitly.")
+        if first["purpose"] != second["purpose"]:
+            raise ValueError("Sampling and point mappings must not be composed without explicit interpretation.")
+
+        inputs = list(dict.fromkeys([first["transformID"], second["transformID"]]))
+        status = (
+            "validated"
+            if first["interpretationStatus"] == second["interpretationStatus"] == "validated"
+            else "provisional"
+        )
+
+        return cls.makeTransform(
+            np.asarray(second["matrix"]) @ np.asarray(first["matrix"]),
+            domainFrame=first["domainFrame"],
+            codomainFrame=second["codomainFrame"],
+            purpose=first["purpose"],
+            interpretationStatus=status,
+            adapter="pgl.affineComposition.v1",
+            inputTransformIDs=inputs,
+        )
+
+    ################################################################
+    # Explain coordinates in ordinary language
+    ################################################################
+    @classmethod
+    def describeFrame(cls, frame):
+        """Generate an explanation from validated structured fields."""
+        frame = cls._validateFrame(frame)
+        representation = frame["representation"]
+
+        descriptions = {
+            "voxelIndices": (
+                "Positions are measured by voxel number along the image's first, "
+                "second, and third axes, starting at zero at the center of the "
+                "first voxel. Fractional positions lie between voxel centers."
+            ),
+            "scannerRAS": (
+                "Positions are measured in millimeters in the recorded physical "
+                "reference space. Positive axes point Right, Anterior, and "
+                "Superior. The image's recorded position and acquisition angle "
+                "are included in the voxel-to-coordinate mapping."
+            ),
+            "scannerLPS": (
+                "Positions are measured in millimeters in the recorded physical "
+                "reference space. Positive axes point Left, Posterior, and "
+                "Superior. The image's recorded position and acquisition angle "
+                "are included in the voxel-to-coordinate mapping."
+            ),
+            "toolNominal": (
+                "Positions are measured in millimeters using the tool's nominal "
+                "description of the image grid. The angle at which the scan was "
+                "acquired is not included in these axes; the original physical "
+                "geometry is stored separately. Axis order, signs, spacing, and "
+                "origin are defined by voxelToFrame, not guessed from the tool name."
+            ),
+        }
+        return descriptions[representation]
+
+    ################################################################
+    # Explain a complete transform
+    ################################################################
+    @classmethod
+    def describe(cls, transform):
+        """Return readable semantics without maintaining a separate text truth."""
+        record = cls._validateTransform(transform)
+
+        meaning = (
+            "For each location in the output/reference, this matrix gives the "
+            "location to sample in the input. It does not directly describe "
+            "where to push an input voxel."
+            if record["purpose"] == "sampling" else
+            "For a point in the source frame, this matrix gives its position "
+            "in the destination frame."
+        )
+        status = (
+            "PROVISIONAL: coordinate interpretation is not approved for application."
+            if record["interpretationStatus"] == "provisional" else
+            "Coordinate interpretation is declared validated by the supplying adapter; "
+            "this does not establish scientific registration quality."
+        )
+
+        return (
+            f"Transform: {record['transformID']}\n"
+            f"Mapping: {record['domainFrame']['frameID']} → {record['codomainFrame']['frameID']}\n\n"
+            f"{meaning}\n\n"
+            f"Starting coordinates:\n{cls.describeFrame(record['domainFrame'])}\n\n"
+            f"Result coordinates:\n{cls.describeFrame(record['codomainFrame'])}\n\n"
+            "Recording, converting, or composing this matrix does not change "
+            "image data. Applying it to generate an image generally requires "
+            "interpolation on an explicitly selected output grid.\n\n"
+            f"{status}"
+        )
+        
+    ################################################################
+    # Interpret within-run AFNI motion matrices
+    ################################################################
+    @classmethod
+    def interpretAFNIVolreg(cls, matrixRows, *, attributes, geometryID, physicalSpaceID, spatialShape, voxelToPhysicalMM, volumeIndices, referenceVolumeIndex, afniVersion):
+        """Convert native within-run 3dvolreg matrices to voxel sampling maps.
+
+        Pure metadata/matrix operation:
+            No image reads, header edits, resampling, or external commands.
+
+        matrixRows:
+            Native -1Dmatrix_save rows, one 12-value row per estimated volume.
+
+        attributes:
+            Numerical values obtained from the SAME source image using
+            3dAttribute:
+                ORIENT_SPECIFIC
+                DELTA
+                ORIGIN
+                IJK_TO_DICOM_REAL
+
+        voxelToPhysicalMM:
+            Original acquisition voxel-to-RAS-mm mapping, selected and
+            validated by the calling action.
+
+        volumeIndices:
+            Original acquisition volume indices in matrix-row order.
+            Must also describe the order of volumes supplied to 3dvolreg.
+
+        referenceVolumeIndex:
+            Original acquisition index of the reference in that same series.
+
+        afniVersion:
+            Reported version/build text from the installation used.
+
+        Scope:
+            Within-run, common-grid 3dvolreg -1Dmatrix_save interpretation.
+            Reference and input share the supplied geometry.
+            Does not handle an external reference image or another source grid.
+
+        Convention:
+            Native matrices map reference locations to input sampling
+            locations in AFNI's nominal dataset coordinates.
+
+            B maps voxel indices to those nominal coordinates.
+            V = inverse(B) @ M @ B maps reference voxel indices to input
+            voxel indices.
+
+        Returns:
+            A portable record containing frames, native interpreted transforms,
+            converted sampling transforms, original-volume associations, and
+            readable descriptions.
+
+        Validation:
+            Coordinate interpretation was tested using AFNI 26.3.11 on macOS
+            ARM with synthetic translation, rotation, and permuted/flipped axes.
+            This does not independently verify registration quality or certify
+            every AFNI build. The actual build is retained separately.
+
+        Raises internally to the owning action runner on invalid definitions.
+        """
+        if not isinstance(afniVersion, str) or not afniVersion.strip():
+            raise ValueError("Record the actual AFNI version/build used.")
+
+        if (
+            type(volumeIndices) is not list or not volumeIndices
+            or any(type(index) is not int or index < 0 for index in volumeIndices)
+            or len(set(volumeIndices)) != len(volumeIndices)
+        ):
+            raise ValueError("volumeIndices must contain unique nonnegative original-volume indices.")
+
+        if type(referenceVolumeIndex) is not int or referenceVolumeIndex not in volumeIndices:
+            raise ValueError("The reference must be a volume represented in this motion estimate.")
+
+        rows = np.asarray(matrixRows, dtype=float)
+        if rows.shape != (len(volumeIndices), 12) or not np.isfinite(rows).all():
+            raise ValueError("Expected one finite 12-value matrix row per declared volume.")
+
+        if not isinstance(attributes, dict):
+            raise TypeError("AFNI geometry attributes must be a dictionary.")
+
+        values = {}
+        for name, count in (
+            ("ORIENT_SPECIFIC", 3),
+            ("DELTA", 3),
+            ("ORIGIN", 3),
+            ("IJK_TO_DICOM_REAL", 12),
+        ):
+            try:
+                value = np.asarray(attributes[name], dtype=float)
+            except (KeyError, TypeError, ValueError):
+                raise ValueError(f"Missing or invalid AFNI attribute {name}.") from None
+
+            if value.size != count or not np.isfinite(value).all():
+                raise ValueError(f"AFNI attribute {name} must contain {count} finite values.")
+            values[name] = value.reshape(-1)
+
+        orientation = values["ORIENT_SPECIFIC"]
+        if not np.equal(orientation, np.floor(orientation)).all():
+            raise ValueError("AFNI orientation codes must be integers.")
+
+        orientation = orientation.astype(int)
+        if np.any(orientation < 0) or np.any(orientation > 5):
+            raise ValueError("Unsupported AFNI orientation codes.")
+
+        # AFNI codes:
+        # 0 R→L, 1 L→R, 2 P→A, 3 A→P, 4 I→S, 5 S→I.
+        # DELTA already includes direction signs; do not apply them twice.
+        physicalAxes = [int(code // 2) for code in orientation]
+        if len(set(physicalAxes)) != 3:
+            raise ValueError("AFNI orientation must describe three distinct axes.")
+
+        delta = values["DELTA"]
+        expectedSigns = np.array([1, -1, -1, 1, 1, -1])[orientation]
+        if np.any(delta == 0) or not np.array_equal(np.sign(delta), expectedSigns):
+            raise ValueError("AFNI DELTA signs disagree with ORIENT_SPECIFIC.")
+
+        physical = cls._matrix(voxelToPhysicalMM, "voxelToPhysicalMM")
+        spacing = np.linalg.norm(physical[:3, :3], axis=0)
+
+        # 3dAttribute prints rounded numerical text. These checks establish
+        # correspondence, not permission to alter the acquisition geometry.
+        if not np.allclose(np.abs(delta), spacing, rtol=0, atol=0.001):
+            raise ValueError("AFNI nominal voxel spacing differs from the declared acquisition spacing.")
+
+        nominal = np.zeros((4, 4))
+        nominal[3, 3] = 1
+        for voxelAxis, physicalAxis in enumerate(physicalAxes):
+            nominal[physicalAxis, voxelAxis] = delta[voxelAxis]
+            nominal[physicalAxis, 3] = values["ORIGIN"][voxelAxis]
+
+        geometry = {
+            "geometryID": geometryID,
+            "physicalSpaceID": physicalSpaceID,
+            "spatialShape": spatialShape,
+            "voxelToPhysicalMM": physical,
+        }
+        nativeFrame = cls.makeFrame(
+            **geometry,
+            representation="toolNominal",
+            voxelToFrame=nominal,
+        )
+        voxelFrame = cls.makeFrame(**geometry, representation="voxelIndices")
+
+        realDICOM = np.eye(4)
+        realDICOM[:3] = values["IJK_TO_DICOM_REAL"].reshape(3, 4)
+        realDICOM = cls._matrix(realDICOM, "AFNI IJK_TO_DICOM_REAL")
+        rasToLPS = np.diag([-1.0, -1.0, 1.0, 1.0])
+
+        corners = np.array([
+            [x, y, z, 1.0]
+            for x in (0, spatialShape[0] - 1)
+            for y in (0, spatialShape[1] - 1)
+            for z in (0, spatialShape[2] - 1)
+        ]).T
+        geometryError = float(np.linalg.norm(
+            ((realDICOM - rasToLPS @ physical) @ corners)[:3],
+            axis=0,
+        ).max())
+
+        if geometryError > 0.01:
+            raise ValueError(
+                f"AFNI's reported physical mapping differs from the supplied "
+                f"acquisition geometry by up to {geometryError:.6g} mm."
+            )
+
+        nativeTransforms = []
+        voxelTransforms = []
+        associations = []
+        adapter = "pgl.AFNI.3dvolreg.sharedGrid.v1"
+
+        for rowIndex, (originalVolumeIndex, row) in enumerate(zip(volumeIndices, rows)):
+            matrix = np.eye(4)
+            matrix[:3] = row.reshape(3, 4)
+
+            # Within a shared nominal millimeter frame, 3dvolreg's linear
+            # component should be a proper rotation, not scale/shear/reflection.
+            linear = matrix[:3, :3]
+            if (
+                not np.allclose(linear.T @ linear, np.eye(3), rtol=0, atol=0.0001)
+                or abs(np.linalg.det(linear) - 1.0) > 0.0001
+            ):
+                raise ValueError(f"Motion matrix row {rowIndex} is not a rigid rotation/translation.")
+
+            native = cls.makeTransform(
+                matrix,
+                domainFrame=nativeFrame,
+                codomainFrame=nativeFrame,
+                purpose="sampling",
+                interpretationStatus="validated",
+                adapter=adapter,
+            )
+            converted = cls.convert(
+                native,
+                domainFrame=voxelFrame,
+                codomainFrame=voxelFrame,
+            )
+
+            nativeTransforms.append(native)
+            voxelTransforms.append(converted)
+            associations.append({
+                "rowIndex": rowIndex,
+                "originalVolumeIndex": originalVolumeIndex,
+                "referenceVolumeIndex": referenceVolumeIndex,
+                "nativeTransformID": native["transformID"],
+                "voxelTransformID": converted["transformID"],
+            })
+
+        explanation = (
+            "These motion estimates describe head rotation and movement relative "
+            "to a reference volume. AFNI expresses positions in millimeters using "
+            "its nominal image-grid axes, rather than including the recorded "
+            "angle of the acquisition in those axes.\n\n"
+            "The native matrix tells us where to sample the input for a location "
+            "in the reference. PGL converts that description into zero-based voxel "
+            "coordinates using the recorded axis order, signs, spacing, and origin.\n\n"
+            "The converted matrix tells us which input voxel location to sample "
+            "for each reference voxel. Fractional voxel positions require "
+            "interpolation when correction is applied. Conversion alone changes "
+            "neither voxel values nor image headers."
+        )
+
+        return {
+            "schemaVersion": 1,
+            "kind": "AFNIWithinRunMotionInterpretation",
+            "adapter": adapter,
+            "afniVersion": afniVersion,
+            "validationScope": {
+                "coordinateInterpretation": "validatedForSharedGridWithinRunMapping",
+                "evidence": (
+                    "Synthetic translation and rotation tests, including "
+                    "permuted/flipped axes, passed with AFNI 26.3.11 on macOS ARM."
+                ),
+                "registrationQuality": "Not established by coordinate conversion.",
+                "crossGridRegistration": "Not supported by this adapter.",
+            },
+            "geometryID": geometryID,
+            "nativeFrame": nativeFrame,
+            "voxelFrame": voxelFrame,
+            "afniAttributes": {name: value.tolist() for name, value in values.items()},
+            "attributeGeometryErrorMM": geometryError,
+            "volumeAssociations": associations,
+            "nativeTransforms": nativeTransforms,
+            "voxelTransforms": voxelTransforms,
+            "description": explanation,
+        }
+        
+    ################################################################
+    # Describe motion in patient-oriented units
+    ################################################################
+    @classmethod
+    def motionSummary(cls, transforms, *, volumeIndices, referenceVolumeIndex, trSeconds=None, volumeTimesSeconds=None, measurementPointRASMM=None):
+        """Calculate readable motion traces without reading or changing images.
+
+        transforms:
+            One validated reference-to-input sampling transform per volume.
+            Endpoint definitions must describe a common physical reference
+            space. All transforms must use the same reference image geometry.
+
+            Matrices are converted to RAS millimeters before decomposition.
+            Raw AFNI matrix rows are not accepted directly.
+
+        volumeIndices:
+            Original acquisition volume indices in transform order.
+
+        referenceVolumeIndex:
+            Original acquisition index of the reference volume.
+
+        trSeconds:
+            Optional positive acquisition TR. When explicit times are absent,
+            time is originalVolumeIndex * TR. Dropped volumes do not reset time.
+
+        volumeTimesSeconds:
+            Optional explicit acquisition-relative volume times in seconds,
+            one per transform. Takes precedence over TR-derived times.
+            Times must increase in the supplied volume order.
+
+        measurementPointRASMM:
+            Fixed physical point at which displacement is measured.
+            None uses the center of the reference image's voxel grid.
+            This is an image-center measurement, not a tracked anatomical
+            landmark or automatically estimated center of the head.
+
+        Interpretation:
+            For rigid registration of anatomy, a reference-to-input sampling
+            map describes estimated head position relative to the reference.
+            It is not the inverse correction point map.
+
+            For general affine registration, scale/shear describe the fitted
+            image mapping, not necessarily actual physical deformation.
+
+        Rotation:
+            Right polar decomposition separates rotation from symmetric
+            stretch: linear = rotation @ stretch.
+            Rotation-vector components use the principal angle (up to 180 deg).
+            They are not sequential Euler rotations.
+
+        Scale/shear:
+            diagonal(stretch) - 1 is reported as percent stretch.
+            Off-diagonal stretch entries are reported as percent symmetric
+            cross-axis coupling after removing rotation.
+            These are not engineering shear strains or shear angles.
+
+        Returns JSON-compatible numbers and generated descriptions.
+        Internal validation errors propagate to the action/display boundary.
+        Does not plot, interpolate images, or mutate the supplied transforms.
+        """
+        import math
+        from scipy.spatial.transform import Rotation
+
+        if not isinstance(transforms, (list, tuple)) or not transforms:
+            raise ValueError("Supply at least one interpreted transform.")
+
+        if (
+            type(volumeIndices) is not list
+            or len(volumeIndices) != len(transforms)
+            or any(type(index) is not int or index < 0 for index in volumeIndices)
+            or len(set(volumeIndices)) != len(volumeIndices)
+        ):
+            raise ValueError("volumeIndices must provide one unique nonnegative original index per transform.")
+
+        if type(referenceVolumeIndex) is not int or referenceVolumeIndex not in volumeIndices:
+            raise ValueError("The reference volume must be represented in volumeIndices.")
+
+        if trSeconds is not None:
+            if type(trSeconds) not in (int, float) or not math.isfinite(trSeconds) or trSeconds <= 0:
+                raise ValueError("trSeconds must be positive and finite.")
+
+        if volumeTimesSeconds is not None:
+            if not isinstance(volumeTimesSeconds, (list, tuple)) or len(volumeTimesSeconds) != len(transforms):
+                raise ValueError("Supply one explicit time per transform.")
+            if any(type(value) not in (int, float) or not math.isfinite(value) for value in volumeTimesSeconds):
+                raise ValueError("Explicit volume times must be finite numbers.")
+
+            timeValues = [float(value) for value in volumeTimesSeconds]
+            if any(right <= left for left, right in zip(timeValues, timeValues[1:])):
+                raise ValueError("Explicit volume times must increase in the supplied order.")
+
+            timeSource = "explicitVolumeTimes"
+            timeUnits = "seconds"
+            timeLabel = "Time from acquisition start (s)"
+
+        elif trSeconds is not None:
+            timeValues = [float(index * trSeconds) for index in volumeIndices]
+            timeSource = "originalVolumeIndexTimesTR"
+            timeUnits = "seconds"
+            timeLabel = "Time from acquisition start (s)"
+
+        else:
+            timeValues = list(volumeIndices)
+            timeSource = "originalVolumeIndex"
+            timeUnits = "volumeIndex"
+            timeLabel = "Original volume index"
+
+        records = [cls._validateTransform(record) for record in transforms]
+        referenceFrame = records[0]["domainFrame"]
+
+        for record in records:
+            if record["purpose"] != "sampling":
+                raise ValueError("Motion display requires declared reference-to-input sampling maps.")
+            if record["interpretationStatus"] != "validated":
+                raise ValueError("Motion display requires a validated coordinate interpretation.")
+
+            domain = record["domainFrame"]
+            codomain = record["codomainFrame"]
+
+            if (
+                domain["geometryID"] != referenceFrame["geometryID"]
+                or domain["physicalSpaceID"] != referenceFrame["physicalSpaceID"]
+                or domain["spatialShape"] != referenceFrame["spatialShape"]
+                or not np.allclose(
+                    domain["voxelToPhysicalMM"],
+                    referenceFrame["voxelToPhysicalMM"],
+                    rtol=0,
+                    atol=1e-8,
+                )
+            ):
+                raise ValueError("All motion estimates must share one reference image geometry.")
+
+            if domain["physicalSpaceID"] != codomain["physicalSpaceID"]:
+                raise ValueError(
+                    "Motion endpoints do not share a declared physical reference. "
+                    "Provide an explicit common-frame interpretation before display."
+                )
+
+        referencePhysical = np.asarray(referenceFrame["voxelToPhysicalMM"])
+
+        if measurementPointRASMM is None:
+            centerVoxel = (np.asarray(referenceFrame["spatialShape"], dtype=float) - 1) / 2
+            point = (referencePhysical @ np.append(centerVoxel, 1.0))[:3]
+            pointDescription = "Center of the reference image grid"
+        else:
+            point = np.asarray(measurementPointRASMM, dtype=float)
+            if point.shape != (3,) or not np.isfinite(point).all():
+                raise ValueError("measurementPointRASMM must contain three finite coordinates.")
+            pointDescription = "Explicit fixed measurement point"
+
+        def physicalFrame(frame):
+            """Change coordinate representation, not the underlying image."""
+            return cls.makeFrame(
+                geometryID=frame["geometryID"],
+                physicalSpaceID=frame["physicalSpaceID"],
+                spatialShape=frame["spatialShape"],
+                voxelToPhysicalMM=frame["voxelToPhysicalMM"],
+                representation="scannerRAS",
+            )
+
+        displacements = []
+        rotations = []
+        stretches = []
+        couplings = []
+
+        for record in records:
+            converted = cls.convert(
+                record,
+                domainFrame=physicalFrame(record["domainFrame"]),
+                codomainFrame=physicalFrame(record["codomainFrame"]),
+            )
+            matrix = np.asarray(converted["matrix"])
+            linear = matrix[:3, :3]
+
+            # Reject reflected mappings rather than forcing them into a
+            # plausible-looking positive rotation.
+            if np.linalg.det(linear) <= 0:
+                raise ValueError("Reflected mappings cannot be displayed as ordinary head motion.")
+
+            left, singularValues, rightTranspose = np.linalg.svd(linear)
+            rotation = left @ rightTranspose
+            stretch = rightTranspose.T @ np.diag(singularValues) @ rightTranspose
+
+            displacement = linear @ point + matrix[:3, 3] - point
+            rotationVector = Rotation.from_matrix(rotation).as_rotvec(degrees=True)
+
+            displacements.append(displacement.tolist())
+            rotations.append(rotationVector.tolist())
+            stretches.append((100 * (np.diag(stretch) - 1)).tolist())
+            couplings.append((100 * np.array([
+                stretch[0, 1], stretch[0, 2], stretch[1, 2],
+            ])).tolist())
+
+        referenceRow = volumeIndices.index(referenceVolumeIndex)
+
+        return {
+            "schemaVersion": 1,
+            "kind": "motionSummary",
+            "transformIDs": [record["transformID"] for record in records],
+            "volumeIndices": list(volumeIndices),
+            "referenceVolumeIndex": referenceVolumeIndex,
+            "referenceRow": referenceRow,
+            "time": {
+                "values": timeValues,
+                "units": timeUnits,
+                "source": timeSource,
+                "label": timeLabel,
+                "referenceValue": timeValues[referenceRow],
+            },
+            "coordinateConvention": "patientRAS",
+            "axisLabels": [
+                "Left–right (+ right)",
+                "Posterior–anterior (+ toward face)",
+                "Inferior–superior (+ toward top of head)",
+            ],
+            "measurementPointRASMM": point.tolist(),
+            "measurementPointDescription": pointDescription,
+            "translationMM": displacements,
+            "rotationVectorDegrees": rotations,
+            "stretchPercent": stretches,
+            "symmetricCouplingPercent": couplings,
+            "couplingLabels": [
+                "Left–right / posterior–anterior",
+                "Left–right / inferior–superior",
+                "Posterior–anterior / inferior–superior",
+            ],
+            "description": (
+                "Estimated movement relative to the reference volume. Zero "
+                "displacement means the fixed measurement point has not moved; "
+                "zero rotation means no rotation relative to the reference. "
+                "The reference estimates are not artificially reset to zero.\n\n"
+                "Translations describe movement of the reference image center "
+                "or explicitly supplied point, not movement of scanner coordinate "
+                "zero. Rotations are rotation-vector components about fixed "
+                "patient right, anterior, and superior axes, in degrees; they "
+                "are not three successive Euler rotations.\n\n"
+                "For affine estimates, stretch and symmetric cross-axis coupling "
+                "describe the fitted image mapping after rotation is separated. "
+                "A coupling of 1% corresponds to 1 mm of cross-axis displacement "
+                "per 100 mm along the other axis in that symmetric stretch "
+                "mapping. These values are not automatically physical head deformation."
+            ),
+        }
+    
+    ################################################################
+    # Display motion in patient-oriented units
+    ################################################################
+    @classmethod
+    def displayMotion(cls, transforms, *, volumeIndices, referenceVolumeIndex, trSeconds=None, volumeTimesSeconds=None, measurementPointRASMM=None, showAffineComponents=None, title="Head movement relative to reference", fig=None):
+        """Plot interpreted motion without changing scientific data.
+
+        Uses motionSummary() for coordinate conversion and numerical values.
+
+        showAffineComponents:
+            False: translation and rotation panels only.
+            True: also show stretch and symmetric cross-axis coupling.
+            None: show affine panels when either exceeds 0.001 percent.
+            This display threshold does not modify or round recorded values.
+
+        fig:
+            Optional Matplotlib figure to replace after input validation.
+            None creates a new figure.
+
+        Returns:
+            Matplotlib figure, or None after a warning.
+            Does not call plt.show(), save a file, or modify session state.
+
+        Validation failures use the default stopping-warning level.
+        Rendering failures use level=1 because scientific results remain valid.
+
+        Translation is displacement at a fixed point: the reference image
+        center by default, not an automatically identified anatomical landmark.
+
+        Rotations are principal rotation-vector components, not sequential
+        Euler rotations. Positive angles follow the right-hand rule around
+        the positive patient RAS axes.
+
+        Affine stretch/coupling describe the fitted image mapping. They should
+        not automatically be interpreted as physical deformation of the head.
+        """
+        from .pglMessages import pglMessages
+
+        try:
+            if showAffineComponents is not None and type(showAffineComponents) is not bool:
+                raise ValueError("showAffineComponents must be True, False, or None.")
+            if not isinstance(title, str) or not title.strip():
+                raise ValueError("title must be a nonblank string.")
+
+            # Finish scientific validation before touching an existing figure.
+            summary = cls.motionSummary(
+                transforms,
+                volumeIndices=volumeIndices,
+                referenceVolumeIndex=referenceVolumeIndex,
+                trSeconds=trSeconds,
+                volumeTimesSeconds=volumeTimesSeconds,
+                measurementPointRASMM=measurementPointRASMM,
+            )
+
+        except Exception as error:
+            pglMessages.warning(f"Motion display stopped: {type(error).__name__}: {error}")
+            return None
+
+        createdFigure = False
+        plt = None
+
+        try:
+            import matplotlib.pyplot as plt
+
+            timeValues = np.asarray(summary["time"]["values"])
+            translation = np.asarray(summary["translationMM"])
+            rotation = np.asarray(summary["rotationVectorDegrees"])
+            stretch = np.asarray(summary["stretchPercent"])
+            coupling = np.asarray(summary["symmetricCouplingPercent"])
+
+            includeAffine = showAffineComponents
+            if includeAffine is None:
+                includeAffine = bool(
+                    np.max(np.abs(stretch)) > 0.001
+                    or np.max(np.abs(coupling)) > 0.001
+                )
+
+            panelCount = 4 if includeAffine else 2
+
+            if fig is None:
+                fig = plt.figure(figsize=(11, 10 if includeAffine else 7), constrained_layout=True)
+                createdFigure = True
+            else:
+                fig.clear()
+                fig.set_layout_engine("constrained")
+
+            axes = fig.subplots(panelCount, 1, sharex=True, squeeze=False)[:, 0]
+            colors = ("#0072B2", "#D55E00", "#009E73")
+            markers = ("o", "s", "^")
+
+            # Fixed patient directions—not voxel-axis order or head-following axes.
+            translationLabels = (
+                "Left–right (+ right)",
+                "Back–front (+ toward face)",
+                "Feet–head (+ toward top of head)",
+            )
+            rotationLabels = (
+                "About left–right axis",
+                "About back–front axis",
+                "About feet–head axis",
+            )
+            stretchLabels = (
+                "Left–right",
+                "Back–front",
+                "Feet–head",
+            )
+            couplingLabels = (
+                "Left–right / back–front",
+                "Left–right / feet–head",
+                "Back–front / feet–head",
+            )
+
+            panels = [
+                (translation, translationLabels, "Displacement (mm)", "Movement at the fixed reference point"),
+                (rotation, rotationLabels, "Rotation (degrees)", "Rotation-vector components in fixed patient axes"),
+            ]
+
+            if includeAffine:
+                panels.extend([
+                    (stretch, stretchLabels, "Stretch change (%)", "Stretch after separating rotation"),
+                    (coupling, couplingLabels, "Cross-axis coupling (%)", "Symmetric cross-axis coupling after separating rotation"),
+                ])
+
+            # Sorting is for display only. Scientific records retain their
+            # original transform/volume ordering.
+            order = np.argsort(timeValues, kind="stable")
+            plottedTimes = timeValues[order]
+            referenceTime = summary["time"]["referenceValue"]
+
+            for axis, (values, labels, ylabel, panelTitle) in zip(axes, panels):
+                axis.axhline(0, color="0.55", linewidth=0.8, zorder=0)
+
+                for component, (label, color, marker) in enumerate(zip(labels, colors, markers)):
+                    axis.plot(
+                        plottedTimes,
+                        values[order, component],
+                        label=label,
+                        color=color,
+                        linewidth=1.2,
+                        marker=marker,
+                        markersize=3,
+                    )
+
+                axis.axvline(
+                    referenceTime,
+                    color="0.25",
+                    linestyle="--",
+                    linewidth=1,
+                    label=f"Reference volume {referenceVolumeIndex}",
+                )
+                axis.set_ylabel(ylabel)
+                axis.set_title(panelTitle, fontsize=10, loc="left")
+                axis.grid(True, alpha=0.2)
+                axis.legend(loc="best", fontsize=8)
+
+            axes[-1].set_xlabel(summary["time"]["label"])
+
+            if len(plottedTimes) == 1:
+                width = 0.5
+                if summary["time"]["units"] == "seconds" and trSeconds is not None:
+                    width = float(trSeconds) / 2
+                axes[-1].set_xlim(float(plottedTimes[0]) - width, float(plottedTimes[0]) + width)
+
+            point = summary["measurementPointRASMM"]
+            pointText = ", ".join(f"{value:.2f}" for value in point)
+
+            explanation = (
+                f"Reference: original volume {referenceVolumeIndex} (zero-based)\n"
+                f"{summary['measurementPointDescription']}: RAS [{pointText}] mm\n"
+                "Positive rotation: right-hand rule about patient Right, Anterior, Superior axes.\n"
+                "Rotation components describe one axis/angle vector—not successive Euler rotations."
+            )
+            if includeAffine:
+                explanation += (
+                    "\nAffine panels describe the fitted mapping, not necessarily head deformation."
+                )
+
+            fig.suptitle(f"{title}\n{explanation}", fontsize=10)
+            return fig
+
+        except Exception as error:
+            # A rendering failure must not invalidate completed estimation.
+            # Close only a figure created here, never the caller's figure.
+            if createdFigure and plt is not None:
+                plt.close(fig)
+
+            pglMessages.warning(
+                f"Motion results are available, but plotting failed: "
+                f"{type(error).__name__}: {error}",
+                level=1,
+            )
+            return None
+        
+    ################################################################
+    # Validate a recorded within-run motion product
+    ################################################################
+    @classmethod
+    def validateMotionProduct(cls, record):
+        """Validate motion metadata without accessing payload files.
+
+        Version 1:
+            Native AFNI outputs with unverified coordinate interpretation.
+
+        Version 2:
+            Adds interpretation and timing to each scan record.
+            Interpretation is produced by interpretAFNIVolreg().
+            Timing contains trSeconds and volumeTimesSeconds, either of which
+            may be None.
+
+        Returns independent scan records indexed by acquisition UUID.
+
+        Structural/numerical consistency is checked, not provenance
+        authenticity or registration quality. Artifact bytes must be verified
+        separately when consumed.
+
+        Invalid definitions raise to the calling action or display boundary.
+        """
+        import re
+
+        from .pglExternalTools import _copyProvenance
+
+        record = _copyProvenance(record)
+        if type(record) is not dict or record.get("kind") != "rigidMotion":
+            raise ValueError("Expected a rigidMotion product.")
+
+        metadata = record.get("metadata")
+        artifacts = record.get("artifacts")
+        if type(metadata) is not dict or type(artifacts) is not dict:
+            raise ValueError("Motion product requires metadata and artifact references.")
+
+        expectedFields = {"schemaVersion", "operation", "backend", "matrixConvention", "scans"}
+        if set(metadata) != expectedFields:
+            raise ValueError("Invalid motion metadata fields.")
+
+        version = metadata["schemaVersion"]
+        if type(version) is not int or version not in (1, 2):
+            raise ValueError("Unsupported motion metadata version.")
+        if metadata["operation"] != "withinRunMotion" or metadata["backend"] != "AFNI":
+            raise ValueError("Expected AFNI within-run motion metadata.")
+
+        expectedConvention = {
+            "format": "AFNI aff12.1D",
+            "producerOption": "3dvolreg -1Dmatrix_save",
+            "mappingStatus": "unverified" if version == 1 else "interpreted",
+        }
+        if metadata["matrixConvention"] != expectedConvention:
+            raise ValueError("Motion matrix convention does not match its metadata version.")
+
+        scans = metadata["scans"]
+        if type(scans) is not list or not scans:
+            raise ValueError("Motion metadata must contain scan records.")
+
+        expectedScanFields = {
+            "scanIndex", "scanUUID", "sourceStageID", "sourceIdentity",
+            "volumeIndices", "referenceVolumeIndex",
+            "matricesRole", "motionParametersRole",
+        }
+        if version == 2: expectedScanFields |= {"interpretation", "timing"}
+
+        byScan = {}
+        scanIndices = set()
+        usedRoles = set()
+
+        def requireText(value, label):
+            if (
+                not isinstance(value, str) or not value.strip()
+                or any(character in value for character in ("\x00", "\n", "\r"))
+            ):
+                raise ValueError(f"{label} must be a nonblank string without NUL or newlines.")
+
+        def validateIdentity(identity):
+            if type(identity) is not dict or set(identity) != {"sha256", "size_bytes"}:
+                raise ValueError("Identity requires sha256 and size_bytes.")
+            if not isinstance(identity["sha256"], str) or re.fullmatch(r"[0-9a-f]{64}", identity["sha256"]) is None:
+                raise ValueError("Invalid SHA-256.")
+            if type(identity["size_bytes"]) is not int or identity["size_bytes"] <= 0:
+                raise ValueError("Byte count must be a positive integer.")
+
+        for scan in scans:
+            if type(scan) is not dict or set(scan) != expectedScanFields:
+                raise ValueError("Invalid motion scan record fields.")
+
+            index = scan["scanIndex"]
+            if type(index) is not int or index < 0 or index in scanIndices:
+                raise ValueError("Motion scan indices must be unique nonnegative integers.")
+            scanIndices.add(index)
+
+            scanUUID = scan["scanUUID"]
+            requireText(scanUUID, "scanUUID")
+            if scanUUID in byScan: raise ValueError("Motion product contains a repeated scan UUID.")
+
+            requireText(scan["sourceStageID"], "sourceStageID")
+            validateIdentity(scan["sourceIdentity"])
+
+            indices = scan["volumeIndices"]
+            if (
+                type(indices) is not list or not indices
+                or any(type(value) is not int or value < 0 for value in indices)
+                or len(set(indices)) != len(indices)
+            ):
+                raise ValueError("volumeIndices must contain unique nonnegative original-volume indices.")
+
+            reference = scan["referenceVolumeIndex"]
+            if type(reference) is not int or reference not in indices:
+                raise ValueError("referenceVolumeIndex must identify a represented original volume.")
+
+            for field in ("matricesRole", "motionParametersRole"):
+                role = scan[field]
+                requireText(role, field)
+                if role in usedRoles: raise ValueError("Motion artifact roles must be distinct.")
+                usedRoles.add(role)
+
+                artifact = artifacts.get(role)
+                if type(artifact) is not dict or set(artifact) != {"attachmentName", "sha256", "size_bytes"}:
+                    raise ValueError(f"Missing or invalid artifact role {role!r}.")
+                requireText(artifact["attachmentName"], "attachmentName")
+                validateIdentity({key: artifact[key] for key in ("sha256", "size_bytes")})
+
+            if version == 2:
+                interpreted = scan["interpretation"]
+                timing = scan["timing"]
+
+                if type(timing) is not dict or set(timing) != {"trSeconds", "volumeTimesSeconds"}:
+                    raise ValueError("Motion timing requires trSeconds and volumeTimesSeconds.")
+
+                if (
+                    type(interpreted) is not dict
+                    or type(interpreted.get("schemaVersion")) is not int
+                    or interpreted["schemaVersion"] != 1
+                    or interpreted.get("kind") != "AFNIWithinRunMotionInterpretation"
+                    or interpreted.get("adapter") != "pgl.AFNI.3dvolreg.sharedGrid.v1"
+                ):
+                    raise ValueError("Unsupported AFNI motion interpretation.")
+
+                requireText(interpreted.get("afniVersion"), "AFNI version")
+                if interpreted.get("geometryID") != scan["sourceStageID"]:
+                    raise ValueError("Interpreted geometry must identify the motion source stage.")
+
+                nativeFrame = cls._validateFrame(interpreted["nativeFrame"])
+                voxelFrame = cls._validateFrame(interpreted["voxelFrame"])
+                if nativeFrame["representation"] != "toolNominal":
+                    raise ValueError("Native AFNI frame must use toolNominal coordinates.")
+                if voxelFrame["representation"] != "voxelIndices":
+                    raise ValueError("Converted frame must use voxel indices.")
+                if nativeFrame["geometryID"] != scan["sourceStageID"]:
+                    raise ValueError("Native frame does not identify the motion source stage.")
+
+                native = interpreted.get("nativeTransforms")
+                converted = interpreted.get("voxelTransforms")
+                associations = interpreted.get("volumeAssociations")
+                if any(type(values) is not list or len(values) != len(indices) for values in (native, converted, associations)):
+                    raise ValueError("Interpretation must contain one transform and association per volume.")
+
+                transformIDs = []
+
+                for rowIndex, originalIndex in enumerate(indices):
+                    nativeRecord = cls._validateTransform(native[rowIndex])
+                    voxelRecord = cls._validateTransform(converted[rowIndex])
+
+                    if nativeRecord["domainFrame"] != nativeFrame or nativeRecord["codomainFrame"] != nativeFrame:
+                        raise ValueError("Native motion transform has inconsistent endpoint frames.")
+                    if voxelRecord["domainFrame"] != voxelFrame or voxelRecord["codomainFrame"] != voxelFrame:
+                        raise ValueError("Converted motion transform has inconsistent endpoint frames.")
+
+                    if (
+                        nativeRecord["purpose"] != "sampling"
+                        or nativeRecord["interpretationStatus"] != "validated"
+                        or nativeRecord["adapter"] != interpreted["adapter"]
+                    ):
+                        raise ValueError("Native motion transform lacks the supported interpreted sampling convention.")
+
+                    linear = np.asarray(nativeRecord["matrix"])[:3, :3]
+                    if (
+                        not np.allclose(linear.T @ linear, np.eye(3), rtol=0, atol=0.0001)
+                        or abs(np.linalg.det(linear) - 1) > 0.0001
+                    ):
+                        raise ValueError("Native rigid-motion transform contains scale, shear, or reflection.")
+
+                    expected = cls.convert(
+                        nativeRecord,
+                        domainFrame=voxelFrame,
+                        codomainFrame=voxelFrame,
+                    )
+                    if (
+                        voxelRecord["purpose"] != expected["purpose"]
+                        or voxelRecord["interpretationStatus"] != expected["interpretationStatus"]
+                        or voxelRecord["adapter"] != expected["adapter"]
+                        or voxelRecord["inputTransformIDs"] != expected["inputTransformIDs"]
+                        or not np.allclose(voxelRecord["matrix"], expected["matrix"], rtol=0, atol=1e-8)
+                    ):
+                        raise ValueError("Stored voxel transform disagrees with its native-coordinate conversion.")
+
+                    expectedAssociation = {
+                        "rowIndex": rowIndex,
+                        "originalVolumeIndex": originalIndex,
+                        "referenceVolumeIndex": reference,
+                        "nativeTransformID": nativeRecord["transformID"],
+                        "voxelTransformID": voxelRecord["transformID"],
+                    }
+                    if associations[rowIndex] != expectedAssociation:
+                        raise ValueError("Transform/volume association is inconsistent.")
+
+                    transformIDs.extend([nativeRecord["transformID"], voxelRecord["transformID"]])
+
+                if len(set(transformIDs)) != len(transformIDs):
+                    raise ValueError("Motion transform identities must be unique within a scan record.")
+
+                # Reuse the tested checks for time, physical frames, and
+                # displayable sampling semantics. No image payload is read.
+                cls.motionSummary(
+                    converted,
+                    volumeIndices=indices,
+                    referenceVolumeIndex=reference,
+                    trSeconds=timing["trSeconds"],
+                    volumeTimesSeconds=timing["volumeTimesSeconds"],
+                )
+
+            byScan[scanUUID] = scan
+
+        return byScan
+
+    ################################################################
+    # Display a bound, interpreted motion product
+    ################################################################
+    @classmethod
+    def displayMotionProduct(cls, product, *, scanIndices=None, showAffineComponents=None, measurementPointRASMM=None, cacheDirectory=None):
+        """Return one motion figure per selected scan from a bound product.
+
+        scanIndices:
+            Optional zero-based indices in the owner's CURRENT MRI collection.
+            None displays all scans represented by the product.
+
+        Verifies exact product ownership and matrix/parameter artifact bytes.
+        Native matrix rows must agree with the interpreted transforms.
+
+        Returns a list of figures. Rendering failures may omit a figure after
+        a recoverable warning. Dependency/metadata/integrity failures raise
+        before any figures are created.
+
+        Does not estimate, apply, save, or automatically show images.
+        Current scan indices are resolved by UUID, not historical position.
+        """
+        from pathlib import Path
+
+        from .pglExternalTools import pglExternalTool
+
+        owner = product._requireOwner()
+        product._findProducingAction(owner)
+        record = product.record
+        byScan = cls.validateMotionProduct(record)
+
+        if record["metadata"]["schemaVersion"] != 2:
+            raise ValueError(
+                "This motion product contains native matrices without interpreted "
+                "coordinate frames. Patient-coordinate motion cannot be plotted yet."
+            )
+        if getattr(owner, "mri", None) is None:
+            raise ValueError("The owning session has no MRI collection.")
+
+        scans = list(owner.mri.scans)
+        positions = {}
+
+        for index, scan in enumerate(scans):
+            positions.setdefault(scan.uuid, []).append(index)
+
+        if scanIndices is None:
+            selected = []
+            for scanUUID in byScan:
+                matches = positions.get(scanUUID, [])
+                if len(matches) != 1:
+                    raise ValueError("A motion scan is absent or ambiguous in the current MRI collection.")
+                selected.append(matches[0])
+        else:
+            if not isinstance(scanIndices, (list, tuple)) or not scanIndices:
+                raise ValueError("scanIndices must be a nonempty list/tuple or None.")
+            selected = list(scanIndices)
+            if any(type(index) is not int or not 0 <= index < len(scans) for index in selected):
+                raise ValueError("Invalid zero-based session.mri.scans index.")
+            if len(set(selected)) != len(selected):
+                raise ValueError("scanIndices must not contain duplicates.")
+
+        def artifactPath(role):
+            """Resolve exact bytes through the existing attachment interface."""
+            artifact = record["artifacts"][role]
+            attachment = owner.derivedFiles.get(artifact["attachmentName"])
+            if attachment is None:
+                raise ValueError(f"Motion artifact {role!r} is unavailable or was discarded.")
+
+            expected = {key: artifact[key] for key in ("sha256", "size_bytes")}
+            if any(attachment.get(key) != value for key, value in expected.items()):
+                raise ValueError(f"Attachment identity differs from motion artifact {role!r}.")
+
+            path = owner.getDerivedFile(artifact["attachmentName"], cacheDirectory=cacheDirectory)
+            if path is None: raise ValueError(f"Motion artifact {role!r} could not be retrieved.")
+            path = Path(path)
+
+            if pglExternalTool._fileIdentity(path) != expected:
+                raise ValueError(f"Motion artifact {role!r} failed byte verification.")
+            return path
+
+        prepared = []
+
+        # Validate all requested data before creating any figures.
+        for index in selected:
+            scan = scans[index]
+            if len(positions[scan.uuid]) != 1:
+                raise ValueError("The selected acquisition UUID appears more than once.")
+            if scan.uuid not in byScan:
+                raise ValueError(f"Motion product does not cover MRI scan {index}.")
+
+            entry = byScan[scan.uuid]
+            count = len(entry["volumeIndices"])
+            matrices = np.loadtxt(artifactPath(entry["matricesRole"]), comments="#", ndmin=2)
+            parameters = np.loadtxt(artifactPath(entry["motionParametersRole"]), comments="#", ndmin=2)
+
+            if matrices.shape != (count, 12) or not np.isfinite(matrices).all():
+                raise ValueError("Motion matrix file has invalid dimensions or values.")
+            if parameters.shape != (count, 6) or not np.isfinite(parameters).all():
+                raise ValueError("Motion parameter file has invalid dimensions or values.")
+
+            interpreted = entry["interpretation"]
+            storedRows = np.array([
+                np.asarray(transform["matrix"])[:3].reshape(-1)
+                for transform in interpreted["nativeTransforms"]
+            ])
+            if not np.allclose(matrices, storedRows, rtol=0, atol=1e-10):
+                raise ValueError("Native matrix file disagrees with the product's interpreted matrices.")
+
+            timing = entry["timing"]
+            cls.motionSummary(
+                interpreted["voxelTransforms"],
+                volumeIndices=entry["volumeIndices"],
+                referenceVolumeIndex=entry["referenceVolumeIndex"],
+                trSeconds=timing["trSeconds"],
+                volumeTimesSeconds=timing["volumeTimesSeconds"],
+                measurementPointRASMM=measurementPointRASMM,
+            )
+            prepared.append((index, scan.name, entry))
+
+        figures = []
+        for index, name, entry in prepared:
+            timing = entry["timing"]
+            figure = cls.displayMotion(
+                entry["interpretation"]["voxelTransforms"],
+                volumeIndices=entry["volumeIndices"],
+                referenceVolumeIndex=entry["referenceVolumeIndex"],
+                trSeconds=timing["trSeconds"],
+                volumeTimesSeconds=timing["volumeTimesSeconds"],
+                measurementPointRASMM=measurementPointRASMM,
+                showAffineComponents=showAffineComponents,
+                title=f"{product.name} — MRI scan {index}: {name}",
+            )
+            if figure is not None: figures.append(figure)
+
+        return figures
+    
+    
