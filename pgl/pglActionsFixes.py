@@ -19,6 +19,8 @@ from .pglStorage import pglStorage
 from .pglPipeline import pglActionStatus
 import json
 import posixpath
+from .pglSession import pglSession
+import numpy as np
 
 class pglActionsFixes:
 
@@ -663,3 +665,589 @@ class pglActionsFixes:
                 runData.events = events
 
             return self.session
+        
+    ################################################################
+    # Fix behavioral MRI volume-trigger times
+    ################################################################
+    class fixVolumeTimes(pglAction):
+        """Repair canonical volume-trigger events independently in each run.
+
+        Uses the median recorded interval and the preceding retained/corrected
+        trigger as the local timing reference. This assumes a fixed acquisition
+        volume time but does not correct accumulated subthreshold timing shifts.
+        
+        Automatic repairs:
+            addMissing inserts missing grid events.
+            adjustTiming moves recorded triggers onto the grid when their
+            discrepancy is at least discrepancyMs.
+
+        Boundary edits follow automatic repairs:
+            Positive startVolumes/endVolumes add evenly spaced triggers.
+            Negative values remove triggers from that boundary.
+
+        With nVols:
+            If neither boundary edit is supplied, adjust the end to reach
+            nVols. Otherwise require the explicitly edited count to match.
+            Explicit zero is a supplied boundary edit.
+
+        A long final gap is protected unless it is within 100 ms of twice
+        the median. Its final trigger is retained without automatic repair.
+        Explicit boundary edits or nVols may still remove it.
+
+        Replaces selected run.data objects only after all plans validate.
+        Original acquisition files and acquisition state remain unchanged.
+        Non-volume events retain their objects and relative ordering.
+        Repair history is stored on data.volumeTimingRepairs.
+
+        Boundary additions/removals are not idempotent: running the action
+        again applies those requested edits again.
+        """
+
+        runIndices = List(Int(), default_value=None, allow_none=True, help="Zero-based run indices; None selects all behavioral runs.")
+        discrepancyMs = Float(20.0, min=0.0, help="Minimum discrepancy in milliseconds for automatic correction.")
+        shortIntervalMs = Float(5.0, min=0.0, help="Warn when consecutive recorded volume triggers are closer than this many milliseconds. Zero disables the warning.")
+        addMissing = Bool(True, help="Insert inferred missing volume-trigger events.")
+        adjustTiming = Bool(True, help="Correct early or late volume-trigger timestamps.")
+        nVols = Int(default_value=None, allow_none=True, min=0, help="Required final number of volumes in each selected run.")
+        startVolumes = Int(default_value=None, allow_none=True, help="Add volumes at the beginning; negative values remove volumes.")
+        endVolumes = Int(default_value=None, allow_none=True, help="Add volumes at the end; negative values remove volumes.")
+
+        ################################################################
+        # Configure repair settings
+        ################################################################
+        def configure(self, **kwargs):
+            from .pglPipeline import pglActionStatus
+
+            self.status = pglActionStatus.INITIALIZED
+            self.error = None
+
+            # Accept a single zero-based run index or a collection of indices.
+            if "runIndices" in kwargs and kwargs["runIndices"] is not None:
+                runIndices = kwargs["runIndices"]
+                if type(runIndices) is int: runIndices = [runIndices]
+                if not isinstance(runIndices, (list, tuple)) or any(type(index) is not int for index in runIndices):
+                    raise TypeError("runIndices must be an integer, a list/tuple of integers, or None.")
+                kwargs["runIndices"] = list(runIndices)
+
+            # Reject Boolean counts before traitlets can interpret them as integers.
+            for name in ("nVols", "startVolumes", "endVolumes"):
+                if name in kwargs and kwargs[name] is not None and type(kwargs[name]) is not int:
+                    raise TypeError(f"{name} must be an integer or None.")
+
+            if "discrepancyMs" in kwargs and isinstance(kwargs["discrepancyMs"], bool):
+                raise TypeError("discrepancyMs must be a number, not Boolean.")
+
+            for name in ("addMissing", "adjustTiming"):
+                if name in kwargs and type(kwargs[name]) is not bool:
+                    raise TypeError(f"{name} must be Boolean.")
+
+            self.configureTraits(**kwargs)
+            self._validateOptions()
+            super().configure()
+
+        ################################################################
+        # Warn about unusually close recorded volume triggers
+        ################################################################
+        def _warnShortVolumeIntervals(self, times, runIndex):
+            import math
+
+            if not math.isfinite(self.shortIntervalMs) or self.shortIntervalMs < 0:
+                raise ValueError("shortIntervalMs must be finite and nonnegative.")
+            if self.shortIntervalMs == 0: return
+
+            # Inspect original intervals, not timestamps generated by repairs.
+            for index in range(1, len(times)):
+                intervalMs = (times[index] - times[index - 1]) * 1000.0
+                if 0 <= intervalMs < self.shortIntervalMs:
+                    pglMessages.warning(f"Run {runIndex}: triggers {index} → {index + 1} are only {intervalMs:.3f} ms apart (warning threshold: {self.shortIntervalMs:g} ms). Possible duplicate or spurious trigger; review before relying on automatic repairs.", level=1)
+                            
+        ################################################################
+        # Validate settings again at execution
+        ################################################################
+        def _validateOptions(self):
+            import math
+
+            if not math.isfinite(self.discrepancyMs) or self.discrepancyMs < 0:
+                raise ValueError("discrepancyMs must be finite and nonnegative.")
+
+            if self.runIndices is not None:
+                if not self.runIndices: raise ValueError("runIndices must not be empty; use None for all runs.")
+                if any(type(index) is not int or index < 0 for index in self.runIndices):
+                    raise ValueError("runIndices must contain nonnegative integer indices.")
+                if len(set(self.runIndices)) != len(self.runIndices):
+                    raise ValueError("runIndices must not contain duplicates.")
+
+            for name in ("nVols", "startVolumes", "endVolumes"):
+                value = getattr(self, name)
+                if value is not None and type(value) is not int:
+                    raise TypeError(f"{name} must be an integer or None.")
+
+            if self.nVols is not None and self.nVols < 0:
+                raise ValueError("nVols must be nonnegative.")
+
+        ################################################################
+        # Merge repaired volumes without reordering other recorded events
+        ################################################################
+        @staticmethod
+        def _mergeVolumeEvents(originalEvents, volumeEvents):
+            import math
+            from numbers import Real
+
+            mergedEvents = []
+            volumeIndex = 0
+
+            # Source events may arrive out of timestamp order. Preserve their
+            # relative order rather than globally sorting the acquisition log.
+            for event in originalEvents:
+                if event.type == "volumeTrigger": continue
+                timestamp = getattr(event, "timestamp", None)
+
+                if isinstance(timestamp, Real) and math.isfinite(float(timestamp)):
+                    while volumeIndex < len(volumeEvents) and volumeEvents[volumeIndex].timestamp <= timestamp:
+                        mergedEvents.append(volumeEvents[volumeIndex])
+                        volumeIndex += 1
+
+                mergedEvents.append(event)
+
+            mergedEvents.extend(volumeEvents[volumeIndex:])
+            return mergedEvents
+
+            ################################################################
+        # Prepare one run without changing its current contents
+        ################################################################
+        def _prepareRun(self, run, runIndex):
+            import math
+            from copy import deepcopy
+            from numbers import Real
+            from .pglExperiment import pglEventVolumeTrigger
+
+            data = run.data
+            if data is None: raise ValueError(f"Run {runIndex}: experiment data is unavailable.")
+
+            originalEvents = list(data.events)
+            volumeRecords = [(index, event) for index, event in enumerate(originalEvents) if event.type == "volumeTrigger"]
+            if len(volumeRecords) < 2:
+                raise ValueError(f"Run {runIndex}: at least two volume triggers are required to estimate volume time.")
+
+            times = []
+            for eventIndex, event in volumeRecords:
+                timestamp = event.timestamp
+                if isinstance(timestamp, bool) or not isinstance(timestamp, Real) or not math.isfinite(float(timestamp)):
+                    raise ValueError(f"Run {runIndex}: invalid volume timestamp at event index {eventIndex}.")
+                times.append(float(timestamp))
+
+            # Warn about unusually close original triggers before checking order.
+            self._warnShortVolumeIntervals(times, runIndex)
+
+            intervals = np.diff(times)
+            if not np.isfinite(intervals).all() or np.any(intervals <= 0):
+                raise ValueError(f"Run {runIndex}: volume intervals must be finite and strictly positive.")
+
+            volumeTime = float(np.median(intervals))
+            threshold = self.discrepancyMs / 1000.0
+            changes = []
+            volumes = []
+            correctedTimes = list(times)
+            correctedEvents = [deepcopy(event) for _, event in volumeRecords]
+
+            # Use the smaller integer at an exact half-interval tie.
+            def nearestMultiple(value):
+                return max(1, int(math.ceil(value - 0.5)))
+
+            def worthFixing(error):
+                return abs(error) > 1e-9 and abs(error) >= threshold - 1e-9
+
+            def addVolume(timestamp, reason):
+                timestamp = float(timestamp)
+                if not math.isfinite(timestamp): raise ValueError(f"Run {runIndex}: generated a nonfinite timestamp.")
+                event = pglEventVolumeTrigger(timestamp=timestamp)
+                changes.append({"operation": "insert", "reason": reason, "timestamp": timestamp})
+                return event
+
+            # A long final gap may end with a manually supplied trigger.
+            # Do not manufacture a scan's worth of events across that gap.
+            finalInterval = float(intervals[-1])
+            finalMultiple = nearestMultiple(finalInterval / volumeTime)
+            closeToDouble = finalMultiple == 2 and abs(finalInterval - 2 * volumeTime) <= 0.100 + 1e-9
+            protectedFinal = finalInterval > 1.5 * volumeTime and not closeToDouble
+
+            ################################################################
+            # Identify isolated timing errors using original neighbors
+            ################################################################
+            candidates = {}
+
+            # Neighbor predictions must agree more closely than the correction
+            # threshold, capped at 10% of a volume interval.
+            supportTolerance = max(1e-9, min(threshold, 0.1 * volumeTime))
+
+            if self.adjustTiming:
+                for position in range(1, len(times) - 1):
+                    # A protected manual ending trigger is not a timing anchor.
+                    if protectedFinal and position + 1 == len(times) - 1: continue
+
+                    leftInterval = times[position] - times[position - 1]
+                    rightInterval = times[position + 1] - times[position]
+
+                    # Very short intervals may represent duplicate/spurious events.
+                    # Warn through the existing helper, but do not move them here.
+                    if min(leftInterval, rightInterval) * 1000.0 < self.shortIntervalMs: continue
+
+                    leftMultiple = nearestMultiple(leftInterval / volumeTime)
+                    rightMultiple = nearestMultiple(rightInterval / volumeTime)
+                    leftError = leftInterval - leftMultiple * volumeTime
+                    rightError = rightInterval - rightMultiple * volumeTime
+
+                    # An isolated late trigger produces a long interval followed
+                    # by a short one; an early trigger produces the reverse.
+                    if leftError * rightError >= 0: continue
+                    if not worthFixing(leftError) or not worthFixing(rightError): continue
+
+                    expectedFromLeft = times[position - 1] + leftMultiple * volumeTime
+                    expectedFromRight = times[position + 1] - rightMultiple * volumeTime
+                    if abs(expectedFromLeft - expectedFromRight) > supportTolerance + 1e-9: continue
+
+                    expectedTime = (expectedFromLeft + expectedFromRight) / 2.0
+                    if not worthFixing(times[position] - expectedTime): continue
+                    if not times[position - 1] < expectedTime < times[position + 1]: continue
+
+                    candidates[position] = {
+                        "timestamp": expectedTime,
+                        "leftTimestamp": times[position - 1],
+                        "rightTimestamp": times[position + 1],
+                        "expectedFromLeft": expectedFromLeft,
+                        "expectedFromRight": expectedFromRight,
+                    }
+
+            # Adjacent candidates depend on anchors that would themselves move.
+            # Retain both rather than arbitrarily choosing which trigger is wrong.
+            ambiguousPositions = {
+                position for position in candidates
+                if position - 1 in candidates or position + 1 in candidates
+            }
+
+            for position, candidate in candidates.items():
+                if position in ambiguousPositions: continue
+
+                expectedTime = candidate["timestamp"]
+                correctedTimes[position] = expectedTime
+                correctedEvents[position].timestamp = expectedTime
+                changes.append({
+                    "operation": "adjust",
+                    "originalEventIndex": volumeRecords[position][0],
+                    "originalTriggerNumber": position + 1,
+                    "originalTimestamp": times[position],
+                    "timestamp": expectedTime,
+                    "leftTimestamp": candidate["leftTimestamp"],
+                    "rightTimestamp": candidate["rightTimestamp"],
+                    "expectedFromLeft": candidate["expectedFromLeft"],
+                    "expectedFromRight": candidate["expectedFromRight"],
+                    "shiftMs": (expectedTime - times[position]) * 1000.0,
+                })
+
+            ################################################################
+            # Infer missing events without propagating timestamp corrections
+            ################################################################
+            unresolvedIntervals = []
+            volumes.append(correctedEvents[0])
+
+            for position in range(1, len(times)):
+                # Preserve the protected final event unless explicit boundary
+                # edits or the requested final count remove it later.
+                if protectedFinal and position == len(times) - 1:
+                    volumes.append(correctedEvents[position])
+                    continue
+
+                leftTime = correctedTimes[position - 1]
+                rightTime = correctedTimes[position]
+                interval = rightTime - leftTime
+                if interval <= 0:
+                    raise ValueError(f"Run {runIndex}: isolated corrections produced overlapping trigger times.")
+
+                multiple = nearestMultiple(interval / volumeTime)
+                nMissing = multiple - 1
+                timingError = interval - multiple * volumeTime
+
+                # The final interval only permits one inferred missing volume,
+                # and only when the original gap was close to twice the median.
+                if position == len(times) - 1 and nMissing and (nMissing != 1 or not closeToDouble):
+                    volumes.append(correctedEvents[position])
+                    protectedFinal = True
+                    continue
+
+                if self.addMissing and nMissing and worthFixing(interval - volumeTime):
+                    # Interpolate between retained anchors. This fills the gap
+                    # without shifting the subsequent recorded trigger sequence.
+                    for missingIndex in range(1, multiple):
+                        missingTime = leftTime + interval * missingIndex / multiple
+                        volumes.append(addVolume(missingTime, "missing"))
+
+                if worthFixing(timingError):
+                    unresolvedIntervals.append({
+                        "firstTrigger": position,
+                        "secondTrigger": position + 1,
+                        "interval": interval,
+                        "expectedInterval": multiple * volumeTime,
+                        "errorMs": timingError * 1000.0,
+                    })
+
+                volumes.append(correctedEvents[position])
+
+            ################################################################
+            # Apply explicit boundary changes
+            ################################################################
+            def editBoundary(count, atStart, reason):
+                nonlocal volumes
+                if not count: return
+
+                if count < 0:
+                    nRemove = -count
+                    if nRemove > len(volumes):
+                        raise ValueError(f"Run {runIndex}: {reason} removes {nRemove} volumes but only {len(volumes)} remain.")
+
+                    removed = volumes[:nRemove] if atStart else volumes[-nRemove:]
+                    for event in removed:
+                        changes.append({"operation": "remove", "reason": reason, "timestamp": float(event.timestamp)})
+
+                    volumes = volumes[nRemove:] if atStart else volumes[:-nRemove]
+                    return
+
+                if not volumes:
+                    raise ValueError(f"Run {runIndex}: cannot add boundary volumes without a remaining trigger to anchor them.")
+
+                boundaryTime = float(volumes[0].timestamp if atStart else volumes[-1].timestamp)
+                if atStart:
+                    added = [addVolume(boundaryTime - step * volumeTime, reason) for step in range(count, 0, -1)]
+                    volumes = added + volumes
+                else:
+                    added = [addVolume(boundaryTime + step * volumeTime, reason) for step in range(1, count + 1)]
+                    volumes.extend(added)
+
+            editBoundary(self.startVolumes, True, "startVolumes")
+            editBoundary(self.endVolumes, False, "endVolumes")
+
+            if self.nVols is not None:
+                explicitBoundary = self.startVolumes is not None or self.endVolumes is not None
+
+                if explicitBoundary and len(volumes) != self.nVols:
+                    raise ValueError(f"Run {runIndex}: explicit boundary edits produce {len(volumes)} volumes, conflicting with nVols={self.nVols}.")
+
+                if not explicitBoundary:
+                    editBoundary(self.nVols - len(volumes), False, "nVols")
+
+            finalTimes = np.asarray([event.timestamp for event in volumes], dtype=float)
+            if not np.isfinite(finalTimes).all() or np.any(np.diff(finalTimes) <= 0):
+                raise ValueError(f"Run {runIndex}: requested repairs produce overlapping or reversed volume timestamps.")
+
+            report = {
+                "runIndex": runIndex,
+                "method": "isolatedNeighborSupport",
+                "volumeTime": volumeTime,
+                "anchorTime": times[0],
+                "originalCount": len(volumeRecords),
+                "finalCount": len(volumes),
+                "protectedFinal": protectedFinal,
+                "discrepancyMs": self.discrepancyMs,
+                "shortIntervalMs": self.shortIntervalMs,
+                "supportToleranceMs": supportTolerance * 1000.0,
+                "addMissing": self.addMissing,
+                "adjustTiming": self.adjustTiming,
+                "nVols": self.nVols,
+                "startVolumes": self.startVolumes,
+                "endVolumes": self.endVolumes,
+                "ambiguousTriggers": [position + 1 for position in sorted(ambiguousPositions)],
+                "unresolvedIntervals": unresolvedIntervals,
+                "changes": changes,
+            }
+
+            # No-op runs retain their original data object and event identities.
+            replacement = data
+            if changes:
+                history = getattr(data, "volumeTimingRepairs", [])
+                if not isinstance(history, list):
+                    raise ValueError(f"Run {runIndex}: volumeTimingRepairs must be a list.")
+
+                replacement = deepcopy(data)
+                replacement.events = self._mergeVolumeEvents(originalEvents, volumes)
+                replacement.volumeTimingRepairs = deepcopy(history) + [report]
+
+            return {"run": run, "original": data, "replacement": replacement, "report": report}
+
+            ################################################################
+            # Apply explicit boundary changes
+            ################################################################
+            def editBoundary(count, atStart, reason):
+                nonlocal volumes
+                if not count: return
+
+                if count < 0:
+                    nRemove = -count
+                    if nRemove > len(volumes):
+                        raise ValueError(f"Run {runIndex}: {reason} removes {nRemove} volumes but only {len(volumes)} remain.")
+
+                    removed = volumes[:nRemove] if atStart else volumes[-nRemove:]
+                    for event in removed:
+                        changes.append({"operation": "remove", "reason": reason, "timestamp": float(event.timestamp)})
+
+                    volumes = volumes[nRemove:] if atStart else volumes[:-nRemove]
+                    return
+
+                if not volumes:
+                    raise ValueError(f"Run {runIndex}: cannot add boundary volumes without a remaining trigger to anchor them.")
+
+                boundaryTime = float(volumes[0].timestamp if atStart else volumes[-1].timestamp)
+                if atStart:
+                    added = [addVolume(boundaryTime - step * volumeTime, reason) for step in range(count, 0, -1)]
+                    volumes = added + volumes
+                else:
+                    added = [addVolume(boundaryTime + step * volumeTime, reason) for step in range(1, count + 1)]
+                    volumes.extend(added)
+
+            editBoundary(self.startVolumes, True, "startVolumes")
+            editBoundary(self.endVolumes, False, "endVolumes")
+
+            if self.nVols is not None:
+                explicitBoundary = self.startVolumes is not None or self.endVolumes is not None
+
+                if explicitBoundary and len(volumes) != self.nVols:
+                    raise ValueError(f"Run {runIndex}: explicit boundary edits produce {len(volumes)} volumes, conflicting with nVols={self.nVols}.")
+
+                if not explicitBoundary:
+                    editBoundary(self.nVols - len(volumes), False, "nVols")
+
+            finalTimes = np.asarray([event.timestamp for event in volumes], dtype=float)
+            if not np.isfinite(finalTimes).all() or np.any(np.diff(finalTimes) <= 0):
+                raise ValueError(f"Run {runIndex}: requested repairs produce overlapping or reversed volume timestamps.")
+
+            report = {
+                "runIndex": runIndex,
+                "method": "localReference",
+                "volumeTime": volumeTime,
+                "anchorTime": times[0],
+                "originalCount": len(volumeRecords),
+                "finalCount": len(volumes),
+                "protectedFinal": protectedFinal,
+                "discrepancyMs": self.discrepancyMs,
+                "shortIntervalMs": self.shortIntervalMs,
+                "addMissing": self.addMissing,
+                "adjustTiming": self.adjustTiming,
+                "nVols": self.nVols,
+                "startVolumes": self.startVolumes,
+                "endVolumes": self.endVolumes,
+                "changes": changes,
+            }
+
+            # No-op runs retain their original data object and event identities.
+            replacement = data
+            if changes:
+                history = getattr(data, "volumeTimingRepairs", [])
+                if not isinstance(history, list):
+                    raise ValueError(f"Run {runIndex}: volumeTimingRepairs must be a list.")
+
+                replacement = deepcopy(data)
+                replacement.events = self._mergeVolumeEvents(originalEvents, volumes)
+                replacement.volumeTimingRepairs = deepcopy(history) + [report]
+
+            return {"run": run, "original": data, "replacement": replacement, "report": report}
+
+        ################################################################
+        # Report the expected timing reference and planned changes
+        ################################################################
+        @staticmethod
+        def _printPlan(report):
+            changes = report["changes"]
+            nInserted = sum(change["operation"] == "insert" for change in changes)
+            nAdjusted = sum(change["operation"] == "adjust" for change in changes)
+            nRemoved = sum(change["operation"] == "remove" for change in changes)
+
+            pglMessages.message(f"Run {report['runIndex']}: median volume time={report['volumeTime']:.6f} s; correction threshold={report['discrepancyMs']:g} ms.")
+            pglMessages.message(f"  Correct isolated triggers only when their original neighboring triggers predict times agreeing within {report['supportToleranceMs']:g} ms.")
+            pglMessages.message("  Missing triggers are interpolated between retained anchors; persistent timing shifts are not propagated or regularized.")
+            pglMessages.message(f"  Volumes: {report['originalCount']} → {report['finalCount']}; insert={nInserted}, adjust={nAdjusted}, remove={nRemoved}.")
+
+            if report["originalCount"] == 2:
+                pglMessages.warning("Only one recorded interval is available; missing or mistimed triggers cannot be independently established.", level=1)
+
+            if report["protectedFinal"]:
+                pglMessages.message("  Final trigger excluded from automatic repair because its gap may reflect a manual ending trigger. Explicit count/boundary edits still apply.")
+                pglMessages.message("  If retained, this final trigger still contributes to the current print summary's timing statistics.")
+
+            if report["ambiguousTriggers"]:
+                pglMessages.warning(f"Run {report['runIndex']}: adjacent correction candidates were retained because their anchors are ambiguous. Original trigger numbers: {report['ambiguousTriggers']}.", level=1)
+
+            unresolved = report["unresolvedIntervals"]
+            if unresolved:
+                reason = "insufficient support for an isolated correction" if report["adjustTiming"] else "timestamp adjustment disabled"
+                pglMessages.warning(f"Run {report['runIndex']}: {len(unresolved)} interval timing discrepancies remain before boundary edits ({reason}). These were not fixed and may still be flagged by print()/display().", level=1)
+
+                for record in unresolved:
+                    pglMessages.message(f"  Retained trigger interval {record['firstTrigger']} → {record['secondTrigger']}: {record['interval']:.6f} s; expected={record['expectedInterval']:.6f} s; error={record['errorMs']:+.3f} ms.")
+
+            for change in changes:
+                if change["operation"] == "adjust":
+                    pglMessages.message(f"  Adjust trigger {change['originalTriggerNumber']}: {change['originalTimestamp']:.6f} → {change['timestamp']:.6f} s ({change['shiftMs']:+.1f} ms).")
+                    pglMessages.message(f"    Neighbor predictions: {change['expectedFromLeft']:.6f} s from preceding trigger, {change['expectedFromRight']:.6f} s from following trigger; using their midpoint.")
+                else:
+                    pglMessages.message(f"  {change['operation'].capitalize()} volume at {change['timestamp']:.6f} s ({change['reason']}).")
+                          
+        ################################################################
+        # Validate all runs before installing repaired data
+        ################################################################
+        def _run(self, session: pglSession) -> pglSession:
+            self._validateOptions()
+
+            if not isinstance(session, pglSession):
+                self.setError("fixVolumeTimes requires a pglSession.")
+                return None
+
+            runs = list(session.runs or [])
+            if not runs:
+                self.setError("Session has no behavioral runs.")
+                return None
+
+            indices = list(range(len(runs))) if self.runIndices is None else list(self.runIndices)
+            if any(index >= len(runs) for index in indices):
+                self.setError(f"runIndices is outside this session's {len(runs)} runs.")
+                return None
+
+            # Existing behavioral matrices are snapshots, not live event views.
+            # Refuse rather than silently leave one inconsistent with repaired events.
+            if "behavior" in session.dataMatrices:
+                self.setError("Fix volume times before constructing the session's behavior matrix. An attached behavior matrix would become stale.")
+                return None
+
+            plans = []
+            try:
+                for runIndex in indices:
+                    plans.append(self._prepareRun(runs[runIndex], runIndex))
+
+                # Aliased run/data objects would make independent edits ambiguous.
+                if len({id(plan["run"]) for plan in plans}) != len(plans):
+                    raise ValueError("Selected runs contain duplicate run objects.")
+                if len({id(plan["original"]) for plan in plans}) != len(plans):
+                    raise ValueError("Selected runs share the same experiment data object.")
+
+            except (ValueError, TypeError) as error:
+                self.setError(f"Volume repair refused: {error}")
+                return None
+
+            for plan in plans: self._printPlan(plan["report"])
+
+            # Restore original data references if an assignment/observer fails.
+            # This cannot roll back arbitrary external observer side effects.
+            installed = []
+            try:
+                for plan in plans:
+                    if plan["replacement"] is plan["original"]: continue
+                    installed.append(plan)
+                    plan["run"].data = plan["replacement"]
+
+            except BaseException as error:
+                for plan in reversed(installed):
+                    try:
+                        plan["run"].data = plan["original"]
+                    except BaseException as rollbackError:
+                        if hasattr(error, "add_note"): error.add_note(f"Could not restore run data: {rollbackError}")
+                raise
+
+            pglMessages.message("Volume-time repair complete. Changes are in memory; use saveSession() to publish a derived checkpoint.")
+            return session
