@@ -1376,10 +1376,20 @@ class pglMRI(pglActionable):
         """Restore acquisition metadata and deferred MRI file references."""
         return pglMRIBundle.loadAcquisition(dataPath, filesystem=filesystem, cacheDirectory=cacheDirectory)
     
-    def print(self, *, verbose=False, readHeaders=True):
-        """Print one geometry summary line per scan.
+    def print(self, *, match=None, verbose=False, readHeaders=True):
+        """Print aligned geometry summaries for all or matching scans.
 
-        Uses the original filename and Flywheel acquisition label when available.
+        match optionally selects scans whose acquisition label contains the
+        supplied string, ignoring case. Filtering occurs before header reads.
+        Scan numbers retain their original one-based collection positions.
+
+        Prints the acquisition label first, followed by HH:MM and scan info.
+        The acquisition date and timezone appear immediately before the filename.
+        Scan numbers and information columns align across selected scans.
+
+        Uses Flywheel's session timezone, falling back to computer-local time.
+        Naive timestamps remain unchanged and are labeled explicitly.
+
         verbose=True adds qform/sform codes and matrices below each summary.
         readHeaders=False avoids opening source files.
 
@@ -1387,8 +1397,14 @@ class pglMRI(pglActionable):
         Transform matrices retain the original header's spatial units.
         """
         import math
+        from pathlib import Path
+        from .pglProgress import pglProgress
 
-        if not self.scans:
+        if match is not None and not isinstance(match, str):
+            raise TypeError("match must be a string or None.")
+
+        scans = list(self.scans)
+        if not scans:
             print("No MRI scans.")
             return
 
@@ -1401,7 +1417,7 @@ class pglMRI(pglActionable):
             return "unknown" if values is None else "[" + ", ".join(formatNumber(value) for value in values) + "]"
 
         def getScanLabel(scan):
-            """Resolve the original filename and acquisition label."""
+            """Resolve the acquisition label and original filename separately."""
             filename = None
             label = None
 
@@ -1441,7 +1457,11 @@ class pglMRI(pglActionable):
                 else:
                     filename = scan.name or "unnamed"
 
-            return f"{filename} ({label})" if label else filename
+            # Do not repeat a filename as the leading acquisition label.
+            if not label:
+                label = scan.name if scan.name and scan.name != filename else "(unlabeled)"
+
+            return label, filename
 
         def printMatrix(matrix):
             """Print a 4x4 matrix with aligned columns."""
@@ -1458,7 +1478,7 @@ class pglMRI(pglActionable):
             for row in rows:
                 columns = "  ".join(value.rjust(width) for value, width in zip(row, widths))
                 print(f"      [{columns}]")
-                
+
         def formatFileSize(scan):
             """Format stored file size in MB or GB with one significant digit."""
             size = None
@@ -1486,35 +1506,119 @@ class pglMRI(pglActionable):
             value, unit = (size / 1_000_000, "MB") if size < 1_000_000_000 else (size / 1_000_000_000, "GB")
             rounded = float(f"{value:.1g}")
             return f"{rounded:,.0f} {unit}" if rounded >= 1 or rounded == 0 else f"{rounded:g} {unit}"
-        
+
         def formatAcquisitionTime(scan):
-            """Format acquisition time without changing its recorded timezone."""
+            """Return separate HH:MM and date/timezone strings.
+
+            Missing or unusable session timezones fall back to computer-local
+            time. Naive timestamps remain unchanged; their timezone is unknown.
+            Original source metadata is never modified.
+            """
             from datetime import datetime
+            from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
             # Use the scan acquisition timestamp, not database creation time.
-            acquisition = scan.sourceMetadata.get("acquisition", {})
+            metadata = scan.sourceMetadata
+            if not isinstance(metadata, dict): return "unknown", "unknown"
+
+            acquisition = metadata.get("acquisition", {})
             timestamp = acquisition.get("timestamp") if isinstance(acquisition, dict) else None
-            if not isinstance(timestamp, str) or not timestamp.strip(): return "unknown"
 
-            # Accept ISO timestamps, including UTC timestamps ending in Z.
-            try:
-                acquired = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-            except ValueError:
-                return "unknown"
+            if isinstance(timestamp, datetime):
+                acquired = timestamp
+            elif isinstance(timestamp, str) and timestamp.strip():
+                # Accept ISO timestamps, including UTC timestamps ending in Z.
+                try:
+                    acquired = datetime.fromisoformat(timestamp.strip().replace("Z", "+00:00"))
+                except ValueError:
+                    return "unknown", "unknown"
+            else:
+                return "unknown", "unknown"
 
-            return acquired.strftime("%H:%M %m/%d/%Y")
-        
+            # Do not guess the meaning of a timestamp without an offset.
+            if acquired.tzinfo is None or acquired.utcoffset() is None:
+                return acquired.strftime("%H:%M"), f"{acquired:%m/%d/%Y} (timezone unspecified)"
+
+            sessionMetadata = metadata.get("session", {})
+            sessionTimezone = sessionMetadata.get("timezone") if isinstance(sessionMetadata, dict) else None
+            displayTimestamp = None
+
+            if isinstance(sessionTimezone, str) and sessionTimezone.strip():
+                try:
+                    displayTimestamp = acquired.astimezone(ZoneInfo(sessionTimezone.strip()))
+                except (ZoneInfoNotFoundError, ValueError, OverflowError, OSError):
+                    pglMessages.warning(f"Could not use scanner-session timezone {sessionTimezone!r} for {scan.name!r}; falling back to computer-local time.", level=1)
+
+            # Absent or empty timezone metadata is an ordinary fallback.
+            if displayTimestamp is None:
+                try:
+                    displayTimestamp = acquired.astimezone()
+                except (ValueError, OverflowError, OSError):
+                    displayTimestamp = acquired
+                    pglMessages.warning(f"Could not convert acquisition time for {scan.name!r} to computer-local time; retaining the source timezone.", level=1)
+
+            timezoneLabel = displayTimestamp.tzname() or displayTimestamp.strftime("%z")
+            return displayTimestamp.strftime("%H:%M"), f"{displayTimestamp:%m/%d/%Y} ({timezoneLabel})"
+
+        # Filter labels before reading headers or gathering file information.
+        # Preserve original scan numbers rather than renumbering matches.
+        selectedScans = []
+        matchText = match.casefold() if match is not None else None
+
+        for index, scan in enumerate(scans, start=1):
+            label, filename = getScanLabel(scan)
+            if matchText is not None and matchText not in label.casefold(): continue
+            selectedScans.append((index, scan, label, filename))
+
+        if not selectedScans:
+            print(f"No MRI scan labels match {match!r}.")
+            return
+
+        if match is not None:
+            print(f"{len(selectedScans)} of {len(scans)} MRI scans matched {match!r}.")
+
+        if not selectedScans: return
+
+        # Prepare summaries once so every column can use its longest value.
+        rows = []
+        with pglProgress("Gathering MRI scan information") as progress:
+            for position, (index, scan, label, filename) in enumerate(selectedScans):
+                # Progress measures completed scans, not downloaded bytes.
+                # Header requests can take different amounts of time per scan.
+                progress(position / len(selectedScans), f"Reading scan {position + 1}/{len(selectedScans)}: {label}")
+                summary = scan.getScanSummary(readHeaders=readHeaders)
+                acquisitionTime, acquisitionDate = formatAcquisitionTime(scan)
+
+                rows.append({
+                    "index": index,
+                    "label": label,
+                    "filename": filename,
+                    "summary": summary,
+                    "time": acquisitionTime,
+                    "date": acquisitionDate,
+                    "dims": f"dims={formatVector(summary['scanDims'])}",
+                    "voxelDims": f"voxelDims={formatVector(summary['voxelDims'])}mm",
+                    "fov": f"fov={formatVector(summary['fov'])}mm",
+                    "size": f"size={formatFileSize(scan)}",
+                    "extraDims": f"extraDims={formatVector(summary['extraDims'])}" if summary["extraDims"] else "",
+                })
+
+            progress.finish(f"Gathered information for {len(selectedScans)} MRI scans")
+
+        numberWidth = len(str(len(scans)))
+        labelWidth = max(len(row["label"]) for row in rows)
+        columnNames = ["time", "dims", "voxelDims", "fov", "size"]
+        if any(row["extraDims"] for row in rows): columnNames.append("extraDims")
+        columnNames.append("date")
+        columnWidths = {name: max(len(row[name]) for row in rows) for name in columnNames}
+
         # Preserve collection order and number scans starting at one.
-        for index, scan in enumerate(self.scans, start=1):
-            summary = scan.getScanSummary(readHeaders=readHeaders)
-            label = getScanLabel(scan)
-            dims = formatVector(summary["scanDims"])
-            voxelDims = formatVector(summary["voxelDims"])
-            fov = formatVector(summary["fov"])
+        for row in rows:
+            summary = row["summary"]
+            information = "  ".join(row[name].ljust(columnWidths[name]) for name in columnNames)
 
             # Keep the ordinary summary on one line without hiding higher axes.
-            extra = f" extraDims={formatVector(summary['extraDims'])}" if summary["extraDims"] else ""
-            print(f"{index}: {label} {formatAcquisitionTime(scan)} dims={dims} voxelDims={voxelDims}mm fov={fov}mm size={formatFileSize(scan)}{extra}")
+            print(f"{row['index']:>{numberWidth}}: {row['label']:<{labelWidth}}  {information} : {row['filename']}")
 
             # Show both header transforms only when verbose output is requested.
             if verbose:
