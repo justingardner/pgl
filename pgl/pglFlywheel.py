@@ -84,36 +84,58 @@ class pglFlywheelSession(pglTraitSettings):
 
     @property
     def loadedScans(self):
-        """Load NIfTI files once, ordered by acquisition time."""
-        if self._scansLoaded:
-            return self.scans
+        """Load NIfTI files once, ordered by acquisition time.
+
+        Reads acquisition/file metadata only, not image payloads.
+        Missing or unusable timestamps sort last.
+        """
+        from datetime import datetime, timezone
+
+        if self._scansLoaded: return self.scans
 
         pglMessages.message(f"Loading scans: {self.name}")
 
         fw = _getFlywheelClient(self._connectionEnv)
-        flywheelSession = fw.get_session(self.id)
+
+        # Keep SDK exception details and authenticated URLs out of messages.
+        try:
+            flywheelSession = fw.get_session(self.id)
+            acquisitions = list(flywheelSession.acquisitions())
+        except Exception:
+            raise RuntimeError("Could not read Flywheel acquisition metadata.") from None
 
         # Sort acquisitions chronologically; missing timestamps go last.
         def acquisitionSortKey(acquisition):
             timestamp = getattr(acquisition, "timestamp", None)
-            return timestamp.timestamp() if timestamp is not None else float("inf")
+            if not isinstance(timestamp, datetime): return float("inf")
 
-        acquisitions = sorted(
-            flywheelSession.acquisitions(),
-            key=acquisitionSortKey,
-        )
+            try:
+                # A naive timestamp has no established absolute time.
+                # Do not silently interpret it in the viewing computer's timezone.
+                if timestamp.tzinfo is None or timestamp.utcoffset() is None: return float("inf")
+                return timestamp.astimezone(timezone.utc).timestamp()
+            except (ValueError, OverflowError, OSError):
+                return float("inf")
+
+        acquisitions.sort(key=acquisitionSortKey)
 
         # Build locally so a failed request does not cache partial results.
         # Files belonging to the same acquisition remain grouped together.
         scans = []
         for flywheelScan in acquisitions:
-            for flywheelFile in flywheelScan.files or []:
-                if flywheelFile.type == "nifti":
-                    scans.append(pglFlywheelScan(
-                        name=f"{flywheelScan.label}: {flywheelFile.name}",
-                        acquisitionID=flywheelScan.id,
-                        fileName=flywheelFile.name,
-                    ))
+            acquisitionID = getattr(flywheelScan, "id", None)
+            acquisitionLabel = getattr(flywheelScan, "label", None) or acquisitionID or "Unnamed acquisition"
+
+            for flywheelFile in getattr(flywheelScan, "files", None) or []:
+                if getattr(flywheelFile, "type", None) != "nifti": continue
+
+                fileName = getattr(flywheelFile, "name", None)
+                if not isinstance(acquisitionID, str) or not acquisitionID:
+                    raise ValueError("Cannot list a Flywheel NIfTI file without an acquisition ID.")
+                if not isinstance(fileName, str) or not fileName:
+                    raise ValueError("Cannot list a Flywheel NIfTI file without a filename.")
+
+                scans.append(pglFlywheelScan(name=f"{acquisitionLabel}: {fileName}", acquisitionID=acquisitionID, fileName=fileName))
 
         self.scans = scans
         self._scansLoaded = True
@@ -126,7 +148,8 @@ class pglFlywheelSession(pglTraitSettings):
 class pglFlywheelProject(pglTraitSettings):
     name = Unicode(help="Name of project", visible=False)
     id = Unicode(help="Identifier of project", visible=False)
-
+    showScanCounts = Bool(False, help="Fetch scan metadata for every session to show NIfTI counts. Can be slow.", visible=False)
+    
     sessions = List(
         Instance(pglFlywheelSession),
         help="Sessions in project",
@@ -140,35 +163,97 @@ class pglFlywheelProject(pglTraitSettings):
 
     @property
     def loadedSessions(self):
-        """Load this project's sessions once, without loading their scans."""
-        if self._sessionsLoaded:
-            return self.sessions
+        """Load this project's sessions, optionally counting NIfTI files.
+
+        With showScanCounts=False, scan metadata remains lazy.
+        True fetches acquisition/file metadata for each session and caches it.
+        Neither mode downloads image payloads.
+
+        Display aware timestamps in Flywheel's recorded session timezone.
+        Missing, invalid, or unavailable session timezones fall back to the
+        viewing computer's local timezone.
+
+        Naive timestamps remain unchanged and are labeled explicitly.
+        Missing timestamps fall back to the session label or ID.
+        Original Flywheel metadata remains unchanged.
+        """
+        from datetime import datetime
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+        if self._sessionsLoaded: return self.sessions
 
         pglMessages.message(f"Loading sessions: {self.name}")
 
         fw = _getFlywheelClient(self._connectionEnv)
         flywheelProject = fw.get_project(self.id)
 
+        # Preserve cached scans and checked selections when changing count display.
+        existingSessions = {session.id: session for session in self.sessions}
+
         # Use the project ID rather than searching by a potentially
         # nonunique project label.
         sessions = []
         for flywheelSession in flywheelProject.sessions():
-            timestamp = flywheelSession.timestamp
-            sessionName = (
-                timestamp.strftime("%Y-%m-%d %H:%M")
-                if timestamp is not None
-                else flywheelSession.label or flywheelSession.id
-            )
+            timestamp = getattr(flywheelSession, "timestamp", None)
+            sessionTimezone = getattr(flywheelSession, "timezone", None)
+            sessionID = getattr(flywheelSession, "id", None)
+            sessionLabel = getattr(flywheelSession, "label", None)
 
-            subject = flywheelSession.subject
+            # Session IDs are required for loading scans; do not invent one.
+            if not isinstance(sessionID, str) or not sessionID:
+                pglMessages.warning("Skipping a Flywheel session without a valid session ID.", level=1)
+                continue
+
+            sessionName = sessionLabel or sessionID
+
+            if timestamp is not None:
+                if not isinstance(timestamp, datetime):
+                    pglMessages.warning(f"Invalid timestamp for Flywheel session {sessionID}; displaying its label instead.", level=1)
+                elif timestamp.tzinfo is None or timestamp.utcoffset() is None:
+                    # Do not guess the meaning of a timestamp without an offset.
+                    sessionName = f"{timestamp:%Y-%m-%d %H:%M} (timezone unspecified)"
+                else:
+                    displayTimestamp = None
+
+                    if isinstance(sessionTimezone, str) and sessionTimezone.strip():
+                        try:
+                            displayTimestamp = timestamp.astimezone(ZoneInfo(sessionTimezone.strip()))
+                        except (ZoneInfoNotFoundError, ValueError, OverflowError, OSError):
+                            pglMessages.warning(f"Could not use Flywheel session timezone {sessionTimezone!r} for session {sessionID}; falling back to computer-local time.", level=1)
+
+                    # Absent or empty timezone metadata is an ordinary fallback.
+                    if displayTimestamp is None:
+                        try:
+                            displayTimestamp = timestamp.astimezone()
+                        except (ValueError, OverflowError, OSError):
+                            displayTimestamp = timestamp
+                            pglMessages.warning(f"Could not convert session {sessionID} to computer-local time; retaining the source timezone.", level=1)
+
+                    timezoneLabel = displayTimestamp.tzname() or displayTimestamp.strftime("%z")
+                    sessionName = f"{displayTimestamp:%Y-%m-%d %H:%M} {timezoneLabel}".rstrip()
+
+            subject = getattr(flywheelSession, "subject", None)
             subjectID = getattr(subject, "label", "") or ""
 
-            sessions.append(pglFlywheelSession(
-                name=sessionName,
-                subjectID=subjectID,
-                id=flywheelSession.id,
-                _connectionEnv=self._connectionEnv,
-            ))
+            session = existingSessions.get(sessionID)
+            if session is None:
+                session = pglFlywheelSession(name=sessionName, subjectID=subjectID, id=sessionID, _connectionEnv=self._connectionEnv)
+            else:
+                session.name = sessionName
+                session.subjectID = subjectID
+                session._connectionEnv = self._connectionEnv
+
+            # Count exactly the NIfTI entries offered by the scan chooser.
+            # Successful loading also caches those entries for later browsing.
+            if self.showScanCounts:
+                try:
+                    nScans = len(session.loadedScans)
+                    session.name = f"{sessionName} — {nScans} scans"
+                except (RuntimeError, ValueError):
+                    session.name = f"{sessionName} — scans unavailable"
+                    pglMessages.warning(f"Could not count scans for Flywheel session {sessionID}. Opening the session will retry.", level=1)
+
+            sessions.append(session)
 
         self.sessions = sessions
         self._sessionsLoaded = True
@@ -451,8 +536,15 @@ class pglFlywheel:
             # Clearing this local reference does not securely erase memory.
             apikey = None
 
-    def choose(self):
+    def choose(self, showScanCounts=False, dialogWidth=1100):
         """Browse Flywheel and return selected-file records.
+
+        showScanCounts=False keeps scan metadata lazy.
+        True fetches acquisition/file metadata for every session in a browsed
+        project to show NIfTI counts. No image payloads are downloaded.
+
+        dialogWidth requests a width in Qt logical pixels, limited to the
+        available screen. None uses the ordinary dialog width.
 
         Returns
         -------
@@ -463,6 +555,14 @@ class pglFlywheel:
             The dialog was cancelled or did not return settings.
             The previous selection remains unchanged.
         """
+        from copy import deepcopy
+        from .pglDialog import pglDialogs
+
+        if type(showScanCounts) is not bool:
+            raise TypeError("showScanCounts must be Boolean.")
+        if dialogWidth is not None and (type(dialogWidth) is not int or dialogWidth <= 0):
+            raise ValueError("dialogWidth must be a positive integer or None.")
+
         if self.fw is None:
             raise RuntimeError("Create a working Flywheel connection first.")
 
@@ -470,13 +570,16 @@ class pglFlywheel:
             pglMessages.message("No Flywheel projects are available.")
             return []
 
-        # Import only when interactive selection is requested.
-        # Use the existing subprocess dialog, including its serialization.
-        from .pglDialog import pglDialogs
+        # Apply browsing options to a copy so cancellation preserves selection.
+        selection = deepcopy(self.selection)
+        for project in selection.projects:
+            if project.showScanCounts != showScanCounts:
+                project.showScanCounts = showScanCounts
+                project._sessionsLoaded = False
 
-        selection = pglDialogs.traitsDialog(self.selection)
-        if selection is None:
-            return None
+        # Use the existing subprocess dialog, including its serialization.
+        selection = pglDialogs.traitsDialog(selection, width=dialogWidth)
+        if selection is None: return None
 
         if not isinstance(selection, pglFlywheelChoose):
             raise TypeError("The Flywheel dialog returned unexpected settings.")

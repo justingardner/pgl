@@ -554,17 +554,22 @@ class pglActions():
         selectedScans = List(Dict(), help="Ordered scan names and pinned source metadata")
         experimentName = Unicode("", help="Explicit PGL experiment label")
         subjectID = Unicode("", help="Session subject label")
+        showScanCounts = Bool(False, help="Show NIfTI counts in the session chooser. Fetches scan metadata for every session and can be slow.")
 
         # Runtime resources must not enter action history or pipeline recipes.
         _client = Any(default_value=None, allow_none=True).tag(serialize=False)
         _cacheDirectory = Unicode("").tag(serialize=False)
 
-        def configure(self, settingsName=None, *, experimentName=None, subjectID=None):
+        def configure(self, settingsName=None, *, experimentName=None, subjectID=None, showScanCounts=False):
             """Connect and choose scans using a saved import-settings profile.
 
             settingsName=None selects the default import-settings profile.
             The profile supplies the keychain identity and local cacheDir.
             Successful configuration records the resolved profile name.
+
+            showScanCounts=False keeps scan discovery lazy while browsing.
+            True fetches acquisition/file metadata for every session in a
+            browsed project to display NIfTI counts. This can be slow.
 
             Cancel or invalid input leaves this action unconfigured.
             No NIfTI payload is downloaded and no cache directory is created.
@@ -590,8 +595,15 @@ class pglActions():
             self.selectedScans = []
             self.experimentName = ""
             self.subjectID = ""
+            self.showScanCounts = False
             self._client = None
             self._cacheDirectory = ""
+
+            # Validate the browsing option before loading settings or connecting.
+            if type(showScanCounts) is not bool:
+                pglMessages.warning("Flywheel loading was not configured: showScanCounts must be Boolean.", level=1)
+                return
+            self.showScanCounts = showScanCounts
 
             # Validate the requested profile name before loading settings.
             if settingsName is not None:
@@ -607,13 +619,7 @@ class pglActions():
             # before connecting or opening the selection dialog.
             try:
                 cacheText = os.fspath(importSettings.cacheDir)
-                if (
-                    not isinstance(cacheText, str)
-                    or not cacheText.strip()
-                    or "://" in cacheText
-                    or "::" in cacheText
-                    or any(character in cacheText for character in ("\x00", "\n", "\r"))
-                ):
+                if not isinstance(cacheText, str) or not cacheText.strip() or "://" in cacheText or "::" in cacheText or any(character in cacheText for character in ("\x00", "\n", "\r")):
                     raise ValueError("Import settings cacheDir must be an ordinary local path.")
 
                 cachePath = str(Path(cacheText).expanduser().absolute())
@@ -630,7 +636,7 @@ class pglActions():
 
             # Browse and select scans. Cancellation leaves the action
             # unconfigured; toMRI() handles an empty accepted selection.
-            if flywheel.choose() is None: return
+            if flywheel.choose(showScanCounts=self.showScanCounts) is None: return
 
             # Validate a single session and pin the selected file versions.
             # This reads metadata only, without creating the cache directory.
@@ -650,13 +656,7 @@ class pglActions():
 
             # Retain portable metadata, not the temporary MRI collection.
             # Every execution constructs independent working scans.
-            records = [
-                {
-                    "name": scan.name,
-                    "sourceMetadata": pglMRIScan._copyMetadata(scan.sourceMetadata),
-                }
-                for scan in mri.scans
-            ]
+            records = [{"name": scan.name, "sourceMetadata": pglMRIScan._copyMetadata(scan.sourceMetadata)} for scan in mri.scans]
 
             # Commit the resolved profile name and accepted scan configuration.
             self.settingsName = importSettings.name

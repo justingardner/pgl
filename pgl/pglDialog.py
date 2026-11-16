@@ -2612,32 +2612,38 @@ class _WindowFigureCanvas(FigureCanvasQTAgg):
 #####################################################################
 class pglDialogs:
     @staticmethod
-    def traitsDialog(settings):
+    def traitsDialog(settings, width=None):
         """
         Pops up a PySide6 dialog in a separate process, blocks until closed,
         and returns edited settings (OK) or None (Cancel).
+
+        width optionally requests a dialog width in Qt logical pixels.
+        None preserves the normal dialog width.
+        The standalone process limits the requested width to the screen.
         """
+        if width is not None and (type(width) is not int or width <= 0):
+            raise ValueError("width must be a positive integer or None.")
+
         try:
             with tempfile.TemporaryDirectory() as tmpDirStr:
-                tmpDir  = Path(tmpDirStr)
-                inFile  = tmpDir / "in.json"
+                tmpDir = Path(tmpDirStr)
+                inFile = tmpDir / "in.json"
                 outFile = tmpDir / "out.json"
 
                 settings.save(inFile)
 
                 # run, redirecting stderr because it produces meaningless messages from text handling
                 scriptPath = Path(__file__).parent / "pglTraitsDialogStandalone.py"
-                result = subprocess.run(
-                    [sys.executable, str(scriptPath), str(inFile), str(outFile)],
-                    stderr=subprocess.DEVNULL
-                )
+                command = [sys.executable, str(scriptPath), str(inFile), str(outFile)]
+                if width is not None: command.append(str(width))
+                result = subprocess.run(command, stderr=subprocess.DEVNULL)
 
                 if result.returncode == 0 and outFile.exists():
                     # OK
                     return pglSerialize.load(outFile)
                 else:
                     # Cancel
-                    return None                               
+                    return None
         except Exception as e:
             pglMessages.warning(f"Error running traitsDialog: {e}")
             return None

@@ -24,6 +24,10 @@ def main():
     # to and from this function from jupyter
     inFile = sys.argv[1]      # settings to edit
     outFile = sys.argv[2]     # where to write result (only if OK)
+    requestedWidth = int(sys.argv[3]) if len(sys.argv) > 3 else None
+
+    if requestedWidth is not None and requestedWidth <= 0:
+        raise ValueError("Dialog width must be positive.")
 
     # load the settings
     settings = pglSerialize.load(inFile)
@@ -31,6 +35,25 @@ def main():
     # setup dialog
     app = QApplication.instance() or QApplication(sys.argv)
     dlg = _pglTraitsDialog(settings)
+
+    # Apply the optional width after the normal interface has been built.
+    # Preserve the existing height and keep the window within the screen.
+    if requestedWidth is not None:
+        screen = dlg.screen() or app.primaryScreen()
+
+        if screen is not None:
+            available = screen.availableGeometry()
+            frameWidth = max(0, dlg.frameGeometry().width() - dlg.width())
+            maxWidth = max(1, available.width() - frameWidth - 40)
+            dlg.setMinimumWidth(min(dlg.minimumWidth(), maxWidth))
+            targetWidth = min(max(requestedWidth, dlg.minimumWidth()), maxWidth)
+            dlg.resize(targetWidth, dlg.height())
+
+            dialogRect = dlg.frameGeometry()
+            dialogRect.moveCenter(available.center())
+            dlg.move(dialogRect.topLeft())
+        else:
+            dlg.resize(max(requestedWidth, dlg.minimumWidth()), dlg.height())
 
     # start dialog, and handle returns
     if dlg.exec() == QDialog.Accepted:
