@@ -11,7 +11,7 @@
 
 from .pglMessages import pglMessages
 from .pglSettings import pglTraitSettings
-from .pglPipeline import pglAction
+from .pglPipeline import pglAction, pglActionCollection
 from traitlets import HasTraits, Enum, Float, Int, List, Tuple, TraitError, Unicode, Dict, default, link, Bool, TraitType, Instance
 from .pglExperiment import pglEventSegment, pglEventVolumeTrigger
 from .pglSession import pglTaskBase
@@ -22,7 +22,7 @@ import posixpath
 from .pglSession import pglSession
 import numpy as np
 
-class pglActionsFixes:
+class pglActionsFixes(pglActionCollection):
 
     class migrateTaskDirectories(pglAction):
         """Migrate all runs in a session to taskNN_taskName directories."""

@@ -25,11 +25,12 @@ from .pglExperiment import pglEventTrial, pglEventSegment
 import matplotlib
 from tqdm.auto import tqdm
 from .pglSettings import pglImportSettings
+from .pglPipeline import pglActionCollection
 
 #################################
 # Collection of predefined actions
 #################################
-class pglActions():
+class pglActions(pglActionCollection):
     
     #+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+#+
     # loadSession

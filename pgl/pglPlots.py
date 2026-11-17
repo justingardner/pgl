@@ -7,6 +7,7 @@
 
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+import numpy as np
 
 ##############################################
 # pglScanTimelinePlot
@@ -96,11 +97,16 @@ class pglScanTimelinePlot:
                 for event in data.events
                 if event.type == 'volumeTrigger'
             ]
+            behaviorTR = (
+                float(np.median(np.diff(volumeTimes)))
+                if len(volumeTimes) > 1 else None
+            )
 
             self.runBlocks.append({
                 'start': start,
                 'end': start + duration,
                 'volumeTimes': volumeTimes,
+                'tr': behaviorTR,
                 'label': ''
             })
 
@@ -166,21 +172,17 @@ class pglScanTimelinePlot:
             self.runColors[runIndex] = color
             self.scanColors[scanIndex] = color
 
-            dimsText = ' × '.join(str(value) for value in scanBlock['dims'][:3])
-            scanInfo = (
-                f"{scanBlock['name']}\n"
-                f"{dimsText} | {scanBlock['nVolumes']} volumes | "
-                f"TR {scanBlock['trSeconds']:g} sec"
+            scanBlock['label'] = (
+                f"Scan {scanIndex}\n"
+                f"nVols: {scanBlock['nVolumes']}\n"
+                f"TR: {scanBlock['trSeconds']:.3f}s"
             )
-
-            # Include MRI information in both corresponding backgrounds.
-            # Counts remain explicit so mismatches are visible.
-            scanBlock['label'] = f"Scan {scanIndex}\n{scanInfo}"
             runBlock['label'] = (
-                f"Run {runIndex} ↔ Scan {scanIndex} | "
-                f"{len(runBlock['volumeTimes'])} triggers\n{scanInfo}"
+                f"Run {runIndex}\n"
+                f"nVols: {len(runBlock['volumeTimes'])}\n"
+                f"TR: {runBlock['tr']:.3f}s"
             )
-
+            
             startOffset = runBlock['start'] - scanBlock['start']
             endOffset = runBlock['end'] - scanBlock['end']
             pairOffsets.append((startOffset + endOffset) / 2)
@@ -329,7 +331,7 @@ class pglScanTimelinePlot:
             if index in colors:
                 ax.text(
                     (start + end) / 2, 1.04, block['label'],
-                    ha='center', va='top', fontsize=8,
+                    ha='center', va='top', fontsize=10,
                     zorder=3
                 )
 
