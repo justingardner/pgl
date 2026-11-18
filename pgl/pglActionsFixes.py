@@ -672,14 +672,19 @@ class pglActionsFixes(pglActionCollection):
     class fixVolumeTimes(pglAction):
         """Repair canonical volume-trigger events independently in each run.
 
-        Uses the median recorded interval and the preceding retained/corrected
-        trigger as the local timing reference. This assumes a fixed acquisition
-        volume time but does not correct accumulated subthreshold timing shifts.
-        
+        Estimates volume time from the median recorded interval.
+
         Automatic repairs:
-            addMissing inserts missing grid events.
-            adjustTiming moves recorded triggers onto the grid when their
-            discrepancy is at least discrepancyMs.
+            addMissing inserts inferred missing triggers between retained anchors.
+            adjustTiming corrects isolated timing errors when predictions from
+            both original neighboring triggers agree sufficiently closely.
+            Persistent timing shifts are not propagated or regularized.
+
+        A final gap greater than 1.5 times the median causes its final trigger
+        to be removed as a suspected manual ending, unless the gap is within
+        100 ms of twice the median. A near-double final gap permits one missing
+        trigger to be inserted when addMissing is enabled.
+        Automatic ending removal is independent of addMissing/adjustTiming.
 
         Boundary edits follow automatic repairs:
             Positive startVolumes/endVolumes add evenly spaced triggers.
@@ -689,10 +694,6 @@ class pglActionsFixes(pglActionCollection):
             If neither boundary edit is supplied, adjust the end to reach
             nVols. Otherwise require the explicitly edited count to match.
             Explicit zero is a supplied boundary edit.
-
-        A long final gap is protected unless it is within 100 ms of twice
-        the median. Its final trigger is retained without automatic repair.
-        Explicit boundary edits or nVols may still remove it.
 
         Replaces selected run.data objects only after all plans validate.
         Original acquisition files and acquisition state remain unchanged.
@@ -812,7 +813,7 @@ class pglActionsFixes(pglActionCollection):
             mergedEvents.extend(volumeEvents[volumeIndex:])
             return mergedEvents
 
-            ################################################################
+        ################################################################
         # Prepare one run without changing its current contents
         ################################################################
         def _prepareRun(self, run, runIndex):
@@ -836,7 +837,7 @@ class pglActionsFixes(pglActionCollection):
                     raise ValueError(f"Run {runIndex}: invalid volume timestamp at event index {eventIndex}.")
                 times.append(float(timestamp))
 
-            # Warn about unusually close original triggers before checking order.
+            # Inspect original intervals before changing any timestamps.
             self._warnShortVolumeIntervals(times, runIndex)
 
             intervals = np.diff(times)
@@ -864,32 +865,32 @@ class pglActionsFixes(pglActionCollection):
                 changes.append({"operation": "insert", "reason": reason, "timestamp": timestamp})
                 return event
 
-            # A long final gap may end with a manually supplied trigger.
-            # Do not manufacture a scan's worth of events across that gap.
+            # Classify the original final gap before correcting its neighbors.
+            # Near-double gaps permit one missing volume; other long final gaps
+            # are treated as ending with a manually supplied trigger.
             finalInterval = float(intervals[-1])
             finalMultiple = nearestMultiple(finalInterval / volumeTime)
             closeToDouble = finalMultiple == 2 and abs(finalInterval - 2 * volumeTime) <= 0.100 + 1e-9
-            protectedFinal = finalInterval > 1.5 * volumeTime and not closeToDouble
+            removeFinalTrigger = finalInterval > 1.5 * volumeTime and not closeToDouble
 
             ################################################################
             # Identify isolated timing errors using original neighbors
             ################################################################
             candidates = {}
 
-            # Neighbor predictions must agree more closely than the correction
-            # threshold, capped at 10% of a volume interval.
+            # Both neighbors must predict approximately the same timestamp.
+            # Cap their permitted disagreement at 10% of the median TR.
             supportTolerance = max(1e-9, min(threshold, 0.1 * volumeTime))
 
             if self.adjustTiming:
                 for position in range(1, len(times) - 1):
-                    # A protected manual ending trigger is not a timing anchor.
-                    if protectedFinal and position + 1 == len(times) - 1: continue
+                    # Do not use a suspected manual ending as a timing anchor.
+                    if removeFinalTrigger and position + 1 == len(times) - 1: continue
 
                     leftInterval = times[position] - times[position - 1]
                     rightInterval = times[position + 1] - times[position]
 
-                    # Very short intervals may represent duplicate/spurious events.
-                    # Warn through the existing helper, but do not move them here.
+                    # Very short intervals may indicate duplicate/spurious events.
                     if min(leftInterval, rightInterval) * 1000.0 < self.shortIntervalMs: continue
 
                     leftMultiple = nearestMultiple(leftInterval / volumeTime)
@@ -897,7 +898,7 @@ class pglActionsFixes(pglActionCollection):
                     leftError = leftInterval - leftMultiple * volumeTime
                     rightError = rightInterval - rightMultiple * volumeTime
 
-                    # An isolated late trigger produces a long interval followed
+                    # An isolated late trigger makes a long interval followed
                     # by a short one; an early trigger produces the reverse.
                     if leftError * rightError >= 0: continue
                     if not worthFixing(leftError) or not worthFixing(rightError): continue
@@ -919,7 +920,7 @@ class pglActionsFixes(pglActionCollection):
                     }
 
             # Adjacent candidates depend on anchors that would themselves move.
-            # Retain both rather than arbitrarily choosing which trigger is wrong.
+            # Retain them rather than arbitrarily choosing which trigger is wrong.
             ambiguousPositions = {
                 position for position in candidates
                 if position - 1 in candidates or position + 1 in candidates
@@ -945,16 +946,27 @@ class pglActionsFixes(pglActionCollection):
                 })
 
             ################################################################
-            # Infer missing events without propagating timestamp corrections
+            # Infer missing events and remove a suspected manual ending
             ################################################################
             unresolvedIntervals = []
             volumes.append(correctedEvents[0])
 
             for position in range(1, len(times)):
-                # Preserve the protected final event unless explicit boundary
-                # edits or the requested final count remove it later.
-                if protectedFinal and position == len(times) - 1:
-                    volumes.append(correctedEvents[position])
+                isFinal = position == len(times) - 1
+
+                # Removal is independent of addMissing and adjustTiming.
+                # Never manufacture missing volumes across this ending gap.
+                if isFinal and removeFinalTrigger:
+                    changes.append({
+                        "operation": "remove",
+                        "reason": "suspectedManualEnd",
+                        "originalEventIndex": volumeRecords[position][0],
+                        "originalTriggerNumber": position + 1,
+                        "timestamp": times[position],
+                        "precedingTimestamp": times[position - 1],
+                        "interval": finalInterval,
+                        "expectedInterval": volumeTime,
+                    })
                     continue
 
                 leftTime = correctedTimes[position - 1]
@@ -967,16 +979,13 @@ class pglActionsFixes(pglActionCollection):
                 nMissing = multiple - 1
                 timingError = interval - multiple * volumeTime
 
-                # The final interval only permits one inferred missing volume,
-                # and only when the original gap was close to twice the median.
-                if position == len(times) - 1 and nMissing and (nMissing != 1 or not closeToDouble):
-                    volumes.append(correctedEvents[position])
-                    protectedFinal = True
-                    continue
+                # Internal gaps can contain multiple missing volumes.
+                # The final gap permits only one, supported by the original gap.
+                allowMissing = not isFinal or (nMissing == 1 and closeToDouble)
 
-                if self.addMissing and nMissing and worthFixing(interval - volumeTime):
-                    # Interpolate between retained anchors. This fills the gap
-                    # without shifting the subsequent recorded trigger sequence.
+                if self.addMissing and nMissing and allowMissing and worthFixing(interval - volumeTime):
+                    # Interpolate between retained anchors without shifting
+                    # the subsequent recorded trigger sequence.
                     for missingIndex in range(1, multiple):
                         missingTime = leftTime + interval * missingIndex / multiple
                         volumes.append(addVolume(missingTime, "missing"))
@@ -993,7 +1002,7 @@ class pglActionsFixes(pglActionCollection):
                 volumes.append(correctedEvents[position])
 
             ################################################################
-            # Apply explicit boundary changes
+            # Apply explicit boundary changes after automatic repairs
             ################################################################
             def editBoundary(count, atStart, reason):
                 nonlocal volumes
@@ -1045,7 +1054,8 @@ class pglActionsFixes(pglActionCollection):
                 "anchorTime": times[0],
                 "originalCount": len(volumeRecords),
                 "finalCount": len(volumes),
-                "protectedFinal": protectedFinal,
+                "removedFinalTrigger": removeFinalTrigger,
+                "finalRecordedInterval": finalInterval,
                 "discrepancyMs": self.discrepancyMs,
                 "shortIntervalMs": self.shortIntervalMs,
                 "supportToleranceMs": supportTolerance * 1000.0,
@@ -1060,83 +1070,7 @@ class pglActionsFixes(pglActionCollection):
             }
 
             # No-op runs retain their original data object and event identities.
-            replacement = data
-            if changes:
-                history = getattr(data, "volumeTimingRepairs", [])
-                if not isinstance(history, list):
-                    raise ValueError(f"Run {runIndex}: volumeTimingRepairs must be a list.")
-
-                replacement = deepcopy(data)
-                replacement.events = self._mergeVolumeEvents(originalEvents, volumes)
-                replacement.volumeTimingRepairs = deepcopy(history) + [report]
-
-            return {"run": run, "original": data, "replacement": replacement, "report": report}
-
-            ################################################################
-            # Apply explicit boundary changes
-            ################################################################
-            def editBoundary(count, atStart, reason):
-                nonlocal volumes
-                if not count: return
-
-                if count < 0:
-                    nRemove = -count
-                    if nRemove > len(volumes):
-                        raise ValueError(f"Run {runIndex}: {reason} removes {nRemove} volumes but only {len(volumes)} remain.")
-
-                    removed = volumes[:nRemove] if atStart else volumes[-nRemove:]
-                    for event in removed:
-                        changes.append({"operation": "remove", "reason": reason, "timestamp": float(event.timestamp)})
-
-                    volumes = volumes[nRemove:] if atStart else volumes[:-nRemove]
-                    return
-
-                if not volumes:
-                    raise ValueError(f"Run {runIndex}: cannot add boundary volumes without a remaining trigger to anchor them.")
-
-                boundaryTime = float(volumes[0].timestamp if atStart else volumes[-1].timestamp)
-                if atStart:
-                    added = [addVolume(boundaryTime - step * volumeTime, reason) for step in range(count, 0, -1)]
-                    volumes = added + volumes
-                else:
-                    added = [addVolume(boundaryTime + step * volumeTime, reason) for step in range(1, count + 1)]
-                    volumes.extend(added)
-
-            editBoundary(self.startVolumes, True, "startVolumes")
-            editBoundary(self.endVolumes, False, "endVolumes")
-
-            if self.nVols is not None:
-                explicitBoundary = self.startVolumes is not None or self.endVolumes is not None
-
-                if explicitBoundary and len(volumes) != self.nVols:
-                    raise ValueError(f"Run {runIndex}: explicit boundary edits produce {len(volumes)} volumes, conflicting with nVols={self.nVols}.")
-
-                if not explicitBoundary:
-                    editBoundary(self.nVols - len(volumes), False, "nVols")
-
-            finalTimes = np.asarray([event.timestamp for event in volumes], dtype=float)
-            if not np.isfinite(finalTimes).all() or np.any(np.diff(finalTimes) <= 0):
-                raise ValueError(f"Run {runIndex}: requested repairs produce overlapping or reversed volume timestamps.")
-
-            report = {
-                "runIndex": runIndex,
-                "method": "localReference",
-                "volumeTime": volumeTime,
-                "anchorTime": times[0],
-                "originalCount": len(volumeRecords),
-                "finalCount": len(volumes),
-                "protectedFinal": protectedFinal,
-                "discrepancyMs": self.discrepancyMs,
-                "shortIntervalMs": self.shortIntervalMs,
-                "addMissing": self.addMissing,
-                "adjustTiming": self.adjustTiming,
-                "nVols": self.nVols,
-                "startVolumes": self.startVolumes,
-                "endVolumes": self.endVolumes,
-                "changes": changes,
-            }
-
-            # No-op runs retain their original data object and event identities.
+            # Changed runs receive a replacement only after all runs validate.
             replacement = data
             if changes:
                 history = getattr(data, "volumeTimingRepairs", [])
@@ -1160,16 +1094,28 @@ class pglActionsFixes(pglActionCollection):
             nRemoved = sum(change["operation"] == "remove" for change in changes)
 
             pglMessages.message(f"Run {report['runIndex']}: median volume time={report['volumeTime']:.6f} s; correction threshold={report['discrepancyMs']:g} ms.")
-            pglMessages.message(f"  Correct isolated triggers only when their original neighboring triggers predict times agreeing within {report['supportToleranceMs']:g} ms.")
-            pglMessages.message("  Missing triggers are interpolated between retained anchors; persistent timing shifts are not propagated or regularized.")
+
+            if report["adjustTiming"]:
+                pglMessages.message(f"  Align isolated triggers to the midpoint of their original neighbors' median-TR predictions, only when those predictions agree within {report['supportToleranceMs']:g} ms.")
+            else:
+                pglMessages.message("  Recorded-trigger timestamp adjustment is disabled.")
+
+            if report["addMissing"]:
+                pglMessages.message("  Infer missing-trigger counts from median-TR multiples; interpolate their timestamps between retained anchors.")
+            else:
+                pglMessages.message("  Missing-trigger insertion is disabled.")
+
+            pglMessages.message("  Persistent timing shifts are not propagated or regularized.")
+            pglMessages.message("  Remove a final trigger when its original gap exceeds 1.5 × median TR, unless the gap is within 100 ms of 2 × median TR.")
             pglMessages.message(f"  Volumes: {report['originalCount']} → {report['finalCount']}; insert={nInserted}, adjust={nAdjusted}, remove={nRemoved}.")
 
             if report["originalCount"] == 2:
-                pglMessages.warning("Only one recorded interval is available; missing or mistimed triggers cannot be independently established.", level=1)
+                pglMessages.warning("Only one recorded interval is available; missing, mistimed, or manual ending triggers cannot be independently established.", level=1)
 
-            if report["protectedFinal"]:
-                pglMessages.message("  Final trigger excluded from automatic repair because its gap may reflect a manual ending trigger. Explicit count/boundary edits still apply.")
-                pglMessages.message("  If retained, this final trigger still contributes to the current print summary's timing statistics.")
+            if report["removedFinalTrigger"]:
+                finalInterval = report["finalRecordedInterval"]
+                pglMessages.message(f"  Suspected manual ending: original final gap={finalInterval:.6f} s ({finalInterval / report['volumeTime']:.3f} × median TR).")
+                pglMessages.message("  Plan removes that final trigger without filling its gap. Explicit boundary/count edits apply afterward.")
 
             if report["ambiguousTriggers"]:
                 pglMessages.warning(f"Run {report['runIndex']}: adjacent correction candidates were retained because their anchors are ambiguous. Original trigger numbers: {report['ambiguousTriggers']}.", level=1)
@@ -1186,9 +1132,12 @@ class pglActionsFixes(pglActionCollection):
                 if change["operation"] == "adjust":
                     pglMessages.message(f"  Adjust trigger {change['originalTriggerNumber']}: {change['originalTimestamp']:.6f} → {change['timestamp']:.6f} s ({change['shiftMs']:+.1f} ms).")
                     pglMessages.message(f"    Neighbor predictions: {change['expectedFromLeft']:.6f} s from preceding trigger, {change['expectedFromRight']:.6f} s from following trigger; using their midpoint.")
+                elif change["operation"] == "remove" and change["reason"] == "suspectedManualEnd":
+                    pglMessages.message(f"  Remove original trigger {change['originalTriggerNumber']} at {change['timestamp']:.6f} s (suspected manual ending; preceding gap={change['interval']:.6f} s).")
                 else:
                     pglMessages.message(f"  {change['operation'].capitalize()} volume at {change['timestamp']:.6f} s ({change['reason']}).")
-                          
+
+          
         ################################################################
         # Validate all runs before installing repaired data
         ################################################################

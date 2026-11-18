@@ -2113,6 +2113,376 @@ class pglMRIBundle:
         mri.scans = scans
         return mri
     
+    ################################################################
+    # Save acquisition sources with current derived-session annotations
+    ################################################################
+    @classmethod
+    def saveDerived(cls, mri, dataPath, *, filesystem=None):
+        """Export MRI acquisitions and current annotations to a fresh bundle.
+
+        Original NIfTI source bytes remain acquisition payloads.
+        Current scan metadata is preserved independently of those bytes.
+
+        Does NOT serialize scan._data or claim that working-image/header edits
+        have been applied to acquisition files. Processed images belong in
+        explicit image products and session.derivedFiles.
+
+        Writes mri.json last, after source export and metadata validation.
+        Does not publish database records or modify the MRI collection.
+
+        Returns the destination path.
+        Failures propagate and may leave an incomplete destination.
+        """
+        import json
+        import os
+        import posixpath
+        from copy import deepcopy
+        from pathlib import Path
+
+        from fsspec import AbstractFileSystem
+        from fsspec.core import url_to_fs
+        from fsspec.implementations.local import LocalFileSystem
+
+        from .pglMessages import pglMessages
+
+        if type(mri) is not pglMRI:
+            raise TypeError("Derived MRI export requires a pglMRI instance.")
+
+        scans = list(mri.scans)
+        if not scans: raise ValueError("Derived MRI export requires at least one scan.")
+
+        pathText = os.fspath(dataPath)
+        if not isinstance(pathText, str) or not pathText.strip():
+            raise ValueError("dataPath must be a nonempty path.")
+        if any(character in pathText for character in ("\x00", "\n", "\r")):
+            raise ValueError("dataPath must not contain NUL or newlines.")
+        if filesystem is not None and not isinstance(filesystem, AbstractFileSystem):
+            raise TypeError("filesystem must be an fsspec filesystem.")
+
+        if filesystem is None:
+            if "://" not in pathText and "::" not in pathText:
+                pathText = str(Path(pathText).expanduser().absolute())
+            filesystem, destination = url_to_fs(pathText)
+        else:
+            destination = filesystem._strip_protocol(pathText)
+            if isinstance(filesystem, LocalFileSystem):
+                destination = str(Path(destination).expanduser().absolute())
+
+        if filesystem.exists(destination):
+            raise FileExistsError(f"MRI bundle destination already exists: {destination}")
+        if isinstance(filesystem, LocalFileSystem) and os.path.lexists(destination):
+            raise FileExistsError(f"MRI bundle destination already exists: {destination}")
+
+        def encode(document):
+            return json.dumps(document, sort_keys=True, indent=2, allow_nan=False).encode("utf-8")
+
+        prepared = []
+
+        ################################################################
+        # Snapshot metadata and source bindings before writing
+        ################################################################
+        for index, scan in enumerate(scans):
+            backing = scan._backing
+            if backing is not None:
+                if not isinstance(backing, pglMRIFileBacking):
+                    raise TypeError(f"Scan {index}: unsupported MRI backing.")
+                sourcePath = backing.path
+            else:
+                sourcePath = scan.localPath
+
+            if not sourcePath or not sourcePath.lower().endswith((".nii", ".nii.gz")):
+                raise ValueError(f"Scan {index}: an original .nii or .nii.gz source is required.")
+
+            # Resolve lazy UUID defaults before taking the metadata snapshot.
+            identifier = scan.uuid
+            suffix = ".nii.gz" if sourcePath.lower().endswith(".nii.gz") else ".nii"
+
+            item = {
+                "scan": scan,
+                "backing": backing,
+                "backingFilesystem": None if backing is None else backing.fs,
+                "sourcePath": sourcePath,
+                "expectedIdentity": None if backing is None else backing.expectedIdentity,
+                "localPath": scan.localPath,
+                "uuid": identifier,
+                "name": scan.name,
+                "sourceMetadata": scan._copyMetadata(scan.sourceMetadata),
+                "metadata": scan._copyMetadata(scan.metadata),
+                "path": f"scans/{index:06d}/source{suffix}",
+            }
+
+            # Validate identifiers before exporting potentially large sources.
+            from uuid import UUID
+
+            try:
+                canonical = str(UUID(identifier))
+            except (ValueError, TypeError, AttributeError):
+                raise ValueError(f"Scan {index}: invalid UUID.") from None
+
+            if canonical != identifier:
+                raise ValueError(f"Scan {index}: UUID must use canonical formatting.")
+            if not isinstance(scan.name, str) or not scan.name.strip():
+                raise ValueError(f"Scan {index}: name must be nonblank.")
+
+            if "nifti" in item["metadata"] and type(item["metadata"]["nifti"]) is not dict:
+                raise ValueError(f"Scan {index}: metadata['nifti'] must be a dictionary.")
+
+            encode({
+                "uuid": identifier,
+                "name": item["name"],
+                "sourceMetadata": item["sourceMetadata"],
+                "metadata": item["metadata"],
+            })
+            prepared.append(item)
+
+        def requireUnchanged():
+            """Detect collection, metadata, and source-binding replacement."""
+            current = list(mri.scans)
+            if len(current) != len(scans) or any(left is not right for left, right in zip(current, scans)):
+                raise ValueError("MRI collection changed during export.")
+
+            for item in prepared:
+                scan = item["scan"]
+                if (
+                    scan.uuid != item["uuid"]
+                    or scan.name != item["name"]
+                    or scan.sourceMetadata != item["sourceMetadata"]
+                    or scan.metadata != item["metadata"]
+                    or scan._backing is not item["backing"]
+                    or scan.localPath != item["localPath"]
+                ):
+                    raise ValueError("MRI metadata or source binding changed during export.")
+
+                backing = item["backing"]
+                if backing is not None and (
+                    backing.fs is not item["backingFilesystem"]
+                    or backing.path != item["sourcePath"]
+                    or backing.expectedIdentity != item["expectedIdentity"]
+                ):
+                    raise ValueError("MRI filesystem backing changed during export.")
+
+        ################################################################
+        # Export original bytes, never the cached working image
+        ################################################################
+        filesystem.makedirs(destination, exist_ok=False)
+        records = []
+
+        pglMessages.message(
+            "Saving MRI acquisition sources and current annotations. "
+            "Processed images are saved separately through derived-file products; "
+            "cached scan.data images are not serialized here."
+        )
+
+        for index, item in enumerate(prepared):
+            requireUnchanged()
+            scan = item["scan"]
+            target = posixpath.join(destination, item["path"])
+
+            pglMessages.message(f"Exporting MRI acquisition {index + 1}/{len(prepared)}: {item['name']}")
+            identity = scan.exportSource(target, filesystem=filesystem)
+            if identity is None:
+                raise RuntimeError(f"Scan {index}: original-source export was refused.")
+
+            # Snapshot the actual exported source, not an edited working image.
+            exportedBacking = pglMRIFileBacking(filesystem, target, expectedIdentity=identity)
+            originalHeader = pglMRINiftiMetadata.readBacking(exportedBacking)
+            sourceMetadata = deepcopy(item["sourceMetadata"])
+
+            if "nifti" in sourceMetadata and sourceMetadata["nifti"] != originalHeader:
+                raise ValueError(f"Scan {index}: exported header conflicts with original provenance.")
+
+            sourceMetadata["nifti"] = scan._copyMetadata(originalHeader)
+
+            records.append({
+                "index": index,
+                "uuid": item["uuid"],
+                "name": item["name"],
+                "path": item["path"],
+                **identity,
+                "sourceMetadata": sourceMetadata,
+                # Unlike acquisition export, do not reset current annotations.
+                "metadata": deepcopy(item["metadata"]),
+            })
+
+        descriptor = {
+            "contract": "pgl.mri.derived.v1",
+            "scans": records,
+        }
+        cls.validateDerivedDescriptor(descriptor)
+        requireUnchanged()
+
+        ################################################################
+        # Publish the completion descriptor only after validation
+        ################################################################
+        content = encode(descriptor)
+        descriptorPath = posixpath.join(destination, "mri.json")
+
+        with filesystem.open(descriptorPath, "xb") as target:
+            if target.write(content) != len(content):
+                raise OSError("Incomplete derived MRI descriptor write.")
+
+        with filesystem.open(descriptorPath, "rb") as source:
+            if source.read(len(content) + 1) != content:
+                raise ValueError("Derived MRI descriptor verification failed.")
+
+        pglMessages.message(f"Exported {len(records)} MRI acquisitions with current annotations. No database checkpoint was published by this helper.")
+        return destination
+
+    ################################################################
+    # Validate a derived MRI descriptor independently of payload access
+    ################################################################
+    @classmethod
+    def validateDerivedDescriptor(cls, descriptor):
+        """Validate acquisition references and independent current metadata.
+
+        Payloads are original acquisition bytes, not working-image exports.
+        Original header snapshots retain the acquisition validator's checks.
+
+        Current metadata may differ from the original snapshot. That difference
+        is an annotation/state record, not evidence of a modified source file.
+
+        Does not read NIfTI payloads or mutate the supplied descriptor.
+        """
+        from copy import deepcopy
+
+        if type(descriptor) is not dict or set(descriptor) != {"contract", "scans"}:
+            raise ValueError("Invalid derived MRI descriptor fields.")
+        if descriptor["contract"] != "pgl.mri.derived.v1":
+            raise ValueError("Unsupported derived MRI descriptor contract.")
+        if type(descriptor["scans"]) is not list or not descriptor["scans"]:
+            raise ValueError("Derived MRI descriptor requires a nonempty scan list.")
+
+        # Reuse the acquisition validator for UUIDs, paths, payload identities,
+        # and exact original-header reconstruction. Only its temporary view
+        # receives an original current-header snapshot.
+        validationView = {
+            "contract": cls.contract,
+            "scans": [],
+        }
+
+        for index, record in enumerate(descriptor["scans"]):
+            if type(record) is not dict:
+                raise ValueError(f"Scan {index}: invalid derived MRI record.")
+
+            currentMetadata = pglMRIScan._copyMetadata(record.get("metadata"))
+            sourceMetadata = pglMRIScan._copyMetadata(record.get("sourceMetadata"))
+
+            if "nifti" in currentMetadata and type(currentMetadata["nifti"]) is not dict:
+                raise ValueError(f"Scan {index}: current NIfTI metadata must be a dictionary.")
+
+            original = sourceMetadata.get("nifti")
+            if type(original) is not dict:
+                raise ValueError(f"Scan {index}: original NIfTI snapshot is required.")
+
+            acquisitionView = deepcopy(record)
+            acquisitionView["metadata"] = {"nifti": deepcopy(original)}
+            validationView["scans"].append(acquisitionView)
+
+        cls.validateDescriptor(validationView)
+        return descriptor
+
+    ################################################################
+    # Restore derived MRI annotations and deferred acquisition sources
+    ################################################################
+    @classmethod
+    def loadDerived(cls, dataPath, *, filesystem=None, cacheDirectory,
+                    maxDescriptorBytes=64 * 1024 * 1024):
+        """Restore a derived MRI bundle without opening NIfTI payloads.
+
+        Reads mri.json and validates its original header snapshots.
+        Installs verified-identity filesystem backings for acquisition sources.
+
+        Preserves current metadata independently of original provenance.
+        Does not reconstruct cached working images or processed-image products;
+        the enclosing session loader restores products and derived attachments.
+
+        Returns a pglMRI collection. Failures propagate.
+        The supplied filesystem remains caller-owned.
+        """
+        import json
+        import os
+        import posixpath
+        from pathlib import Path
+
+        from fsspec import AbstractFileSystem
+        from fsspec.core import url_to_fs
+        from fsspec.implementations.local import LocalFileSystem
+
+        if type(maxDescriptorBytes) is not int or maxDescriptorBytes <= 0:
+            raise ValueError("maxDescriptorBytes must be a positive integer.")
+
+        pathText = os.fspath(dataPath)
+        cacheText = os.fspath(cacheDirectory)
+
+        if not isinstance(pathText, str) or not pathText.strip():
+            raise ValueError("dataPath must be a nonempty path.")
+        if any(character in pathText for character in ("\x00", "\n", "\r")):
+            raise ValueError("dataPath must not contain NUL or newlines.")
+        if (
+            not isinstance(cacheText, str) or not cacheText.strip()
+            or "://" in cacheText or "::" in cacheText
+            or any(character in cacheText for character in ("\x00", "\n", "\r"))
+        ):
+            raise ValueError("cacheDirectory must be an ordinary local path.")
+        if filesystem is not None and not isinstance(filesystem, AbstractFileSystem):
+            raise TypeError("filesystem must be an fsspec filesystem.")
+
+        if filesystem is None:
+            if "://" not in pathText and "::" not in pathText:
+                pathText = str(Path(pathText).expanduser().absolute())
+            filesystem, root = url_to_fs(pathText)
+        else:
+            root = filesystem._strip_protocol(pathText)
+            if isinstance(filesystem, LocalFileSystem):
+                root = str(Path(root).expanduser().absolute())
+
+        def uniqueKeys(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result: raise ValueError(f"Duplicate MRI descriptor key: {key!r}")
+                result[key] = value
+            return result
+
+        def rejectConstant(value):
+            raise ValueError(f"Nonfinite JSON constant is not permitted: {value}")
+
+        with filesystem.open(posixpath.join(root, "mri.json"), "rb") as source:
+            content = source.read(maxDescriptorBytes + 1)
+        if len(content) > maxDescriptorBytes:
+            raise ValueError("MRI descriptor exceeds the configured size limit.")
+
+        descriptor = json.loads(
+            content,
+            object_pairs_hook=uniqueKeys,
+            parse_constant=rejectConstant,
+        )
+        cls.validateDerivedDescriptor(descriptor)
+
+        cachePath = str(Path(cacheText).expanduser().absolute())
+        scans = []
+
+        for record in descriptor["scans"]:
+            scan = pglMRIScan(
+                uuid=record["uuid"],
+                name=record["name"],
+                sourceMetadata=pglMRIScan._copyMetadata(record["sourceMetadata"]),
+                metadata=pglMRIScan._copyMetadata(record["metadata"]),
+            )
+
+            backing = pglMRIFileBacking(
+                filesystem,
+                posixpath.join(root, record["path"]),
+                expectedIdentity={key: record[key] for key in ("sha256", "size_bytes")},
+            )
+            if scan.attachBacking(backing, cacheDirectory=cachePath) is None:
+                raise RuntimeError("Could not attach validated derived MRI acquisition backing.")
+
+            scans.append(scan)
+
+        mri = pglMRI()
+        mri.scans = scans
+        return mri
+    
 ################################################################
 # Coordinate-frame and linear-transform metadata
 ################################################################

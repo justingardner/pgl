@@ -2389,7 +2389,12 @@ class pglSession(pglActionable):
     mri = Instance(pglMRI, allow_none=True, default_value=None, help="MRI data", serialize=False)
     dataMatrices = Dict(default_value={}, help="Named scientific matrices owned by this working session; persisted explicitly through session checkpoint integration", serialize=False)
     derivedFiles = Dict(default_value={}, help="Named derived file attachments; persisted explicitly through session checkpoint integration", serialize=False)
+    # Persisted explicitly through saveScanRunMatches(), not session checkpoints.
+    scanRunCorrespondence = Dict(default_value=None,allow_none=True,help="Validated MRI scan UUID ↔ behavioral data UUID correspondence; None means not configured.",serialize=False)
+  
     selectedFilesystem = Instance(AbstractFileSystem,allow_none=True,default_value=None,help="Filesystem used to load the selected behavioral runs", serialize=False)
+  
+  
     
     # Explicit labels apply only when there are no behavioral runs.
     # Checkpoint persistence will handle these explicitly rather than relying
@@ -3181,3 +3186,450 @@ class pglSession(pglActionable):
             raise NotImplementedError(f"Default movie launching is unsupported on {sys.platform!r}.")
 
         return moviePath
+    
+    ################################################################
+    # Validate a portable scan/run correspondence record
+    ################################################################
+    @staticmethod
+    def _validateScanRunCorrespondence(record):
+        """Return an independent validated correspondence record.
+
+        UUIDs identify acquisitions, not exact scientific content revisions.
+        This checks the portable schema only; resolution checks the session.
+        """
+        from uuid import UUID
+
+        if type(record) is not dict or set(record) != {"schemaVersion", "pairs"}:
+            raise ValueError("Scan/run correspondence requires schemaVersion and pairs.")
+        if type(record["schemaVersion"]) is not int or record["schemaVersion"] != 1:
+            raise ValueError("Unsupported scan/run correspondence schemaVersion.")
+        if type(record["pairs"]) is not list:
+            raise TypeError("Scan/run correspondence pairs must be a list.")
+
+        pairs = []
+        usedScans, usedBehavior = set(), set()
+
+        for position, pair in enumerate(record["pairs"]):
+            if type(pair) is not dict or set(pair) != {"scanUUID", "behaviorDataUUID"}:
+                raise ValueError(f"Correspondence pair {position}: invalid fields.")
+
+            for name in ("scanUUID", "behaviorDataUUID"):
+                value = pair[name]
+                if not isinstance(value, str):
+                    raise TypeError(f"Correspondence pair {position}: {name} must be a UUID string.")
+
+                try:
+                    canonical = str(UUID(value))
+                except (ValueError, AttributeError):
+                    raise ValueError(f"Correspondence pair {position}: invalid {name}.") from None
+
+                if canonical != value:
+                    raise ValueError(f"Correspondence pair {position}: {name} must use canonical lowercase UUID formatting.")
+
+            scanUUID, behaviorUUID = pair["scanUUID"], pair["behaviorDataUUID"]
+            if scanUUID in usedScans:
+                raise ValueError(f"Correspondence pair {position}: MRI scan identity is repeated.")
+            if behaviorUUID in usedBehavior:
+                raise ValueError(f"Correspondence pair {position}: behavioral data identity is repeated.")
+
+            usedScans.add(scanUUID)
+            usedBehavior.add(behaviorUUID)
+            pairs.append({"scanUUID": scanUUID, "behaviorDataUUID": behaviorUUID})
+
+        return {"schemaVersion": 1, "pairs": pairs}
+
+    ################################################################
+    # Verify that a behavioral identity exists in its saved data file
+    ################################################################
+    @staticmethod
+    def _requireSavedBehaviorIdentity(run, runIndex, expectedUUID):
+        """Verify a matched run's UUID against its backing data.json.
+
+        Reads saved behavioral JSON, not task files or MRI voxel data.
+        Does not compare scientific contents: repaired working data may differ.
+
+        Missing legacy identities require an explicit migration. Never invent
+        an identity or rewrite the acquisition file during matching.
+        """
+        import json
+        import posixpath
+        from uuid import UUID
+
+        if run.filesystem is None or not run.fullDataPath:
+            raise ValueError(
+                f"Run {runIndex}: matching currently requires a file-backed run "
+                "with a UUID recorded in data.json."
+            )
+
+        path = posixpath.join(run.fullDataPath, "data.json")
+
+        def uniqueKeys(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result: raise ValueError(f"Run {runIndex}: duplicate JSON key {key!r} in data.json.")
+                result[key] = value
+            return result
+
+        # A checkpoint filesystem verifies source bytes when opened.
+        # Ordinary filesystems retain their existing access behavior.
+        with run.filesystem.open(path, "rt", encoding="utf-8") as source:
+            document = json.load(source, object_pairs_hook=uniqueKeys)
+
+        if not isinstance(document, dict):
+            raise ValueError(f"Run {runIndex}: data.json must contain a JSON object.")
+
+        savedUUID = document.get("uuid")
+        if not isinstance(savedUUID, str) or not savedUUID:
+            raise ValueError(
+                f"Run {runIndex}: data.json has no saved UUID. "
+                "An explicit identity migration is required before durable matching; "
+                "the acquisition file was not modified."
+            )
+
+        try:
+            canonical = str(UUID(savedUUID))
+        except (ValueError, AttributeError):
+            raise ValueError(f"Run {runIndex}: data.json contains an invalid UUID.") from None
+
+        if canonical != savedUUID:
+            raise ValueError(f"Run {runIndex}: saved UUID is not in canonical lowercase format.")
+        if savedUUID != expectedUUID:
+            raise ValueError(
+                f"Run {runIndex}: current behavioral data UUID differs from data.json. "
+                "Refusing to attach a correspondence to an unverified acquisition identity."
+            )
+
+    ################################################################
+    # Resolve portable identities against current session collections
+    ################################################################
+    def _resolveScanRunCorrespondence(self, record):
+        """Return current zero-based (scanIndex, runIndex) pairs.
+
+        Resolves identities afresh so collection reordering is safe.
+        Missing or ambiguous matched identities raise rather than disappear.
+
+        May load behavioral data to inspect UUIDs. Does not load tasks, MRI
+        headers, or voxel arrays. Matched behavioral identities are checked
+        against saved data.json on every resolution.
+
+        Concurrent collection/data mutation is unsupported.
+        """
+        record = self._validateScanRunCorrespondence(record)
+        if not record["pairs"]: return []
+
+        runs = list(self.runs or [])
+        scans = list(self.mri.scans) if self.mri is not None else []
+
+        scanPositions, behaviorPositions = {}, {}
+
+        for index, scan in enumerate(scans):
+            identifier = scan.uuid
+            if isinstance(identifier, str) and identifier:
+                scanPositions.setdefault(identifier, []).append(index)
+
+        for index, run in enumerate(runs):
+            data = run.data
+            if data is None:
+                raise ValueError(f"Run {index}: behavioral data is unavailable; correspondence cannot be resolved safely.")
+
+            identifier = data.uuid
+            if isinstance(identifier, str) and identifier:
+                behaviorPositions.setdefault(identifier, []).append(index)
+
+        resolved = []
+
+        for position, pair in enumerate(record["pairs"]):
+            scanMatches = scanPositions.get(pair["scanUUID"], [])
+            runMatches = behaviorPositions.get(pair["behaviorDataUUID"], [])
+
+            if not scanMatches:
+                raise ValueError(f"Correspondence pair {position}: matched MRI scan {pair['scanUUID']} is absent.")
+            if len(scanMatches) != 1:
+                raise ValueError(f"Correspondence pair {position}: MRI identity occurs at multiple indices {scanMatches}.")
+
+            if not runMatches:
+                raise ValueError(f"Correspondence pair {position}: matched behavioral data {pair['behaviorDataUUID']} is absent.")
+            if len(runMatches) != 1:
+                raise ValueError(f"Correspondence pair {position}: behavioral identity occurs at multiple run indices {runMatches}.")
+
+            scanIndex, runIndex = scanMatches[0], runMatches[0]
+            self._requireSavedBehaviorIdentity(runs[runIndex], runIndex, pair["behaviorDataUUID"])
+            resolved.append((scanIndex, runIndex))
+
+        return resolved
+
+    ################################################################
+    # Set scan/run matches using simple current collection indices
+    ################################################################
+    def setScanRunMatches(self, matches, *, verbose=True):
+        """Replace scan/run correspondence after validating every pair.
+
+        matches:
+            One (scanIndex, runIndex) tuple, or a list/tuple of pairs.
+            All indices are zero-based. An empty collection explicitly clears
+            matches while retaining a configured correspondence record.
+
+        Each scan/run may appear once. Unmatched acquisitions are permitted.
+        Stores scan.uuid and run.data.uuid, never authoritative indices.
+
+        Returns the resolved list of index pairs.
+        Validation failure leaves the previous correspondence unchanged.
+
+        Changes working metadata only. Use saveSession() to preserve it with
+        session contents. Does not establish volume correspondence or clock alignment.
+        """
+        import numpy as np
+        from numbers import Integral
+
+        if type(verbose) is not bool: raise TypeError("verbose must be Boolean.")
+
+        def isIndex(value):
+            return isinstance(value, Integral) and not isinstance(value, (bool, np.bool_))
+
+        if isinstance(matches, tuple) and len(matches) == 2 and all(isIndex(value) for value in matches):
+            matches = [matches]
+        if not isinstance(matches, (list, tuple)):
+            raise TypeError("matches must be a (scanIndex, runIndex) tuple or a list/tuple of pairs.")
+
+        runs = list(self.runs or [])
+        scans = list(self.mri.scans) if self.mri is not None else []
+        requested = []
+        usedScans, usedRuns = set(), set()
+
+        # Validate all index selections before loading behavioral data.
+        for position, pair in enumerate(matches):
+            if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                raise ValueError(f"Match {position}: expected (scanIndex, runIndex).")
+            if not all(isIndex(value) for value in pair):
+                raise TypeError(f"Match {position}: indices must be integers, not Boolean.")
+
+            scanIndex, runIndex = map(int, pair)
+            if not 0 <= scanIndex < len(scans): raise IndexError(f"Invalid MRI scan index: {scanIndex}")
+            if not 0 <= runIndex < len(runs): raise IndexError(f"Invalid behavioral run index: {runIndex}")
+            if scanIndex in usedScans: raise ValueError(f"MRI scan {scanIndex} appears in more than one match.")
+            if runIndex in usedRuns: raise ValueError(f"Behavioral run {runIndex} appears in more than one match.")
+
+            usedScans.add(scanIndex)
+            usedRuns.add(runIndex)
+            requested.append((scanIndex, runIndex))
+
+        pairs = []
+
+        for scanIndex, runIndex in requested:
+            data = runs[runIndex].data
+            if data is None: raise ValueError(f"Run {runIndex}: behavioral data is unavailable.")
+
+            pairs.append({
+                "scanUUID": scans[scanIndex].uuid,
+                "behaviorDataUUID": data.uuid,
+            })
+
+        record = self._validateScanRunCorrespondence({"schemaVersion": 1, "pairs": pairs})
+        resolved = self._resolveScanRunCorrespondence(record)
+
+        if resolved != requested:
+            raise ValueError("Session collections changed while preparing correspondence.")
+
+        # Install once, after schema, uniqueness, and saved identity checks.
+        self.scanRunCorrespondence = record
+
+        if verbose:
+            self.printScanRunMatches()
+            pglMessages.message("Correspondence updated in memory. Use saveSession() to preserve matches with the session's MRI, behavioral contents, and derived products.")
+
+        return list(resolved)
+
+    ################################################################
+    # Get current index pairs from the stored correspondence
+    ################################################################
+    def getScanRunMatches(self):
+        """Return a new list of current (scanIndex, runIndex) tuples.
+
+        Raises if correspondence is unset, invalid, missing an endpoint, or
+        ambiguous. An explicitly configured empty correspondence returns [].
+
+        Does not infer matches or modify stored correspondence.
+        """
+        if self.scanRunCorrespondence is None:
+            raise ValueError("Scan/run correspondence is not configured. Use setScanRunMatches().")
+
+        return self._resolveScanRunCorrespondence(self.scanRunCorrespondence)
+
+    ################################################################
+    # Print resolved pairs and unmatched acquisition indices
+    ################################################################
+    def printScanRunMatches(self):
+        """Report correspondence without reading MRI headers or task data."""
+        if self.scanRunCorrespondence is None:
+            pglMessages.message("Scan/run correspondence is not configured.")
+            return
+
+        matches = self.getScanRunMatches()
+        runs = list(self.runs or [])
+        scans = list(self.mri.scans) if self.mri is not None else []
+        matchedScans = {scanIndex for scanIndex, _ in matches}
+        matchedRuns = {runIndex for _, runIndex in matches}
+
+        def displayIndices(indices):
+            return ", ".join(str(index) for index in indices) or "(none)"
+
+        pglMessages.message(f"Scan/run correspondence: {len(matches)} matched pairs; indices are zero-based.")
+
+        for scanIndex, runIndex in matches:
+            name = " ".join((scans[scanIndex].name or "unnamed").split())
+            pglMessages.message(f"  MRI scan {scanIndex} ({name}) ↔ behavioral run {runIndex}")
+
+        unmatchedScans = [index for index in range(len(scans)) if index not in matchedScans]
+        unmatchedRuns = [index for index in range(len(runs)) if index not in matchedRuns]
+
+        pglMessages.message(f"  Unmatched MRI scans: {displayIndices(unmatchedScans)}")
+        pglMessages.message(f"  Unmatched behavioral runs: {displayIndices(unmatchedRuns)}")
+        pglMessages.message("  These are acquisition matches only; volume correspondence and clock alignment are separate.")
+
+    ################################################################
+    # Save correspondence as a standalone portable JSON document
+    ################################################################
+    def saveScanRunMatches(self, filename, *, filesystem=None):
+        """Save validated correspondence without overwriting an existing file.
+
+        filename supports a local path or an fsspec URL. An explicit filesystem
+        may be supplied. Local ~ is expanded.
+
+        Validates against the current session before writing.
+        Writes UUID pairs only—not indices, paths, data, or action history.
+        Reads the destination back to verify exact bytes.
+
+        Returns the destination path in the resolved filesystem.
+        Does not publish a database checkpoint or modify acquisition files.
+
+        Failed writes may leave a partial destination. No automatic deletion
+        or overwrite occurs. The supplied filesystem remains caller-owned.
+        """
+        import json
+        import os
+        import posixpath
+        from pathlib import Path
+        from fsspec import AbstractFileSystem
+        from fsspec.core import url_to_fs
+        from fsspec.implementations.local import LocalFileSystem
+
+        if self.scanRunCorrespondence is None:
+            raise ValueError("No correspondence to save. Use setScanRunMatches() first.")
+
+        record = self._validateScanRunCorrespondence(self.scanRunCorrespondence)
+        self._resolveScanRunCorrespondence(record)
+
+        pathText = os.fspath(filename)
+        if not isinstance(pathText, str) or not pathText.strip():
+            raise ValueError("filename must be a nonempty path.")
+        if any(character in pathText for character in ("\x00", "\n", "\r")):
+            raise ValueError("filename must not contain NUL or newlines.")
+        if filesystem is not None and not isinstance(filesystem, AbstractFileSystem):
+            raise TypeError("filesystem must be an fsspec filesystem.")
+
+        if filesystem is None:
+            if "://" not in pathText and "::" not in pathText:
+                pathText = str(Path(pathText).expanduser().absolute())
+            filesystem, destination = url_to_fs(pathText)
+        else:
+            destination = filesystem._strip_protocol(pathText)
+            if isinstance(filesystem, LocalFileSystem):
+                destination = str(Path(destination).expanduser().absolute())
+
+        if filesystem.exists(destination):
+            raise FileExistsError(f"Correspondence destination already exists: {destination}")
+        if isinstance(filesystem, LocalFileSystem) and os.path.lexists(destination):
+            raise FileExistsError(f"Correspondence destination already exists: {destination}")
+
+        content = (json.dumps(record, sort_keys=True, indent=4, allow_nan=False) + "\n").encode("utf-8")
+        if len(content) > 16 * 1024 * 1024:
+            raise ValueError("Correspondence exceeds the supported 16 MiB document size.")
+
+        parent = posixpath.dirname(destination)
+        if parent: filesystem.makedirs(parent, exist_ok=True)
+
+        # Exclusive creation prevents deliberate replacement of an existing file.
+        with filesystem.open(destination, "xb") as target:
+            if target.write(content) != len(content):
+                raise OSError("Incomplete scan/run correspondence write.")
+
+        with filesystem.open(destination, "rb") as source:
+            if source.read(len(content) + 1) != content:
+                raise ValueError("Saved scan/run correspondence failed byte verification.")
+
+        pglMessages.message(f"Saved {len(record['pairs'])} scan/run matches to {destination}. This is a correspondence document, not a session checkpoint.")
+        return destination
+
+    ################################################################
+    # Load and resolve a standalone correspondence document
+    ################################################################
+    def loadScanRunMatches(self, filename, *, filesystem=None, verbose=True):
+        """Replace correspondence from JSON after complete validation.
+
+        Resolves UUIDs against the current scan/run collections, allowing
+        reordering but rejecting absent or ambiguous matched identities.
+
+        Verifies matched behavioral UUIDs against saved data.json.
+        Does not guess matches, create identities, or load scientific MRI data.
+
+        Returns the resolved list of current index pairs.
+        Read/validation failure leaves existing correspondence unchanged.
+        """
+        import json
+        import os
+        from pathlib import Path
+        from fsspec import AbstractFileSystem
+        from fsspec.core import url_to_fs
+        from fsspec.implementations.local import LocalFileSystem
+
+        if type(verbose) is not bool: raise TypeError("verbose must be Boolean.")
+
+        pathText = os.fspath(filename)
+        if not isinstance(pathText, str) or not pathText.strip():
+            raise ValueError("filename must be a nonempty path.")
+        if any(character in pathText for character in ("\x00", "\n", "\r")):
+            raise ValueError("filename must not contain NUL or newlines.")
+        if filesystem is not None and not isinstance(filesystem, AbstractFileSystem):
+            raise TypeError("filesystem must be an fsspec filesystem.")
+
+        if filesystem is None:
+            if "://" not in pathText and "::" not in pathText:
+                pathText = str(Path(pathText).expanduser().absolute())
+            filesystem, sourcePath = url_to_fs(pathText)
+        else:
+            sourcePath = filesystem._strip_protocol(pathText)
+            if isinstance(filesystem, LocalFileSystem):
+                sourcePath = str(Path(sourcePath).expanduser().absolute())
+
+        limit = 16 * 1024 * 1024
+        with filesystem.open(sourcePath, "rb") as source:
+            content = source.read(limit + 1)
+        if len(content) > limit:
+            raise ValueError("Correspondence exceeds the supported 16 MiB document size.")
+
+        def uniqueKeys(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result: raise ValueError(f"Duplicate correspondence JSON key: {key!r}")
+                result[key] = value
+            return result
+
+        def rejectConstant(value):
+            raise ValueError(f"Nonfinite JSON constant is not permitted: {value}")
+
+        document = json.loads(
+            content.decode("utf-8"),
+            object_pairs_hook=uniqueKeys,
+            parse_constant=rejectConstant,
+        )
+        record = self._validateScanRunCorrespondence(document)
+        resolved = self._resolveScanRunCorrespondence(record)
+
+        # The old correspondence remains intact until every check succeeds.
+        self.scanRunCorrespondence = record
+
+        if verbose:
+            pglMessages.message(f"Loaded scan/run correspondence from {sourcePath}.")
+            self.printScanRunMatches()
+
+        return list(resolved)

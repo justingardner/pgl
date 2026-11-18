@@ -704,7 +704,7 @@ class pglDatabase:
         restores annotations, and binds the saved history baseline.
 
         Supports legacy raw/derived contracts, derived v2 matrix products,
-        and derived v3 file attachments.
+        derived v3 file attachments, and derived MRI v1 checkpoints.
 
         Scientific fields remain deferred where supported. Derived files
         are restored as unopened references; their bytes are downloaded only
@@ -812,6 +812,7 @@ class pglDatabase:
                             "pgl.derived.session.v1",
                             "pgl.derived.session.v2",
                             "pgl.derived.session.v3",
+                            "pgl.derived.mri.v1",
                         ):
                             loader = cls.loadDerivedSession
                             hasMNE = contractVersion in (
@@ -822,6 +823,7 @@ class pglDatabase:
                             hasFileContract = contractVersion in (
                                 "pgl.derived.behavior.v3",
                                 "pgl.derived.session.v3",
+                                "pgl.derived.mri.v1",
                             )
 
                             # V3 behavioral sessions need a cache independently
@@ -885,14 +887,17 @@ class pglDatabase:
 
         pglPostgres.validateTimeouts(lockTimeoutSeconds=lockTimeoutSeconds, ioTimeoutSeconds=ioTimeoutSeconds, connectTimeoutSeconds=connectTimeoutSeconds)
         
-        # Never save only the behavioral portion of an MRI session.
+        # MRI checkpoints preserve original acquisitions, annotations,
+        # current behavior, correspondence, and explicit derived products.
         if getattr(session, "mri", None) is not None:
-            pglMessages.warning(
-                "Session was not saved: MRI checkpoint persistence is "
-                "not implemented yet. No database or payload writes were "
-                "attempted; the working session is unchanged."
-            )
-            return None
+            from .pglMRI import pglMRI
+
+            if type(session.mri) is not pglMRI or not session.mri.scans:
+                pglMessages.warning("Session was not saved: MRI requires a nonempty pglMRI collection.")
+                return None
+            if session.mne is not None:
+                pglMessages.warning("Session was not saved: combined MRI/MNE checkpoints are unsupported.")
+                return None
         
         # Refuse unsafe saves without turning an expected rejection into
         # a notebook traceback. Keep the failure marker and history intact.
@@ -3855,25 +3860,23 @@ class pglDatabase:
 
         return connection.execute(statement, (ingestMethod, description, createdBy)).fetchone()[0]
 
-    # ++++++++++++++++++++++++ createDerivedCheckpoint ++++++++++++++++++++++++
-    # Advanced database/checkpoint API. Observe the connection and transaction requirements in the
-    # docstring.
-    # Direct callers in this module: _saveDerivedSession.
+    ################################################################
+    # Allocate an unpublished derived checkpoint
+    ################################################################
     @staticmethod
     def createDerivedCheckpoint(connection, postgres, createdBy, parentSessionID, description=None, ingestMethod="manual", *, checkpointName=None, contractVersion="pgl.derived.behavior.v1", modalities=None):
         """Create an unpublished derived checkpoint in the caller's transaction.
 
         Supports:
-            v1: Behavioral/MNE inventories.
-            v2: Inventories with explicit matrix product references.
-            v3: Inventories with matrix references and derived-file attachments.
+            Behavioral/MNE v1/v2/v3 contracts.
+            MRI v1 with optional behavior, products, and derived files.
 
         Database lineage rules require a completed, active parent.
-        Modalities describe source content categories; matrices and derived
-        files do not add a separate modality.
+        Matrix products and derived files do not add separate modalities.
+        Combined MRI/MNE checkpoints remain unsupported.
 
-        Does not write payloads, attach products/files, complete the checkpoint,
-        or modify the working session.
+        Does not write payloads, complete or commit the checkpoint, or modify
+        the working session.
         """
         for label, value in (("createdBy", createdBy), ("parentSessionID", parentSessionID)):
             if type(value) is not int or not 0 <= value <= 9223372036854775807:
@@ -3891,32 +3894,42 @@ class pglDatabase:
             "pgl.derived.behavior.v2",
             "pgl.derived.behavior.v3",
         }
-        sessionContracts = {
+        mneContracts = {
             "pgl.derived.session.v1",
             "pgl.derived.session.v2",
             "pgl.derived.session.v3",
         }
+        mriContracts = {"pgl.derived.mri.v1"}
 
-        if contractVersion not in behaviorContracts | sessionContracts:
+        if contractVersion not in behaviorContracts | mneContracts | mriContracts:
             raise ValueError("Unsupported derived checkpoint contract.")
 
-        hasMNE = contractVersion in sessionContracts
-        if modalities is None: modalities = ["mne"] if hasMNE else ["behavior"]
+        hasMNE = contractVersion in mneContracts
+        hasMRI = contractVersion in mriContracts
+
+        if modalities is None:
+            modalities = ["mri"] if hasMRI else ["mne"] if hasMNE else ["behavior"]
 
         if not isinstance(modalities, (list, tuple)) or not modalities:
             raise ValueError("modalities must be a nonempty list or tuple.")
-
-        if any(not isinstance(value, str) or value not in ("behavior", "mne") for value in modalities):
-            raise ValueError("Supported content categories are 'behavior' and 'mne'.")
-
+        if any(not isinstance(value, str) or value not in ("behavior", "mne", "mri") for value in modalities):
+            raise ValueError("Supported content categories are behavior, mne, and mri.")
         if len(set(modalities)) != len(modalities):
             raise ValueError("Duplicate modalities are not allowed.")
 
-        if not hasMNE and set(modalities) != {"behavior"}:
-            raise ValueError("Behavioral checkpoints require only the behavior category.")
+        selected = set(modalities)
 
-        if hasMNE and "mne" not in modalities:
-            raise ValueError("MNE session checkpoints require the mne category.")
+        # The contract determines which modality combinations are legal.
+        # Do not permit an MRI collection to be omitted under a behavior/MNE
+        # contract or allow unsupported MRI/MNE combinations.
+        if hasMRI:
+            if "mri" not in selected or not selected <= {"behavior", "mri"}:
+                raise ValueError("Derived MRI checkpoints require MRI and optionally behavior.")
+        elif hasMNE:
+            if "mne" not in selected or not selected <= {"behavior", "mne"}:
+                raise ValueError("Derived MNE checkpoints require MNE and optionally behavior.")
+        elif selected != {"behavior"}:
+            raise ValueError("Behavioral checkpoints require only the behavior category.")
 
         table = sql.Identifier(postgres.databaseSchema, "session")
         statement = sql.SQL("""
@@ -3934,8 +3947,17 @@ class pglDatabase:
 
         return connection.execute(
             statement,
-            (parentSessionID, ingestMethod, list(modalities), checkpointName, description, contractVersion, createdBy),
+            (
+                parentSessionID,
+                ingestMethod,
+                list(modalities),
+                checkpointName,
+                description,
+                contractVersion,
+                createdBy,
+            ),
         ).fetchone()[0]
+    
     
     # ++++++++++++++++++++++ registerStagedRawCheckpoint +++++++++++++++++++++
     @classmethod
@@ -5092,7 +5114,8 @@ class pglDatabase:
         Called by loadDerivedSession() and loadRawSessionBundle().
         Uses the caller's SQL transaction for catalog lookup.
 
-        Supports raw session v1 and derived behavior/session v1/v2/v3.
+        Supports raw session v1/v2, derived behavior/session v1/v2/v3,
+        and derived MRI v1.
         Checks manifest integrity and encoding, exact file/product links,
         registered availability, and matrix descriptors.
 
@@ -5144,6 +5167,7 @@ class pglDatabase:
                 "pgl.derived.session.v1",
                 "pgl.derived.session.v2",
                 "pgl.derived.session.v3",
+                "pgl.derived.mri.v1",
             ),
         }
 
@@ -5338,40 +5362,38 @@ class pglDatabase:
             access.close()
             raise
 
-    # +++++++++++++++++++++++ _reconstructSessionBundle +++++++++++++++++++++++
-    # Direct callers in this module: _loadSessionBundle, reconstructDerivedSession.
-    # +++++++++++++++++++++++ _reconstructSessionBundle ++++++++++++++++++++++
+    ################################################################
+    # Reconstruct history, modality contents, and correspondence
+    ################################################################
     @classmethod
     def _reconstructSessionBundle(cls, manifest, fileLocations, storageOptionsByBackend=None, *, cacheDirectory=None, directLocalPolicy="materialize", cacheContext=None, origin="derived", accessContext=None, ownsAccess=False):
-        """Restore history and deferred session contents from verified inventory.
+        """Restore a session from a verified checkpoint inventory.
 
-        Supports existing behavioral/MNE contracts and raw v2 MRI bundles.
+        Supports existing behavioral/MNE contracts, raw MRI bundles, and
+        pgl.derived.mri.v1.
+
         Matrix attachments are restored separately by the database loader.
+        Derived files retain deferred checkpoint references.
+        MRI acquisition payloads remain deferred.
 
-        Reads history and modality descriptors, not NIfTI voxel payloads.
-        MRI restoration installs filesystem backings and saved header metadata.
-        First scan.data access materializes and verifies the selected NIfTI.
+        Correspondence is restored explicitly, without replaying actions.
+        Its matched endpoints are validated after restoring the collections.
+        This may read behavioral data.json files, but not tasks or MRI voxels.
 
-        accessContext retains caller-side access independently of SQL.
-        Ownership transfers to the checkpoint filesystem only after successful
-        reconstruction. On failure, the caller retains context ownership.
+        Ownership of accessContext transfers only after reconstruction succeeds.
+        On failure, the caller retains ownership of its access context.
 
-        cacheDirectory supplies local materialization storage for MNE/MRI and
-        deferred derived files. MRI currently always materializes into cache;
-        directLocalPolicy continues to apply to MNE only.
-
-        Does not publish data or query SQL. The returned filesystem must remain
-        open while deferred readers still need source access.
+        Does not query SQL, publish files, or run scientific processing.
         """
-        from .pglMRI import pglMRI
+        from copy import deepcopy
+
+        from .pglMRI import pglMRI, pglMRIBundle
         from .pglSession import pglSession, pglMNE
 
         if directLocalPolicy not in ("materialize", "immutable"):
             raise ValueError("directLocalPolicy must be 'materialize' or 'immutable'.")
-
         if type(ownsAccess) is not bool:
-            raise ValueError("ownsAccess must be a boolean.")
-
+            raise ValueError("ownsAccess must be Boolean.")
         if ownsAccess and accessContext is None:
             raise ValueError("ownsAccess requires an access context.")
 
@@ -5382,8 +5404,7 @@ class pglDatabase:
         if (hasMNE or hasMRI) and (cacheDirectory is None or not str(cacheDirectory).strip()):
             raise ValueError("MNE/MRI restoration requires an explicit cacheDirectory.")
 
-        # Borrow access during construction. Transfer ownership only after
-        # every restoration step succeeds.
+        # Borrow access until every reconstruction step has succeeded.
         filesystem = pglCheckpointFilesystem(
             manifest,
             fileLocations,
@@ -5395,9 +5416,13 @@ class pglDatabase:
         try:
             filesystem.mneCacheContext = deepcopy(cacheContext)
             history, metadata = cls._readSessionHistory(filesystem, len(manifest["runs"]))
+            correspondence = getattr(history, "_checkpointScanRunCorrespondence", None)
 
-            # Verify inner descriptors against the outer checkpoint inventory.
-            # These checks read metadata only, never scientific payload files.
+            # Raw acquisition exports must not carry derived correspondence.
+            if origin == "raw" and correspondence is not None:
+                raise ValueError("Raw acquisition history must not contain derived scan/run correspondence.")
+
+            # Verify inner descriptors against the hashed outer inventory.
             if hasMNE: cls._verifyMNEInventory(manifest, filesystem)
             if hasMRI: cls._verifyMRIInventory(manifest, filesystem)
 
@@ -5421,20 +5446,25 @@ class pglDatabase:
                 )
 
             if hasMRI:
-                # The MRI loader reads its descriptor and attaches references
-                # to this checkpoint filesystem. No Flywheel client is needed.
-                mri = pglMRI.loadAcquisitionBundle(
-                    manifest["mri"]["path"],
-                    filesystem=filesystem,
-                    cacheDirectory=cacheDirectory,
-                )
+                if origin == "derived":
+                    mri = pglMRIBundle.loadDerived(
+                        manifest["mri"]["path"],
+                        filesystem=filesystem,
+                        cacheDirectory=cacheDirectory,
+                    )
+                else:
+                    mri = pglMRI.loadAcquisitionBundle(
+                        manifest["mri"]["path"],
+                        filesystem=filesystem,
+                        cacheDirectory=cacheDirectory,
+                    )
+
                 if mri is None:
                     raise ValueError("MRI bundle restoration was refused.")
-
                 session.mri = mri
 
-            # Existing derived contracts retain their attachment behavior.
-            # Raw acquisition checkpoints do not contain derived attachments.
+            # Restore product payload references without materializing files.
+            # Product records themselves remain in the restored action history.
             if origin == "derived":
                 cls._restoreSessionDerivedFiles(
                     session,
@@ -5443,12 +5473,20 @@ class pglDatabase:
                     cacheDirectory=cacheDirectory,
                 )
 
+            if correspondence is not None:
+                record = session._validateScanRunCorrespondence(correspondence)
+                resolved = session._resolveScanRunCorrespondence(record)
+
+                # Install only after all matched identities have resolved.
+                session.scanRunCorrespondence = record
+                pglMessages.message(f"Restored {len(resolved)} scan/run matches by acquisition identity; no matching action was replayed.")
+
+            # Older checkpoints leave correspondence unset.
             filesystem._ownsAccess = ownsAccess
             return session
 
         except BaseException:
-            # Still borrowing the supplied context: cleanup must not take
-            # ownership from the caller when reconstruction fails.
+            # Still borrowing access: do not close the caller's access context.
             filesystem.close()
             raise
 
@@ -6693,6 +6731,8 @@ class pglDatabase:
 
         Selects a derived v3 contract when derivedFiles is nonempty.
         Sessions without derived files retain the existing v2 contract.
+        MRI sessions use pgl.derived.mri.v1 with explicit product/file lists.
+        MRI acquisitions remain separate from corrected-image attachments.
 
         Uses the caller's outer SQL transaction and an internal savepoint.
         One payload access context is shared across publication and verification.
@@ -6712,6 +6752,7 @@ class pglDatabase:
         from fsspec.implementations.local import LocalFileSystem
 
         from .pglSession import pglMNE
+        from .pglMRI import pglMRI
 
         for label, value in (("createdBy", createdBy), ("backendID", backendID), ("parentSessionID", parentSessionID)):
             if type(value) is not int or not 0 <= value <= 9223372036854775807:
@@ -6729,7 +6770,37 @@ class pglDatabase:
 
         products = cls._snapshotSessionMatrices(session)
         runs = list(session.runs or [])
-        hasMNE = session.mne is not None
+        mneData = session.mne
+        mriData = session.mri
+        hasMNE = mneData is not None
+        hasMRI = mriData is not None
+
+        if hasMRI and (type(mriData) is not pglMRI or not mriData.scans):
+            raise ValueError("MRI checkpoints require a nonempty pglMRI collection.")
+        if hasMRI and hasMNE:
+            raise ValueError("Combined MRI/MNE derived checkpoints are unsupported.")
+
+        # Keep acquisition identities and annotations stable throughout save.
+        # Runtime backings are compared by identity, never deep-copied.
+        scans = list(mriData.scans) if hasMRI else []
+        scanSnapshots = [
+            {
+                "uuid": scan.uuid,
+                "name": scan.name,
+                "sourceMetadata": scan._copyMetadata(scan.sourceMetadata),
+                "metadata": scan._copyMetadata(scan.metadata),
+                "backing": scan._backing,
+                "backingFilesystem": None if scan._backing is None else scan._backing.fs,
+                "backingPath": None if scan._backing is None else scan._backing.path,
+                "expectedIdentity": None if scan._backing is None else scan._backing.expectedIdentity,
+                "localPath": scan.localPath,
+            }
+            for scan in scans
+        ]
+        correspondenceSnapshot = deepcopy(session.scanRunCorrespondence)
+
+        # Validate correspondence and capture history before publishing products.
+        historySnapshot = cls._sessionHistoryBytes(session, acquisition=False)
 
         if not isinstance(session.derivedFiles, dict):
             raise TypeError("session.derivedFiles must be a dictionary.")
@@ -6739,8 +6810,8 @@ class pglDatabase:
         derivedSnapshot = deepcopy(session.derivedFiles)
         hasDerivedFiles = bool(derivedSnapshot)
 
-        if not runs and not hasMNE:
-            raise ValueError("A derived checkpoint must contain behavioral runs or MNE contents.")
+        if not runs and not hasMNE and not hasMRI:
+            raise ValueError("A derived checkpoint must contain behavioral, MRI, or MNE contents.")
 
         if hasMNE and type(session.mne) is not pglMNE:
             raise TypeError("MNE checkpoints currently support pglMNE, not subclasses.")
@@ -6749,12 +6820,14 @@ class pglDatabase:
             pglStorage.requireSafeSave(matrix)
             pglStorage.validateDataMatrixEncoding(matrix.requireData())
 
-        if hasDerivedFiles:
+        if hasMRI:
+            contractVersion = "pgl.derived.mri.v1"
+        elif hasDerivedFiles:
             contractVersion = "pgl.derived.session.v3" if hasMNE else "pgl.derived.behavior.v3"
         else:
             contractVersion = "pgl.derived.session.v2" if hasMNE else "pgl.derived.behavior.v2"
 
-        modalities = (["behavior"] if runs else []) + (["mne"] if hasMNE else [])
+        modalities = (["behavior"] if runs else []) + (["mne"] if hasMNE else []) + (["mri"] if hasMRI else [])
 
         sessions = sql.Identifier(postgres.databaseSchema, "session")
         users = sql.Identifier(postgres.databaseSchema, "users")
@@ -6777,6 +6850,41 @@ class pglDatabase:
             cls._requireSessionMatricesUnchanged(session, products)
             if session.derivedFiles != derivedSnapshot:
                 raise ValueError("Derived-file attachments changed while saving.")
+            if session.scanRunCorrespondence != correspondenceSnapshot:
+                raise ValueError("Scan/run correspondence changed while saving.")
+            if session.mri is not mriData or session.mne is not mneData:
+                raise ValueError("Session modality collections changed while saving.")
+
+            currentRuns = list(session.runs or [])
+            if len(currentRuns) != len(runs) or any(left is not right for left, right in zip(currentRuns, runs)):
+                raise ValueError("Behavioral run collection changed while saving.")
+
+            if hasMRI:
+                currentScans = list(mriData.scans)
+                if len(currentScans) != len(scans) or any(left is not right for left, right in zip(currentScans, scans)):
+                    raise ValueError("MRI scan collection changed while saving.")
+
+                for scan, snapshot in zip(scans, scanSnapshots):
+                    if (
+                        scan.uuid != snapshot["uuid"]
+                        or scan.name != snapshot["name"]
+                        or scan.sourceMetadata != snapshot["sourceMetadata"]
+                        or scan.metadata != snapshot["metadata"]
+                        or scan._backing is not snapshot["backing"]
+                        or scan.localPath != snapshot["localPath"]
+                    ):
+                        raise ValueError("MRI metadata or source binding changed while saving.")
+
+                    backing = scan._backing
+                    if backing is not None and (
+                        backing.fs is not snapshot["backingFilesystem"]
+                        or backing.path != snapshot["backingPath"]
+                        or backing.expectedIdentity != snapshot["expectedIdentity"]
+                    ):
+                        raise ValueError("MRI source backing changed while saving.")
+
+            if cls._sessionHistoryBytes(session, acquisition=False) != historySnapshot:
+                raise ValueError("Session history or metadata changed while saving.")
 
         # Reserve additional weight for matrix publication only when needed.
         matrixEnd = 0.35 if products else 0.04
@@ -7352,61 +7460,113 @@ class pglDatabase:
             "files": sorted(files, key=lambda record: record["name"]),
         }
 
-    # ++++++++++++++++++++++++ saveDerivedSessionFiles ++++++++++++++++++++++++
-    # Direct callers in this module: _saveDerivedSession.
+    ################################################################
+    # Export current session contents into a derived checkpoint directory
+    ################################################################
     @classmethod
     def saveDerivedSessionFiles(cls, session, dataPath, filesystem=None, filesystemPrefix=None, *, productRecords=None):
-        """Export current session files and their checkpoint manifest.
+        """Export current contents, history, correspondence, and attachments.
 
-        Behavioral/MNE contents, history, and attached derived files are
-        exported into a fresh destination. Matrix arrays remain in separately
-        published Zarr bundles.
+        Supports:
+            Existing behavioral/MNE derived contracts.
+            pgl.derived.mri.v1 for MRI with optional behavior.
+
+        MRI payloads remain original acquisition sources. Current annotations
+        are preserved separately. Processed images are derived attachments,
+        linked to acquisition UUIDs through their registered products.
 
         productRecords:
-            None: permitted only without attached matrices.
-            List: explicit named matrix revision references supplied by the
-                  publication coordinator.
+            None is permitted only without attached matrices.
+            Otherwise supply exact named matrix revision references from the
+            publication coordinator. Matrix arrays are published separately.
 
-        Without derived-file attachments:
-            Preserve existing v1/v2 contract selection.
-
-        With derived-file attachments:
-            Write a v3 manifest with explicit products and derivedFiles lists.
-            Attachment bytes join the ordinary verified file inventory.
-
-        Does not register database rows or modify working attachments.
-        Failed exports may leave partial destination files.
+        Does not register SQL rows or modify working scientific contents.
+        Writes manifest.json last. Failed exports may leave partial output.
+        Concurrent mutation is unsupported; detectable changes are rejected.
         """
+        import json
+        import posixpath
+        import hashlib
         from copy import deepcopy
 
-        from .pglStorage import pglStorage
+        from .pglMRI import pglMRI, pglMRIBundle
         from .pglSession import pglMNE
+        from .pglStorage import pglStorage
+
+        pglStorage.requireSafeSave(session)
 
         runs = list(session.runs or [])
         mneData = session.mne
+        mriData = session.mri
+        hasMRI = mriData is not None
         products = cls._snapshotSessionMatrices(session)
-
-        # Attachment metadata contains no filesystem handles. Deferred access
-        # lives separately in the session's runtime-only backing dictionary.
         derivedSnapshot = deepcopy(session.derivedFiles)
+        correspondenceSnapshot = deepcopy(session.scanRunCorrespondence)
+
+        if mneData is not None and hasMRI:
+            raise ValueError("Combined MRI/MNE derived checkpoints are not supported.")
+        if mneData is not None and type(mneData) is not pglMNE:
+            raise TypeError("MNE export currently supports pglMNE, not subclasses.")
+        if hasMRI and (type(mriData) is not pglMRI or not mriData.scans):
+            raise ValueError("MRI export requires a nonempty pglMRI collection.")
+        if not runs and mneData is None and not hasMRI:
+            raise ValueError("A checkpoint must contain behavioral, MRI, or MNE contents.")
 
         if productRecords is None:
             if products:
-                raise ValueError("Session has attached matrices. The save coordinator must publish them and supply productRecords; refusing to omit attachments.")
-
+                raise ValueError("The save coordinator must publish attached matrices and supply productRecords.")
             validatedProducts = None
         else:
             validatedProducts = cls._validateSessionProductRecords(productRecords)
-            declaredNames = {record["name"] for record in validatedProducts}
+            if {record["name"] for record in validatedProducts} != set(products):
+                raise ValueError("Manifest products must exactly match session.dataMatrices.")
 
-            if declaredNames != set(products):
-                raise ValueError("Manifest product names must exactly match session.dataMatrices.")
+        if not isinstance(derivedSnapshot, dict):
+            raise TypeError("session.derivedFiles must be a dictionary.")
 
-        if not runs and mneData is None:
-            raise ValueError("A checkpoint must contain behavioral runs or MNE contents.")
+        # Capture MRI collection and portable annotations for end-of-export
+        # checks. Original-header discovery occurs on exported copies only.
+        scans = list(mriData.scans) if hasMRI else []
+        scanSnapshots = [
+            {
+                "uuid": scan.uuid,
+                "name": scan.name,
+                "sourceMetadata": scan._copyMetadata(scan.sourceMetadata),
+                "metadata": scan._copyMetadata(scan.metadata),
+            }
+            for scan in scans
+        ]
 
-        if mneData is not None and type(mneData) is not pglMNE:
-            raise TypeError("MNE export currently supports pglMNE, not subclasses.")
+        def requireUnchanged():
+            currentRuns = list(session.runs or [])
+            if len(currentRuns) != len(runs) or any(left is not right for left, right in zip(currentRuns, runs)):
+                raise ValueError("Behavioral run collection changed during export.")
+            if session.mne is not mneData or session.mri is not mriData:
+                raise ValueError("Session modality contents changed during export.")
+            if session.derivedFiles != derivedSnapshot:
+                raise ValueError("Derived-file attachments changed during export.")
+            if session.scanRunCorrespondence != correspondenceSnapshot:
+                raise ValueError("Scan/run correspondence changed during export.")
+
+            cls._requireSessionMatricesUnchanged(session, products)
+
+            if hasMRI:
+                currentScans = list(mriData.scans)
+                if len(currentScans) != len(scans) or any(left is not right for left, right in zip(currentScans, scans)):
+                    raise ValueError("MRI scan collection changed during export.")
+
+                for scan, snapshot in zip(scans, scanSnapshots):
+                    if (
+                        scan.uuid != snapshot["uuid"]
+                        or scan.name != snapshot["name"]
+                        or scan.sourceMetadata != snapshot["sourceMetadata"]
+                        or scan.metadata != snapshot["metadata"]
+                    ):
+                        raise ValueError("MRI scan metadata changed during export.")
+
+        # History encoding validates correspondence against current identities
+        # and saved behavioral UUIDs before any output directory is created.
+        historyBytes = cls._sessionHistoryBytes(session, acquisition=False)
 
         if dataPath is None or not str(dataPath).strip():
             raise ValueError("A destination path is required.")
@@ -7420,22 +7580,18 @@ class pglDatabase:
         if filesystem is None: raise ValueError("Could not resolve destination filesystem.")
         if filesystem.exists(destination): raise FileExistsError(f"Destination already exists: {destination}")
 
-        historyBytes = cls._sessionHistoryBytes(session, acquisition=False)
+        requireUnchanged()
         filesystem.makedirs(destination, exist_ok=False)
-        directories = set()
-        files = []
-        runRecords = []
+        directories, files, runRecords = set(), [], []
 
         def inventoryDirectory(relativeRoot):
-            """Inventory an exported behavioral or MNE directory."""
+            """Hash exported files without loading scientific arrays."""
             fullRoot = posixpath.join(destination, relativeRoot)
             directories.add(relativeRoot)
 
             for currentPath, directoryNames, fileNames in filesystem.walk(fullRoot, detail=False, on_error="raise"):
                 logicalPath = posixpath.relpath(currentPath, destination)
-
-                for name in directoryNames:
-                    directories.add(posixpath.join(logicalPath, name))
+                for name in directoryNames: directories.add(posixpath.join(logicalPath, name))
 
                 for name in fileNames:
                     savedPath = posixpath.join(currentPath, name)
@@ -7444,31 +7600,40 @@ class pglDatabase:
                         **pglStorage.hashFile(filesystem, savedPath),
                     })
 
+        ################################################################
+        # Export current behavioral contents
+        ################################################################
         if runs:
             filesystem.makedirs(posixpath.join(destination, "runs"), exist_ok=False)
             directories.add("runs")
 
         for index, run in enumerate(runs):
             runName = f"runs/{index:06d}"
+            pglMessages.message(f"Exporting current behavioral run {index + 1}/{len(runs)}.")
             run.saveDerivedRun(dataPath=posixpath.join(destination, runName), filesystem=filesystem)
             runRecords.append({"index": index, "path": runName})
             inventoryDirectory(runName)
 
+        ################################################################
+        # Export modality contents
+        ################################################################
         if mneData is not None:
             mneData.saveBundle(posixpath.join(destination, "mne"), filesystem=filesystem)
             inventoryDirectory("mne")
 
-        # Export registered attachments through the tested database helper.
-        # This also supports attachments restored from checkpoint backings.
-        if session.derivedFiles != derivedSnapshot:
-            raise ValueError("Derived-file attachments changed before export.")
+        if hasMRI:
+            pglMRIBundle.saveDerived(mriData, posixpath.join(destination, "mri"), filesystem=filesystem)
+            inventoryDirectory("mri")
 
+        ################################################################
+        # Export attached artifacts, including corrected MRI images
+        ################################################################
+        requireUnchanged()
         derivedParts = cls._saveSessionDerivedFiles(session, filesystem, destination)
         directories.update(derivedParts["directories"])
         files.extend(derivedParts["files"])
 
         historyPath = posixpath.join(destination, "history.json")
-
         with filesystem.open(historyPath, "xb") as target:
             if target.write(historyBytes) != len(historyBytes):
                 raise OSError("Incomplete session history write.")
@@ -7477,22 +7642,25 @@ class pglDatabase:
             "sha256": hashlib.sha256(historyBytes).hexdigest(),
             "size_bytes": len(historyBytes),
         }
-        storedHistory = pglStorage.hashFile(filesystem, historyPath)
-        if storedHistory != expectedHistory: raise ValueError("Saved session history verification failed.")
+        if pglStorage.hashFile(filesystem, historyPath) != expectedHistory:
+            raise ValueError("Saved session history verification failed.")
+        files.append({"name": "history.json", **expectedHistory})
 
-        files.append({"name": "history.json", **storedHistory})
-
-        contractVersion = "pgl.derived.session.v1" if mneData is not None else "pgl.derived.behavior.v1"
-
-        if validatedProducts is not None:
-            contractVersion = "pgl.derived.session.v2" if mneData is not None else "pgl.derived.behavior.v2"
-
-        if derivedParts["derivedFiles"]:
-            contractVersion = "pgl.derived.session.v3" if mneData is not None else "pgl.derived.behavior.v3"
-
-            # V3 always declares products. None was already checked above
-            # to ensure that no attached matrices would be omitted.
+        ################################################################
+        # Select the checkpoint contract without changing legacy layouts
+        ################################################################
+        if hasMRI:
+            contractVersion = "pgl.derived.mri.v1"
             if validatedProducts is None: validatedProducts = []
+        else:
+            contractVersion = "pgl.derived.session.v1" if mneData is not None else "pgl.derived.behavior.v1"
+
+            if validatedProducts is not None:
+                contractVersion = "pgl.derived.session.v2" if mneData is not None else "pgl.derived.behavior.v2"
+
+            if derivedParts["derivedFiles"]:
+                contractVersion = "pgl.derived.session.v3" if mneData is not None else "pgl.derived.behavior.v3"
+                if validatedProducts is None: validatedProducts = []
 
         manifest = {
             "contract_version": contractVersion,
@@ -7500,32 +7668,59 @@ class pglDatabase:
             "directories": sorted(directories),
             "files": sorted(files, key=lambda record: record["name"]),
         }
-
         if mneData is not None: manifest["mne"] = {"path": "mne"}
+        if hasMRI: manifest["mri"] = {"path": "mri"}
         if validatedProducts is not None: manifest["products"] = validatedProducts
-        if derivedParts["derivedFiles"]: manifest["derivedFiles"] = derivedParts["derivedFiles"]
+        if hasMRI or derivedParts["derivedFiles"]:
+            manifest["derivedFiles"] = derivedParts["derivedFiles"]
 
         cls.validateDerivedManifest(manifest)
 
         class DestinationView:
-            """Read exported files by their logical checkpoint paths."""
-
+            """Expose exported files by logical checkpoint path."""
             def open(self, path, mode="rb", **kwargs):
                 return filesystem.open(posixpath.join(destination, path), mode=mode, **kwargs)
 
         view = DestinationView()
-        _, metadata = cls._readSessionHistory(view, len(runs))
+        restoredHistory, labels = cls._readSessionHistory(view, len(runs))
 
-        if runs and metadata != cls._behaviorLabelMetadata(manifest, view):
-            raise ValueError("Derived history labels differ from the exported behavioral settings.")
-
+        if runs and labels != cls._behaviorLabelMetadata(manifest, view):
+            raise ValueError("History labels differ from exported behavioral settings.")
         if mneData is not None: cls._verifyMNEInventory(manifest, view)
+        mriDescriptor = cls._verifyMRIInventory(manifest, view) if hasMRI else None
 
-        cls._requireSessionMatricesUnchanged(session, products)
-        if session.derivedFiles != derivedSnapshot:
-            raise ValueError("Derived-file attachments changed during export.")
+        ################################################################
+        # Verify correspondence against exported identities, not just memory
+        ################################################################
+        savedCorrespondence = getattr(restoredHistory, "_checkpointScanRunCorrespondence", None)
+        if savedCorrespondence != correspondenceSnapshot:
+            raise ValueError("Exported correspondence differs from the working record.")
 
-        # Publish the staging manifest only after all exports and checks pass.
+        if savedCorrespondence is not None and savedCorrespondence["pairs"]:
+            if mriDescriptor is None:
+                raise ValueError("Nonempty scan/run correspondence requires exported MRI scans.")
+
+            scanIDs = [record["uuid"] for record in mriDescriptor["scans"]]
+            behaviorIDs = []
+
+            for record in runRecords:
+                with view.open(posixpath.join(record["path"], "data.json"), "rt", encoding="utf-8") as source:
+                    document = json.load(source)
+                if not isinstance(document, dict):
+                    raise ValueError("Exported behavioral data must contain a JSON object.")
+                behaviorIDs.append(document.get("uuid"))
+
+            for pair in savedCorrespondence["pairs"]:
+                if scanIDs.count(pair["scanUUID"]) != 1:
+                    raise ValueError("Matched MRI identity is absent or ambiguous in exported contents.")
+                if behaviorIDs.count(pair["behaviorDataUUID"]) != 1:
+                    raise ValueError("Matched behavioral identity is absent or ambiguous in exported contents.")
+
+        requireUnchanged()
+        if cls._sessionHistoryBytes(session, acquisition=False) != historyBytes:
+            raise ValueError("Session history or metadata changed during export.")
+
+        # The manifest is the final completion marker for local staging.
         cls.stageDerivedManifest(manifest, filesystem, destination)
         return destination, manifest
 
@@ -8425,65 +8620,111 @@ class pglDatabase:
 
     # ++++++++++++++++++++++++++ _sessionHistoryBytes +++++++++++++++++++++++++
     # Direct callers in this module: saveDerivedSessionFiles, saveRawSessionFiles.
+    ################################################################
+    # Encode checkpoint history, labels, and derived correspondence
+    ################################################################
     @classmethod
     def _sessionHistoryBytes(cls, session, *, acquisition=False):
-        """Encode history and labels after checking working-session safety.
+        """Encode history and explicit session metadata after safety checks.
 
-        Runtime failure state is not serialized into checkpoint metadata.
-        Labels remain part of the payload identity.
+        Derived exports include configured scan/run correspondence.
+        Raw exports omit it because it is derived analysis metadata.
+
+        Runtime failure state is not serialized.
+        Correspondence is validated against current acquisition identities.
+        Does not modify scientific data or publish files.
         """
         from .pglPipeline import pglActionable
 
-        # All current derived exports and MNE raw exports pass through here.
-        # Refuse unsafe working state before serializing or writing payloads.
+        if type(acquisition) is not bool:
+            raise TypeError("acquisition must be Boolean.")
+
         pglStorage.requireSafeSave(session)
 
-        metadata = {"version": 1, "labels": session.getSessionLabels(acquisition=acquisition)}
-        cls._validateSessionLabelMetadata(metadata, runCount=len(session.runs or []))
+        labels = {
+            "version": 1,
+            "labels": session.getSessionLabels(acquisition=acquisition),
+        }
+        cls._validateSessionLabelMetadata(labels, runCount=len(session.runs or []))
 
+        correspondence = None
+        if not acquisition and session.scanRunCorrespondence is not None:
+            correspondence = session._validateScanRunCorrespondence(session.scanRunCorrespondence)
+            session._resolveScanRunCorrespondence(correspondence)
+
+        # Retain the existing history representation and its action products.
         history = pglActionable()
         history.uuid = session.uuid
         history.actionHistory = list(session.actionHistory)
         document = json.loads(history.toJSON())
 
-        if "pgl_session_labels" in document:
-            raise ValueError("History wrapper already contains the reserved session-label field.")
+        reserved = {"pgl_session_labels", "pgl_scan_run_correspondence"}
+        if reserved.intersection(document):
+            raise ValueError("History wrapper contains a reserved session metadata field.")
 
-        document["pgl_session_labels"] = metadata
+        document["pgl_session_labels"] = labels
+
+        # Absence means unset; an explicit empty pair list remains configured.
+        if correspondence is not None:
+            document["pgl_scan_run_correspondence"] = correspondence
+
         return json.dumps(document, sort_keys=True, indent=4).encode("utf-8")
 
-    # ++++++++++++++++++++++++++ _readSessionHistory ++++++++++++++++++++++++++
-    # Direct callers in this module: _readReplayCheckpointHistory, _reconstructSessionBundle,
-    # _registerSessionBundleFiles, saveDerivedSessionFiles, saveRawSessionFiles.
+    ################################################################
+    # Restore checkpoint history and explicit session metadata
+    ################################################################
     @classmethod
     def _readSessionHistory(cls, filesystem, runCount):
-        """Restore history and optional labels without loading behavioral fields.
+        """Restore history and labels without resolving scientific payloads.
 
-        Supports older history files without session-label metadata.
+        Supports older files without labels or scan/run correspondence.
+
+        Returns the existing (history, labels) tuple.
+        Validated correspondence is carried temporarily on
+        history._checkpointScanRunCorrespondence for session reconstruction.
+
+        Only correspondence structure is checked here. The session loader
+        must resolve its endpoints after restoring runs and MRI scans.
         """
         from .pglPipeline import pglActionable
+        from .pglSession import pglSession
+
+        def uniqueKeys(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result: raise ValueError(f"Duplicate checkpoint-history key: {key!r}")
+                result[key] = value
+            return result
 
         with filesystem.open("history.json", "rt", encoding="utf-8") as source:
-            document = json.load(source)
+            document = json.load(source, object_pairs_hook=uniqueKeys)
 
         if not isinstance(document, dict):
             raise ValueError("Checkpoint history must contain a JSON object.")
 
-        hasMetadata = "pgl_session_labels" in document
-        metadata = document.pop("pgl_session_labels", None)
+        hasLabels = "pgl_session_labels" in document
+        labels = document.pop("pgl_session_labels", None)
+        if hasLabels:
+            cls._validateSessionLabelMetadata(labels, runCount=runCount)
 
-        if hasMetadata:
-            cls._validateSessionLabelMetadata(metadata, runCount=runCount)
+        hasCorrespondence = "pgl_scan_run_correspondence" in document
+        correspondence = document.pop("pgl_scan_run_correspondence", None)
+        if hasCorrespondence:
+            # Explicit null is not a correspondence record. Unset is encoded
+            # by omitting the field, preserving compatibility with old files.
+            correspondence = pglSession._validateScanRunCorrespondence(correspondence)
 
         history = pglActionable.fromJSON(json.dumps(document), filename="history.json")
-
         if type(history) is not pglActionable:
             raise ValueError("Checkpoint history must contain a pglActionable wrapper.")
 
         if json.loads(history.toJSON()) != document:
             raise ValueError("Checkpoint history could not be reconstructed without changes.")
 
-        return history, metadata
+        # Install runtime transport metadata only after the serialization
+        # round-trip check. This is not an action or a replay instruction.
+        history._checkpointScanRunCorrespondence = correspondence
+        return history, labels
 
     # +++++++++++++++++++++++++ _behaviorLabelMetadata ++++++++++++++++++++++++
     # Direct callers in this module: _registerSessionBundleFiles, registerStagedRawCheckpoint,
@@ -8778,25 +9019,30 @@ class pglDatabase:
     ################################################################
     @classmethod
     def validateDerivedManifest(cls, manifest):
-        """Validate derived v1/v2/v3 manifests without accessing payloads.
+        """Validate derived behavioral/MNE and MRI checkpoint inventories.
 
-        V1 preserves the original behavioral/MNE inventory.
-        V2 adds explicit named matrix revision references.
-        V3 additionally declares generic derived-file attachments.
+        Existing contracts:
+            V1: Behavioral/MNE inventory.
+            V2: Adds explicit matrix-product references.
+            V3: Adds explicit derived-file attachments.
 
-        V3 attachment descriptions contain portable metadata and payload paths.
-        Payload hashes and sizes remain in the ordinary files inventory.
-        Local cache paths and action settings are not embedded.
+        MRI contract:
+            pgl.derived.mri.v1 includes MRI, optional behavior, matrix
+            references, and derived-file attachments.
 
-        Existing v1/v2 validation behavior is preserved.
-        Does not mutate the supplied manifest or verify actual payload bytes.
+        Does not read payloads, mutate the manifest, or establish scientific
+        validity. Inner modality descriptors are verified separately.
         """
         import posixpath
         import re
 
-        if not isinstance(manifest, dict): raise ValueError("Manifest must be a dictionary.")
+        if not isinstance(manifest, dict):
+            raise ValueError("Manifest must be a dictionary.")
 
         contract = manifest.get("contract_version")
+        if contract == "pgl.derived.mri.v1":
+            return cls._validateDerivedMRIManifest(manifest)
+
         v2Contracts = {
             "pgl.derived.behavior.v2": "pgl.derived.behavior.v1",
             "pgl.derived.session.v2": "pgl.derived.session.v1",
@@ -8829,11 +9075,8 @@ class pglDatabase:
 
             def validatePath(path):
                 if (
-                    not isinstance(path, str)
-                    or not path
-                    or path.startswith("/")
-                    or "\\" in path
-                    or "\x00" in path
+                    not isinstance(path, str) or not path
+                    or path.startswith("/") or "\\" in path or "\x00" in path
                     or any(part in ("", ".", "..") for part in path.split("/"))
                 ):
                     raise ValueError(f"Invalid manifest path: {path!r}")
@@ -8843,6 +9086,7 @@ class pglDatabase:
                 raise ValueError("Directories must be unique and sorted.")
 
             fileNames = []
+
             for record in fileRecords:
                 if not isinstance(record, dict) or set(record) != {"name", "sha256", "size_bytes"}:
                     raise ValueError("File record has missing or unexpected fields.")
@@ -8858,8 +9102,7 @@ class pglDatabase:
             if fileNames != sorted(set(fileNames)):
                 raise ValueError("File names must be unique and sorted.")
 
-            directorySet = set(directories)
-            fileSet = set(fileNames)
+            directorySet, fileSet = set(directories), set(fileNames)
             if directorySet.intersection(fileSet):
                 raise ValueError("A path cannot be both a file and a directory.")
 
@@ -8894,8 +9137,7 @@ class pglDatabase:
 
                 filename = attachment["filename"]
                 if (
-                    not isinstance(filename, str)
-                    or not filename.strip()
+                    not isinstance(filename, str) or not filename.strip()
                     or filename in (".", "..")
                     or any(character in filename for character in ("/", "\\", "\x00", "\n", "\r"))
                 ):
@@ -9281,18 +9523,24 @@ class pglDatabase:
         return descriptor
 
     # ++++++++++++++++++++++++++ _verifyMRIInventory ++++++++++++++++++++++++++
+    ################################################################
+    # Verify MRI descriptor and original-source payload references
+    ################################################################
     @classmethod
     def _verifyMRIInventory(cls, manifest, filesystem, *, maxDescriptorBytes=64 * 1024 * 1024):
-        """Verify MRI descriptor metadata against the outer file inventory.
+        """Verify MRI metadata against the outer checkpoint inventory.
 
-        filesystem exposes logical checkpoint paths, such as mri/mri.json.
-        Ordinary staging directories may supply a small rooted view.
+        Raw MRI checkpoints require pgl.mri.acquisition.v1.
+        Derived MRI checkpoints require pgl.mri.derived.v1.
+
+        Both describe original acquisition payloads. Processed image products
+        live in the session's separate derived-file attachment inventory.
 
         Reads the MRI descriptor only, not NIfTI payloads.
-        Requires the caller to validate the outer manifest first.
+        The caller must validate the outer manifest first.
 
-        Checks descriptor bytes, strict inner structure, and exact payload
-        correspondence. Does not query SQL, restore scans, or modify metadata.
+        Checks descriptor bytes, inner structure, and exact acquisition
+        payload correspondence. Does not reconstruct scans or modify metadata.
         """
         import hashlib
         import json
@@ -9305,6 +9553,16 @@ class pglDatabase:
 
         if manifest.get("mri") != {"path": "mri"}:
             raise ValueError("Missing or invalid MRI bundle declaration.")
+
+        outerContract = manifest.get("contract_version")
+        if outerContract == "pgl.raw.session.v2":
+            expectedInnerContract = pglMRIBundle.contract
+            validator = pglMRIBundle.validateDescriptor
+        elif outerContract == "pgl.derived.mri.v1":
+            expectedInnerContract = "pgl.mri.derived.v1"
+            validator = pglMRIBundle.validateDerivedDescriptor
+        else:
+            raise ValueError(f"Unsupported MRI checkpoint contract: {outerContract!r}")
 
         inventory = {record["name"]: record for record in manifest["files"]}
         descriptorPath = "mri/mri.json"
@@ -9329,15 +9587,24 @@ class pglDatabase:
                 result[key] = value
             return result
 
-        descriptor = json.loads(content, object_pairs_hook=uniqueKeys)
-        pglMRIBundle.validateDescriptor(descriptor)
+        def rejectConstant(value):
+            raise ValueError(f"Nonfinite MRI descriptor JSON constant: {value}")
+
+        descriptor = json.loads(
+            content,
+            object_pairs_hook=uniqueKeys,
+            parse_constant=rejectConstant,
+        )
+        if type(descriptor) is not dict or descriptor.get("contract") != expectedInnerContract:
+            raise ValueError("MRI descriptor contract disagrees with its enclosing checkpoint.")
+
+        validator(descriptor)
 
         expected = {}
+
         for scan in descriptor["scans"]:
             name = posixpath.join("mri", scan["path"])
-            if name in expected:
-                raise ValueError("Duplicate MRI payload reference.")
-
+            if name in expected: raise ValueError("Duplicate MRI acquisition payload reference.")
             expected[name] = (scan["sha256"], scan["size_bytes"])
 
         actual = {
@@ -9345,11 +9612,11 @@ class pglDatabase:
             for name, record in inventory.items()
             if name.startswith("mri/") and name != descriptorPath
         }
+
         if actual != expected:
-            raise ValueError("MRI descriptor payloads do not exactly match checkpoint inventory.")
+            raise ValueError("MRI descriptor acquisition payloads do not exactly match the checkpoint inventory.")
 
         return descriptor
-
     # -------------------------------------------------------------------------
     # Dataset configuration, history, and publication validation
     # -------------------------------------------------------------------------
@@ -10803,6 +11070,7 @@ class pglDatabase:
             ("derived", "pgl.derived.session.v1"),
             ("derived", "pgl.derived.session.v2"),
             ("derived", "pgl.derived.session.v3"),
+            ("derived", "pgl.derived.mri.v1"),
         }
 
         if (origin, contract) not in supported:
@@ -11991,6 +12259,172 @@ class pglDatabase:
             "No automatic start, restart, or retry was performed.",
             level=2,
         )
+        
+    ################################################################
+    # Validate a derived MRI session checkpoint inventory
+    ################################################################
+    @classmethod
+    def _validateDerivedMRIManifest(cls, manifest):
+        """Validate derived MRI inventories without reading payload files.
+
+        Contract:
+            pgl.derived.mri.v1
+
+        Contains:
+            MRI acquisition sources and current scan annotations.
+            Optional current behavioral runs.
+            Explicit matrix-product references.
+            Explicit derived-file attachments.
+            Session history and associated metadata.
+
+        Corrected images are derived attachments, not replacement acquisitions.
+        Combined MRI/MNE checkpoints remain unsupported.
+
+        Validates complete inventory structure before separating attachments.
+        Does not mutate the manifest or verify scientific payload bytes.
+        """
+        import posixpath
+        import re
+
+        expectedFields = {
+            "contract_version", "runs", "mri", "directories",
+            "files", "products", "derivedFiles",
+        }
+        if type(manifest) is not dict or set(manifest) != expectedFields:
+            raise ValueError("Derived MRI manifest has missing or unexpected fields.")
+        if manifest["contract_version"] != "pgl.derived.mri.v1":
+            raise ValueError("Unsupported derived MRI checkpoint contract.")
+        if manifest["mri"] != {"path": "mri"}:
+            raise ValueError("Derived MRI bundle path must be 'mri'.")
+
+        for field in ("runs", "directories", "files", "derivedFiles"):
+            if type(manifest[field]) is not list:
+                raise ValueError(f"Manifest {field} must be a list.")
+
+        cls._validateSessionProductRecords(manifest["products"])
+
+        def validatePath(path):
+            if (
+                not isinstance(path, str) or not path
+                or path.startswith("/") or "\\" in path or "\x00" in path
+                or any(part in ("", ".", "..") for part in path.split("/"))
+            ):
+                raise ValueError(f"Invalid checkpoint path: {path!r}")
+
+        ################################################################
+        # Validate the complete inventory before removing any entries
+        ################################################################
+        directories = manifest["directories"]
+        for path in directories: validatePath(path)
+        if directories != sorted(set(directories)):
+            raise ValueError("Manifest directories must be unique and sorted.")
+
+        fileNames = []
+
+        for record in manifest["files"]:
+            if type(record) is not dict or set(record) != {"name", "sha256", "size_bytes"}:
+                raise ValueError("Invalid checkpoint file record.")
+
+            validatePath(record["name"])
+            if not isinstance(record["sha256"], str) or re.fullmatch(r"[0-9a-f]{64}", record["sha256"]) is None:
+                raise ValueError("Invalid checkpoint file SHA-256.")
+            if type(record["size_bytes"]) is not int or not 0 <= record["size_bytes"] <= 9223372036854775807:
+                raise ValueError("Invalid checkpoint file size.")
+
+            fileNames.append(record["name"])
+
+        if fileNames != sorted(set(fileNames)):
+            raise ValueError("Manifest filenames must be unique and sorted.")
+
+        directorySet, fileSet = set(directories), set(fileNames)
+        if directorySet.intersection(fileSet):
+            raise ValueError("A checkpoint path cannot be both a file and a directory.")
+
+        for path in directories + fileNames:
+            parent = posixpath.dirname(path)
+            if parent and parent not in directorySet:
+                raise ValueError(f"Missing checkpoint parent directory for {path!r}.")
+
+        ################################################################
+        # Validate explicitly declared derived attachments
+        ################################################################
+        attachments = manifest["derivedFiles"]
+        attachmentNames = []
+        expectedPayloads = set()
+        expectedDirectories = {"derived"} if attachments else set()
+
+        for index, attachment in enumerate(attachments):
+            if type(attachment) is not dict or set(attachment) != {
+                "name", "runIndex", "filename", "mediaType", "path",
+            }:
+                raise ValueError("Invalid derived-file descriptor.")
+
+            name = attachment["name"]
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("Derived-file names must be nonblank strings.")
+            if any(character in name for character in ("\x00", "\n", "\r")):
+                raise ValueError("Invalid derived-file name.")
+            attachmentNames.append(name)
+
+            runIndex = attachment["runIndex"]
+            if runIndex is not None:
+                if type(runIndex) is not int or not 0 <= runIndex < len(manifest["runs"]):
+                    raise ValueError("Invalid derived-file behavioral run index.")
+
+            filename = attachment["filename"]
+            if (
+                not isinstance(filename, str) or not filename.strip()
+                or filename in (".", "..")
+                or any(character in filename for character in ("/", "\\", "\x00", "\n", "\r"))
+            ):
+                raise ValueError("Derived filename must be one safe filename.")
+
+            mediaType = attachment["mediaType"]
+            if not isinstance(mediaType, str) or not mediaType.strip():
+                raise ValueError("Derived-file mediaType must be a nonblank string.")
+            if any(character in mediaType for character in ("\x00", "\n", "\r")):
+                raise ValueError("Invalid derived-file mediaType.")
+
+            # Preserve the existing deterministic attachment directory layout.
+            root = f"derived/f{index:06d}"
+            expectedPath = f"{root}/{filename}"
+            if attachment["path"] != expectedPath:
+                raise ValueError(f"Derived-file path must be {expectedPath!r}.")
+
+            expectedDirectories.add(root)
+            expectedPayloads.add(expectedPath)
+
+        if attachmentNames != sorted(set(attachmentNames)):
+            raise ValueError("Derived-file names must be unique and sorted.")
+
+        actualPayloads = {path for path in fileSet if path == "derived" or path.startswith("derived/")}
+        actualDirectories = {path for path in directorySet if path == "derived" or path.startswith("derived/")}
+
+        if actualPayloads != expectedPayloads:
+            raise ValueError("Derived-file declarations do not exactly match attachment payloads.")
+        if actualDirectories != expectedDirectories:
+            raise ValueError("Derived-file declarations do not exactly match attachment directories.")
+
+        ################################################################
+        # Reuse the existing MRI/behavior inventory layout checks
+        ################################################################
+        # This is only a temporary structural validation view. The actual
+        # checkpoint remains derived, and its inner MRI descriptor is checked
+        # separately against pgl.mri.derived.v1.
+        inventoryView = {
+            "contract_version": "pgl.raw.session.v2",
+            "runs": manifest["runs"],
+            "mri": manifest["mri"],
+            "directories": [
+                path for path in directories if path not in expectedDirectories
+            ],
+            "files": [
+                record for record in manifest["files"]
+                if record["name"] not in expectedPayloads
+            ],
+        }
+        cls.validateRawSessionV2Manifest(inventoryView)
+        return manifest
 
 # =========================================================================
 # RUNTIME PAYLOAD ACCESS CONTEXT
@@ -12199,36 +12633,35 @@ class pglCheckpointFilesystem(AbstractFileSystem):
     protocol = "pglcheckpoint"
     cachable = False
 
-    # +++++++++++++++++++++++++++++ __init__ ++++++++++++++++++++++++++++++++
+    ################################################################
+    # Validate inventory and retain deferred payload access
+    ################################################################
     def __init__(self, manifest, fileLocations, storageOptionsByBackend=None, *, accessContext=None, ownsAccess=False):
-        """Validate a checkpoint inventory and retain its runtime access context.
+        """Construct a read-only logical checkpoint filesystem.
 
-        Returns a read-only filesystem with no scientific fields reconstructed.
-        Copies inventory metadata so later caller edits do not alter identities.
+        Supports raw behavior v1, raw session v1/v2, derived behavior/session
+        v1/v2/v3, and derived MRI v1.
 
-        Supports raw behavior v1, raw session v1/v2, and derived behavior/session
-        v1/v2/v3 inventories, including derived-file payloads.
+        Construction reads no payload bytes. Opening a file verifies its
+        complete contents through the existing _open() implementation.
 
-        When accessContext is supplied, configure backend options on that
-        context rather than supplying another options collection here.
+        With accessContext, configure backend options on that context.
+        Without one, retain local/explicit-URL reconstruction compatibility.
 
-        Ownership transfers only after successful construction. If construction
-        raises, the caller remains responsible for closing its context.
+        Ownership transfers on successful construction only.
         """
         super().__init__()
 
-        if type(ownsAccess) is not bool: raise ValueError("ownsAccess must be a boolean.")
-
+        if type(ownsAccess) is not bool:
+            raise ValueError("ownsAccess must be Boolean.")
         if accessContext is not None and not isinstance(accessContext, pglDatabaseAccess):
             raise TypeError("accessContext must be a pglDatabaseAccess instance.")
-
         if ownsAccess and accessContext is None:
             raise ValueError("ownsAccess requires an access context.")
-
         if accessContext is not None and storageOptionsByBackend:
             raise ValueError("Configure storage options on accessContext, not on both objects.")
-
-        if not isinstance(manifest, dict): raise ValueError("Manifest must contain a dictionary.")
+        if not isinstance(manifest, dict):
+            raise ValueError("Manifest must contain a dictionary.")
 
         contractVersion = manifest.get("contract_version")
 
@@ -12243,13 +12676,13 @@ class pglCheckpointFilesystem(AbstractFileSystem):
             "pgl.derived.session.v1",
             "pgl.derived.session.v2",
             "pgl.derived.session.v3",
+            "pgl.derived.mri.v1",
         ):
             pglDatabase.validateDerivedManifest(manifest)
         else:
             raise ValueError(f"Unsupported checkpoint contract: {contractVersion!r}")
 
         expectedFiles = {record["name"]: record for record in manifest["files"]}
-
         if set(fileLocations) != set(expectedFiles):
             raise ValueError("File locations must cover exactly the manifest files.")
 
@@ -12264,14 +12697,16 @@ class pglCheckpointFilesystem(AbstractFileSystem):
 
             if record["sha256"] != expected["sha256"] or record["size_bytes"] != expected["size_bytes"]:
                 raise ValueError(f"File identity does not match manifest: {name!r}")
-
             if not isinstance(record["locations"], list) or not record["locations"]:
                 raise ValueError(f"File has no location candidates: {name!r}")
 
             for location in record["locations"]:
                 key = location["object_key"]
-
-                if not isinstance(key, str) or key.startswith("/") or "\\" in key or "\x00" in key or any(part in {"", ".", ".."} for part in key.split("/")):
+                if (
+                    not isinstance(key, str) or key.startswith("/")
+                    or "\\" in key or "\x00" in key
+                    or any(part in {"", ".", ".."} for part in key.split("/"))
+                ):
                     raise ValueError(f"Invalid payload object key: {key!r}")
 
                 root = location["url_prefix"]
@@ -12280,38 +12715,32 @@ class pglCheckpointFilesystem(AbstractFileSystem):
 
         self._entries = {"": {"name": "", "type": "directory", "size": 0}}
 
-        # ++++++++++++++++++++++++++ validateName +++++++++++++++++++++++++++
         def validateName(name):
-            """Validate a logical checkpoint path without accessing storage."""
             if not isinstance(name, str) or not name:
                 raise ValueError("Checkpoint paths must be nonempty strings.")
-
             if name.startswith("/") or "\\" in name or "\x00" in name:
                 raise ValueError(f"Invalid checkpoint path: {name!r}")
-
             if any(part in {"", ".", ".."} for part in name.split("/")):
                 raise ValueError(f"Invalid checkpoint path: {name!r}")
 
-        # ++++++++++++++++++++++++++++ addEntry +++++++++++++++++++++++++++++
         def addEntry(name, kind, size):
-            """Install one unique inventory entry."""
             validateName(name)
-            if name in self._entries: raise ValueError(f"Duplicate checkpoint path: {name!r}")
+            if name in self._entries:
+                raise ValueError(f"Duplicate checkpoint path: {name!r}")
             self._entries[name] = {"name": name, "type": kind, "size": size}
 
-        for name in manifest["directories"]: addEntry(name, "directory", 0)
+        for name in manifest["directories"]:
+            addEntry(name, "directory", 0)
 
         for record in manifest["files"]:
             size = record["size_bytes"]
             if type(size) is not int or size < 0:
                 raise ValueError(f"Invalid file size for {record['name']!r}")
-
             addEntry(record["name"], "file", size)
 
         for name in self._entries:
             if not name: continue
             parentEntry = self._entries.get(posixpath.dirname(name))
-
             if parentEntry is None or parentEntry["type"] != "directory":
                 raise ValueError(f"Missing parent directory for checkpoint path: {name!r}")
 
