@@ -2675,6 +2675,53 @@ class pglSession(pglActionable):
                 figures.append(figure)
 
         return figures
+    
+    ################################################################
+    # Display the saved MRI scan/run correspondence
+    ################################################################
+    def displayScanRunMapping(self, **plotOptions):
+        """Plot saved scan/run matches using current collection indices.
+
+        Defaults to recorded UTC alignment and continuous matched-scan zoom.
+        Additional options are passed to pglScanTimelinePlot.
+
+        Examples:
+            session.displayScanRunMapping()
+            session.displayScanRunMapping(alignmentMode="first")
+            session.displayScanRunMapping(
+                alignmentMode="first",
+                showTrialSegments=True,
+                showBehaviorVolumes=False,
+            )
+
+        Returns the plot object for saving, inspection, and offset access.
+        Does not modify correspondence or scientific timestamps.
+        """
+        from .pglPlots import pglScanTimelinePlot
+
+        if self.mri is None or not self.mri.scans:
+            raise ValueError("Scan/run mapping display requires MRI scans.")
+
+        # Resolve saved acquisition identities against the current collections.
+        # Missing or ambiguous matches are rejected rather than silently skipped.
+        matches = self.getScanRunMatches()
+        if not matches:
+            raise ValueError("No scan/run matches are configured for display.")
+
+        reserved = {"pglRuns", "pglScans", "proposedMatch"}
+        if reserved.intersection(plotOptions):
+            raise ValueError("Runs, scans, and correspondence are supplied by the session.")
+
+        # Clock alignment shows recorded differences without fitting them away.
+        options = {"alignmentMode": "clock", "zoom": True, **plotOptions}
+        plot = pglScanTimelinePlot(
+            pglRuns=self.runs,
+            pglScans=self.mri.scans,
+            proposedMatch=matches,
+            **options,
+        )
+        plot.show()
+        return plot
 
     ################################################################
     # Identify a completed local derived file
