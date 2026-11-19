@@ -2774,179 +2774,87 @@ Installation documentation:
             return None
         
     ################################################################
-    # Open an image in the AFNI graphical viewer
+    # Display an acquisition in an external viewer
     ################################################################
-    def viewer(self, inputImage, *, cacheDirectory=None):
-        """Open an image in AFNI after checking GUI readiness.
+    def viewer(self, scanNum=0, *, backend="afni", afniDirectory=None, matlabExecutable=None, mlrDirectory=None, cacheDirectory=None):
+        """Open a selected original acquisition in AFNI or MATLAB mlrVol.
 
-        inputImage:
-            Existing local .nii or .nii.gz file, including 4D acquisitions.
+        scanNum:
+            Zero-based index in this MRI collection's scans.
+
+        backend:
+            "afni" (default) or "mlrVol", case-insensitive.
+
+        afniDirectory:
+            Optional AFNI executable directory.
+
+        matlabExecutable:
+            Optional full path to MATLAB's bin/matlab executable.
+
+        mlrDirectory:
+            Optional directory containing mlrVol.m.
+            Other mrTools dependencies must be available through MATLAB setup.
 
         cacheDirectory:
-            Optional parent directory for viewer stdout/stderr logs.
-            None uses the system temporary directory.
+            Optional cache override for acquisition retrieval and viewer files.
 
-        On macOS, starts or activates XQuartz and verifies its X11 connection
-        before launching AFNI. Does not quit or restart XQuartz, close existing
-        viewers, or modify the parent Python process's environment.
+        Returns a launcher process, or None after a warning on failure.
 
-        Returns:
-            subprocess.Popen handle, or None after a warning on failure.
-
-        AFNI may detach from this process. Its process status alone therefore
-        does not establish whether the graphical window opened or closed.
-
-        Does not register scientific products, alter headers, or change scans.
-        The input file must remain available while the viewer is using it.
+        Does not access scan.data or implicitly select corrected-image products.
+        mlrVol receives an independent copy because it supports editing/saving.
+        Each MATLAB call starts a new desktop; existing sessions are not reused.
         """
-        import os
-        import shutil
-        import subprocess
-        import sys
-        import tempfile
-        import time
         from pathlib import Path
 
+        from .pglExternalTools import pglAFNI, pglMATLAB
         from .pglMessages import pglMessages
 
         try:
-            source = Path(inputImage).expanduser().resolve()
-            if not source.is_file() or not source.name.lower().endswith((".nii", ".nii.gz")):
-                raise ValueError("inputImage must be an existing local .nii or .nii.gz file.")
-            if any(character in str(source) for character in ("[", "]", "<", ">", "\x00", "\n", "\r")):
-                raise ValueError("The image path contains characters ambiguous in an AFNI dataset argument.")
+            if not isinstance(backend, str) or backend.lower() not in ("afni", "mlrvol"):
+                raise ValueError("backend must be 'afni' or 'mlrVol'.")
+            backendName = backend.lower()
 
-            cacheRoot = None
-            if cacheDirectory is not None:
-                text = os.fspath(cacheDirectory)
-                if (
-                    not isinstance(text, str) or not text.strip()
-                    or "://" in text or "::" in text
-                    or any(character in text for character in ("\x00", "\n", "\r"))
-                ):
-                    raise ValueError("cacheDirectory must be an ordinary local path.")
-                cacheRoot = Path(text).expanduser().resolve()
+            scans = list(self.scans)
+            if not scans: raise ValueError("No MRI scans are attached.")
+            if type(scanNum) is not int or not 0 <= scanNum < len(scans):
+                raise ValueError(f"scanNum must be a zero-based integer between 0 and {len(scans) - 1}.")
 
-            # Use the same installation-selection policy as motion estimation.
-            selectedDirectory = None if self.directory is None else Path(self.directory).expanduser().resolve()
-            managed = pglAFNIInstallation()
-            managedDirectory = managed.root / "abin"
+            scan = scans[scanNum]
 
-            if selectedDirectory is None or selectedDirectory == managedDirectory.resolve():
-                state = managed.readState()
-                if state is not None and state["status"] != "verified":
-                    raise RuntimeError(managed.continuationMessage(state))
-                if state is not None or managedDirectory.exists():
-                    selectedDirectory = managedDirectory
+            # Prefer acquisition backing. Do not accidentally display an edited
+            # working array in place of the original acquisition.
+            if scan._backing is not None:
+                cache = scan._cacheDirectory if cacheDirectory is None else cacheDirectory
+                if cache is None or not str(cache).strip():
+                    raise ValueError("A local cache directory is required to retrieve this acquisition.")
 
-            if selectedDirectory is None:
-                discovered = shutil.which("afni")
-                if discovered is None:
-                    raise FileNotFoundError("AFNI is unavailable. Supply its executable directory or install AFNI.")
-                selectedDirectory = Path(discovered).absolute().parent
+                source = Path(scan._backing.materialize(cache))
 
-            # Environment changes apply only to the probes and AFNI viewer.
-            environment = dict(os.environ)
-            executable = self._resolveExecutable(str(selectedDirectory / "afni"), environment)
+            elif scan.localPath:
+                source = Path(scan.localPath).expanduser().absolute()
 
-            if sys.platform == "darwin":
-                probePath = Path("/opt/X11/bin/xdpyinfo")
-                if not probePath.is_file():
-                    raise FileNotFoundError("XQuartz's /opt/X11/bin/xdpyinfo was not found. Install or repair XQuartz.")
+            else:
+                raise ValueError(f"MRI scan {scanNum} has no acquisition source.")
 
-                pglMessages.message("Checking XQuartz readiness...")
+            if not source.is_file():
+                raise FileNotFoundError(f"MRI scan {scanNum}'s acquisition file is unavailable: {source}")
 
-                # Activate an existing instance or start it if necessary.
-                # Never restart XQuartz: other viewers may be using it.
-                launch = subprocess.run(
-                    ["/usr/bin/open", "-a", "XQuartz"],
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                    check=False,
-                )
-                if launch.returncode != 0:
-                    raise RuntimeError(launch.stderr.strip() or "Could not start XQuartz.")
+            scanName = scan.name.replace("\n", " ").replace("\r", " ")
+            pglMessages.message(f"Opening MRI scan {scanNum} in {backend}: {scanName}")
 
-                ready = False
-                diagnostic = "XQuartz has not published a DISPLAY value."
+            if backendName == "afni":
+                afni = pglAFNI(directory=afniDirectory)
+                return afni.viewer(source, cacheDirectory=cacheDirectory)
 
-                for attempt in range(1, 5):
-                    # The display socket can become available during startup.
-                    displayResult = subprocess.run(
-                        ["/bin/launchctl", "getenv", "DISPLAY"],
-                        capture_output=True,
-                        text=True,
-                        timeout=5,
-                        check=False,
-                    )
-                    xDisplay = displayResult.stdout.strip()
-
-                    if displayResult.returncode == 0 and xDisplay:
-                        environment["DISPLAY"] = xDisplay
-
-                        try:
-                            probe = subprocess.run(
-                                [str(probePath)],
-                                env=environment,
-                                stdout=subprocess.DEVNULL,
-                                stderr=subprocess.PIPE,
-                                text=True,
-                                timeout=5,
-                                check=False,
-                            )
-                        except subprocess.TimeoutExpired:
-                            diagnostic = f"XQuartz connection timed out for DISPLAY={xDisplay}."
-                        else:
-                            if probe.returncode == 0:
-                                ready = True
-                                break
-                            diagnostic = probe.stderr.strip() or "XQuartz connection failed."
-
-                    else:
-                        diagnostic = displayResult.stderr.strip() or "XQuartz has not published a DISPLAY value."
-
-                    if attempt < 4:
-                        pglMessages.message(f"Waiting for XQuartz ({attempt}/4)...")
-                        time.sleep(1)
-
-                if not ready:
-                    raise RuntimeError(
-                        f"{diagnostic}\n"
-                        "AFNI was not launched. Check XQuartz before retrying; "
-                        "existing X11 applications were not stopped."
-                    )
-
-            if cacheRoot is not None: cacheRoot.mkdir(parents=True, exist_ok=True)
-            logDirectory = Path(tempfile.mkdtemp(
-                prefix="pgl-afni-viewer-",
-                dir=None if cacheRoot is None else str(cacheRoot),
-            ))
-            stdoutPath = logDirectory / "stdout.log"
-            stderrPath = logDirectory / "stderr.log"
-
-            # GUI lifetime is separate from recorded scientific execution.
-            # File-backed output avoids unattended pipe blocking.
-            with stdoutPath.open("xb") as stdout, stderrPath.open("xb") as stderr:
-                process = subprocess.Popen(
-                    [str(executable), "-dset", str(source)],
-                    cwd=str(logDirectory),
-                    env=environment,
-                    stdin=subprocess.DEVNULL,
-                    stdout=stdout,
-                    stderr=stderr,
-                    shell=False,
-                )
-
-            pglMessages.message(
-                f"AFNI viewer process started for {source.name}.\n"
-                f"Launcher process: {process.pid}\n"
-                f"Startup logs: {logDirectory}"
+            return pglMATLAB.viewer(
+                source,
+                matlabExecutable=matlabExecutable,
+                mlrDirectory=mlrDirectory,
+                cacheDirectory=cacheDirectory,
             )
-            return process
 
         except Exception as error:
-            pglMessages.warning(f"AFNI viewer could not be launched: {type(error).__name__}: {error}")
+            pglMessages.warning(f"MRI viewer could not be opened: {type(error).__name__}: {error}")
             return None
     
 ################################################################
@@ -4698,3 +4606,152 @@ PREPARED SCRIPT
             f"Executable directory: {self.root / 'abin'}"
         )
         return updated
+    
+################################################################
+# MATLAB viewer access
+################################################################
+class pglMATLAB:
+    """Launch MATLAB-based viewers without running a processing action."""
+
+    ################################################################
+    # Open an image using mlrVol
+    ################################################################
+    @staticmethod
+    def viewer(inputImage, *, matlabExecutable=None, mlrDirectory=None, cacheDirectory=None):
+        """Open a copy of an image in a new MATLAB desktop using mlrVol.
+
+        matlabExecutable:
+            Full path to MATLAB's bin/matlab executable.
+            None searches PATH, then /Applications/MATLAB*.app on macOS.
+            Multiple installations require an explicit choice.
+
+        mlrDirectory:
+            Optional directory containing mlrVol.m.
+            None uses MATLAB's normal startup/path configuration.
+            Other mrTools dependencies must also be on MATLAB's path.
+
+        cacheDirectory:
+            Optional parent directory for the viewer copy and startup logs.
+            None uses the system temporary directory.
+
+        Returns a launcher process, or None after a warning on launch failure.
+        Process launch does not establish that MATLAB loaded the image.
+
+        Opens an independent file copy because mlrVol supports editing/saving.
+        The copy and logs remain after closure; no automatic cleanup occurs.
+        Closing mlrVol does not close the new MATLAB desktop.
+        """
+        import os
+        import shutil
+        import subprocess
+        import sys
+        import tempfile
+        from pathlib import Path
+
+        from .pglMessages import pglMessages
+
+        try:
+            source = Path(inputImage).expanduser().resolve()
+            if not source.is_file() or not source.name.lower().endswith((".nii", ".nii.gz")):
+                raise ValueError("inputImage must be an existing local .nii or .nii.gz file.")
+
+            # Do not silently choose between multiple MATLAB installations.
+            if matlabExecutable is None:
+                matlabExecutable = shutil.which("matlab")
+
+                if matlabExecutable is None and sys.platform == "darwin":
+                    candidates = sorted(Path("/Applications").glob("MATLAB*.app/bin/matlab"))
+                    candidates = [path for path in candidates if path.is_file()]
+
+                    if len(candidates) == 1:
+                        matlabExecutable = candidates[0]
+                    elif len(candidates) > 1:
+                        choices = "\n".join(str(path) for path in candidates)
+                        raise ValueError(f"Choose matlabExecutable explicitly from:\n{choices}")
+
+            if matlabExecutable is None:
+                raise FileNotFoundError("MATLAB was not found. Supply its full bin/matlab path.")
+
+            executable = Path(matlabExecutable).expanduser().resolve()
+            if not executable.is_file() or not os.access(executable, os.X_OK):
+                raise ValueError(f"MATLAB executable is unavailable: {executable}")
+
+            mlrPath = None
+            if mlrDirectory is not None:
+                mlrPath = Path(mlrDirectory).expanduser().resolve()
+                if not (mlrPath / "mlrVol.m").is_file():
+                    raise ValueError("mlrDirectory must contain mlrVol.m.")
+
+            cacheRoot = None
+            if cacheDirectory is not None:
+                text = os.fspath(cacheDirectory)
+                if (
+                    not isinstance(text, str) or not text.strip()
+                    or "://" in text or "::" in text
+                    or any(character in text for character in ("\x00", "\n", "\r"))
+                ):
+                    raise ValueError("cacheDirectory must be an ordinary local path.")
+                cacheRoot = Path(text).expanduser().resolve()
+                cacheRoot.mkdir(parents=True, exist_ok=True)
+
+            workingDirectory = Path(tempfile.mkdtemp(
+                prefix="pgl-mlrvol-",
+                dir=None if cacheRoot is None else str(cacheRoot),
+            ))
+
+            # Use a real copy, never a hard link or symlink to acquisition data.
+            viewerImage = workingDirectory / source.name
+            pglMessages.message(f"Creating an independent viewer copy of {source.name}...")
+            shutil.copyfile(source, viewerImage)
+
+            # Pass paths as environment data, not interpolated MATLAB source.
+            environment = dict(os.environ)
+            environment["PGL_MLRVOL_IMAGE"] = str(viewerImage)
+            environment["PGL_MLRVOL_DIRECTORY"] = "" if mlrPath is None else str(mlrPath)
+
+            matlabCommand = (
+                "try; "
+                "pglMlrDirectory=getenv('PGL_MLRVOL_DIRECTORY'); "
+                "if ~isempty(pglMlrDirectory); addpath(pglMlrDirectory); end; "
+                "assert(exist('mlrVol','file')~=0,"
+                "'mlrVol is not on the MATLAB path. Configure mrTools or supply mlrDirectory.'); "
+                "fprintf('Using mlrVol: %s\\n',which('mlrVol')); "
+                "mlrVol(getenv('PGL_MLRVOL_IMAGE')); "
+                "drawnow; "
+                "catch pglViewerError; "
+                "disp(getReport(pglViewerError,'extended','hyperlinks','off')); "
+                "end;"
+            )
+
+            stdoutPath = workingDirectory / "stdout.log"
+            stderrPath = workingDirectory / "stderr.log"
+            matlabLog = workingDirectory / "matlab.log"
+
+            # Use -r, not -batch, so the interactive desktop stays open.
+            # GUI viewing is separate from recorded scientific execution.
+            with stdoutPath.open("xb") as stdout, stderrPath.open("xb") as stderr:
+                process = subprocess.Popen(
+                    [
+                        str(executable),
+                        "-desktop",
+                        "-logfile", str(matlabLog),
+                        "-r", matlabCommand,
+                    ],
+                    cwd=str(workingDirectory),
+                    env=environment,
+                    stdin=subprocess.DEVNULL,
+                    stdout=stdout,
+                    stderr=stderr,
+                    shell=False,
+                )
+
+            pglMessages.message(
+                f"MATLAB viewer process started for {source.name}.\n"
+                f"Launcher process: {process.pid}\n"
+                f"Viewer copy and startup logs: {workingDirectory}"
+            )
+            return process
+
+        except Exception as error:
+            pglMessages.warning(f"mlrVol viewer could not be launched: {type(error).__name__}: {error}")
+            return None

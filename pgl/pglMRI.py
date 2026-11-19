@@ -1631,33 +1631,46 @@ class pglMRI(pglActionable):
                     printMatrix(summary[form])
                     
     ################################################################
-    # Display an acquisition in the AFNI viewer
+    # Display an acquisition in an external viewer
     ################################################################
-    def viewer(self, scanNum=0, *, afniDirectory=None, cacheDirectory=None):
-        """Open a selected original acquisition in the AFNI viewer.
+    def viewer(self, scanNum=0, *, backend="mlrvol", afniDirectory=None, matlabExecutable=None, mlrDirectory=None, cacheDirectory=None):
+        """Open a selected original acquisition in AFNI or MATLAB mlrVol.
 
         scanNum:
             Zero-based index in this MRI collection's scans.
 
+        backend:
+            "afni" (default) or "mlrVol", case-insensitive.
+
         afniDirectory:
-            Optional AFNI executable directory; None uses ordinary discovery.
+            Optional AFNI executable directory.
+
+        matlabExecutable:
+            Optional full path to MATLAB's bin/matlab executable.
+
+        mlrDirectory:
+            Optional directory containing mlrVol.m.
+            Other mrTools dependencies must be available through MATLAB setup.
 
         cacheDirectory:
-            Optional local cache override. Deferred acquisitions otherwise
-            use their configured cache directory.
+            Optional cache override for acquisition retrieval and viewer files.
 
-        Returns:
-            Viewer process handle, or None after a warning on failure.
+        Returns a launcher process, or None after a warning on failure.
 
-        Does not access scan.data, modify the acquisition, or run processing.
-        Corrected-image products are not implicitly substituted.
+        Does not access scan.data or implicitly select corrected-image products.
+        mlrVol receives an independent copy because it supports editing/saving.
+        Each MATLAB call starts a new desktop; existing sessions are not reused.
         """
         from pathlib import Path
 
-        from .pglExternalTools import pglAFNI
+        from .pglExternalTools import pglAFNI, pglMATLAB
         from .pglMessages import pglMessages
 
         try:
+            if not isinstance(backend, str) or backend.lower() not in ("afni", "mlrvol"):
+                raise ValueError("backend must be 'afni' or 'mlrVol'.")
+            backendName = backend.lower()
+
             scans = list(self.scans)
             if not scans: raise ValueError("No MRI scans are attached.")
             if type(scanNum) is not int or not 0 <= scanNum < len(scans):
@@ -1665,8 +1678,8 @@ class pglMRI(pglActionable):
 
             scan = scans[scanNum]
 
-            # Prefer the acquisition backing, matching processing-source
-            # resolution. Do not accidentally display an edited working array.
+            # Prefer acquisition backing. Do not accidentally display an edited
+            # working array in place of the original acquisition.
             if scan._backing is not None:
                 cache = scan._cacheDirectory if cacheDirectory is None else cacheDirectory
                 if cache is None or not str(cache).strip():
@@ -1684,10 +1697,18 @@ class pglMRI(pglActionable):
                 raise FileNotFoundError(f"MRI scan {scanNum}'s acquisition file is unavailable: {source}")
 
             scanName = scan.name.replace("\n", " ").replace("\r", " ")
-            pglMessages.message(f"Opening MRI scan {scanNum}: {scanName}")
+            pglMessages.message(f"Opening MRI scan {scanNum} in {backend}: {scanName}")
 
-            afni = pglAFNI(directory=afniDirectory)
-            return afni.viewer(source, cacheDirectory=cacheDirectory)
+            if backendName == "afni":
+                afni = pglAFNI(directory=afniDirectory)
+                return afni.viewer(source, cacheDirectory=cacheDirectory)
+
+            return pglMATLAB.viewer(
+                source,
+                matlabExecutable=matlabExecutable,
+                mlrDirectory=mlrDirectory,
+                cacheDirectory=cacheDirectory,
+            )
 
         except Exception as error:
             pglMessages.warning(f"MRI viewer could not be opened: {type(error).__name__}: {error}")
