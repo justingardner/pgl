@@ -276,8 +276,12 @@ class pglActionable(pglTraitSettings):
         """Inspect a committed product without reading payloads.
 
         Supply exactly one of name or productID.
-        Duplicate logical names are ambiguous; no newest-product heuristic
-        is used.
+
+        Name selection resolves the current explicitly superseding version.
+        Unrelated duplicate names and competing replacements are ambiguous.
+        No timestamp or newest-product heuristic is used.
+
+        ID selection resolves that exact historical version unchanged.
 
         Returns pglDerivedProduct, or None after a warning.
 
@@ -289,7 +293,7 @@ class pglActionable(pglTraitSettings):
         except Exception as error:
             pglMessages.warning(f"Derived product was not selected: {error}")
             return None
-
+    
 ################################################################
 # Portable scientific-product selector
 ################################################################
@@ -402,7 +406,13 @@ class pglProductSelector(pglSerialize):
             return None
 
     def _resolve(self, owner):
-        """Resolve exact committed metadata, raising on absence or ambiguity."""
+        """Resolve committed metadata by exact ID or explicit named version.
+
+        Named versions must form one complete, unbranched supersession chain.
+        No timestamp, history-order, or newest-product heuristic is used.
+
+        Pinned IDs continue to resolve historical versions unchanged.
+        """
         self._validate()
         if not isinstance(owner, pglActionable):
             raise TypeError("Product resolution requires an object carrying PGL history.")
@@ -435,14 +445,91 @@ class pglProductSelector(pglSerialize):
                 "action first or explicitly select a different input."
             )
 
-        # Do not use kind as a hidden tiebreaker between duplicate names.
-        if len(matches) != 1:
-            identities = ", ".join(record["productID"] for record in matches)
-            raise ValueError(
-                f"Product {label!r} is ambiguous. Select an explicit productID: {identities}"
-            )
+        if self.productID is not None:
+            # Pinned selection never follows a supersession link.
+            if len(matches) != 1:
+                raise ValueError(f"Product ID {label!r} occurs more than once in history.")
+            record = matches[0]
 
-        record = matches[0]
+        else:
+            recordsByID = {}
+            for candidate in matches:
+                identifier = candidate.get("productID")
+                if not isinstance(identifier, str) or not identifier.strip():
+                    raise ValueError(f"Product {label!r} has an invalid product ID.")
+                if identifier in recordsByID:
+                    raise ValueError(f"Product ID {identifier!r} occurs more than once in history.")
+                recordsByID[identifier] = candidate
+
+            predecessors = {}
+            successors = {}
+
+            for identifier, candidate in recordsByID.items():
+                revision = candidate.get("metadata", {}).get("_productRevision")
+                if revision is None: continue
+
+                if (
+                    not isinstance(revision, dict)
+                    or set(revision) != {"schemaVersion", "supersedesProductID"}
+                    or type(revision["schemaVersion"]) is not int
+                    or revision["schemaVersion"] != 1
+                ):
+                    raise ValueError(f"Product {identifier!r} has invalid revision metadata.")
+
+                previousID = revision["supersedesProductID"]
+                if not isinstance(previousID, str) or not previousID.strip():
+                    raise ValueError("A superseded product ID must be a nonblank string.")
+                if previousID == identifier:
+                    raise ValueError("A product cannot supersede itself.")
+                if previousID not in recordsByID:
+                    raise ValueError(
+                        f"Product {identifier!r} supersedes an unavailable committed "
+                        f"version of {label!r}: {previousID!r}."
+                    )
+
+                previous = recordsByID[previousID]
+                if candidate.get("kind") != previous.get("kind"):
+                    raise ValueError("Product versions must retain the same semantic kind.")
+                if previousID not in candidate.get("inputProductIDs", []):
+                    raise ValueError("A superseded version must be recorded as an input product.")
+                if previousID in successors:
+                    raise ValueError(
+                        f"Product {label!r} has competing replacement versions. "
+                        "Select an explicit productID."
+                    )
+
+                predecessors[identifier] = previousID
+                successors[previousID] = identifier
+
+            # A current version is one that no other committed version replaces.
+            currentIDs = set(recordsByID) - set(successors)
+            if len(currentIDs) != 1:
+                identities = ", ".join(recordsByID)
+                raise ValueError(
+                    f"Product {label!r} is ambiguous or has a cyclic version chain. "
+                    f"Select an explicit productID: {identities}"
+                )
+
+            currentID = next(iter(currentIDs))
+            visited = set()
+            identifier = currentID
+
+            while identifier is not None:
+                if identifier in visited:
+                    raise ValueError(f"Product {label!r} has a cyclic version chain.")
+                visited.add(identifier)
+                identifier = predecessors.get(identifier)
+
+            # Reject unrelated duplicate names and disconnected version cycles.
+            if visited != set(recordsByID):
+                raise ValueError(
+                    f"Product {label!r} contains unrelated or disconnected versions. "
+                    "Select an explicit productID."
+                )
+
+            record = recordsByID[currentID]
+
+        # Kind is validation, never a hidden tiebreaker between duplicate names.
         if self.kind is not None and record.get("kind") != self.kind:
             raise ValueError(
                 f"Product {label!r} has kind {record.get('kind')!r}; "
@@ -1242,21 +1329,25 @@ class pglAction(pglActionable):
     ################################################################
     # Register this execution's named scientific product
     ################################################################
-    def registerProduct(self, name, kind, *, session, files=None, inputProductIDs=None, metadata=None, invocationIDs=None):
+    def registerProduct(self, name, kind, *, session, files=None, inputProductIDs=None, metadata=None, invocationIDs=None, supersedesProductID=None):
         """Register an output using already attached session payloads.
 
         Called inside scientific execution after output validation/attachment.
 
-        files maps scientific roles to session.derivedFiles names:
-            {"matrices": matrixAttachmentName, "motionParameters": motionName}
-
+        files maps artifact roles to session.derivedFiles attachment names.
         Input file identities are copied from registered attachment records.
-        This method does not rehash files, create attachments, or copy bytes.
+        This method does not rehash files.
 
-        Producer identity comes automatically from the active recorder.
-        Products are committed in history only if the action succeeds.
+        supersedesProductID:
+            Optional exact ID of the current committed version of this name.
+            Registers a replacement without modifying the historical product.
+            The replacement becomes current only if this action succeeds.
 
-        Errors propagate internally to the action runner, stopping execution.
+        A replacement must retain the previous product's name and kind.
+        Its predecessor is automatically recorded as an exact dependency.
+
+        This method does not merge scientific records or request confirmation.
+        The owning scientific action must prepare the complete replacement.
         """
         from .pglExternalTools import getExecutionRecorder
 
@@ -1274,18 +1365,62 @@ class pglAction(pglActionable):
             raise TypeError("Product payloads require a session with derivedFiles.")
 
         files = {} if files is None else files
+        metadata = {} if metadata is None else deepcopy(metadata)
+        inputProductIDs = [] if inputProductIDs is None else deepcopy(inputProductIDs)
+
         if type(files) is not dict:
             raise TypeError("files must map artifact roles to attachment names.")
+        if type(metadata) is not dict:
+            raise TypeError("metadata must be a dictionary.")
+        if type(inputProductIDs) is not list:
+            raise TypeError("inputProductIDs must be a list.")
+        if any(not isinstance(identifier, str) or not identifier.strip() for identifier in inputProductIDs):
+            raise ValueError("Input product identities must be nonblank strings.")
+        if len(set(inputProductIDs)) != len(inputProductIDs):
+            raise ValueError("Input product identities must not contain duplicates.")
 
-        # Do not silently replace a previously committed named product.
-        # Future explicit version/rebinding support can preserve old identities.
-        for entry in session.actionHistory:
-            if entry.actionStatus != pglActionStatus.SUCCESS: continue
-            if any(
-                record.get("name") == name and record.get("recordStatus") == "committed"
-                for record in entry.actionProducts
-            ):
-                raise ValueError(f"Product {name!r} already exists. Choose another outputName.")
+        # Revision links are framework-owned. Callers supply the predecessor
+        # through supersedesProductID, not through arbitrary metadata.
+        if "_productRevision" in metadata:
+            raise ValueError("Use supersedesProductID rather than supplying _productRevision metadata.")
+
+        existing = [
+            record
+            for entry in session.actionHistory
+            if entry.actionStatus == pglActionStatus.SUCCESS
+            for record in entry.actionProducts
+            if record.get("recordStatus") == "committed"
+            and record.get("name") == name
+        ]
+
+        previousSelector = None
+
+        if supersedesProductID is None:
+            if existing:
+                raise ValueError(
+                    f"Product {name!r} already exists. Explicitly supersede its "
+                    "current version or choose another outputName."
+                )
+
+        else:
+            if not isinstance(supersedesProductID, str) or not supersedesProductID.strip():
+                raise ValueError("supersedesProductID must be a nonblank string or None.")
+
+            # Resolve the current named version, not just any historical record.
+            current = pglProductSelector(name, kind=kind)._resolve(session)
+            if current.productID != supersedesProductID:
+                raise ValueError(
+                    f"Product {name!r} has changed or the supplied predecessor is "
+                    "not its current committed version."
+                )
+
+            previousSelector = pglProductSelector(productID=supersedesProductID, kind=kind)
+            metadata["_productRevision"] = {
+                "schemaVersion": 1,
+                "supersedesProductID": supersedesProductID,
+            }
+            if supersedesProductID not in inputProductIDs:
+                inputProductIDs.append(supersedesProductID)
 
         artifacts = {}
 
@@ -1293,7 +1428,7 @@ class pglAction(pglActionable):
             if not isinstance(role, str) or not role.strip():
                 raise ValueError("Artifact roles must be nonblank strings.")
             if not isinstance(attachmentName, str) or not attachmentName.strip():
-                raise ValueError("Attachment names must be nonblank strings.")
+                raise ValueError("Artifact names must be nonblank strings.")
 
             attachment = session.derivedFiles.get(attachmentName)
             if attachment is None:
@@ -1304,6 +1439,10 @@ class pglAction(pglActionable):
                 "sha256": attachment["sha256"],
                 "size_bytes": attachment["size_bytes"],
             }
+
+        # Record the exact predecessor as consumed, preserving dependency
+        # provenance even if later scientific execution fails.
+        if previousSelector is not None: previousSelector.resolve(session)
 
         return recorder.registerProduct(
             name,

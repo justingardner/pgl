@@ -13,7 +13,7 @@ from copy import deepcopy
 from .pglMessages import pglMessages
 from .pglPipeline import pglActionCollection
 
-from traitlets import Bool, Float, Instance, Int, List, Unicode, Union
+from traitlets import Bool, Enum, Float, Instance, Int, List, Unicode, Union
 
 from .pglPipeline import pglAction, pglDeferredAction, pglProductSelector
 
@@ -28,6 +28,42 @@ class pglActionsMRI(pglActionCollection):
     publish products, or append action history.
     """
 
+    ################################################################
+    # Select acquisitions without imposing geometry relationships
+    ################################################################
+    @staticmethod
+    def _selectAcquisitionScans(mri, scanIndices=None):
+        """Return selected scan indices and UUIDs without comparing geometry.
+
+        None selects all attached scans. No implicit scan classification,
+        header inspection, or cross-run grouping is performed.
+        """
+        from .pglMRI import pglMRI
+
+        if not isinstance(mri, pglMRI): raise TypeError("Expected pglMRI.")
+
+        scans = list(mri.scans)
+        if not scans: raise ValueError("No MRI scans are attached.")
+
+        if scanIndices is None:
+            indices = list(range(len(scans)))
+        elif isinstance(scanIndices, (list, tuple)):
+            indices = list(scanIndices)
+        else:
+            raise TypeError("scanIndices must be a list/tuple of indices or None.")
+
+        if not indices: raise ValueError("Select at least one MRI scan.")
+        if any(type(index) is not int or not 0 <= index < len(scans) for index in indices):
+            raise ValueError("scanIndices must contain valid zero-based session.mri.scans indices.")
+        if len(set(indices)) != len(indices):
+            raise ValueError("scanIndices must not contain duplicates.")
+
+        identifiers = [scans[index].uuid for index in indices]
+        if len(set(identifiers)) != len(identifiers):
+            raise ValueError("Select each acquisition UUID only once.")
+
+        return [{"scanIndex": index, "scanUUID": scans[index].uuid} for index in indices]
+    
     ################################################################
     # Prepare geometry groups and explicit run-alignment references
     ################################################################
@@ -52,9 +88,10 @@ class pglActionsMRI(pglActionCollection):
             Never reads editable metadata or accesses scan.data.
 
             Requires a coded qform and recognized spatial units.
-            A coded sform must agree with qform numerically.
-            Code meanings are retained; a coded form alone is not proof that
-            its coordinates faithfully represent the physical acquisition.
+            Uses qform for acquisition-grid comparisons; sform does not
+            participate and may describe a different coordinate system.
+            A coded qform alone is not proof that its coordinates faithfully
+            represent the physical acquisition.
 
             Compares spatial shape, voxel sizes, orientation, origin, and
             voxel-center corner positions. Unit conversion is for comparison
@@ -97,25 +134,9 @@ class pglActionsMRI(pglActionCollection):
             if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} must be finite and nonnegative.")
 
+        selectedScans = pglActionsMRI._selectAcquisitionScans(mri, scanIndices)
         scans = list(mri.scans)
-        if not scans: raise ValueError("No MRI scans are attached.")
-
-        if scanIndices is None:
-            indices = list(range(len(scans)))
-        elif isinstance(scanIndices, (list, tuple)):
-            indices = list(scanIndices)
-        else:
-            raise TypeError("scanIndices must be a list/tuple of indices or None.")
-
-        if not indices: raise ValueError("Select at least one MRI scan.")
-        if any(type(index) is not int or not 0 <= index < len(scans) for index in indices):
-            raise ValueError("scanIndices must contain valid zero-based session.mri.scans indices.")
-        if len(set(indices)) != len(indices):
-            raise ValueError("scanIndices must not contain duplicates.")
-
-        identifiers = [scans[index].uuid for index in indices]
-        if len(set(identifiers)) != len(identifiers):
-            raise ValueError("Select each acquisition UUID only once.")
+        indices = [record["scanIndex"] for record in selectedScans]
 
         def validChoice(value):
             return type(value) is int or (
@@ -176,12 +197,8 @@ class pglActionsMRI(pglActionCollection):
             sformCode = fields.get("sform_code")
             if type(qformCode) is not int or qformCode <= 0:
                 raise ValueError(f"Scan {index}: a coded acquisition qform is required; geometry will not be guessed.")
-            if type(sformCode) is not int or sformCode < 0:
-                raise ValueError(f"Scan {index}: invalid sform code.")
-
-            for form, code in (("qform", qformCode), ("sform", sformCode)):
-                if transforms.get(f"{form}_code", code) != code:
-                    raise ValueError(f"Scan {index}: inconsistent recorded {form} code.")
+            if transforms.get("qform_code", qformCode) != qformCode:
+                raise ValueError(f"Scan {index}: inconsistent recorded qform code.")
 
             def readAffine(value, label):
                 """Interpret a recorded affine in mm without editing its source."""
@@ -223,23 +240,8 @@ class pglActionsMRI(pglActionCollection):
             ):
                 raise ValueError(f"Scan {index}: pixdim and qform voxel sizes disagree.")
 
-            if sformCode > 0:
-                sform = readAffine(transforms.get("sform"), "sform")
-                sSizes = np.linalg.norm(sform[:3, :3], axis=0)
-                sDirections = sform[:3, :3] / sSizes
-                cornerError = np.linalg.norm(((sform - qform) @ corners)[:3], axis=0).max()
-
-                if (
-                    not np.allclose(sSizes, sizes, rtol=0, atol=spatialToleranceMM)
-                    or not np.allclose(sDirections, directions, rtol=0, atol=orientationTolerance)
-                    or cornerError > spatialToleranceMM
-                ):
-                    raise ValueError(
-                        f"Scan {index}: coded sform conflicts with acquisition qform. "
-                        "Resolve the geometry before registration; allowGeometryMismatch "
-                        "does not bypass conflicting headers within an image."
-                    )
-
+            # Group acquisition prescriptions using qform, not sform.
+            # The sform may independently describe an aligned coordinate system.
             geometries[index] = {
                 "shape": shape,
                 "matrix": qform,
@@ -1207,9 +1209,11 @@ class pglActionsMRI(pglActionCollection):
         deferApply=True registers motion without creating corrected images.
 
         Corrected data remain on each original acquisition grid.
+
+        The inherited _run() coordinates _estimate() and _apply().
         """
-        scanIndices = List(Int(), default_value=None, allow_none=True, help="Zero-based MRI scan indices; None selects all.")
-        referenceVolume = Int(0, min=0, help="Reference volume index within each original acquisition.")
+        scanIndices = List(Int(), default_value=None, allow_none=True, help="Zero-based MRI scan indices; None opens selection during configuration.")
+        referenceVolume = Union([Int(min=0), Enum(["mid", "middle", "first", "last"])], default_value="mid", help="Reference within each scan: mid (default), middle, first, last, or a zero-based index.")
         twoPass = Bool(True, help="Use AFNI two-pass motion estimation.")
         outputName = Unicode("motion", help="Name of the motion-estimation product.")
         correctedOutputName = Unicode("motionCorrected", help="Name of the corrected-image product.")
@@ -1218,8 +1222,120 @@ class pglActionsMRI(pglActionCollection):
         cacheDirectory = Unicode(default_value=None, allow_none=True, help="Local working-cache override.")
         timeout = Float(default_value=None, allow_none=True, help="Per-scan estimation timeout in seconds.")
 
+        ################################
+        # Configure and select scans
+        ################################
+        def configure(self, session=None, **kwargs) -> bool:
+            """Configure motion estimation, prompting when scanIndices is None.
+
+            Explicit or previously configured indices bypass the dialog.
+            Pass scanIndices=None with a session to open selection again.
+
+            Reference rules are resolved independently for each acquisition.
+            Single-volume acquisitions are silently omitted from the dialog.
+            Returns False on cancellation or unavailable selection.
+            """
+            from .pglMRI import pglMRINiftiMetadata
+            from .pglPipeline import pglActionStatus
+            from .pglSession import pglSession
+
+            # Cancellation must not leave a previous configured status active.
+            self.status = pglActionStatus.INITIALIZED
+            self.configureTraits(**kwargs)
+
+            if session is not None and (not isinstance(session, pglSession) or session.mri is None):
+                raise ValueError("Scan selection requires a session with MRI scans.")
+
+            if self.scanIndices is not None:
+                # Explicit indices support noninteractive pipeline setup.
+                indices = self.scanIndices
+                if not indices or any(type(index) is not int or index < 0 for index in indices):
+                    raise ValueError("scanIndices must contain nonnegative integer indices.")
+                if len(set(indices)) != len(indices):
+                    raise ValueError("scanIndices must not contain duplicates.")
+                if session is not None:
+                    pglActionsMRI._selectAcquisitionScans(session.mri, indices)
+
+                super().configure()
+                return True
+
+            if session is None:
+                pglMessages.warning("Supply session to select MRI scans, or configure explicit scanIndices.", level=1)
+                return False
+
+            selectedScans = pglActionsMRI._selectAcquisitionScans(session.mri)
+            scanLabels = []
+            eligibleIndices = []
+
+            for scanRecord in selectedScans:
+                scanIndex = scanRecord["scanIndex"]
+                scan = session.mri.scans[scanIndex]
+
+                try:
+                    # Read acquisition headers only, never scan.data.
+                    snapshot = scan.sourceMetadata.get("nifti")
+                    if snapshot is None:
+                        if scan._backing is not None:
+                            snapshot = pglMRINiftiMetadata.readBacking(scan._backing)
+                        elif scan.localPath:
+                            snapshot = pglMRINiftiMetadata.read(scan.localPath)
+                        else:
+                            raise ValueError("No acquisition header or source.")
+
+                    dimensions = snapshot["fields"].get("dim")
+                    if (
+                        not isinstance(dimensions, list) or not dimensions
+                        or type(dimensions[0]) is not int or dimensions[0] not in (3, 4)
+                        or len(dimensions) <= dimensions[0]
+                        or any(type(size) is not int or size <= 0 for size in dimensions[1:dimensions[0] + 1])
+                    ):
+                        raise ValueError("Unsupported or invalid image dimensions; expected a valid 3D/4D image.")
+
+                    volumeCount = dimensions[4] if dimensions[0] == 4 else 1
+
+                    # Single-volume scans are normal, but have no within-run
+                    # motion to estimate. Do not print a message for each one.
+                    if volumeCount < 2: continue
+
+                    referenceIndex = self._resolveReferenceVolume(volumeCount)
+
+                except Exception as error:
+                    pglMessages.warning(f"Cannot offer MRI scan {scanIndex}: {error}", level=1)
+                    continue
+
+                scanName = scan.name.replace("\n", " ").replace("\r", " ")
+                scanLabels.append(f"{scanIndex}: {scanName} — {volumeCount} volumes; reference {referenceIndex} (zero-based)")
+                eligibleIndices.append(scanIndex)
+
+            if not scanLabels:
+                pglMessages.warning("No scans support within-run motion with the requested reference volume.", level=1)
+                return False
+
+            # Import the GUI module only for interactive configuration.
+            from .pglDialog import pglDialogs
+
+            selectedPositions = pglDialogs.selectItems(
+                scanLabels,
+                title=f"Select MRI scans — within-run reference: {self.referenceVolume}",
+            )
+            if selectedPositions is None:
+                pglMessages.message("Motion scan selection cancelled; no processing was started.")
+                return False
+
+            # Dialog indices refer to scanLabels, not session.mri.scans.
+            indices = [eligibleIndices[position] for position in selectedPositions]
+            pglActionsMRI._selectAcquisitionScans(session.mri, indices)
+            self.scanIndices = indices
+
+            super().configure()
+            return True
+        
+        ################################################################
+        # Estimate through the inherited deferred-action coordinator
+        ################################################################
         def _estimate(self, session):
             """Estimate all selected scans, then attach and register outputs."""
+            import math
             from pathlib import Path
 
             import nibabel as nib
@@ -1248,16 +1364,16 @@ class pglActionsMRI(pglActionCollection):
             if requestedNames & existing:
                 raise ValueError(f"Output products already exist: {sorted(requestedNames & existing)}")
 
-            # Reuse tested acquisition validation/selection. Geometry groups
-            # do not imply cross-run alignment in this within-run action.
-            plan = pglActionsMRI._prepareRunAlignment(
-                session.mri,
-                self.scanIndices,
-                referenceRun="first",
-            )
+            # Configuration must resolve interactive selection before execution.
+            if self.scanIndices is None:
+                raise ValueError("Select MRI scans during configuration or supply explicit scanIndices.")
+
+            # Within-run motion needs acquisition selection, not cross-run
+            # geometry grouping or selection of a reference run.
+            selectedScans = pglActionsMRI._selectAcquisitionScans(session.mri, self.scanIndices)
 
             sources = []
-            for scanRecord in plan["scans"]:
+            for scanRecord in selectedScans:
                 source = pglActionsMRI._resolveImageSource(
                     session,
                     {
@@ -1267,18 +1383,32 @@ class pglActionsMRI(pglActionCollection):
                     },
                     cacheDirectory=self.cacheDirectory,
                 )
-                if source["volumeCount"] < 2 or self.referenceVolume >= source["volumeCount"]:
-                    raise ValueError(f"Invalid motion reference/volume count for MRI scan {source['scanIndex']}.")
-                sources.append(source)
+
+                # Preflight every selected scan before launching AFNI.
+                # Keep the configured rule unchanged; resolve it per source.
+                try:
+                    referenceIndex = self._resolveReferenceVolume(source["volumeCount"])
+                except ValueError as error:
+                    raise ValueError(f"MRI scan {source['scanIndex']}: {error}") from error
+
+                sources.append((source, referenceIndex))
 
             afni = pglAFNI(directory=self.afniDirectory)
             generated = []
             invocationIDs = []
 
-            for source in sources:
+            for source, referenceIndex in sources:
+                scanName = session.mri.scans[source["scanIndex"]].name.replace("\n", " ").replace("\r", " ")
+                pglMessages.message(
+                    f"Estimating within-run motion: scan {source['scanIndex']} {scanName!r}\n"
+                    f"  Aligning {source['volumeCount']} volumes to this scan's original "
+                    f"volume {referenceIndex} (zero-based; selection: {self.referenceVolume}).\n"
+                    "  No alignment to other scans is performed."
+                )
+
                 result = afni.volreg(
                     source["localPath"],
-                    referenceVolume=self.referenceVolume,
+                    referenceVolume=referenceIndex,
                     twoPass=self.twoPass,
                     cacheDirectory=self.cacheDirectory,
                     timeout=self.timeout,
@@ -1295,16 +1425,16 @@ class pglActionsMRI(pglActionCollection):
                 units = image.header.get_xyzt_units()[1]
                 secondsPerUnit = {"sec": 1.0, "msec": 0.001, "usec": 0.000001}.get(units)
                 tr = None if secondsPerUnit is None else float(image.header.get_zooms()[3] * secondsPerUnit)
-                if tr is not None and (not __import__("math").isfinite(tr) or tr <= 0): tr = None
+                if tr is not None and (not math.isfinite(tr) or tr <= 0): tr = None
 
-                generated.append((source, result, details, tr))
+                generated.append((source, referenceIndex, result, details, tr))
                 invocationIDs.append(result.invocationID)
 
             files = {}
             records = []
             executionID = self.actionHistory[-1].actionID
 
-            for source, result, details, tr in generated:
+            for source, referenceIndex, result, details, tr in generated:
                 roles = {}
                 for outputRole in ("matrices", "motionParameters"):
                     role = f"scan.{source['scanUUID']}.{outputRole}"
@@ -1323,13 +1453,15 @@ class pglActionsMRI(pglActionCollection):
                     files[role] = attachmentName
                     roles[outputRole] = role
 
+                # Products record the actual integer reference used for this
+                # acquisition. The action configuration retains the rule.
                 records.append({
                     "scanIndex": source["scanIndex"],
                     "scanUUID": source["scanUUID"],
                     "sourceStageID": source["sourceStageID"],
                     "sourceIdentity": source["sourceIdentity"],
                     "volumeIndices": source["volumeIndices"],
-                    "referenceVolumeIndex": self.referenceVolume,
+                    "referenceVolumeIndex": referenceIndex,
                     "matricesRole": roles["matrices"],
                     "motionParametersRole": roles["motionParameters"],
                     "interpretation": details["interpretation"],
@@ -1371,7 +1503,10 @@ class pglActionsMRI(pglActionCollection):
                 invocationIDs=invocationIDs,
             )
             return session
-
+        
+        ################################################################
+        # Apply this execution's prepared motion product
+        ################################################################
         def _apply(self, session):
             """Apply this execution's exact motion result, not a named fallback."""
             if self._motionRecord is None:
@@ -1386,10 +1521,38 @@ class pglActionsMRI(pglActionCollection):
             )
             return session
 
+        ################################################################
+        # Present results after successful history/product finalization
+        ################################################################
         def _afterSuccess(self, session):
             """Show the committed motion product when requested."""
             if self.showMotion and self._motionRecord is not None:
                 pglActionsMRI._showMotionProduct(session, self._motionRecord["productID"])
+                
+        ################################################################
+        # Resolve the reference independently for each acquisition
+        ################################################################
+        def _resolveReferenceVolume(self, volumeCount):
+            """Resolve a reference rule to a zero-based source-volume index."""
+            if type(volumeCount) is not int or volumeCount < 2:
+                raise ValueError("Within-run motion requires at least two volumes.")
+
+            choice = self.referenceVolume
+            if type(choice) is int:
+                referenceIndex = choice
+            elif choice in ("mid", "middle"):
+                # For an even count, choose the later of the two middle volumes.
+                referenceIndex = volumeCount // 2
+            elif choice == "first":
+                referenceIndex = 0
+            elif choice == "last":
+                referenceIndex = volumeCount - 1
+            else:
+                raise ValueError("referenceVolume must be mid, middle, first, last, or a nonnegative integer.")
+
+            if not 0 <= referenceIndex < volumeCount:
+                raise ValueError(f"Reference volume {referenceIndex} is outside this scan's {volumeCount} volumes.")
+            return referenceIndex
                 
                 
     ################################################################

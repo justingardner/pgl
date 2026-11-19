@@ -1733,7 +1733,7 @@ Installation documentation:
 
         Initial interpretation support:
             4D NIfTI, millimeter spatial units, coded qform.
-            Any coded sform must agree with the qform.
+            This wrapper does not require qform and sform to agree.
             Reference and input share the same image grid.
 
         sourceStageID:
@@ -1743,6 +1743,9 @@ Installation documentation:
         physicalSpaceID:
             Explicit physical reference identity. None uses a source-specific
             identity rather than assuming unrelated scans share a frame.
+
+        AFNI-native coordinates are interpreted through pglMRITransforms using
+        AFNI's queried geometry attributes, not treated as qform coordinates.
 
         Always estimates with -prefix NULL. No corrected image is generated.
 
@@ -1803,22 +1806,13 @@ Installation documentation:
                     if image.header.get_xyzt_units()[0] != "mm":
                         raise ValueError("This initial AFNI interpretation adapter requires millimeter spatial units.")
 
-                    qform, qcode = image.get_qform(coded=True)
-                    sform, scode = image.get_sform(coded=True)
+                    qform, _ = image.get_qform(coded=True)
                     if qform is None:
-                        raise ValueError("A coded acquisition qform is required.")
+                        raise ValueError("A coded acquisition qform is required by the current frame interpretation.")
 
-                    if sform is not None:
-                        corners = np.array([
-                            [x, y, z, 1.0]
-                            for x in (0, image.shape[0] - 1)
-                            for y in (0, image.shape[1] - 1)
-                            for z in (0, image.shape[2] - 1)
-                        ]).T
-                        difference = np.linalg.norm(((sform - qform) @ corners)[:3], axis=0).max()
-                        if difference > 0.001:
-                            raise ValueError("Coded qform and sform describe conflicting image geometry.")
-
+                    # Do not compare qform with sform. They may describe
+                    # different coordinate systems for the same voxel array.
+                    # Preserve AFNI-native-frame interpretation below.
                     stageID = sourceStageID or f"image:{identity['sha256']}"
                     spaceID = physicalSpaceID or f"sourcePhysical:{identity['sha256']}"
                     details["sourceIdentity"] = identity
@@ -1864,6 +1858,10 @@ Installation documentation:
                         comments="#",
                         ndmin=2,
                     )
+
+                    # AFNI's native millimeter frame is not the voxel-index
+                    # frame or simply the qform world frame. Keep the explicit
+                    # frame conversion in pglMRITransforms.
                     interpretation = pglMRITransforms.interpretAFNIVolreg(
                         rows,
                         attributes=attributes,
@@ -2252,6 +2250,8 @@ Installation documentation:
 
         inputImage/referenceImage:
             Explicit local NIfTI sources on matching acquisition grids.
+            Acquisition-grid compatibility uses qform and spatial shape.
+            This wrapper does not require qform and sform to agree.
 
         inputVolume/referenceVolume:
             Zero-based volume indices in the supplied files.
@@ -2273,13 +2273,17 @@ Installation documentation:
         Runs 3dvolreg on one selected input volume with -prefix NULL.
         Does not resample images, choose scans, group runs, or register products.
 
+        AFNI-native coordinate conversion remains delegated to
+        pglMRITransforms using AFNI's queried geometry attributes.
+
         Freeform failures warn and return None.
         Inside an action, failures propagate internally to stop execution.
         KeyboardInterrupt/SystemExit propagate after recording.
 
-        Initial support is the tested matching-grid, millimeter NIfTI case.
+        Initial support is the matching-grid, millimeter NIfTI case.
         Numerical grid agreement does not establish anatomical alignment.
         """
+        import math
         import os
         import shutil
         import tempfile
@@ -2378,8 +2382,7 @@ Installation documentation:
                         if image.header.get_xyzt_units()[0] != "mm":
                             raise ValueError("This adapter requires millimeter spatial units.")
 
-                        qform, qcode = image.get_qform(coded=True)
-                        sform, scode = image.get_sform(coded=True)
+                        qform, _ = image.get_qform(coded=True)
                         if qform is None: raise ValueError("Alignment requires a coded acquisition qform.")
                         qform = pglMRITransforms._matrix(qform, "acquisition qform")
 
@@ -2391,12 +2394,8 @@ Installation documentation:
                             for z in (0, shape[2] - 1)
                         ]).T
 
-                        if sform is not None:
-                            sform = pglMRITransforms._matrix(sform, "acquisition sform")
-                            error = np.linalg.norm(((sform - qform) @ corners)[:3], axis=0).max()
-                            if error > 0.001:
-                                raise ValueError("Coded qform and sform conflict.")
-
+                        # Compare acquisition prescriptions using qform.
+                        # A separate sform mapping does not invalidate them.
                         spacing = np.asarray(image.header.get_zooms()[:3])
                         if not np.allclose(
                             spacing, np.linalg.norm(qform[:3, :3], axis=0),
@@ -2571,6 +2570,8 @@ Installation documentation:
                     ):
                         raise ValueError("Cross-run output is not a rigid transformation.")
 
+                    # Preserve the explicit conversion from AFNI-native
+                    # reference-to-input coordinates to voxel sampling maps.
                     native = pglMRITransforms.makeTransform(
                         matrix,
                         domainFrame=baseFrames["native"],
@@ -2607,10 +2608,11 @@ Installation documentation:
                         "nativeTransform": native,
                         "voxelTransform": voxel,
                         "validationScope": (
-                            "Matching acquisition grids; supported by synthetic "
-                            "cross-run rotation/translation and composition tests "
-                            "with AFNI 26.3.11 on macOS ARM. Registration quality "
-                            "must be evaluated separately."
+                            "Matching acquisition grids. The existing adapter records "
+                            "synthetic cross-run rotation/translation and composition "
+                            "tests with AFNI 26.3.11 on macOS ARM. Those tests do not "
+                            "establish coverage of differing qform/sform mappings. "
+                            "Registration quality must be evaluated separately."
                         ),
                         "description": (
                             "One fixed alignment between run reference images. "
@@ -2629,8 +2631,8 @@ Installation documentation:
                     if isinstance(error, pglToolExecutionError):
                         child = error.result
                         result.returnCode = child.returnCode
-                        result.stdoutPath = child.stdoutPath
                         result.stderrPath = child.stderrPath
+                        result.stdoutPath = child.stdoutPath
                         if result.logDirectory is None: result.logDirectory = child.logDirectory
 
                 finally:

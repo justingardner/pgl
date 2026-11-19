@@ -2886,3 +2886,157 @@ Path(sys.argv[2]).write_text(json.dumps(response), encoding="utf-8")
             # consent, and do not silently switch confirmation interfaces.
             pglMessages.warning(f"Confirmation was not obtained: {type(error).__name__}: {error}", level=1)
             return False
+    
+    ################################################################
+    # Select from a list of strings
+    ################################################################
+    @staticmethod
+    def selectItems(items, title="Select items"):
+        """Display checkboxes and return zero-based selected positions.
+
+        items is a nonempty list of strings. Duplicate labels are allowed.
+        Nothing is selected initially; at least one selection is required.
+
+        Returns selected indices in list order, or None on Cancel/failure.
+        Qt runs in a separate process to avoid notebook conflicts.
+        """
+        import json
+        import subprocess
+        import sys
+        import tempfile
+        from pathlib import Path
+
+        if not isinstance(items, list) or not items or not all(isinstance(item, str) for item in items):
+            raise ValueError("items must be a nonempty list of strings.")
+        if not isinstance(title, str) or not title.strip():
+            raise ValueError("title must be a nonblank string.")
+
+        # Pass display strings through JSON, not Python source interpolation.
+        dialogScript = r'''
+import json
+import sys
+from pathlib import Path
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QApplication, QDialog, QDialogButtonBox, QHBoxLayout,
+    QListWidget, QListWidgetItem, QPushButton, QVBoxLayout,
+)
+
+request = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+
+app = QApplication([])
+dialog = QDialog()
+dialog.setWindowTitle(request["title"])
+dialog.setSizeGripEnabled(True)
+dialog.setStyleSheet("""
+    QDialog { background-color: #1e1f22; }
+    QListWidget {
+        background-color: #2b2d31;
+        color: #eaecef;
+        border: 1px solid #3a3d42;
+        border-radius: 6px;
+        padding: 6px;
+    }
+    QListWidget::item { padding: 6px; }
+    QPushButton {
+        background-color: #34373c;
+        color: #eaecef;
+        border: 1px solid #3a3d42;
+        border-radius: 6px;
+        padding: 7px 16px;
+    }
+    QPushButton:hover { background-color: #3f4247; }
+    QPushButton:disabled { color: #777777; }
+""")
+
+layout = QVBoxLayout(dialog)
+itemList = QListWidget()
+layout.addWidget(itemList, 1)
+
+for label in request["items"]:
+    item = QListWidgetItem(label)
+    item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsUserCheckable)
+    item.setCheckState(Qt.CheckState.Unchecked)
+    itemList.addItem(item)
+
+buttonRow = QHBoxLayout()
+selectAllButton = QPushButton("Select all")
+selectNoneButton = QPushButton("Select none")
+buttonBox = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+okButton = buttonBox.button(QDialogButtonBox.StandardButton.Ok)
+
+for button in [selectAllButton, selectNoneButton] + buttonBox.buttons():
+    button.setAutoDefault(False)
+
+def selectedIndices():
+    return [
+        index for index in range(itemList.count())
+        if itemList.item(index).checkState() == Qt.CheckState.Checked
+    ]
+
+def setSelection(checked):
+    state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+    for index in range(itemList.count()):
+        itemList.item(index).setCheckState(state)
+
+selectAllButton.clicked.connect(lambda: setSelection(True))
+selectNoneButton.clicked.connect(lambda: setSelection(False))
+itemList.itemChanged.connect(lambda item: okButton.setEnabled(bool(selectedIndices())))
+buttonBox.accepted.connect(dialog.accept)
+buttonBox.rejected.connect(dialog.reject)
+okButton.setEnabled(False)
+
+buttonRow.addWidget(selectAllButton)
+buttonRow.addWidget(selectNoneButton)
+buttonRow.addStretch(1)
+buttonRow.addWidget(buttonBox)
+layout.addLayout(buttonRow)
+
+dialog.resize(720, 450)
+screen = app.primaryScreen()
+if screen is not None:
+    available = screen.availableGeometry()
+    dialog.resize(min(dialog.width(), max(1, available.width() - 40)), min(dialog.height(), max(1, available.height() - 60)))
+    dialog.move(available.center() - dialog.rect().center())
+
+selection = selectedIndices() if dialog.exec() == QDialog.DialogCode.Accepted else None
+Path(sys.argv[2]).write_text(json.dumps(selection), encoding="utf-8")
+'''
+
+        try:
+            with tempfile.TemporaryDirectory(prefix="pgl-select-") as directory:
+                root = Path(directory)
+                inputFile = root / "request.json"
+                outputFile = root / "response.json"
+                inputFile.write_text(json.dumps({"title": title, "items": items}, ensure_ascii=False), encoding="utf-8")
+
+                # No interaction timeout: the user may need time to choose.
+                result = subprocess.run(
+                    [sys.executable, "-c", dialogScript, str(inputFile), str(outputFile)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
+                )
+                if result.returncode != 0:
+                    details = result.stderr.strip()[-4000:] or "No diagnostic output."
+                    raise RuntimeError(f"Selection dialog exited with code {result.returncode}:\n{details}")
+                if not outputFile.is_file(): raise RuntimeError("Selection dialog returned no response.")
+
+                selected = json.loads(outputFile.read_text(encoding="utf-8"))
+                if selected is None: return None
+                if (
+                    not isinstance(selected, list) or not selected
+                    or any(type(index) is not int or not 0 <= index < len(items) for index in selected)
+                    or len(set(selected)) != len(selected)
+                ):
+                    raise ValueError("Invalid selection response.")
+
+                return sorted(selected)
+
+        except Exception as error:
+            pglMessages.warning(f"Selection was not obtained: {type(error).__name__}: {error}", level=1)
+            return None
