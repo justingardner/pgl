@@ -63,6 +63,7 @@ class pglActionHistory(pglTraitSettings):
     actionInput = Dict(default_value={}, help="Explicit input provenance when recorded; empty for legacy or unspecified inputs")
     actionEnvironment = Dict(default_value={}, help="Runtime environment captured for this execution; empty when not recorded")
     actionInvocations = List(Dict(), help="External-tool invocation attempts recorded during this execution")
+    actionLogs = Dict(default_value={}, help="Archived command logs indexed by invocation ID and stdout/stderr")
     actionApplication = Dict(default_value={}, help="Preparation/application outcome for this execution; empty for ordinary or legacy actions")
     actionProducts = List(Dict(), help="Products recorded by this execution, with committed/uncommitted outcome")
     actionProductInputs = List(Dict(), help="Explicit product selectors and exact committed products resolved during execution")
@@ -174,13 +175,13 @@ class pglActionHistory(pglTraitSettings):
         collectionFields = {
             "actionCode", "actionInput", "actionEnvironment",
             "actionInvocations", "actionApplication", "actionProducts",
-            "actionProductInputs",
+            "actionProductInputs", "actionLogs",
         }
 
         for name in (
             "actionID", "parentActionID", "actionCode", "actionInput",
             "actionEnvironment", "actionInvocations", "actionApplication",
-            "actionProducts", "actionProductInputs",
+            "actionProducts", "actionProductInputs", "actionLogs",
         ):
             value = data.get(name)
             empty = not value if name in collectionFields else value is None
@@ -189,7 +190,7 @@ class pglActionHistory(pglTraitSettings):
                 data.pop(name, None)
 
         return data
-    
+        
     @classmethod
     def fromJSONdict(cls, data, type="all", filename=None):
         """Restore history without creating new execution provenance."""
@@ -216,6 +217,143 @@ class pglActionHistory(pglTraitSettings):
     def print(self):
         """Print the execution description without displaying full source."""
         pglMessages.print(self.toString())
+        
+    ################################################################
+    # Preserve command logs and attach them to a history recipient
+    ################################################################
+    def _preserveLogs(self, owner, *, cacheDirectory=None):
+        """Copy command logs into a persistent cache and attach their files.
+
+        Invocation provenance remains unchanged. actionLogs supplies separate
+        attachment references and records unavailable archives explicitly.
+
+        Called after command execution and invocation finalization.
+        Multiple history recipients reuse the same archived bytes.
+
+        Ordinary archival errors warn without changing scientific status.
+        Objects without the attachment interface retain local archive references.
+        """
+        import hashlib
+        import os
+        import shutil
+        import tempfile
+        from pathlib import Path
+
+        from .pglExternalTools import pglExternalTool
+
+        logs = deepcopy(self.actionLogs)
+        canAttach = callable(getattr(owner, "addDerivedFile", None)) and hasattr(owner, "derivedFiles")
+
+        def archiveRoot():
+            """Use an explicit action cache or a persistent per-user default."""
+            if cacheDirectory is None:
+                return Path.home() / ".cache" / "pgl" / "actionLogs"
+
+            text = os.fspath(cacheDirectory)
+            if (
+                not isinstance(text, str) or not text.strip()
+                or "://" in text or "::" in text
+                or any(character in text for character in ("\x00", "\n", "\r"))
+            ):
+                raise ValueError("Log cacheDirectory must be an ordinary local path.")
+
+            return Path(text).expanduser().absolute() / "actionLogs"
+
+        for invocation in self.actionInvocations:
+            invocationID = invocation.get("invocationID")
+            invocationResult = invocation.get("result")
+            if not isinstance(invocationID, str) or not isinstance(invocationResult, dict): continue
+
+            # Generic command records contain their own logs. Enclosing
+            # scientific records need not duplicate their child log files.
+            commandLogs = invocationResult.get("logs")
+            if not isinstance(commandLogs, dict): continue
+
+            streamRecords = logs.setdefault(invocationID, {})
+
+            for stream in ("stdout", "stderr"):
+                original = commandLogs.get(stream)
+                if not isinstance(original, dict): continue
+
+                attachmentName = f"action.{self.actionID}.invocation.{invocationID}.{stream}"
+                previous = streamRecords.get(stream, {})
+                record = {
+                    "attachmentName": attachmentName,
+                    "originalPath": original.get("localPath"),
+                    "archiveStatus": "unavailable",
+                }
+                streamRecords[stream] = record
+
+                try:
+                    # Another recipient may already have archived these bytes.
+                    sourceText = previous.get("localPath") if previous.get("archiveStatus") == "archived" else original.get("localPath")
+                    if not isinstance(sourceText, str) or not sourceText:
+                        raise ValueError("The invocation has no usable log path.")
+
+                    source = Path(sourceText)
+                    identity = pglExternalTool._fileIdentity(source)
+
+                    # Compare with execution-time identity when it was captured.
+                    for key in ("sha256", "size_bytes"):
+                        if key in original and identity[key] != original[key]:
+                            raise ValueError("Log bytes differ from their execution-time identity.")
+
+                    root = archiveRoot()
+                    root.mkdir(parents=True, exist_ok=True)
+
+                    # Hashing the logical name avoids interpreting identifiers
+                    # as directory components. Include content identity too.
+                    nameHash = hashlib.sha256(attachmentName.encode("utf-8")).hexdigest()
+                    destination = root / f"{nameHash}-{identity['sha256']}.log"
+
+                    if destination.exists():
+                        if pglExternalTool._fileIdentity(destination) != identity:
+                            raise ValueError("An existing archived log has a different identity.")
+                    else:
+                        # Publish only a complete, verified copy. An interrupted
+                        # copy must not look like an archived log.
+                        temporaryPath = None
+                        try:
+                            with tempfile.NamedTemporaryFile(prefix=".pgl-log-", dir=root, delete=False) as temporary:
+                                temporaryPath = Path(temporary.name)
+                                with source.open("rb") as handle: shutil.copyfileobj(handle, temporary)
+                                temporary.flush()
+                                os.fsync(temporary.fileno())
+
+                            if pglExternalTool._fileIdentity(temporaryPath) != identity:
+                                raise ValueError("Log changed while being archived.")
+
+                            os.replace(temporaryPath, destination)
+                        finally:
+                            if temporaryPath is not None: temporaryPath.unlink(missing_ok=True)
+
+                    record.update({
+                        **identity,
+                        "localPath": str(destination),
+                        "archiveStatus": "archived",
+                    })
+
+                    # An archived file and an attachment are distinct:
+                    # history can be shared by several scientific recipients.
+                    if canAttach:
+                        attachment = owner.derivedFiles.get(attachmentName)
+                        if attachment is None:
+                            owner.addDerivedFile(attachmentName, destination, mediaType="text/plain")
+                            attachment = owner.derivedFiles[attachmentName]
+
+                        if any(attachment.get(key) != identity[key] for key in ("sha256", "size_bytes")):
+                            raise ValueError("The log attachment has a different identity.")
+
+                except Exception as error:
+                    # If copying succeeded but attachment failed, preserve that
+                    # distinction and the path to the successfully archived file.
+                    record["error"] = f"{type(error).__name__}: {error}"
+                    pglMessages.warning(
+                        f"Could not fully preserve {stream} for invocation {invocationID}: {error}",
+                        level=1,
+                    )
+
+        self.actionLogs = logs
            
 
 ########################
@@ -239,27 +377,207 @@ class pglActionable(pglTraitSettings):
         if actionID not in self._failedActionIDs:
             self._failedActionIDs = [*self._failedActionIDs, actionID]
 
-    def history(self, verbose=False):
-        """Print the object and its numbered history, optionally with settings."""
+    def history(self, actionIndex=None, *, verbose=False, showLogs=False, tail=None, cacheDirectory=None):
+        """List history or inspect one action and its saved command logs.
+
+        history():
+            Numbered action list with archived-log counts.
+
+        history(verbose=True):
+            Include configuration settings for each action.
+
+        history(index):
+            Detailed action information, including available log references.
+
+        history(index, showLogs=True, tail=None):
+            Retrieve and print logs. tail optionally limits each log to its
+            final N lines. None prints the complete contents.
+
+        Legacy history(True/False) remains a positional verbose setting.
+        Listing/details read metadata only; showLogs retrieves payloads.
+        """
+        import shlex
+        from collections import deque
+        from pathlib import Path
+        from pprint import pformat
+
+        # Preserve the previous history(verbose) positional calling convention.
+        if type(actionIndex) is bool:
+            verbose = verbose or actionIndex
+            actionIndex = None
+
+        if actionIndex is not None and type(actionIndex) is not int:
+            raise TypeError("actionIndex must be an integer or None.")
+        if type(verbose) is not bool or type(showLogs) is not bool:
+            raise TypeError("verbose and showLogs must be Boolean.")
+        if tail is not None and (type(tail) is not int or tail <= 0):
+            raise ValueError("tail must be a positive integer or None.")
+        if showLogs and actionIndex is None:
+            raise ValueError("Select a history index when requesting log contents.")
+
         self.print()
         pglMessages.printHeader("action history")
 
         if self._failedActionIDs:
-            pglMessages.warning("This working object has failed action attempts and is blocked from checkpoint saving. Reload a saved checkpoint before continuing with a saveable analysis.", level=2)
+            pglMessages.warning(
+                "This working object has failed action attempts and is blocked from checkpoint saving. "
+                "Reload a saved checkpoint before continuing with a saveable analysis.",
+                level=2,
+            )
 
         if not self.actionHistory:
             pglMessages.message(f"{type(self).__name__} has no history")
             return
 
-        for iAction, action in enumerate(self.actionHistory):
-            pglMessages.print(f"{iAction}: {action.toString()}")
+        if actionIndex is not None and not 0 <= actionIndex < len(self.actionHistory):
+            raise ValueError(f"actionIndex must be between 0 and {len(self.actionHistory) - 1}.")
 
-            if verbose:
-                if action.actionSettings:
-                    for name, value in sorted(action.actionSettings.items()):
-                        pglMessages.print(f"    {name} = {value!r}")
+        def printSettings(entry):
+            if entry.actionSettings:
+                for name, value in sorted(entry.actionSettings.items()):
+                    pglMessages.print(f"    {name} = {value!r}")
+            else:
+                pglMessages.print("    (No saved configuration parameters)")
+
+        def logRecords(entry):
+            for invocationID, streams in getattr(entry, "actionLogs", {}).items():
+                for stream in ("stdout", "stderr"):
+                    record = streams.get(stream)
+                    if isinstance(record, dict): yield invocationID, stream, record
+
+        if actionIndex is None:
+            for index, entry in enumerate(self.actionHistory):
+                records = list(logRecords(entry))
+                archivedCount = sum(record.get("archiveStatus") == "archived" for _, _, record in records)
+                unavailableCount = len(records) - archivedCount
+                suffix = f" | {archivedCount} archived log(s)" if records else ""
+                if unavailableCount: suffix += f", {unavailableCount} unavailable"
+
+                pglMessages.print(f"{index}: {entry.toString()}{suffix}")
+                if verbose: printSettings(entry)
+            return
+
+        entry = self.actionHistory[actionIndex]
+        pglMessages.print(f"{actionIndex}: {entry.toString()}")
+        pglMessages.print(f"Execution ID: {entry.actionID}")
+        if entry.parentActionID: pglMessages.print(f"Parent execution: {entry.parentActionID}")
+        if entry.actionError is not None: pglMessages.print(f"Error: {entry.actionError}")
+
+        pglMessages.printHeader("configuration")
+        printSettings(entry)
+
+        if entry.actionApplication:
+            pglMessages.printHeader("application")
+            pglMessages.print(pformat(entry.actionApplication, sort_dicts=False))
+
+        pglMessages.printHeader("input products")
+        if entry.actionProductInputs:
+            for productInput in entry.actionProductInputs:
+                pglMessages.print(pformat(productInput, sort_dicts=False))
+        else:
+            pglMessages.print("(No recorded product dependencies)")
+
+        pglMessages.printHeader("output products")
+        if entry.actionProducts:
+            for product in entry.actionProducts:
+                pglMessages.print(
+                    f"{product.get('name')} [{product.get('kind')}] "
+                    f"ID={product.get('productID')} "
+                    f"status={product.get('recordStatus', 'unspecified')}"
+                )
+        else:
+            pglMessages.print("(No recorded products)")
+
+        pglMessages.printHeader("external commands")
+        if not entry.actionInvocations:
+            pglMessages.print("(No recorded external invocations)")
+
+        for invocation in entry.actionInvocations:
+            invocationID = invocation.get("invocationID", "(unknown)")
+            invocationResult = invocation.get("result", {})
+            executable = invocationResult.get("resolvedExecutable") if isinstance(invocationResult, dict) else None
+
+            # Show the actual executable when recorded. Invocation IDs remain
+            # the authoritative association between commands and log files.
+            label = str(executable) if executable else invocation.get("operation", "invocation")
+            pglMessages.print(f"{invocationID}: {label} — {invocation.get('status', 'unknown')}")
+
+            # Some recorders retain command specifications in a nested field.
+            specification = invocation.get("specification", invocation)
+            if isinstance(specification, dict):
+                arguments = specification.get("arguments")
+                commandName = executable or specification.get("requestedExecutable")
+                if commandName and isinstance(arguments, (list, tuple)):
+                    pglMessages.print(f"    {shlex.join([str(commandName), *map(str, arguments)])}")
+
+        pglMessages.printHeader("log files")
+        records = list(logRecords(entry))
+        if not records:
+            pglMessages.print("(No archived logs; older history may contain only original paths in actionInvocations.)")
+            return
+
+        attachments = getattr(self, "derivedFiles", {})
+        getFile = getattr(self, "getDerivedFile", None)
+
+        for invocationID, stream, record in records:
+            attachmentName = record.get("attachmentName")
+            attachment = attachments.get(attachmentName)
+            archived = record.get("archiveStatus") == "archived"
+
+            pglMessages.print(f"{invocationID} — {stream}")
+            pglMessages.print(f"    Attachment: {attachmentName}")
+            pglMessages.print(f"    Archive status: {record.get('archiveStatus', 'unknown')}")
+            pglMessages.print(f"    Attached to this object: {'yes' if attachment is not None else 'no'}")
+            if "size_bytes" in record: pglMessages.print(f"    Size: {record['size_bytes']} bytes")
+            if record.get("originalPath"): pglMessages.print(f"    Original path: {record['originalPath']}")
+            if record.get("localPath"): pglMessages.print(f"    Original archive location: {record['localPath']}")
+            if record.get("error"): pglMessages.print(f"    Archival diagnostic: {record['error']}")
+
+            if not showLogs: continue
+
+            if not archived:
+                pglMessages.print("    Log contents unavailable: archival did not complete.")
+                continue
+
+            try:
+                if callable(getFile):
+                    # Never silently substitute a stale filesystem path for a
+                    # missing attachment on a session.
+                    if attachment is None:
+                        raise ValueError("The log attachment is absent from this object.")
+                    if any(attachment.get(key) != record.get(key) for key in ("sha256", "size_bytes")):
+                        raise ValueError("The attachment identity differs from action history.")
+
+                    path = getFile(attachmentName, cacheDirectory=cacheDirectory)
+                    if path is None: raise ValueError("The log attachment could not be retrieved.")
+
                 else:
-                    pglMessages.print("    (No saved configuration parameters)")
+                    # An action object may carry history but no attachment
+                    # interface. Its local archive is still inspectable.
+                    from .pglExternalTools import pglExternalTool
+
+                    path = Path(record["localPath"])
+                    expected = {key: record[key] for key in ("sha256", "size_bytes")}
+                    if pglExternalTool._fileIdentity(path) != expected:
+                        raise ValueError("The local archive identity differs from history.")
+
+                pglMessages.printHeader(f"{stream}: {invocationID}")
+
+                if record.get("size_bytes") == 0:
+                    pglMessages.print("(Empty log)")
+                    continue
+
+                # Stream full logs line by line; retain only the requested tail.
+                with Path(path).open("r", encoding="utf-8", errors="replace") as handle:
+                    lines = handle if tail is None else deque(handle, maxlen=tail)
+                    for line in lines:
+                        pglMessages.print(line.rstrip("\r\n"))
+
+            except Exception as error:
+                pglMessages.warning(
+                    f"Could not display {stream} for invocation {invocationID}: {error}",
+                    level=1,
+                )
                     
     def getPipeline(self, name=None):
         """Extract an independent recipe from this object's recorded history.
@@ -1043,6 +1361,9 @@ class pglAction(pglActionable):
         Failed actions attach history to directly supplied input actionables
         and any actionable result returned before failure.
 
+        Completed command logs are archived and attached to those same
+        recipients when they support derived-file attachments.
+
         Failure marks those working objects unsafe for checkpoint saving.
         Later successful executions do not clear that state.
 
@@ -1087,8 +1408,24 @@ class pglAction(pglActionable):
         entry = None
         result = None
         contextToken = None
+        logRecipients = []
 
         def appendEntry(owner):
+            # Preserve logs even when history already contains this exact
+            # entry. Avoid repeating the work for the same recipient.
+            if owner is not self and all(owner is not existing for existing in logRecipients):
+                logRecipients.append(owner)
+
+                try:
+                    entry._preserveLogs(owner, cacheDirectory=getattr(self, "cacheDirectory", None))
+                except Exception as error:
+                    # Archival must not replace an existing scientific error
+                    # or silently change an otherwise successful computation.
+                    pglMessages.warning(
+                        f"Could not preserve all logs for action {self.name}: {error}",
+                        level=1,
+                    )
+
             # Settings equality compares UUIDs; use identity to detect whether
             # this exact execution entry has already been attached.
             if owner is not self and all(existing is not entry for existing in owner.actionHistory):
@@ -1101,8 +1438,8 @@ class pglAction(pglActionable):
             try:
                 entry = pglActionHistory(self)
 
-                # Capture before scientific execution. Construction/restoration
-                # of history objects alone never discovers today's environment.
+                # Snapshot before scientific execution. Construction/restoration
+                # of history alone never discovers today's environment.
                 recorder = pglExecutionRecorder(actionID=entry.actionID)
                 entry.actionEnvironment = recorder.exportEnvironment()
                 self.actionHistory.append(entry)
@@ -1177,15 +1514,15 @@ class pglAction(pglActionable):
                         for owner in inputActionables:
                             owner._recordFailedAction(entry.actionID)
 
-                        # Ingestion may create and return a partial session without
-                        # having received an input session.
+                        # Ingestion may return a partial session without having
+                        # received an input session.
                         if isinstance(result, pglActionable) and result is not self:
                             result._recordFailedAction(entry.actionID)
 
                     entry.update(self)
 
                     if self.status == pglActionStatus.SUCCESS and isinstance(result, pglActionable):
-                        # A new returned object must not silently erase a direct
+                        # A returned object must not silently erase a direct
                         # input's unresolved failure state.
                         for owner in inputActionables:
                             for failedActionID in owner._failedActionIDs:
@@ -1198,6 +1535,14 @@ class pglAction(pglActionable):
 
                         if isinstance(result, pglActionable):
                             appendEntry(result)
+
+                    # Even without a scientific recipient, preserve local logs
+                    # referenced by the action's own execution history.
+                    if not logRecipients:
+                        try:
+                            entry._preserveLogs(self, cacheDirectory=getattr(self, "cacheDirectory", None))
+                        except Exception as error:
+                            pglMessages.warning(f"Could not preserve action logs: {error}", level=1)
 
             if self.status == pglActionStatus.FAILED:
                 return None

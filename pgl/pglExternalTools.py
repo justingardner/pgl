@@ -810,10 +810,11 @@ class pglExternalTool:
                 f"{type(error).__name__}: {error}",
             )
             return None
+
     ################################################################
     # Execute one command
     ################################################################
-    def _runCommand(self, commandName=None, *, arguments=None, cwd=None, timeout=None, environment=None, cacheDirectory=None):
+    def _runCommand(self, commandName=None, *, arguments=None, cwd=None, timeout=None, environment=None, cacheDirectory=None, streamOutput=False):
         """Execute a command and automatically retain its provenance.
 
         commandName:
@@ -841,6 +842,13 @@ class pglExternalTool:
             None uses the OS temporary directory. Successful and failed logs
             are retained; no automatic cache eviction is performed.
 
+        streamOutput:
+            Display newly written stdout/stderr while the command runs.
+            Complete original bytes remain in separate retained log files.
+            Output is displayed as written; no percentage or ETA is inferred.
+            Ordering between stdout and stderr is not guaranteed.
+            Child-side buffering can delay visible output.
+
         Returns:
             pglToolResult on zero exit status.
 
@@ -855,9 +863,14 @@ class pglExternalTool:
         Descendant-process cleanup is not guaranteed by this initial runner;
         adapters launching process trees need an explicit lifecycle strategy.
         """
+        import codecs
+        import math
         import os
         import subprocess
+        import sys
         import tempfile
+        import time
+        from contextlib import ExitStack
         from pathlib import Path
 
         commandName = self.executable if commandName is None else commandName
@@ -881,6 +894,8 @@ class pglExternalTool:
         if timeout is not None:
             if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
                 raise ValueError("timeout must be positive and finite, or None.")
+        if type(streamOutput) is not bool:
+            raise TypeError("streamOutput must be Boolean.")
 
         if environment is None: environment = {}
         if type(environment) is not dict: raise TypeError("environment must be a dictionary or None.")
@@ -915,6 +930,7 @@ class pglExternalTool:
             "arguments": argumentList,
             "workingDirectory": str(workingDirectory),
             "timeoutSeconds": timeout,
+            "streamOutput": streamOutput,
             "environment": {
                 name: effectiveEnvironment[name]
                 for name in self.recordedEnvironmentNames
@@ -967,27 +983,103 @@ class pglExternalTool:
             result.stdoutPath = logDirectory / "stdout.log"
             result.stderrPath = logDirectory / "stderr.log"
 
-            # File-backed output avoids retaining potentially large tool logs
-            # in memory. stdin is closed so unattended tools cannot hang on a
-            # hidden prompt; interactive tools need a separate adapter.
-            with result.stdoutPath.open("xb") as stdout, result.stderrPath.open("xb") as stderr:
-                completed = subprocess.run(
-                    [str(executable), *argumentList],
+            # Both streams remain file-backed. Live display reads those files
+            # without replacing or modifying the recorded bytes.
+            with ExitStack() as stack:
+                stdout = stack.enter_context(result.stdoutPath.open("xb"))
+                stderr = stack.enter_context(result.stderrPath.open("xb"))
+                readers = []
+
+                if streamOutput:
+                    for path, destination in (
+                        (result.stdoutPath, sys.stdout),
+                        (result.stderrPath, sys.stderr),
+                    ):
+                        readers.append({
+                            "file": stack.enter_context(path.open("rb", buffering=0)),
+                            "decoder": codecs.getincrementaldecoder("utf-8")(errors="replace"),
+                            "destination": destination,
+                            "displayFailed": False,
+                        })
+
+                def displayText(reader, text):
+                    """Do not fail a scientific command because display broke."""
+                    if not text or reader["displayFailed"]: return
+
+                    try:
+                        reader["destination"].write(text)
+                        reader["destination"].flush()
+                    except Exception as error:
+                        reader["displayFailed"] = True
+                        executionDetails.setdefault("displayErrors", []).append({
+                            "errorType": type(error).__name__,
+                            "message": str(error),
+                        })
+
+                def displayAvailable(final=False):
+                    """Read bounded chunks, including partial lines and UTF-8."""
+                    for reader in readers:
+                        handle = reader["file"]
+
+                        # During execution, bound each pass so noisy output
+                        # cannot indefinitely delay timeout/cancellation checks.
+                        # At completion, drain the bytes currently in the file.
+                        remaining = (
+                            max(0, os.fstat(handle.fileno()).st_size - handle.tell())
+                            if final else 65536
+                        )
+
+                        while remaining > 0:
+                            chunk = handle.read(min(65536, remaining))
+                            if not chunk: break
+                            remaining -= len(chunk)
+                            displayText(reader, reader["decoder"].decode(chunk))
+
+                        if final:
+                            displayText(reader, reader["decoder"].decode(b"", final=True))
+
+                # stdin is closed so unattended tools cannot hang on a hidden
+                # prompt; interactive tools need a separate adapter.
+                command = [str(executable), *argumentList]
+                process = subprocess.Popen(
+                    command,
                     cwd=str(workingDirectory),
                     env=effectiveEnvironment,
                     stdin=subprocess.DEVNULL,
                     stdout=stdout,
                     stderr=stderr,
                     shell=False,
-                    timeout=timeout,
-                    check=False,
                 )
 
-            result.returnCode = completed.returncode
-            executionDetails["returnCode"] = completed.returncode
+                try:
+                    if streamOutput:
+                        deadline = None if timeout is None else time.monotonic() + timeout
 
-            if completed.returncode != 0:
-                raise RuntimeError(f"Command exited with return code {completed.returncode}.")
+                        while process.poll() is None:
+                            if deadline is not None and time.monotonic() >= deadline:
+                                raise subprocess.TimeoutExpired(command, timeout)
+
+                            displayAvailable()
+                            delay = 0.1 if deadline is None else min(0.1, max(0.0, deadline - time.monotonic()))
+                            time.sleep(delay)
+
+                        displayAvailable(final=True)
+
+                    else:
+                        process.wait(timeout=timeout)
+
+                finally:
+                    # Always stop and reap the direct child before closing or
+                    # hashing its logs, including on timeout or interruption.
+                    try:
+                        if process.poll() is None: process.kill()
+                    finally:
+                        process.wait()
+                        result.returnCode = process.returncode
+                        executionDetails["returnCode"] = process.returncode
+
+            if result.returnCode != 0:
+                raise RuntimeError(f"Command exited with return code {result.returnCode}.")
 
             result.status = "success"
 
@@ -1951,6 +2043,9 @@ Installation documentation:
         Creates one enclosing scientific-tool invocation plus the ordinary
         version and subprocess invocation records.
 
+        Displays AFNI's verbose estimation output while retaining full logs.
+        This is native tool output, not an estimated percentage or ETA.
+
         Input/output hashes identify file bytes, not scientific correctness.
         Source mutation is checked before/after execution, but concurrent
         source/tool modification is unsupported.
@@ -1958,6 +2053,7 @@ Installation documentation:
         Header inspection remains lazy with respect to voxel arrays.
         The AFNI subprocess necessarily reads image data for estimation.
         """
+        import math
         import os
         import shutil
         import tempfile
@@ -2012,6 +2108,7 @@ Installation documentation:
                     "twoPass": twoPass,
                     "interpolation": "Fourier",
                     "writeCorrectedImage": False,
+                    "verbose": True,
                 },
                 "inputPath": str(source),
                 "timeoutSeconds": timeout,
@@ -2059,8 +2156,8 @@ Installation documentation:
                     "referenceVolume": referenceVolume,
                 }
 
-                # No header normalization or assignment. Scientific acquisition
-                # geometry validation belongs to the consuming MRI action.
+                # No header normalization or assignment. AFNI-native frame
+                # interpretation remains the responsibility of volreg().
                 del image
 
                 # Match availability selection without probing one installation
@@ -2120,7 +2217,8 @@ Installation documentation:
                 matrixPath = outputDirectory / "motion.aff12.1D"
                 parameterPath = outputDirectory / "motion.1D"
 
-                arguments = ["-Fourier"]
+                # Verbosity affects reporting, not the requested registration.
+                arguments = ["-Fourier", "-verbose"]
                 if twoPass: arguments.append("-twopass")
                 arguments.extend([
                     "-base", f"{source}[{referenceVolume}]",
@@ -2136,6 +2234,7 @@ Installation documentation:
                     cwd=outputDirectory,
                     timeout=timeout,
                     cacheDirectory=outputDirectory,
+                    streamOutput=True,
                 )
                 details["childInvocationIDs"].append(commandResult.invocationID)
                 result.returnCode = commandResult.returnCode
