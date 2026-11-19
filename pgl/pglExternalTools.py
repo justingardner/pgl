@@ -2772,6 +2772,182 @@ Installation documentation:
                 raise
             pglMessages.warning(f"AFNI run-reference alignment stopped: {type(error).__name__}: {error}")
             return None
+        
+    ################################################################
+    # Open an image in the AFNI graphical viewer
+    ################################################################
+    def viewer(self, inputImage, *, cacheDirectory=None):
+        """Open an image in AFNI after checking GUI readiness.
+
+        inputImage:
+            Existing local .nii or .nii.gz file, including 4D acquisitions.
+
+        cacheDirectory:
+            Optional parent directory for viewer stdout/stderr logs.
+            None uses the system temporary directory.
+
+        On macOS, starts or activates XQuartz and verifies its X11 connection
+        before launching AFNI. Does not quit or restart XQuartz, close existing
+        viewers, or modify the parent Python process's environment.
+
+        Returns:
+            subprocess.Popen handle, or None after a warning on failure.
+
+        AFNI may detach from this process. Its process status alone therefore
+        does not establish whether the graphical window opened or closed.
+
+        Does not register scientific products, alter headers, or change scans.
+        The input file must remain available while the viewer is using it.
+        """
+        import os
+        import shutil
+        import subprocess
+        import sys
+        import tempfile
+        import time
+        from pathlib import Path
+
+        from .pglMessages import pglMessages
+
+        try:
+            source = Path(inputImage).expanduser().resolve()
+            if not source.is_file() or not source.name.lower().endswith((".nii", ".nii.gz")):
+                raise ValueError("inputImage must be an existing local .nii or .nii.gz file.")
+            if any(character in str(source) for character in ("[", "]", "<", ">", "\x00", "\n", "\r")):
+                raise ValueError("The image path contains characters ambiguous in an AFNI dataset argument.")
+
+            cacheRoot = None
+            if cacheDirectory is not None:
+                text = os.fspath(cacheDirectory)
+                if (
+                    not isinstance(text, str) or not text.strip()
+                    or "://" in text or "::" in text
+                    or any(character in text for character in ("\x00", "\n", "\r"))
+                ):
+                    raise ValueError("cacheDirectory must be an ordinary local path.")
+                cacheRoot = Path(text).expanduser().resolve()
+
+            # Use the same installation-selection policy as motion estimation.
+            selectedDirectory = None if self.directory is None else Path(self.directory).expanduser().resolve()
+            managed = pglAFNIInstallation()
+            managedDirectory = managed.root / "abin"
+
+            if selectedDirectory is None or selectedDirectory == managedDirectory.resolve():
+                state = managed.readState()
+                if state is not None and state["status"] != "verified":
+                    raise RuntimeError(managed.continuationMessage(state))
+                if state is not None or managedDirectory.exists():
+                    selectedDirectory = managedDirectory
+
+            if selectedDirectory is None:
+                discovered = shutil.which("afni")
+                if discovered is None:
+                    raise FileNotFoundError("AFNI is unavailable. Supply its executable directory or install AFNI.")
+                selectedDirectory = Path(discovered).absolute().parent
+
+            # Environment changes apply only to the probes and AFNI viewer.
+            environment = dict(os.environ)
+            executable = self._resolveExecutable(str(selectedDirectory / "afni"), environment)
+
+            if sys.platform == "darwin":
+                probePath = Path("/opt/X11/bin/xdpyinfo")
+                if not probePath.is_file():
+                    raise FileNotFoundError("XQuartz's /opt/X11/bin/xdpyinfo was not found. Install or repair XQuartz.")
+
+                pglMessages.message("Checking XQuartz readiness...")
+
+                # Activate an existing instance or start it if necessary.
+                # Never restart XQuartz: other viewers may be using it.
+                launch = subprocess.run(
+                    ["/usr/bin/open", "-a", "XQuartz"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+                if launch.returncode != 0:
+                    raise RuntimeError(launch.stderr.strip() or "Could not start XQuartz.")
+
+                ready = False
+                diagnostic = "XQuartz has not published a DISPLAY value."
+
+                for attempt in range(1, 5):
+                    # The display socket can become available during startup.
+                    displayResult = subprocess.run(
+                        ["/bin/launchctl", "getenv", "DISPLAY"],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                        check=False,
+                    )
+                    xDisplay = displayResult.stdout.strip()
+
+                    if displayResult.returncode == 0 and xDisplay:
+                        environment["DISPLAY"] = xDisplay
+
+                        try:
+                            probe = subprocess.run(
+                                [str(probePath)],
+                                env=environment,
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.PIPE,
+                                text=True,
+                                timeout=5,
+                                check=False,
+                            )
+                        except subprocess.TimeoutExpired:
+                            diagnostic = f"XQuartz connection timed out for DISPLAY={xDisplay}."
+                        else:
+                            if probe.returncode == 0:
+                                ready = True
+                                break
+                            diagnostic = probe.stderr.strip() or "XQuartz connection failed."
+
+                    else:
+                        diagnostic = displayResult.stderr.strip() or "XQuartz has not published a DISPLAY value."
+
+                    if attempt < 4:
+                        pglMessages.message(f"Waiting for XQuartz ({attempt}/4)...")
+                        time.sleep(1)
+
+                if not ready:
+                    raise RuntimeError(
+                        f"{diagnostic}\n"
+                        "AFNI was not launched. Check XQuartz before retrying; "
+                        "existing X11 applications were not stopped."
+                    )
+
+            if cacheRoot is not None: cacheRoot.mkdir(parents=True, exist_ok=True)
+            logDirectory = Path(tempfile.mkdtemp(
+                prefix="pgl-afni-viewer-",
+                dir=None if cacheRoot is None else str(cacheRoot),
+            ))
+            stdoutPath = logDirectory / "stdout.log"
+            stderrPath = logDirectory / "stderr.log"
+
+            # GUI lifetime is separate from recorded scientific execution.
+            # File-backed output avoids unattended pipe blocking.
+            with stdoutPath.open("xb") as stdout, stderrPath.open("xb") as stderr:
+                process = subprocess.Popen(
+                    [str(executable), "-dset", str(source)],
+                    cwd=str(logDirectory),
+                    env=environment,
+                    stdin=subprocess.DEVNULL,
+                    stdout=stdout,
+                    stderr=stderr,
+                    shell=False,
+                )
+
+            pglMessages.message(
+                f"AFNI viewer process started for {source.name}.\n"
+                f"Launcher process: {process.pid}\n"
+                f"Startup logs: {logDirectory}"
+            )
+            return process
+
+        except Exception as error:
+            pglMessages.warning(f"AFNI viewer could not be launched: {type(error).__name__}: {error}")
+            return None
     
 ################################################################
 # AFNI installation state and administrator-stage launcher

@@ -1629,6 +1629,69 @@ class pglMRI(pglActionable):
                     print(f"   {form}_code={codeText}{note}")
                     print(f"   {form} (header spatial units: {summary['spatialUnits']}):")
                     printMatrix(summary[form])
+                    
+    ################################################################
+    # Display an acquisition in the AFNI viewer
+    ################################################################
+    def viewer(self, scanNum=0, *, afniDirectory=None, cacheDirectory=None):
+        """Open a selected original acquisition in the AFNI viewer.
+
+        scanNum:
+            Zero-based index in this MRI collection's scans.
+
+        afniDirectory:
+            Optional AFNI executable directory; None uses ordinary discovery.
+
+        cacheDirectory:
+            Optional local cache override. Deferred acquisitions otherwise
+            use their configured cache directory.
+
+        Returns:
+            Viewer process handle, or None after a warning on failure.
+
+        Does not access scan.data, modify the acquisition, or run processing.
+        Corrected-image products are not implicitly substituted.
+        """
+        from pathlib import Path
+
+        from .pglExternalTools import pglAFNI
+        from .pglMessages import pglMessages
+
+        try:
+            scans = list(self.scans)
+            if not scans: raise ValueError("No MRI scans are attached.")
+            if type(scanNum) is not int or not 0 <= scanNum < len(scans):
+                raise ValueError(f"scanNum must be a zero-based integer between 0 and {len(scans) - 1}.")
+
+            scan = scans[scanNum]
+
+            # Prefer the acquisition backing, matching processing-source
+            # resolution. Do not accidentally display an edited working array.
+            if scan._backing is not None:
+                cache = scan._cacheDirectory if cacheDirectory is None else cacheDirectory
+                if cache is None or not str(cache).strip():
+                    raise ValueError("A local cache directory is required to retrieve this acquisition.")
+
+                source = Path(scan._backing.materialize(cache))
+
+            elif scan.localPath:
+                source = Path(scan.localPath).expanduser().absolute()
+
+            else:
+                raise ValueError(f"MRI scan {scanNum} has no acquisition source.")
+
+            if not source.is_file():
+                raise FileNotFoundError(f"MRI scan {scanNum}'s acquisition file is unavailable: {source}")
+
+            scanName = scan.name.replace("\n", " ").replace("\r", " ")
+            pglMessages.message(f"Opening MRI scan {scanNum}: {scanName}")
+
+            afni = pglAFNI(directory=afniDirectory)
+            return afni.viewer(source, cacheDirectory=cacheDirectory)
+
+        except Exception as error:
+            pglMessages.warning(f"MRI viewer could not be opened: {type(error).__name__}: {error}")
+            return None
     
 ################################################################
 # MRI acquisition bundles
