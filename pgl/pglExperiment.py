@@ -384,44 +384,64 @@ class pglExperimentBase(pglStateDataSettings):
             # return timestamps for end compared to start
             return data.endTime - data.startTime
 
-    def getNearestVolumeTrigger(self, event=None, direction='nearest'):
-        '''
-        Find the nearest volume trigger to a given event.
-        
-        Args:
-            event: The event to find the nearest volume trigger for
-            direction: 'nearest' (default), 'before', or 'after'
-        
-        Returns:
-            int: volume_number (starting at 1) or None if not found
-        '''
-        if event is None:
-            return None
-        
-        # Get only the volume triggers and number them sequentially
-        volumeTriggers = [(i + 1, e.timestamp) for i, e in 
-                        enumerate([e for e in self.data.events if e.type == "volumeTrigger"])]
-        
-        if not volumeTriggers:
-            return None
-        
-        if direction == 'before':
-            # Find closest timestamp before the event
-            beforeTriggers = [vt for vt in volumeTriggers if vt[1] <= event.timestamp]
-            if not beforeTriggers:
-                return None
-            volumeNumber, nearestTimestamp = max(beforeTriggers, key=lambda x: x[1])
-        elif direction == 'after':
-            # Find closest timestamp after the event
-            afterTriggers = [vt for vt in volumeTriggers if vt[1] >= event.timestamp]
-            if not afterTriggers:
-                return None
-            volumeNumber, nearestTimestamp = min(afterTriggers, key=lambda x: x[1])
-        else:  # direction == 'nearest' (default)
-            # Find closest timestamp in either direction
-            volumeNumber, nearestTimestamp = min(volumeTriggers, key=lambda x: abs(x[1] - event.timestamp))
-        
-        return volumeNumber
+    def getNearestVolumeTrigger(self, event=None, direction="nearest"):
+        """Return a zero-based volume-trigger index for an event.
+
+        direction:
+            nearest: Closest timestamp; ties select the earlier trigger.
+            before: Last trigger at or before the event.
+            after: First trigger at or after the event.
+
+        Returns None for a missing event, no triggers, or no trigger on the
+        requested side.
+
+        Indices refer to volumeTrigger events in recorded order, not positions
+        in the complete events list. Trigger timestamps must increase strictly.
+
+        A behavioral trigger index is not automatically an MRI array index:
+        missing/extra triggers and discarded MRI volumes require explicit
+        correspondence.
+        """
+        import math
+        from bisect import bisect_left, bisect_right
+        from numbers import Real
+
+        if direction not in ("nearest", "before", "after"):
+            raise ValueError("direction must be nearest, before, or after.")
+        if event is None: return None
+
+        def validTimestamp(value):
+            return not isinstance(value, (bool, np.bool_)) and isinstance(value, Real) and math.isfinite(float(value))
+
+        timestamp = getattr(event, "timestamp", None)
+        if not validTimestamp(timestamp):
+            raise ValueError("Event timestamp must be a finite number.")
+
+        data = self.data
+        if data is None:
+            raise ValueError("Experiment data is unavailable.")
+
+        times = [entry.timestamp for entry in data.events if entry.type == "volumeTrigger"]
+        if not times: return None
+
+        if any(not validTimestamp(value) for value in times):
+            raise ValueError("Volume-trigger timestamps must be finite numbers.")
+        if any(right <= left for left, right in zip(times, times[1:])):
+            raise ValueError("Volume-trigger timestamps must increase strictly in recorded order.")
+
+        if direction == "before":
+            index = bisect_right(times, timestamp) - 1
+            return index if index >= 0 else None
+
+        if direction == "after":
+            index = bisect_left(times, timestamp)
+            return index if index < len(times) else None
+
+        index = bisect_left(times, timestamp)
+        if index == 0: return 0
+        if index == len(times): return len(times) - 1
+
+        return index - 1 if timestamp - times[index - 1] <= times[index] - timestamp else index
     
 ##############################################s
 # Experiment class

@@ -230,98 +230,296 @@ class pglRun(pglLazyLoad, pglExperimentBase):
             pglMessages.warning(f"error: {e}")
     
     def getTrialsByParameter(self, parameterName: str, taskName: str = None):
-        '''
-        Extracts trial data grouped by parameterName
-        
-        Args:
-            parameterName (str): Name of parameter to group data by
-        
-        Returns:
-            dictionary with fields
-                parameterName (str): Name of parameter that the trials are sorted by
-                nParameterValues (int): Number of different parameter values
-                parameterValues (list): List of all parameter values
-                trialNum: 
-                volumeNum:
-                trialTime:
-        '''
-        # figure out what task we are working on
-        if taskName is None:
-            task = self.tasks[0]
-        else:
-            # search for the taskName (case insensitive)
-            task = next((t for t in self.tasks if t.settings.taskName.lower() == taskName.lower()), None)
-            # if not found, check if they meant the taskSaveName
-            if task is None:
-                task = next((t for t in self.tasks if t.settings.taskSaveName.lower() == taskName.lower()), None)
-        
-        if task is None:
-            pglMessages.warning(f"Could not find {taskName} in experiemnt.\nValid tasks are: {' '.join(t.settings.taskName for t in self.tasks)}")
-            return None
-                
-        # gather all the different parameter names
-        parameters = task.parameters
-        # get all the parameters recursively
-        # so that we get all parameters in blocks 
-        def collectParameters(parameterList):
-            parameters = []
-            for p in parameterList:
-                if isinstance(p, pglParameterBlock):
-                    parameters.extend(collectParameters(p.settings.parameters))
-                else:
-                    parameters.append(p)
-            return parameters
-        parameters = collectParameters(parameters)
-        
-        # get the matching parameter
-        parameter = next((p for p in parameters if p.settings.name == parameterName), None)
-        if parameter is None:
-            pglMessages.warning(f"Could not find '{parameterName}' in parameters {[p.settings.name for p in parameters]}")
-            return
-        
-        # initialize the list of lists for volumes by conditions        
-        validValues = parameter.settings.validValues
-        volumes = [[] for _ in range(len(validValues))]
-        startTimes = [[] for _ in range(len(validValues))]
-        trialNums = [[] for _ in range(len(validValues))]
-        nTrials = [0 for _ in range(len(validValues))]
-        nTrialsTotal = 0
-        
-        # loop over trials, collecting the params dictionary for each trial
-        for iTrial, params in enumerate(task.data.params):
-            # find matching trial event
-            trialEvent = next((event for event in task.data.events if isinstance(event, pglEventTrial) and event.trialNum == iTrial), None)
-            
-            # get the trials tart time and volume
-            trialStart = trialEvent.timestamp - task.data.startTime if trialEvent else "No trial event found"
-            trialVolume = self.getNearestVolumeTrigger(trialEvent)
+        """Group recorded trial starts by a configured parameter value.
 
-            # if we found a volume trigger
-            if trialVolume is not None:
-                # get the value that was set for this trial
-                trialValue = params.get(parameter.settings.name,None)
-                # if it matches the valid values
-                if trialValue in validValues:
-                    # get the index
-                    conditionIndex = validValues.index(trialValue)
-                    
-                    # and populate arrays with data
-                    volumes[conditionIndex].append(trialVolume)
-                    startTimes[conditionIndex].append(trialStart)
-                    trialNums[conditionIndex].append(iTrial+1)
-                    nTrials[conditionIndex] += 1
-                    nTrialsTotal += 1
-        
-        # pack everything up
+        Returns pglTrialsByParameter with:
+            parameterName, parameterValues, parameter
+            trialNums: Zero-based behavioral trial indices per group.
+            volumes: Zero-based nearest volume-trigger indices per group.
+            startTimes: Seconds relative to task.data.startTime.
+            nTrials: Included trial count per parameter value.
+            nTrialsTotal: Total included trials.
+
+        Uses the first task when taskName is omitted. Explicit names match
+        taskName first, then taskSaveName, case-insensitively.
+
+        Preserves configured validValues ordering and empty groups.
+        Trials without a recorded START, parameter value, or matching volume
+        trigger are excluded.
+
+        Volume indices refer to the behavioral trigger sequence, not an
+        independently established MRI-volume correspondence.
+        """
+        import math
+        from numbers import Integral, Real
+
+        from .pglExperiment import pglEventTrial
+        from .pglParameter import pglParameterBlock
+
+        if not isinstance(parameterName, str) or not parameterName.strip():
+            raise ValueError("parameterName must be a nonblank string.")
+        if taskName is not None and (not isinstance(taskName, str) or not taskName.strip()):
+            raise ValueError("taskName must be a nonblank string or None.")
+
+        tasks = list(self.tasks or [])
+        if not tasks:
+            pglMessages.warning("Cannot group trials: no tasks are available.", level=1)
+            return None
+
+        if taskName is None:
+            task = tasks[0]
+        else:
+            selectedName = taskName.casefold()
+            matches = [task for task in tasks if task.settings.taskName.casefold() == selectedName]
+            if not matches:
+                matches = [task for task in tasks if task.settings.taskSaveName.casefold() == selectedName]
+
+            if len(matches) != 1:
+                available = ", ".join(task.settings.taskSaveName for task in tasks)
+                pglMessages.warning(f"Expected one task matching {taskName!r}; found {len(matches)}. Available tasks: {available}", level=1)
+                return None
+
+            task = matches[0]
+
+        def collectParameters(parameterList):
+            """Flatten nested parameter blocks without changing their order."""
+            parameters = []
+            for parameter in parameterList:
+                if isinstance(parameter, pglParameterBlock):
+                    parameters.extend(collectParameters(parameter.settings.parameters))
+                else:
+                    parameters.append(parameter)
+            return parameters
+
+        parameters = collectParameters(task.parameters)
+        matches = [parameter for parameter in parameters if parameter.settings.name == parameterName]
+
+        if len(matches) != 1:
+            available = [parameter.settings.name for parameter in parameters]
+            pglMessages.warning(f"Expected one parameter named {parameterName!r}; found {len(matches)}. Available parameters: {available}", level=1)
+            return None
+
+        parameter = matches[0]
+        validValues = list(parameter.settings.validValues)
+
+        def validTimestamp(value):
+            return not isinstance(value, (bool, np.bool_)) and isinstance(value, Real) and math.isfinite(float(value))
+
+        if task.data is None or not validTimestamp(task.data.startTime):
+            raise ValueError("Task data requires a finite startTime.")
+
+        # Index recorded START events once. Never accidentally use a trial END.
+        starts = {}
+        for event in task.data.events:
+            if not isinstance(event, pglEventTrial) or event.eventType != pglEventTrial.boundaryType.START.value:
+                continue
+
+            index = event.trialNum
+            if isinstance(index, (bool, np.bool_)) or not isinstance(index, Integral) or index < 0:
+                raise ValueError("Recorded trial indices must be nonnegative integers.")
+            index = int(index)
+
+            if index in starts:
+                raise ValueError(f"Trial {index} has multiple START events.")
+            if not validTimestamp(event.timestamp):
+                raise ValueError(f"Trial {index} has an invalid START timestamp.")
+
+            starts[index] = event
+
+        volumes = [[] for _ in validValues]
+        startTimes = [[] for _ in validValues]
+        trialNums = [[] for _ in validValues]
+
+        for trialIndex, params in enumerate(task.data.params):
+            trialEvent = starts.get(trialIndex)
+            if trialEvent is None or parameterName not in params: continue
+
+            trialValue = params[parameterName]
+            matchingGroups = [
+                index for index, value in enumerate(validValues)
+                if np.array_equal(trialValue, value)
+            ]
+
+            if not matchingGroups: continue
+            if len(matchingGroups) != 1:
+                raise ValueError("Parameter validValues contain ambiguous duplicate values.")
+
+            # The matcher now returns zero-based indices directly.
+            volumeIndex = self.getNearestVolumeTrigger(trialEvent)
+            if volumeIndex is None: continue
+
+            groupIndex = matchingGroups[0]
+            volumes[groupIndex].append(volumeIndex)
+            startTimes[groupIndex].append(float(trialEvent.timestamp - task.data.startTime))
+            trialNums[groupIndex].append(trialIndex)
+
+        nTrials = [len(indices) for indices in trialNums]
+
         return pglTrialsByParameter(
             parameterName=parameter.settings.name,
             parameterValues=validValues,
             parameter=parameter,
-            nTrialsTotal=nTrialsTotal,
+            nTrialsTotal=sum(nTrials),
             volumes=volumes,
             startTimes=startTimes,
             trialNums=trialNums,
-            nTrials=nTrials
+            nTrials=nTrials,
+        )
+        
+    def getTrialsByStimulus(self, taskName=None, *, includeBlank=False, direction="nearest"):
+        """Group recorded trial starts using the task's stimulus database.
+
+        All returned indices are zero-based:
+            stimulusNums: Run-local inventory indices; -1 means blank.
+            imageIndices: Original HDF5 image indices when available.
+            trialNums: Behavioral trial indices per stimulus group.
+            volumes: Behavioral volume-trigger indices per stimulus group.
+
+        Other fields:
+            stimulusIds, stimulusNames, sourceInfo
+            startTimes: Seconds relative to task.data.startTime.
+            nTrials: Recorded trial-start count per group.
+            nTrialsTotal: Total included trial starts.
+            nStimuli: Number of returned groups.
+
+        Selects the single main task, or the only task if none is marked main.
+        Explicit taskName matches taskName, then taskSaveName.
+
+        Planned but unstarted trials are omitted. Started but incomplete trials
+        remain included. Missing volume matches are retained as None.
+
+        Reads metadata/events, never stimulus pixels.
+        Behavioral trigger indices are not automatically MRI array indices.
+        """
+        import math
+        from copy import deepcopy
+        from numbers import Integral, Real
+        from types import SimpleNamespace
+
+        from .pglExperiment import pglEventTrial
+        from .pglImage import pglStimulusDatabase, blankStimulusNum
+
+        if type(includeBlank) is not bool:
+            raise TypeError("includeBlank must be Boolean.")
+        if direction not in ("nearest", "before", "after"):
+            raise ValueError("direction must be nearest, before, or after.")
+        if taskName is not None and (not isinstance(taskName, str) or not taskName.strip()):
+            raise ValueError("taskName must be a nonblank string or None.")
+
+        tasks = list(self.tasks or [])
+
+        if taskName is None:
+            mainTasks = [task for task in tasks if getattr(task.settings, "isMainTask", False)]
+            matches = mainTasks if mainTasks else tasks
+        else:
+            selectedName = taskName.casefold()
+            matches = [task for task in tasks if task.settings.taskName.casefold() == selectedName]
+            if not matches:
+                matches = [task for task in tasks if task.settings.taskSaveName.casefold() == selectedName]
+
+        if len(matches) != 1:
+            available = ", ".join(task.settings.taskSaveName for task in tasks) or "(none)"
+            pglMessages.warning(f"Choose one task with taskName; found {len(matches)} candidates. Available tasks: {available}", level=1)
+            return None
+
+        task = matches[0]
+        database = task.stimulusDatabase
+
+        if not isinstance(database, pglStimulusDatabase):
+            pglMessages.warning("The selected task has no pglStimulusDatabase.", level=1)
+            return None
+
+        def validTimestamp(value):
+            return not isinstance(value, (bool, np.bool_)) and isinstance(value, Real) and math.isfinite(float(value))
+
+        if task.data is None or not validTimestamp(task.data.startTime):
+            raise ValueError("Task data requires a finite startTime.")
+
+        starts = {}
+
+        for event in task.data.events:
+            if not isinstance(event, pglEventTrial) or event.eventType != pglEventTrial.boundaryType.START.value:
+                continue
+
+            trialIndex = event.trialNum
+            if isinstance(trialIndex, (bool, np.bool_)) or not isinstance(trialIndex, Integral):
+                raise ValueError("Recorded trial indices must be integers.")
+            trialIndex = int(trialIndex)
+
+            if not 0 <= trialIndex < database.nTrials:
+                raise ValueError(f"Trial {trialIndex} has no corresponding stimulus trial.")
+            if trialIndex in starts:
+                raise ValueError(f"Trial {trialIndex} has multiple START events.")
+            if not validTimestamp(event.timestamp):
+                raise ValueError(f"Trial {trialIndex} has an invalid START timestamp.")
+
+            starts[trialIndex] = event
+
+        groups = {}
+
+        for trialIndex, event in sorted(starts.items()):
+            trial = database.getTrial(trialIndex)
+            if trial.trialNum != trialIndex:
+                raise ValueError("Stimulus trial numbering differs from sequence position.")
+
+            stimulusNum = trial.stimulusNum
+            if isinstance(stimulusNum, (bool, np.bool_)) or not isinstance(stimulusNum, Integral):
+                raise ValueError("Stimulus indices must be integers.")
+            stimulusNum = int(stimulusNum)
+
+            if trial.isBlank:
+                if trial.stimulus is not None:
+                    raise ValueError("Blank trial unexpectedly references a stimulus.")
+                if not includeBlank: continue
+            else:
+                if not 0 <= stimulusNum < len(database.stimuli):
+                    raise ValueError("Trial references an invalid stimulus index.")
+                if trial.stimulus is not database.stimuli[stimulusNum]:
+                    raise ValueError("Trial stimulus differs from the current inventory.")
+
+            group = groups.setdefault(stimulusNum, {"trialNums": [], "volumes": [], "startTimes": []})
+            group["trialNums"].append(trialIndex)
+            group["volumes"].append(self.getNearestVolumeTrigger(event, direction=direction))
+            group["startTimes"].append(float(event.timestamp - task.data.startTime))
+
+        # Inventory order, with the optional blank group last.
+        stimulusNums = sorted(groups, key=lambda index: (index == blankStimulusNum, index))
+        stimulusIds, stimulusNames, sourceInfo, imageIndices = [], [], [], []
+
+        for stimulusNum in stimulusNums:
+            if stimulusNum == blankStimulusNum:
+                stimulusIds.append(None)
+                stimulusNames.append("Blank")
+                sourceInfo.append({})
+                imageIndices.append(None)
+                continue
+
+            stimulus = database.stimuli[stimulusNum]
+            provenance = deepcopy(stimulus.sourceInfo)
+            stimulusIds.append(stimulus.stimulusId or None)
+            stimulusNames.append(stimulus.name)
+            sourceInfo.append(provenance)
+            imageIndices.append(provenance.get("imageIndex", getattr(stimulus, "imageIndex", None)))
+
+        trialNums = [groups[index]["trialNums"] for index in stimulusNums]
+        volumes = [groups[index]["volumes"] for index in stimulusNums]
+        startTimes = [groups[index]["startTimes"] for index in stimulusNums]
+        nTrials = [len(indices) for indices in trialNums]
+
+        return SimpleNamespace(
+            taskName=task.settings.taskName,
+            taskSaveName=task.settings.taskSaveName,
+            stimulusNums=stimulusNums,
+            stimulusIds=stimulusIds,
+            stimulusNames=stimulusNames,
+            sourceInfo=sourceInfo,
+            imageIndices=imageIndices,
+            trialNums=trialNums,
+            volumes=volumes,
+            startTimes=startTimes,
+            nTrials=nTrials,
+            nTrialsTotal=sum(nTrials),
+            nStimuli=len(stimulusNums),
         )
         
     def saveDerivedRun(self, dataPath, filesystem=None, filesystemPrefix=None):
