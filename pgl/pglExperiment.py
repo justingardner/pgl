@@ -3660,51 +3660,103 @@ class pglTaskBase(pglTraitSettings):
         self.data.display(taskName=self.settings.taskName, nTotalTrials=self.settings.nTrials, ax=ax)
     
     def print(self):
-        '''
-        Print a summary of the task data
-        '''
+        """Print task metadata and zero-based trial details.
+
+        Includes stimulus names when a stimulus database is attached.
+        Reads stimulus metadata only, never image pixels.
+
+        Trial times are relative to task start. Volume indices are shown
+        when this task has an experiment/run reference supporting matching.
+        Counts remain counts; trial and volume indices are zero-based.
+        """
         from .pglTimestamp import pglTimestamp
-        timestamp = pglTimestamp()
-        
+
         if self.data.startTime is None:
             pglMessages.message(f"Task {self.settings.taskName} was never run")
             return
-        
+
         if self.data.endTime is None:
             pglMessages.message(f"Task {self.settings.taskName} has no endTime")
             return
-        
-        # print task name and number of trials
-        pglMessages.print(f"Task: {self.settings.taskName} | Trials: {self.state.currentTrial+1}")
-        pglMessages.print(f"Duration={timestamp.formatDuration(self.data.endTime - self.data.startTime)} | startTime={self.data.startTime} | endTime={self.data.endTime}")
 
-        # print seglen and waitFor
+        # Report recorded trial starts, not the current-trial state counter.
+        pglMessages.print(f"Task: {self.settings.taskName} | Trials: {self.data.nTrials}")
+        pglMessages.print(f"Duration={pglTimestamp.formatDuration(self.data.endTime - self.data.startTime)} | startTime={self.data.startTime} | endTime={self.data.endTime}")
+        pglMessages.print("Trial and volume indices are zero-based.")
+
+        # Print segment configuration.
         pglMessages.print(f"seglen={self.settings.seglen}")
         pglMessages.print(f"waitUntilVolumeTrigger={self.settings.waitUntilVolumeTrigger}")
-                
-        # print fixedParameters
-        pglMessages.print('\n'.join(f"{key}={value}" for key, value in self.settings.fixedParameters.items()))
-        pglMessages.print('-' * 40)
-        
 
-        # print parameters
-        for p in self.parameters:
-            pglMessages.print(f"{p.settings.name}")
-        
-        # print trial by trial information
-        for iTrial, params in enumerate(self.data.params):
-            # find matching trial event
-            trialEvent = next((event for event in self.data.events if isinstance(event, pglEventTrial) and event.trialNum == iTrial), None)
-            trialStart = trialEvent.timestamp-self.data.startTime if trialEvent else "No trial event found"
-            if hasattr(self,'e'):
-                trialVolume = self.e.getNearestVolumeTrigger(trialEvent)
+        # Print fixed parameters.
+        pglMessages.print("\n".join(f"{key}={value}" for key, value in self.settings.fixedParameters.items()))
+        pglMessages.print("-" * 40)
+
+        # Print parameter names.
+        for parameter in self.parameters:
+            pglMessages.print(f"{parameter.settings.name}")
+
+        # Index START events only. Multiple starts are reported as ambiguous
+        # rather than silently choosing one or accidentally selecting an END.
+        startsByTrial = {}
+        for event in self.data.events:
+            if isinstance(event, pglEventTrial) and event.eventType == pglEventTrial.boundaryType.START.value:
+                startsByTrial.setdefault(event.trialNum, []).append(event)
+
+        database = self.stimulusDatabase
+        experiment = getattr(self, "e", None)
+        volumeMatcher = getattr(experiment, "getNearestVolumeTrigger", None)
+
+        def singleLine(value):
+            """Keep names and parameter values on one display line."""
+            return str(value).replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t")
+
+        # Preserve one row per recorded parameter entry. Planned stimulus
+        # trials beyond this collection are not presented as acquired trials.
+        for trialIndex, params in enumerate(self.data.params):
+            starts = startsByTrial.get(trialIndex, [])
+            trialEvent = starts[0] if len(starts) == 1 else None
+
+            if not starts:
+                timingLabel = "no recorded START"
+            elif len(starts) > 1:
+                timingLabel = "multiple recorded START events"
+            elif trialEvent.timestamp is None:
+                timingLabel = "START timestamp unavailable"
             else:
-                trialVolume = None
-            if trialVolume is None:
-                pglMessages.print(f"Trial {iTrial+1} at {trialStart:.2f}s: " + ', '.join(f"{key}={value}" for key, value in params.items()))
-            else:
-                pglMessages.print(f"Trial {iTrial+1} at {trialStart:.2f}s (vol={trialVolume}): " + ', '.join(f"{key}={value}" for key, value in params.items()))
-    
+                trialStart = trialEvent.timestamp - self.data.startTime
+                timingLabel = f"{trialStart:.2f}s"
+
+            label = f"Trial {trialIndex} at {timingLabel}"
+
+            if trialEvent is not None and trialEvent.timestamp is not None and callable(volumeMatcher):
+                volumeIndex = volumeMatcher(trialEvent)
+                if volumeIndex is not None:
+                    label += f" (vol={volumeIndex})"
+
+            details = []
+
+            # getTrial() retrieves the presentation record without loading img.
+            if database is not None:
+                if trialIndex < database.nTrials:
+                    stimulusTrial = database.getTrial(trialIndex)
+
+                    if stimulusTrial.trialNum != trialIndex:
+                        stimulusName = "(trial numbering mismatch)"
+                    elif stimulusTrial.isBlank:
+                        stimulusName = "Blank"
+                    elif stimulusTrial.stimulus is None:
+                        stimulusName = "(missing stimulus)"
+                    else:
+                        stimulusName = stimulusTrial.stimulus.name or "(unnamed stimulus)"
+
+                    details.append(f"stimulus={singleLine(stimulusName)}")
+                else:
+                    details.append("stimulus=(no corresponding stimulus trial)")
+
+            details.extend(f"{key}={singleLine(value)}" for key, value in params.items())
+            pglMessages.print(label + (": " + ", ".join(details) if details else ""))
+                
     def printSource(self):
         """Print and return the task's original defining module or notebook cell.
 
