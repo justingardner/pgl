@@ -377,11 +377,14 @@ class pglActionable(pglTraitSettings):
         if actionID not in self._failedActionIDs:
             self._failedActionIDs = [*self._failedActionIDs, actionID]
 
-    def history(self, actionIndex=None, *, verbose=False, showLogs=False, tail=None, cacheDirectory=None):
+    def history(self, actionIndex=None, *, verbose=False, showProducts=False, showLogs=False, tail=None, cacheDirectory=None):
         """List history or inspect one action and its saved command logs.
 
         history():
             Numbered action list with archived-log counts.
+
+        history(showProducts=True):
+            Include aligned product-kind summaries beneath each action.
 
         history(verbose=True):
             Include configuration settings for each action.
@@ -394,7 +397,9 @@ class pglActionable(pglTraitSettings):
             final N lines. None prints the complete contents.
 
         Legacy history(True/False) remains a positional verbose setting.
-        Listing/details read metadata only; showLogs retrieves payloads.
+        Product summaries read history metadata only. The existing self.print()
+        overview may resolve object-specific metadata, such as session labels.
+        Only showLogs requests log payload retrieval.
         """
         import shlex
         from collections import deque
@@ -408,14 +413,16 @@ class pglActionable(pglTraitSettings):
 
         if actionIndex is not None and type(actionIndex) is not int:
             raise TypeError("actionIndex must be an integer or None.")
-        if type(verbose) is not bool or type(showLogs) is not bool:
-            raise TypeError("verbose and showLogs must be Boolean.")
+        if any(type(value) is not bool for value in (verbose, showProducts, showLogs)):
+            raise TypeError("verbose, showProducts, and showLogs must be Boolean.")
         if tail is not None and (type(tail) is not int or tail <= 0):
             raise ValueError("tail must be a positive integer or None.")
         if showLogs and actionIndex is None:
             raise ValueError("Select a history index when requesting log contents.")
+        if actionIndex is not None and not 0 <= actionIndex < len(self.actionHistory):
+            raise ValueError("actionIndex is outside this object's history.")
 
-        self.print()
+        #self.print()
         pglMessages.printHeader("action history")
 
         if self._failedActionIDs:
@@ -429,36 +436,71 @@ class pglActionable(pglTraitSettings):
             pglMessages.message(f"{type(self).__name__} has no history")
             return
 
-        if actionIndex is not None and not 0 <= actionIndex < len(self.actionHistory):
-            raise ValueError(f"actionIndex must be between 0 and {len(self.actionHistory) - 1}.")
-
         def printSettings(entry):
-            if entry.actionSettings:
-                for name, value in sorted(entry.actionSettings.items()):
-                    pglMessages.print(f"    {name} = {value!r}")
-            else:
-                pglMessages.print("    (No saved configuration parameters)")
+            """Print bounded configuration summaries without expanding huge records.
 
-        def logRecords(entry):
-            for invocationID, streams in getattr(entry, "actionLogs", {}).items():
-                for stream in ("stdout", "stderr"):
-                    record = streams.get(stream)
-                    if isinstance(record, dict): yield invocationID, stream, record
+            Named record lists show counts and a few names, not their nested
+            source metadata. Other values use depth-limited representations.
+            Stored configuration remains unchanged.
+            """
+            from itertools import islice
+            from reprlib import Repr
+
+            formatter = Repr()
+            formatter.maxlevel = 2
+            formatter.maxlist = 4
+            formatter.maxtuple = 4
+            formatter.maxdict = 3
+            formatter.maxset = 4
+            formatter.maxfrozenset = 4
+            formatter.maxstring = 100
+            formatter.maxother = 100
+            formatter.maxlong = 40
+
+            if not entry.actionSettings:
+                pglMessages.print("    (No saved configuration parameters)")
+                return
+
+            for name, value in sorted(entry.actionSettings.items()):
+                if isinstance(value, (list, tuple)) and value and all(isinstance(item, dict) for item in value):
+                    # Scan selectors carry complete source snapshots for replay.
+                    # Print only their readable labels, never those snapshots.
+                    labels = []
+                    for item in value[:3]:
+                        label = item.get("name") or item.get("label")
+                        labels.append(self._productDisplayText(label, 70) if isinstance(label, str) else "(unnamed record)")
+
+                    valueText = f"{len(value)} record(s); names=" + ", ".join(labels)
+                    if len(value) > 3: valueText += f", +{len(value) - 3} more"
+
+                elif isinstance(value, dict):
+                    # A shallow key inventory avoids exposing large nested
+                    # records merely to explain what a setting contains.
+                    keys = [self._productDisplayText(key, 40) for key in islice(value, 4)]
+                    valueText = f"{len(value)} field(s); keys=" + ", ".join(keys) if value else "{}"
+                    if len(value) > 4: valueText += f", +{len(value) - 4} more"
+
+                else:
+                    valueText = formatter.repr(value)
+                    if isinstance(value, (list, tuple, set, frozenset)) and len(value) > 4:
+                        valueText = f"{len(value)} items; {valueText}"
+
+                # Keep every setting on one bounded line, including strings.
+                pglMessages.print(f"    {name} = {self._productDisplayText(valueText, 240)}")
+
+        widths = self._productSummaryWidths() if showProducts else None
 
         if actionIndex is None:
             for index, entry in enumerate(self.actionHistory):
-                records = list(logRecords(entry))
-                archivedCount = sum(record.get("archiveStatus") == "archived" for _, _, record in records)
-                unavailableCount = len(records) - archivedCount
-                suffix = f" | {archivedCount} archived log(s)" if records else ""
-                if unavailableCount: suffix += f", {unavailableCount} unavailable"
-
-                pglMessages.print(f"{index}: {entry.toString()}{suffix}")
+                pglMessages.print(self._historyActionLine(index, entry))
+                if showProducts: self._printProductRows(entry, widths=widths, verbose=verbose)
                 if verbose: printSettings(entry)
             return
 
         entry = self.actionHistory[actionIndex]
-        pglMessages.print(f"{actionIndex}: {entry.toString()}")
+        pglMessages.print(self._historyActionLine(actionIndex, entry))
+        if showProducts: self._printProductRows(entry, widths=widths, verbose=verbose)
+
         pglMessages.print(f"Execution ID: {entry.actionID}")
         if entry.parentActionID: pglMessages.print(f"Parent execution: {entry.parentActionID}")
         if entry.actionError is not None: pglMessages.print(f"Error: {entry.actionError}")
@@ -511,7 +553,7 @@ class pglActionable(pglTraitSettings):
                     pglMessages.print(f"    {shlex.join([str(commandName), *map(str, arguments)])}")
 
         pglMessages.printHeader("log files")
-        records = list(logRecords(entry))
+        records = list(self._historyLogRecords(entry))
         if not records:
             pglMessages.print("(No archived logs; older history may contain only original paths in actionInvocations.)")
             return
@@ -578,14 +620,6 @@ class pglActionable(pglTraitSettings):
                     f"Could not display {stream} for invocation {invocationID}: {error}",
                     level=1,
                 )
-                    
-    def getPipeline(self, name=None):
-        """Extract an independent recipe from this object's recorded history.
-
-        Does not edit history, load checkpoints, or execute actions.
-        Extraction does not establish a default replay input.
-        """
-        return pglPipeline.fromHistory(self, name=name)
     
     ################################################################
     # Find a committed named scientific product
@@ -611,6 +645,270 @@ class pglActionable(pglTraitSettings):
         except Exception as error:
             pglMessages.warning(f"Derived product was not selected: {error}")
             return None
+    
+    def getPipeline(self, name=None):
+        """Extract an independent recipe from this object's recorded history.
+
+        Does not edit history, load checkpoints, or execute actions.
+        Extraction does not establish a default replay input.
+        """
+        return pglPipeline.fromHistory(self, name=name)
+    
+    ################################################################
+    # Shared history/product presentation
+    ################################################################
+    @staticmethod
+    def _productDisplayText(value, limit=120):
+        """Keep metadata on one display line without printing large values."""
+        text = " ".join(str(value).split())
+        return text if len(text) <= limit else text[:limit - 3] + "..."
+
+    @staticmethod
+    def _historyLogRecords(entry):
+        """Yield recorded log references without opening their files."""
+        for invocationID, streams in entry.actionLogs.items():
+            for stream in ("stdout", "stderr"):
+                record = streams.get(stream)
+                if isinstance(record, dict): yield invocationID, stream, record
+
+    def _historyActionLine(self, index, entry):
+        """Use exactly the same execution line in history and product views."""
+        records = list(self._historyLogRecords(entry))
+        archivedCount = sum(record.get("archiveStatus") == "archived" for _, _, record in records)
+        unavailableCount = len(records) - archivedCount
+        suffix = f" | {archivedCount} archived log(s)" if records else ""
+        if unavailableCount: suffix += f", {unavailableCount} unavailable"
+        return f"{index}: {entry.toString()}{suffix}"
+
+    def _productSummaryRows(self, entry, *, verbose=False):
+        """Summarize products with human-readable information first.
+
+        Normal output:
+            Names, backend, operation, descriptive scalar metadata, and
+            explicitly recorded scientific counts.
+
+        verbose=True:
+            Append record-status counts, artifact-role counts, and remaining
+            metadata. Large metadata values are bounded for display.
+
+        Uncommitted/unspecified outcomes and unavailable logs remain visible
+        regardless of verbosity.
+
+        Counts describe recorded products and artifact references, not
+        inferred numbers of scientific arrays. No payloads are accessed.
+        """
+        from collections import Counter
+
+        if type(verbose) is not bool:
+            raise TypeError("verbose must be Boolean.")
+
+        groups = {}
+        for product in entry.actionProducts:
+            kind = self._productDisplayText(product.get("kind") or "unspecified")
+            groups.setdefault(kind, []).append(product)
+
+        # Deliberately prioritize meaningful fields rather than printing
+        # arbitrary metadata keys in alphabetical order.
+        usefulKeys = (
+            "backend", "operation", "description", "summary",
+            "nScans", "nRuns", "nVolumes", "nMatrices", "nTransforms",
+            "units", "coordinateSystem",
+        )
+        rows = []
+
+        def summarizeValues(values, *, limit=90):
+            """Show distinct recorded values without expanding large collections."""
+            texts = list(dict.fromkeys(self._productDisplayText(value, limit) for value in values))
+            text = ", ".join(texts[:3])
+            if len(texts) > 3: text += f", +{len(texts) - 3} more"
+            return text
+
+        for kind, products in groups.items():
+            names = [product.get("name") or "(unnamed)" for product in products]
+            details = [f"names={summarizeValues(names, limit=50)}"]
+            metadataRecords = [product.get("metadata", {}) for product in products]
+            displayedKeys = set()
+
+            for key in usefulKeys:
+                values = [metadata[key] for metadata in metadataRecords if key in metadata and metadata[key] is not None]
+                if not values: continue
+
+                # Ordinary output stays compact and avoids expanding nested
+                # records, arrays, identities, and other machine metadata.
+                if not all(type(value) in (str, bool, int, float) for value in values): continue
+
+                valueText = summarizeValues(values)
+                if len(values) != len(products): valueText += f" ({len(values)}/{len(products)} records)"
+                details.append(f"{key}={valueText}")
+                displayedKeys.add(key)
+
+            statuses = Counter(product.get("recordStatus") or "unspecified" for product in products)
+
+            # Never conceal unsuccessful or incompletely recorded outcomes.
+            exceptionalStatuses = {status: count for status, count in statuses.items() if status != "committed"}
+            if exceptionalStatuses:
+                details.append("status: " + ", ".join(f"{self._productDisplayText(status)}={count}" for status, count in exceptionalStatuses.items()))
+
+            if entry.actionStatus != pglActionStatus.SUCCESS and statuses.get("committed"):
+                details.append("WARNING: committed records belong to a non-successful action")
+
+            if verbose:
+                details.append("records: " + ", ".join(f"{self._productDisplayText(status)}={count}" for status, count in statuses.items()))
+
+                roles = Counter(role for product in products for role in product.get("artifacts", {}))
+                if roles:
+                    details.append("artifacts: " + ", ".join(f"{self._productDisplayText(role)}={count}" for role, count in roles.items()))
+
+                # Remaining metadata belongs at the end, and only in the
+                # explicitly requested technical view.
+                remainingKeys = set().union(*(set(metadata) for metadata in metadataRecords)) - displayedKeys
+                for key in sorted(remainingKeys):
+                    values = [metadata[key] for metadata in metadataRecords if key in metadata]
+                    details.append(f"{self._productDisplayText(key, 40)}={summarizeValues(values)}")
+
+            rows.append((kind, len(products), "; ".join(details)))
+
+        logRecords = list(self._historyLogRecords(entry))
+        if logRecords:
+            streams = Counter(stream for _, stream, _ in logRecords)
+            archivedCount = sum(record.get("archiveStatus") == "archived" for _, _, record in logRecords)
+            unavailableCount = len(logRecords) - archivedCount
+
+            details = [", ".join(f"{stream}={count}" for stream, count in streams.items())]
+            if unavailableCount: details.append(f"unavailable={unavailableCount}")
+            if verbose: details.append(f"archived={archivedCount}")
+
+            rows.append(("logs", len(logRecords), "; ".join(details)))
+
+        return rows
+
+    def _productSummaryWidths(self):
+        """Calculate shared column widths across this object's entire history."""
+        rows = [row for entry in self.actionHistory for row in self._productSummaryRows(entry)]
+        kindWidth = max([len("Kind"), *(len(kind) for kind, _, _ in rows)])
+        countWidth = max([1, *(len(str(count)) for _, count, _ in rows)])
+        return kindWidth, countWidth
+
+    def _printProductRows(self, entry, *, widths, details=False, verbose=False):
+        """Print aligned summaries and optional product retrieval commands.
+
+        verbose controls technical summary metadata.
+        details explicitly requests individual products and copyable commands.
+
+        Exact-ID commands select the recorded version, not a newer product
+        with the same name. Retrieval still validates provenance and payloads.
+        Commands use 'session' as the example variable name.
+
+        Reads history metadata only; does not open or verify payload files.
+        """
+        if type(verbose) is not bool or type(details) is not bool:
+            raise TypeError("verbose and details must be Boolean.")
+
+        kindWidth, countWidth = widths
+        rows = self._productSummaryRows(entry, verbose=verbose)
+
+        for kind, count, description in rows:
+            pglMessages.print(f"    {kind:<{kindWidth}}  {count:>{countWidth}}  {description}")
+
+        if not details:
+            if rows:
+                # Preserve the original history index in filtered views.
+                indices = [index for index, candidate in enumerate(self.actionHistory) if candidate is entry]
+                if len(indices) == 1:
+                    pglMessages.print(f"    Inspect/get: session.printDataProducts({indices[0]})")
+            return
+
+        # Exact identities are useful here because this is an explicitly
+        # requested retrieval view, rather than the compact history listing.
+        for product in entry.actionProducts:
+            name = self._productDisplayText(product.get("name") or "(unnamed)")
+            kind = self._productDisplayText(product.get("kind") or "unspecified")
+            status = self._productDisplayText(product.get("recordStatus") or "unspecified")
+            identifier = product.get("productID")
+            committed = entry.actionStatus == pglActionStatus.SUCCESS and product.get("recordStatus") == "committed"
+            canSelect = committed and isinstance(identifier, str) and bool(identifier.strip())
+
+            pglMessages.print(f"        {name} [{kind}] | {status}")
+
+            if canSelect:
+                pglMessages.print(f"            Get: product = session.getProduct(productID={identifier!r})")
+            else:
+                pglMessages.print("            Get: unavailable through getProduct() — no committed selectable record")
+
+            artifacts = product.get("artifacts", {})
+            roleWidth = max([1, *(len(self._productDisplayText(role)) for role in artifacts)])
+
+            for role, artifact in artifacts.items():
+                roleText = self._productDisplayText(role)
+                size = artifact.get("size_bytes")
+                sizeText = f"{size:,} bytes" if type(size) is int else "size not recorded"
+                pglMessages.print(f"            {roleText:<{roleWidth}}  {sizeText}")
+
+                if canSelect:
+                    pglMessages.print(f"                File: product.getFile(role={role!r})")
+
+                if verbose:
+                    attachmentName = self._productDisplayText(artifact.get("attachmentName") or "(not recorded)")
+                    pglMessages.print(f"                Attachment: {attachmentName}")
+
+        # Command logs use the attachment interface, not getProduct().
+        for invocationID, stream, record in self._historyLogRecords(entry):
+            attachmentName = record.get("attachmentName")
+            status = self._productDisplayText(record.get("archiveStatus") or "unspecified")
+            pglMessages.print(f"        {stream:<6}  {status}")
+
+            if record.get("archiveStatus") == "archived" and isinstance(attachmentName, str) and attachmentName:
+                pglMessages.print(f"            File: session.getDerivedFile({attachmentName!r})")
+
+            if verbose:
+                pglMessages.print(f"            Invocation: {self._productDisplayText(invocationID)}")
+
+    def _printRecordedProducts(self, actionIndex=None, *, details=False):
+        """Print only producing executions, retaining original history indices."""
+        if actionIndex is not None:
+            if type(actionIndex) is not int: raise TypeError("actionIndex must be an integer or None.")
+            if not 0 <= actionIndex < len(self.actionHistory): raise ValueError("actionIndex is outside this object's history.")
+
+        pglMessages.printHeader("data products" if details else "products")
+        pglMessages.print("Recorded outputs: product counts are records; artifact counts are file references.")
+
+        if self._failedActionIDs:
+            pglMessages.warning("This working object contains failed action attempts; uncommitted outputs are not usable committed products.", level=2)
+
+        widths = self._productSummaryWidths()
+        entries = enumerate(self.actionHistory) if actionIndex is None else [(actionIndex, self.actionHistory[actionIndex])]
+        printed = False
+
+        for index, entry in entries:
+            if not self._productSummaryRows(entry): continue
+            if printed: pglMessages.print()
+            pglMessages.print(self._historyActionLine(index, entry))
+            self._printProductRows(entry, widths=widths, details=details)
+            printed = True
+
+        if not printed:
+            pglMessages.print("(No recorded products or command logs)")
+
+    def printProducts(self, actionIndex=None):
+        """Print producing actions with one aligned summary per product kind.
+
+        Uses the same action lines and indices as history().
+        Includes recorded command logs and explicitly labels product outcomes.
+
+        Historical versions remain visible. This is not a current-attachment
+        inventory, and missing provenance is never inferred from filenames.
+        Reads history metadata only; does not retrieve or verify payload bytes.
+        """
+        self._printRecordedProducts(actionIndex, details=False)
+
+    def printDataProducts(self, actionIndex=None):
+        """Print product summaries plus individual names, IDs, and artifact roles.
+
+        Optionally select one zero-based history index.
+        Includes recorded log attachment names without opening their files.
+        Products and attachments without recorded history are not inferred.
+        """
+        self._printRecordedProducts(actionIndex, details=True)
     
 ################################################################
 # Portable scientific-product selector
@@ -1179,6 +1477,93 @@ class pglDerivedProduct:
         except Exception as error:
             pglMessages.warning(f"Product display stopped: {type(error).__name__}: {error}")
             return None
+        
+        
+    ################################################################
+    # Print
+    ################################################################
+    def print(self, verbose=False):
+        """Print the producing action and readable product information.
+
+        Uses the owner's history line when the owner is still available.
+        Reads recorded metadata only; never retrieves scientific payloads.
+
+        verbose=True adds provenance IDs, attachment names, and hashes.
+        """
+        if type(verbose) is not bool: raise TypeError("verbose must be Boolean.")
+
+        record = self._record
+        metadata = record.get("metadata", {})
+        artifacts = record.get("artifacts", {})
+        text = pglActionable._productDisplayText
+
+        pglMessages.printHeader(f"Product: {text(self.name)}")
+
+        # Show the same producing-action line used by session.history().
+        # Do not automatically reload a released owner merely for printing.
+        owner = self._ownerReference() if self._ownerReference is not None else None
+
+        if owner is None:
+            pglMessages.print("Producing action: history unavailable because the owning object is no longer available.")
+        else:
+            try:
+                entry = self._findProducingAction(owner)
+                indices = [index for index, candidate in enumerate(owner.actionHistory) if candidate is entry]
+                if len(indices) != 1: raise ValueError("Producing history entry is ambiguous.")
+                pglMessages.print(owner._historyActionLine(indices[0], entry))
+            except (ValueError, KeyError) as error:
+                pglMessages.print(f"Producing action: could not verify history — {text(error)}")
+
+        pglMessages.print()
+
+        information = {
+            "Name": self.name,
+            "Kind": self.kind,
+        }
+
+        # Put useful scientific descriptions before technical provenance.
+        usefulKeys = (
+            "backend", "operation", "description", "summary",
+            "nScans", "nRuns", "nVolumes", "nMatrices", "nTransforms",
+            "units", "coordinateSystem",
+        )
+        for key in usefulKeys:
+            if key in metadata: information[key] = metadata[key]
+
+        # Always expose an unsuccessful or unspecified product outcome.
+        status = record.get("recordStatus", "unspecified")
+        if verbose or status != "committed": information["Status"] = status
+
+        information["Artifact files"] = len(artifacts)
+        if artifacts: information["File roles"] = ", ".join(artifacts)
+
+        if verbose:
+            information["Product ID"] = self.productID
+            information["Producer action ID"] = self.producerActionID
+
+            for key, value in metadata.items():
+                if key not in usefulKeys: information[f"metadata.{key}"] = value
+
+            if record.get("inputProductIDs"): information["Input product IDs"] = record["inputProductIDs"]
+            if record.get("invocationIDs"): information["Invocation IDs"] = record["invocationIDs"]
+
+        labelWidth = max(len(label) for label in information)
+
+        for label, value in information.items():
+            pglMessages.print(f"    {label:<{labelWidth}} : {text(value, 240)}")
+
+        # Attachment bookkeeping belongs only in the explicit technical view.
+        if verbose and artifacts:
+            pglMessages.print()
+            pglMessages.printHeader("Artifact details")
+            roleWidth = max(len(text(role)) for role in artifacts)
+
+            for role, artifact in artifacts.items():
+                size = artifact.get("size_bytes")
+                sizeText = f"{size:,} bytes" if type(size) is int else "size not recorded"
+                pglMessages.print(f"    {text(role):<{roleWidth}}  {sizeText}")
+                pglMessages.print(f"        Attachment: {text(artifact.get('attachmentName'))}")
+                pglMessages.print(f"        SHA-256: {text(artifact.get('sha256'))}")
         
     ################################################################
     # Register a display implementation for a scientific product kind
