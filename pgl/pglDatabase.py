@@ -868,14 +868,20 @@ class pglDatabase:
     # conventions.
     @classmethod
     def saveSession(cls, session, *, parentSessionID=None, settings=None, settingsName=None, backendID=None, checkpointName=None, description=None, ingestMethod="manual", storageOptions=None, sslRootCert=None, lockTimeoutSeconds=30.0, ioTimeoutSeconds=60, connectTimeoutSeconds=10):
-        """Save current contents/history as a derived checkpoint with progress.
+        """Publish current contents using selective checkpoint payload reuse.
 
-        Runtime timeout overrides apply to a private configuration copy.
-        They do not impose a total-save deadline or modify source filesystems.
+        Untouched checkpoint-backed behavioral contents, stimuli, MRI
+        acquisitions, and restored attachments reuse registered content.
 
-        Prepares baseline metadata before commit.
-        Updates working identity, annotations, and baseline only after commit
-        and connection cleanup.
+        Materialized mutable contents are serialized conservatively.
+        MNE and working matrices retain their existing full-export paths.
+
+        Acquires a session publication/lifecycle lock before database writes.
+        Ordinary SELECT reports remain available; competing publication and
+        dependency/lifecycle operations may wait.
+
+        Updates working identity, annotations, and history baseline only
+        after commit and connection cleanup.
 
         Expected operational failures warn and return None.
         Integrity/programming errors and KeyboardInterrupt propagate.
@@ -886,9 +892,7 @@ class pglDatabase:
         from .pglPostgres import pglPostgres
 
         pglPostgres.validateTimeouts(lockTimeoutSeconds=lockTimeoutSeconds, ioTimeoutSeconds=ioTimeoutSeconds, connectTimeoutSeconds=connectTimeoutSeconds)
-        
-        # MRI checkpoints preserve original acquisitions, annotations,
-        # current behavior, correspondence, and explicit derived products.
+
         if getattr(session, "mri", None) is not None:
             from .pglMRI import pglMRI
 
@@ -898,27 +902,29 @@ class pglDatabase:
             if session.mne is not None:
                 pglMessages.warning("Session was not saved: combined MRI/MNE checkpoints are unsupported.")
                 return None
-        
-        # Refuse unsafe saves without turning an expected rejection into
-        # a notebook traceback. Keep the failure marker and history intact.
+
+        # Preserve the existing friendly refusal for failed-action safety.
         try:
             pglStorage.requireSafeSave(session)
         except ValueError as error:
             pglMessages.warning(str(error))
             return None
-        
-        cls._getCheckpointHistoryBoundary(session)
 
-        resolvedParentID = session.sessionID if parentSessionID is None else parentSessionID
+        cls._getCheckpointHistoryBoundary(session)
+        originalBaseline = deepcopy(session._checkpointBaseline)
+        originalSessionID = session.sessionID
+        resolvedParentID = originalSessionID if parentSessionID is None else parentSessionID
 
         if resolvedParentID is None:
-            pglMessages.warning("Cannot save session: this session has no loaded or saved source checkpoint. Use saveRawSession() to create a parentless root, or supply parentSessionID.", level=2)
+            pglMessages.warning(
+                "Cannot save session: no source checkpoint is selected. "
+                "Use saveRawSession() to create a root, or supply parentSessionID.",
+                level=2,
+            )
             return None
 
         for label, value in (("parentSessionID", resolvedParentID), ("backendID", backendID)):
-            if label == "backendID" and value is None:
-                continue
-
+            if label == "backendID" and value is None: continue
             if type(value) is not int or not 0 <= value <= 9223372036854775807:
                 raise ValueError(f"{label} must be a nonnegative PostgreSQL bigint.")
 
@@ -926,16 +932,15 @@ class pglDatabase:
             raise TypeError("storageOptions must be a dictionary or None.")
 
         def normalizeAnnotation(value, label):
-            if value is None:
-                return None
-
+            if value is None: return None
             if not isinstance(value, str) or "\x00" in value:
                 raise ValueError(f"{label} must be a string without NUL, or None.")
-
             return value if value.strip() else None
 
-        resolvedCheckpointName = normalizeAnnotation(session.checkpointName if checkpointName is None else checkpointName, "checkpointName")
-        resolvedDescription = normalizeAnnotation(session.description if description is None else description, "description")
+        originalCheckpointName = session.checkpointName
+        originalDescription = session.description
+        resolvedCheckpointName = normalizeAnnotation(originalCheckpointName if checkpointName is None else checkpointName, "checkpointName")
+        resolvedDescription = normalizeAnnotation(originalDescription if description is None else description, "description")
 
         if not isinstance(ingestMethod, str) or ingestMethod not in {"manual", "automated"}:
             raise ValueError("ingestMethod must be manual or automated.")
@@ -957,21 +962,21 @@ class pglDatabase:
                     return None
 
                 username = resolvedSettings.username
-
                 if not isinstance(username, str) or not username.strip() or "\x00" in username:
                     pglMessages.warning("Cannot save session: set a valid username in PGL settings.", level=0)
                     return None
 
                 progress(0.01, "Loading PostgreSQL configuration")
                 postgres = pglPostgres.fromSettings(settings=resolvedSettings)
-
-                if postgres is None:
-                    return None
+                if postgres is None: return None
 
                 postgres = postgres.withTimeouts(lockTimeoutSeconds=lockTimeoutSeconds, ioTimeoutSeconds=ioTimeoutSeconds, connectTimeoutSeconds=connectTimeoutSeconds)
 
+                if originalBaseline and originalBaseline["databaseIdentity"] != cls._checkpointDatabaseIdentity(postgres):
+                    raise ValueError("The selected database differs from this session's checkpoint baseline.")
+
                 if backendID is None and not postgres.storageLocations:
-                    pglMessages.warning("Cannot save session: no storageLocations are configured in the PostgreSQL configuration.", level=0)
+                    pglMessages.warning("Cannot save session: no storageLocations are configured.", level=0)
                     return None
 
                 databasePath = resolvedSettings.databasePath.strip()
@@ -983,28 +988,54 @@ class pglDatabase:
                         return None
 
                     with connection.transaction():
+                        connection.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+
+                        # Acquire before backend registration, user creation,
+                        # matrix publication, or checkpoint row locks.
+                        progress(0.03, "Acquiring checkpoint publication/lifecycle lock")
+                        cls._acquireCheckpointPublicationLock(connection, postgres, progress=progress)
+
                         if backendID is None:
-                            progress(0.03, "Resolving storage destination / acquiring registration lock")
+                            progress(0.035, "Resolving checkpoint storage destination")
                             backendID = cls._getConfiguredStorageBackend(connection, postgres, storageOptions=storageOptions)
 
                         progress(0.04, "Resolving checkpoint owner")
                         createdBy = cls.getOrCreateUser(connection, postgres, username)
 
-                        progress(0.05, "Preparing derived checkpoint")
-                        sessionID = cls._saveDerivedSession(connection, postgres, session, createdBy, backendID, parentSessionID=resolvedParentID, checkpointName=resolvedCheckpointName, description=resolvedDescription, ingestMethod=ingestMethod, storageOptions=storageOptions, progress=progress.section(0.05, 0.95))
+                        progress(0.05, "Preparing selective derived checkpoint")
+                        sessionID = cls._saveDerivedSession(
+                            connection,
+                            postgres,
+                            session,
+                            createdBy,
+                            backendID,
+                            parentSessionID=resolvedParentID,
+                            checkpointName=resolvedCheckpointName,
+                            description=resolvedDescription,
+                            ingestMethod=ingestMethod,
+                            storageOptions=storageOptions,
+                            progress=progress.section(0.05, 0.95),
+                        )
 
-                        progress(0.96, "Validating working history and preparing checkpoint baseline")
+                        progress(0.96, "Preparing committed checkpoint baseline")
                         pglStorage.requireSafeSave(session)
                         cls._getCheckpointHistoryBoundary(session)
+
+                        if session.sessionID != originalSessionID or session._checkpointBaseline != originalBaseline:
+                            raise ValueError("Working checkpoint identity changed while saving.")
+                        if session.checkpointName != originalCheckpointName or session.description != originalDescription:
+                            raise ValueError("Working checkpoint annotations changed while saving.")
+
                         pendingBaseline = cls._prepareCheckpointBaseline(session, sessionID, postgres)
 
-                        progress(0.98, "Committing transaction")
+                        progress(0.98, "Committing checkpoint transaction")
                         commitAttempted = True
 
                     commitConfirmed = True
                     progress(0.99, "Closing PostgreSQL connection and tunnel")
 
-                # No database or payload resources remain owned by this save.
+                # Preserve existing reader/backing ownership. Updating sessionID
+                # does not retarget the working object's deferred source readers.
                 session.sessionID = sessionID
                 session.checkpointName = resolvedCheckpointName
                 session.description = resolvedDescription
@@ -1015,12 +1046,25 @@ class pglDatabase:
         except Exception as error:
             operation = getattr(progress, "_description", operation)
 
-            if not cls._handleCheckpointSaveFailure(error, checkpointKind="Session checkpoint", checkpointID=sessionID, operation=operation, commitAttempted=commitAttempted, commitConfirmed=commitConfirmed):
+            if not cls._handleCheckpointSaveFailure(
+                error,
+                checkpointKind="Session checkpoint",
+                checkpointID=sessionID,
+                operation=operation,
+                commitAttempted=commitAttempted,
+                commitConfirmed=commitConfirmed,
+            ):
                 raise
 
             return None
 
-        pglMessages.message(f"Checkpoint {sessionID} is complete. Database configuration: {databasePath} (database={postgres.databaseName}, schema={postgres.databaseSchema}; {perf_counter() - saveStarted:.1f} s total).", wrapText=False)
+        pglMessages.message(
+            f"Checkpoint {sessionID} is complete. Database configuration: "
+            f"{databasePath} (database={postgres.databaseName}, "
+            f"schema={postgres.databaseSchema}; "
+            f"{perf_counter() - saveStarted:.1f} s total).",
+            wrapText=False,
+        )
         return sessionID
 
     # +++++++++++++++++++++++++++++ saveRawSession ++++++++++++++++++++++++++++
@@ -4231,6 +4275,180 @@ class pglDatabase:
     # -------------------------------------------------------------------------
     # Resolve catalog identities and attach verified locations or logical file links in the caller's
     # transaction.
+    
+    @classmethod
+    def _resolveCheckpointFileReuse(cls, connection, postgres, references):
+        """Resolve existing checkpoint content without opening payload bytes.
+
+        references maps NEW logical filenames to records returned by
+        pglCheckpointFilesystem.getPublicationReference().
+
+        The caller must:
+            Establish reuse eligibility from current object/backing state.
+            Own a READ COMMITTED transaction.
+            Acquire the session publication lock before publication writes.
+
+        Checks the configured database, content identity, active completed
+        ownership, and present verified locations on active backends.
+
+        Returns logical filename -> {fileID, sha256, size_bytes}.
+
+        Locks eligible content/location/backend rows until outer commit.
+        Does not refresh verification timestamps, read payloads, commit,
+        retry, or modify references.
+        """
+        from psycopg.pq import TransactionStatus
+        from psycopg.rows import tuple_row
+
+        if not isinstance(references, dict):
+            raise TypeError("references must be a dictionary.")
+
+        if not references:
+            return {}
+
+        if connection.info.transaction_status != TransactionStatus.INTRANS:
+            raise ValueError("Checkpoint reuse requires an active transaction.")
+
+        databaseIdentity = cls._checkpointDatabaseIdentity(postgres)
+        prepared = {}
+        sizesByHash = {}
+
+        def validateName(name):
+            if (
+                not isinstance(name, str)
+                or not name
+                or name.startswith("/")
+                or "\\" in name
+                or "\x00" in name
+                or any(part in ("", ".", "..") for part in name.split("/"))
+            ):
+                raise ValueError("Checkpoint filenames must be valid relative POSIX paths.")
+
+        for name, reference in references.items():
+            validateName(name)
+            if name == "manifest.json":
+                raise ValueError("The outer manifest cannot be a reuse candidate.")
+
+            fields = {"databaseIdentity", "sourceName", "sha256", "size_bytes"}
+            if not isinstance(reference, dict) or set(reference) != fields:
+                raise ValueError(f"Invalid checkpoint reuse reference: {name!r}")
+
+            if reference["databaseIdentity"] != databaseIdentity:
+                raise ValueError("Cross-database checkpoint payload reuse is unsupported.")
+
+            validateName(reference["sourceName"])
+            digest, size = reference["sha256"], reference["size_bytes"]
+
+            if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                raise ValueError("Invalid reused SHA-256.")
+            if type(size) is not int or not 0 <= size <= 9223372036854775807:
+                raise ValueError("Invalid reused byte count.")
+            if digest in sizesByHash and sizesByHash[digest] != size:
+                raise ValueError("Conflicting sizes for the same reused content hash.")
+
+            sizesByHash[digest] = size
+            prepared[name] = {"sha256": digest, "size_bytes": size}
+
+        with connection.cursor(row_factory=tuple_row) as cursor:
+            cursor.execute("SHOW transaction_isolation")
+            if cursor.fetchone()[0] != "read committed":
+                raise ValueError("Checkpoint reuse requires READ COMMITTED isolation.")
+
+            # Check actual lock ownership rather than accepting a Python flag.
+            cursor.execute("""
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM pg_catalog.pg_locks AS held
+                    JOIN pg_catalog.pg_class AS relation
+                      ON relation.oid = held.relation
+                    JOIN pg_catalog.pg_namespace AS namespace
+                      ON namespace.oid = relation.relnamespace
+                    WHERE held.pid = pg_catalog.pg_backend_pid()
+                      AND held.locktype = 'relation'
+                      AND held.granted
+                      AND namespace.nspname = %s
+                      AND relation.relname = 'session'
+                      AND held.mode IN (
+                          'ShareRowExclusiveLock',
+                          'ExclusiveLock',
+                          'AccessExclusiveLock'
+                      )
+                )
+            """, (postgres.databaseSchema,))
+
+            if cursor.fetchone() != (True,):
+                raise ValueError("Acquire the checkpoint publication lock before resolving reuse.")
+
+        sessions = sql.Identifier(postgres.databaseSchema, "session")
+        links = sql.Identifier(postgres.databaseSchema, "session_files")
+        files = sql.Identifier(postgres.databaseSchema, "files")
+        locations = sql.Identifier(postgres.databaseSchema, "storage_locations")
+        backends = sql.Identifier(postgres.databaseSchema, "storage_backends")
+
+        statement = sql.SQL("""
+            SELECT content.file_id, content.sha256, content.size_bytes
+            FROM {files} AS content
+            JOIN {locations} AS location
+              ON location.file_id = content.file_id
+            JOIN {backends} AS backend
+              ON backend.backend_id = location.backend_id
+            WHERE content.sha256 = ANY(%s::text[])
+              AND content.deleted_at IS NULL
+              AND location.deleted_at IS NULL
+              AND location.status = 'present'
+              AND location.verified_at IS NOT NULL
+              AND backend.is_active
+              AND EXISTS (
+                  SELECT 1
+                  FROM {links} AS reference
+                  JOIN {sessions} AS owner
+                    ON owner.session_id = reference.session_id
+                  WHERE reference.file_id = content.file_id
+                    AND reference.deleted_at IS NULL
+                    AND owner.deleted_at IS NULL
+                    AND owner.status = 'complete'
+              )
+            ORDER BY content.file_id, backend.backend_id, location.object_key
+            FOR SHARE OF content, location, backend
+        """).format(
+            files=files,
+            locations=locations,
+            backends=backends,
+            links=links,
+            sessions=sessions,
+        )
+
+        with connection.cursor(row_factory=tuple_row) as cursor:
+            cursor.execute(statement, (sorted(sizesByHash),))
+            rows = cursor.fetchall()
+
+        catalog = {}
+
+        for fileID, digest, size in rows:
+            if size != sizesByHash[digest]:
+                raise ValueError("Registered content size differs from its reuse reference.")
+
+            record = {"fileID": fileID, "sha256": digest, "size_bytes": size}
+            if digest in catalog and catalog[digest] != record:
+                raise ValueError("Conflicting registered identities for reused content.")
+
+            catalog[digest] = record
+
+        missing = sorted(name for name, identity in prepared.items() if identity["sha256"] not in catalog)
+
+        if missing:
+            examples = ", ".join(repr(name) for name in missing[:5])
+            extra = f" and {len(missing) - 5} more" if len(missing) > 5 else ""
+            raise ValueError(
+                f"Cannot reuse checkpoint payloads: {examples}{extra}. "
+                "Each requires active content, an active completed owner, "
+                "and a present verified location on an active backend."
+            )
+
+        return {
+            name: dict(catalog[identity["sha256"]])
+            for name, identity in sorted(prepared.items())
+        }
 
     # ++++++++++++++++++++++++++++ getOrCreateUser ++++++++++++++++++++++++++++
     # Advanced database/checkpoint API. Observe the connection and transaction requirements in the
@@ -6727,32 +6945,33 @@ class pglDatabase:
     # ++++++++++++++++++++++++++ _saveDerivedSession ++++++++++++++++++++++++
     @classmethod
     def _saveDerivedSession(cls, connection, postgres, session, createdBy, backendID, *, parentSessionID, checkpointName=None, description=None, ingestMethod="manual", storageOptions=None, progress=None):
-        """Publish current contents, matrices, and derived-file attachments.
+        """Publish a derived checkpoint using staged bytes and existing content.
 
-        Selects a derived v3 contract when derivedFiles is nonempty.
-        Sessions without derived files retain the existing v2 contract.
-        MRI sessions use pgl.derived.mri.v1 with explicit product/file lists.
-        MRI acquisitions remain separate from corrected-image attachments.
+        Requires the caller's explicit READ COMMITTED transaction and early
+        checkpoint publication lock. Public saveSession() owns that protocol.
 
-        Uses the caller's outer SQL transaction and an internal savepoint.
-        One payload access context is shared across publication and verification.
+        Stages:
+            Current metadata/history.
+            Materialized mutable contents requiring serialization.
+            New/local scientific files.
 
-        Optional progress covers matrix publication, temporary export, parent
-        comparison, byte-based copying/verification, registration, and completion.
+        Reuses:
+            Eligible untouched checkpoint-backed payloads.
+            Existing file IDs and storage locations, without payload reads.
 
-        Working matrices always publish fresh revisions. Parent reuse remains
-        limited to matching saves with no attached matrix products.
+        Keeps complete manifest/file links for the new checkpoint.
+        Does not update working identity, annotations, or history baseline.
 
-        Does not update working identity or history baseline.
-        Payload writes are not transactional.
+        MNE and working matrices retain their existing full-export behavior.
+        Matching parent reuse remains available when no matrices are attached.
+
+        Payload writes are not transactional. Failed saves may leave
+        unregistered files or matrix bundles.
         """
-        from copy import deepcopy
         from tempfile import TemporaryDirectory
 
         from fsspec.implementations.local import LocalFileSystem
-
-        from .pglSession import pglMNE
-        from .pglMRI import pglMRI
+        from psycopg.pq import TransactionStatus
 
         for label, value in (("createdBy", createdBy), ("backendID", backendID), ("parentSessionID", parentSessionID)):
             if type(value) is not int or not 0 <= value <= 9223372036854775807:
@@ -6764,25 +6983,25 @@ class pglDatabase:
 
         if not isinstance(ingestMethod, str) or ingestMethod not in {"manual", "automated"}:
             raise ValueError("ingestMethod must be manual or automated.")
-
         if storageOptions is not None and not isinstance(storageOptions, dict):
             raise TypeError("storageOptions must be a dictionary or None.")
+        if connection.info.transaction_status != TransactionStatus.INTRANS:
+            raise ValueError("Derived publication requires an active outer transaction.")
 
+        # Reentrant for the public coordinator, which acquired this before
+        # writes. Advanced callers must follow that same early-lock protocol.
+        cls._acquireCheckpointPublicationLock(connection, postgres, progress=progress)
+
+        pglStorage.requireSafeSave(session)
         products = cls._snapshotSessionMatrices(session)
         runs = list(session.runs or [])
         mneData = session.mne
         mriData = session.mri
-        hasMNE = mneData is not None
-        hasMRI = mriData is not None
+        derivedSnapshot = deepcopy(session.derivedFiles)
+        correspondenceSnapshot = deepcopy(session.scanRunCorrespondence)
+        historySnapshot = cls._sessionHistoryBytes(session, acquisition=False)
 
-        if hasMRI and (type(mriData) is not pglMRI or not mriData.scans):
-            raise ValueError("MRI checkpoints require a nonempty pglMRI collection.")
-        if hasMRI and hasMNE:
-            raise ValueError("Combined MRI/MNE derived checkpoints are unsupported.")
-
-        # Keep acquisition identities and annotations stable throughout save.
-        # Runtime backings are compared by identity, never deep-copied.
-        scans = list(mriData.scans) if hasMRI else []
+        scans = list(mriData.scans) if mriData is not None else []
         scanSnapshots = [
             {
                 "uuid": scan.uuid,
@@ -6797,69 +7016,26 @@ class pglDatabase:
             }
             for scan in scans
         ]
-        correspondenceSnapshot = deepcopy(session.scanRunCorrespondence)
-
-        # Validate correspondence and capture history before publishing products.
-        historySnapshot = cls._sessionHistoryBytes(session, acquisition=False)
-
-        if not isinstance(session.derivedFiles, dict):
-            raise TypeError("session.derivedFiles must be a dictionary.")
-
-        # Only portable/local attachment metadata lives in this dictionary.
-        # Filesystem handles remain in separate runtime backing records.
-        derivedSnapshot = deepcopy(session.derivedFiles)
-        hasDerivedFiles = bool(derivedSnapshot)
-
-        if not runs and not hasMNE and not hasMRI:
-            raise ValueError("A derived checkpoint must contain behavioral, MRI, or MNE contents.")
-
-        if hasMNE and type(session.mne) is not pglMNE:
-            raise TypeError("MNE checkpoints currently support pglMNE, not subclasses.")
-
-        for matrix in products.values():
-            pglStorage.requireSafeSave(matrix)
-            pglStorage.validateDataMatrixEncoding(matrix.requireData())
-
-        if hasMRI:
-            contractVersion = "pgl.derived.mri.v1"
-        elif hasDerivedFiles:
-            contractVersion = "pgl.derived.session.v3" if hasMNE else "pgl.derived.behavior.v3"
-        else:
-            contractVersion = "pgl.derived.session.v2" if hasMNE else "pgl.derived.behavior.v2"
-
-        modalities = (["behavior"] if runs else []) + (["mne"] if hasMNE else []) + (["mri"] if hasMRI else [])
-
-        sessions = sql.Identifier(postgres.databaseSchema, "session")
-        users = sql.Identifier(postgres.databaseSchema, "users")
-        backends = sql.Identifier(postgres.databaseSchema, "storage_backends")
-        links = sql.Identifier(postgres.databaseSchema, "session_files")
-        files = sql.Identifier(postgres.databaseSchema, "files")
-        locations = sql.Identifier(postgres.databaseSchema, "storage_locations")
-
-        def isLocal(filesystem):
-            protocols = filesystem.protocol
-            protocols = {protocols} if isinstance(protocols, str) else set(protocols)
-            return bool(protocols.intersection({"file", "local"}))
 
         def report(fraction, description):
             if progress is not None: progress(fraction, description)
 
-        def requireAttachmentsUnchanged():
-            # Concurrent mutation is unsupported. Detect changes to the
-            # attachment metadata before accepting or completing publication.
+        def requireUnchanged():
+            """Preserve the existing publication-time structural checks."""
+            pglStorage.requireSafeSave(session)
             cls._requireSessionMatricesUnchanged(session, products)
-            if session.derivedFiles != derivedSnapshot:
-                raise ValueError("Derived-file attachments changed while saving.")
-            if session.scanRunCorrespondence != correspondenceSnapshot:
-                raise ValueError("Scan/run correspondence changed while saving.")
-            if session.mri is not mriData or session.mne is not mneData:
-                raise ValueError("Session modality collections changed while saving.")
 
             currentRuns = list(session.runs or [])
             if len(currentRuns) != len(runs) or any(left is not right for left, right in zip(currentRuns, runs)):
                 raise ValueError("Behavioral run collection changed while saving.")
+            if session.mne is not mneData or session.mri is not mriData:
+                raise ValueError("Session modality collections changed while saving.")
+            if session.derivedFiles != derivedSnapshot:
+                raise ValueError("Derived attachments changed while saving.")
+            if session.scanRunCorrespondence != correspondenceSnapshot:
+                raise ValueError("Scan/run correspondence changed while saving.")
 
-            if hasMRI:
+            if mriData is not None:
                 currentScans = list(mriData.scans)
                 if len(currentScans) != len(scans) or any(left is not right for left, right in zip(currentScans, scans)):
                     raise ValueError("MRI scan collection changed while saving.")
@@ -6881,28 +7057,34 @@ class pglDatabase:
                         or backing.path != snapshot["backingPath"]
                         or backing.expectedIdentity != snapshot["expectedIdentity"]
                     ):
-                        raise ValueError("MRI source backing changed while saving.")
+                        raise ValueError("MRI acquisition backing changed while saving.")
 
             if cls._sessionHistoryBytes(session, acquisition=False) != historySnapshot:
-                raise ValueError("Session history or metadata changed while saving.")
+                raise ValueError("Session history or labels changed while saving.")
 
-        # Reserve additional weight for matrix publication only when needed.
-        matrixEnd = 0.35 if products else 0.04
-        transferStart = matrixEnd + 0.06
+        def isLocal(filesystem):
+            protocols = filesystem.protocol
+            protocols = {protocols} if isinstance(protocols, str) else set(protocols)
+            return bool(protocols.intersection({"file", "local"}))
+
+        sessions = sql.Identifier(postgres.databaseSchema, "session")
+        users = sql.Identifier(postgres.databaseSchema, "users")
+        backends = sql.Identifier(postgres.databaseSchema, "storage_backends")
+        links = sql.Identifier(postgres.databaseSchema, "session_files")
+        files = sql.Identifier(postgres.databaseSchema, "files")
+        locations = sql.Identifier(postgres.databaseSchema, "storage_locations")
 
         with connection.transaction(), pglDatabaseAccess(postgres, {backendID: storageOptions or {}}) as access:
-            report(0, "Validating creator, storage backend, and parent checkpoint")
+            report(0, "Validating checkpoint owner, destination, and parent")
 
             statement = sql.SQL("SELECT 1 FROM {} WHERE user_id = %s FOR SHARE").format(users)
             if connection.execute(statement, (createdBy,)).fetchone() is None:
-                raise ValueError(f"Unknown creator: {createdBy}")
+                raise ValueError("Unknown checkpoint creator.")
 
             statement = sql.SQL("SELECT url_prefix, is_active FROM {} WHERE backend_id = %s FOR SHARE").format(backends)
             backend = connection.execute(statement, (backendID,)).fetchone()
             if backend is None or not backend[1]:
-                raise ValueError(f"Storage backend is missing or inactive: {backendID}")
-
-            registeredRoot = backend[0]
+                raise ValueError("Destination backend is missing or inactive.")
 
             statement = sql.SQL("""
                 SELECT origin, status, contract_version, manifest_hash,
@@ -6915,64 +7097,79 @@ class pglDatabase:
             parent = connection.execute(statement, (parentSessionID,)).fetchone()
 
             if parent is None or parent[1] != "complete" or parent[8] is not None:
-                raise ValueError("Parent must be a completed, active checkpoint.")
+                raise ValueError("Parent must be a completed active checkpoint.")
 
             report(0.02, "Opening destination storage")
-            destinationFS, destinationRoot = access.resolve(backendID, registeredRoot)
+            destinationFS, destinationRoot = access.resolve(backendID, backend[0])
             stagingFS = LocalFileSystem(skip_instance_cache=True)
 
-            productProgress = progress.section(0.03, matrixEnd) if progress is not None else None
+            # Matrix publication retains its existing separate Zarr path.
+            matrixEnd = 0.25 if products else 0.04
             productRecords = cls._publishSessionMatrices(
-                connection, postgres, session, products,
+                connection,
+                postgres,
+                session,
+                products,
                 createdBy=createdBy,
                 backendID=backendID,
                 filesystem=destinationFS,
                 destinationRoot=destinationRoot,
-                progress=productProgress,
+                progress=progress.section(0.03, matrixEnd) if progress is not None else None,
             )
 
             with TemporaryDirectory(prefix="pgl-derived-session-") as temporary:
-                report(matrixEnd, "Exporting current contents and derived files to temporary staging")
-                stagingRoot, manifest = cls.saveDerivedSessionFiles(
+                report(matrixEnd, "Staging current contents and reusable references")
+
+                staged = cls._stageDerivedSessionCheckpoint(
                     session,
-                    dataPath=Path(temporary) / "bundle",
-                    filesystem=stagingFS,
+                    stagingFS,
+                    str(Path(temporary) / "bundle"),
                     productRecords=productRecords,
+                    progress=progress.section(matrixEnd, 0.55) if progress is not None else None,
                 )
 
-                requireAttachmentsUnchanged()
-
-                if manifest["contract_version"] != contractVersion:
-                    raise ValueError("Exported manifest contract differs from the expected checkpoint contract.")
+                stagingRoot = staged["destination"]
+                manifest = staged["manifest"]
+                references = staged["reusedFiles"]
+                requireUnchanged()
 
                 if manifest["products"] != productRecords:
-                    raise ValueError("Exported manifest products differ from the published matrix references.")
+                    raise ValueError("Staged matrix references differ from published revisions.")
 
-                # The exporter validates all attachment descriptors and hashes.
-                # Also confirm that no attachment was omitted or substituted
-                # relative to the coordinator's starting metadata snapshot.
-                exportedDerived = manifest.get("derivedFiles", [])
-                if [record["name"] for record in exportedDerived] != sorted(derivedSnapshot):
-                    raise ValueError("Exported derived-file names differ from the working attachments.")
+                if [record["name"] for record in manifest.get("derivedFiles", [])] != sorted(derivedSnapshot):
+                    raise ValueError("Staged attachment names differ from the working collection.")
 
                 fileIdentities = {record["name"]: record for record in manifest["files"]}
 
-                for record in exportedDerived:
+                for record in manifest.get("derivedFiles", []):
                     attachment = derivedSnapshot[record["name"]]
                     for field in ("runIndex", "filename", "mediaType"):
                         if record[field] != attachment[field]:
-                            raise ValueError(f"Exported derived-file {field} differs from its attachment.")
+                            raise ValueError("Staged attachment metadata differs from its working record.")
 
                     identity = fileIdentities[record["path"]]
                     if any(identity[field] != attachment[field] for field in ("sha256", "size_bytes")):
-                        raise ValueError("Exported derived-file identity differs from its attachment.")
+                        raise ValueError("Staged attachment identity differs from its working record.")
+
+                report(0.55, "Resolving reused file identities in the database")
+                reusedFiles = cls._resolveCheckpointFileReuse(connection, postgres, references)
 
                 manifestBytes = cls.encodeRawManifest(manifest)
                 manifestHash = hashlib.sha256(manifestBytes).hexdigest()
-                report(matrixEnd + 0.03, "Comparing contents with the parent checkpoint")
+                contractVersion = manifest["contract_version"]
+                modalities = (["behavior"] if manifest["runs"] else []) + (["mne"] if "mne" in manifest else []) + (["mri"] if "mri" in manifest else [])
 
+                ################################################################
+                # Preserve existing identical-parent reuse
+                ################################################################
                 sameParent = parent[0] == "derived" and parent[2] == contractVersion and parent[3] == manifestHash
-                sameMetadata = parent[4] == description and parent[5] == ingestMethod and parent[6] == createdBy and sorted(parent[7]) == sorted(modalities) and parent[9] == checkpointName
+                sameMetadata = (
+                    parent[4] == description
+                    and parent[5] == ingestMethod
+                    and parent[6] == createdBy
+                    and sorted(parent[7]) == sorted(modalities)
+                    and parent[9] == checkpointName
+                )
 
                 if not products and sameParent and sameMetadata:
                     cls._verifySessionProducts(connection, postgres, parentSessionID, [])
@@ -6988,46 +7185,54 @@ class pglDatabase:
                     expected["manifest.json"] = (manifestHash, len(manifestBytes), "manifest")
 
                     statement = sql.SQL("""
-                        SELECT link.name,
-                               content.sha256,
-                               content.size_bytes,
+                        SELECT link.name, content.sha256, content.size_bytes,
                                link.role,
                                (
                                    link.deleted_at IS NULL
                                    AND content.deleted_at IS NULL
                                    AND EXISTS (
                                        SELECT 1
-                                       FROM {} AS location
+                                       FROM {locations} AS location
+                                       JOIN {backends} AS backend
+                                         ON backend.backend_id = location.backend_id
                                        WHERE location.file_id = content.file_id
-                                         AND location.backend_id = %s
                                          AND location.deleted_at IS NULL
                                          AND location.status = 'present'
                                          AND location.verified_at IS NOT NULL
+                                         AND backend.is_active
                                    )
                                ) AS available
-                        FROM {} AS link
-                        JOIN {} AS content ON content.file_id = link.file_id
+                        FROM {links} AS link
+                        JOIN {files} AS content ON content.file_id = link.file_id
                         WHERE link.session_id = %s
                         ORDER BY link.name
-                    """).format(locations, links, files)
+                    """).format(locations=locations, backends=backends, links=links, files=files)
 
-                    rows = connection.execute(statement, (backendID, parentSessionID)).fetchall()
+                    rows = connection.execute(statement, (parentSessionID,)).fetchall()
                     actual = {name: (digest, size, role) for name, digest, size, role, available in rows}
 
                     if actual != expected:
-                        raise ValueError("Parent checkpoint file links do not match its manifest identity; it cannot be reused.")
+                        raise ValueError("Matching parent has inconsistent file links.")
 
-                    if all(available for name, digest, size, role, available in rows):
-                        requireAttachmentsUnchanged()
-                        pglMessages.warning(f"Session contents and save metadata match checkpoint {parentSessionID}. No new checkpoint was created; returning the existing ID.", level=2)
+                    if all(available for _, _, _, _, available in rows):
+                        requireUnchanged()
+                        pglMessages.warning(
+                            f"Session contents and metadata match checkpoint {parentSessionID}. "
+                            "No new checkpoint was created; returning the existing ID.",
+                            level=2,
+                        )
                         report(1, f"Reusing checkpoint {parentSessionID}; cleaning up staging")
                         return parentSessionID
 
-                    report(None, "Matching parent lacks eligible destination files; creating a new checkpoint")
-
-                report(None, "Allocating derived checkpoint")
+                ################################################################
+                # Allocate and upload only physical staging files
+                ################################################################
+                report(0.58, "Allocating derived checkpoint")
                 sessionID = cls.createDerivedCheckpoint(
-                    connection, postgres, createdBy, parentSessionID,
+                    connection,
+                    postgres,
+                    createdBy,
+                    parentSessionID,
                     checkpointName=checkpointName,
                     description=description,
                     ingestMethod=ingestMethod,
@@ -7038,42 +7243,51 @@ class pglDatabase:
                 objectPrefix = f"session{sessionID:06d}"
                 destination = posixpath.join(destinationRoot, objectPrefix)
 
+                # Retain source/destination overlap protection.
                 for run in runs:
-                    if run.filesystem is None: raise ValueError("Source run has no filesystem.")
+                    if run.filesystem is None:
+                        raise ValueError("Source run has no filesystem.")
 
                     if isLocal(destinationFS) and isLocal(run.filesystem):
                         target = Path(destination).expanduser().resolve()
                         source = Path(run.fullDataPath).expanduser().resolve()
-
                         if target == source or source in target.parents:
-                            raise ValueError("Derived destination must be outside source run directories.")
+                            raise ValueError("Checkpoint destination must be outside source run directories.")
 
                     elif destinationFS == run.filesystem:
                         target = posixpath.normpath(destination)
                         source = posixpath.normpath(run.fullDataPath)
-
                         if target == source or target.startswith(source.rstrip("/") + "/"):
-                            raise ValueError("Derived destination must be outside source run directories.")
+                            raise ValueError("Checkpoint destination must be outside source run directories.")
 
-                report(transferStart, "Creating checkpoint directories")
-                if destinationFS.exists(destination): raise FileExistsError(f"Destination already exists: {destination}")
+                if destinationFS.exists(destination):
+                    raise FileExistsError(destination)
+
                 destinationFS.makedirs(destination, exist_ok=False)
 
+                # Preserve the directory layout, including empty directories.
+                # Reused scientific files themselves need no new physical path.
                 for directory in manifest["directories"]:
-                    report(None, f"Creating checkpoint directory {directory}")
                     destinationFS.makedirs(posixpath.join(destination, directory), exist_ok=True)
 
-                fileRecords = [
-                    *manifest["files"],
-                    {"name": "manifest.json", "sha256": manifestHash, "size_bytes": len(manifestBytes)},
+                physicalRecords = [
+                    record for record in manifest["files"]
+                    if record["name"] not in reusedFiles
                 ]
+                physicalRecords.append({
+                    "name": "manifest.json",
+                    "sha256": manifestHash,
+                    "size_bytes": len(manifestBytes),
+                })
 
-                # Copying includes one read-back verification; registration
-                # includes another full stored-file verification.
-                transferEnd = transferStart + (0.94 - transferStart) * 2 / 3
-                transferProgress = progress.section(transferStart, transferEnd) if progress is not None else None
+                report(
+                    0.60,
+                    f"Uploading {len(physicalRecords)} files; "
+                    f"reusing {len(reusedFiles)} existing payload references",
+                )
+                transferProgress = progress.section(0.60, 0.82) if progress is not None else None
 
-                for record, fileProgress in pglProgress.fileSections(fileRecords, transferProgress):
+                for record, fileProgress in pglProgress.fileSections(physicalRecords, transferProgress):
                     pglStorage.copyVerifiedFile(
                         stagingFS,
                         posixpath.join(stagingRoot, record["name"]),
@@ -7084,23 +7298,31 @@ class pglDatabase:
                         progress=fileProgress,
                     )
 
-                registrationProgress = progress.section(transferEnd, 0.94) if progress is not None else None
-                cls.registerDerivedSessionFiles(
-                    connection, postgres, sessionID, backendID, manifest,
+                ################################################################
+                # Register complete logical contents and finish publication
+                ################################################################
+                cls._registerMixedDerivedSessionFiles(
+                    connection,
+                    postgres,
+                    sessionID,
+                    backendID,
+                    manifest,
                     objectPrefix=objectPrefix,
+                    reusedFiles=reusedFiles,
                     accessContext=access,
-                    progress=registrationProgress,
+                    progress=progress.section(0.82, 0.95) if progress is not None else None,
                 )
 
-                report(0.95, "Registering checkpoint matrix links")
+                report(0.96, "Registering checkpoint matrix links")
                 cls._registerSessionProducts(connection, postgres, sessionID, productRecords)
-                requireAttachmentsUnchanged()
 
+                requireUnchanged()
                 for matrix in products.values(): pglStorage.requireSafeSave(matrix)
 
-                report(0.97, "Validating derived checkpoint completion")
+                report(0.98, "Validating complete checkpoint inventory")
                 cls.completeDerivedCheckpoint(connection, postgres, sessionID, manifest)
-                report(1, "Cleaning up staging and payload access")
+
+                report(1, "Closing temporary staging and publication payload access")
                 return sessionID
 
     ################################################################
@@ -7724,6 +7946,1766 @@ class pglDatabase:
         cls.stageDerivedManifest(manifest, filesystem, destination)
         return destination, manifest
 
+    @classmethod
+    def _stageDerivedMRICheckpoint(cls, mri, filesystem, destination, *, progress=None):
+        """Stage MRI metadata and only acquisitions requiring physical export.
+
+        destination:
+            Existing checkpoint staging directory. Its mri/ child must not
+            already exist.
+
+        Checkpoint-backed acquisitions:
+            Read their verified MRI descriptor, not their NIfTI payload.
+            Check backing, descriptor, and checkpoint content identities.
+            Preserve original acquisition references independently of _data.
+            Write current annotations into the new MRI descriptor.
+
+        Other acquisition sources:
+            Export original bytes using scan.exportSource().
+            Verify the exported header against preserved source provenance.
+
+        Returns:
+            directories: Complete logical MRI directory inventory.
+            files: Complete logical MRI file identities.
+            reusedFiles: Mapping of logical destination filename to existing
+                checkpoint publication reference.
+
+        Files listed in reusedFiles are deliberately absent from staging.
+        This is NOT a standalone bundle export. The database coordinator must
+        resolve reuse references, publish new bytes, and attach every file.
+
+        Does not query SQL, publish a checkpoint, change working scans, or
+        serialize cached working images. Processed images remain separate
+        derived-file attachments.
+
+        Concurrent mutation is unsupported; detectable collection, metadata,
+        and backing changes are rejected. Failed staging may leave files;
+        the enclosing temporary-directory owner handles cleanup.
+        """
+        from copy import deepcopy
+
+        from .pglMRI import pglMRI, pglMRIFileBacking, pglMRIBundle, pglMRINiftiMetadata
+
+        if type(mri) is not pglMRI:
+            raise TypeError("MRI checkpoint staging requires a pglMRI instance.")
+
+        scans = list(mri.scans)
+        if not scans:
+            raise ValueError("MRI checkpoint staging requires at least one scan.")
+
+        if not filesystem.isdir(destination):
+            raise ValueError("MRI checkpoint staging requires an existing directory.")
+
+        mriRoot = posixpath.join(destination, "mri")
+        if filesystem.exists(mriRoot):
+            raise FileExistsError(mriRoot)
+
+        prepared = []
+
+        # Resolve lazy UUID defaults before taking snapshots. Never access data.
+        for index, scan in enumerate(scans):
+            backing = scan._backing
+            if backing is not None and not isinstance(backing, pglMRIFileBacking):
+                raise TypeError(f"Scan {index}: unsupported acquisition backing.")
+
+            sourcePath = backing.path if backing is not None else scan.localPath
+            if not isinstance(sourcePath, str) or not sourcePath.lower().endswith((".nii", ".nii.gz")):
+                raise ValueError(f"Scan {index}: an original NIfTI source is required.")
+
+            identifier = scan.uuid
+            try:
+                canonicalUUID = str(uuid.UUID(identifier))
+            except (ValueError, TypeError, AttributeError):
+                raise ValueError(f"Scan {index}: invalid acquisition UUID.") from None
+
+            if identifier != canonicalUUID:
+                raise ValueError(f"Scan {index}: acquisition UUID must use canonical formatting.")
+            if not isinstance(scan.name, str) or not scan.name.strip():
+                raise ValueError(f"Scan {index}: name must be nonblank.")
+
+            sourceMetadata = scan._copyMetadata(scan.sourceMetadata)
+            metadata = scan._copyMetadata(scan.metadata)
+            if "nifti" in metadata and type(metadata["nifti"]) is not dict:
+                raise ValueError(f"Scan {index}: metadata['nifti'] must be a dictionary.")
+
+            suffix = ".nii.gz" if sourcePath.lower().endswith(".nii.gz") else ".nii"
+            prepared.append({
+                "scan": scan,
+                "uuid": identifier,
+                "name": scan.name,
+                "sourceMetadata": sourceMetadata,
+                "metadata": metadata,
+                "backing": backing,
+                "backingFilesystem": None if backing is None else backing.fs,
+                "sourcePath": sourcePath,
+                "expectedIdentity": None if backing is None else backing.expectedIdentity,
+                "localPath": scan.localPath,
+                "path": f"scans/{index:06d}/source{suffix}",
+            })
+
+        def requireUnchanged():
+            """Inspect runtime bindings and metadata without resolving data."""
+            current = list(mri.scans)
+            if len(current) != len(scans) or any(left is not right for left, right in zip(current, scans)):
+                raise ValueError("MRI collection changed during checkpoint staging.")
+
+            for item in prepared:
+                scan = item["scan"]
+                if (
+                    scan.uuid != item["uuid"]
+                    or scan.name != item["name"]
+                    or scan.sourceMetadata != item["sourceMetadata"]
+                    or scan.metadata != item["metadata"]
+                    or scan._backing is not item["backing"]
+                    or scan.localPath != item["localPath"]
+                ):
+                    raise ValueError("MRI metadata or source binding changed during checkpoint staging.")
+
+                backing = item["backing"]
+                if backing is not None and (
+                    backing.fs is not item["backingFilesystem"]
+                    or backing.path != item["sourcePath"]
+                    or backing.expectedIdentity != item["expectedIdentity"]
+                ):
+                    raise ValueError("MRI acquisition backing changed during checkpoint staging.")
+
+        def uniqueKeys(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result: raise ValueError(f"Duplicate MRI descriptor key: {key!r}")
+                result[key] = value
+            return result
+
+        def rejectConstant(value):
+            raise ValueError(f"Nonfinite MRI descriptor JSON constant: {value}")
+
+        descriptors = {}
+
+        def checkpointAcquisition(item):
+            """Resolve original header provenance using verified metadata only."""
+            backing = item["backing"]
+            if backing is None or not isinstance(backing.fs, pglCheckpointFilesystem):
+                return None
+
+            sourceFS = backing.fs
+            sourceName = sourceFS._logicalPath(item["sourcePath"])
+            parts = sourceName.split("/")
+
+            # Existing MRI contracts use <bundle>/scans/NNNNNN/source.nii[.gz].
+            # Reject unexpected bindings instead of inferring a descriptor.
+            if (
+                len(parts) < 4
+                or parts[-3] != "scans"
+                or re.fullmatch(r"[0-9]{6}", parts[-2]) is None
+                or parts[-1] not in ("source.nii", "source.nii.gz")
+            ):
+                raise ValueError("Checkpoint MRI backing has an unsupported acquisition path.")
+
+            bundleRoot = "/".join(parts[:-3])
+            relativePath = "/".join(parts[-3:])
+            descriptorPath = posixpath.join(bundleRoot, "mri.json")
+            descriptorKey = (id(sourceFS), descriptorPath)
+
+            reference = sourceFS.getPublicationReference(sourceName)
+            identity = {key: reference[key] for key in ("sha256", "size_bytes")}
+
+            if item["expectedIdentity"] != identity:
+                raise ValueError("MRI backing identity differs from its checkpoint inventory.")
+
+            if descriptorKey not in descriptors:
+                # Check the bound before open(): checkpoint opens verify/spool
+                # their complete file before returning a stream.
+                maxBytes = 64 * 1024 * 1024
+                entry = sourceFS.info(descriptorPath)
+                if entry["type"] != "file" or not 0 <= entry["size"] <= maxBytes:
+                    raise ValueError("MRI source descriptor exceeds the supported size limit.")
+
+                with sourceFS.open(descriptorPath, "rb") as source:
+                    content = source.read(entry["size"] + 1)
+
+                if len(content) != entry["size"]:
+                    raise ValueError("MRI source descriptor has an unexpected size.")
+
+                descriptor = json.loads(content, object_pairs_hook=uniqueKeys, parse_constant=rejectConstant)
+                if not isinstance(descriptor, dict):
+                    raise ValueError("MRI source descriptor must contain an object.")
+
+                contract = descriptor.get("contract")
+                if contract == pglMRIBundle.contract:
+                    pglMRIBundle.validateDescriptor(descriptor)
+                elif contract == "pgl.mri.derived.v1":
+                    pglMRIBundle.validateDerivedDescriptor(descriptor)
+                else:
+                    raise ValueError("Unsupported checkpoint MRI source descriptor.")
+
+                descriptors[descriptorKey] = {
+                    record["path"]: record for record in descriptor["scans"]
+                }
+
+            record = descriptors[descriptorKey].get(relativePath)
+            if record is None:
+                raise ValueError("MRI acquisition is absent from its source descriptor.")
+
+            if record["uuid"] != item["uuid"]:
+                raise ValueError("MRI acquisition UUID differs from its source descriptor.")
+
+            if {key: record[key] for key in identity} != identity:
+                raise ValueError("MRI source descriptor disagrees with its checkpoint payload identity.")
+
+            return reference, deepcopy(record["sourceMetadata"]["nifti"])
+
+        # Establish reuse and original-header associations before writing output.
+        # Each source MRI descriptor is read only once for this operation.
+        for index, item in enumerate(prepared):
+            if progress is not None:
+                progress(0.1 * index / len(prepared), f"Checking MRI acquisition reference {index + 1}/{len(prepared)}")
+
+            item["reuse"] = checkpointAcquisition(item)
+            if item["reuse"] is not None:
+                _, originalHeader = item["reuse"]
+                preservedHeader = item["sourceMetadata"].get("nifti")
+                if "nifti" in item["sourceMetadata"] and preservedHeader != originalHeader:
+                    raise ValueError("MRI original-header metadata differs from its verified source descriptor.")
+
+        requireUnchanged()
+        filesystem.makedirs(mriRoot, exist_ok=False)
+
+        directories = {"mri", "mri/scans"}
+        files = []
+        reusedFiles = {}
+        records = []
+
+        for index, item in enumerate(prepared):
+            requireUnchanged()
+            logicalName = posixpath.join("mri", item["path"])
+            directories.add(posixpath.dirname(logicalName))
+
+            if progress is not None:
+                action = "Reusing" if item["reuse"] is not None else "Exporting"
+                progress(0.1 + 0.8 * index / len(prepared), f"{action} MRI acquisition {index + 1}/{len(prepared)}: {item['name']}")
+
+            if item["reuse"] is not None:
+                reference, originalHeader = item["reuse"]
+                identity = {key: reference[key] for key in ("sha256", "size_bytes")}
+                reusedFiles[logicalName] = deepcopy(reference)
+
+                # No payload open, cache materialization, or destination copy.
+                # Logical directories are recorded even without physical files.
+            else:
+                target = posixpath.join(destination, logicalName)
+                identity = item["scan"].exportSource(target, filesystem=filesystem)
+                if identity is None:
+                    raise RuntimeError("MRI acquisition export was refused.")
+
+                exported = pglMRIFileBacking(filesystem, target, expectedIdentity=identity)
+                originalHeader = pglMRINiftiMetadata.readBacking(exported)
+
+            sourceMetadata = deepcopy(item["sourceMetadata"])
+            if "nifti" in sourceMetadata and sourceMetadata["nifti"] != originalHeader:
+                raise ValueError("MRI acquisition header conflicts with preserved source provenance.")
+
+            sourceMetadata["nifti"] = deepcopy(originalHeader)
+            records.append({
+                "index": index,
+                "uuid": item["uuid"],
+                "name": item["name"],
+                "path": item["path"],
+                **identity,
+                "sourceMetadata": sourceMetadata,
+                "metadata": deepcopy(item["metadata"]),
+            })
+            files.append({"name": logicalName, **identity})
+
+        descriptor = {"contract": "pgl.mri.derived.v1", "scans": records}
+        pglMRIBundle.validateDerivedDescriptor(descriptor)
+        requireUnchanged()
+
+        if progress is not None:
+            progress(0.95, "Writing current MRI annotations and acquisition references")
+
+        content = json.dumps(descriptor, sort_keys=True, indent=2, allow_nan=False).encode("utf-8")
+        if len(content) > 64 * 1024 * 1024:
+            raise ValueError("Derived MRI descriptor exceeds the supported size limit.")
+
+        descriptorPath = posixpath.join(mriRoot, "mri.json")
+        with filesystem.open(descriptorPath, "xb") as target:
+            if target.write(content) != len(content):
+                raise OSError("Incomplete derived MRI descriptor write.")
+
+        expected = {"sha256": hashlib.sha256(content).hexdigest(), "size_bytes": len(content)}
+        if pglStorage.hashFile(filesystem, descriptorPath) != expected:
+            raise ValueError("Derived MRI descriptor verification failed.")
+
+        files.append({"name": "mri/mri.json", **expected})
+        requireUnchanged()
+
+        if progress is not None:
+            progress(1, f"MRI staging ready: {len(reusedFiles)} reused acquisitions, {len(records) - len(reusedFiles)} exported")
+
+        return {
+            "directories": sorted(directories),
+            "files": sorted(files, key=lambda record: record["name"]),
+            "reusedFiles": reusedFiles,
+        }
+        
+    @classmethod
+    def _stageDerivedStimuliCheckpoint(cls, database, filesystem, destination, *, taskPath, progress=None):
+        """Stage current stimulus metadata and collect reusable PNG references.
+
+        destination:
+            Existing checkpoint staging directory.
+
+        taskPath:
+            Relative task directory within the new checkpoint, for example
+            runs/000000/task01_nSD-mini.
+
+        Unopened checkpoint-backed PNGs:
+            Read their verified stimulus manifest, not their image bytes.
+            Match source path, stimulus identity, and checkpoint SHA-256.
+            Reuse existing content while preserving current trial metadata.
+
+        Materialized images and other sources:
+            Encode current pixels using the existing PNG export policy.
+            Materialized images are conservatively treated as potentially
+            edited; an existing backing does not prove they are unchanged.
+
+        Returns:
+            directories: Complete logical stimulus directory inventory.
+            files: Complete logical stimulus file identities.
+            reusedFiles: Existing checkpoint references indexed by NEW logical
+                filename. Those payloads are absent from physical staging.
+
+        Does not query SQL or publish a checkpoint.
+        Does not change stimulus IDs or replace source bindings.
+        Non-checkpoint image access may populate its ordinary image cache.
+
+        Supports the exact existing image database/image classes. Other
+        exporters require their own explicit staging implementation.
+        Concurrent mutation is unsupported.
+        """
+        from copy import deepcopy
+        from io import BytesIO
+
+        from .pglImage import pglImageDatabase, pglImageFile, pglImageFileH5, pglImageFileNSDMini
+
+        if type(database) is not pglImageDatabase:
+            raise TypeError("Mixed stimulus staging requires an exact pglImageDatabase.")
+
+        if (
+            not isinstance(taskPath, str)
+            or not taskPath
+            or taskPath.startswith("/")
+            or "\\" in taskPath
+            or "\x00" in taskPath
+            or any(part in ("", ".", "..") for part in taskPath.split("/"))
+        ):
+            raise ValueError("taskPath must be a valid relative POSIX path.")
+
+        if not filesystem.isdir(destination):
+            raise ValueError("Stimulus staging requires an existing checkpoint directory.")
+
+        bundleName = posixpath.join(taskPath, "stimuli")
+        imageDirectory = posixpath.join(bundleName, "images")
+        bundlePath = posixpath.join(destination, bundleName)
+
+        if filesystem.exists(bundlePath):
+            raise FileExistsError(bundlePath)
+
+        stimuli = list(database.stimuli)
+        trials = list(database.trials)
+        runStarted = database._runStarted
+        referenced = {}
+        trialRecords = []
+        trialSnapshots = []
+
+        # Validate references without evaluating trial.img or stimulus.img.
+        for index, trial in enumerate(trials):
+            if type(trial.trialNum) is not int or trial.trialNum != index:
+                raise ValueError("Trial numbers must match their sequence positions.")
+            if type(trial.trialId) is not int or trial.trialId < 0:
+                raise ValueError("Trial IDs must be nonnegative integers.")
+            if type(trial.stimulusNum) is not int:
+                raise ValueError("Trial stimulus numbers must be integers.")
+            if trial.status not in ("pending", "completed"):
+                raise ValueError("Unsupported stimulus trial status.")
+
+            stimulusNum = trial.stimulusNum
+            if stimulusNum == -1:
+                if trial.stimulus is not None:
+                    raise ValueError("A blank trial cannot reference an image.")
+            else:
+                if not 0 <= stimulusNum < len(stimuli):
+                    raise ValueError("Trial references an invalid stimulus number.")
+                if trial.stimulus is not stimuli[stimulusNum]:
+                    raise ValueError("Stimulus inventory and trial references disagree.")
+                referenced[stimulusNum] = trial.stimulus
+
+            record = {
+                "trialNum": trial.trialNum,
+                "trialId": trial.trialId,
+                "stimulusNum": stimulusNum,
+                "status": trial.status,
+                "completedAt": trial.completedAt,
+                "metadata": deepcopy(trial.metadata),
+            }
+            trialRecords.append(record)
+            trialSnapshots.append((trial, trial.stimulus))
+
+        if len({record["trialId"] for record in trialRecords}) != len(trialRecords):
+            raise ValueError("Trial IDs must be unique.")
+
+        def encode(document):
+            return (
+                json.dumps(
+                    document,
+                    indent=2,
+                    default=pglImageDatabase._manifestJsonDefault,
+                    allow_nan=False,
+                ) + "\n"
+            ).encode("utf-8")
+
+        prepared = []
+        for stimulusNum, stimulus in sorted(referenced.items()):
+            if type(stimulus) not in (pglImageFile, pglImageFileH5, pglImageFileNSDMini):
+                raise TypeError("Unsupported stimulus image class for checkpoint staging.")
+
+            sourceInfo = deepcopy(stimulus.sourceInfo)
+            if not sourceInfo:
+                sourceInfo = {
+                    "filename": stimulus.filename,
+                    "filesystemPrefix": stimulus.filesystemPrefix,
+                    "originalStimulusNum": stimulusNum,
+                }
+                if isinstance(stimulus, pglImageFileH5):
+                    sourceInfo.update({
+                        "datasetPath": stimulus.datasetPath,
+                        "imageIndex": stimulus.imageIndex,
+                        "imageAxis": stimulus.imageAxis,
+                    })
+
+            record = {
+                "stimulusNum": stimulusNum,
+                "stimulusId": stimulus.stimulusId or uuid.uuid4().hex,
+                "name": stimulus.name,
+                "metadata": deepcopy(stimulus.metadata),
+                "caption": stimulus.caption,
+                "condition": stimulus.condition,
+                "conditionNum": stimulus.conditionNum,
+                "sourceInfo": sourceInfo,
+            }
+
+            # Snapshot portable fields separately from runtime image objects.
+            snapshot = {
+                "stimulusId": stimulus.stimulusId,
+                "name": stimulus.name,
+                "metadata": deepcopy(stimulus.metadata),
+                "caption": stimulus.caption,
+                "condition": stimulus.condition,
+                "conditionNum": stimulus.conditionNum,
+                "sourceInfo": deepcopy(stimulus.sourceInfo),
+                "filename": stimulus.filename,
+                "filesystemPrefix": stimulus.filesystemPrefix,
+            }
+            prepared.append({
+                "stimulus": stimulus,
+                "filesystem": stimulus.filesystem,
+                "snapshot": encode(snapshot),
+                "record": record,
+                "initialImage": stimulus._img,
+            })
+
+        identifiers = [item["record"]["stimulusId"] for item in prepared]
+        if len(set(identifiers)) != len(identifiers):
+            raise ValueError("Referenced stimulus IDs must be unique.")
+
+        manifest = {
+            "formatName": "pglImageDatabaseRun",
+            "formatVersion": 2,
+            "runStarted": runStarted,
+            "stimuli": [item["record"] for item in prepared],
+            "trials": trialRecords,
+        }
+        encode(manifest)  # Validate metadata before payload reads or writes.
+
+        sourceManifests = {}
+
+        def uniqueKeys(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result: raise ValueError(f"Duplicate stimulus manifest key: {key!r}")
+                result[key] = value
+            return result
+
+        def reusableImage(item):
+            """Return identity/geometry from verified source metadata only."""
+            stimulus = item["stimulus"]
+            sourceFS = item["filesystem"]
+
+            # Exact class avoids applying ordinary PNG semantics to HDF5
+            # selections or subclasses with custom image transformations.
+            if type(stimulus) is not pglImageFile or stimulus._img is not None:
+                return None
+            if not isinstance(sourceFS, pglCheckpointFilesystem):
+                return None
+
+            sourceName = sourceFS._logicalPath(stimulus.filename)
+            parts = sourceName.split("/")
+            if len(parts) < 3 or parts[-2] != "images" or not parts[-1].lower().endswith(".png"):
+                raise ValueError("Checkpoint image has an unsupported stimulus payload path.")
+
+            sourceRoot = "/".join(parts[:-2])
+            relativeName = "/".join(parts[-2:])
+            manifestPath = posixpath.join(sourceRoot, "manifest.json")
+            key = (id(sourceFS), manifestPath)
+
+            reference = sourceFS.getPublicationReference(sourceName)
+
+            if key not in sourceManifests:
+                # Bound the descriptor before checkpoint open verifies/spools it.
+                entry = sourceFS.info(manifestPath)
+                if entry["type"] != "file" or not 0 <= entry["size"] <= 16 * 1024 * 1024:
+                    raise ValueError("Stimulus manifest exceeds the supported metadata limit.")
+
+                with sourceFS.open(manifestPath, "rb") as source:
+                    content = source.read(entry["size"] + 1)
+                if len(content) != entry["size"]:
+                    raise ValueError("Stimulus manifest size mismatch.")
+
+                document = json.loads(content, object_pairs_hook=uniqueKeys)
+                if (
+                    not isinstance(document, dict)
+                    or document.get("formatName") != "pglImageDatabaseRun"
+                    or type(document.get("formatVersion")) is not int
+                    or document["formatVersion"] not in (1, 2)
+                    or not isinstance(document.get("stimuli"), list)
+                ):
+                    raise ValueError("Unsupported source stimulus manifest.")
+
+                sourceManifests[key] = document["stimuli"]
+
+            matches = [
+                record for record in sourceManifests[key]
+                if isinstance(record, dict)
+                and record.get("filename") == relativeName
+                and record.get("stimulusId") == stimulus.stimulusId
+            ]
+            if len(matches) != 1:
+                raise ValueError("Image backing lacks a unique matching saved stimulus record.")
+
+            record = matches[0]
+            if record.get("sha256") != reference["sha256"]:
+                raise ValueError("Stimulus manifest hash differs from checkpoint image identity.")
+
+            size = record.get("size")
+            mode = record.get("mode")
+            if (
+                not isinstance(size, list)
+                or len(size) != 2
+                or any(type(value) is not int or value <= 0 for value in size)
+                or mode not in ("L", "RGB", "RGBA")
+            ):
+                raise ValueError("Saved stimulus image geometry is invalid or unsupported.")
+
+            return reference, list(size), mode
+
+        # Collect reuse decisions before creating output. No image pixels are
+        # loaded by this pass, and each source stimulus manifest is read once.
+        for item in prepared:
+            item["reuse"] = reusableImage(item)
+
+        filesystem.makedirs(posixpath.join(destination, imageDirectory), exist_ok=False)
+        files = []
+        reusedFiles = {}
+        allocatedNames = {}
+
+        def writeBytes(logicalName, content):
+            """Write new staging bytes and verify their complete identity."""
+            path = posixpath.join(destination, logicalName)
+            identity = {"sha256": hashlib.sha256(content).hexdigest(), "size_bytes": len(content)}
+
+            with filesystem.open(path, "xb") as target:
+                if target.write(content) != len(content):
+                    raise OSError("Incomplete stimulus staging write.")
+
+            if pglStorage.hashFile(filesystem, path) != identity:
+                raise ValueError("Stimulus staging verification failed.")
+
+            return identity
+
+        for index, item in enumerate(prepared):
+            stimulus = item["stimulus"]
+            record = item["record"]
+            reuse = item["reuse"]
+
+            if progress is not None:
+                action = "Reusing" if reuse is not None else "Encoding"
+                progress(index / max(len(prepared), 1), f"{action} stimulus {index + 1}/{len(prepared)}")
+
+            imageBytes = None
+            if reuse is not None:
+                reference, size, mode = reuse
+                identity = {key: reference[key] for key in ("sha256", "size_bytes")}
+            else:
+                # Already materialized pixels may have been edited in place.
+                # Other source types use their established image loader.
+                img = stimulus.img
+                if img.mode not in ("L", "RGB", "RGBA"):
+                    raise ValueError(f"Cannot export image mode {img.mode!r} losslessly.")
+
+                with BytesIO() as buffer:
+                    img.save(buffer, format="PNG")
+                    imageBytes = buffer.getvalue()
+
+                size, mode = list(img.size), img.mode
+                identity = {"sha256": hashlib.sha256(imageBytes).hexdigest(), "size_bytes": len(imageBytes)}
+
+            preferredName = pglImageDatabase._getRunImageFilename(stimulus, record["stimulusNum"])
+            stem = posixpath.splitext(preferredName)[0]
+            candidate = preferredName
+            suffix = 2
+
+            # Keep portable case-insensitive names. Identical images with the
+            # same preferred name may share one logical payload.
+            while candidate.casefold() in allocatedNames:
+                existingName, existingIdentity = allocatedNames[candidate.casefold()]
+                if existingIdentity == identity:
+                    candidate = existingName
+                    break
+                candidate = f"{stem}_{suffix}.png"
+                suffix += 1
+
+            logicalName = posixpath.join(imageDirectory, candidate)
+
+            if candidate.casefold() not in allocatedNames:
+                allocatedNames[candidate.casefold()] = (candidate, dict(identity))
+
+                if reuse is not None:
+                    reusedFiles[logicalName] = deepcopy(reference)
+                elif writeBytes(logicalName, imageBytes) != identity:
+                    raise ValueError("Encoded stimulus identity changed during staging.")
+
+                files.append({"name": logicalName, **identity})
+
+            record.update({
+                "filename": f"images/{candidate}",
+                "sha256": identity["sha256"],
+                "size": size,
+                "mode": mode,
+            })
+
+        # Do not allow detected collection/metadata changes to publish a mixed
+        # snapshot. Pixel mutation during serialization remains unsupported.
+        currentStimuli = list(database.stimuli)
+        currentTrials = list(database.trials)
+        if (
+            len(currentStimuli) != len(stimuli)
+            or any(left is not right for left, right in zip(currentStimuli, stimuli))
+            or len(currentTrials) != len(trials)
+            or any(left is not right for left, right in zip(currentTrials, trials))
+            or database._runStarted != runStarted
+        ):
+            raise ValueError("Stimulus database changed during checkpoint staging.")
+
+        for record, (trial, originalStimulus) in zip(trialRecords, trialSnapshots):
+            current = {
+                "trialNum": trial.trialNum,
+                "trialId": trial.trialId,
+                "stimulusNum": trial.stimulusNum,
+                "status": trial.status,
+                "completedAt": trial.completedAt,
+                "metadata": trial.metadata,
+            }
+            if trial.stimulus is not originalStimulus or encode(current) != encode(record):
+                raise ValueError("Stimulus trial changed during checkpoint staging.")
+
+        for item in prepared:
+            stimulus = item["stimulus"]
+            current = {
+                "stimulusId": stimulus.stimulusId,
+                "name": stimulus.name,
+                "metadata": stimulus.metadata,
+                "caption": stimulus.caption,
+                "condition": stimulus.condition,
+                "conditionNum": stimulus.conditionNum,
+                "sourceInfo": stimulus.sourceInfo,
+                "filename": stimulus.filename,
+                "filesystemPrefix": stimulus.filesystemPrefix,
+            }
+            if stimulus.filesystem is not item["filesystem"] or encode(current) != item["snapshot"]:
+                raise ValueError("Stimulus metadata or source binding changed during staging.")
+
+            if item["reuse"] is not None and stimulus._img is not None:
+                raise ValueError("A reused stimulus was materialized during checkpoint staging.")
+            if item["initialImage"] is not None and stimulus._img is not item["initialImage"]:
+                raise ValueError("A materialized stimulus was replaced during staging.")
+
+        content = encode(manifest)
+        if len(content) > 16 * 1024 * 1024:
+            raise ValueError("Stimulus manifest exceeds the supported metadata limit.")
+
+        manifestName = posixpath.join(bundleName, "manifest.json")
+        files.append({"name": manifestName, **writeBytes(manifestName, content)})
+
+        if progress is not None:
+            progress(1, f"Stimuli staged: {len(reusedFiles)} reused PNG files")
+
+        return {
+            "directories": sorted([bundleName, imageDirectory]),
+            "files": sorted(files, key=lambda record: record["name"]),
+            "reusedFiles": reusedFiles,
+        }
+    
+    @classmethod
+    def _stageDerivedRunCheckpoint(cls, run, filesystem, destination, *, runPath, progress=None):
+        """Stage current behavioral contents without resolving reusable payloads.
+
+        destination:
+            Existing checkpoint staging directory.
+
+        runPath:
+            New logical run directory, for example runs/000000.
+
+        Pending checkpoint-backed scalar fields reuse their saved bytes.
+        Resolved fields serialize their current values.
+
+        Pending tasks:
+            Preserve individually loaded objects from _taskCache.
+            Reuse uncached checkpoint-backed task directories.
+            Resolve non-checkpoint tasks through their ordinary loader.
+
+        Loaded tasks:
+            Save current settings, state, data, and parameter bundles.
+            Stage stimulus metadata/images separately, avoiding saveRun()'s
+            unconditional image materialization.
+
+        Returns complete logical directories/files plus reusedFiles.
+        Reused payloads are intentionally absent from physical staging.
+
+        This is database publication staging, not a standalone export.
+        Does not query SQL, commit, or change the working run's source binding.
+
+        Concurrent mutation is unsupported. Detectable collection and pending
+        backing replacements are rejected. Existing component serializers may
+        initialize their ordinary metadata defaults.
+        """
+        from .pglExperiment import pglTaskBase
+        from .pglLazyLoad import pglFsspecBacking
+        from .pglSerialize import pglSerialize
+        from .pglSession import pglRun
+
+        if type(run) is not pglRun:
+            raise TypeError("Behavioral checkpoint staging requires an exact pglRun.")
+
+        if not isinstance(runPath, str) or re.fullmatch(r"runs/[0-9]{6}", runPath) is None:
+            raise ValueError("runPath must have the form runs/000000.")
+
+        if not filesystem.isdir(destination):
+            raise ValueError("Behavioral staging requires an existing checkpoint directory.")
+
+        runDestination = posixpath.join(destination, runPath)
+        if filesystem.exists(runDestination):
+            raise FileExistsError(runDestination)
+
+        directories = {"runs", runPath}
+        filesByName = {}
+        reusedFiles = {}
+        pendingChecks = []
+
+        def report(fraction, description):
+            if progress is not None: progress(fraction, description)
+
+        def validateRelativePath(path):
+            if (
+                not isinstance(path, str)
+                or not path
+                or path.startswith("/")
+                or "\\" in path
+                or "\x00" in path
+                or any(part in ("", ".", "..") for part in path.split("/"))
+            ):
+                raise ValueError(f"Invalid behavioral checkpoint path: {path!r}")
+
+        def addParents(name):
+            parent = posixpath.dirname(name)
+            while parent:
+                directories.add(parent)
+                parent = posixpath.dirname(parent)
+
+        def addFile(record, reference=None):
+            """Keep the logical inventory exact, including reused files."""
+            name = record["name"]
+            validateRelativePath(name)
+
+            if name in filesByName or name in directories:
+                raise ValueError(f"Duplicate or conflicting checkpoint file: {name!r}")
+
+            filesByName[name] = dict(record)
+            addParents(name)
+
+            if reference is not None:
+                expected = {key: record[key] for key in ("sha256", "size_bytes")}
+                if any(reference[key] != value for key, value in expected.items()):
+                    raise ValueError("Reuse reference differs from its logical file identity.")
+                reusedFiles[name] = deepcopy(reference)
+
+        def addReference(sourceFS, sourcePath, logicalName):
+            reference = sourceFS.getPublicationReference(sourcePath)
+            addFile({
+                "name": logicalName,
+                "sha256": reference["sha256"],
+                "size_bytes": reference["size_bytes"],
+            }, reference)
+
+        def inventoryWrittenDirectory(logicalRoot):
+            """Hash physical staging files only; reused files are added separately."""
+            fullRoot = posixpath.join(destination, logicalRoot)
+            directories.add(logicalRoot)
+
+            for current, directoryNames, fileNames in filesystem.walk(fullRoot, detail=False, on_error="raise"):
+                relativeRoot = posixpath.relpath(current, destination)
+                validateRelativePath(relativeRoot)
+
+                for name in directoryNames:
+                    logicalName = posixpath.join(relativeRoot, name)
+                    validateRelativePath(logicalName)
+                    directories.add(logicalName)
+
+                for name in fileNames:
+                    logicalName = posixpath.join(relativeRoot, name)
+                    addFile({
+                        "name": logicalName,
+                        **pglStorage.hashFile(filesystem, posixpath.join(current, name)),
+                    })
+
+        def reuseTaskDirectory(sourceFS, sourcePath, logicalRoot):
+            """Carry an unopened task inventory forward without payload reads."""
+            sourceRoot = sourceFS._logicalPath(sourcePath)
+            if sourceFS.info(sourceRoot)["type"] != "directory":
+                raise ValueError("Pending task backing is not a directory.")
+
+            # Match the required task layout before accepting subtree reuse.
+            for name in ("settings.json", "state.json", "data.json"):
+                if sourceFS.info(posixpath.join(sourceRoot, name))["type"] != "file":
+                    raise ValueError(f"Pending task is missing {name}.")
+
+            if sourceFS.info(posixpath.join(sourceRoot, "parameters"))["type"] != "directory":
+                raise ValueError("Pending task is missing its parameters directory.")
+
+            directories.add(logicalRoot)
+
+            # Checkpoint walk/info are inventory operations, not payload reads.
+            # Preserve ancillary files belonging to this unchanged task too.
+            for current, directoryNames, fileNames in sourceFS.walk(sourceRoot, detail=False, on_error="raise"):
+                relativeRoot = posixpath.relpath(current, sourceRoot)
+                targetRoot = logicalRoot if relativeRoot == "." else posixpath.join(logicalRoot, relativeRoot)
+                validateRelativePath(targetRoot)
+                directories.add(targetRoot)
+
+                for name in directoryNames:
+                    logicalName = posixpath.join(targetRoot, name)
+                    validateRelativePath(logicalName)
+                    directories.add(logicalName)
+
+                for name in fileNames:
+                    addReference(
+                        sourceFS,
+                        posixpath.join(current, name),
+                        posixpath.join(targetRoot, name),
+                    )
+
+        report(0, "Preparing current behavioral metadata")
+
+        # Task names define the current bundle layout. Resolving this small
+        # metadata object does not load task contents or stimulus pixels.
+        experimentSettings = run.experimentSettings
+        if experimentSettings is None:
+            raise ValueError("Cannot save run without experiment settings.")
+
+        taskNames = list(experimentSettings.tasks)
+        taskDirectories = [
+            pglTaskBase.getTaskDirectoryName(taskID=index, taskName=name)
+            for index, name in enumerate(taskNames)
+        ]
+
+        for name in taskDirectories:
+            validateRelativePath(name)
+            if "/" in name:
+                raise ValueError("Task directory names must be single path components.")
+
+        if len(set(taskDirectories)) != len(taskDirectories):
+            raise ValueError("Task directory names must be unique.")
+
+        components = {"experimentSettings": experimentSettings}
+        componentReferences = {}
+
+        for name in ("settings", "data"):
+            if run.lazyIsPending(name):
+                backing = run._lazyRuntime().pending[name]
+
+                if isinstance(backing, pglFsspecBacking) and isinstance(backing.fs, pglCheckpointFilesystem):
+                    componentReferences[name] = (backing.fs, backing.path)
+                    pendingChecks.append((name, backing))
+                    continue
+
+            # Assignment cancels pending backing. A resolved/assigned value,
+            # including an explicit None, must not be replaced by old bytes.
+            component = getattr(run, name)
+            if component is None:
+                raise ValueError(f"Cannot save run: missing {name}.")
+            components[name] = component
+
+        # Match existing saveDerivedRun() semantics: state is not lazy-bound.
+        # None means use the saved source state, without installing it on run.
+        state = run.state
+        stateSourceFS = run.filesystem
+        stateSourceRoot = run.fullDataPath
+
+        if state is not None:
+            components["state"] = state
+        else:
+            if stateSourceFS is None or not stateSourceRoot:
+                raise ValueError("Cannot save run: state is missing and there is no source.")
+
+            statePath = posixpath.join(stateSourceRoot, "state.json")
+            if isinstance(stateSourceFS, pglCheckpointFilesystem):
+                componentReferences["state"] = (stateSourceFS, statePath)
+            else:
+                with stateSourceFS.open(statePath, "rb") as source:
+                    restoredState = pglSerialize.fromJSON(source.read(), filename=statePath)
+
+                if restoredState is None:
+                    raise ValueError("Cannot restore source experiment state for export.")
+                components["state"] = restoredState
+
+        for name, component in components.items():
+            if not callable(getattr(component, "saveStrict", None)):
+                raise TypeError(f"Run component {name!r} has no saveStrict() method.")
+
+        tasksPending = run.lazyIsPending("tasks")
+        taskBacking = run._lazyRuntime().pending["tasks"] if tasksPending else None
+        taskPlans = []
+
+        if tasksPending:
+            if not isinstance(taskBacking, pglFsspecBacking):
+                raise TypeError("Pending behavioral tasks require pglFsspecBacking.")
+
+            pendingChecks.append(("tasks", taskBacking))
+
+            # getTaskAt() maps current task names to the backing directory.
+            # Verify that mapping before treating uncached tasks as unchanged.
+            settingsPath = posixpath.join(taskBacking.path, "experimentSettings.json")
+
+            if isinstance(taskBacking.fs, pglCheckpointFilesystem):
+                entry = taskBacking.fs.info(settingsPath)
+                if entry["type"] != "file" or not 0 <= entry["size"] <= 16 * 1024 * 1024:
+                    raise ValueError("Source experiment settings exceed the metadata limit.")
+
+            with taskBacking.fs.open(settingsPath, "rb") as source:
+                content = source.read(16 * 1024 * 1024 + 1)
+
+            if len(content) > 16 * 1024 * 1024:
+                raise ValueError("Source experiment settings exceed the metadata limit.")
+
+            savedSettings = json.loads(content)
+            if not isinstance(savedSettings, dict) or savedSettings.get("tasks") != taskNames:
+                raise ValueError(
+                    "Task names changed while the task collection remains pending. "
+                    "Resolve the original task collection before changing its layout."
+                )
+
+            cachedTasks = dict(run._taskCache)
+            if any(type(index) is not int or not 0 <= index < len(taskNames) for index in cachedTasks):
+                raise ValueError("Individual task cache contains an invalid index.")
+
+            for index, taskDirectory in enumerate(taskDirectories):
+                if index in cachedTasks:
+                    taskPlans.append(("working", cachedTasks[index]))
+                elif isinstance(taskBacking.fs, pglCheckpointFilesystem):
+                    sourcePath = posixpath.join(taskBacking.path, taskDirectory)
+                    taskPlans.append(("reuse", sourcePath))
+                else:
+                    # Ordinary source files lack registered immutable identities.
+                    # Preserve existing loading/export behavior for those tasks.
+                    taskPlans.append(("working", run.getTaskAt(index)))
+
+            # Include tasks loaded above when checking for subsequent replacement.
+            cachedTasks = dict(run._taskCache)
+            resolvedTasks = None
+        else:
+            values = run._trait_values.get("tasks")
+            if values is None:
+                raise ValueError("Cannot save run: tasks are missing.")
+
+            resolvedTasks = list(values)
+            cachedTasks = None
+            if len(resolvedTasks) != len(taskNames):
+                raise ValueError("Task count differs from current experiment settings.")
+
+            taskPlans = [("working", task) for task in resolvedTasks]
+
+        # Validate working task layout before creating output.
+        for index, (kind, value) in enumerate(taskPlans):
+            if kind == "reuse": continue
+
+            task = value
+            if task is None:
+                raise ValueError(f"Task {index} is missing.")
+
+            if task._getTaskDirectoryName() != taskDirectories[index]:
+                raise ValueError(f"Task {index} directory differs from current experiment settings.")
+
+            for name in ("settings", "state", "data"):
+                component = getattr(task, name, None)
+                if component is None or not callable(getattr(component, "saveStrict", None)):
+                    raise ValueError(f"Task {index} lacks a persistable {name} component.")
+
+            for parameter in task.parameters:
+                if not callable(getattr(parameter, "saveBundleStrict", None)):
+                    raise TypeError(f"Task {index} contains an unsupported parameter bundle.")
+
+        filesystem.makedirs(runDestination, exist_ok=False)
+
+        report(0.05, "Staging run settings, state, and behavioral data")
+
+        for name in ("experimentSettings", "settings", "state", "data"):
+            logicalName = posixpath.join(runPath, f"{name}.json")
+
+            if name in componentReferences:
+                sourceFS, sourcePath = componentReferences[name]
+                addReference(sourceFS, sourcePath, logicalName)
+            else:
+                path = posixpath.join(destination, logicalName)
+                components[name].saveStrict(filename=path, filesystem=filesystem)
+                addFile({"name": logicalName, **pglStorage.hashFile(filesystem, path)})
+
+        for index, (kind, value) in enumerate(taskPlans):
+            logicalTask = posixpath.join(runPath, taskDirectories[index])
+            start = 0.1 + 0.85 * index / max(len(taskPlans), 1)
+            end = 0.1 + 0.85 * (index + 1) / max(len(taskPlans), 1)
+            taskProgress = progress.section(start, end) if progress is not None else None
+
+            if kind == "reuse":
+                if taskProgress is not None:
+                    taskProgress(0, f"Reusing unopened task {index + 1}/{len(taskPlans)}")
+
+                reuseTaskDirectory(taskBacking.fs, value, logicalTask)
+
+                if taskProgress is not None:
+                    taskProgress(1, "Task inventory reused without payload reads")
+                continue
+
+            task = value
+            taskDestination = posixpath.join(destination, logicalTask)
+            filesystem.makedirs(taskDestination, exist_ok=False)
+
+            if taskProgress is not None:
+                taskProgress(0, f"Saving current task metadata {index + 1}/{len(taskPlans)}")
+
+            # Do not call saveBundleStrict(): its stimulus export resolves img.
+            for name in ("settings", "state", "data"):
+                getattr(task, name).saveStrict(
+                    filename=posixpath.join(taskDestination, f"{name}.json"),
+                    filesystem=filesystem,
+                )
+
+            parameterPath = posixpath.join(taskDestination, "parameters")
+            filesystem.makedirs(parameterPath, exist_ok=False)
+
+            for parameter in list(task.parameters):
+                parameter.saveBundleStrict(dataPath=parameterPath, filesystem=filesystem)
+
+            # Inventory metadata/parameters before the stimulus helper adds its
+            # own mixed physical/reference inventory.
+            inventoryWrittenDirectory(logicalTask)
+
+            stimulusDatabase = task.stimulusDatabase
+            if stimulusDatabase is not None:
+                stimulusProgress = taskProgress.section(0.2, 1) if taskProgress is not None else None
+                parts = cls._stageDerivedStimuliCheckpoint(
+                    stimulusDatabase,
+                    filesystem,
+                    destination,
+                    taskPath=logicalTask,
+                    progress=stimulusProgress,
+                )
+
+                directories.update(parts["directories"])
+                for record in parts["files"]:
+                    addFile(record, parts["reusedFiles"].get(record["name"]))
+
+            elif taskProgress is not None:
+                # Explicitly cleared stimuli stay absent. Do not restore them
+                # from the source task merely because saved files exist there.
+                taskProgress(1, "Task metadata staged; no stimulus database attached")
+
+        report(0.97, "Checking behavioral staging consistency")
+
+        if run.experimentSettings is not experimentSettings or list(experimentSettings.tasks) != taskNames:
+            raise ValueError("Experiment settings or task layout changed during staging.")
+
+        for name, backing in pendingChecks:
+            if not run.lazyIsPending(name) or run._lazyRuntime().pending[name] is not backing:
+                raise ValueError(f"Pending run field {name!r} changed during staging.")
+
+        for name in ("settings", "data"):
+            if name in components and getattr(run, name) is not components[name]:
+                raise ValueError(f"Run component {name!r} was replaced during staging.")
+
+        if run.state is not state:
+            raise ValueError("Run state was replaced during staging.")
+
+        if state is None and (run.filesystem is not stateSourceFS or run.fullDataPath != stateSourceRoot):
+            raise ValueError("Run state source binding changed during staging.")
+
+        if tasksPending:
+            currentCache = dict(run._taskCache)
+            if set(currentCache) != set(cachedTasks) or any(currentCache[index] is not task for index, task in cachedTasks.items()):
+                raise ValueError("Individual task cache changed during staging.")
+        else:
+            current = run._trait_values.get("tasks")
+            if current is None or len(current) != len(resolvedTasks) or any(left is not right for left, right in zip(current, resolvedTasks)):
+                raise ValueError("Task collection changed during staging.")
+
+        if set(filesByName).intersection(directories):
+            raise ValueError("Behavioral staging contains conflicting file and directory paths.")
+
+        report(1, f"Behavioral run staged: {len(reusedFiles)} existing file references")
+
+        return {
+            "directories": sorted(directories),
+            "files": [filesByName[name] for name in sorted(filesByName)],
+            "reusedFiles": reusedFiles,
+        }
+        
+    @classmethod
+    def _stageDerivedFilesCheckpoint(cls, session, filesystem, destination, *, progress=None):
+        """Stage new attachments and reference existing checkpoint payloads.
+
+        Restored checkpoint attachments:
+            Require matching attachment/backing metadata.
+            Check identity against the checkpoint inventory.
+            Reuse registered bytes without calling getDerivedFile().
+
+        Local or other supported attachments:
+            Resolve and verify using getDerivedFile().
+            Copy into staging with complete byte verification.
+
+        Returns:
+            derivedFiles: Portable attachment descriptors.
+            directories: Complete logical attachment directories.
+            files: Complete logical file identities.
+            reusedFiles: Existing checkpoint references indexed by NEW path.
+
+        Reused files are deliberately absent from physical staging.
+        This is not a standalone export. The publication coordinator must
+        resolve references and attach every declared file.
+
+        Does not query SQL, publish a checkpoint, or change attachments.
+        Local paths and runtime filesystem handles never enter the manifest.
+        Concurrent mutation is unsupported; detectable metadata/backing
+        replacements are rejected.
+        """
+        from copy import deepcopy
+
+        from fsspec.implementations.local import LocalFileSystem
+
+        if not isinstance(session.derivedFiles, dict):
+            raise TypeError("session.derivedFiles must be a dictionary.")
+
+        if not filesystem.isdir(destination):
+            raise ValueError("Attachment staging requires an existing checkpoint directory.")
+
+        attachments = deepcopy(session.derivedFiles)
+
+        if not attachments:
+            if progress is not None: progress(1, "No derived attachments")
+            return {"derivedFiles": [], "directories": [], "files": [], "reusedFiles": {}}
+
+        derivedRoot = posixpath.join(destination, "derived")
+        if filesystem.exists(derivedRoot):
+            raise FileExistsError(derivedRoot)
+
+        for name in attachments:
+            if (
+                not isinstance(name, str)
+                or not name.strip()
+                or any(character in name for character in ("\x00", "\n", "\r"))
+            ):
+                raise ValueError("Derived-file names must be nonblank strings without NUL or newlines.")
+
+        prepared = []
+        descriptors = []
+        directories = {"derived"}
+        runCount = len(session.runs or [])
+
+        if progress is not None: progress(0, "Validating derived attachment references")
+
+        for index, name in enumerate(sorted(attachments)):
+            attachment = attachments[name]
+            required = {"version", "runIndex", "filename", "mediaType", "sha256", "size_bytes"}
+
+            if (
+                not isinstance(attachment, dict)
+                or not required.issubset(attachment)
+                or set(attachment) - required - {"localPath"}
+                or type(attachment["version"]) is not int
+                or attachment["version"] != 1
+            ):
+                raise ValueError(f"Invalid derived-file attachment: {name!r}")
+
+            runIndex = attachment["runIndex"]
+            if runIndex is not None and (type(runIndex) is not int or not 0 <= runIndex < runCount):
+                raise ValueError(f"Invalid behavioral run association for {name!r}.")
+
+            filename = attachment["filename"]
+            if (
+                not isinstance(filename, str)
+                or not filename.strip()
+                or filename in (".", "..")
+                or any(character in filename for character in ("/", "\\", "\x00", "\n", "\r"))
+            ):
+                raise ValueError("Derived filename must be a single safe filename.")
+
+            mediaType = attachment["mediaType"]
+            if (
+                not isinstance(mediaType, str)
+                or not mediaType.strip()
+                or any(character in mediaType for character in ("\x00", "\n", "\r"))
+            ):
+                raise ValueError("Derived mediaType must be a nonblank string without NUL or newlines.")
+
+            digest = attachment["sha256"]
+            size = attachment["size_bytes"]
+            if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                raise ValueError(f"Invalid derived-file SHA-256 for {name!r}.")
+            if type(size) is not int or not 0 <= size <= 9223372036854775807:
+                raise ValueError(f"Invalid derived-file size for {name!r}.")
+
+            relativeRoot = f"derived/f{index:06d}"
+            logicalName = posixpath.join(relativeRoot, filename)
+            directories.add(relativeRoot)
+
+            descriptors.append({
+                "name": name,
+                "runIndex": runIndex,
+                "filename": filename,
+                "mediaType": mediaType,
+                "path": logicalName,
+            })
+
+            item = {
+                "name": name,
+                "path": logicalName,
+                "identity": {"sha256": digest, "size_bytes": size},
+                "reference": None,
+                "backing": None,
+                "source": None,
+            }
+
+            if "localPath" in attachment:
+                localPath = attachment["localPath"]
+                if not isinstance(localPath, str) or not localPath:
+                    raise ValueError(f"Invalid local attachment path for {name!r}.")
+            else:
+                backing = getattr(session, "_derivedFileBackings", {}).get(name)
+                if not isinstance(backing, dict) or backing.get("attachment") != attachment:
+                    raise ValueError(f"Attachment {name!r} has no matching saved backing.")
+
+                sourceFS = backing.get("filesystem")
+                sourcePath = backing.get("path")
+                if not isinstance(sourcePath, str) or not sourcePath:
+                    raise ValueError(f"Attachment {name!r} has an invalid backing path.")
+
+                item.update({
+                    "backing": backing,
+                    "backingFilesystem": sourceFS,
+                    "backingPath": sourcePath,
+                })
+
+                if isinstance(sourceFS, pglCheckpointFilesystem):
+                    reference = sourceFS.getPublicationReference(sourcePath)
+                    if any(reference[key] != value for key, value in item["identity"].items()):
+                        raise ValueError(f"Attachment {name!r} differs from its checkpoint payload identity.")
+
+                    item["reference"] = reference
+
+            prepared.append(item)
+
+        def requireUnchanged():
+            """Validate attachment metadata and captured backing bindings."""
+            if session.derivedFiles != attachments:
+                raise ValueError("Derived attachments changed during checkpoint staging.")
+
+            if len(session.runs or []) != runCount:
+                raise ValueError("Behavioral run collection size changed during attachment staging.")
+
+            currentBackings = getattr(session, "_derivedFileBackings", {})
+
+            for item in prepared:
+                backing = item["backing"]
+                if backing is None: continue
+
+                if (
+                    currentBackings.get(item["name"]) is not backing
+                    or backing.get("attachment") != attachments[item["name"]]
+                    or backing.get("filesystem") is not item["backingFilesystem"]
+                    or backing.get("path") != item["backingPath"]
+                ):
+                    raise ValueError("Derived attachment backing changed during checkpoint staging.")
+
+        requireUnchanged()
+
+        # Verify non-reusable sources before creating the attachment directory.
+        # Checkpoint-backed attachments never enter this retrieval path.
+        for item in prepared:
+            if item["reference"] is not None: continue
+
+            if progress is not None:
+                progress(None, f"Verifying attachment source: {item['name']}")
+
+            source = session.getDerivedFile(item["name"])
+            if source is None:
+                raise ValueError(f"Derived attachment disappeared: {item['name']!r}")
+
+            item["source"] = Path(source)
+
+        requireUnchanged()
+        filesystem.makedirs(derivedRoot, exist_ok=False)
+
+        files = []
+        reusedFiles = {}
+        localFS = LocalFileSystem(skip_instance_cache=True)
+
+        # Reused payloads require only metadata work. Weight actual transfers
+        # by bytes without letting large reused files dominate the estimate.
+        workRecords = [
+            {
+                "name": item["name"],
+                "size_bytes": 1 if item["reference"] is not None else max(1, item["identity"]["size_bytes"]),
+                "item": item,
+            }
+            for item in prepared
+        ]
+        fileRange = progress.section(0.1, 1) if progress is not None else None
+
+        for work, fileProgress in pglProgress.fileSections(workRecords, fileRange):
+            requireUnchanged()
+            item = work["item"]
+            logicalName = item["path"]
+            identity = item["identity"]
+
+            if item["reference"] is not None:
+                # Preserve the logical directory without creating or copying
+                # a physical payload. Registration will attach existing content.
+                reusedFiles[logicalName] = deepcopy(item["reference"])
+                if fileProgress is not None:
+                    fileProgress(1, "Reusing saved attachment without payload access")
+            else:
+                filesystem.makedirs(
+                    posixpath.dirname(posixpath.join(destination, logicalName)),
+                    exist_ok=False,
+                )
+
+                stored = pglStorage.copyVerifiedFile(
+                    localFS,
+                    str(item["source"]),
+                    filesystem,
+                    destination,
+                    {"name": logicalName, **identity},
+                    objectKey=logicalName,
+                    progress=fileProgress,
+                )
+
+                if any(stored[key] != value for key, value in identity.items()):
+                    raise ValueError("Staged attachment identity differs from its registered working identity.")
+
+            files.append({"name": logicalName, **identity})
+
+        requireUnchanged()
+
+        if progress is not None:
+            progress(1, f"Attachments staged: {len(reusedFiles)} reused, {len(files) - len(reusedFiles)} copied")
+
+        return {
+            "derivedFiles": descriptors,
+            "directories": sorted(directories),
+            "files": sorted(files, key=lambda record: record["name"]),
+            "reusedFiles": reusedFiles,
+        }
+        
+    @classmethod
+    def _stageDerivedSessionCheckpoint(cls, session, filesystem, destination, *, productRecords, progress=None):
+        """Stage a complete logical checkpoint with selective physical export.
+
+        destination:
+            Fresh checkpoint staging directory; must not already exist.
+
+        productRecords:
+            Named matrix revisions already prepared by the publication
+            coordinator. Must exactly match current matrix attachment names.
+
+        Returns:
+            destination: Physical staging directory.
+            manifest: Complete logical checkpoint manifest.
+            reusedFiles: Existing checkpoint references indexed by logical path.
+
+        Every manifest file is represented exactly once:
+            A physical staged file, or an existing checkpoint reference.
+
+        Reused payloads are not copied into staging.
+        The outer manifest and history are always written for this publication.
+
+        Behavioral contents, stimuli, MRI acquisitions, and derived attachments
+        use selective staging. MNE retains the existing full bundle exporter.
+        Matrix arrays are published separately by the caller.
+
+        Does not query SQL, register file links, commit, or update session
+        checkpoint bookkeeping. This is not a standalone bundle export.
+
+        Concurrent mutation is unsupported. Detectable collection, annotation,
+        attachment, and history changes are rejected. The caller additionally
+        owns publication-time validation and transaction cleanup.
+        """
+        from copy import deepcopy
+
+        from .pglMRI import pglMRI
+        from .pglSession import pglMNE
+        from .pglStorage import pglStorage
+
+        pglStorage.requireSafeSave(session)
+
+        if not isinstance(destination, str) or not destination.strip():
+            raise ValueError("A nonempty checkpoint staging path is required.")
+        if filesystem.exists(destination):
+            raise FileExistsError(destination)
+
+        runs = list(session.runs or [])
+        mneData = session.mne
+        mriData = session.mri
+        hasMNE = mneData is not None
+        hasMRI = mriData is not None
+
+        if hasMNE and hasMRI:
+            raise ValueError("Combined MRI/MNE checkpoints remain unsupported.")
+        if hasMNE and type(mneData) is not pglMNE:
+            raise TypeError("MNE checkpoint staging requires an exact pglMNE.")
+        if hasMRI and (type(mriData) is not pglMRI or not mriData.scans):
+            raise ValueError("MRI checkpoint staging requires a nonempty pglMRI.")
+        if not runs and not hasMNE and not hasMRI:
+            raise ValueError("A checkpoint must contain behavioral, MRI, or MNE contents.")
+
+        products = cls._snapshotSessionMatrices(session)
+        validatedProducts = cls._validateSessionProductRecords(productRecords)
+
+        if {record["name"] for record in validatedProducts} != set(products):
+            raise ValueError("Matrix revision references must exactly match current attachments.")
+
+        if not isinstance(session.derivedFiles, dict):
+            raise TypeError("session.derivedFiles must be a dictionary.")
+
+        derivedSnapshot = deepcopy(session.derivedFiles)
+        correspondenceSnapshot = deepcopy(session.scanRunCorrespondence)
+
+        # Capture history before any staging. Correspondence validation may read
+        # behavioral data.json, but does not open stimulus or MRI payloads.
+        historyBytes = cls._sessionHistoryBytes(session, acquisition=False)
+
+        scans = list(mriData.scans) if hasMRI else []
+        scanSnapshots = [
+            {
+                "uuid": scan.uuid,
+                "name": scan.name,
+                "sourceMetadata": scan._copyMetadata(scan.sourceMetadata),
+                "metadata": scan._copyMetadata(scan.metadata),
+                "backing": scan._backing,
+                "backingFilesystem": None if scan._backing is None else scan._backing.fs,
+                "backingPath": None if scan._backing is None else scan._backing.path,
+                "expectedIdentity": None if scan._backing is None else scan._backing.expectedIdentity,
+                "localPath": scan.localPath,
+            }
+            for scan in scans
+        ]
+
+        def report(fraction, description):
+            if progress is not None: progress(fraction, description)
+
+        def requireUnchanged():
+            """Check working structure without resolving scientific payloads."""
+            pglStorage.requireSafeSave(session)
+            cls._requireSessionMatricesUnchanged(session, products)
+
+            currentRuns = list(session.runs or [])
+            if len(currentRuns) != len(runs) or any(left is not right for left, right in zip(currentRuns, runs)):
+                raise ValueError("Behavioral run collection changed during checkpoint staging.")
+
+            if session.mne is not mneData or session.mri is not mriData:
+                raise ValueError("Session modality collection changed during checkpoint staging.")
+            if session.derivedFiles != derivedSnapshot:
+                raise ValueError("Derived attachments changed during checkpoint staging.")
+            if session.scanRunCorrespondence != correspondenceSnapshot:
+                raise ValueError("Scan/run correspondence changed during checkpoint staging.")
+
+            if hasMRI:
+                currentScans = list(mriData.scans)
+                if len(currentScans) != len(scans) or any(left is not right for left, right in zip(currentScans, scans)):
+                    raise ValueError("MRI scan collection changed during checkpoint staging.")
+
+                for scan, snapshot in zip(scans, scanSnapshots):
+                    if (
+                        scan.uuid != snapshot["uuid"]
+                        or scan.name != snapshot["name"]
+                        or scan.sourceMetadata != snapshot["sourceMetadata"]
+                        or scan.metadata != snapshot["metadata"]
+                        or scan._backing is not snapshot["backing"]
+                        or scan.localPath != snapshot["localPath"]
+                    ):
+                        raise ValueError("MRI metadata or source binding changed during checkpoint staging.")
+
+                    backing = scan._backing
+                    if backing is not None and (
+                        backing.fs is not snapshot["backingFilesystem"]
+                        or backing.path != snapshot["backingPath"]
+                        or backing.expectedIdentity != snapshot["expectedIdentity"]
+                    ):
+                        raise ValueError("MRI acquisition backing changed during checkpoint staging.")
+
+        directories = set()
+        filesByName = {}
+        reusedFiles = {}
+        runRecords = []
+
+        def addParts(parts):
+            """Merge disjoint component inventories without hiding duplicates."""
+            incomingFiles = parts["files"]
+            incomingReferences = parts.get("reusedFiles", {})
+            incomingNames = [record["name"] for record in incomingFiles]
+
+            if len(set(incomingNames)) != len(incomingNames):
+                raise ValueError("A staging component returned duplicate filenames.")
+            if set(incomingReferences) - set(incomingNames):
+                raise ValueError("A reuse reference has no matching logical file.")
+
+            directories.update(parts["directories"])
+
+            for record in incomingFiles:
+                name = record["name"]
+                if name in filesByName:
+                    raise ValueError(f"Duplicate staged checkpoint filename: {name!r}")
+
+                filesByName[name] = dict(record)
+
+                if name in incomingReferences:
+                    reference = incomingReferences[name]
+                    if any(reference[key] != record[key] for key in ("sha256", "size_bytes")):
+                        raise ValueError("Reused content differs from its manifest identity.")
+                    reusedFiles[name] = deepcopy(reference)
+
+        def inventoryPhysicalDirectory(relativeRoot):
+            """Inventory an ordinary exported bundle, currently used for MNE."""
+            componentDirectories = {relativeRoot}
+            componentFiles = []
+            fullRoot = posixpath.join(destination, relativeRoot)
+
+            for current, directoryNames, fileNames in filesystem.walk(fullRoot, detail=False, on_error="raise"):
+                logicalRoot = posixpath.relpath(current, destination)
+
+                for name in directoryNames:
+                    componentDirectories.add(posixpath.join(logicalRoot, name))
+
+                for name in fileNames:
+                    componentFiles.append({
+                        "name": posixpath.join(logicalRoot, name),
+                        **pglStorage.hashFile(filesystem, posixpath.join(current, name)),
+                    })
+
+            return {
+                "directories": sorted(componentDirectories),
+                "files": componentFiles,
+                "reusedFiles": {},
+            }
+
+        requireUnchanged()
+        filesystem.makedirs(destination, exist_ok=False)
+
+        ################################################################
+        # Stage behavioral metadata and selective task/stimulus contents
+        ################################################################
+        for index, run in enumerate(runs):
+            start = 0.55 * index / len(runs)
+            end = 0.55 * (index + 1) / len(runs)
+            runProgress = progress.section(start, end) if progress is not None else None
+            runPath = f"runs/{index:06d}"
+
+            report(start, f"Staging behavioral run {index + 1}/{len(runs)}")
+            parts = cls._stageDerivedRunCheckpoint(
+                run,
+                filesystem,
+                destination,
+                runPath=runPath,
+                progress=runProgress,
+            )
+            addParts(parts)
+            runRecords.append({"index": index, "path": runPath})
+
+        ################################################################
+        # Stage modality metadata and acquisition contents
+        ################################################################
+        if hasMRI:
+            report(0.55, "Staging MRI annotations and acquisition references")
+            addParts(cls._stageDerivedMRICheckpoint(
+                mriData,
+                filesystem,
+                destination,
+                progress=progress.section(0.55, 0.80) if progress is not None else None,
+            ))
+
+        elif hasMNE:
+            # Explicit compatibility path. This still resolves/exports MNE
+            # fields; do not claim that MNE payload reuse is implemented here.
+            report(0.55, "Exporting MNE bundle using the existing full-export path")
+            mneData.saveBundle(posixpath.join(destination, "mne"), filesystem=filesystem)
+            addParts(inventoryPhysicalDirectory("mne"))
+
+        ################################################################
+        # Stage new attachments and reuse saved attachment references
+        ################################################################
+        requireUnchanged()
+        derivedParts = cls._stageDerivedFilesCheckpoint(
+            session,
+            filesystem,
+            destination,
+            progress=progress.section(0.80, 0.92) if progress is not None else None,
+        )
+        addParts(derivedParts)
+
+        ################################################################
+        # Write current history independently of reused scientific payloads
+        ################################################################
+        report(0.92, "Writing current checkpoint history")
+        historyPath = posixpath.join(destination, "history.json")
+
+        with filesystem.open(historyPath, "xb") as target:
+            if target.write(historyBytes) != len(historyBytes):
+                raise OSError("Incomplete checkpoint history write.")
+
+        historyIdentity = {
+            "sha256": hashlib.sha256(historyBytes).hexdigest(),
+            "size_bytes": len(historyBytes),
+        }
+        if pglStorage.hashFile(filesystem, historyPath) != historyIdentity:
+            raise ValueError("Staged checkpoint history verification failed.")
+
+        addParts({
+            "directories": [],
+            "files": [{"name": "history.json", **historyIdentity}],
+            "reusedFiles": {},
+        })
+
+        ################################################################
+        # Preserve existing manifest contracts and logical layouts
+        ################################################################
+        if hasMRI:
+            contractVersion = "pgl.derived.mri.v1"
+        elif derivedParts["derivedFiles"]:
+            contractVersion = "pgl.derived.session.v3" if hasMNE else "pgl.derived.behavior.v3"
+        else:
+            contractVersion = "pgl.derived.session.v2" if hasMNE else "pgl.derived.behavior.v2"
+
+        manifest = {
+            "contract_version": contractVersion,
+            "runs": runRecords,
+            "directories": sorted(directories),
+            "files": [filesByName[name] for name in sorted(filesByName)],
+            "products": validatedProducts,
+        }
+
+        if hasMNE: manifest["mne"] = {"path": "mne"}
+        if hasMRI: manifest["mri"] = {"path": "mri"}
+        if hasMRI or derivedParts["derivedFiles"]:
+            manifest["derivedFiles"] = derivedParts["derivedFiles"]
+
+        cls.validateDerivedManifest(manifest)
+
+        ################################################################
+        # Verify generated descriptors and behavioral labels
+        ################################################################
+        class StagingView:
+            """Expose only physically staged files by logical name."""
+
+            def open(self, path, mode="rb", **kwargs):
+                if path in reusedFiles:
+                    raise ValueError(f"Staging validation unexpectedly requested reused payload bytes: {path!r}")
+                return filesystem.open(posixpath.join(destination, path), mode=mode, **kwargs)
+
+        view = StagingView()
+        restoredHistory, labels = cls._readSessionHistory(view, len(runs))
+
+        # Run staging always writes current experimentSettings.json.
+        if runs and labels != cls._behaviorLabelMetadata(manifest, view):
+            raise ValueError("History labels differ from staged behavioral settings.")
+
+        if hasMNE: cls._verifyMNEInventory(manifest, view)
+        mriDescriptor = cls._verifyMRIInventory(manifest, view) if hasMRI else None
+
+        savedCorrespondence = getattr(restoredHistory, "_checkpointScanRunCorrespondence", None)
+        if savedCorrespondence != correspondenceSnapshot:
+            raise ValueError("Staged correspondence differs from the working record.")
+
+        if savedCorrespondence is not None and savedCorrespondence["pairs"]:
+            if mriDescriptor is None:
+                raise ValueError("Nonempty scan/run correspondence requires MRI acquisitions.")
+
+            scanIDs = [record["uuid"] for record in mriDescriptor["scans"]]
+            behaviorIDs = []
+
+            # History preparation resolves run.data when validating nonempty
+            # correspondence. Therefore these current data files were written
+            # by run staging, not silently carried forward as pending bytes.
+            for record in runRecords:
+                path = posixpath.join(record["path"], "data.json")
+                with view.open(path, "rt", encoding="utf-8") as source:
+                    document = json.load(source)
+
+                if not isinstance(document, dict):
+                    raise ValueError("Staged behavioral data must contain an object.")
+                behaviorIDs.append(document.get("uuid"))
+
+            for pair in savedCorrespondence["pairs"]:
+                if scanIDs.count(pair["scanUUID"]) != 1:
+                    raise ValueError("Matched MRI acquisition is absent or ambiguous in staged metadata.")
+                if behaviorIDs.count(pair["behaviorDataUUID"]) != 1:
+                    raise ValueError("Matched behavioral acquisition is absent or ambiguous in staged metadata.")
+
+        ################################################################
+        # Ensure every file is either staged or reused, never both/neither
+        ################################################################
+        report(0.97, "Checking complete physical/reference inventory")
+        physicalNames = set()
+
+        for current, _, fileNames in filesystem.walk(destination, detail=False, on_error="raise"):
+            for name in fileNames:
+                physicalNames.add(posixpath.relpath(posixpath.join(current, name), destination))
+
+        expectedPhysical = set(filesByName) - set(reusedFiles)
+        if physicalNames != expectedPhysical:
+            raise ValueError("Physical staging files do not exactly match the non-reused manifest inventory.")
+
+        requireUnchanged()
+        if cls._sessionHistoryBytes(session, acquisition=False) != historyBytes:
+            raise ValueError("Session history or labels changed during checkpoint staging.")
+
+        # Write the outer manifest last. It describes the complete logical
+        # checkpoint, not a self-contained copy of the temporary directory.
+        cls.stageDerivedManifest(manifest, filesystem, destination)
+
+        report(1, f"Checkpoint staged: {len(expectedPhysical)} physical files, {len(reusedFiles)} reused references")
+
+        return {
+            "destination": destination,
+            "manifest": manifest,
+            "reusedFiles": reusedFiles,
+        }
+    
     # ++++++++++++++++++++++++++ stageDerivedManifest +++++++++++++++++++++++++
     # Direct callers in this module: saveDerivedSessionFiles.
     @classmethod
@@ -7977,6 +9959,367 @@ class pglDatabase:
                             raise ValueError(f"Checkpoint file has no declared owner: {name!r}")
 
                         registerPayload(name, record, role=payloadRole, subjectID=subjectsByRun[runPath], fileProgress=fileProgress)
+
+        return sessionID
+    
+    @classmethod
+    def _registerMixedDerivedSessionFiles(cls, connection, postgres, sessionID, backendID, manifest, *, objectPrefix, reusedFiles, accessContext, progress=None):
+        """Register a derived checkpoint containing new and reused payloads.
+
+        reusedFiles:
+            Mapping of logical filenames to records returned by
+            _resolveCheckpointFileReuse():
+                fileID, sha256, size_bytes
+
+            The caller must resolve these records in this same outer
+            transaction, before publication writes or checkpoint row locks.
+            Its dependency/content/location locks must remain held.
+
+        New files:
+            Must already exist under backendID/objectPrefix.
+            Verify their bytes before registering locations and file links.
+
+        Reused files:
+            Recheck catalog identity and eligibility.
+            Attach existing file IDs without reading payload bytes or
+            refreshing storage verification timestamps.
+
+        Descriptor/history validation uses a mixed checkpoint filesystem.
+        Those small metadata files may be read; reused scientific payloads
+        are not opened merely to register their links.
+
+        Borrows accessContext. Does not close it, copy payloads, register
+        matrix products, complete the checkpoint, or commit the outer
+        transaction.
+
+        Uses a savepoint so partial registration rolls back on failure.
+        """
+        from psycopg.pq import TransactionStatus
+        from psycopg.rows import tuple_row
+
+        for label, value in (("sessionID", sessionID), ("backendID", backendID)):
+            if type(value) is not int or not 0 <= value <= 9223372036854775807:
+                raise ValueError(f"{label} must be a nonnegative PostgreSQL bigint.")
+
+        if (
+            not isinstance(objectPrefix, str)
+            or not objectPrefix
+            or objectPrefix.startswith("/")
+            or "\\" in objectPrefix
+            or "\x00" in objectPrefix
+            or any(part in ("", ".", "..") for part in objectPrefix.split("/"))
+        ):
+            raise ValueError("objectPrefix must be a valid relative POSIX path.")
+
+        if not isinstance(accessContext, pglDatabaseAccess):
+            raise TypeError("accessContext must be a pglDatabaseAccess instance.")
+        if cls._checkpointDatabaseIdentity(accessContext._postgres) != cls._checkpointDatabaseIdentity(postgres):
+            raise ValueError("Payload access belongs to a different configured database.")
+
+        if connection.info.transaction_status != TransactionStatus.INTRANS:
+            raise ValueError("Mixed registration requires an active caller-owned transaction.")
+
+        cls.validateDerivedManifest(manifest)
+
+        if not isinstance(reusedFiles, dict):
+            raise TypeError("reusedFiles must be a dictionary.")
+
+        inventory = {record["name"]: record for record in manifest["files"]}
+        if set(reusedFiles) - set(inventory):
+            raise ValueError("Reused files must belong to the manifest inventory.")
+
+        # Copy metadata rather than retaining caller-owned registration records.
+        reusedFiles = deepcopy(reusedFiles)
+        reuseByID = {}
+
+        for name, record in reusedFiles.items():
+            if not isinstance(record, dict) or set(record) != {"fileID", "sha256", "size_bytes"}:
+                raise ValueError(f"Invalid resolved reuse record for {name!r}.")
+
+            fileID = record["fileID"]
+            if type(fileID) is not int or not 0 <= fileID <= 9223372036854775807:
+                raise ValueError("Reused fileID must be a nonnegative PostgreSQL bigint.")
+
+            expected = {key: inventory[name][key] for key in ("sha256", "size_bytes")}
+            identity = {key: record[key] for key in expected}
+
+            if identity != expected:
+                raise ValueError(f"Reused identity differs from the manifest: {name!r}")
+
+            if fileID in reuseByID and reuseByID[fileID] != identity:
+                raise ValueError("One reused file ID has conflicting content identities.")
+
+            reuseByID[fileID] = identity
+
+        # These generated metadata files must be newly staged/uploaded.
+        # This keeps their validation independent of scientific-payload reuse.
+        generatedNames = {"history.json"}
+        generatedNames.update(
+            posixpath.join(run["path"], "experimentSettings.json")
+            for run in manifest["runs"]
+        )
+        if "mri" in manifest: generatedNames.add("mri/mri.json")
+        if "mne" in manifest: generatedNames.add("mne/mne.json")
+
+        if generatedNames.intersection(reusedFiles):
+            raise ValueError("Mixed registration requires newly staged history, labels, and modality descriptors.")
+
+        manifestBytes = cls.encodeRawManifest(manifest)
+        manifestIdentity = {
+            "sha256": hashlib.sha256(manifestBytes).hexdigest(),
+            "size_bytes": len(manifestBytes),
+        }
+
+        sessions = sql.Identifier(postgres.databaseSchema, "session")
+        links = sql.Identifier(postgres.databaseSchema, "session_files")
+        files = sql.Identifier(postgres.databaseSchema, "files")
+        locations = sql.Identifier(postgres.databaseSchema, "storage_locations")
+        backends = sql.Identifier(postgres.databaseSchema, "storage_backends")
+
+        def report(fraction, description):
+            if progress is not None: progress(fraction, description)
+
+        with connection.transaction():
+            with connection.cursor(row_factory=tuple_row) as cursor:
+                report(0, "Checking unpublished checkpoint and reuse catalog")
+
+                statement = sql.SQL("""
+                    SELECT origin, status, contract_version, deleted_at
+                    FROM {}
+                    WHERE session_id = %s
+                    FOR UPDATE
+                """).format(sessions)
+                cursor.execute(statement, (sessionID,))
+
+                if cursor.fetchone() != ("derived", "in_progress", manifest["contract_version"], None):
+                    raise ValueError("Checkpoint must be active, in progress, and match the derived manifest.")
+
+                cursor.execute(
+                    sql.SQL("SELECT 1 FROM {} WHERE session_id = %s LIMIT 1").format(links),
+                    (sessionID,),
+                )
+                if cursor.fetchone() is not None:
+                    raise ValueError("Checkpoint already has file links.")
+
+                cursor.execute(
+                    sql.SQL("SELECT url_prefix, is_active FROM {} WHERE backend_id = %s FOR SHARE").format(backends),
+                    (backendID,),
+                )
+                backend = cursor.fetchone()
+
+                if backend is None or not backend[1]:
+                    raise ValueError("Destination backend is missing or inactive.")
+
+                registeredRoot = backend[0]
+                locationsByID = {}
+
+                if reuseByID:
+                    # Earlier reuse resolution holds the protecting locks.
+                    # Recheck rather than trusting arbitrary supplied file IDs.
+                    statement = sql.SQL("""
+                        SELECT content.file_id,
+                               content.sha256,
+                               content.size_bytes,
+                               backend.backend_id,
+                               backend.url_prefix,
+                               location.object_key
+                        FROM {files} AS content
+                        JOIN {locations} AS location
+                          ON location.file_id = content.file_id
+                        JOIN {backends} AS backend
+                          ON backend.backend_id = location.backend_id
+                        WHERE content.file_id = ANY(%s::bigint[])
+                          AND content.deleted_at IS NULL
+                          AND location.deleted_at IS NULL
+                          AND location.status = 'present'
+                          AND location.verified_at IS NOT NULL
+                          AND backend.is_active
+                          AND EXISTS (
+                              SELECT 1
+                              FROM {links} AS reference
+                              JOIN {sessions} AS owner
+                                ON owner.session_id = reference.session_id
+                              WHERE reference.file_id = content.file_id
+                                AND reference.deleted_at IS NULL
+                                AND owner.deleted_at IS NULL
+                                AND owner.status = 'complete'
+                          )
+                        ORDER BY content.file_id, location.priority,
+                                 backend.backend_id, location.object_key
+                    """).format(
+                        files=files,
+                        locations=locations,
+                        backends=backends,
+                        links=links,
+                        sessions=sessions,
+                    )
+                    cursor.execute(statement, (sorted(reuseByID),))
+
+                    for fileID, digest, size, sourceBackendID, root, key in cursor.fetchall():
+                        if reuseByID[fileID] != {"sha256": digest, "size_bytes": size}:
+                            raise ValueError("Reused content identity differs from the current catalog.")
+
+                        locationsByID.setdefault(fileID, []).append({
+                            "backend_id": sourceBackendID,
+                            "url_prefix": root,
+                            "object_key": key,
+                        })
+
+                    if set(locationsByID) != set(reuseByID):
+                        raise ValueError("Some reused payloads no longer have eligible active catalog references.")
+
+            ################################################################
+            # Validate generated metadata through the complete logical inventory
+            ################################################################
+            report(0.02, "Verifying uploaded checkpoint manifest")
+            destinationFS, destinationRoot = accessContext.resolve(backendID, registeredRoot)
+            manifestKey = posixpath.join(objectPrefix, "manifest.json")
+
+            actual = pglStorage.hashFile(
+                destinationFS,
+                posixpath.join(destinationRoot, manifestKey),
+                expectedSize=manifestIdentity["size_bytes"],
+                description="Verifying uploaded checkpoint manifest",
+            )
+            if actual != manifestIdentity:
+                raise ValueError("Uploaded checkpoint manifest differs from the supplied manifest.")
+
+            fileLocations = {}
+
+            for name, record in inventory.items():
+                if name in reusedFiles:
+                    candidates = locationsByID[reusedFiles[name]["fileID"]]
+                else:
+                    candidates = [{
+                        "backend_id": backendID,
+                        "url_prefix": registeredRoot,
+                        "object_key": posixpath.join(objectPrefix, name),
+                    }]
+
+                fileLocations[name] = {
+                    "sha256": record["sha256"],
+                    "size_bytes": record["size_bytes"],
+                    "locations": deepcopy(candidates),
+                }
+
+            # Construct a complete view, but open only generated metadata.
+            # Closing this view must not close the coordinator's access context.
+            archive = pglCheckpointFilesystem(
+                manifest,
+                fileLocations,
+                accessContext=accessContext,
+                ownsAccess=False,
+            )
+
+            try:
+                report(0.03, "Validating modality descriptors and current history")
+
+                if "mri" in manifest: cls._verifyMRIInventory(manifest, archive)
+                if "mne" in manifest: cls._verifyMNEInventory(manifest, archive)
+
+                _, historyMetadata = cls._readSessionHistory(archive, len(manifest["runs"]))
+
+                if manifest["runs"]:
+                    metadata = cls._behaviorLabelMetadata(manifest, archive)
+                    if historyMetadata != metadata:
+                        raise ValueError("Current history labels differ from uploaded behavioral settings.")
+                else:
+                    if historyMetadata is None:
+                        raise ValueError("New modality-only checkpoints require explicit session-label metadata.")
+                    metadata = historyMetadata
+
+            finally:
+                archive.close()
+
+            cls._recordSessionLabelMetadata(connection, postgres, sessionID, metadata)
+
+            subjectsByRun = {
+                run["path"]: metadata["labels"][run["index"]]["subjectID"]
+                for run in manifest["runs"]
+            }
+            modalitySubject = metadata["labels"][0]["subjectID"] if not manifest["runs"] else None
+            derivedByPath = {record["path"]: record for record in manifest.get("derivedFiles", [])}
+
+            def fileOwner(name):
+                """Assign roles and subjects from current logical ownership."""
+                if name == "manifest.json": return "manifest", None
+                if name == "history.json": return "history", None
+
+                if name in derivedByPath:
+                    runIndex = derivedByPath[name]["runIndex"]
+                    subjectID = None if runIndex is None else subjectsByRun[manifest["runs"][runIndex]["path"]]
+                    return "derived", subjectID
+
+                if ("mri" in manifest and name.startswith("mri/")) or ("mne" in manifest and name.startswith("mne/")):
+                    return "derived", modalitySubject
+
+                runRoot = "/".join(name.split("/")[:2])
+                if runRoot not in subjectsByRun:
+                    raise ValueError(f"Checkpoint file has no declared owner: {name!r}")
+
+                return "derived", subjectsByRun[runRoot]
+
+            ################################################################
+            # Attach reused identities; verify/register newly uploaded bytes
+            ################################################################
+            records = [
+                *manifest["files"],
+                {"name": "manifest.json", **manifestIdentity},
+            ]
+
+            # Metadata-only reuse receives small weight rather than pretending
+            # its full payload size will be transferred or verified.
+            work = [
+                {
+                    "name": record["name"],
+                    "size_bytes": 1 if record["name"] in reusedFiles else max(1, record["size_bytes"]),
+                    "record": record,
+                }
+                for record in records
+            ]
+            fileRange = progress.section(0.05, 1) if progress is not None else None
+
+            for item, fileProgress in pglProgress.fileSections(work, fileRange):
+                record = item["record"]
+                name = record["name"]
+                role, subjectID = fileOwner(name)
+
+                if name in reusedFiles:
+                    fileID = reusedFiles[name]["fileID"]
+                    if fileProgress is not None:
+                        fileProgress(0, "Attaching existing registered content")
+                else:
+                    if fileProgress is not None:
+                        fileProgress(0, "Resolving newly uploaded content")
+
+                    fileID = cls.getOrCreateFile(
+                        connection,
+                        postgres,
+                        record["sha256"],
+                        record["size_bytes"],
+                    )
+                    cls.verifyAndRegisterStorageLocation(
+                        connection,
+                        postgres,
+                        fileID,
+                        backendID,
+                        posixpath.join(objectPrefix, name),
+                        accessContext=accessContext,
+                        progress=fileProgress,
+                    )
+
+                cls.attachCheckpointFile(
+                    connection,
+                    postgres,
+                    sessionID,
+                    name,
+                    fileID,
+                    role=role,
+                    subjectID=subjectID,
+                )
+
+                if fileProgress is not None:
+                    fileProgress(1, "Checkpoint file link registered")
 
         return sessionID
 
@@ -12425,6 +14768,64 @@ class pglDatabase:
         }
         cls.validateRawSessionV2Manifest(inventoryView)
         return manifest
+    
+    @classmethod
+    def _acquireCheckpointPublicationLock(cls, connection, postgres, *, progress=None):
+        """Acquire the session publication/lifecycle lock before any writes.
+
+        SHARE ROW EXCLUSIVE:
+            Allows ordinary SELECT reports.
+            Conflicts with session lifecycle EXCLUSIVE locks.
+            Serializes publication against other session writers and dataset
+            dependency SHARE locks.
+
+        Unlike SHARE, concurrent publication holders cannot both acquire this
+        lock and then deadlock merely by inserting into session.
+
+        Uses NOWAIT attempts in savepoints, bounded by lockTimeoutSeconds.
+        Does not change SQL statement_timeout or lock_timeout settings.
+
+        The caller must own an explicit READ COMMITTED transaction.
+        The acquired lock remains held until the outer transaction ends.
+        """
+        from time import monotonic, sleep
+
+        from psycopg.pq import TransactionStatus
+
+        if connection.info.transaction_status != TransactionStatus.INTRANS:
+            raise ValueError("Checkpoint publication requires an active caller-owned transaction.")
+
+        isolation = connection.execute("SHOW transaction_isolation").fetchone()[0]
+        if isolation != "read committed":
+            raise ValueError("Checkpoint publication requires READ COMMITTED isolation.")
+
+        table = sql.Identifier(postgres.databaseSchema, "session")
+        statement = sql.SQL("LOCK TABLE {} IN SHARE ROW EXCLUSIVE MODE NOWAIT").format(table)
+        timeout = postgres.lockTimeoutSeconds
+        started = monotonic()
+
+        while True:
+            try:
+                # A failed NOWAIT must roll back only this attempt, not leave
+                # the caller's publication transaction in an aborted state.
+                with connection.transaction():
+                    connection.execute(statement)
+                return
+
+            except psycopg.errors.LockNotAvailable:
+                elapsed = monotonic() - started
+                if elapsed >= timeout:
+                    raise TimeoutError(
+                        f"Timed out after {timeout:g} seconds waiting for the "
+                        "checkpoint publication/lifecycle lock."
+                    ) from None
+
+                if progress is not None:
+                    progress(None, f"Waiting for checkpoint publication/lifecycle lock ({elapsed:.1f} s)")
+
+                sleep(min(0.1, max(0.0, timeout - elapsed)))
+    
+    
 
 # =========================================================================
 # RUNTIME PAYLOAD ACCESS CONTEXT
@@ -12777,6 +15178,43 @@ class pglCheckpointFilesystem(AbstractFileSystem):
 
         return entries if detail else [child["name"] for child in entries]
 
+    def getPublicationReference(self, path):
+        """Return checkpoint content metadata without opening its payload.
+
+        Used by database publication after the owning exporter has established
+        that these saved bytes still represent the desired contents.
+
+        This method does NOT establish that a materialized working object is
+        unchanged. Retained lazy backing alone is not sufficient evidence.
+
+        Requires a database-owned access context. Standalone reconstruction
+        without that context cannot establish the source database identity.
+
+        Returns independent metadata only. Does not resolve storage, connect
+        to SQL, read bytes, or transfer ownership of the access context.
+        """
+        if self._pglClosed:
+            raise ValueError("Checkpoint filesystem is closed.")
+
+        if self._accessContext is None:
+            raise ValueError("Checkpoint payload reuse requires a database access context.")
+
+        if self._accessContext._closed:
+            raise ValueError("Checkpoint payload access context is closed.")
+
+        entry = self.info(path)
+        if entry["type"] != "file":
+            raise IsADirectoryError(entry["name"])
+
+        payload = self._payloads[entry["name"]]
+
+        return {
+            "databaseIdentity": deepcopy(pglDatabase._checkpointDatabaseIdentity(self._accessContext._postgres)),
+            "sourceName": entry["name"],
+            "sha256": payload["sha256"],
+            "size_bytes": payload["size_bytes"],
+        }
+    
     # +++++++++++++++++++++++++ _resolveLocation ++++++++++++++++++++++++++++
     def _resolveLocation(self, location):
         """Resolve a physical replica using this reader's retained context.
