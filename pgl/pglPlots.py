@@ -46,9 +46,9 @@ class pglScanTimelinePlot:
     # Read timing, align matched scans, and construct the figure
     ################################################################
     def __init__(self, pglRuns, pglScans, proposedMatch='first',
-                 alignmentMode='clock', volumeMarkerStyle='tick',
+                 alignmentMode='first', volumeMarkerStyle='tick',
                  readHeaders=True, figsize=(16, 12), zoom=False,
-                 showTrialSegments=False, showBehaviorVolumes=True):
+                 showTrialSegments=True, showBehaviorVolumes=True):
         import math
         import warnings
         import numpy as np

@@ -2713,7 +2713,7 @@ class pglSession(pglActionable):
             raise ValueError("Runs, scans, and correspondence are supplied by the session.")
 
         # Clock alignment shows recorded differences without fitting them away.
-        options = {"alignmentMode": "clock", "zoom": True, **plotOptions}
+        options = {"alignmentMode": "first", "zoom": True, **plotOptions}
         plot = pglScanTimelinePlot(
             pglRuns=self.runs,
             pglScans=self.mri.scans,
