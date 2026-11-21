@@ -8,6 +8,7 @@
 #############
 # Import modules
 #############
+from .pglActionProgress import actionProgress, operationProgress, currentProgress, progressCall, statusOutput, noProgressBar, daskProgress
 from copy import deepcopy
 from pathlib import Path
 from uuid import uuid4
@@ -16,6 +17,8 @@ from traitlets import Any, Dict, Instance, List, Unicode
 
 from .pglPipeline import pglActionable
 from .pglSettings import pglTraitSettings
+from .pglData import pglDataMatrix
+from .pglMessages import pglMessages
 
 ################################################################
 # MRI filesystem backing
@@ -1320,10 +1323,9 @@ class pglMRI(pglActionable):
     It does not copy files, publish checkpoints, or infer behavioral matching.
     """
 
-    scans = List(
-        Instance(pglMRIScan),
-        help="Ordered MRI scans",
-    )
+    scans = List(Instance(pglMRIScan), help="Ordered MRI scans")
+    dataMatrices = Dict(default_value={},help="MRI-owned scientific matrices, including retained image stages and analysis results; persisted explicitly through session checkpoint integration",serialize=False)
+    _sessionReference = Any(default_value=None, allow_none=True, help="Runtime weak reference to the owning session", serialize=False)
 
     def add(self, filename, *, name=None, sourceMetadata=None):
         """Attach a local NIfTI without opening its header or voxel array.
@@ -1713,6 +1715,1104 @@ class pglMRI(pglActionable):
         except Exception as error:
             pglMessages.warning(f"MRI viewer could not be opened: {type(error).__name__}: {error}")
             return None
+        
+    def getAcquisitionDataMatrix(self, scanNum=0, *, cacheDirectory=None):
+        """Return an original acquisition as a lazy MRI image matrix.
+
+        scanNum:
+            Zero-based index in this collection.
+
+        cacheDirectory:
+            Optional local cache override for a deferred acquisition.
+            None uses the scan's existing cache configuration.
+
+        Returns:
+            pglDataMatrix containing dimensions (x, y, z, volume).
+            Invalid scan selection or missing source configuration warns and
+            returns None. Storage, format, and integrity failures propagate.
+
+        Always reads the original acquisition source. Does not use scan.data,
+        which may contain working-image edits.
+
+        Deferred sources may require complete download/materialization.
+        Construction reads headers, but does not compute scientific arrays.
+        Deferred voxel reads apply NIfTI scaling and convert to float32.
+
+        Does not attach the returned matrix, publish a checkpoint, alter
+        current-stage selection, or modify the scan's backing/localPath.
+
+        Keep source/cache files unchanged and available while the matrix or
+        any lazy views depend on them. Close the matrix when finished.
+        """
+        from numbers import Integral
+        from pathlib import Path
+
+        from .pglMessages import pglMessages
+
+        scans = list(self.scans)
+
+        if isinstance(scanNum, (bool, np.bool_)) or not isinstance(scanNum, Integral):
+            pglMessages.warning("scanNum must be a zero-based integer.", level=1)
+            return None
+
+        scanNum = int(scanNum)
+        if not 0 <= scanNum < len(scans):
+            validRange = f"0 through {len(scans) - 1}" if scans else "(no scans)"
+            pglMessages.warning(f"scanNum {scanNum} is out of bounds. Valid indices: {validRange}.", level=1)
+            return None
+
+        scan = scans[scanNum]
+        scanUUID = scan.uuid
+
+        # A stage must resolve to exactly one acquisition in this collection.
+        if sum(candidate.uuid == scanUUID for candidate in scans) != 1:
+            raise ValueError("The selected scan UUID occurs more than once in this MRI collection.")
+
+        if scan._backing is not None:
+            if not isinstance(scan._backing, pglMRIFileBacking):
+                raise TypeError("Unsupported MRI acquisition backing.")
+
+            cache = scan._cacheDirectory if cacheDirectory is None else cacheDirectory
+            if cache is None or not str(cache).strip():
+                pglMessages.warning("A local cacheDirectory is required for this acquisition.", level=1)
+                return None
+
+            # The backing verifies its recorded identity during materialization.
+            # Do not replace acquisition bindings with a derived/working image.
+            path = Path(scan._backing.materialize(cache))
+
+        elif scan.localPath:
+            path = Path(scan.localPath).expanduser().absolute()
+
+        else:
+            pglMessages.warning(f"MRI scan {scanNum} has no acquisition source.", level=1)
+            return None
+
+        # Verify preserved header provenance before constructing deferred reads.
+        # Local-only sources without an expected identity are not thereby
+        # certified against a historical full-payload hash.
+        snapshot = pglMRINiftiMetadata.read(path)
+        original = scan.sourceMetadata.get("nifti")
+
+        if original is not None and original != snapshot:
+            raise ValueError("Acquisition header differs from its preserved original snapshot.")
+
+        matrix = pglMRIData.fromNifti(
+            path,
+            scanUUID=scanUUID,
+            sourceStageID=f"acquisition:{scanUUID}",
+            name=f"acquisition.{scanUUID}",
+        )
+
+        # Preserve original on-disk header provenance separately from the
+        # working NiBabel header snapshot carried by pglMRIData.
+        matrix.provenance = {
+            **matrix.provenance,
+            "originalNifti": snapshot,
+        }
+
+        return matrix
+    
+    def _getSession(self, *, required=True):
+        """Return the live owning session without reading scientific data.
+
+        Ownership is runtime-only and established by pglSession when this
+        collection is attached. Never searches for a session globally.
+
+        required=False permits an unattached collection or an expired owner.
+        """
+        reference = self._sessionReference
+        session = None if reference is None else reference()
+
+        if session is None and required:
+            raise ValueError(
+                "This MRI collection is not attached to a live session. "
+                "Attach it with session.add(mri) before accessing action products."
+            )
+
+        return session
+
+    def _bindSession(self, session):
+        """Bind this collection to one live session without creating a cycle.
+
+        Called by the session attachment observer, not by scientific actions.
+        Rebinding to the same owner is harmless. Sharing one live MRI collection
+        between sessions is rejected because its current-stage history would
+        otherwise be ambiguous.
+        """
+        import weakref
+
+        from .pglSession import pglSession
+
+        if not isinstance(session, pglSession):
+            raise TypeError("MRI ownership requires a pglSession.")
+        if session.mri is not self:
+            raise ValueError("The session must attach this MRI collection before binding it.")
+
+        owner = self._getSession(required=False)
+        if owner is not None and owner is not session:
+            raise ValueError("This MRI collection already belongs to another live session.")
+
+        self._sessionReference = weakref.ref(session)
+
+    def _unbindSession(self, session):
+        """Remove this owner's runtime connection without closing payloads.
+
+        Detachment does not delete matrices, alter history, or close readers.
+        References belonging to a different owner are never removed.
+        """
+        if self._getSession(required=False) is session:
+            self._sessionReference = None
+            
+    def _getCommittedImageStages(self):
+        """Collect explicit replacement stages from the owning session history.
+
+        Only successful executions and committed image products participate.
+        Existing imageStages metadata alone does not declare a replacement.
+
+        New declaration:
+            product.metadata["imageReplacements"] = {
+                "schemaVersion": 1,
+                "stages": [
+                    {
+                        "scanUUID": ...,
+                        "stageID": ...,
+                        "matrixName": ...,
+                        "matrixUUID": ...,
+                        "inputStageID": ...,
+                        "replacesStageID": ...,
+                    },
+                ],
+            }
+
+        stageID must be:
+            product:<productID>:<matrixName>
+
+        matrixUUID identifies the working matrix independently of its storage
+        revision. Checkpoint publication generates new revision IDs, while
+        retaining the matrix's scientific-object UUID.
+
+        Returns:
+            stages: Records accepted by pglMRIData._resolveImageStage().
+            bindings: Stage ID -> exact product/matrix identities.
+
+        Reads metadata only. Does not inspect payload availability or record
+        product consumption; the accessor records the selected dependency.
+
+        An unattached collection has no session replacement history.
+        """
+        from copy import deepcopy
+        from uuid import UUID
+
+        from .pglPipeline import pglActionStatus
+
+        session = self._getSession(required=False)
+        if session is None: return [], {}
+
+        stages = []
+        bindings = {}
+        seenProducts = set()
+
+        def requireText(value, label):
+            if (
+                not isinstance(value, str) or not value.strip()
+                or any(character in value for character in ("\x00", "\n", "\r"))
+            ):
+                raise ValueError(f"{label} must be a nonblank string without NUL or newlines.")
+
+        def requireUUID(value, label):
+            requireText(value, label)
+            try:
+                canonical = str(UUID(value))
+            except (ValueError, AttributeError):
+                raise ValueError(f"{label} must be a canonical UUID.") from None
+            if canonical != value:
+                raise ValueError(f"{label} must be a canonical UUID.")
+
+        expectedFields = {
+            "scanUUID", "stageID", "matrixName", "matrixUUID",
+            "inputStageID", "replacesStageID",
+        }
+
+        for entry in session.actionHistory:
+            if entry.actionStatus != pglActionStatus.SUCCESS: continue
+
+            for product in entry.actionProducts:
+                if product.get("recordStatus") != "committed": continue
+
+                metadata = product.get("metadata")
+                if not isinstance(metadata, dict):
+                    raise ValueError("Committed product metadata must be a dictionary.")
+                if "imageReplacements" not in metadata: continue
+
+                if product.get("kind") != "image":
+                    raise ValueError("Only image products may declare image replacements.")
+
+                productID = product.get("productID")
+                requireUUID(productID, "Replacement productID")
+
+                if productID in seenProducts:
+                    raise ValueError("A replacement product occurs more than once in session history.")
+                seenProducts.add(productID)
+
+                if product.get("producerActionID") != entry.actionID:
+                    raise ValueError("Replacement product disagrees with its producing execution.")
+
+                declaration = metadata["imageReplacements"]
+                if (
+                    type(declaration) is not dict
+                    or set(declaration) != {"schemaVersion", "stages"}
+                    or type(declaration["schemaVersion"]) is not int
+                    or declaration["schemaVersion"] != 1
+                ):
+                    raise ValueError("Unsupported image replacement declaration.")
+
+                records = declaration["stages"]
+                if type(records) is not list or not records:
+                    raise ValueError("Image replacement declaration requires nonempty stages.")
+
+                productScans = set()
+                productMatrices = set()
+
+                for record in records:
+                    if type(record) is not dict or set(record) != expectedFields:
+                        raise ValueError("Invalid replacement-stage fields.")
+
+                    for field in expectedFields:
+                        requireText(record[field], field)
+                    requireUUID(record["scanUUID"], "scanUUID")
+                    requireUUID(record["matrixUUID"], "matrixUUID")
+
+                    # One replacement per acquisition in a producing product.
+                    if record["scanUUID"] in productScans:
+                        raise ValueError("One product declares multiple replacements for the same scan.")
+                    if record["matrixName"] in productMatrices:
+                        raise ValueError("Replacement matrix names must be distinct within a product.")
+
+                    productScans.add(record["scanUUID"])
+                    productMatrices.add(record["matrixName"])
+
+                    stageID = record["stageID"]
+                    expectedID = f"product:{productID}:{record['matrixName']}"
+                    if stageID != expectedID:
+                        raise ValueError("Replacement stage identity disagrees with its product and matrix.")
+                    if stageID in bindings:
+                        raise ValueError("Repeated replacement-stage identity.")
+
+                    stages.append({
+                        key: deepcopy(value)
+                        for key, value in record.items()
+                        if key != "matrixUUID"
+                    })
+                    bindings[stageID] = {
+                        "productID": productID,
+                        "producerActionID": entry.actionID,
+                        "matrixUUID": record["matrixUUID"],
+                    }
+
+        return stages, bindings
+    
+    def getDataMatrix(self, scanNum=0, *, source=None, stageID=None, lazy=True, cacheDirectory=None):
+        """Return a selected MRI image as a voxel-by-volume pglDataMatrix.
+
+        scanNum:
+            Zero-based index in this MRI collection.
+
+        source:
+            None or "current": current committed replacement, otherwise raw.
+            "raw": explicitly read the original acquisition.
+
+        stageID:
+            Exact retained stage, or acquisition:<scanUUID>.
+            Mutually exclusive with an explicitly supplied source.
+
+        lazy:
+            True preserves deferred arrays.
+            False computes the selected data and rejects nonfinite values.
+
+        Returns:
+            pglDataMatrix containing an xarray.DataArray with dimensions
+            (voxel, volume), MRI metadata, and selection provenance.
+
+        The result is an analysis view, not a newly attached scientific product.
+        It is not automatically added to dataMatrices or checkpointed.
+
+        Selection failures for invalid scan indices warn and return None.
+        Invalid arguments, inconsistent history, missing replacement payloads,
+        and identity mismatches raise. Never silently falls back to raw when a
+        declared replacement is unavailable.
+
+        Inside an action, derived selection records consumption of the exact
+        committed product through pglProductSelector.
+
+        Does not change current stages, apply transforms, normalize values,
+        publish products, or delete intermediates.
+
+        Lazy views borrow their source resources. Keep the owning session and
+        source matrices/files available while using them.
+        """
+        from copy import deepcopy
+        from numbers import Integral
+
+        from .pglMessages import pglMessages
+        from .pglPipeline import pglProductSelector
+
+        if source is not None and source not in ("current", "raw"):
+            raise ValueError("source must be None, 'current', or 'raw'.")
+        if stageID is not None:
+            if not isinstance(stageID, str) or not stageID.strip():
+                raise ValueError("stageID must be a nonblank string or None.")
+            if source is not None:
+                raise ValueError("Supply source or stageID, not both.")
+        if type(lazy) is not bool:
+            raise TypeError("lazy must be Boolean.")
+
+        scans = list(self.scans)
+        if isinstance(scanNum, (bool, np.bool_)) or not isinstance(scanNum, Integral):
+            pglMessages.warning("scanNum must be a zero-based integer.", level=1)
+            return None
+
+        scanNum = int(scanNum)
+        if not 0 <= scanNum < len(scans):
+            validRange = f"0 through {len(scans) - 1}" if scans else "(no scans)"
+            pglMessages.warning(f"scanNum {scanNum} is out of bounds. Valid indices: {validRange}.", level=1)
+            return None
+
+        scan = scans[scanNum]
+        scanUUID = scan.uuid
+        if sum(candidate.uuid == scanUUID for candidate in scans) != 1:
+            raise ValueError("Selected scan UUID is ambiguous in this MRI collection.")
+
+        acquisitionID = f"acquisition:{scanUUID}"
+        selected = None
+        binding = None
+
+        # Explicit acquisition access deliberately bypasses replacement history.
+        # It is an override, not a fallback after a replacement error.
+        explicitRaw = source == "raw" or stageID == acquisitionID
+
+        if not explicitRaw:
+            stages, bindings = self._getCommittedImageStages()
+            selected = pglMRIData._resolveImageStage(scanUUID, stages, stageID=stageID)
+            if selected is not None:
+                binding = bindings[selected["stageID"]]
+
+        if selected is None:
+            imageMatrix = self.getAcquisitionDataMatrix(scanNum, cacheDirectory=cacheDirectory)
+            if imageMatrix is None: return None
+
+            resolvedStageID = acquisitionID
+            productID = None
+            producerActionID = None
+            matrixName = None
+
+        else:
+            session = self._getSession()
+            matrixName = selected["matrixName"]
+
+            if matrixName not in self.dataMatrices:
+                raise ValueError(
+                    f"Image stage {selected['stageID']!r} has no retained matrix "
+                    f"{matrixName!r}. Its payload may have been released. "
+                    "Use source='raw' only if acquisition data is intended."
+                )
+
+            imageMatrix = self.dataMatrices[matrixName]
+            if not isinstance(imageMatrix, pglDataMatrix):
+                raise TypeError("Replacement attachment must be a pglDataMatrix.")
+            if imageMatrix.uuid != binding["matrixUUID"]:
+                raise ValueError("Replacement matrix UUID differs from its committed stage record.")
+
+            image = pglMRIData.validate(imageMatrix)
+            metadata = image.attrs["pglMRI"]
+
+            if metadata["scanUUID"] != scanUUID:
+                raise ValueError("Replacement matrix belongs to another acquisition.")
+            if metadata["sourceStageID"] != selected["stageID"]:
+                raise ValueError("Replacement matrix metadata identifies a different image stage.")
+
+            # Resolving by exact product ID also records consumption when an
+            # execution recorder is active. Never resolve by display name.
+            product = pglProductSelector(productID=binding["productID"], kind="image").resolve(session)
+            if product is None:
+                raise ValueError("The selected replacement product could not be resolved.")
+            if product.producerActionID != binding["producerActionID"]:
+                raise ValueError("Replacement producer identity changed during selection.")
+
+            resolvedStageID = selected["stageID"]
+            productID = binding["productID"]
+            producerActionID = binding["producerActionID"]
+
+        view = pglMRIData.getDataMatrix(imageMatrix, lazy=lazy)
+        result = pglDataMatrix(view, name=f"{scan.name or scanUUID} data")
+
+        # This records the selection, not a claim that a new processing action
+        # produced or committed the returned analysis view.
+        result.provenance = {
+            "operation": "MRIDataMatrixView",
+            "scanUUID": scanUUID,
+            "sourceStageID": resolvedStageID,
+            "sourceMatrixUUID": imageMatrix.uuid,
+            "sourceMatrixRevisionID": imageMatrix.matrixRevisionID,
+            "matrixName": matrixName,
+            "productID": productID,
+            "producerActionID": producerActionID,
+            "selection": {
+                "source": source,
+                "stageID": stageID,
+                "lazy": lazy,
+            },
+            "sourceProvenance": deepcopy(imageMatrix.provenance),
+        }
+
+        return result
+    
+    def publishImageReplacement(self, action, matrix, *, scanNum=0, inputStageID, replacesStageID, outputName, cacheDirectory):
+        """Publish one replacement through the shared multi-scan publisher.
+
+        Retains the existing single-scan API. Publication, validation, Zarr
+        storage, and action commitment semantics are implemented centrally.
+        """
+        from dask.diagnostics import ProgressBar
+        from .pglMessages import pglMessages
+        return self.publishImageReplacements(
+            action,
+            [{
+                "scanNum": scanNum,
+                "matrix": matrix,
+                "inputStageID": inputStageID,
+                "replacesStageID": replacesStageID,
+            }],
+            outputName=outputName,
+            cacheDirectory=cacheDirectory,
+        )
+        
+    @operationProgress("Publishing MRI replacements")
+    def publishImageReplacements(self, action, replacements, *, outputName, cacheDirectory, metadata=None, inputProductIDs=None):
+        """Publish multiple scan replacements as one committed image product.
+
+        replacements:
+            Nonempty list of dictionaries containing exactly:
+                scanNum
+                matrix
+                inputStageID
+                replacesStageID
+
+            Each matrix is a native-shaped MRI pglDataMatrix whose metadata
+            identifies its scientific input stage before publication.
+
+        metadata:
+            Additional product metadata, such as transform and sampling
+            provenance. imageReplacements is reserved for this publisher.
+
+        inputProductIDs:
+            Additional scientific dependencies. Each must be either committed
+            in this session or already registered in this active execution.
+            Supports immediate application of newly estimated transforms.
+
+        Validates every selection before writing. Writes each image through
+        the existing Zarr backend and reopens it lazily.
+
+        All completed matrices are attached in one dictionary assignment.
+        One product declares every replacement. Action success determines
+        commitment; no independent current-stage pointer is changed.
+
+        Failure can leave cache bundles and, after attachment, diagnostic
+        matrices. No filesystem or arbitrary observer rollback is claimed.
+        Current selection ignores uncommitted declarations.
+
+        Does not close existing readers or delete intermediates. The action
+        runner applies its retention policy only after successful commitment.
+        Concurrent actions on the same session remain unsupported.
+        """
+        _progress = currentProgress()
+        import os
+        from copy import deepcopy
+        from numbers import Integral
+        from pathlib import Path
+        from uuid import uuid4
+
+        import dask.array as da
+
+        from .pglExternalTools import getExecutionRecorder, _copyProvenance
+        from .pglPipeline import pglAction, pglActionStatus, pglProductSelector
+        from .pglStorage import pglStorage
+
+        session = self._getSession()
+        recorder = getExecutionRecorder()
+
+        if (
+            not isinstance(action, pglAction)
+            or not getattr(action, "_executionInProgress", False)
+            or recorder is None
+            or not action.actionHistory
+            or recorder.actionID != action.actionHistory[-1].actionID
+        ):
+            raise RuntimeError("Image publication requires its producing action's active execution.")
+
+        if session._failedActionIDs or self._failedActionIDs:
+            raise ValueError("Cannot publish replacements on a working object with unresolved failures.")
+
+        def requireText(value, label):
+            if (
+                not isinstance(value, str) or not value.strip()
+                or any(character in value for character in ("\x00", "\n", "\r"))
+            ):
+                raise ValueError(f"{label} must be a nonblank string without NUL or newlines.")
+
+        requireText(outputName, "outputName")
+
+        if type(replacements) is not list or not replacements:
+            raise ValueError("replacements must be a nonempty list.")
+
+        cacheText = os.fspath(cacheDirectory)
+        if (
+            not isinstance(cacheText, str) or not cacheText.strip()
+            or "://" in cacheText or "::" in cacheText
+            or any(character in cacheText for character in ("\x00", "\n", "\r"))
+        ):
+            raise ValueError("cacheDirectory must be an ordinary local path.")
+
+        metadata = {} if metadata is None else _copyProvenance(metadata)
+        if type(metadata) is not dict:
+            raise TypeError("metadata must be a dictionary.")
+        if {"imageReplacements", "_productRevision"}.intersection(metadata):
+            raise ValueError("Replacement/revision metadata is reserved for the publisher.")
+
+        dependencies = [] if inputProductIDs is None else _copyProvenance(inputProductIDs)
+        if type(dependencies) is not list:
+            raise TypeError("inputProductIDs must be a list.")
+        for identifier in dependencies: requireText(identifier, "Input product ID")
+        if len(set(dependencies)) != len(dependencies):
+            raise ValueError("Input product IDs must be unique.")
+
+        stagedProducts = recorder.exportProducts()
+        if any(record["name"] == outputName for record in stagedProducts):
+            raise ValueError("This execution already registered outputName.")
+        if any(
+            record.get("name") == outputName and record.get("recordStatus") == "committed"
+            for entry in session.actionHistory
+            if entry.actionStatus == pglActionStatus.SUCCESS
+            for record in entry.actionProducts
+        ):
+            raise ValueError("outputName already identifies a committed product; choose a new name.")
+
+        # Same-execution dependencies need no committed selector yet. Their
+        # exact IDs are linked in the output and commit with the same history.
+        stagedByID = {record["productID"]: record for record in stagedProducts}
+
+        for identifier in dependencies:
+            if identifier in stagedByID:
+                if stagedByID[identifier]["producerActionID"] != recorder.actionID:
+                    raise ValueError("Staged dependency belongs to another execution.")
+            else:
+                product = pglProductSelector(productID=identifier).resolve(session)
+                if product is None:
+                    raise ValueError("An explicit scientific dependency is unavailable.")
+
+        stages, bindings = self._getCommittedImageStages()
+        scans = list(self.scans)
+        attachments = dict(self.dataMatrices)
+        scanUUIDs = [scan.uuid for scan in scans]
+        productID = str(uuid4())
+        prepared = []
+        selectedScans = set()
+
+        stagedScans = set()
+        for record in stagedProducts:
+            declaration = record.get("metadata", {}).get("imageReplacements", {})
+            for stage in declaration.get("stages", []):
+                stagedScans.add(stage["scanUUID"])
+
+        expectedFields = {"scanNum", "matrix", "inputStageID", "replacesStageID"}
+
+        for request in replacements:
+            if type(request) is not dict or set(request) != expectedFields:
+                raise ValueError("Each replacement requires scanNum, matrix, inputStageID, and replacesStageID.")
+
+            index = request["scanNum"]
+            if isinstance(index, (bool, np.bool_)) or not isinstance(index, Integral):
+                raise TypeError("scanNum must be a zero-based integer.")
+            index = int(index)
+            if not 0 <= index < len(scans):
+                raise ValueError("scanNum is outside this MRI collection.")
+
+            scanUUID = scanUUIDs[index]
+            if scanUUIDs.count(scanUUID) != 1:
+                raise ValueError("Selected acquisition UUID is ambiguous.")
+            if scanUUID in selectedScans or scanUUID in stagedScans:
+                raise ValueError("This execution may replace each scan only once.")
+            selectedScans.add(scanUUID)
+
+            inputStageID = request["inputStageID"]
+            replacesStageID = request["replacesStageID"]
+            requireText(inputStageID, "inputStageID")
+            requireText(replacesStageID, "replacesStageID")
+
+            matrix = request["matrix"]
+            image = pglMRIData.validate(matrix)
+            pglStorage.requireSafeSave(matrix)
+            imageMetadata = image.attrs["pglMRI"]
+
+            if imageMetadata["scanUUID"] != scanUUID:
+                raise ValueError("Replacement matrix belongs to another acquisition.")
+            if imageMetadata["sourceStageID"] != inputStageID:
+                raise ValueError("Replacement matrix must identify its scientific input before publication.")
+
+            acquisitionID = f"acquisition:{scanUUID}"
+            current = pglMRIData._resolveImageStage(scanUUID, stages)
+            currentID = acquisitionID if current is None else current["stageID"]
+            if replacesStageID != currentID:
+                raise ValueError("replacesStageID is not the current committed stage.")
+
+            pglMRIData._resolveImageStage(scanUUID, stages, stageID=inputStageID)
+
+            # Preserve exact image dependencies even when input and replaced
+            # stages differ, as in recomputation from original acquisitions.
+            for identifier in dict.fromkeys((inputStageID, replacesStageID)):
+                if identifier == acquisitionID: continue
+                binding = bindings[identifier]
+                product = pglProductSelector(productID=binding["productID"], kind="image").resolve(session)
+                if product is None:
+                    raise ValueError("An upstream image product is unavailable.")
+                if product.productID not in dependencies:
+                    dependencies.append(product.productID)
+
+            matrixName = f"image.{productID}.{scanUUID}"
+            candidate = {
+                "scanUUID": scanUUID,
+                "stageID": f"product:{productID}:{matrixName}",
+                "matrixName": matrixName,
+                "inputStageID": inputStageID,
+                "replacesStageID": replacesStageID,
+            }
+            pglMRIData._resolveImageStage(scanUUID, [*stages, candidate])
+
+            prepared.append({
+                "matrix": matrix,
+                "image": image,
+                "imageAttrs": deepcopy(image.attrs),
+                "candidate": candidate,
+            })
+
+        def requireUnchanged():
+            """Check bindings/history before attachment, without computing arrays."""
+            if self._getSession() is not session or session.mri is not self:
+                raise ValueError("MRI ownership changed during publication.")
+            if session._failedActionIDs or self._failedActionIDs:
+                raise ValueError("The working object acquired an unresolved failure.")
+
+            if (
+                len(self.scans) != len(scans)
+                or any(left is not right for left, right in zip(self.scans, scans))
+                or [scan.uuid for scan in self.scans] != scanUUIDs
+            ):
+                raise ValueError("MRI acquisition collection changed during publication.")
+
+            if (
+                set(self.dataMatrices) != set(attachments)
+                or any(self.dataMatrices[name] is not matrix for name, matrix in attachments.items())
+            ):
+                raise ValueError("MRI attachments changed during publication.")
+
+            currentStages, currentBindings = self._getCommittedImageStages()
+            if currentStages != stages or currentBindings != bindings:
+                raise ValueError("Committed replacement history changed during publication.")
+
+            for item in prepared:
+                if item["matrix"].data is not item["image"] or item["image"].attrs != item["imageAttrs"]:
+                    raise ValueError("A replacement matrix changed during publication.")
+                pglStorage.requireSafeSave(item["matrix"])
+
+        def requireFinite(block):
+            if not np.isfinite(block).all():
+                raise ValueError("Replacement image contains nonfinite voxel values.")
+            return block
+
+        root = Path(cacheText).expanduser().absolute() / "mriImages"
+        opened = {}
+        declarations = []
+        attachmentAttempted = False
+
+        try:
+            for imagePosition, item in enumerate(prepared):
+                _imageProgress = _progress.section(imagePosition / len(prepared), (imagePosition + 1) / len(prepared))
+                requireUnchanged()
+                candidate = item["candidate"]
+                image = item["image"]
+                statusOutput(f"Writing replacement image {candidate['scanUUID']} ({imagePosition} of {len(prepared)} completed): shape={image.shape}, dtype={image.dtype}.")
+                
+
+                outputData = image.copy(deep=False)
+                outputData.attrs = deepcopy(item["imageAttrs"])
+                outputData.attrs["pglMRI"]["sourceStageID"] = candidate["stageID"]
+
+                values = da.asarray(outputData.data)
+                outputData.data = values.map_blocks(
+                    requireFinite,
+                    dtype=values.dtype,
+                    meta=np.empty((0,) * values.ndim, dtype=values.dtype),
+                )
+
+                output = pglDataMatrix(outputData, name=candidate["matrixName"])
+                output.provenance = {
+                    "operation": "MRIImageReplacement",
+                    "productID": productID,
+                    "producerActionID": recorder.actionID,
+                    "scanUUID": candidate["scanUUID"],
+                    "inputStageID": candidate["inputStageID"],
+                    "replacesStageID": candidate["replacesStageID"],
+                    "sourceProvenance": deepcopy(item["matrix"].provenance),
+                }
+                matrixUUID = output.uuid
+                pglMRIData.validate(output)
+
+                # Dask reports completed graph tasks, not bytes or volumes.
+                # The graph includes delayed correction and Zarr writing.
+                with noProgressBar(minimum=0, dt=0.5):
+                    with daskProgress(_imageProgress.section(0, 0.95), f"Writing image {candidate['scanUUID']}"):
+                        savedPath = pglStorage.saveDataMatrix(output, root)
+
+                statusOutput("Zarr write finished. Reopening and validating replacement metadata.")
+                restored = pglStorage.loadDataMatrix(savedPath)
+                opened[candidate["matrixName"]] = restored
+
+                stored = pglMRIData.validate(restored)
+                if restored.uuid != matrixUUID:
+                    raise ValueError("Zarr restoration changed the replacement matrix UUID.")
+                if stored.shape != outputData.shape or stored.dtype != outputData.dtype:
+                    raise ValueError("Zarr restoration changed replacement shape or dtype.")
+                if stored.attrs != outputData.attrs:
+                    raise ValueError("Zarr restoration changed replacement metadata.")
+
+                declarations.append({**candidate, "matrixUUID": matrixUUID})
+                _imageProgress(1, f"Image {candidate['scanUUID']} — written and validated")
+                statusOutput("All replacement images have been written and validated.")
+                
+            requireUnchanged()
+            if set(opened).intersection(attachments):
+                raise ValueError("A replacement attachment name already exists.")
+
+            # One assignment installs the complete batch. Observer failures can
+            # occur after assignment, so do not close potentially attached readers.
+            statusOutput(f"All {len(prepared)} replacement images validated. Attaching matrices and registering the image product.")
+            attachmentAttempted = True
+            self.dataMatrices = {**attachments, **opened}
+
+            return action.registerProduct(
+                outputName,
+                "image",
+                session=session,
+                productID=productID,
+                inputProductIDs=dependencies,
+                metadata={
+                    **metadata,
+                    "imageReplacements": {
+                        "schemaVersion": 1,
+                        "stages": declarations,
+                    },
+                },
+            )
+
+        finally:
+            if not attachmentAttempted:
+                for matrix in opened.values():
+                    matrix.close()
+            
+    def releaseImageIntermediates(self, *, keepStageIDs=None, dryRun=False):
+        """Release superseded image attachments while preserving provenance.
+
+        Always keeps:
+            Each scan's current committed replacement.
+            Persistently pinned stages set through keepImageStage().
+            Additional keepStageIDs supplied for this call.
+            Matrices not declared as committed image replacements.
+
+        keepStageIDs:
+            Optional list/tuple of extra historical stages to retain for this
+            call. Does not create or remove persistent pins.
+
+        dryRun:
+            Return the proposed changes without changing attachments.
+
+        Removing an attachment excludes it from subsequent checkpoint saves.
+        Complete stage/product history remains, so requests for released data
+        fail explicitly instead of silently selecting another stage.
+
+        Does not delete cache/database files or close readers. Existing lazy
+        views may still depend on detached matrices. Saved checkpoints are
+        never modified.
+
+        Validation completes before a single dictionary replacement.
+        Failed working objects are rejected. Concurrent execution/mutation is
+        unsupported. Automatic action integration is not implemented here.
+        """
+        from .pglExternalTools import getExecutionRecorder
+
+        session = self._getSession()
+
+        if getExecutionRecorder() is not None:
+            raise RuntimeError("Release image intermediates only outside action execution.")
+        if session._failedActionIDs or self._failedActionIDs:
+            raise ValueError("Cannot release intermediates from a working object with unresolved action failures.")
+        if type(dryRun) is not bool:
+            raise TypeError("dryRun must be Boolean.")
+
+        if keepStageIDs is None:
+            keepStageIDs = []
+        elif not isinstance(keepStageIDs, (list, tuple)):
+            raise TypeError("keepStageIDs must be a list/tuple of exact stage IDs or None.")
+        else:
+            keepStageIDs = list(keepStageIDs)
+
+        if any(
+            not isinstance(identifier, str) or not identifier.strip()
+            or any(character in identifier for character in ("\x00", "\n", "\r"))
+            for identifier in keepStageIDs
+        ):
+            raise ValueError("keepStageIDs must contain nonblank stage IDs without NUL or newlines.")
+        if len(set(keepStageIDs)) != len(keepStageIDs):
+            raise ValueError("keepStageIDs must not contain duplicates.")
+
+        stages, bindings = self._getCommittedImageStages()
+        byID = {stage["stageID"]: stage for stage in stages}
+        unknownIDs = set(keepStageIDs) - set(byID)
+        if unknownIDs:
+            raise ValueError(f"Requested retained image stages are not declared: {sorted(unknownIDs)}")
+
+        persistentPins = self._getKeptImageStageIDs(stages)
+        protectedIDs = set(keepStageIDs) | persistentPins
+
+        scans = list(self.scans)
+        scanPositions = {}
+        for index, scan in enumerate(scans):
+            scanPositions.setdefault(scan.uuid, []).append(index)
+
+        # Validate every represented chain before preparing any removal.
+        for scanUUID in sorted({stage["scanUUID"] for stage in stages}):
+            if len(scanPositions.get(scanUUID, [])) != 1:
+                raise ValueError("A replacement acquisition is absent or ambiguous in this MRI collection.")
+
+            current = pglMRIData._resolveImageStage(scanUUID, stages)
+            if current is not None: protectedIDs.add(current["stageID"])
+
+        attachments = dict(self.dataMatrices)
+        usedMatrixNames = set()
+
+        for stage in stages:
+            identifier = stage["stageID"]
+            matrixName = stage["matrixName"]
+
+            if matrixName in usedMatrixNames:
+                raise ValueError("Multiple image stages declare the same matrix attachment name.")
+            usedMatrixNames.add(matrixName)
+
+            matrix = attachments.get(matrixName)
+            if matrix is None:
+                if matrixName in attachments:
+                    raise TypeError(f"Image attachment {matrixName!r} is None.")
+                if identifier in protectedIDs:
+                    raise ValueError(f"Cannot retain unavailable image stage {identifier!r}.")
+                continue
+
+            # Never remove unrelated data that reused a historical matrix name.
+            if not isinstance(matrix, pglDataMatrix):
+                raise TypeError(f"Image attachment {matrixName!r} is not a pglDataMatrix.")
+            if matrix.uuid != bindings[identifier]["matrixUUID"]:
+                raise ValueError(f"Image attachment {matrixName!r} has a different matrix UUID.")
+
+            image = pglMRIData.validate(matrix)
+            metadata = image.attrs["pglMRI"]
+            if metadata["scanUUID"] != stage["scanUUID"] or metadata["sourceStageID"] != identifier:
+                raise ValueError(f"Image attachment {matrixName!r} disagrees with its declared stage.")
+            if matrix._failedActionIDs:
+                raise ValueError(f"Image attachment {matrixName!r} has unresolved action failures.")
+
+        releasedNames = sorted(
+            stage["matrixName"]
+            for stage in stages
+            if stage["stageID"] not in protectedIDs
+            and stage["matrixName"] in attachments
+        )
+
+        result = {
+            "dryRun": dryRun,
+            "releaseMatrixNames": releasedNames,
+            "retainedImageMatrixNames": sorted(byID[identifier]["matrixName"] for identifier in protectedIDs),
+            "alreadyReleasedStageIDs": sorted(
+                stage["stageID"]
+                for stage in stages
+                if stage["matrixName"] not in attachments
+            ),
+            "persistentlyKeptStageIDs": sorted(persistentPins),
+        }
+
+        if dryRun or not releasedNames:
+            return result
+
+        # Recheck declarations, pins, collections, and attachment identities.
+        currentAttachments = self.dataMatrices
+        if (
+            set(currentAttachments) != set(attachments)
+            or any(currentAttachments[name] is not matrix for name, matrix in attachments.items())
+        ):
+            raise ValueError("MRI matrix attachments changed while preparing retention.")
+
+        currentStages, currentBindings = self._getCommittedImageStages()
+        if currentStages != stages or currentBindings != bindings:
+            raise ValueError("Committed image stages changed while preparing retention.")
+        if self._getKeptImageStageIDs(currentStages) != persistentPins:
+            raise ValueError("Persistent image retention changed while preparing release.")
+        if len(self.scans) != len(scans) or any(left is not right for left, right in zip(self.scans, scans)):
+            raise ValueError("MRI scan collection changed while preparing retention.")
+
+        releasedSet = set(releasedNames)
+
+        # Do not close readers or delete files. Returned views and other
+        # references may still depend on detached matrices.
+        self.dataMatrices = {
+            name: matrix
+            for name, matrix in attachments.items()
+            if name not in releasedSet
+        }
+
+        return result
+    
+    def _getKeptImageStageIDs(self, stages=None):
+        """Read and validate persistent image-retention annotations.
+
+        Annotations live in scan.metadata["imageRetention"]:
+            {"schemaVersion": 1, "keepStageIDs": [...]}
+
+        Uses committed stage declarations, not attachment names or timestamps.
+        Does not read scientific arrays or modify metadata.
+
+        A declared pin must identify a committed stage of that acquisition.
+        Payload availability is checked by retention/access operations.
+        """
+        if stages is None:
+            stages, _ = self._getCommittedImageStages()
+
+        byID = {stage["stageID"]: stage for stage in stages}
+        kept = set()
+        annotatedScans = set()
+
+        for scan in self.scans:
+            if "imageRetention" not in scan.metadata: continue
+
+            if scan.uuid in annotatedScans:
+                raise ValueError("Retention annotations contain an ambiguous scan UUID.")
+            annotatedScans.add(scan.uuid)
+
+            record = scan.metadata["imageRetention"]
+            if (
+                type(record) is not dict
+                or set(record) != {"schemaVersion", "keepStageIDs"}
+                or type(record["schemaVersion"]) is not int
+                or record["schemaVersion"] != 1
+            ):
+                raise ValueError("Invalid image-retention metadata.")
+
+            identifiers = record["keepStageIDs"]
+            if (
+                type(identifiers) is not list
+                or any(not isinstance(value, str) or not value.strip() for value in identifiers)
+                or len(set(identifiers)) != len(identifiers)
+            ):
+                raise ValueError("keepStageIDs must contain unique nonblank stage IDs.")
+
+            for identifier in identifiers:
+                stage = byID.get(identifier)
+                if stage is None or stage["scanUUID"] != scan.uuid:
+                    raise ValueError("A persistent retention annotation does not identify a committed stage of its scan.")
+                kept.add(identifier)
+
+        return kept
+
+    def keepImageStage(self, stageID, *, keep=True):
+        """Protect or unprotect a committed image stage from future cleanup.
+
+        keep=True:
+            Require an available, valid replacement matrix and persist its pin.
+
+        keep=False:
+            Remove the pin. Does not immediately release the attachment.
+
+        Writes only scan.metadata["imageRetention"]. Original sourceMetadata,
+        current-stage selection, arrays, and action history are unchanged.
+
+        Returns the sorted persistent keepStageIDs for the selected scan.
+        Use saveSession() to preserve the annotation in a new checkpoint.
+
+        Does not restore previously released payloads, delete files, or run
+        processing. Must be called outside action execution on a safe session.
+        """
+        from .pglExternalTools import getExecutionRecorder
+
+        session = self._getSession()
+
+        if getExecutionRecorder() is not None:
+            raise RuntimeError("Change image retention outside action execution.")
+        if session._failedActionIDs or self._failedActionIDs:
+            raise ValueError("Cannot change retention on a working object with unresolved action failures.")
+        if type(keep) is not bool:
+            raise TypeError("keep must be Boolean.")
+        if not isinstance(stageID, str) or not stageID.strip():
+            raise ValueError("stageID must be a nonblank string.")
+
+        stages, bindings = self._getCommittedImageStages()
+        existingPins = self._getKeptImageStageIDs(stages)
+        byID = {stage["stageID"]: stage for stage in stages}
+
+        stage = byID.get(stageID)
+        if stage is None:
+            raise ValueError("stageID must identify a committed derived image stage.")
+
+        matches = [scan for scan in self.scans if scan.uuid == stage["scanUUID"]]
+        if len(matches) != 1:
+            raise ValueError("The image stage's acquisition is absent or ambiguous.")
+        scan = matches[0]
+
+        # Validate the chain even when removing a pin. Retention must not conceal
+        # malformed lineage or competing replacements.
+        pglMRIData._resolveImageStage(scan.uuid, stages, stageID=stageID)
+
+        if keep:
+            matrix = self.dataMatrices.get(stage["matrixName"])
+            if not isinstance(matrix, pglDataMatrix):
+                raise ValueError("Cannot protect a released or unavailable image matrix.")
+            if matrix.uuid != bindings[stageID]["matrixUUID"]:
+                raise ValueError("Image attachment UUID differs from its committed stage.")
+            if matrix._failedActionIDs:
+                raise ValueError("The image matrix has unresolved action failures.")
+
+            image = pglMRIData.validate(matrix)
+            metadata = image.attrs["pglMRI"]
+            if metadata["scanUUID"] != scan.uuid or metadata["sourceStageID"] != stageID:
+                raise ValueError("Image matrix metadata differs from its committed stage.")
+
+        selectedPins = {
+            identifier for identifier in existingPins
+            if byID[identifier]["scanUUID"] == scan.uuid
+        }
+
+        if keep:
+            selectedPins.add(stageID)
+        else:
+            selectedPins.discard(stageID)
+
+        identifiers = sorted(selectedPins)
+        updated = scan.updateMetadata(
+            "imageRetention",
+            schemaVersion=1,
+            keepStageIDs=identifiers,
+        )
+        if updated is None:
+            raise RuntimeError("Image retention metadata was not updated.")
+
+        return identifiers
+    
+    
     
 ################################################################
 # MRI acquisition bundles
@@ -5100,3 +6200,560 @@ class pglMRITransforms:
                 "No already-corrected image is used as input."
             ),
         }
+        
+################################################################
+#    pglMRIData.py
+#    purpose: MRI image tensors and matrix views
+################################################################
+class pglMRIData:
+    """Construct and inspect MRI matrices using existing PGL storage.
+
+    Stored representation:
+        xarray.DataArray with dimensions (x, y, z, volume).
+
+    Analysis representation:
+        xarray.DataArray with dimensions (voxel, volume).
+
+    Voxel flattening uses C order: z varies fastest, then y, then x.
+    Dimensions describe array axes, not anatomical directions.
+
+    These helpers do not select current stages, attach session products,
+    publish database records, or delete storage.
+
+    Ordinary pglDataMatrix objects are used so existing Zarr/database
+    persistence remains authoritative.
+    """
+
+    contract = "pgl.mri.image.v1"
+
+    @classmethod
+    def fromNifti(cls, filename, *, scanUUID, sourceStageID, volumeIndices=None, name=None):
+        """Construct a lazy MRI tensor from an explicitly resolved NIfTI.
+
+        filename:
+            Existing local source selected by the image-source resolver.
+
+        scanUUID:
+            Acquisition identity associated with this image.
+
+        sourceStageID:
+            Exact scientific source stage, not a filename or display name.
+
+        volumeIndices:
+            Original acquisition indices in stored volume order.
+            None is permitted only for an acquisition stage.
+
+        Reads image/header metadata, not voxel arrays. Deferred reads apply
+        NIfTI scaling and convert values to float32.
+
+        The source file must remain unchanged and available while readers
+        depend on it. Source-byte verification belongs to the resolver.
+
+        Does not attach the result to a session or write Zarr data.
+        """
+        from pathlib import Path
+
+        import dask.array as da
+        import nibabel as nib
+        import xarray as xr
+
+        from .pglMRI import pglMRIScan, pglMRINiftiMetadata
+
+        for label, value in (("scanUUID", scanUUID), ("sourceStageID", sourceStageID)):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{label} must be a nonblank string.")
+
+        if name is not None and (not isinstance(name, str) or not name.strip()):
+            raise ValueError("name must be a nonblank string or None.")
+
+        path = Path(filename).expanduser().absolute()
+        if not path.is_file() or not path.name.lower().endswith((".nii", ".nii.gz")):
+            raise ValueError("MRI import requires an existing local .nii or .nii.gz file.")
+
+        image = nib.load(str(path), mmap=True)
+        if not isinstance(image, (nib.Nifti1Image, nib.Nifti2Image)):
+            raise TypeError("MRI import requires a single-file NIfTI image.")
+        if len(image.shape) != 4 or any(size <= 0 for size in image.shape):
+            raise ValueError("MRI time-series import requires a nonempty four-dimensional image.")
+        if np.dtype(image.get_data_dtype()).kind not in "iuf":
+            raise TypeError("MRI time-series import supports real integer and floating-point values.")
+
+        count = int(image.shape[3])
+
+        if volumeIndices is None:
+            if sourceStageID != f"acquisition:{scanUUID}":
+                raise ValueError("Derived sources require explicit original-volume indices.")
+            volumeIndices = list(range(count))
+        else:
+            volumeIndices = list(volumeIndices)
+
+        if (
+            len(volumeIndices) != count
+            or any(type(index) is not int or index < 0 for index in volumeIndices)
+            or len(set(volumeIndices)) != count
+        ):
+            raise ValueError("Supply one unique nonnegative original-volume index per stored volume.")
+
+        affine = np.asarray(image.affine, dtype=float)
+        if affine.shape != (4, 4) or not np.isfinite(affine).all():
+            raise ValueError("The selected image must have a finite 4x4 affine.")
+
+        # Reuse the existing header-summary implementation. This temporary
+        # wrapper inspects the supplied image; it does not reopen the source.
+        headerScan = pglMRIScan()
+        headerScan._data = image
+        summary = headerScan.getScanSummary(readHeaders=False)
+
+        # One volume per source-read task. A lock protects proxy reads, and
+        # explicit meta prevents Dask from probing scientific array values.
+        # asarray=True applies NiBabel proxy scaling before float32 conversion.
+        values = da.from_array(
+            image.dataobj,
+            chunks=(*image.shape[:3], 1),
+            name=False,
+            lock=True,
+            asarray=True,
+            fancy=False,
+            meta=np.empty((0, 0, 0, 0), dtype=image.get_data_dtype()),
+        ).astype(np.float32)
+
+        metadata = {
+            "contract": cls.contract,
+            "scanUUID": scanUUID,
+            "sourceStageID": sourceStageID,
+            "spatialShape": [int(size) for size in image.shape[:3]],
+            "volumeIndices": volumeIndices,
+            "voxelOrder": "C",
+            "affine": affine.tolist(),
+            "spatialUnits": summary["spatialUnits"],
+            "trSeconds": summary["trSeconds"],
+            "intensityScaling": "NIfTI scaling applied to array values",
+            "nifti": pglMRINiftiMetadata.fromData(image),
+        }
+
+        data = xr.DataArray(
+            values,
+            dims=("x", "y", "z", "volume"),
+            name="image",
+            attrs={"pglMRI": metadata},
+        )
+        matrix = pglDataMatrix(data, name=name or f"mri.{scanUUID}")
+        matrix.provenance = {
+            "operation": "importNifti",
+            "scanUUID": scanUUID,
+            "sourceStageID": sourceStageID,
+            "outputDtype": "float32",
+        }
+
+        cls.validate(matrix)
+        return matrix
+
+    @classmethod
+    def validate(cls, matrix):
+        """Validate MRI structure and metadata without computing array values.
+
+        Returns the image DataArray.
+
+        This checks the representation, not voxel finiteness, anatomical
+        alignment, source integrity, or correctness of volume correspondence.
+        """
+        import math
+
+        import xarray as xr
+
+        if not isinstance(matrix, pglDataMatrix):
+            raise TypeError("Expected a pglDataMatrix.")
+
+        data = matrix.requireData()
+        if not isinstance(data, xr.DataArray):
+            raise TypeError("An MRI image matrix must contain an xarray.DataArray.")
+        if tuple(data.dims) != ("x", "y", "z", "volume"):
+            raise ValueError("MRI image dimensions must be (x, y, z, volume).")
+        if any(size <= 0 for size in data.shape):
+            raise ValueError("MRI image dimensions must be nonempty.")
+        if np.dtype(data.dtype).kind not in "iuf":
+            raise TypeError("MRI image values must be real numerical data.")
+
+        metadata = data.attrs.get("pglMRI")
+        if not isinstance(metadata, dict) or metadata.get("contract") != cls.contract:
+            raise ValueError("Missing or unsupported MRI image metadata.")
+
+        for field in ("scanUUID", "sourceStageID"):
+            value = metadata.get(field)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"MRI metadata requires {field}.")
+
+        if metadata.get("spatialShape") != list(data.shape[:3]):
+            raise ValueError("MRI spatialShape disagrees with the stored array.")
+        if metadata.get("voxelOrder") != "C":
+            raise ValueError("Unsupported MRI voxel flattening order.")
+
+        indices = metadata.get("volumeIndices")
+        if (
+            type(indices) is not list
+            or len(indices) != data.shape[3]
+            or any(type(index) is not int or index < 0 for index in indices)
+            or len(set(indices)) != len(indices)
+        ):
+            raise ValueError("MRI volumeIndices must identify every stored volume uniquely.")
+
+        affine = np.asarray(metadata.get("affine"), dtype=float)
+        if affine.shape != (4, 4) or not np.isfinite(affine).all():
+            raise ValueError("MRI affine must be finite and 4x4.")
+        if not np.allclose(affine[3], [0, 0, 0, 1], rtol=0, atol=1e-10):
+            raise ValueError("MRI affine must have a homogeneous last row.")
+        try:
+            np.linalg.inv(affine[:3, :3])
+        except np.linalg.LinAlgError:
+            raise ValueError("MRI affine must have an invertible spatial mapping.") from None
+
+        if metadata.get("spatialUnits") not in ("unknown", "m", "mm", "um"):
+            raise ValueError("Unsupported MRI spatial units.")
+
+        trSeconds = metadata.get("trSeconds")
+        if trSeconds is not None and (
+            type(trSeconds) not in (int, float)
+            or not math.isfinite(trSeconds)
+            or trSeconds <= 0
+        ):
+            raise ValueError("MRI trSeconds must be positive and finite, or None.")
+
+        return data
+
+    @classmethod
+    def getDataMatrix(cls, matrix, *, lazy=True):
+        """Return a (voxel, volume) analysis view without changing its owner.
+
+        Default:
+            Preserve lazy backing and do not read scientific values.
+
+        lazy=False:
+            Compute an independent analysis result and reject nonfinite values.
+            Does not replace the stored image tensor.
+
+        Voxel index:
+            ((x * ny) + y) * nz + z
+
+        The returned xarray object is a view, not a separately owned PGL
+        product. Keep its source matrix open for deferred reads.
+        """
+        from copy import deepcopy
+
+        import xarray as xr
+
+        if type(lazy) is not bool:
+            raise TypeError("lazy must be Boolean.")
+
+        data = cls.validate(matrix)
+        metadata = deepcopy(data.attrs["pglMRI"])
+        voxelCount = int(np.prod(data.shape[:3], dtype=np.int64))
+        values = data.data.reshape((voxelCount, data.shape[3]))
+
+        result = xr.DataArray(
+            values,
+            dims=("voxel", "volume"),
+            name="image",
+            coords={
+                "originalVolumeIndex": (
+                    "volume",
+                    np.asarray(metadata["volumeIndices"], dtype=np.int64),
+                ),
+            },
+            attrs={"pglMRI": metadata},
+        )
+
+        if not lazy:
+            result = result.compute()
+            if not np.isfinite(result.data).all():
+                raise ValueError("Selected MRI data contains nonfinite values.")
+
+        return result
+    
+    @staticmethod
+    def _resolveImageStage(scanUUID, stages, *, stageID=None):
+        """Resolve one explicit, unbranched acquisition replacement chain.
+
+        stages:
+            List of stage records already selected from successful, committed
+            action products. The caller must verify their producer identities.
+
+            Each record contains exactly:
+                scanUUID
+                stageID
+                matrixName
+                inputStageID
+                replacesStageID
+
+        inputStageID:
+            Scientific image input used to generate this stage.
+
+        replacesStageID:
+            Previous current stage displaced by this result.
+
+        Those links can differ. For example, a combined motion correction can
+        read the acquisition while replacing a prior corrected result.
+
+        stageID:
+            None selects the unique current stage.
+            An explicit acquisition or historical stage selects that version.
+
+        Returns:
+            None for the original acquisition.
+            An independent stage dictionary for a derived image.
+
+        Validates the selected scan's complete chain before selection.
+        Missing predecessors, cycles, disconnected records, and competing
+        replacements raise. Scientific inputs must be earlier chain stages
+        or the original acquisition.
+
+        Does not inspect payload availability, open arrays, mutate records,
+        choose by timestamps, publish stages, or delete intermediates.
+
+        Historical stages remain in the chain after their payloads are
+        released. Payload availability is checked separately at data access.
+        """
+        from copy import deepcopy
+
+        def requireText(value, label):
+            if (
+                not isinstance(value, str) or not value.strip()
+                or any(character in value for character in ("\x00", "\n", "\r"))
+            ):
+                raise ValueError(f"{label} must be a nonblank string without NUL or newlines.")
+
+        requireText(scanUUID, "scanUUID")
+        if stageID is not None: requireText(stageID, "stageID")
+        if type(stages) is not list:
+            raise TypeError("stages must be a list.")
+
+        acquisitionID = f"acquisition:{scanUUID}"
+        expectedFields = {
+            "scanUUID", "stageID", "matrixName",
+            "inputStageID", "replacesStageID",
+        }
+        byID = {}
+        allIDs = set()
+
+        for record in stages:
+            if type(record) is not dict or set(record) != expectedFields:
+                raise ValueError("Invalid image-stage record fields.")
+
+            for field in expectedFields:
+                requireText(record[field], field)
+
+            identifier = record["stageID"]
+            if identifier.startswith("acquisition:"):
+                raise ValueError("Derived stages must not use acquisition stage identities.")
+            if identifier in allIDs:
+                raise ValueError(f"Repeated image-stage identity: {identifier!r}.")
+            allIDs.add(identifier)
+
+            if record["scanUUID"] != scanUUID: continue
+            byID[identifier] = record
+
+        # Every predecessor must belong to this scan or be its acquisition.
+        # A replacement cannot silently cross scan identities.
+        successors = {}
+
+        for identifier, record in byID.items():
+            previousID = record["replacesStageID"]
+
+            if previousID != acquisitionID and previousID not in byID:
+                raise ValueError(f"Stage {identifier!r} has an unavailable replacement predecessor.")
+            if previousID == identifier:
+                raise ValueError("An image stage cannot replace itself.")
+            if previousID in successors:
+                raise ValueError(
+                    f"Competing image replacements for {previousID!r}. "
+                    "Resolve the branch explicitly before selecting current data."
+                )
+
+            successors[previousID] = identifier
+
+        # Walk from the acquisition; every record must belong to this chain.
+        # This rejects disconnected cycles as well as ordinary dangling links.
+        visited = set()
+        ancestors = {acquisitionID}
+        currentID = acquisitionID
+
+        while currentID in successors:
+            nextID = successors[currentID]
+            if nextID in visited:
+                raise ValueError("Image replacement chain contains a cycle.")
+
+            record = byID[nextID]
+            if record["inputStageID"] not in ancestors:
+                raise ValueError(
+                    f"Stage {nextID!r} does not identify an earlier stage "
+                    "of this acquisition as its scientific input."
+                )
+
+            visited.add(nextID)
+            ancestors.add(nextID)
+            currentID = nextID
+
+        if visited != set(byID):
+            raise ValueError("Image replacement records contain a disconnected or cyclic chain.")
+
+        selectedID = currentID if stageID is None else stageID
+
+        if selectedID == acquisitionID:
+            return None
+        if selectedID not in byID:
+            raise ValueError(f"Requested image stage {selectedID!r} is unavailable for this scan.")
+
+        return deepcopy(byID[selectedID])
+    
+    @staticmethod
+    def prepareVolumeSource(filename, *, cacheDirectory):
+        """Prepare a local NIfTI for efficient repeated volume reads.
+
+        .nii:
+            Return the existing source path without copying.
+
+        .nii.gz:
+            Stream decompressed bytes into a fresh local working directory.
+            Read through gzip EOF to validate its checksum/trailer.
+            Verify that the output header matches the compressed source.
+            Publish the completed .nii by renaming its private staging file.
+
+        Returns:
+            Path to an uncompressed .nii suitable for NiBabel memory mapping.
+
+        Does not load voxel arrays, apply NIfTI scaling, resample images, or
+        modify acquisition bindings/provenance.
+
+        Source identity verification remains the caller's responsibility.
+        The acquisition must remain unchanged throughout processing.
+
+        Progress reports compressed input bytes consumed, not output volume
+        count. Text messages are also captured by the action console logger.
+
+        Each compressed-source call creates a new working copy. Reuse and
+        automatic eviction are deliberately not inferred from filenames.
+        Successful files remain available for dependent readers. Failed
+        preparation removes its own private directory only.
+        """
+        import gzip
+        import os
+        import shutil
+        import tempfile
+        import time
+        from pathlib import Path
+
+        from .pglProgress import pglProgress
+
+        sourcePath = Path(filename).expanduser().absolute()
+        if not sourcePath.is_file():
+            raise FileNotFoundError(f"NIfTI source is unavailable: {sourcePath}")
+
+        lowerName = sourcePath.name.lower()
+        if lowerName.endswith(".nii"):
+            return sourcePath
+        if not lowerName.endswith(".nii.gz"):
+            raise ValueError("Volume preparation requires a .nii or .nii.gz source.")
+
+        cacheText = os.fspath(cacheDirectory)
+        if (
+            not isinstance(cacheText, str) or not cacheText.strip()
+            or "://" in cacheText or "::" in cacheText
+            or any(character in cacheText for character in ("\x00", "\n", "\r"))
+        ):
+            raise ValueError("cacheDirectory must be an ordinary local path.")
+
+        # Header-only interpretation; preserve original encoded fields,
+        # including dtype, scaling, geometry, extensions, and voxel offset.
+        sourceHeader = pglMRINiftiMetadata.read(sourcePath)
+
+        cacheRoot = Path(cacheText).expanduser().absolute() / "mriVolumeSources"
+        cacheRoot.mkdir(parents=True, exist_ok=True)
+        directory = Path(tempfile.mkdtemp(prefix="source-", dir=cacheRoot))
+        stagedPath = directory / "image.nii.partial"
+        outputPath = directory / "image.nii"
+
+        started = time.monotonic()
+        lastTextUpdate = started
+        lastBarUpdate = started
+        outputBytes = 0
+
+        statusOutput(f"Preparing memory-mapped volume source: {sourcePath}", flush=True)
+        statusOutput(f"  Uncompressed working copy: {outputPath}", flush=True)
+
+        try:
+            with sourcePath.open("rb") as compressed:
+                before = os.fstat(compressed.fileno())
+                compressedSize = before.st_size
+
+                with pglProgress("Decompressing MRI acquisition once") as progress:
+                    progress(0, "Streaming gzip bytes to an uncompressed working file")
+
+                    with gzip.GzipFile(fileobj=compressed, mode="rb") as incoming:
+                        with stagedPath.open("xb") as outgoing:
+                            while True:
+                                block = incoming.read(4 * 1024 * 1024)
+                                if not block: break
+
+                                if outgoing.write(block) != len(block):
+                                    raise OSError("Incomplete uncompressed MRI write.")
+                                outputBytes += len(block)
+
+                                now = time.monotonic()
+                                consumed = compressed.tell()
+
+                                if now - lastBarUpdate >= 0.5:
+                                    # Reserve completion for checksum, flush,
+                                    # source-change checks, and header validation.
+                                    fraction = 0.95 * consumed / max(compressedSize, 1)
+                                    progress(
+                                        min(fraction, 0.95),
+                                        f"Input {consumed / (1024 ** 2):,.1f} / "
+                                        f"{compressedSize / (1024 ** 2):,.1f} MiB; "
+                                        f"output {outputBytes / (1024 ** 2):,.1f} MiB",
+                                    )
+                                    lastBarUpdate = now
+
+                                if now - lastTextUpdate >= 10:
+                                    statusOutput(
+                                        f"  Decompression: input "
+                                        f"{consumed / (1024 ** 2):,.1f} / "
+                                        f"{compressedSize / (1024 ** 2):,.1f} MiB; "
+                                        f"output {outputBytes / (1024 ** 2):,.1f} MiB; "
+                                        f"{now - started:,.1f}s elapsed",
+                                        flush=True,
+                                    )
+                                    lastTextUpdate = now
+
+                            outgoing.flush()
+                            os.fsync(outgoing.fileno())
+
+                    after = os.fstat(compressed.fileno())
+                    if (
+                        after.st_size != before.st_size
+                        or after.st_mtime_ns != before.st_mtime_ns
+                    ):
+                        raise ValueError("Compressed acquisition changed during preparation.")
+
+                    if outputBytes == 0 or stagedPath.stat().st_size != outputBytes:
+                        raise ValueError("Uncompressed MRI has an invalid output size.")
+
+                    # The directory is private and uniquely created by this call.
+                    stagedPath.rename(outputPath)
+                    progress(0.97, "Validating the uncompressed NIfTI header")
+
+                    if pglMRINiftiMetadata.read(outputPath) != sourceHeader:
+                        raise ValueError("Decompression changed the NIfTI header representation.")
+
+                    progress.finish("Uncompressed volume source ready")
+
+            statusOutput(
+                f"Volume source ready: {outputBytes / (1024 ** 2):,.1f} MiB "
+                f"in {time.monotonic() - started:,.1f}s",
+                flush=True,
+            )
+            return outputPath
+
+        except BaseException:
+            # Delete only this call's private, incomplete preparation.
+            # Never remove acquisition sources or an existing cache directory.
+            shutil.rmtree(directory, ignore_errors=True)
+            raise

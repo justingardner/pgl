@@ -8,6 +8,7 @@
 #############
 # Import
 #############
+from .pglActionProgress import actionProgress, operationProgress, currentProgress, progressCall, statusOutput, noProgressBar, daskProgress
 from .pglMessages import pglMessages
 from .pglSettings import pglTraitSettings
 from datetime import datetime
@@ -26,6 +27,191 @@ from .pglSerialize import pglSerialize
 # Track the active execution, not the action instance. ContextVar keeps
 # independent execution contexts separate and supports nested action calls.
 _activeActionID = ContextVar("pglActiveActionID", default=None)
+
+class pglActionConsoleCapture:
+    """Tee Python console output to live streams and persistent local files.
+
+    Files are flushed on every write. Original streams are never closed.
+
+    Nested actions on the same thread are supported: child output also passes
+    through the parent's tee. Concurrent action capture on different threads
+    is rejected because Python stream redirection is process-global.
+
+    Unrelated background-thread output may appear in the transcript.
+
+    Does not intercept native file-descriptor writes, rich notebook display()
+    output, or handlers holding previously cached stream references.
+    External-command logging remains the responsibility of tool adapters.
+    """
+
+    from threading import RLock
+
+    _captureLock = RLock()
+
+    class _Tee:
+        """A text stream forwarding output without owning the live stream."""
+
+        def __init__(self, display, logfile):
+            from threading import RLock
+
+            self.display = display
+            self.logfile = logfile
+            self.captureErrors = []
+            self._lock = RLock()
+
+        def _recordError(self, error):
+            message = f"{type(error).__name__}: {error}"
+            if message not in self.captureErrors: self.captureErrors.append(message)
+
+        def write(self, text):
+            if not isinstance(text, str):
+                raise TypeError("Action console capture expects text.")
+
+            with self._lock:
+                # Keep diagnostic files useful even if the display later fails.
+                # Disk errors do not silently masquerade as complete capture.
+                try:
+                    written = self.logfile.write(text)
+                    if written != len(text):
+                        raise OSError("Incomplete action transcript write.")
+                    self.logfile.flush()
+                except Exception as error:
+                    self._recordError(error)
+
+                if self.display is not None:
+                    self.display.write(text)
+                    self.display.flush()
+
+            return len(text)
+
+        def flush(self):
+            with self._lock:
+                try:
+                    self.logfile.flush()
+                except Exception as error:
+                    self._recordError(error)
+
+                if self.display is not None:
+                    self.display.flush()
+
+        def isatty(self):
+            return bool(self.display is not None and getattr(self.display, "isatty", lambda: False)())
+
+        def writable(self):
+            return True
+
+        def fileno(self):
+            from io import UnsupportedOperation
+
+            # Exposing a descriptor would let callers bypass Python capture.
+            raise UnsupportedOperation("Action console tee has no file descriptor.")
+
+        @property
+        def encoding(self):
+            return getattr(self.display, "encoding", None) or "utf-8"
+
+        @property
+        def errors(self):
+            return getattr(self.display, "errors", None) or "replace"
+
+        @property
+        def closed(self):
+            return self.logfile.closed
+
+    def __init__(self, cacheDirectory=None):
+        self.cacheDirectory = cacheDirectory
+        self.directory = None
+        self.paths = {}
+        self.streams = {}
+        self._stack = None
+        self._locked = False
+
+    def __enter__(self):
+        import os
+        import sys
+        import tempfile
+        from contextlib import ExitStack, redirect_stderr, redirect_stdout
+        from pathlib import Path
+
+        if not self._captureLock.acquire(blocking=False):
+            raise RuntimeError(
+                "Another thread is running an action with console capture. "
+                "Run actions serially or in separate processes."
+            )
+        self._locked = True
+        stack = ExitStack()
+
+        try:
+            if self.cacheDirectory is None:
+                root = Path.home() / ".cache" / "pgl" / "actionLogs"
+            else:
+                text = os.fspath(self.cacheDirectory)
+                if (
+                    not isinstance(text, str) or not text.strip()
+                    or "://" in text or "::" in text
+                    or any(character in text for character in ("\x00", "\n", "\r"))
+                ):
+                    raise ValueError("Action log cacheDirectory must be an ordinary local path.")
+                root = Path(text).expanduser().absolute() / "actionLogs"
+
+            root.mkdir(parents=True, exist_ok=True)
+            self.directory = Path(tempfile.mkdtemp(prefix="python-", dir=root))
+            self.paths = {
+                "stdout": self.directory / "stdout.log",
+                "stderr": self.directory / "stderr.log",
+            }
+
+            stdoutFile = stack.enter_context(self.paths["stdout"].open("x", encoding="utf-8"))
+            stderrFile = stack.enter_context(self.paths["stderr"].open("x", encoding="utf-8"))
+
+            self.streams = {
+                "stdout": self._Tee(sys.stdout, stdoutFile),
+                "stderr": self._Tee(sys.stderr, stderrFile),
+            }
+
+            # ExitStack restores streams before closing their transcript files.
+            stack.enter_context(redirect_stdout(self.streams["stdout"]))
+            stack.enter_context(redirect_stderr(self.streams["stderr"]))
+
+            self._stack = stack
+            return self
+
+        except BaseException:
+            try:
+                stack.close()
+            finally:
+                self._captureLock.release()
+                self._locked = False
+            raise
+
+    def __exit__(self, exceptionType, exceptionValue, traceback):
+        try:
+            for stream in self.streams.values():
+                try:
+                    stream.flush()
+                except Exception as error:
+                    stream._recordError(error)
+
+            try:
+                self._stack.close()
+            except Exception as error:
+                # Preserve the original scientific exception/outcome. Stream
+                # restoration callbacks still run through ExitStack.
+                for stream in self.streams.values():
+                    stream._recordError(error)
+        finally:
+            if self._locked:
+                self._captureLock.release()
+                self._locked = False
+
+        return False
+
+    @property
+    def captureErrors(self):
+        return {
+            name: list(stream.captureErrors)
+            for name, stream in self.streams.items()
+        }
 
 ########################
 # action status
@@ -354,6 +540,93 @@ class pglActionHistory(pglTraitSettings):
                     )
 
         self.actionLogs = logs
+        
+    def _preserveConsoleLogs(self, capture, owners):
+        """Record and attach closed Python stdout/stderr transcripts.
+
+        Uses the existing actionLogs layout, so history(showLogs=True) works
+        without a separate viewer or fabricated external-command invocation.
+
+        Called only after capture exits: file identities must describe closed,
+        finalized files, not transcripts still receiving output.
+
+        Local files remain available even when attachment fails. Incomplete
+        capture is recorded explicitly rather than labeled fully archived.
+
+        Does not alter scientific outcome, products, or failure flags.
+        Does not replace existing external-command log records.
+        """
+        from copy import deepcopy
+        from pathlib import Path
+
+        from .pglExternalTools import pglExternalTool
+
+        logs = deepcopy(self.actionLogs)
+        consoleKey = f"action:{self.actionID}:console"
+
+        if consoleKey in logs:
+            raise ValueError("Python console logs are already finalized for this execution.")
+
+        captureErrors = capture.captureErrors
+        streams = {}
+
+        for stream in ("stdout", "stderr"):
+            attachmentName = f"action.{self.actionID}.console.{stream}"
+            record = {
+                "attachmentName": attachmentName,
+                "archiveStatus": "unavailable",
+            }
+            streams[stream] = record
+
+            try:
+                path = Path(capture.paths[stream])
+                record["originalPath"] = str(path)
+                record["localPath"] = str(path)
+
+                identity = pglExternalTool._fileIdentity(path)
+                record.update(identity)
+
+                errors = list(captureErrors.get(stream, []))
+                if not errors:
+                    record["archiveStatus"] = "archived"
+
+                # Each owner receives its own attachment record referencing
+                # the same immutable finalized transcript.
+                for owner in owners:
+                    if not callable(getattr(owner, "addDerivedFile", None)): continue
+                    if not hasattr(owner, "derivedFiles"): continue
+
+                    try:
+                        attachment = owner.derivedFiles.get(attachmentName)
+                        if attachment is None:
+                            owner.addDerivedFile(attachmentName, path, mediaType="text/plain")
+                            attachment = owner.derivedFiles.get(attachmentName)
+
+                        if attachment is None or any(
+                            attachment.get(key) != value for key, value in identity.items()
+                        ):
+                            raise ValueError("Console attachment identity differs from its transcript.")
+
+                    except Exception as error:
+                        errors.append(f"Attachment to {type(owner).__name__}: {type(error).__name__}: {error}")
+
+                if errors:
+                    record["error"] = "; ".join(errors)
+
+            except Exception as error:
+                record["error"] = f"{type(error).__name__}: {error}"
+
+        logs[consoleKey] = streams
+        self.actionLogs = logs
+
+        # These warnings happen after transcript closure. They cannot safely be
+        # appended to files whose identities have already been registered.
+        for stream, record in streams.items():
+            if record.get("error"):
+                pglMessages.warning(
+                    f"Action {self.actionID} {stream} log preservation: {record['error']}",
+                    level=1,
+                )
            
 
 ########################
@@ -387,18 +660,22 @@ class pglActionable(pglTraitSettings):
             Include aligned product-kind summaries beneath each action.
 
         history(verbose=True):
-            Include configuration settings for each action.
+            Include bounded configuration settings for each action and
+            technical product-summary metadata when showProducts=True.
 
         history(index):
             Detailed action information, including available log references.
+            Negative indices count from the end, just like a Python list:
+            history(-1) selects the last action; history(-2) the preceding one.
+            The displayed history index remains nonnegative.
 
         history(index, showLogs=True, tail=None):
             Retrieve and print logs. tail optionally limits each log to its
             final N lines. None prints the complete contents.
 
         Legacy history(True/False) remains a positional verbose setting.
-        Product summaries read history metadata only. The existing self.print()
-        overview may resolve object-specific metadata, such as session labels.
+        Listing and product summaries read history metadata only.
+        No session/run overview is printed.
         Only showLogs requests log payload retrieval.
         """
         import shlex
@@ -419,10 +696,17 @@ class pglActionable(pglTraitSettings):
             raise ValueError("tail must be a positive integer or None.")
         if showLogs and actionIndex is None:
             raise ValueError("Select a history index when requesting log contents.")
-        if actionIndex is not None and not 0 <= actionIndex < len(self.actionHistory):
-            raise ValueError("actionIndex is outside this object's history.")
 
-        #self.print()
+        # Accept Python-style negative indexing, then normalize for display.
+        # Out-of-bounds selection warns and returns without printing history.
+        if actionIndex is not None:
+            historyCount = len(self.actionHistory)
+            if not -historyCount <= actionIndex < historyCount:
+                validRange = f"-{historyCount} through {historyCount - 1}" if historyCount else "(history is empty)"
+                pglMessages.warning(f"actionIndex {actionIndex} is outside this object's history. Valid indices: {validRange}.", level=1)
+                return
+            if actionIndex < 0: actionIndex += historyCount
+            
         pglMessages.printHeader("action history")
 
         if self._failedActionIDs:
@@ -1632,6 +1916,7 @@ class pglAction(pglActionable):
     name = Unicode("", help="Name of action")
     status = Instance(pglActionStatus, help="action status")
     error = Instance(Exception, allow_none=True, default_value=None, help="error")
+    keepIntermediates = Bool(False, help="Keep superseded MRI image attachments after this action. False releases unpinned intermediates for scans replaced by this execution; files and existing checkpoints are not deleted.")
     # settings for the action, required to be a pglTraitSettings. Subclass should override this
     #settings = Instance(pglTraitSettings, allow_none=True, default_value=None, help='Settings for this action')
     version = Unicode("", help='Verion of pglAction')
@@ -1739,34 +2024,38 @@ class pglAction(pglActionable):
         '''
         return self.status.value >= pglActionStatus.CONFIGURED.value
         
+    @actionProgress
     def run(self, *args, **kwargs):
-        """Execute an action with identity, runtime provenance, and history.
+        """Execute with provenance, live console output, and saved transcripts.
+
+        Python stdout/stderr are displayed live and flushed to separate local
+        files throughout execution, finalization, retention, and presentation.
+
+        Closed transcripts are recorded in actionLogs and attached to history
+        recipients supporting derived files. External-command logs retain their
+        existing independent capture and archival mechanism.
 
         Successful actions attach history to their returned actionable.
-        Failed actions attach history to directly supplied input actionables
-        and any actionable result returned before failure.
+        Failed actions attach history to directly supplied actionables and any
+        actionable result returned before failure. Failure marks these objects
+        unsafe for checkpoint saving; later success does not clear that state.
 
-        Completed command logs are archived and attached to those same
-        recipients when they support derived-file attachments.
+        Nested actions have separate recorders and transcripts. Child console
+        output also appears in the parent's transcript. Concurrent action
+        capture on different threads is rejected.
 
-        Failure marks those working objects unsafe for checkpoint saving.
-        Later successful executions do not clear that state.
+        Ordinary scientific exceptions warn and return None. Interruptions are
+        recorded and propagated. Tracebacks are printed live and saved.
 
-        Runtime environment is captured before scientific execution.
-        Tool adapters automatically record through the active execution context.
-        Nested actions receive separate recorders and restore their parent's
-        recorder when they finish.
+        Log setup failure prevents scientific execution. Archival failures
+        warn without replacing the scientific outcome. Files remain local for
+        diagnosis; partial capture is identified explicitly.
 
-        Explicit setError() failures are preserved.
-        Ordinary scientific exceptions warn and return None.
-        KeyboardInterrupt and SystemExit are recorded and propagated.
-
-        After successful history/product finalization, _afterSuccess() may
-        present already-validated results. Ordinary presentation failures warn
-        at level=1 without changing scientific SUCCESS.
-
-        Scientific mutations are not rolled back.
+        Scientific mutations are not rolled back. Python capture does not
+        intercept native file-descriptor writes or rich notebook display().
         """
+        import traceback
+
         from .pglExternalTools import pglExecutionRecorder
 
         if getattr(self, "_executionInProgress", False):
@@ -1781,8 +2070,8 @@ class pglAction(pglActionable):
 
         inputActionables = []
 
-        # Inspect only directly supplied objects. Discovering provenance
-        # recipients must not open scientific fields or deferred payloads.
+        # Inspect direct arguments only. Discovering recipients must not load
+        # scientific fields, tasks, arrays, or deferred storage.
         for value in (*args, *kwargs.values()):
             if isinstance(value, pglActionable) and value is not self and all(value is not existing for existing in inputActionables):
                 inputActionables.append(value)
@@ -1790,174 +2079,193 @@ class pglAction(pglActionable):
         previousStatus = self.status
         previousError = self.error
         self._executionInProgress = True
+
         entry = None
         result = None
         contextToken = None
         logRecipients = []
+        capture = pglActionConsoleCapture(getattr(self, "cacheDirectory", None))
 
         def appendEntry(owner):
-            # Preserve logs even when history already contains this exact
-            # entry. Avoid repeating the work for the same recipient.
+            """Preserve external logs and attach this exact history object."""
             if owner is not self and all(owner is not existing for existing in logRecipients):
                 logRecipients.append(owner)
 
                 try:
                     entry._preserveLogs(owner, cacheDirectory=getattr(self, "cacheDirectory", None))
                 except Exception as error:
-                    # Archival must not replace an existing scientific error
-                    # or silently change an otherwise successful computation.
                     pglMessages.warning(
-                        f"Could not preserve all logs for action {self.name}: {error}",
+                        f"Could not preserve all external-command logs for action {self.name}: {error}",
                         level=1,
                     )
 
-            # Settings equality compares UUIDs; use identity to detect whether
-            # this exact execution entry has already been attached.
+            # Settings equality can compare UUIDs. History attachment requires
+            # object identity, not equality with a different execution snapshot.
             if owner is not self and all(existing is not entry for existing in owner.actionHistory):
                 owner.actionHistory.append(entry)
 
         try:
-            self.error = None
-            self.status = pglActionStatus.RUNNING
+            with capture:
+                print(f"Action console logs: {capture.directory}", flush=True)
 
-            try:
-                entry = pglActionHistory(self)
+                self.error = None
+                self.status = pglActionStatus.RUNNING
 
-                # Snapshot before scientific execution. Construction/restoration
-                # of history alone never discovers today's environment.
-                recorder = pglExecutionRecorder(actionID=entry.actionID)
-                entry.actionEnvironment = recorder.exportEnvironment()
-                self.actionHistory.append(entry)
-
-            except Exception as error:
-                # Snapshot failure occurs before scientific execution.
-                self.status = previousStatus
-                self.error = previousError
-                pglMessages.warning(
-                    f"Action {self.name} was not started: could not capture execution provenance: {error}"
-                )
-                return None
-
-            except BaseException:
-                self.status = previousStatus
-                self.error = previousError
-                raise
-
-            contextToken = _activeActionID.set(entry.actionID)
-
-            with recorder.activate():
                 try:
-                    result = self._run(*args, **kwargs)
+                    entry = pglActionHistory(self)
+                    recorder = pglExecutionRecorder(actionID=entry.actionID)
+                    entry.actionEnvironment = recorder.exportEnvironment()
+                    self.actionHistory.append(entry)
 
-                    # A wrapper must finalize each invocation even when its
-                    # caller elects to handle the tool's failure explicitly.
-                    recorder.requireComplete()
-
-                    if self.status == pglActionStatus.FAILED or self.error is not None:
-                        self.status = pglActionStatus.FAILED
-
-                        if self.error is None:
-                            self.error = RuntimeError(
-                                f"Action {self.name} reported failure without an error description."
-                            )
-
-                    elif self.status == pglActionStatus.SKIPPED:
-                        pass
-
-                    elif result is None:
-                        self.error = RuntimeError(
-                            f"Action {self.name} returned None without reporting failure or an explicit skip."
-                        )
-                        self.status = pglActionStatus.FAILED
-                        pglMessages.warning(str(self.error))
-
-                    else:
-                        self.status = pglActionStatus.SUCCESS
-
-                except (KeyboardInterrupt, SystemExit) as error:
-                    self.error = RuntimeError(
-                        f"{type(error).__name__}: action execution was interrupted."
+                except Exception as error:
+                    self.status = previousStatus
+                    self.error = previousError
+                    traceback.print_exc()
+                    pglMessages.warning(
+                        f"Action {self.name} was not started: could not capture execution provenance: {error}"
                     )
-                    self.status = pglActionStatus.FAILED
+                    return None
+
+                except BaseException:
+                    self.status = previousStatus
+                    self.error = previousError
+                    traceback.print_exc()
                     raise
 
-                except Exception as error:
-                    self.error = error
-                    self.status = pglActionStatus.FAILED
-                    pglMessages.warning(f"Error running action {self.name}: {error}")
+                contextToken = _activeActionID.set(entry.actionID)
 
-                finally:
-                    # Finalize execution-time provenance independently of the
-                    # scientific outcome. Unfinished attempts remain visible.
-                    recorder.close()
-                    entry.actionEnvironment = recorder.exportEnvironment()
-                    entry.actionInvocations = recorder.exportInvocations()
+                with recorder.activate():
+                    try:
+                        result = self._run(*args, **kwargs)
+                        recorder.requireComplete()
 
-                    if self.status == pglActionStatus.FAILED:
-                        # Even an action returning None may already have mutated
-                        # its input. Mark every direct input conservatively.
-                        for owner in inputActionables:
-                            owner._recordFailedAction(entry.actionID)
+                        if self.status == pglActionStatus.FAILED or self.error is not None:
+                            self.status = pglActionStatus.FAILED
 
-                        # Ingestion may return a partial session without having
-                        # received an input session.
-                        if isinstance(result, pglActionable) and result is not self:
-                            result._recordFailedAction(entry.actionID)
+                            if self.error is None:
+                                self.error = RuntimeError(
+                                    f"Action {self.name} reported failure without an error description."
+                                )
 
-                    entry.update(self)
+                        elif self.status == pglActionStatus.SKIPPED:
+                            pass
 
-                    if self.status == pglActionStatus.SUCCESS and isinstance(result, pglActionable):
-                        # A returned object must not silently erase a direct
-                        # input's unresolved failure state.
-                        for owner in inputActionables:
-                            for failedActionID in owner._failedActionIDs:
-                                result._recordFailedAction(failedActionID)
+                        elif result is None:
+                            self.error = RuntimeError(
+                                f"Action {self.name} returned None without reporting failure or an explicit skip."
+                            )
+                            self.status = pglActionStatus.FAILED
+                            pglMessages.warning(str(self.error))
 
-                        appendEntry(result)
-                    else:
-                        for owner in inputActionables:
-                            appendEntry(owner)
+                        else:
+                            self.status = pglActionStatus.SUCCESS
 
-                        if isinstance(result, pglActionable):
+                    except (KeyboardInterrupt, SystemExit) as error:
+                        self.error = RuntimeError(
+                            f"{type(error).__name__}: action execution was interrupted."
+                        )
+                        self.status = pglActionStatus.FAILED
+                        traceback.print_exc()
+                        raise
+
+                    except Exception as error:
+                        self.error = error
+                        self.status = pglActionStatus.FAILED
+                        traceback.print_exc()
+                        pglMessages.warning(f"Error running action {self.name}: {error}")
+
+                    finally:
+                        # Finalize tool provenance and product commitment using
+                        # the original runner's scientific outcome rules.
+                        recorder.close()
+                        entry.actionEnvironment = recorder.exportEnvironment()
+                        entry.actionInvocations = recorder.exportInvocations()
+
+                        if self.status == pglActionStatus.FAILED:
+                            for owner in inputActionables:
+                                owner._recordFailedAction(entry.actionID)
+
+                            if isinstance(result, pglActionable) and result is not self:
+                                result._recordFailedAction(entry.actionID)
+
+                        entry.update(self)
+
+                        if self.status == pglActionStatus.SUCCESS and isinstance(result, pglActionable):
+                            for owner in inputActionables:
+                                for failedActionID in owner._failedActionIDs:
+                                    result._recordFailedAction(failedActionID)
+
                             appendEntry(result)
 
-                    # Even without a scientific recipient, preserve local logs
-                    # referenced by the action's own execution history.
-                    if not logRecipients:
-                        try:
-                            entry._preserveLogs(self, cacheDirectory=getattr(self, "cacheDirectory", None))
-                        except Exception as error:
-                            pglMessages.warning(f"Could not preserve action logs: {error}", level=1)
+                        else:
+                            for owner in inputActionables:
+                                appendEntry(owner)
 
-            if self.status == pglActionStatus.FAILED:
-                return None
+                            if isinstance(result, pglActionable):
+                                appendEntry(result)
 
-            if self.status == pglActionStatus.SUCCESS:
-                if not isinstance(result, pglActionable):
-                    pglMessages.warning(
-                        f"Action {self.name} returned type {type(result).__name__}; "
-                        "execution history is retained on the action and directly supplied input actionables.",
-                        level=1,
-                    )
+                        # Preserve external-command logs even without a session.
+                        if not logRecipients:
+                            try:
+                                entry._preserveLogs(self, cacheDirectory=getattr(self, "cacheDirectory", None))
+                            except Exception as error:
+                                pglMessages.warning(f"Could not preserve action logs: {error}", level=1)
 
-                # Products are committed and attached before presentation.
-                # This hook must not introduce new scientific processing.
-                try:
-                    self._afterSuccess(result)
-                except Exception as error:
-                    pglMessages.warning(
-                        f"Action {self.name} succeeded, but presenting its results failed: "
-                        f"{type(error).__name__}: {error}",
-                        level=1,
-                    )
+                if self.status == pglActionStatus.FAILED:
+                    return None
 
-            return result
+                if self.status == pglActionStatus.SUCCESS:
+                    if not isinstance(result, pglActionable):
+                        pglMessages.warning(
+                            f"Action {self.name} returned type {type(result).__name__}; "
+                            "execution history is retained on the action and directly supplied input actionables.",
+                            level=1,
+                        )
+
+                    # Preserve the existing retention lifecycle. This runs
+                    # outside this execution's recorder, but inside its tee.
+                    self._finalizeImageRetention(result)
+
+                    try:
+                        self._afterSuccess(result)
+                    except Exception as error:
+                        traceback.print_exc()
+                        pglMessages.warning(
+                            f"Action {self.name} succeeded, but presenting its results failed: "
+                            f"{type(error).__name__}: {error}",
+                            level=1,
+                        )
+
+                return result
 
         finally:
-            if contextToken is not None:
-                _activeActionID.reset(contextToken)
+            # The capture context has exited: original streams are restored
+            # and files are closed before identities are calculated.
+            try:
+                if entry is not None and capture.paths:
+                    owners = []
 
-            self._executionInProgress = False
+                    for owner in [self, *inputActionables, *logRecipients, result]:
+                        if not isinstance(owner, pglActionable): continue
+                        if any(owner is existing for existing in owners): continue
+                        if not any(existing is entry for existing in owner.actionHistory): continue
+                        owners.append(owner)
+
+                    try:
+                        entry._preserveConsoleLogs(capture, owners)
+                    except Exception as error:
+                        pglMessages.warning(
+                            f"Could not attach Python console logs for action {self.name}: "
+                            f"{type(error).__name__}: {error}. "
+                            f"Local transcripts remain at {capture.directory}.",
+                            level=1,
+                        )
+
+            finally:
+                if contextToken is not None:
+                    _activeActionID.reset(contextToken)
+
+                self._executionInProgress = False
     
     def _run(self):
         '''
@@ -2059,7 +2367,7 @@ class pglAction(pglActionable):
     ################################################################
     # Register this execution's named scientific product
     ################################################################
-    def registerProduct(self, name, kind, *, session, files=None, inputProductIDs=None, metadata=None, invocationIDs=None, supersedesProductID=None):
+    def registerProduct(self, name, kind, *, session, files=None, inputProductIDs=None, metadata=None, invocationIDs=None, supersedesProductID=None, productID=None):
         """Register an output using already attached session payloads.
 
         Called inside scientific execution after output validation/attachment.
@@ -2076,9 +2384,19 @@ class pglAction(pglActionable):
         A replacement must retain the previous product's name and kind.
         Its predecessor is automatically recorded as an exact dependency.
 
+        productID:
+            Optional preallocated canonical UUID for complete metadata/payload
+            preparation before registration. None generates a fresh UUID.
+            Must not occur in destination history, including failed attempts.
+
+        Named product supersession is distinct from an MRI image replacement.
+        Image replacement associations are declared explicitly in metadata.
+
         This method does not merge scientific records or request confirmation.
         The owning scientific action must prepare the complete replacement.
         """
+        from uuid import UUID, uuid4
+
         from .pglExternalTools import getExecutionRecorder
 
         recorder = getExecutionRecorder()
@@ -2094,6 +2412,35 @@ class pglAction(pglActionable):
         if not isinstance(session, pglActionable) or not hasattr(session, "derivedFiles"):
             raise TypeError("Product payloads require a session with derivedFiles.")
 
+        # Allocate before validation so the same identity is checked against
+        # history and passed unchanged to the execution recorder.
+        if productID is None:
+            productID = str(uuid4())
+        else:
+            if not isinstance(productID, str):
+                raise TypeError("productID must be a canonical UUID string or None.")
+            try:
+                canonicalID = str(UUID(productID))
+            except (ValueError, AttributeError):
+                raise ValueError("productID must be a canonical UUID string.") from None
+            if canonicalID != productID:
+                raise ValueError("productID must use canonical lowercase UUID formatting.")
+
+        if any(
+            record.get("productID") == productID
+            for entry in session.actionHistory
+            for record in entry.actionProducts
+        ):
+            raise ValueError("productID already occurs in destination history.")
+
+        # Include previous attempts made by a reused action instance.
+        if any(
+            record.get("productID") == productID
+            for entry in self.actionHistory
+            for record in entry.actionProducts
+        ):
+            raise ValueError("productID already occurs in this action's history.")
+
         files = {} if files is None else files
         metadata = {} if metadata is None else deepcopy(metadata)
         inputProductIDs = [] if inputProductIDs is None else deepcopy(inputProductIDs)
@@ -2108,6 +2455,8 @@ class pglAction(pglActionable):
             raise ValueError("Input product identities must be nonblank strings.")
         if len(set(inputProductIDs)) != len(inputProductIDs):
             raise ValueError("Input product identities must not contain duplicates.")
+        if productID in inputProductIDs:
+            raise ValueError("A product cannot identify itself as an upstream input.")
 
         # Revision links are framework-owned. Callers supply the predecessor
         # through supersedesProductID, not through arbitrary metadata.
@@ -2181,6 +2530,7 @@ class pglAction(pglActionable):
             inputProductIDs=inputProductIDs,
             metadata=metadata,
             invocationIDs=invocationIDs,
+            productID=productID,
         )
         
     ################################################################
@@ -2203,6 +2553,106 @@ class pglAction(pglActionable):
         The hook's return value is ignored.
         """
         pass
+    
+    def _finalizeImageRetention(self, result):
+        """Release eligible image attachments after successful history commit.
+
+        Separate from _afterSuccess(), which is presentation-only.
+
+        Acts only when this execution committed image replacement declarations.
+        Limits cleanup to acquisitions replaced by THIS execution. Historical
+        stages of other scans are protected for this call.
+
+        keepIntermediates=True skips automatic release. Persistent stage pins
+        always remain protected by the MRI retention implementation.
+
+        Scientific success is not revoked by an ordinary retention failure.
+        Validation failures leave attachments unchanged and produce a warning.
+        Unexpected observer errors during assignment may occur after attachment
+        replacement; no general rollback of observer side effects is claimed.
+
+        Does not delete files, close readers, mutate historical products, or
+        alter saved checkpoints. Nested execution defers cleanup rather than
+        releasing data while an enclosing action remains active.
+        """
+        from .pglExternalTools import getExecutionRecorder
+        from .pglSession import pglSession
+
+        if self.status != pglActionStatus.SUCCESS or self.keepIntermediates:
+            return
+        if not self.actionHistory:
+            return
+
+        entry = self.actionHistory[-1]
+        replacementProducts = [
+            record
+            for record in entry.actionProducts
+            if record.get("recordStatus") == "committed"
+            and "imageReplacements" in record.get("metadata", {})
+        ]
+        if not replacementProducts:
+            return
+
+        try:
+            if not isinstance(result, pglSession) or result.mri is None:
+                raise ValueError("Image replacement actions must return their owning MRI session.")
+
+            if all(existing is not entry for existing in result.actionHistory):
+                raise ValueError("The producing execution has not been attached to the returned session.")
+
+            # An enclosing recorder means this is a nested action. Its caller
+            # may still need older arrays or may fail; do not clean up early.
+            if getExecutionRecorder() is not None:
+                pglMessages.warning(
+                    "Automatic image retention was deferred because an enclosing "
+                    "action is still executing. Intermediates remain attached.",
+                    level=1,
+                )
+                return
+
+            mri = result.mri
+            if mri._getSession() is not result:
+                raise ValueError("MRI ownership differs from the returned session.")
+
+            # Reuse complete committed-declaration validation before reading
+            # stage associations or deciding which attachments may be released.
+            stages, bindings = mri._getCommittedImageStages()
+            productIDs = {record["productID"] for record in replacementProducts}
+            affectedScans = {
+                stage["scanUUID"]
+                for stage in stages
+                if bindings[stage["stageID"]]["productID"] in productIDs
+            }
+
+            if not affectedScans:
+                raise ValueError("Committed replacement products declare no resolvable image stages.")
+
+            # The public retention operation spans the MRI collection. Protect
+            # attached historical stages belonging to unaffected acquisitions.
+            # Already-released stages must not be passed as requested keep IDs.
+            keepStageIDs = [
+                stage["stageID"]
+                for stage in stages
+                if stage["scanUUID"] not in affectedScans
+                and stage["matrixName"] in mri.dataMatrices
+            ]
+
+            released = mri.releaseImageIntermediates(keepStageIDs=keepStageIDs)
+            count = len(released["releaseMatrixNames"])
+
+            if count:
+                statusOutput(
+                    f"Released {count} superseded MRI image attachment(s). "
+                    "Pinned stages, current images, cache files, and saved checkpoints are preserved."
+                )
+
+        except Exception as error:
+            pglMessages.warning(
+                f"Action {self.name} succeeded, but automatic image retention "
+                f"could not complete: {type(error).__name__}: {error}. "
+                "Inspect MRI attachments before saving; no payload files were deleted.",
+                level=1,
+            )
 
 ########################
 # class pglDeferredAction

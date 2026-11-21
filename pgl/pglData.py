@@ -17,6 +17,33 @@ import xarray as xr
 from traitlets import Any, Dict, Unicode, validate
 
 ##################################
+# pglDataAttachment
+##################################
+class pglDataAttachment(Any):
+    """A scientific-data attachment with identity-based change detection.
+
+    Traitlets' ordinary value comparison can invoke xarray/Dask equality and
+    truth conversion, unexpectedly computing lazy scientific arrays.
+
+    Validate assignments normally, but notify only when the attached object
+    changes by identity. Never compare array contents.
+
+    In-place changes to an already attached object do not produce assignment
+    notifications. Assign a new xarray object when observers need notification.
+    """
+
+    def set(self, obj, value):
+        """Validate and install an attachment without evaluating equality."""
+        newValue = self._validate(obj, value)
+        oldValue = obj._trait_values.get(self.name, self.default_value)
+
+        obj._trait_values[self.name] = newValue
+
+        # Do not use ==, !=, bool(array), or numerical comparisons here.
+        if oldValue is not newValue:
+            obj._notify_trait(self.name, oldValue, newValue)
+            
+##################################
 # pglDataMatrix
 ##################################
 class pglDataMatrix(pglActionable):
@@ -32,7 +59,7 @@ class pglDataMatrix(pglActionable):
     No operation performed by this wrapper automatically computes array values.
     """
 
-    data = Any(default_value=None, allow_none=True, help="Scientific xarray contents").tag(serialize=False)
+    data = pglDataAttachment(default_value=None, allow_none=True, help="Scientific xarray contents; attachment changes are detected by identity without computing values").tag(serialize=False)
 
     matrixRevisionID = Unicode(default_value=None, allow_none=True, help="Identity of the published artifact from which this object was restored")
     provenance = Dict(default_value={}, help="Recorded construction inputs, parameters, code, and environment")
@@ -692,3 +719,4 @@ class pglEventsData(pglDataMatrix):
         for i, channelName in enumerate(self.channelNames):
             unit = self.units[i] if i < len(self.units) else ""
             print(f"  {i:2d}: {channelName:<12} ({unit})")
+

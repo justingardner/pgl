@@ -443,6 +443,448 @@ class pglExperimentBase(pglStateDataSettings):
 
         return index - 1 if timestamp - times[index - 1] <= times[index] - timestamp else index
     
+    def getMainTask(self, *, verbose=False):
+        """Return the explicitly marked or heuristically selected main task.
+
+        Selection order:
+            Exactly one task marked isMainTask: return it.
+            Only one task available: return it.
+            Otherwise: select the unique task with the most recorded STARTs.
+
+        Multiple explicit main tasks, tied trial counts, missing event data,
+        or no recorded trials warn and return None.
+
+        Heuristic selection is reported. verbose additionally reports
+        explicit and single-task selection. Task settings are never changed.
+
+        Accessing self.tasks may lazy-load saved task metadata/events.
+        Does not load stimulus pixels or MRI payloads.
+        """
+        from numbers import Integral
+
+        if type(verbose) is not bool:
+            raise TypeError("verbose must be Boolean.")
+
+        tasks = list(getattr(self, "tasks", None) or [])
+
+        if not tasks:
+            pglMessages.warning("Cannot select a main task: no tasks are available.", level=1)
+            return None
+
+        def taskLabel(index, task):
+            """Use the zero-based list index, not historical taskID values."""
+            settings = getattr(task, "settings", None)
+            name = getattr(settings, "taskSaveName", None) or getattr(settings, "taskName", None) or "(unnamed task)"
+            name = str(name).replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t")
+            return f"task {index} ({name})"
+
+        # Explicit intent takes precedence over every heuristic.
+        mainTasks = [(index, task) for index, task in enumerate(tasks) if getattr(getattr(task, "settings", None), "isMainTask", False)]
+
+        if len(mainTasks) == 1:
+            index, task = mainTasks[0]
+            if verbose: pglMessages.message(f"Selected {taskLabel(index, task)}: isMainTask=True.")
+            return task
+
+        if len(mainTasks) > 1:
+            candidates = ", ".join(taskLabel(index, task) for index, task in mainTasks)
+            pglMessages.warning(f"Multiple tasks have isMainTask=True: {candidates}. Select one explicitly with taskName.", level=1)
+            return None
+
+        if len(tasks) == 1:
+            if verbose: pglMessages.message(f"Selected {taskLabel(0, tasks[0])}: the only task.")
+            return tasks[0]
+
+        # Count distinct recorded trial STARTs, not configured nTrials or the
+        # runtime currentTrial counter. Duplicate starts must not inflate counts.
+        counts = []
+
+        for index, task in enumerate(tasks):
+            data = getattr(task, "data", None)
+            events = getattr(data, "events", None)
+
+            if events is None:
+                pglMessages.warning(f"Cannot infer the main task: {taskLabel(index, task)} has no available event data. Select taskName explicitly.", level=1)
+                return None
+
+            trialNums = set()
+
+            for event in events:
+                if not isinstance(event, pglEventTrial) or event.eventType != pglEventTrial.boundaryType.START.value: continue
+
+                trialNum = event.trialNum
+                if isinstance(trialNum, (bool, np.bool_)) or not isinstance(trialNum, Integral) or trialNum < 0:
+                    pglMessages.warning(f"Cannot infer the main task: {taskLabel(index, task)} has an invalid recorded trial index {trialNum!r}.", level=1)
+                    return None
+
+                if trialNum in trialNums:
+                    pglMessages.warning(f"Cannot infer the main task: {taskLabel(index, task)} has multiple START events for trial {trialNum}.", level=1)
+                    return None
+
+                trialNums.add(int(trialNum))
+
+            counts.append(len(trialNums))
+
+        maxTrials = max(counts)
+        winners = [index for index, count in enumerate(counts) if count == maxTrials]
+
+        if maxTrials == 0 or len(winners) != 1:
+            summary = "; ".join(f"{taskLabel(index, task)}: {counts[index]} trials started" for index, task in enumerate(tasks))
+            reason = "no recorded trial STARTs" if maxTrials == 0 else "tied highest trial counts"
+            pglMessages.warning(f"Cannot infer the main task: {reason}. {summary}. Select taskName explicitly.", level=1)
+            return None
+
+        index = winners[0]
+        pglMessages.message(f"Selected {taskLabel(index, tasks[index])}: most recorded trial STARTs ({maxTrials}); no task is marked main.")
+        return tasks[index]
+
+    def getTrialsInfo(self, parameterName=None, taskName=None, *, segmentNum=None, includeBlank=False, direction="nearest"):
+        """Group recorded trial information by stimulus or parameter.
+
+        parameterName=None groups by stimulus; otherwise groups by parameter.
+        taskName=None uses getMainTask(). Explicit names match taskName first,
+        then taskSaveName, case-insensitively.
+
+        segmentNum=None uses trial START. A nonnegative segmentNum uses that
+        segment's recorded START within each trial. Missing segment starts are
+        omitted and reported; trial START is never substituted.
+
+        Common result fields:
+            taskName, taskSaveName, groupBy, segmentNum, direction
+            groupValues, groupNames, nGroups
+            trialNums: Zero-based behavioral trial indices per group.
+            volumes: Zero-based behavioral trigger indices, or None.
+            startTimes: Selected onset seconds relative to task start.
+            onsetTimestamps: Selected onsets in the recorded clock.
+            timeOrigin: Task start timestamp used for startTimes.
+            nTrials: Included trial count per group.
+            nTrialsTotal: Total included trials.
+            omittedTrialNums: Trial indices grouped by omission reason.
+
+        Parameter fields:
+            parameterName, parameterValues, parameter
+
+        Stimulus fields:
+            stimulusNums, stimulusIds, stimulusNames
+            sourceInfo, imageIndices, nStimuli
+
+        Parameter groups preserve configured validValues order and empty groups.
+        Stimulus groups include observed stimuli in inventory order, with the
+        optional blank group last. Stimulus inventory indices are run-local;
+        stimulus IDs/provenance must establish correspondence across runs.
+
+        Planned but unstarted trials are excluded. Started but incomplete trials
+        remain included when their selected onset and grouping data exist.
+        Missing volume matches do not remove trials.
+
+        Reads metadata/events, never stimulus pixels or MRI payloads.
+        Behavioral trigger indices are not automatically MRI array indices.
+        Recorded segment STARTs mark task transitions, not verified display
+        onset times. This method does not infer stimulus durations.
+
+        Selection failures warn and return None. Invalid arguments or
+        inconsistent recorded data raise.
+        """
+        from copy import deepcopy
+        from numbers import Integral, Real
+        from types import SimpleNamespace
+
+        from .pglParameter import pglParameterBlock
+        from .pglImage import pglStimulusDatabase, blankStimulusNum
+
+        if parameterName is not None and (not isinstance(parameterName, str) or not parameterName.strip()):
+            raise ValueError("parameterName must be a nonblank string or None.")
+        if taskName is not None and (not isinstance(taskName, str) or not taskName.strip()):
+            raise ValueError("taskName must be a nonblank string or None.")
+
+        if segmentNum is not None:
+            if isinstance(segmentNum, (bool, np.bool_)) or not isinstance(segmentNum, Integral):
+                raise TypeError("segmentNum must be an integer or None.")
+            segmentNum = int(segmentNum)
+            if segmentNum < 0:
+                pglMessages.warning("segmentNum must be nonnegative; segment indices are zero-based.", level=1)
+                return None
+
+        if type(includeBlank) is not bool:
+            raise TypeError("includeBlank must be Boolean.")
+        if parameterName is not None and includeBlank:
+            raise ValueError("includeBlank applies only to stimulus grouping.")
+        if direction not in ("nearest", "before", "after"):
+            raise ValueError("direction must be nearest, before, or after.")
+
+        # Explicit task selection bypasses main-task inference.
+        if taskName is None:
+            task = self.getMainTask()
+            if task is None: return None
+        else:
+            tasks = list(self.tasks or [])
+            selectedName = taskName.casefold()
+            matches = [task for task in tasks if task.settings.taskName.casefold() == selectedName]
+
+            if not matches:
+                matches = [task for task in tasks if task.settings.taskSaveName.casefold() == selectedName]
+
+            if len(matches) != 1:
+                available = ", ".join(task.settings.taskSaveName for task in tasks) or "(none)"
+                pglMessages.warning(f"Expected one task matching {taskName!r}; found {len(matches)}. Available tasks: {available}", level=1)
+                return None
+
+            task = matches[0]
+
+        if segmentNum is not None and segmentNum >= task.settings.nSegments:
+            pglMessages.warning(f"segmentNum {segmentNum} is outside this task's {task.settings.nSegments} configured segments; indices are zero-based.", level=1)
+            return None
+
+        def validTimestamp(value):
+            return not isinstance(value, (bool, np.bool_)) and isinstance(value, Real) and math.isfinite(float(value))
+
+        def validIndex(value):
+            return not isinstance(value, (bool, np.bool_)) and isinstance(value, Integral) and value >= 0
+
+        def collectParameters(parameterList):
+            """Flatten nested parameter blocks without changing their order."""
+            parameters = []
+            for parameter in parameterList:
+                if isinstance(parameter, pglParameterBlock):
+                    parameters.extend(collectParameters(parameter.settings.parameters))
+                else:
+                    parameters.append(parameter)
+            return parameters
+
+        def newGroup():
+            return {"trialNums": [], "volumes": [], "startTimes": [], "onsetTimestamps": []}
+
+        if task.data is None or not validTimestamp(task.data.startTime):
+            raise ValueError("Task data requires a finite startTime.")
+
+        parameter = None
+        database = None
+        validValues = []
+        groups = {}
+
+        if parameterName is not None:
+            parameters = collectParameters(task.parameters)
+            matches = [parameter for parameter in parameters if parameter.settings.name == parameterName]
+
+            if len(matches) != 1:
+                available = [parameter.settings.name for parameter in parameters]
+                pglMessages.warning(f"Expected one parameter named {parameterName!r}; found {len(matches)}. Available parameters: {available}", level=1)
+                return None
+
+            parameter = matches[0]
+            validValues = list(parameter.settings.validValues)
+
+            # Ambiguous configured groups are invalid even if no trial has
+            # yet used the duplicated value.
+            for index, value in enumerate(validValues):
+                if any(np.array_equal(value, previous) for previous in validValues[:index]):
+                    raise ValueError("Parameter validValues contain ambiguous duplicate values.")
+
+            groups = {index: newGroup() for index in range(len(validValues))}
+
+        else:
+            database = task.stimulusDatabase
+            if not isinstance(database, pglStimulusDatabase):
+                pglMessages.warning("The selected task has no pglStimulusDatabase.", level=1)
+                return None
+
+        # Index recorded START events once. Never accidentally use a trial END.
+        # Segment events have no trialNum: associate them through event order,
+        # not timestamp sorting, since trial/segment starts may share timestamps.
+        starts, segmentStarts = {}, {}
+        activeTrial = None
+        lastBoundaryTime = None
+
+        for event in task.data.events:
+            if isinstance(event, pglEventTrial):
+                if event.eventType == pglEventTrial.boundaryType.START.value:
+                    if not validIndex(event.trialNum):
+                        raise ValueError("Recorded trial indices must be nonnegative integers.")
+
+                    trialIndex = int(event.trialNum)
+                    if trialIndex in starts:
+                        raise ValueError(f"Trial {trialIndex} has multiple START events.")
+                    if not validTimestamp(event.timestamp):
+                        raise ValueError(f"Trial {trialIndex} has an invalid START timestamp.")
+
+                    if segmentNum is not None:
+                        if lastBoundaryTime is not None and event.timestamp < lastBoundaryTime:
+                            raise ValueError("Trial/segment boundary timestamps decrease in recorded event order.")
+                        lastBoundaryTime = event.timestamp
+
+                    starts[trialIndex] = event
+                    activeTrial = trialIndex
+
+                elif event.eventType == pglEventTrial.boundaryType.END.value:
+                    # Historical task shutdown can record a trial END whose
+                    # index is the next-trial counter. Do not use it as an onset
+                    # or require its index to match the last recorded START.
+                    activeTrial = None
+
+            elif segmentNum is not None and isinstance(event, pglEventSegment):
+                if event.eventType != pglEventSegment.boundaryType.START.value: continue
+                if not validIndex(event.segmentNum):
+                    raise ValueError("Recorded segment indices must be nonnegative integers.")
+                if activeTrial is None:
+                    raise ValueError(f"Segment {event.segmentNum} START has no preceding active trial START.")
+                if not validTimestamp(event.timestamp):
+                    raise ValueError(f"Trial {activeTrial}, segment {event.segmentNum} has an invalid START timestamp.")
+                if lastBoundaryTime is not None and event.timestamp < lastBoundaryTime:
+                    raise ValueError("Trial/segment boundary timestamps decrease in recorded event order.")
+
+                lastBoundaryTime = event.timestamp
+                if event.segmentNum != segmentNum: continue
+
+                if activeTrial in segmentStarts:
+                    raise ValueError(f"Trial {activeTrial} has multiple START events for segment {segmentNum}.")
+
+                segmentStarts[activeTrial] = event
+
+        omittedTrialNums = {
+            "missingSegmentStart": [],
+            "missingParameter": [],
+            "unconfiguredParameterValue": [],
+            "blankStimulus": [],
+        }
+
+        for trialIndex, trialEvent in sorted(starts.items()):
+            onsetEvent = trialEvent if segmentNum is None else segmentStarts.get(trialIndex)
+
+            if onsetEvent is None:
+                omittedTrialNums["missingSegmentStart"].append(trialIndex)
+                continue
+
+            if parameter is not None:
+                if trialIndex >= len(task.data.params) or parameterName not in task.data.params[trialIndex]:
+                    omittedTrialNums["missingParameter"].append(trialIndex)
+                    continue
+
+                trialValue = task.data.params[trialIndex][parameterName]
+                matchingGroups = [index for index, value in enumerate(validValues) if np.array_equal(trialValue, value)]
+
+                if not matchingGroups:
+                    omittedTrialNums["unconfiguredParameterValue"].append(trialIndex)
+                    continue
+
+                groupIndex = matchingGroups[0]
+
+            else:
+                if not 0 <= trialIndex < database.nTrials:
+                    raise ValueError(f"Trial {trialIndex} has no corresponding stimulus trial.")
+
+                trial = database.getTrial(trialIndex)
+                if trial.trialNum != trialIndex:
+                    raise ValueError("Stimulus trial numbering differs from sequence position.")
+
+                stimulusNum = trial.stimulusNum
+                if isinstance(stimulusNum, (bool, np.bool_)) or not isinstance(stimulusNum, Integral):
+                    raise ValueError("Stimulus indices must be integers.")
+                stimulusNum = int(stimulusNum)
+
+                if trial.isBlank:
+                    if stimulusNum != blankStimulusNum or trial.stimulus is not None:
+                        raise ValueError("Blank trial has inconsistent stimulus metadata.")
+                    if not includeBlank:
+                        omittedTrialNums["blankStimulus"].append(trialIndex)
+                        continue
+                else:
+                    if not 0 <= stimulusNum < len(database.stimuli):
+                        raise ValueError("Trial references an invalid stimulus index.")
+                    if trial.stimulus is not database.stimuli[stimulusNum]:
+                        raise ValueError("Trial stimulus differs from the current inventory.")
+
+                groupIndex = stimulusNum
+                if groupIndex not in groups: groups[groupIndex] = newGroup()
+
+            # The matcher returns zero-based behavioral trigger indices.
+            # Retain None: absence of a trigger match must not erase a trial.
+            group = groups[groupIndex]
+            group["trialNums"].append(trialIndex)
+            group["volumes"].append(self.getNearestVolumeTrigger(onsetEvent, direction=direction))
+            group["startTimes"].append(float(onsetEvent.timestamp - task.data.startTime))
+            group["onsetTimestamps"].append(float(onsetEvent.timestamp))
+
+        if omittedTrialNums["missingSegmentStart"]:
+            count = len(omittedTrialNums["missingSegmentStart"])
+            pglMessages.warning(f"Omitted {count} started trial(s) without a recorded START for segment {segmentNum}; indices are available in omittedTrialNums.", level=1)
+
+        omissionLabels = {
+            "missingParameter": f"missing parameter {parameterName!r}",
+            "unconfiguredParameterValue": f"parameter {parameterName!r} value outside configured validValues",
+        }
+
+        for reason, label in omissionLabels.items():
+            if omittedTrialNums[reason]:
+                pglMessages.warning(f"Omitted {len(omittedTrialNums[reason])} started trial(s): {label}. Trial indices are available in omittedTrialNums.", level=1)
+
+        # Excluding blanks is an intentional selection, not a warning.
+        # Their indices are still retained in omittedTrialNums for auditing.
+        if parameter is not None:
+            groupIndices = list(range(len(validValues)))
+            groupValues = deepcopy(validValues)
+            groupNames = [str(value) for value in validValues]
+            extra = {
+                "parameterName": parameter.settings.name,
+                "parameterValues": deepcopy(validValues),
+                "parameter": parameter,
+            }
+
+        else:
+            # Inventory order, with the optional blank group last.
+            groupIndices = sorted(groups, key=lambda index: (index == blankStimulusNum, index))
+            stimulusIds, stimulusNames, sourceInfo, imageIndices = [], [], [], []
+
+            for stimulusNum in groupIndices:
+                if stimulusNum == blankStimulusNum:
+                    stimulusIds.append(None)
+                    stimulusNames.append("Blank")
+                    sourceInfo.append({})
+                    imageIndices.append(None)
+                    continue
+
+                stimulus = database.stimuli[stimulusNum]
+                provenance = deepcopy(stimulus.sourceInfo)
+                stimulusIds.append(stimulus.stimulusId or None)
+                stimulusNames.append(stimulus.name)
+                sourceInfo.append(provenance)
+                imageIndices.append(provenance.get("imageIndex", getattr(stimulus, "imageIndex", None)))
+
+            # Missing IDs remain missing, never replaced with run-local indices.
+            # Cross-run condition construction must validate their identities.
+            groupValues = list(stimulusIds)
+            groupNames = list(stimulusNames)
+            extra = {
+                "stimulusNums": list(groupIndices),
+                "stimulusIds": stimulusIds,
+                "stimulusNames": stimulusNames,
+                "sourceInfo": sourceInfo,
+                "imageIndices": imageIndices,
+                "nStimuli": len(groupIndices),
+            }
+
+        trialNums = [groups[index]["trialNums"] for index in groupIndices]
+        nTrials = [len(indices) for indices in trialNums]
+
+        return SimpleNamespace(
+            taskName=task.settings.taskName,
+            taskSaveName=task.settings.taskSaveName,
+            groupBy="parameter" if parameter is not None else "stimulus",
+            segmentNum=segmentNum,
+            direction=direction,
+            groupValues=groupValues,
+            groupNames=groupNames,
+            nGroups=len(groupIndices),
+            trialNums=trialNums,
+            volumes=[groups[index]["volumes"] for index in groupIndices],
+            startTimes=[groups[index]["startTimes"] for index in groupIndices],
+            onsetTimestamps=[groups[index]["onsetTimestamps"] for index in groupIndices],
+            timeOrigin=float(task.data.startTime),
+            nTrials=nTrials,
+            nTrialsTotal=sum(nTrials),
+            omittedTrialNums=omittedTrialNums,
+            **extra,
+        )
+    
 ##############################################s
 # Experiment class
 ##############################################
@@ -3181,7 +3623,7 @@ class pglTaskSettings(pglTraitSettings):
     taskID = Int(0, help="Numeric identifier for the task, used for pglExperiment to keep track of tasks.")
     verbose = Bool(True, help="Print routine task messages and trial parameters. Does not suppress warnings or errors.")
     trialPrintNewline = Bool(True, help="Print a newline after each trial's parameters.")
-    isMainTask = Bool(False, help="Use this task to judge whether enough trials ran. If no tasks are marked, all tasks are candidates.")
+    isMainTask = Bool(False, help="Mark a main task for analysis selection and aborted-run classification. Analysis requires one marked task; with none marked, it may infer the main task from recorded trial counts.")
     
     # make sure that any settings that the experimenter writes into settings get saved
     _serializeUnregisteredFields = True

@@ -813,6 +813,7 @@ class pglDatabase:
                             "pgl.derived.session.v2",
                             "pgl.derived.session.v3",
                             "pgl.derived.mri.v1",
+                            "pgl.derived.mri.v2",
                         ):
                             loader = cls.loadDerivedSession
                             hasMNE = contractVersion in (
@@ -824,8 +825,9 @@ class pglDatabase:
                                 "pgl.derived.behavior.v3",
                                 "pgl.derived.session.v3",
                                 "pgl.derived.mri.v1",
+                                "pgl.derived.mri.v2",
                             )
-
+                            
                             # V3 behavioral sessions need a cache independently
                             # of MNE. Resolve its location without creating it.
                             resolvedCache = (
@@ -3943,7 +3945,7 @@ class pglDatabase:
             "pgl.derived.session.v2",
             "pgl.derived.session.v3",
         }
-        mriContracts = {"pgl.derived.mri.v1"}
+        mriContracts = {"pgl.derived.mri.v1", "pgl.derived.mri.v2"}
 
         if contractVersion not in behaviorContracts | mneContracts | mriContracts:
             raise ValueError("Unsupported derived checkpoint contract.")
@@ -5386,6 +5388,7 @@ class pglDatabase:
                 "pgl.derived.session.v2",
                 "pgl.derived.session.v3",
                 "pgl.derived.mri.v1",
+                "pgl.derived.mri.v2",
             ),
         }
 
@@ -5560,7 +5563,7 @@ class pglDatabase:
                 accessContext=access,
                 ownsAccess=True,
             )
-            session.dataMatrices = matrices
+            cls._installSessionMatrices(session, matrices, manifest)
             return session
 
         except BaseException:
@@ -7739,9 +7742,9 @@ class pglDatabase:
                 raise ValueError("The save coordinator must publish attached matrices and supply productRecords.")
             validatedProducts = None
         else:
-            validatedProducts = cls._validateSessionProductRecords(productRecords)
+            validatedProducts = cls._validateMatrixRecordsForSession(session, productRecords)
             if {record["name"] for record in validatedProducts} != set(products):
-                raise ValueError("Manifest products must exactly match session.dataMatrices.")
+                raise ValueError("Manifest products must exactly match session and MRI matrix attachments.")
 
         if not isinstance(derivedSnapshot, dict):
             raise TypeError("session.derivedFiles must be a dictionary.")
@@ -7872,7 +7875,7 @@ class pglDatabase:
         # Select the checkpoint contract without changing legacy layouts
         ################################################################
         if hasMRI:
-            contractVersion = "pgl.derived.mri.v1"
+            contractVersion = "pgl.derived.mri.v2"
             if validatedProducts is None: validatedProducts = []
         else:
             contractVersion = "pgl.derived.session.v1" if mneData is not None else "pgl.derived.behavior.v1"
@@ -9395,7 +9398,7 @@ class pglDatabase:
             raise ValueError("A checkpoint must contain behavioral, MRI, or MNE contents.")
 
         products = cls._snapshotSessionMatrices(session)
-        validatedProducts = cls._validateSessionProductRecords(productRecords)
+        validatedProducts = cls._validateMatrixRecordsForSession(session, productRecords)
 
         if {record["name"] for record in validatedProducts} != set(products):
             raise ValueError("Matrix revision references must exactly match current attachments.")
@@ -9605,7 +9608,7 @@ class pglDatabase:
         # Preserve existing manifest contracts and logical layouts
         ################################################################
         if hasMRI:
-            contractVersion = "pgl.derived.mri.v1"
+            contractVersion = "pgl.derived.mri.v2"
         elif derivedParts["derivedFiles"]:
             contractVersion = "pgl.derived.session.v3" if hasMNE else "pgl.derived.behavior.v3"
         else:
@@ -9736,6 +9739,56 @@ class pglDatabase:
             raise ValueError("Stored derived manifest verification failed.")
 
         return {"object_key": "manifest.json", **stored}
+
+    @classmethod
+    def _installSessionMatrices(cls, session, matrices, manifest):
+        """Install loaded matrices according to the validated manifest version.
+
+        MRI-v2:
+            Explicit ownership selects session.dataMatrices or
+            session.mri.dataMatrices.
+
+        Legacy:
+            All matrices remain session-owned, regardless of their names.
+
+        Requires a newly reconstructed session with empty matrix collections.
+        Does not open or compute arrays. The enclosing loader owns resource
+        cleanup if validation or installation fails.
+        """
+        from .pglData import pglDataMatrix
+
+        cls.validateDerivedManifest(manifest) if manifest.get("contract_version", "").startswith("pgl.derived.") else cls.validateRawSessionManifest(manifest)
+
+        records = manifest.get("products", [])
+        if manifest["contract_version"] == "pgl.derived.mri.v2":
+            cls._installOwnedSessionMatrices(session, matrices, records)
+            return
+
+        records = cls._validateSessionProductRecords(records)
+
+        if type(matrices) is not dict:
+            raise TypeError("Restored matrices must be a dictionary.")
+        if set(matrices) != {record["name"] for record in records}:
+            raise ValueError("Loaded matrix keys differ from the legacy manifest.")
+        if not isinstance(session.dataMatrices, dict) or session.dataMatrices:
+            raise ValueError("Matrix restoration requires an empty session.dataMatrices.")
+
+        if session.mri is not None:
+            if not isinstance(session.mri.dataMatrices, dict) or session.mri.dataMatrices:
+                raise ValueError("Legacy restoration requires an empty MRI matrix collection.")
+
+        installed = {}
+
+        for record in records:
+            matrix = matrices[record["name"]]
+            if not isinstance(matrix, pglDataMatrix):
+                raise TypeError(f"Restored matrix {record['name']!r} is not a pglDataMatrix.")
+            if matrix.matrixRevisionID != record["matrixRevisionID"]:
+                raise ValueError(f"Restored matrix {record['name']!r} has the wrong revision.")
+
+            installed[record["name"]] = matrix
+
+        session.dataMatrices = installed
 
 
     # -------------------------------------------------------------------------
@@ -10451,6 +10504,75 @@ class pglDatabase:
 
         return manifestHash
 
+    @classmethod
+    def _publishedMatrixRecords(cls, session, records):
+        """Add explicit ownership to freshly published MRI matrix references.
+
+        records:
+            Catalog-key/revision pairs produced by _publishSessionMatrices().
+
+        MRI sessions:
+            Return owner-aware records for the MRI-v2 manifest.
+
+        Other sessions:
+            Preserve the existing two-field record format.
+
+        Validates exact attachment coverage. Does not modify matrix identities,
+        working attachments, supplied records, or SQL rows.
+        """
+        catalogRecords = cls._validateSessionProductRecords(records)
+        bindings = cls._sessionMatrixBindings(session)
+
+        if {record["name"] for record in catalogRecords} != set(bindings):
+            raise ValueError("Published matrix references do not match current attachments.")
+
+        if session.mri is None:
+            return catalogRecords
+
+        ownedRecords = []
+
+        for record in catalogRecords:
+            ownerName, localName, _ = bindings[record["name"]]
+            ownedRecords.append({
+                "name": record["name"],
+                "owner": ownerName,
+                "localName": localName,
+                "matrixRevisionID": record["matrixRevisionID"],
+            })
+
+        return cls._validateOwnedMatrixRecords(ownedRecords)
+
+    @classmethod
+    def _validateMatrixRecordsForSession(cls, session, records):
+        """Validate publication records against their working attachment owners.
+
+        The session's modality determines the output contract:
+            MRI present: owner-aware MRI-v2 records.
+            Otherwise: existing legacy records.
+
+        Never infer working ownership from an arbitrary product-name prefix.
+        Requires exact coverage of current attachments.
+
+        Does not verify payload bytes or query whether revisions are registered.
+        """
+        hasMRI = session.mri is not None
+        validated = (
+            cls._validateOwnedMatrixRecords(records)
+            if hasMRI else
+            cls._validateSessionProductRecords(records)
+        )
+        bindings = cls._sessionMatrixBindings(session)
+
+        if {record["name"] for record in validated} != set(bindings):
+            raise ValueError("Matrix revision references do not exactly match current attachments.")
+
+        if hasMRI:
+            for record in validated:
+                ownerName, localName, _ = bindings[record["name"]]
+                if record["owner"] != ownerName or record["localName"] != localName:
+                    raise ValueError("Published matrix ownership differs from the working attachment.")
+
+        return validated
 
     # -------------------------------------------------------------------------
     # Session matrix products
@@ -10460,55 +10582,83 @@ class pglDatabase:
 
     # ++++++++++++++++++++++++ _snapshotSessionMatrices +++++++++++++++++++++++
     # Direct callers in this module: _saveDerivedSession, saveDerivedSessionFiles.
-    @staticmethod
-    def _snapshotSessionMatrices(session):
-        """Validate and snapshot the working session's matrix attachments.
+    @classmethod
+    def _sessionMatrixBindings(cls, session):
+        """Describe matrix ownership without reading scientific array values.
 
-        Reads attachment identities and validates array encodings without
-        publishing anything. Does not extract missing products.
+        Without MRI:
+            Preserve legacy literal session attachment names as catalog keys.
 
-        Returns a new dictionary in deterministic product-name order.
-        Matrix objects themselves are not copied.
+        With MRI:
+            Use canonical owner/localName keys for BOTH owners, matching the
+            MRI-v2 manifest contract.
+
+        Returns:
+            catalogKey -> (ownerName, localName, matrix)
+
+        Matrix objects are not copied. Does not attach, publish, or compute.
         """
         from .pglData import pglDataMatrix
 
-        products = session.dataMatrices
+        hasMRI = session.mri is not None
+        owners = [("session", session.dataMatrices)]
+        if hasMRI: owners.append(("mri", session.mri.dataMatrices))
 
-        if not isinstance(products, dict):
-            raise TypeError("session.dataMatrices must be a dictionary.")
+        bindings = {}
 
-        for productName, matrix in products.items():
-            if not isinstance(productName, str) or not productName.strip():
-                raise ValueError("Session matrix names must be nonblank strings.")
+        for ownerName, matrices in owners:
+            if not isinstance(matrices, dict):
+                raise TypeError(f"{ownerName}.dataMatrices must be a dictionary.")
 
-            if any(character in productName for character in ("\x00", "\n", "\r")):
-                raise ValueError("Session matrix names must not contain NUL or newline characters.")
+            for localName, matrix in matrices.items():
+                # Reuse name validation even when retaining legacy catalog keys.
+                ownedKey = cls._matrixAttachmentKey(ownerName, localName)
 
-            if not isinstance(matrix, pglDataMatrix):
-                raise TypeError(f"Session product {productName!r} must be a pglDataMatrix.")
+                if not isinstance(matrix, pglDataMatrix):
+                    raise TypeError(f"{ownerName} matrix {localName!r} must be a pglDataMatrix.")
 
-        return {name: products[name] for name in sorted(products)}
+                catalogKey = ownedKey if hasMRI else localName
+                if catalogKey in bindings:
+                    raise ValueError(f"Duplicate matrix catalog key: {catalogKey!r}.")
 
-    # ++++++++++++++++++++ _requireSessionMatricesUnchanged +++++++++++++++++++
-    # Direct callers in this module: _publishSessionMatrices, _saveDerivedSession,
-    # saveDerivedSessionFiles.
-    @staticmethod
-    def _requireSessionMatricesUnchanged(session, products):
-        """Reject changes to attachment names or object identities.
+                bindings[catalogKey] = (ownerName, localName, matrix)
 
-        This is not a content-freshness test and cannot detect arbitrary
-        in-place edits to exposed xarray values. Concurrent mutation while
-        saving is unsupported.
+        return {key: bindings[key] for key in sorted(bindings)}
+
+    @classmethod
+    def _snapshotSessionMatrices(cls, session):
+        """Snapshot all retained session and MRI matrix attachments.
+
+        Returns a deterministic catalog-key -> matrix dictionary.
+        Matrix objects are not copied or computed.
+
+        MRI checkpoints use owner-aware catalog keys for both collections.
+        Non-MRI checkpoints preserve their existing literal attachment names.
+
+        Array encoding and safe-save checks remain the publisher's responsibility.
         """
-        current = session.dataMatrices
+        bindings = cls._sessionMatrixBindings(session)
+        return {key: binding[2] for key, binding in bindings.items()}
 
-        if not isinstance(current, dict) or set(current) != set(products):
-            raise ValueError("Session matrix attachments changed while saving.")
+    @classmethod
+    def _requireSessionMatricesUnchanged(cls, session, products):
+        """Reject attachment-name, ownership-key, or object-identity changes.
 
-        for productName, matrix in products.items():
-            if current[productName] is not matrix:
-                raise ValueError(f"Session matrix {productName!r} was replaced while saving.")
+        Does not compare numerical contents or detect arbitrary in-place
+        mutation of exposed arrays. Concurrent mutation remains unsupported.
 
+        The enclosing checkpoint coordinator also checks modality collection
+        identity and other working-session metadata.
+        """
+        current = cls._snapshotSessionMatrices(session)
+
+        if set(current) != set(products):
+            raise ValueError("Session/MRI matrix attachments changed while saving.")
+
+        for catalogKey, matrix in products.items():
+            if current[catalogKey] is not matrix:
+                raise ValueError(f"Matrix attachment {catalogKey!r} was replaced while saving.")
+    
     # ++++++++++++++++++++++++ _publishSessionMatrices ++++++++++++++++++++++++
     # Direct callers in this module: _saveDerivedSession.
     @classmethod
@@ -10604,7 +10754,42 @@ class pglDatabase:
         for matrix in products.values():
             pglStorage.requireSafeSave(matrix)
 
-        return records
+        return cls._publishedMatrixRecords(session, records)
+    
+    @classmethod
+    def _validatedMatrixLinks(cls, records):
+        """Validate either complete record format and return SQL link records.
+
+        This helper is for low-level catalog registration, verification, and
+        loading. It does not select a checkpoint contract or install owners.
+
+        Accepts:
+            A homogeneous list of legacy two-field records.
+            A homogeneous list of explicit owner-aware records.
+            An empty list.
+
+        Mixed, partial, and unknown record formats are rejected.
+
+        Manifest validation must separately enforce the format allowed by its
+        version. Legacy names remain literal even if they resemble encoded keys.
+        """
+        if type(records) is not list:
+            raise ValueError("Matrix records must be a list.")
+        if not records: return []
+
+        if any(type(record) is not dict for record in records):
+            raise ValueError("Each matrix record must be a dictionary.")
+
+        legacyFields = {"name", "matrixRevisionID"}
+        ownedFields = {"name", "owner", "localName", "matrixRevisionID"}
+
+        if all(set(record) == legacyFields for record in records):
+            return cls._matrixCatalogRecords(records, owned=False)
+
+        if all(set(record) == ownedFields for record in records):
+            return cls._matrixCatalogRecords(records, owned=True)
+
+        raise ValueError("Matrix records contain mixed, partial, or unsupported record formats.")
 
     # ++++++++++++++++++++++++ _registerSessionProducts +++++++++++++++++++++++
     # Direct callers in this module: _saveDerivedSession.
@@ -10621,7 +10806,7 @@ class pglDatabase:
         if type(sessionID) is not int or not 0 <= sessionID <= 9223372036854775807:
             raise ValueError("sessionID must be a nonnegative PostgreSQL bigint.")
 
-        records = cls._validateSessionProductRecords(records)
+        records = cls._validatedMatrixLinks(records)
         sessions = sql.Identifier(postgres.databaseSchema, "session")
         products = sql.Identifier(postgres.databaseSchema, "session_products")
 
@@ -10664,7 +10849,7 @@ class pglDatabase:
         if type(sessionID) is not int or not 0 <= sessionID <= 9223372036854775807:
             raise ValueError("sessionID must be a nonnegative PostgreSQL bigint.")
 
-        records = cls._validateSessionProductRecords(records)
+        records = cls._validatedMatrixLinks(records)
         products = sql.Identifier(postgres.databaseSchema, "session_products")
         revisions = sql.Identifier(postgres.databaseSchema, "matrix_revisions")
         backends = sql.Identifier(postgres.databaseSchema, "storage_backends")
@@ -10844,7 +11029,7 @@ class pglDatabase:
         On success, the caller owns the returned matrices and must close them
         once their deferred readers are no longer needed.
         """
-        records = cls._validateSessionProductRecords(records)
+        records = cls._validatedMatrixLinks(records)
         cls._verifySessionProducts(connection, postgres, sessionID, records)
 
         if not records:
@@ -10953,6 +11138,140 @@ class pglDatabase:
             raise ValueError("Session product names must be unique and sorted.")
 
         return validated
+    
+    @staticmethod
+    def _matrixAttachmentKey(owner, localName):
+        """Return a canonical catalog key for an explicitly owned matrix.
+
+        Ownership is supplied separately, never inferred from a user name.
+
+        JSON tuple encoding avoids separator collisions while allowing the
+        same local name under session and MRI owners. This key is not a path.
+
+        Legacy matrix names must never be decoded using this convention.
+        Only owner-aware manifest records use these keys.
+        """
+        import json
+
+        if owner not in ("session", "mri"):
+            raise ValueError("Matrix owner must be 'session' or 'mri'.")
+
+        if not isinstance(localName, str) or not localName.strip():
+            raise ValueError("Matrix localName must be a nonblank string.")
+        if any(character in localName for character in ("\x00", "\n", "\r")):
+            raise ValueError("Matrix localName must not contain NUL or newline characters.")
+
+        return json.dumps([owner, localName], ensure_ascii=False, separators=(",", ":"))
+
+    @classmethod
+    def _validateOwnedMatrixRecords(cls, records):
+        """Validate MRI-v2 matrix ownership records without reading arrays.
+
+        Each record contains:
+            name: Canonical catalog key, derived from owner and localName.
+            owner: "session" or "mri".
+            localName: Dictionary key under that owner.
+            matrixRevisionID: Published matrix revision UUID.
+
+        Records must be sorted by canonical catalog key. Owner/local-name
+        pairs must be unique; different owners may use the same local name.
+
+        Does not accept or reinterpret legacy records. The enclosing manifest
+        version determines which validator applies.
+
+        Returns independent records. Does not mutate the input, access SQL,
+        open Zarr metadata, or assign matrices to working objects.
+        """
+        if type(records) is not list:
+            raise ValueError("Owned matrix records must be a list.")
+
+        validated = []
+        catalogRecords = []
+        expectedFields = {"name", "owner", "localName", "matrixRevisionID"}
+
+        for index, record in enumerate(records):
+            if type(record) is not dict or set(record) != expectedFields:
+                raise ValueError(f"Owned matrix {index}: invalid record fields.")
+
+            owner = record["owner"]
+            localName = record["localName"]
+            expectedKey = cls._matrixAttachmentKey(owner, localName)
+
+            if record["name"] != expectedKey:
+                raise ValueError(
+                    f"Owned matrix {index}: catalog key disagrees with "
+                    "its explicit owner and localName."
+                )
+
+            # Reuse existing UUID, ordering, and catalog-name validation.
+            catalogRecords.append({
+                "name": expectedKey,
+                "matrixRevisionID": record["matrixRevisionID"],
+            })
+            validated.append({
+                "name": expectedKey,
+                "owner": owner,
+                "localName": localName,
+                "matrixRevisionID": record["matrixRevisionID"],
+            })
+
+        cls._validateSessionProductRecords(catalogRecords)
+        return validated
+    
+    @classmethod
+    def _installOwnedSessionMatrices(cls, session, matrices, records):
+        """Install already-open matrices under their explicit manifest owners.
+
+        matrices maps canonical catalog keys to opened pglDataMatrix objects.
+        records must be owner-aware records from a validated MRI-v2 manifest.
+
+        Validate every destination before assigning either dictionary.
+        Requires empty destination collections; never merges or overwrites.
+
+        Does not open, compute, copy, close, or delete matrix payloads.
+        The enclosing loader owns cleanup if installation fails.
+
+        Trait observers may raise during assignment. This helper does not
+        claim transactional rollback of arbitrary observer side effects;
+        installation belongs on a newly reconstructed, unpublished session.
+        """
+        from .pglData import pglDataMatrix
+
+        records = cls._validateOwnedMatrixRecords(records)
+
+        if type(matrices) is not dict:
+            raise TypeError("Restored matrices must be a dictionary.")
+
+        expectedKeys = {record["name"] for record in records}
+        if set(matrices) != expectedKeys:
+            raise ValueError("Restored matrix keys differ from the ownership manifest.")
+
+        if not isinstance(session.dataMatrices, dict) or session.dataMatrices:
+            raise ValueError("Matrix restoration requires an empty session.dataMatrices.")
+
+        mri = session.mri
+        if mri is None:
+            raise ValueError("MRI-v2 matrix restoration requires an MRI collection.")
+        if not isinstance(mri.dataMatrices, dict) or mri.dataMatrices:
+            raise ValueError("Matrix restoration requires an empty MRI dataMatrices collection.")
+
+        sessionMatrices = {}
+        mriMatrices = {}
+
+        for record in records:
+            matrix = matrices[record["name"]]
+            if not isinstance(matrix, pglDataMatrix):
+                raise TypeError(f"Restored matrix {record['name']!r} is not a pglDataMatrix.")
+            if matrix.matrixRevisionID != record["matrixRevisionID"]:
+                raise ValueError(f"Restored matrix {record['name']!r} has the wrong revision.")
+
+            destination = sessionMatrices if record["owner"] == "session" else mriMatrices
+            destination[record["localName"]] = matrix
+
+        # Matrix identity and display name remain unchanged. The manifest's
+        # localName is the attachment key, not a request to rename the matrix.
+        session.dataMatrices = sessionMatrices
+        mri.dataMatrices = mriMatrices
 
 
     # -------------------------------------------------------------------------
@@ -11372,6 +11691,7 @@ class pglDatabase:
         MRI contract:
             pgl.derived.mri.v1 includes MRI, optional behavior, matrix
             references, and derived-file attachments.
+            pgl.derived.mri.v2 adds explicit matrix owner/localName fields.
 
         Does not read payloads, mutate the manifest, or establish scientific
         validity. Inner modality descriptors are verified separately.
@@ -11383,9 +11703,11 @@ class pglDatabase:
             raise ValueError("Manifest must be a dictionary.")
 
         contract = manifest.get("contract_version")
+        if contract == "pgl.derived.mri.v2":
+            return cls._validateDerivedMRIV2Manifest(manifest)
         if contract == "pgl.derived.mri.v1":
             return cls._validateDerivedMRIManifest(manifest)
-
+        
         v2Contracts = {
             "pgl.derived.behavior.v2": "pgl.derived.behavior.v1",
             "pgl.derived.session.v2": "pgl.derived.session.v1",
@@ -11901,7 +12223,7 @@ class pglDatabase:
         if outerContract == "pgl.raw.session.v2":
             expectedInnerContract = pglMRIBundle.contract
             validator = pglMRIBundle.validateDescriptor
-        elif outerContract == "pgl.derived.mri.v1":
+        elif outerContract in ("pgl.derived.mri.v1", "pgl.derived.mri.v2"):
             expectedInnerContract = "pgl.mri.derived.v1"
             validator = pglMRIBundle.validateDerivedDescriptor
         else:
@@ -13414,6 +13736,7 @@ class pglDatabase:
             ("derived", "pgl.derived.session.v2"),
             ("derived", "pgl.derived.session.v3"),
             ("derived", "pgl.derived.mri.v1"),
+            ("derived", "pgl.derived.mri.v2"),
         }
 
         if (origin, contract) not in supported:
@@ -14607,6 +14930,59 @@ class pglDatabase:
     # Validate a derived MRI session checkpoint inventory
     ################################################################
     @classmethod
+    def _validateDerivedMRIV2Manifest(cls, manifest):
+        """Validate MRI-v2 inventories with explicit matrix ownership.
+
+        Contract:
+            pgl.derived.mri.v2
+
+        Preserves the MRI-v1 acquisition, behavioral, history, and derived-file
+        inventory layout. Changes only the matrix-reference representation:
+
+            name: Canonical catalog key.
+            owner: "session" or "mri".
+            localName: Attachment name within that owner.
+            matrixRevisionID: Published matrix revision UUID.
+
+        Original acquisition payloads remain acquisitions. MRI matrices are
+        published separately through the existing Zarr revision system.
+
+        The inner MRI acquisition/annotation descriptor remains
+        pgl.mri.derived.v1. Matrix ownership belongs to this outer checkpoint.
+
+        Reuses the complete MRI-v1 inventory validator through a temporary
+        catalog-only view. Does not weaken its path, identity, attachment,
+        history, or modality checks.
+
+        Does not mutate the manifest, read payloads, query SQL, or establish
+        scientific validity or current-image-stage selection.
+        """
+        expectedFields = {
+            "contract_version", "runs", "mri", "directories",
+            "files", "products", "derivedFiles",
+        }
+
+        if type(manifest) is not dict or set(manifest) != expectedFields:
+            raise ValueError("Derived MRI-v2 manifest has missing or unexpected fields.")
+        if manifest["contract_version"] != "pgl.derived.mri.v2":
+            raise ValueError("Expected the derived MRI-v2 checkpoint contract.")
+
+        # Ownership is validated before projecting records into catalog links.
+        # The original records, including owner/localName, remain unchanged.
+        catalogRecords = cls._matrixCatalogRecords(manifest["products"], owned=True)
+
+        inventoryView = {
+            **manifest,
+            "contract_version": "pgl.derived.mri.v1",
+            "products": catalogRecords,
+        }
+
+        # The existing validator does not mutate its input. Reusing it avoids
+        # maintaining two copies of the complete acquisition/file checks.
+        cls._validateDerivedMRIManifest(inventoryView)
+        return manifest
+
+    @classmethod
     def _validateDerivedMRIManifest(cls, manifest):
         """Validate derived MRI inventories without reading payload files.
 
@@ -14824,6 +15200,41 @@ class pglDatabase:
                     progress(None, f"Waiting for checkpoint publication/lifecycle lock ({elapsed:.1f} s)")
 
                 sleep(min(0.1, max(0.0, timeout - elapsed)))
+                
+    @classmethod
+    def _matrixCatalogRecords(cls, records, *, owned=False):
+        """Return the catalog-link projection of validated matrix records.
+
+        owned=False:
+            Legacy records containing name and matrixRevisionID.
+            Names remain literal session attachment names.
+
+        owned=True:
+            Explicit owner/localName records from MRI-v2 manifests.
+            Canonical catalog keys are preserved unchanged.
+
+        The enclosing manifest contract must choose the mode explicitly.
+        Never infer ownership from a name or from the presence of extra fields.
+
+        Returns independent dictionaries. Does not read payloads, access SQL,
+        mutate records, or discard ownership from the original manifest.
+        """
+        if type(owned) is not bool:
+            raise TypeError("owned must be Boolean.")
+
+        validated = (
+            cls._validateOwnedMatrixRecords(records)
+            if owned else
+            cls._validateSessionProductRecords(records)
+        )
+
+        return [
+            {
+                "name": record["name"],
+                "matrixRevisionID": record["matrixRevisionID"],
+            }
+            for record in validated
+        ]
     
     
 
@@ -15078,6 +15489,7 @@ class pglCheckpointFilesystem(AbstractFileSystem):
             "pgl.derived.session.v2",
             "pgl.derived.session.v3",
             "pgl.derived.mri.v1",
+            "pgl.derived.mri.v2",
         ):
             pglDatabase.validateDerivedManifest(manifest)
         else:

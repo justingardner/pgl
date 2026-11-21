@@ -8,6 +8,7 @@
 #############
 # Imports
 #############
+from .pglActionProgress import actionProgress, operationProgress, currentProgress, progressCall, statusOutput, noProgressBar, daskProgress
 from contextlib import contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
@@ -378,7 +379,7 @@ class pglExecutionRecorder:
     ################################################################
     # Register a named scientific output
     ################################################################
-    def registerProduct(self, name, kind, *, artifacts=None, inputProductIDs=None, metadata=None, invocationIDs=None):
+    def registerProduct(self, name, kind, *, artifacts=None, inputProductIDs=None, metadata=None, invocationIDs=None, productID=None):
         """Record a named product produced by this execution.
 
         Does not copy files, attach payloads, or establish scientific validity.
@@ -399,13 +400,22 @@ class pglExecutionRecorder:
             successful invocations recorded so far. Supply an explicit list
             when a product uses only a subset.
 
-        Returns an independent product record with automatically assigned
-        product and producer IDs.
+        productID:
+            Optional preallocated canonical UUID. Allows metadata and payloads
+            to identify their producing product before registration.
+            None generates a new UUID as before.
+
+            This recorder checks uniqueness within its execution. The owning
+            action checks for collisions in the destination session history.
+
+        Returns an independent product record. Metadata is copied at
+        registration; editing the returned record does not update provenance.
 
         Action completion determines whether the recorded product is committed
         or uncommitted. A successful subprocess alone does not commit a product.
         """
         import re
+        from uuid import UUID, uuid4
 
         self._requireOpen()
 
@@ -422,6 +432,21 @@ class pglExecutionRecorder:
         if any(record["name"] == name for record in products):
             raise ValueError(f"This execution already registered product {name!r}.")
 
+        if productID is None:
+            productID = str(uuid4())
+        else:
+            if not isinstance(productID, str):
+                raise TypeError("productID must be a canonical UUID string or None.")
+            try:
+                canonicalID = str(UUID(productID))
+            except (ValueError, AttributeError):
+                raise ValueError("productID must be a canonical UUID string.") from None
+            if canonicalID != productID:
+                raise ValueError("productID must use canonical lowercase UUID formatting.")
+
+        if any(record["productID"] == productID for record in products):
+            raise ValueError("This execution already registered the supplied productID.")
+
         artifacts = {} if artifacts is None else _copyProvenance(artifacts)
         metadata = {} if metadata is None else _copyProvenance(metadata)
         inputProductIDs = [] if inputProductIDs is None else _copyProvenance(inputProductIDs)
@@ -436,9 +461,12 @@ class pglExecutionRecorder:
                 raise ValueError("Input product identities must be nonblank strings.")
         if len(set(inputProductIDs)) != len(inputProductIDs):
             raise ValueError("Input product identities must not contain duplicates.")
+        if productID in inputProductIDs:
+            raise ValueError("A product cannot identify itself as an upstream input.")
 
         for role, artifact in artifacts.items():
-            if not role.strip(): raise ValueError("Artifact roles must not be blank.")
+            if not isinstance(role, str) or not role.strip():
+                raise ValueError("Artifact roles must be nonblank strings.")
             if type(artifact) is not dict or set(artifact) != {"attachmentName", "sha256", "size_bytes"}:
                 raise ValueError("Artifact references require attachmentName, sha256, and size_bytes.")
 
@@ -475,7 +503,7 @@ class pglExecutionRecorder:
 
         record = {
             "schemaVersion": 1,
-            "productID": str(uuid4()),
+            "productID": productID,
             "name": name,
             "kind": kind,
             "producerActionID": self._actionID,
@@ -673,25 +701,123 @@ class pglExternalTool:
     # Identify executable or log bytes
     ################################################################
     @staticmethod
-    def _fileIdentity(filename):
-        """Hash a regular local file without loading its contents into RAM."""
+    def _fileIdentity(filename, *, showProgress=None):
+        """Hash a regular local file without loading its contents into RAM.
+
+        showProgress:
+            None: report automatically for files of at least 16 MiB.
+            True: report regardless of file size.
+            False: remain quiet.
+
+        Reporting includes:
+            Start and completion messages.
+            Byte-level progress through pglProgress.
+            Text updates every 10 seconds, captured by the action console tee.
+
+        Existing callers require no changes. Small transform/log files remain
+        quiet by default; large acquisition checks become visible.
+
+        Reads the complete file in 1 MiB blocks. Does not modify the source.
+        Detects size/mtime changes during hashing, but does not provide a
+        filesystem snapshot or protection against all concurrent modification.
+        """
         import hashlib
         import os
         import stat
+        import time
+        from contextlib import ExitStack
         from pathlib import Path
 
+        from .pglProgress import pglProgress
+
+        if showProgress is not None and type(showProgress) is not bool:
+            raise TypeError("showProgress must be Boolean or None.")
+
+        path = Path(filename)
         digest = hashlib.sha256()
         size = 0
 
-        with Path(filename).open("rb") as source:
-            if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+        # Open first so file validation and size describe the actual handle.
+        with path.open("rb") as source:
+            before = os.fstat(source.fileno())
+            if not stat.S_ISREG(before.st_mode):
                 raise ValueError("Expected a regular file.")
 
-            while True:
-                block = source.read(1024 * 1024)
-                if not block: break
-                digest.update(block)
-                size += len(block)
+            expectedSize = before.st_size
+            report = expectedSize >= 16 * 1024 * 1024 if showProgress is None else showProgress
+            label = str(path).replace("\r", "\\r").replace("\n", "\\n")
+            started = time.monotonic()
+            lastBarUpdate = started
+            lastTextUpdate = started
+
+            with ExitStack() as resources:
+                progress = None
+
+                if report:
+                    # Plain text is intentional: notebook widgets alone do not
+                    # become part of the saved Python stdout transcript.
+                    statusOutput(
+                        f"Verifying SHA-256: {label}\n"
+                        f"  Reading {expectedSize / (1024 ** 2):,.1f} MiB",
+                        flush=True,
+                    )
+                    progress = resources.enter_context(
+                        pglProgress(f"Hashing {path.name}")
+                    )
+                    progress(0, "Reading file bytes for SHA-256 verification")
+
+                while True:
+                    block = source.read(1024 * 1024)
+                    if not block: break
+
+                    digest.update(block)
+                    size += len(block)
+
+                    if size > expectedSize:
+                        raise ValueError(f"File grew during hashing: {label}")
+
+                    if report:
+                        now = time.monotonic()
+
+                        # Limit UI updates; keep hashing independent of display
+                        # refresh speed and avoid flooding the notebook.
+                        if now - lastBarUpdate >= 0.5:
+                            progress(
+                                size / max(expectedSize, 1),
+                                f"Hashed {size / (1024 ** 2):,.1f} / "
+                                f"{expectedSize / (1024 ** 2):,.1f} MiB",
+                            )
+                            lastBarUpdate = now
+
+                        if now - lastTextUpdate >= 10:
+                            elapsed = now - started
+                            percent = 100 * size / max(expectedSize, 1)
+                            rate = size / (1024 ** 2) / max(elapsed, 0.001)
+                            statusOutput(
+                                f"  SHA-256 {percent:5.1f}%: "
+                                f"{size / (1024 ** 2):,.1f} / "
+                                f"{expectedSize / (1024 ** 2):,.1f} MiB; "
+                                f"{elapsed:,.1f}s elapsed; {rate:,.1f} MiB/s",
+                                flush=True,
+                            )
+                            lastTextUpdate = now
+
+                after = os.fstat(source.fileno())
+                if (
+                    size != expectedSize
+                    or after.st_size != expectedSize
+                    or after.st_mtime_ns != before.st_mtime_ns
+                ):
+                    raise ValueError(f"File changed during hashing: {label}")
+
+                if report:
+                    elapsed = time.monotonic() - started
+                    progress.finish(f"SHA-256 complete — {size / (1024 ** 2):,.1f} MiB")
+                    statusOutput(
+                        f"SHA-256 complete: {path.name} — "
+                        f"{size / (1024 ** 2):,.1f} MiB in {elapsed:,.1f}s",
+                        flush=True,
+                    )
 
         return {"sha256": digest.hexdigest(), "size_bytes": size}
 

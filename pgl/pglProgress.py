@@ -9,6 +9,7 @@
 #    purpose: Shared progress display for checkpoint publication
 ################################################################
 
+from .pglActionProgress import borrowProgress
 import math
 import time
 
@@ -41,6 +42,8 @@ class pglProgress:
 
         Rendering setup failures do not prevent saving.
         """
+        # Nested helpers share the active action display.
+        if borrowProgress(self, description): return
         self._root = self
         self._start = 0.0
         self._end = 1.0
@@ -239,25 +242,51 @@ class pglProgress:
             progress(1, "No files to process")
 
     def finish(self, description):
-        """Report success only after the caller confirms commit and cleanup."""
+        """Complete this progress scope without completing its parent.
+
+        Root:
+            Explicitly mark the whole operation successfully complete.
+
+        Child section:
+            Advance to this section's endpoint and update its description.
+            Never mark the entire operation complete.
+
+        Only the root owner may report overall success after commitment and
+        cleanup. Completing a helper is not completion of the enclosing action.
+        """
         root = self._root
+
+        if root._closed:
+            return
+
+        if self is not root:
+            self(1.0, description)
+            return
+
         root._finished = True
         root._fraction = 1.0
-        root._description = description
+        root._description = str(description)
 
         if root._bar is not None:
             try:
-                root._bar.set_description_str(description, refresh=False)
+                root._bar.set_description_str(root._description, refresh=False)
                 root._bar.n = 100
                 root._bar.refresh()
             except Exception as error:
                 root._disableDisplay(error)
-
+                
     def close(self, outcome=None):
-        """Close the display without inventing successful completion."""
+        """Close only a display owned by this scope.
+
+        Child sections borrow the root display. Closing a child must not close
+        the parent's display or invent an overall success/failure outcome.
+
+        The root owner is responsible for closing the display after handling
+        the actual operation outcome.
+        """
         root = self._root
 
-        if root._closed:
+        if self is not root or root._closed:
             return
 
         root._closed = True
@@ -275,11 +304,20 @@ class pglProgress:
             bar.refresh()
             bar.close()
         except Exception:
+            # A rendering/close failure must not replace the scientific error.
             pass
 
     def __enter__(self): return self
 
     def __exit__(self, exceptionType, exception, traceback):
+        """Release this scope without closing a borrowed parent display.
+
+        Exceptions propagate unchanged. A child helper cannot decide whether
+        its parent recovers, fails, or continues with another operation.
+        """
+        if self is not self._root:
+            return False
+
         if exceptionType is None:
             outcome = None if self._finished else "Not completed"
         elif issubclass(exceptionType, KeyboardInterrupt):

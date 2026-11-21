@@ -8,6 +8,7 @@
 #############
 # Imports
 #############
+from .pglActionProgress import actionProgress, operationProgress, currentProgress, progressCall, statusOutput, noProgressBar, daskProgress
 from copy import deepcopy
 
 from .pglMessages import pglMessages
@@ -755,71 +756,92 @@ class pglActionsMRI(pglActionCollection):
     # Apply motion mappings on original acquisition grids
     ################################################################
     @staticmethod
+    @operationProgress("Applying MRI motion correction")
     def _applyWithinRunMotion(action, session, productRecord, *, outputName, cacheDirectory=None, runAlignmentRecord=None):
-        """Apply within-run motion, optionally composed with run alignment.
+        """Apply exact acquisition-based motion and publish Zarr replacements.
 
-        productRecord:
-            Exact interpreted within-run motion product.
+        Supports interpreted within-run motion and optional matching-grid
+        between-run alignment derived from that exact motion product.
 
-        runAlignmentRecord:
-            Optional runAlignment product estimated from that exact motion
-            product. Only its selected scans are processed.
+        Scientific input:
+            Original acquisitions with full original volume sequences.
+            Existing corrected stages may be replaced, but are not resampled.
 
-        Initial scope:
-            Original acquisition sources and full original volume sequences.
-            Rigid within-run motion and matching-grid run alignment.
-            Cubic SciPy interpolation, constant-zero boundary, float32 output.
-
-        All source/product associations and required artifacts are validated
-        before image generation.
-
-        With run alignment:
-            output acquisition voxel -> common reference -> run reference
+        Sampling:
+            Output acquisition voxel -> common reference -> run reference
                 -> original input volume.
 
-        Each original volume is sampled once. Existing corrected images are
-        neither read nor overwritten.
+            Cubic SciPy interpolation, constant-zero boundary, float32 output.
+            Each output volume is sampled once using the composed mapping.
 
-        Output files preserve each source's acquisition geometry.
-        Returns a newly registered image-product record.
+        Storage/execution:
+            Compressed inputs are decompressed once into local working .nii
+            files. Volume reads then use NiBabel's memory-mapped proxy.
+            Delayed correction tasks are written through the Zarr publisher
+            using a synchronous Dask scheduler.
 
-        Failed staging is retained for diagnosis. Publication of multiple
-        attachments is not a general transaction; action failure marks the
-        supplied session unsafe through the ordinary runner.
+        Progress:
+            Reports acquisition/artifact preflight, decompression, correction,
+            Zarr computation/writing, and final identity verification.
+            Text updates are captured by the action console logger.
+
+        Does not allocate a full corrected run. Individual volumes,
+        interpolation workspace, and storage buffers still require memory.
+
+        Registration remains uncommitted until the action succeeds. A failed
+        final identity check fails the action; no current stage is switched.
+
+        Successful working .nii files and Zarr bundles remain cached.
+        This function does not evict files or close other consumers' readers.
+        Acquisition sources must remain immutable throughout processing.
         """
+        _progress = currentProgress()
         import os
-        import tempfile
+        import time
         from copy import deepcopy
         from pathlib import Path
 
+        import dask
+        import dask.array as da
         import nibabel as nib
         import numpy as np
+        from dask import delayed
+        from dask.diagnostics import ProgressBar
         from scipy.ndimage import affine_transform
 
+        from .pglData import pglDataMatrix
         from .pglExternalTools import pglExternalTool
-        from .pglMRI import pglMRITransforms
+        from .pglMRI import pglMRIData, pglMRITransforms
+        from .pglPipeline import pglActionStatus
         from .pglSession import pglSession
 
         if not isinstance(session, pglSession) or session.mri is None:
             raise ValueError("Motion application requires a session with MRI scans.")
+        if session.mri._getSession() is not session:
+            raise ValueError("MRI collection is not bound to this session.")
+        if session._failedActionIDs or session.mri._failedActionIDs:
+            raise ValueError("Cannot apply motion to a working object with unresolved failures.")
+
         if (
             not isinstance(outputName, str) or not outputName.strip()
             or any(character in outputName for character in ("\x00", "\n", "\r"))
         ):
             raise ValueError("outputName must be a nonblank string without NUL or newlines.")
 
-        parent = None
-        if cacheDirectory is not None:
-            text = os.fspath(cacheDirectory)
+        def localCachePath(value):
+            text = os.fspath(value)
             if (
                 not isinstance(text, str) or not text.strip()
                 or "://" in text or "::" in text
                 or any(character in text for character in ("\x00", "\n", "\r"))
             ):
                 raise ValueError("cacheDirectory must be an ordinary local path.")
-            parent = Path(text).expanduser().resolve()
+            return Path(text).expanduser().absolute()
+
+        explicitCache = None if cacheDirectory is None else localCachePath(cacheDirectory)
 
         for entry in session.actionHistory:
+            if entry.actionStatus != pglActionStatus.SUCCESS: continue
             if any(
                 record.get("name") == outputName
                 and record.get("recordStatus") == "committed"
@@ -827,6 +849,7 @@ class pglActionsMRI(pglActionCollection):
             ):
                 raise ValueError(f"Product {outputName!r} already exists.")
 
+        statusOutput("Motion preflight: validating motion-product metadata.", flush=True)
         motionByScan = pglMRITransforms.validateMotionProduct(productRecord)
         if productRecord["metadata"]["schemaVersion"] != 2:
             raise ValueError("Application requires interpreted version-2 motion.")
@@ -836,8 +859,10 @@ class pglActionsMRI(pglActionCollection):
         compositeByScan = {}
 
         if runAlignmentRecord is not None:
-            # This verifies the exact motion-product identity, source stages,
-            # reference volumes, geometry connections, and composition order.
+            statusOutput("Motion preflight: validating and composing between-run alignment.", flush=True)
+
+            # Preserve exact product, source-stage, reference, and coordinate
+            # associations before generating any corrected data.
             compositePlan = pglMRITransforms.composeRunMotion(
                 productRecord,
                 runAlignmentRecord,
@@ -854,10 +879,53 @@ class pglActionsMRI(pglActionCollection):
         else:
             selectedUUIDs = list(motionByScan)
 
+        # Capture the current stages before computation. They are replacement
+        # targets, not implicit scientific inputs for acquisition transforms.
+        committedStages, _ = session.mri._getCommittedImageStages()
+        replacesByScan = {}
+
+        for scanUUID in selectedUUIDs:
+            current = pglMRIData._resolveImageStage(scanUUID, committedStages)
+            replacesByScan[scanUUID] = (
+                f"acquisition:{scanUUID}" if current is None else current["stageID"]
+            )
+
+        positions = {}
+        for index, scan in enumerate(session.mri.scans):
+            positions.setdefault(scan.uuid, []).append(index)
+
+        for scanUUID in selectedUUIDs:
+            if len(positions.get(scanUUID, [])) != 1:
+                raise ValueError("A motion acquisition is absent or ambiguous in the current MRI collection.")
+
+        if explicitCache is not None:
+            outputCache = explicitCache
+        else:
+            scanCaches = {
+                session.mri.scans[positions[scanUUID][0]]._cacheDirectory
+                for scanUUID in selectedUUIDs
+                if session.mri.scans[positions[scanUUID][0]]._cacheDirectory
+            }
+            outputCache = (
+                localCachePath(next(iter(scanCaches)))
+                if len(scanCaches) == 1 else
+                Path.home() / ".cache" / "pgl"
+            )
+
+        statusOutput(f"Motion working cache: {outputCache}", flush=True)
+        statusOutput("Compressed sources will be expanded once; allow space for uncompressed inputs and corrected Zarr outputs.", flush=True)
+
         verifiedArtifacts = []
+        jobs = []
+
+        def scanLabel(index):
+            name = " ".join((session.mri.scans[index].name or "unnamed").split())
+            return f"scan {index} {name!r}"
 
         def readArtifact(ownerRecord, role, expectedShape):
-            """Verify declared attachment bytes and read numerical text."""
+            """Retrieve, verify, and read one exact numerical artifact."""
+            statusOutput(f"  Retrieving transform artifact: {role}", flush=True)
+
             artifact = ownerRecord["artifacts"][role]
             attachment = session.derivedFiles.get(artifact["attachmentName"])
             expected = {key: artifact[key] for key in ("sha256", "size_bytes")}
@@ -883,301 +951,361 @@ class pglActionsMRI(pglActionCollection):
             verifiedArtifacts.append((path, expected))
             return values
 
-        jobs = []
+        def requireSourceBytesUnchanged(label):
+            """Check actual acquisition and transform bytes around computation."""
+            statusOutput(label, flush=True)
 
-        # Preflight every source and matrix before generating any output.
-        for scanUUID in selectedUUIDs:
-            motion = motionByScan[scanUUID]
+            for position, job in enumerate(jobs):
+                source = job["source"]
+                statusOutput(
+                    f"  Verifying acquisition scan {source['scanIndex']} "
+                    f"({position} of {len(jobs)} completed).",
+                    flush=True,
+                )
+                if pglExternalTool._fileIdentity(source["localPath"]) != source["sourceIdentity"]:
+                    raise ValueError("An acquisition source changed during correction.")
 
-            if motion["sourceStageID"] != f"acquisition:{scanUUID}":
-                raise ValueError(
-                    "This application engine supports original acquisition sources "
-                    "only. Derived source stages require explicit support."
+            statusOutput(f"  Verifying {len(verifiedArtifacts)} transform artifacts.", flush=True)
+            for path, expected in verifiedArtifacts:
+                if pglExternalTool._fileIdentity(path) != expected:
+                    raise ValueError("A transform artifact changed during correction.")
+
+        try:
+            # Validate all scientific sources/transforms before correction.
+            for scanPosition, scanUUID in enumerate(selectedUUIDs):
+                motion = motionByScan[scanUUID]
+                scanIndex = positions[scanUUID][0]
+
+                statusOutput(
+                    f"\nMotion preflight: {scanLabel(scanIndex)} "
+                    f"({scanPosition} of {len(selectedUUIDs)} completed).",
+                    flush=True,
                 )
 
-            source = pglActionsMRI._resolveImageSource(
-                session,
-                {"schemaVersion": 1, "kind": "acquisition", "scanUUID": scanUUID},
-                expectedMotionSource=motion,
-                cacheDirectory=cacheDirectory,
-            )
-            count = source["volumeCount"]
+                if motion["sourceStageID"] != f"acquisition:{scanUUID}":
+                    raise ValueError(
+                        "This application engine supports original acquisition "
+                        "motion sources only."
+                    )
 
-            matrices = readArtifact(
-                productRecord, motion["matricesRole"], (count, 12),
-            )
-            readArtifact(
-                productRecord, motion["motionParametersRole"], (count, 6),
-            )
+                statusOutput("  Resolving original acquisition and checking its identity/header.", flush=True)
+                source = progressCall(_progress, 0.04 + 0.16 * scanPosition / len(selectedUUIDs), 0.04 + 0.16 * (scanPosition + 1) / len(selectedUUIDs), f"Preflight scan {scanIndex} — retrieving and verifying acquisition", pglActionsMRI._resolveImageSource, session, {"schemaVersion": 1, "kind": "acquisition", "scanUUID": scanUUID}, expectedMotionSource=motion, cacheDirectory=cacheDirectory)
+                count = source["volumeCount"]
 
-            nativeRows = np.array([
-                np.asarray(transform["matrix"])[:3].reshape(-1)
-                for transform in motion["interpretation"]["nativeTransforms"]
-            ])
-            if not np.allclose(matrices, nativeRows, rtol=0, atol=1e-10):
-                raise ValueError("Native motion matrices disagree with their interpreted records.")
-
-            image = nib.load(source["localPath"])
-            physical = image.get_qform(coded=True)[0]
-            sourceFrame = motion["interpretation"]["voxelFrame"]
-
-            if len(image.shape) != 4:
-                raise ValueError("Motion application requires a four-dimensional source.")
-            if physical is None or image.header.get_xyzt_units()[0] != "mm":
-                raise ValueError("Application requires a coded millimeter acquisition qform.")
-            if (
-                list(image.shape[:3]) != sourceFrame["spatialShape"]
-                or not np.allclose(
-                    physical, sourceFrame["voxelToPhysicalMM"],
-                    rtol=0, atol=0.0001,
+                matrices = readArtifact(
+                    productRecord, motion["matricesRole"], (count, 12),
                 )
-            ):
-                raise ValueError("Motion interpretation does not describe the actual acquisition grid.")
+                readArtifact(
+                    productRecord, motion["motionParametersRole"], (count, 6),
+                )
 
-            if compositePlan is None:
-                transforms = motion["interpretation"]["voxelTransforms"]
-                alignment = None
-            else:
-                alignment = alignmentByScan[scanUUID]
+                nativeRows = np.array([
+                    np.asarray(transform["matrix"])[:3].reshape(-1)
+                    for transform in motion["interpretation"]["nativeTransforms"]
+                ])
+                if not np.allclose(matrices, nativeRows, rtol=0, atol=1e-10):
+                    raise ValueError("Native motion matrices disagree with their interpreted records.")
 
-                if not alignment["isReference"]:
-                    rows = readArtifact(
-                        runAlignmentRecord, alignment["matricesRole"], (1, 12),
-                    )
-                    readArtifact(
-                        runAlignmentRecord, alignment["motionParametersRole"], (1, 6),
-                    )
-                    native = np.asarray(
-                        alignment["interpretation"]["nativeTransform"]["matrix"]
-                    )
-                    if not np.allclose(rows.reshape(3, 4), native[:3], rtol=0, atol=1e-10):
-                        raise ValueError("Native run-alignment matrix disagrees with its interpreted record.")
+                statusOutput("  Checking acquisition geometry and sampling transforms.", flush=True)
+                image = nib.load(str(source["localPath"]), mmap=True)
+                physical = image.get_qform(coded=True)[0]
+                sourceFrame = motion["interpretation"]["voxelFrame"]
 
-                transforms = [
-                    item["transform"]
-                    for item in compositeByScan[scanUUID]["composites"]
-                ]
-
-            if len(transforms) != count:
-                raise ValueError("There must be one sampling transform per source volume.")
-
-            for transform in transforms:
-                validated = pglMRITransforms._validateTransform(transform)
+                if len(image.shape) != 4:
+                    raise ValueError("Motion application requires a four-dimensional source.")
+                if physical is None or image.header.get_xyzt_units()[0] != "mm":
+                    raise ValueError("Application requires a coded millimeter acquisition qform.")
                 if (
-                    validated["purpose"] != "sampling"
-                    or validated["interpretationStatus"] != "validated"
-                    or validated["domainFrame"] != sourceFrame
-                    or validated["codomainFrame"] != sourceFrame
+                    list(image.shape[:3]) != sourceFrame["spatialShape"]
+                    or not np.allclose(
+                        physical, sourceFrame["voxelToPhysicalMM"],
+                        rtol=0, atol=0.0001,
+                    )
                 ):
-                    raise ValueError("Application mappings do not connect the original acquisition grid to itself.")
+                    raise ValueError("Motion interpretation does not describe the acquisition grid.")
 
-            jobs.append({
-                "motion": motion,
-                "source": source,
-                "transforms": transforms,
-                "alignment": alignment,
-            })
+                if compositePlan is None:
+                    transforms = motion["interpretation"]["voxelTransforms"]
+                    alignment = None
+                else:
+                    alignment = alignmentByScan[scanUUID]
 
-        def scanLabel(index):
-            name = session.mri.scans[index].name.replace("\n", " ").replace("\r", " ")
-            return f"scan {index} {name!r}"
+                    if not alignment["isReference"]:
+                        rows = readArtifact(
+                            runAlignmentRecord, alignment["matricesRole"], (1, 12),
+                        )
+                        readArtifact(
+                            runAlignmentRecord, alignment["motionParametersRole"], (1, 6),
+                        )
+                        native = np.asarray(
+                            alignment["interpretation"]["nativeTransform"]["matrix"]
+                        )
+                        if not np.allclose(rows.reshape(3, 4), native[:3], rtol=0, atol=1e-10):
+                            raise ValueError("Native alignment matrix disagrees with its interpreted record.")
 
-        currentIndices = {
-            job["source"]["scanUUID"]: job["source"]["scanIndex"]
-            for job in jobs
-        }
+                    transforms = [
+                        item["transform"]
+                        for item in compositeByScan[scanUUID]["composites"]
+                    ]
 
-        pglMessages.message(
-            "Applying motion corrections from original acquisition sources.\n"
-            "Each volume will be sampled once; existing corrected images are not inputs."
-        )
+                if len(transforms) != count:
+                    raise ValueError("There must be one sampling transform per source volume.")
 
-        for job in jobs:
-            source = job["source"]
-            motion = job["motion"]
-            alignment = job["alignment"]
+                validatedTransforms = []
+                for transform in transforms:
+                    validated = pglMRITransforms._validateTransform(transform)
+                    if (
+                        validated["purpose"] != "sampling"
+                        or validated["interpretationStatus"] != "validated"
+                        or validated["domainFrame"] != sourceFrame
+                        or validated["codomainFrame"] != sourceFrame
+                    ):
+                        raise ValueError("Sampling mappings do not connect the acquisition grid to itself.")
+                    validatedTransforms.append(validated)
 
-            if alignment is None:
-                targetText = (
-                    f"its within-run reference, original volume "
-                    f"{motion['referenceVolumeIndex']}"
+                statusOutput("  Constructing lazy source metadata; no voxel computation is expected.", flush=True)
+                sourceMatrix = pglMRIData.fromNifti(
+                    source["localPath"],
+                    scanUUID=scanUUID,
+                    sourceStageID=source["sourceStageID"],
+                    volumeIndices=source["volumeIndices"],
+                    name=f"motionSource.{scanUUID}",
                 )
-            else:
-                referenceIndex = currentIndices[alignment["commonReferenceScanUUID"]]
-                targetText = (
-                    f"group {alignment['groupIndex']} reference "
-                    f"{scanLabel(referenceIndex)}, original volume "
-                    f"{alignment['commonReferenceVolumeIndex']}"
-                )
 
-            pglMessages.print(
-                f"  {scanLabel(source['scanIndex'])}: "
-                f"{source['volumeCount']} volumes → {targetText}\n"
-                "    Output grid: this scan's unchanged acquisition grid."
+                # Retain the wrapper immediately so failure cleanup can close it.
+                job = {
+                    "motion": motion,
+                    "source": source,
+                    "sourceMatrix": sourceMatrix,
+                    "transforms": validatedTransforms,
+                    "alignment": alignment,
+                    "shape": tuple(image.shape),
+                }
+                jobs.append(job)
+
+                sourceData = pglMRIData.validate(sourceMatrix)
+                if tuple(sourceData.shape) != tuple(image.shape):
+                    raise ValueError("Source tensor dimensions differ from the verified image.")
+                if not np.allclose(sourceData.attrs["pglMRI"]["affine"], image.affine, rtol=0, atol=1e-8):
+                    raise ValueError("Source tensor affine differs from the verified image.")
+
+                statusOutput(f"  Preflight complete: {scanPosition + 1} of {len(selectedUUIDs)} scans.", flush=True)
+
+            # Build uncompressed working sources once. The original source path
+            # and compressed content identity remain authoritative provenance.
+            for position, job in enumerate(jobs):
+                source = job["source"]
+                statusOutput(
+                    f"\nPreparing volume reads for scan {source['scanIndex']} "
+                    f"({position} of {len(jobs)} prepared).",
+                    flush=True,
+                )
+                job["volumePath"] = progressCall(_progress, 0.20 + 0.15 * position / len(jobs), 0.20 + 0.15 * (position + 1) / len(jobs), f"Preparing scan {source['scanIndex']} — uncompressed volume access", pglMRIData.prepareVolumeSource, source["localPath"], cacheDirectory=outputCache)
+
+                preparedImage = nib.load(str(job["volumePath"]), mmap=True)
+                if tuple(preparedImage.shape) != job["shape"]:
+                    raise ValueError("Prepared volume source has different dimensions.")
+                if not np.allclose(
+                    preparedImage.affine,
+                    job["sourceMatrix"].data.attrs["pglMRI"]["affine"],
+                    rtol=0, atol=1e-8,
+                ):
+                    raise ValueError("Prepared volume source has different geometry.")
+
+                details = job["volumePath"].stat()
+                job["volumeStat"] = (details.st_size, details.st_mtime_ns)
+
+            totalVolumes = sum(job["source"]["volumeCount"] for job in jobs)
+            statusOutput(
+                f"\nReady to correct {totalVolumes} volumes across {len(jobs)} scans.\n"
+                "Scientific input: original acquisition. Existing corrected images are replacement targets only.\n"
+                f"Zarr output cache: {outputCache / 'mriImages'}",
+                flush=True,
             )
 
-        if parent is not None: parent.mkdir(parents=True, exist_ok=True)
-        outputDirectory = Path(tempfile.mkdtemp(
-            prefix="pgl-motion-applied-",
-            dir=None if parent is None else str(parent),
-        ))
-        pglMessages.print(f"New output directory: {outputDirectory}")
+            correctionProgress = {
+                "completed": 0,
+                "lastReport": time.monotonic(),
+            }
 
-        completed = []
+            def correctVolume(filename, row, mapping, spatialShape, scanIndex, scanCount, scanProgress):
+                """Read and sample one uncompressed acquisition volume."""
+                if scanProgress["started"] is None:
+                    scanProgress["started"] = time.monotonic()
+                    statusOutput(f"\nCorrecting scan {scanIndex}: {scanCount} volumes.", flush=True)
 
-        for position, job in enumerate(jobs):
-            motion = job["motion"]
-            source = job["source"]
-            pglMessages.message(
-                f"Correcting {position + 1}/{len(jobs)}: "
-                f"{scanLabel(source['scanIndex'])}"
-            )
+                sourceImage = nib.load(filename, mmap=True)
+                volume = np.asarray(sourceImage.dataobj[..., row], dtype=np.float32)
 
-            image = nib.load(source["localPath"])
-            corrected = np.empty(image.shape, dtype=np.float32)
+                if volume.shape != spatialShape or not np.isfinite(volume).all():
+                    raise ValueError("Source volume has invalid dimensions or nonfinite values.")
 
-            # Read one input volume at a time. The output run is currently
-            # held in RAM; no out-of-core output claim is made here.
-            for row, transform in enumerate(job["transforms"]):
-                mapping = np.asarray(transform["matrix"])
-                volume = np.asarray(image.dataobj[..., row], dtype=np.float32)
-                if not np.isfinite(volume).all():
-                    raise ValueError("Source image contains nonfinite voxel values.")
-
-                corrected[..., row] = affine_transform(
+                corrected = affine_transform(
                     volume,
                     matrix=mapping[:3, :3],
                     offset=mapping[:3, 3],
-                    output_shape=image.shape[:3],
+                    output_shape=spatialShape,
+                    output=np.float32,
                     order=3,
                     mode="constant",
                     cval=0,
                     prefilter=True,
                 )
+                if not np.isfinite(corrected).all():
+                    raise ValueError("Motion correction produced nonfinite values.")
 
-            if not np.isfinite(corrected).all():
-                raise ValueError("Correction produced nonfinite values.")
+                # Synchronous scheduler: these counters are updated serially.
+                # Completion order is not assumed to match volume-index order.
+                scanProgress["completed"] += 1
+                correctionProgress["completed"] += 1
+                now = time.monotonic()
 
-            header = image.header.copy()
-            header.set_data_dtype(np.float32)
-            header.set_slope_inter(1, 0)
-            output = image.__class__(corrected, image.affine.copy(), header=header)
-
-            # Define the same geometry used for sampling before writing.
-            # This does not repair a differently gridded image afterward.
-            output.set_qform(image.get_qform(), code=int(image.header["qform_code"]))
-            output.set_sform(image.get_sform(), code=int(image.header["sform_code"]))
-
-            filename = outputDirectory / f"scan-{source['scanUUID']}.nii.gz"
-            nib.save(output, filename)
-            stored = nib.load(filename)
-
-            if (
-                stored.shape != image.shape
-                or stored.header.get_xyzt_units() != image.header.get_xyzt_units()
-                or not np.allclose(
-                    stored.header.get_zooms(), image.header.get_zooms(),
-                    rtol=0, atol=0.0001,
-                )
-            ):
-                raise ValueError("Corrected dimensions, spacing, TR, or units changed.")
-
-            for form in ("qform", "sform"):
-                before, beforeCode = getattr(image, f"get_{form}")(coded=True)
-                after, afterCode = getattr(stored, f"get_{form}")(coded=True)
-                if int(beforeCode) != int(afterCode):
-                    raise ValueError(f"Corrected image {form} code changed.")
-                if before is not None and (
-                    after is None or not np.allclose(before, after, rtol=0, atol=0.0001)
+                if (
+                    scanProgress["completed"] == 1
+                    or scanProgress["completed"] == scanCount
+                    or now - correctionProgress["lastReport"] >= 10
                 ):
-                    raise ValueError(f"Corrected image {form} geometry changed.")
+                    statusOutput(
+                        f"  Scan {scanIndex}: {scanProgress['completed']}/{scanCount} "
+                        f"volumes corrected; total {correctionProgress['completed']}/{totalVolumes}; "
+                        f"last original volume index {row}; "
+                        f"{now - scanProgress['started']:.1f}s elapsed for this scan.",
+                        flush=True,
+                    )
+                    correctionProgress["lastReport"] = now
 
-            completed.append((job, filename))
+                # Returning a corrected volume is not the same as completing
+                # its Zarr write. The Dask/write messages cover that phase.
+                return corrected
 
-        # Recheck every source and artifact before installing attachments.
-        for job in jobs:
-            source = job["source"]
-            if pglExternalTool._fileIdentity(source["localPath"]) != source["sourceIdentity"]:
-                raise ValueError("An acquisition source changed during correction.")
+            replacements = []
 
-        for path, expected in verifiedArtifacts:
-            if pglExternalTool._fileIdentity(path) != expected:
-                raise ValueError("A transform artifact changed during correction.")
+            for job in jobs:
+                source = job["source"]
+                spatialShape = job["shape"][:3]
+                scanProgress = {"completed": 0, "started": None}
+                volumes = []
 
-        files = {}
-        imageStages = {}
-        executionID = action.actionHistory[-1].actionID
+                for row, transform in enumerate(job["transforms"]):
+                    task = delayed(correctVolume, pure=False)(
+                        str(job["volumePath"]),
+                        row,
+                        np.asarray(transform["matrix"], dtype=float),
+                        spatialShape,
+                        source["scanIndex"],
+                        source["volumeCount"],
+                        scanProgress,
+                    )
+                    volumes.append(da.from_delayed(task, shape=spatialShape, dtype=np.float32))
 
-        for job, filename in completed:
-            source = job["source"]
-            role = f"scan.{source['scanUUID']}.image"
-            attachmentName = f"mri.{executionID}.{role}"
-            session.addDerivedFile(
-                attachmentName,
-                filename,
-                mediaType="application/octet-stream",
-            )
-            files[role] = attachmentName
-            imageStages[role] = {
-                "scanUUID": source["scanUUID"],
-                "volumeIndices": list(source["volumeIndices"]),
+                correctedData = job["sourceMatrix"].data.copy(deep=False)
+                correctedData.attrs = deepcopy(job["sourceMatrix"].data.attrs)
+                correctedData.data = da.stack(volumes, axis=3)
+                correctedData.attrs["pglMRI"]["niftiMetadataRole"] = "sourceHeaderSnapshot"
+
+                correctedMatrix = pglDataMatrix(
+                    correctedData,
+                    name=f"motionCorrected.{source['scanUUID']}",
+                )
+                correctedMatrix.provenance = {
+                    "operation": "motionCorrection",
+                    "scanUUID": source["scanUUID"],
+                    "sourceStageID": source["sourceStageID"],
+                    "sourceIdentity": deepcopy(source["sourceIdentity"]),
+                    "originalNifti": deepcopy(source["nifti"]),
+                }
+                pglMRIData.validate(correctedMatrix)
+
+                replacements.append({
+                    "scanNum": source["scanIndex"],
+                    "matrix": correctedMatrix,
+                    "inputStageID": source["sourceStageID"],
+                    "replacesStageID": replacesByScan[source["scanUUID"]],
+                })
+
+            productIDs = [productRecord["productID"]]
+            metadata = {
+                "schemaVersion": 2,
+                "operation": (
+                    "withinRunMotionApplication"
+                    if runAlignmentRecord is None else
+                    "withinAndBetweenRunMotionApplication"
+                ),
+                "appliedMotionProductID": productRecord["productID"],
+                "appliedProducerActionID": productRecord["producerActionID"],
+                "appliedTransformIDs": [
+                    transform["transformID"]
+                    for job in jobs
+                    for transform in job["transforms"]
+                ],
+                "appliedScanUUIDs": list(selectedUUIDs),
+                "sources": [
+                    {
+                        "scanUUID": job["source"]["scanUUID"],
+                        "sourceStageID": job["source"]["sourceStageID"],
+                        "sourceIdentity": deepcopy(job["source"]["sourceIdentity"]),
+                        "volumeIndices": list(job["source"]["volumeIndices"]),
+                    }
+                    for job in jobs
+                ],
+                "outputGrid": "originalAcquisition",
+                "outputStorage": "pgl.matrix.zarr.v1",
+                "spatialInterpolationCountPerOutput": 1,
+                "sampling": {
+                    "implementation": "scipy.ndimage.affine_transform",
+                    "order": 3,
+                    "mode": "constant",
+                    "cval": 0.0,
+                    "prefilter": True,
+                    "outputDtype": "float32",
+                },
+                "execution": {
+                    "scheduler": "synchronous",
+                    "volumeTaskOrder": "schedulerDefined",
+                    "timeChunkSize": 1,
+                    "inputAccess": "uncompressedNiftiProxy",
+                },
             }
 
-        productIDs = [productRecord["productID"]]
-        metadata = {
-            "schemaVersion": 1,
-            "operation": (
-                "withinRunMotionApplication"
-                if runAlignmentRecord is None else
-                "withinAndBetweenRunMotionApplication"
-            ),
-            "imageStages": imageStages,
-            "appliedMotionProductID": productRecord["productID"],
-            "appliedProducerActionID": productRecord["producerActionID"],
-            "appliedTransformIDs": [
-                transform["transformID"]
-                for job in jobs
-                for transform in job["transforms"]
-            ],
-            "appliedScanUUIDs": list(selectedUUIDs),
-            "sources": [
-                {
-                    "scanUUID": job["source"]["scanUUID"],
-                    "sourceStageID": job["source"]["sourceStageID"],
-                    "sourceIdentity": deepcopy(job["source"]["sourceIdentity"]),
-                    "volumeIndices": list(job["source"]["volumeIndices"]),
-                }
-                for job in jobs
-            ],
-            "outputGrid": "originalAcquisition",
-            "sampling": {
-                "implementation": "scipy.ndimage.affine_transform",
-                "order": 3,
-                "mode": "constant",
-                "cval": 0.0,
-                "prefilter": True,
-                "outputDtype": "float32",
-            },
-        }
+            if runAlignmentRecord is not None:
+                productIDs.append(runAlignmentRecord["productID"])
+                metadata.update({
+                    "appliedRunAlignmentProductID": runAlignmentRecord["productID"],
+                    "appliedRunAlignmentProducerActionID": runAlignmentRecord["producerActionID"],
+                    "compositePlan": compositePlan,
+                })
 
-        if runAlignmentRecord is not None:
-            productIDs.append(runAlignmentRecord["productID"])
-            metadata.update({
-                "appliedRunAlignmentProductID": runAlignmentRecord["productID"],
-                "appliedRunAlignmentProducerActionID": runAlignmentRecord["producerActionID"],
-                "compositePlan": compositePlan,
-                "spatialInterpolationCountPerOutput": 1,
-            })
+            progressCall(_progress, 0.35, 0.40, "Verifying source bytes before correction", requireSourceBytesUnchanged, "\nVerifying original source and transform bytes before correction.")
 
-        return action.registerProduct(
-            outputName,
-            "image",
-            session=session,
-            files=files,
-            inputProductIDs=productIDs,
-            metadata=metadata,
-            invocationIDs=[],
-        )
+            statusOutput(
+                "\nStarting correction and Zarr publication. "
+                "The progress bar measures Dask tasks, not bytes or volumes.",
+                flush=True,
+            )
+            with dask.config.set(scheduler="synchronous"):
+                with noProgressBar(minimum=0, dt=0.5):
+                    registered = progressCall(_progress, 0.40, 0.92, "Correcting volumes and writing Zarr replacements", session.mri.publishImageReplacements, action, replacements, outputName=outputName, cacheDirectory=outputCache, metadata=metadata, inputProductIDs=productIDs)
+
+            statusOutput("\nZarr publication finished. Checking working source files.", flush=True)
+            for job in jobs:
+                details = job["volumePath"].stat()
+                if (details.st_size, details.st_mtime_ns) != job["volumeStat"]:
+                    raise ValueError("A prepared volume source changed during correction.")
+
+            progressCall(_progress, 0.92, 0.99, "Final source and transform verification", requireSourceBytesUnchanged, "Performing final original-source and transform byte verification.")
+            statusOutput(
+                "Motion application validated. Returning to the action runner "
+                "for product commitment and retention.",
+                flush=True,
+            )
+            return registered
+
+        finally:
+            # These wrappers belong only to this invocation. Published matrices
+            # were independently reopened from Zarr and are not closed here.
+            for job in jobs:
+                job["sourceMatrix"].close()
+    
     ################################################################
     # Present a completed motion product
     ################################################################
