@@ -32,7 +32,7 @@ from pathlib import Path
 from IPython.display import HTML, display
 from collections import OrderedDict
 import ipywidgets as widgets
-from traitlets import HasTraits, Float, Int, List, TraitError, Unicode, Dict, default, link, Bool, TraitType
+from traitlets import HasTraits, Float, Int, List, TraitError, Unicode, Dict, default, link, Bool, TraitType, Instance
 from functools import partial
 import math
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
@@ -40,6 +40,7 @@ from matplotlib.figure import Figure
 from .pglMessages import pglMessages
 import traceback
 import re
+from copy import deepcopy
 
 
 
@@ -1426,8 +1427,35 @@ class _pglTraitsDialog(QDialog):
     # ----- Text / Path -----
     #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
     def _addText(self, traitName, trait, current, helpText, settingsObject, layout=None, settingsKey=None):
+        """Add a text editor, with a Browse button for isPath=True traits.
+
+        Path metadata:
+            isPath=True:
+                Enable browsing. Defaults to selecting an existing directory.
+
+            pathType="directory":
+                Select an existing directory.
+
+            pathType="file":
+                Select an existing file, such as an executable.
+
+            pathType="saveFile":
+                Select a destination filename. Does not create/write the file.
+
+            pathFilter:
+                Optional Qt file filter for file/saveFile selection.
+
+        Picker cancellation leaves the editor and settings copy unchanged.
+        Accepted paths go through the ordinary text-change commit mechanism.
+        The enclosing dialog still controls whether edits are accepted.
+        """
+        import os
+        from pathlib import Path
+
+        from PySide6.QtWidgets import QFileDialog
+
         edit = QLineEdit(str(current) if current is not None else "")
-        edit.setAlignment(Qt.AlignCenter) 
+        edit.setAlignment(Qt.AlignCenter)
         edit.setToolTip(helpText)
 
         def onChange(text):
@@ -1435,7 +1463,120 @@ class _pglTraitsDialog(QDialog):
                 self._commit(settingsObject, traitName, text)
 
         edit.textChanged.connect(onChange)
-        self._register(traitName, trait, edit, lambda v: edit.setText(str(v) if v is not None else ""), layout, settingsKey)
+
+        def setter(value):
+            # Retargeting a settings profile should update the displayed value
+            # without generating another edit/commit.
+            wasBlocked = edit.blockSignals(True)
+            try:
+                edit.setText(str(value) if value is not None else "")
+            finally:
+                edit.blockSignals(wasBlocked)
+
+        if not trait.metadata.get("isPath", False):
+            self._register(traitName, trait, edit, setter, layout, settingsKey)
+            return
+
+        pathType = trait.metadata.get("pathType", "directory")
+        if pathType not in ("directory", "file", "saveFile"):
+            raise ValueError(f"{traitName}: pathType must be directory, file, or saveFile.")
+
+        pathFilter = trait.metadata.get("pathFilter", "All files (*)")
+        if not isinstance(pathFilter, str):
+            raise TypeError(f"{traitName}: pathFilter must be a string.")
+
+        browse = QPushButton("…")
+        browse.setToolTip("Browse for a directory" if pathType == "directory" else "Browse for a file")
+        browse.setAutoDefault(False)
+        browse.setDefault(False)
+
+        # Override the dialog-wide button minimum width for a compact picker.
+        browse.setStyleSheet(
+            "QPushButton { min-width: 28px; max-width: 28px; padding: 2px 4px; }"
+        )
+        browse.setFixedWidth(40)
+
+        fieldLabel = trait.metadata.get("traitDisplayName", traitName)
+
+        def initialLocation():
+            """Start at the entered local path or its nearest existing parent."""
+            text = edit.text().strip()
+
+            # Filesystem pickers cannot browse fsspec URLs. Users can still
+            # enter those manually in the ordinary text editor.
+            if not text or "://" in text or "::" in text or "\x00" in text:
+                return str(Path.home())
+
+            path = Path(os.path.expandvars(text)).expanduser().absolute()
+
+            if pathType == "saveFile" and path.parent.is_dir():
+                return str(path)
+            if pathType == "file" and path.is_file():
+                return str(path)
+            if path.is_dir():
+                return str(path)
+
+            parent = path.parent
+            while not parent.is_dir():
+                if parent == parent.parent:
+                    return str(Path.home())
+                parent = parent.parent
+
+            return str(parent)
+
+        def onBrowse(checked=False):
+            if self._updatingWidget:
+                return
+
+            try:
+                start = initialLocation()
+
+                if pathType == "directory":
+                    selected = QFileDialog.getExistingDirectory(
+                        self,
+                        f"Select {fieldLabel}",
+                        start,
+                    )
+                elif pathType == "file":
+                    selected, _ = QFileDialog.getOpenFileName(
+                        self,
+                        f"Select {fieldLabel}",
+                        start,
+                        pathFilter,
+                    )
+                else:
+                    selected, _ = QFileDialog.getSaveFileName(
+                        self,
+                        f"Select {fieldLabel}",
+                        start,
+                        pathFilter,
+                    )
+
+                # Empty means Cancel: do not set text or commit anything.
+                if selected:
+                    edit.setText(selected)
+
+            except Exception as error:
+                message = QMessageBox(self)
+                message.setIcon(QMessageBox.Icon.Warning)
+                message.setWindowTitle("Path selection failed")
+                message.setTextFormat(Qt.TextFormat.PlainText)
+                message.setText(str(error))
+                message.exec()
+
+        browse.clicked.connect(onBrowse)
+
+        row = QWidget()
+        rowLayout = QHBoxLayout(row)
+        rowLayout.setContentsMargins(0, 0, 0, 0)
+        rowLayout.setSpacing(6)
+        rowLayout.addWidget(edit, 1)
+        rowLayout.addWidget(browse)
+
+        # Register the complete row so enabled/visible metadata and Boolean
+        # contingencies apply to both the editor and Browse button.
+        self._register(traitName, trait, row, setter, layout, settingsKey)
+
     #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
     # ----- Enum -> dropdown -----
     #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
@@ -2647,6 +2788,75 @@ class pglDialogs:
         except Exception as e:
             pglMessages.warning(f"Error running traitsDialog: {e}")
             return None
+        
+    @staticmethod
+    def toolDialog(document, width=None):
+        """Edit a portable tool schema using the existing standalone traits GUI.
+
+        Returns the validated edited document, or None on user cancellation.
+        Does not save permanent configuration or install software.
+
+        Unlike traitsDialog(), this exchanges plain JSON and builds temporary
+        trait classes inside the child process. No per-tool serialization
+        classes or public export entries are required.
+
+        A child-process failure raises instead of being reported as Cancel.
+        """
+        import json
+        import subprocess
+        import sys
+        import tempfile
+        from pathlib import Path
+
+        if width is not None and (type(width) is not int or width <= 0):
+            raise ValueError("width must be positive or None.")
+
+        document = pglToolDialog.validate(document)
+
+        with tempfile.TemporaryDirectory(prefix="pgl-tool-dialog-") as temporary:
+            root = Path(temporary)
+            inputPath = root / "in.json"
+            outputPath = root / "out.json"
+
+            inputPath.write_text(
+                json.dumps(document, ensure_ascii=False, allow_nan=False),
+                encoding="utf-8",
+            )
+
+            script = Path(__file__).parent / "pglTraitsDialogStandalone.py"
+            command = [
+                sys.executable, str(script), "--tool-schema",
+                str(inputPath), str(outputPath),
+            ]
+            if width is not None: command.append(str(width))
+
+            # Preserve diagnostics for real failures instead of discarding them.
+            result = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                errors="replace",
+            )
+
+            if result.returncode == 1:
+                return None
+            if result.returncode != 0:
+                details = (result.stderr or result.stdout or "No child diagnostic")[-12000:]
+                raise RuntimeError(f"Tool dialog failed:\n{details}")
+            if not outputPath.is_file():
+                raise RuntimeError("Tool dialog accepted without returning its settings.")
+
+            edited = pglToolDialog.validate(
+                json.loads(outputPath.read_text(encoding="utf-8"))
+            )
+
+            # The child edits values/profiles, never the adapter's schema.
+            for field in ("schemaVersion", "toolName", "label", "multipleInstallations", "fields"):
+                if edited[field] != document[field]:
+                    raise ValueError(f"Tool dialog changed protected field {field!r}.")
+
+            return edited
 
     ################################################################
     # Display information and request explicit confirmation
@@ -3040,3 +3250,257 @@ Path(sys.argv[2]).write_text(json.dumps(selection), encoding="utf-8")
         except Exception as error:
             pglMessages.warning(f"Selection was not obtained: {type(error).__name__}: {error}", level=1)
             return None
+        
+################################################################
+#   pglToolDialog.py
+#    purpose: Build existing PGL traits dialogs from tool field schemas
+################################################################
+class pglToolDialog:
+    """Portable tool-editor schema backed by the existing traits GUI.
+
+    JSON contains field descriptions and values, not executable class names.
+    Only allowlisted field types are converted to traits.
+
+    Runtime editor classes exist only within the current process. They never
+    pass through pglSerialize or require public export registration.
+
+    One editor handles one tool. Installation profiles share that tool's
+    field layout, as required by the existing settings-list widget.
+    """
+
+    @staticmethod
+    def validate(document):
+        """Validate and copy a tool-editor document without opening a GUI."""
+        import re
+        from .pglSettings import pglTraitSettings
+
+        if type(document) is not dict or set(document) != {
+            "schemaVersion", "toolName", "label", "multipleInstallations",
+            "fields", "profiles", "defaultInstallation",
+        }:
+            raise ValueError("Invalid tool-editor document fields.")
+
+        if type(document["schemaVersion"]) is not int or document["schemaVersion"] != 1:
+            raise ValueError("Unsupported tool-editor schema.")
+        if type(document["multipleInstallations"]) is not bool:
+            raise TypeError("multipleInstallations must be Boolean.")
+
+        def requireText(value, label):
+            if (
+                not isinstance(value, str) or not value.strip()
+                or any(character in value for character in ("\x00", "\n", "\r"))
+            ):
+                raise ValueError(f"{label} must be a nonblank string without NUL or newlines.")
+
+        requireText(document["toolName"], "toolName")
+        requireText(document["label"], "label")
+
+        fields = document["fields"]
+        if type(fields) is not dict or not fields:
+            raise ValueError("Tool fields must be a nonempty dictionary.")
+
+        reserved = set(pglTraitSettings.class_traits()) | set(dir(pglTraitSettings))
+        reserved |= {"profiles", "configNames"}
+
+        def validateValue(value, definition, label):
+            if definition["type"] == "bool":
+                if type(value) is not bool:
+                    raise TypeError(f"{label} must be Boolean.")
+            else:
+                if not isinstance(value, str):
+                    raise TypeError(f"{label} must be a string.")
+                if any(character in value for character in ("\x00", "\n", "\r")):
+                    raise ValueError(f"{label} must not contain NUL or newlines.")
+
+        for name, definition in fields.items():
+            if (
+                not isinstance(name, str)
+                or re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", name) is None
+                or name in reserved
+            ):
+                raise ValueError(f"Invalid or reserved tool field name: {name!r}")
+
+            if type(definition) is not dict or set(definition) != {
+                "type", "default", "label", "help",
+            }:
+                raise ValueError(f"Invalid definition for tool field {name!r}.")
+            if definition["type"] not in ("text", "path", "bool"):
+                raise ValueError(f"Unsupported tool field type: {definition['type']!r}")
+
+            requireText(definition["label"], f"{name} label")
+            if not isinstance(definition["help"], str):
+                raise TypeError("Field help must be a string.")
+
+            validateValue(definition["default"], definition, f"{name} default")
+
+        profiles = document["profiles"]
+        if type(profiles) is not list or not profiles:
+            raise ValueError("Supply at least one installation profile.")
+        if not document["multipleInstallations"] and len(profiles) != 1:
+            raise ValueError("This tool supports only one configuration.")
+
+        names = []
+        for profile in profiles:
+            if type(profile) is not dict or set(profile) != {"name", "values"}:
+                raise ValueError("A profile requires name and values.")
+
+            requireText(profile["name"], "Installation name")
+            names.append(profile["name"])
+
+            values = profile["values"]
+            if type(values) is not dict or set(values) != set(fields):
+                raise ValueError("Profile values must exactly match declared fields.")
+
+            for name, definition in fields.items():
+                validateValue(values[name], definition, name)
+
+        if len(set(names)) != len(names):
+            raise ValueError("Installation names must be unique.")
+
+        defaultName = document["defaultInstallation"]
+        if not isinstance(defaultName, str) or defaultName not in names:
+            raise ValueError("defaultInstallation must identify one profile.")
+
+        return deepcopy(document)
+
+    @classmethod
+    def build(cls, document):
+        """Build the existing traits editor from a validated tool schema.
+
+        Multiple installations:
+            Show the installation selector, editable names, default checkbox,
+            and New/Copy/Delete controls.
+
+        Single configuration:
+            Show configuration fields directly, without a profile selector,
+            name, default checkbox, or profile-management controls.
+
+        Runtime editor classes remain local to this process. Only the plain
+        document returned by extract() crosses the process boundary.
+        """
+        from traitlets import Bool, Instance, List, Unicode
+
+        from .pglSettings import pglTraitSettings
+
+        document = cls.validate(document)
+        multiple = document["multipleInstallations"]
+
+        traits = {
+            "__module__": __name__,
+            "name": Unicode(
+                "New installation",
+                visible=multiple,
+                enabled=multiple,
+                help="Unique name for this installation profile.",
+            ),
+        }
+
+        for name, definition in document["fields"].items():
+            options = {
+                "help": definition["help"],
+                "traitDisplayName": definition["label"],
+            }
+
+            if definition["type"] == "bool":
+                trait = Bool(definition["default"], **options)
+            else:
+                trait = Unicode(definition["default"], **options)
+                if definition["type"] == "path":
+                    trait = trait.tag(isPath=True)
+
+            traits[name] = trait
+
+        # Build from allowlisted traits, not executable source or class names
+        # supplied by the document.
+        profileClass = type("pglToolProfileEditor", (pglTraitSettings,), traits)
+
+        profiles = []
+        for record in document["profiles"]:
+            profile = profileClass()
+            profile.name = record["name"]
+            profile.isDefault = record["name"] == document["defaultInstallation"]
+
+            for name, value in record["values"].items():
+                setattr(profile, name, value)
+
+            profiles.append(profile)
+
+        if not multiple:
+            # No List trait means no configuration-name selector is rendered.
+            # Keep the internal name solely for document round-trip identity.
+            return profiles[0]
+
+        profileTrait = List(
+            Instance(profileClass),
+            settingsListKey="name",
+            buttons=True,
+            setDefault=True,
+            hideKey=False,
+            traitDisplayName="Installation",
+            help="Select the installation to edit. The default is explicitly marked.",
+        )
+        editorClass = type(
+            "pglToolEditor",
+            (pglTraitSettings,),
+            {
+                "__module__": __name__,
+                "profiles": profileTrait,
+            },
+        )
+
+        # Display the default first. Selecting a row for editing does not itself
+        # change the explicitly marked default installation.
+        profiles.sort(key=lambda profile: not profile.isDefault)
+        editor = editorClass()
+        editor.profiles = profiles
+        return editor
+
+    @classmethod
+    def extract(cls, document, editor):
+        """Return edited values without serializing runtime editor classes.
+
+        Single-configuration tools retain their internal profile identity
+        without displaying or editing that identity in the GUI.
+
+        Multiple-installation tools return the edited profile names and require
+        exactly one explicitly selected default.
+        """
+        document = cls.validate(document)
+
+        if not document["multipleInstallations"]:
+            originalName = document["profiles"][0]["name"]
+
+            edited = {
+                **document,
+                "profiles": [{
+                    "name": originalName,
+                    "values": {
+                        name: getattr(editor, name)
+                        for name in document["fields"]
+                    },
+                }],
+                "defaultInstallation": originalName,
+            }
+            return cls.validate(edited)
+
+        profiles = list(editor.profiles)
+        defaults = [profile.name for profile in profiles if profile.isDefault]
+
+        if len(defaults) != 1:
+            raise ValueError("Select exactly one default installation.")
+
+        edited = {
+            **document,
+            "profiles": [
+                {
+                    "name": profile.name,
+                    "values": {
+                        name: getattr(profile, name)
+                        for name in document["fields"]
+                    },
+                }
+                for profile in profiles
+            ],
+            "defaultInstallation": defaults[0],
+        }
+        return cls.validate(edited)

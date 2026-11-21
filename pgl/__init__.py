@@ -104,7 +104,13 @@ _EXPORTS = {
  'pglEyelink': ('.pglEyelink', 'pglEyelink'),
  'pgl': ('._graphics', 'pgl'),
  'pglInfo': ('.pglInfo', 'pglInfo'),
- 'pglAFNI': ('.pglExternalTools', 'pglAFNI')
+ 'pglAFNI': ('.pglExternalTools', 'pglAFNI'),
+ 'pglToolSettings': ('.pglSettings', 'pglToolSettings'),
+ 'pglExecutableToolSettings': ('.pglSettings', 'pglExecutableToolSettings'),
+ 'pglToolSettingsList': ('.pglSettings', 'pglToolSettingsList'),
+ 'pglExternalTool': ('.pglExternalTools', 'pglExternalTool'),
+ 'pglMATLAB': ('.pglExternalTools', 'pglMATLAB'),
+ 'pglGLMsingle': ('.pglExternalTools', 'pglGLMsingle'),
 }
 
 _resolved_exports = {}

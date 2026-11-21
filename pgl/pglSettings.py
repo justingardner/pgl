@@ -1213,6 +1213,51 @@ class pglTraitSettings(HasTraits, pglSerialize):
         return allValid
 
 ##################################################
+# pglToolSettings
+##################################################
+class pglToolSettings(pglTraitSettings):
+    """Base for machine-local tool configuration edited by pglDialogs.
+
+    Subclasses declare their editable traits. configNames explicitly identifies
+    which values belong in the persistent tool-settings document.
+
+    Tool identity is supplied by the adapter and is not editable in the GUI.
+    """
+
+    name = Unicode("", enabled=False, help="Tool")
+    toolName = Unicode("", visible=False, enabled=False, help="Stable tool identifier")
+
+    configNames = ()
+
+
+class pglExecutableToolSettings(pglToolSettings):
+    """Configuration for tools resolved from an executable directory."""
+
+    directory = Unicode(
+        "",
+        isPath=True,
+        help="Directory containing the tool executables. Leave blank to use automatic discovery through PATH.",
+    )
+
+    configNames = ("directory",)
+
+
+class pglToolSettingsList(pglTraitSettings):
+    """Existing traits-dialog selector for registered tool configurations."""
+
+    settingsList = List(
+        Instance(pglToolSettings),
+        settingsListKey="name",
+        hideKey=True,
+        traitDisplayName="Choose tool",
+        help="Edit machine-local tool configuration. Blank paths use automatic discovery.",
+    )
+
+    def __init__(self, settingsList=None):
+        super().__init__()
+        if settingsList is not None: self.settingsList = settingsList
+
+##################################################
 # Stencil settings
 ##################################################
 class pglStencilSettings(pglTraitSettings):

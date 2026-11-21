@@ -678,8 +678,605 @@ class pglExternalTool:
         "LC_ALL",
         "LC_NUMERIC",
     )
+    # Subclasses opt into automatic registration by declaring toolName.
+    # Intermediate adapter bases can omit it.
+    toolName = None
+    toolLabel = None
+    multipleInstallations = True
+    resolvedLocationField = None
 
-    def __init__(self, executable=None, *, directory=None):
+    configurationFields = {
+        "directory": {
+            "type": "path",
+            "default": "",
+            "label": "Executable directory",
+            "help": "Directory containing the executables. Leave blank for automatic discovery.",
+        },
+    }
+    _toolRegistry = {}
+
+    def __init_subclass__(cls, **kwargs):
+        """Register a named adapter when its module is imported.
+
+        Does not instantiate the tool, discover executables, or install anything.
+        Intermediate subclasses must declare their own toolName to register.
+
+        Reloading the same module/class replaces its previous class object.
+        A different class attempting to use that name is rejected.
+        """
+        import re
+
+        super().__init_subclass__(**kwargs)
+        name = cls.__dict__.get("toolName")
+        if name is None: return
+
+        if not isinstance(name, str) or re.fullmatch(r"[a-z][a-z0-9_-]*", name) is None:
+            raise ValueError("toolName must be a lowercase identifier such as 'afni' or 'glmsingle'.")
+
+        previous = pglExternalTool._toolRegistry.get(name)
+        if previous is not None and previous is not cls:
+            previousIdentity = (previous.__module__, previous.__qualname__)
+            currentIdentity = (cls.__module__, cls.__qualname__)
+            if previousIdentity != currentIdentity:
+                raise ValueError(f"Tool name {name!r} is already registered by another adapter.")
+
+        pglExternalTool._toolRegistry[name] = cls
+
+    @classmethod
+    def registeredTools(cls):
+        """Return registered adapter classes without probing installations."""
+        if cls is pglExternalTool:
+            return dict(sorted(pglExternalTool._toolRegistry.items()))
+
+        name = cls.__dict__.get("toolName")
+        if name is None or pglExternalTool._toolRegistry.get(name) is not cls:
+            raise ValueError("This adapter is not registered under its own toolName.")
+
+        return {name: cls}
+
+
+    @staticmethod
+    def _toolSettingsPath(configFile=None):
+        """Resolve the shared configuration path without reading tool payloads.
+
+        configFile is primarily useful for isolated tests.
+        Ordinary use follows the existing PGL settings-directory mechanism.
+        """
+        from pathlib import Path
+
+        from .pglSettings import pglSettingsManager
+
+        if configFile is not None:
+            return Path(configFile).expanduser().absolute()
+
+        directory = pglSettingsManager.getPGLSettingsDir()
+        if directory is None:
+            raise OSError("Could not access the PGL settings directory.")
+
+        return Path(directory) / "tools.json"
+
+    @staticmethod
+    def _writeToolSettings(path, document):
+        """Atomically replace configuration after complete JSON encoding.
+
+        Does not install tools, modify scientific settings, or delete entries.
+        Concurrent configuration writers are unsupported.
+        """
+        import json
+        import os
+        import tempfile
+
+        document = _copyProvenance(document)
+        content = (
+            json.dumps(document, sort_keys=True, indent=4, ensure_ascii=False, allow_nan=False)
+            + "\n"
+        ).encode("utf-8")
+        if len(content) > 1024 * 1024:
+            raise ValueError("Tool settings exceed the supported 1 MiB size.")
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporaryPath = None
+
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix=".tools-",
+                suffix=".json",
+                dir=path.parent,
+                delete=False,
+            ) as target:
+                from pathlib import Path
+
+                temporaryPath = Path(target.name)
+                if target.write(content) != len(content):
+                    raise OSError("Incomplete tool-settings write.")
+                target.flush()
+                os.fsync(target.fileno())
+
+            os.replace(temporaryPath, path)
+            temporaryPath = None
+        finally:
+            if temporaryPath is not None: temporaryPath.unlink(missing_ok=True)
+
+    @staticmethod
+    def _readToolSettings(path):
+        """Read tool configuration, migrating legacy entries in memory.
+
+        V1:
+            tools[toolName] = configuration values
+
+        V2:
+            tools[toolName] = {
+                "defaultInstallation": profile name,
+                "installations": {profile name: configuration values},
+            }
+
+        Reading never rewrites an existing file. V1 entries become a profile
+        named "default", preserving every saved configuration field.
+
+        Unknown tool entries and unknown configuration fields are preserved.
+        Malformed documents raise instead of being replaced with defaults.
+        """
+        import json
+
+        if not path.exists():
+            return {"schemaVersion": 2, "tools": {}}
+
+        def uniqueKeys(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError(f"Duplicate tool-settings key: {key!r}")
+                result[key] = value
+            return result
+
+        def rejectConstant(value):
+            raise ValueError(f"Nonfinite tool-settings value: {value}")
+
+        with path.open("rb") as source:
+            content = source.read(1024 * 1024 + 1)
+        if len(content) > 1024 * 1024:
+            raise ValueError("Tool settings exceed 1 MiB.")
+
+        document = _copyProvenance(json.loads(
+            content,
+            object_pairs_hook=uniqueKeys,
+            parse_constant=rejectConstant,
+        ))
+
+        if (
+            type(document) is not dict
+            or set(document) != {"schemaVersion", "tools"}
+            or type(document["schemaVersion"]) is not int
+            or document["schemaVersion"] not in (1, 2)
+            or type(document["tools"]) is not dict
+        ):
+            raise ValueError("Unsupported tool-settings document.")
+
+        def requireName(value, label):
+            if (
+                not isinstance(value, str) or not value.strip()
+                or any(character in value for character in ("\x00", "\n", "\r"))
+            ):
+                raise ValueError(f"{label} must be a nonblank name without NUL or newlines.")
+
+        tools = {}
+
+        for toolName, entry in document["tools"].items():
+            requireName(toolName, "Tool name")
+            if type(entry) is not dict:
+                raise ValueError("Tool configuration entries must be dictionaries.")
+
+            if document["schemaVersion"] == 1:
+                entry = {
+                    "defaultInstallation": "default",
+                    "installations": {"default": entry},
+                }
+
+            if set(entry) != {"defaultInstallation", "installations"}:
+                raise ValueError(f"Invalid installation-profile record for {toolName!r}.")
+
+            installations = entry["installations"]
+            if type(installations) is not dict or not installations:
+                raise ValueError(f"Tool {toolName!r} requires at least one installation profile.")
+
+            for profileName, values in installations.items():
+                requireName(profileName, "Installation name")
+                if type(values) is not dict:
+                    raise ValueError("Installation values must be dictionaries.")
+
+            defaultName = entry["defaultInstallation"]
+            requireName(defaultName, "Default installation")
+            if defaultName not in installations:
+                raise ValueError("Default installation does not identify a saved profile.")
+
+            tools[toolName] = entry
+
+        return {"schemaVersion": 2, "tools": tools}
+
+    @classmethod
+    def _settingsFromValues(cls, values):
+        """Validate adapter-declared fields without constructing GUI classes.
+
+        Returns a lightweight namespace for compatibility with adapter checks.
+        Its configNames identifies only supported fields. Unknown saved fields
+        remain in storage but are not treated as executable configuration.
+
+        No Qt imports, tool probes, or optional package imports occur here.
+        """
+        import re
+        from types import SimpleNamespace
+
+        if type(values) is not dict:
+            raise TypeError("Tool configuration must be a dictionary.")
+
+        fields = cls.configurationFields
+        if type(fields) is not dict or not fields:
+            raise ValueError("configurationFields must be a nonempty dictionary.")
+        if type(cls.multipleInstallations) is not bool:
+            raise TypeError("multipleInstallations must be Boolean.")
+
+        resolved = {}
+
+        for name, definition in fields.items():
+            if (
+                not isinstance(name, str)
+                or re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", name) is None
+                or name in ("name", "toolName", "configNames")
+            ):
+                raise ValueError(f"Invalid configuration field: {name!r}")
+
+            if type(definition) is not dict or set(definition) != {"type", "default", "label", "help"}:
+                raise ValueError(f"Invalid configuration definition for {name!r}.")
+            if definition["type"] not in ("text", "path", "bool"):
+                raise ValueError(f"Unsupported configuration type for {name!r}.")
+            if not isinstance(definition["label"], str) or not definition["label"].strip():
+                raise ValueError("Configuration labels must be nonblank strings.")
+            if not isinstance(definition["help"], str):
+                raise ValueError("Configuration help must be a string.")
+
+            # Validate defaults as well as supplied values.
+            for value in (definition["default"], values.get(name, definition["default"])):
+                if definition["type"] == "bool":
+                    if type(value) is not bool:
+                        raise TypeError(f"{name} must be Boolean.")
+                elif (
+                    not isinstance(value, str)
+                    or any(character in value for character in ("\x00", "\n", "\r"))
+                ):
+                    raise ValueError(f"{name} must be a string without NUL or newlines.")
+
+            resolved[name] = values.get(name, definition["default"])
+
+        return SimpleNamespace(
+            name=cls.toolLabel or cls.toolName,
+            toolName=cls.toolName,
+            configNames=tuple(fields),
+            **resolved,
+        )
+
+    @classmethod
+    def _getInstallationProfiles(cls, document):
+        """Return saved profiles or a virtual default without writing settings."""
+        cls.registeredTools()
+        if cls is pglExternalTool:
+            raise ValueError("Select a tool adapter.")
+
+        entry = document["tools"].get(cls.toolName)
+        if entry is None:
+            entry = {
+                "defaultInstallation": "default",
+                "installations": {"default": {}},
+            }
+
+        if not cls.multipleInstallations and len(entry["installations"]) != 1:
+            raise ValueError(f"{cls.toolLabel or cls.toolName} supports only one configuration.")
+
+        return _copyProvenance(entry)
+
+    @classmethod
+    def getConfiguration(cls, *, installation=None, configFile=None):
+        """Return supported fields from the selected installation profile.
+
+        installation=None selects the saved default, or the virtual automatic
+        default when no configuration has been saved.
+
+        An unknown explicit profile raises. Never silently selects another
+        installation or rewrites preferences.
+        """
+        document = cls._readToolSettings(cls._toolSettingsPath(configFile))
+        entry = cls._getInstallationProfiles(document)
+
+        if installation is not None and (not isinstance(installation, str) or not installation.strip()):
+            raise ValueError("installation must be a nonblank profile name or None.")
+
+        selected = entry["defaultInstallation"] if installation is None else installation
+        if selected not in entry["installations"]:
+            raise ValueError(f"Unknown installation {selected!r} for {cls.toolName!r}.")
+
+        settings = cls._settingsFromValues(entry["installations"][selected])
+        return _copyProvenance({
+            name: getattr(settings, name)
+            for name in settings.configNames
+        })
+
+    @classmethod
+    def configure(cls, *, configFile=None):
+        """Edit tool profiles using the existing schema-driven PGL dialog.
+
+        Top-level call:
+            Select registered tools, then edit their configurations.
+
+        Subclass call:
+            Edit only that tool.
+
+        Existing nonblank values always take precedence. When the adapter
+        declares resolvedLocationField, a blank field can be prefilled from
+        that profile's matching, successful cached validation.
+
+        Prefilling does not run probes or save settings. All edits are saved
+        together only after every dialog is accepted. Cancel changes nothing.
+
+        A discovered path accepted with OK becomes an explicit configuration.
+        That configuration change can invalidate its previous status cache;
+        validate=True establishes a fresh check for the explicit selection.
+
+        Unknown fields survive for profiles retaining their names. Renaming
+        profiles while removing profiles with unknown fields is refused rather
+        than guessing how to transfer unsupported configuration.
+
+        Does not install software, change Python environments, or launch tools.
+        """
+        from copy import deepcopy
+
+        from .pglDialog import pglDialogs, pglToolDialog
+        from .pglMessages import pglMessages
+
+        adapters = cls.registeredTools()
+        if not adapters:
+            pglMessages.warning("No tool adapters are registered.", level=1)
+            return None
+
+        path = cls._toolSettingsPath(configFile)
+        original = cls._readToolSettings(path)
+        updated = deepcopy(original)
+        selectedNames = list(adapters)
+
+        if cls is pglExternalTool:
+            labels = [
+                f"{adapter.toolLabel or name} [{name}]"
+                for name, adapter in adapters.items()
+            ]
+            selected = pglDialogs.selectItems(labels, title="Choose tools to configure")
+            if selected is None: return None
+            selectedNames = [selectedNames[index] for index in selected]
+
+        for toolName in selectedNames:
+            adapter = adapters[toolName]
+            entry = adapter._getInstallationProfiles(original)
+            fields = deepcopy(adapter.configurationFields)
+            locationField = adapter.resolvedLocationField
+
+            if locationField is not None:
+                if (
+                    not isinstance(locationField, str)
+                    or locationField not in fields
+                    or fields[locationField]["type"] != "path"
+                ):
+                    raise ValueError(
+                        f"{toolName}: resolvedLocationField must identify a declared path field."
+                    )
+
+            profiles = []
+            for profileName, values in entry["installations"].items():
+                settings = adapter._settingsFromValues(values)
+                profiles.append({
+                    "name": profileName,
+                    "values": {
+                        name: getattr(settings, name)
+                        for name in settings.configNames
+                    },
+                })
+
+            # Read cached observations only when they could supply a blank
+            # location. getToolReports(validate=False) performs no tool probes.
+            needsSuggestion = (
+                locationField is not None
+                and any(not profile["values"][locationField].strip() for profile in profiles)
+            )
+
+            if needsSuggestion:
+                reports = adapter.getToolReports(validate=False, configFile=path)
+                reportsByProfile = {
+                    report["installation"]: report
+                    for report in reports
+                }
+
+                for profile in profiles:
+                    if profile["values"][locationField].strip(): continue
+
+                    report = reportsByProfile.get(profile["name"])
+                    if report is None: continue
+                    if report["reportSource"] != "cached" or report["available"] is not True:
+                        continue
+
+                    location = report.get("location")
+                    if not isinstance(location, str) or not location.strip():
+                        continue
+
+                    # This changes only the document passed to the dialog.
+                    # The original settings and status cache remain untouched.
+                    profile["values"][locationField] = location
+
+                fields[locationField]["help"] += (
+                    " A matching previous successful check may supply a suggested "
+                    "path. OK saves the displayed path; clear it to retain "
+                    "automatic discovery. Cancel saves nothing."
+                )
+
+            request = {
+                "schemaVersion": 1,
+                "toolName": toolName,
+                "label": adapter.toolLabel or toolName,
+                "multipleInstallations": adapter.multipleInstallations,
+                "fields": fields,
+                "profiles": profiles,
+                "defaultInstallation": entry["defaultInstallation"],
+            }
+            edited = pglDialogs.toolDialog(request)
+            if edited is None: return None
+
+            # Validate again at the configuration boundary. The dialog edits
+            # profiles/values, not the adapter's identity or schema.
+            edited = pglToolDialog.validate(edited)
+            for field in ("schemaVersion", "toolName", "label", "multipleInstallations", "fields"):
+                if edited[field] != request[field]:
+                    raise ValueError(f"Tool dialog changed protected field {field!r}.")
+
+            newProfiles = {}
+            editedNames = {profile["name"] for profile in edited["profiles"]}
+            oldNames = set(entry["installations"])
+
+            removedWithUnknown = [
+                name for name in oldNames - editedNames
+                if set(entry["installations"][name]) - set(fields)
+            ]
+            if removedWithUnknown and editedNames - oldNames:
+                raise ValueError(
+                    "Cannot safely rename/copy profiles while removing profiles "
+                    f"with unsupported fields: {removedWithUnknown}. "
+                    "Keep their names, or delete them in a separate edit."
+                )
+
+            for profile in edited["profiles"]:
+                adapter._settingsFromValues(profile["values"])
+                previous = entry["installations"].get(profile["name"], {})
+                newProfiles[profile["name"]] = {
+                    **previous,
+                    **profile["values"],
+                }
+
+            updated["tools"][toolName] = {
+                "defaultInstallation": edited["defaultInstallation"],
+                "installations": newProfiles,
+            }
+
+        if cls._readToolSettings(path) != original:
+            raise ValueError("Tool configuration changed while editing. Reopen the dialog.")
+
+        cls._writeToolSettings(path, updated)
+        pglMessages.message(f"Saved tool installation profiles: {path}")
+        return deepcopy(updated["tools"])
+    
+    @classmethod
+    def print(cls, *, validate=False, verbose=False, timeout=10.0, cacheDirectory=None, configFile=None):
+        """Print registered tools using fresh or persistently saved checks.
+
+        print():
+            Display cached status/version/location without launching probes.
+
+        print(validate=True):
+            Recheck installations and replace the stored observations.
+            A failed check replaces an older successful result.
+
+        Configuration remains separate from observed status. Cached results
+        are labeled explicitly and are never claimed to be fresh verification.
+
+        Returns the displayed reports. No installation occurs.
+        """
+        import builtins
+
+        if type(verbose) is not bool:
+            raise TypeError("verbose must be Boolean.")
+
+        reports = cls.getToolReports(
+            validate=validate,
+            timeout=timeout,
+            cacheDirectory=cacheDirectory,
+            configFile=configFile,
+        )
+        path = cls._toolSettingsPath(configFile)
+
+        def singleLine(value, limit=None):
+            text = " ".join(str(value).split())
+            return text if limit is None or len(text) <= limit else text[:limit - 1] + "…"
+
+        headings = ("Tool", "Status", "Check", "Version", "Resolved location")
+        rows = [
+            (
+                singleLine(report["label"], 24),
+                singleLine(report["status"], 24),
+                report["reportSource"],
+                singleLine(report["version"] or "—", 48),
+                singleLine(report["location"] or "—", 100),
+            )
+            for report in reports
+        ]
+
+        builtins.print(f"\nTool configuration: {path}")
+        builtins.print(f"Saved checks: {path.with_name(f'{path.stem}.status.json')}")
+
+        if rows:
+            widths = [
+                max(len(headings[index]), *(len(row[index]) for row in rows))
+                for index in range(4)
+            ]
+
+            builtins.print()
+            builtins.print(
+                "  ".join(headings[index].ljust(widths[index]) for index in range(4))
+                + "  " + headings[4]
+            )
+            for row in rows:
+                builtins.print(
+                    "  ".join(row[index].ljust(widths[index]) for index in range(4))
+                    + "  " + row[4]
+                )
+        else:
+            builtins.print("No registered tool adapters.")
+
+        if any(report["reportSource"] == "cached" for report in reports):
+            builtins.print("\nCached = last recorded check, not a new availability test.")
+
+        for report in reports:
+            if report["diagnostic"]:
+                builtins.print(f"\n{report['label']}: {singleLine(report['diagnostic'])}")
+
+            if verbose:
+                builtins.print(f"\n{report['label']} [{report['toolName']}]")
+                builtins.print(f"  Checked: {report['checkedAt'] or 'Not checked for this configuration'}")
+
+                for field, value in report["configuration"].items():
+                    automatic = value is None or isinstance(value, str) and not value.strip()
+                    text = "Automatic/default" if automatic else repr(value)
+                    builtins.print(f"  {field}: {singleLine(text)}")
+
+                if report["version"]:
+                    builtins.print(f"  Full version: {singleLine(report['version'])}")
+                if report["location"]:
+                    builtins.print(f"  Location: {singleLine(report['location'])}")
+
+        if cls is pglExternalTool:
+            document = cls._readToolSettings(path)
+            unknown = sorted(set(document["tools"]) - set(cls.registeredTools()))
+            if unknown:
+                builtins.print("\nSaved configuration without a loaded adapter:")
+                for name in unknown:
+                    builtins.print(f"  {name}")
+
+        return reports
+
+    def __init__(self, executable=None, *, directory=None, installation=None):
+        """Select executable configuration without launching or installing tools.
+
+        Selection:
+            Explicit executable path or directory.
+            Explicit named installation.
+            Saved default installation.
+            Automatic discovery when no path is configured.
+
+        Named installation and explicit path selection cannot be combined.
+        Existing instances retain their selection after settings are edited.
+        """
         import os
         from pathlib import Path
 
@@ -688,15 +1285,63 @@ class pglExternalTool:
             if not isinstance(executable, str) or not executable.strip() or "\x00" in executable:
                 raise ValueError("executable must be a nonblank command or path without NUL.")
 
+        explicitExecutable = False
+        if executable is not None:
+            expanded = os.path.expanduser(executable)
+            explicitExecutable = os.path.isabs(expanded) or bool(os.path.dirname(expanded))
+
+        if installation is not None:
+            if not isinstance(installation, str) or not installation.strip():
+                raise ValueError("installation must be a nonblank profile name.")
+            if directory is not None or explicitExecutable:
+                raise ValueError("Select an installation profile or an explicit path, not both.")
+
+        self.configurationSource = "automatic"
+        self.installation = None
+
+        adapter = type(self)
+        toolName = adapter.__dict__.get("toolName")
+        registered = toolName is not None and pglExternalTool._toolRegistry.get(toolName) is adapter
+
+        if installation is not None and not registered:
+            raise ValueError("Named installations require a registered tool adapter.")
+
+        if directory is None and not explicitExecutable and registered:
+            document = adapter._readToolSettings(adapter._toolSettingsPath())
+            entry = adapter._getInstallationProfiles(document)
+            selected = entry["defaultInstallation"] if installation is None else installation
+
+            if selected not in entry["installations"]:
+                raise ValueError(f"Unknown installation {selected!r} for {toolName!r}.")
+
+            settings = adapter._settingsFromValues(entry["installations"][selected])
+            self.installation = selected
+
+            savedDirectory = getattr(settings, "directory", "")
+            if savedDirectory.strip():
+                directory = savedDirectory
+                self.configurationSource = "profile" if installation is not None else "saved"
+            elif installation is not None:
+                self.configurationSource = "profile"
+
         if directory is not None:
             directory = os.fspath(directory)
-            if not isinstance(directory, str) or not directory.strip() or "\x00" in directory:
-                raise ValueError("directory must be a nonblank local path without NUL.")
+            if (
+                not isinstance(directory, str) or not directory.strip()
+                or any(character in directory for character in ("\x00", "\n", "\r"))
+            ):
+                raise ValueError("directory must be a nonblank local path without NUL or newlines.")
+
             directory = str(Path(directory).expanduser().absolute())
+            if self.configurationSource == "automatic":
+                self.configurationSource = "explicit"
+
+        if explicitExecutable:
+            self.configurationSource = "explicit"
 
         self.executable = executable
         self.directory = directory
-
+        
     ################################################################
     # Identify executable or log bytes
     ################################################################
@@ -1276,6 +1921,358 @@ class pglExternalTool:
 
         return result
     
+    @classmethod
+    def getStatus(cls, *, configuration=None, timeout=10.0, cacheDirectory=None):
+        """Return the common installation-status report.
+
+        Subclasses override this method using their existing discovery and
+        validation mechanisms. The base implementation does not run commands
+        or assume that a configured path establishes availability.
+
+        configuration:
+            Optional explicit configuration dictionary supplied by the shared
+            printer/dialog. None reads this adapter's saved configuration.
+
+        Status reports contain:
+            toolName, label, status, available, version, location,
+            diagnostic, details.
+
+        available=None means availability was not established.
+        No status operation may automatically install or update software.
+        """
+        configuration = cls.getConfiguration() if configuration is None else _copyProvenance(configuration)
+        cls._settingsFromValues(configuration)
+
+        return {
+            "toolName": cls.toolName,
+            "label": cls.toolLabel or cls.toolName,
+            "status": "Check unsupported",
+            "available": None,
+            "version": None,
+            "location": None,
+            "diagnostic": "This adapter has not implemented installation-status checking.",
+            "details": {},
+        }
+    
+    @classmethod
+    def getToolReports(cls, *, validate=False, timeout=10.0, cacheDirectory=None, configFile=None):
+        """Return one report per installation of each registered tool.
+
+        validate=False reads cached observations without probing.
+        validate=True checks every profile and replaces its saved observation,
+        including failed checks.
+
+        Configuration selects installations; status records observations.
+        Neither checking nor printing installs tools or changes the default.
+
+        Status-cache v2:
+            tools[toolName][installationName] = {
+                context, checkedAt, report,
+            }
+
+        Legacy v1 status caches are not reused because they did not explicitly
+        identify installation profiles. Reading never rewrites them; fresh
+        validation writes v2.
+
+        Unknown tool entries in a v2 cache are preserved.
+        Concurrent configuration/status writers are unsupported.
+        """
+        import json
+        import math
+        import sys
+        from copy import deepcopy
+        from datetime import datetime, timezone
+
+        if type(validate) is not bool:
+            raise TypeError("validate must be Boolean.")
+        if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout must be positive and finite.")
+
+        adapters = cls.registeredTools()
+        configPath = cls._toolSettingsPath(configFile)
+        statusPath = configPath.with_name(f"{configPath.stem}.status.json")
+        configurationDocument = cls._readToolSettings(configPath)
+        statusDocument = {"schemaVersion": 2, "tools": {}}
+
+        def uniqueKeys(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError(f"Duplicate tool status-cache key: {key!r}")
+                result[key] = value
+            return result
+
+        def rejectConstant(value):
+            raise ValueError(f"Nonfinite tool status-cache value: {value}")
+
+        if statusPath.exists():
+            with statusPath.open("rb") as source:
+                content = source.read(1024 * 1024 + 1)
+            if len(content) > 1024 * 1024:
+                raise ValueError("Tool status cache exceeds 1 MiB.")
+
+            previous = _copyProvenance(json.loads(
+                content,
+                object_pairs_hook=uniqueKeys,
+                parse_constant=rejectConstant,
+            ))
+
+            if (
+                type(previous) is not dict
+                or set(previous) != {"schemaVersion", "tools"}
+                or type(previous["schemaVersion"]) is not int
+                or previous["schemaVersion"] not in (1, 2)
+                or type(previous["tools"]) is not dict
+            ):
+                raise ValueError("Invalid tool status cache.")
+
+            if previous["schemaVersion"] == 2:
+                statusDocument = previous
+
+        reportFields = {
+            "toolName", "label", "status", "available",
+            "version", "location", "diagnostic", "details",
+        }
+
+        def validateReport(report, toolName):
+            """Reject malformed adapter reports before caching them."""
+            report = _copyProvenance(report)
+
+            if type(report) is not dict or set(report) != reportFields:
+                raise ValueError("Invalid tool status-report fields.")
+            if report["toolName"] != toolName:
+                raise ValueError("Status report identifies a different tool.")
+            if report["available"] is not None and type(report["available"]) is not bool:
+                raise ValueError("available must be Boolean or None.")
+
+            for field in ("label", "status"):
+                if not isinstance(report[field], str) or not report[field].strip():
+                    raise ValueError(f"{field} must be a nonblank string.")
+
+            for field in ("version", "location", "diagnostic"):
+                if report[field] is not None and not isinstance(report[field], str):
+                    raise ValueError(f"{field} must be a string or None.")
+
+            if type(report["details"]) is not dict:
+                raise ValueError("Status details must be a dictionary.")
+
+            return report
+
+        reports = []
+
+        for toolName, adapter in adapters.items():
+            entry = adapter._getInstallationProfiles(configurationDocument)
+            cachedProfiles = statusDocument["tools"].get(toolName, {})
+
+            if type(cachedProfiles) is not dict:
+                raise ValueError(f"Invalid status-cache profile mapping for {toolName!r}.")
+
+            # Work on a copy; publication occurs only after all checks finish.
+            cachedProfiles = deepcopy(cachedProfiles)
+
+            for profileName, values in entry["installations"].items():
+                # Validate THIS profile's values, not its enclosing container.
+                settings = adapter._settingsFromValues(values)
+                configuration = _copyProvenance({
+                    field: getattr(settings, field)
+                    for field in settings.configNames
+                })
+
+                context = {
+                    "configuration": configuration,
+                    "adapter": f"{adapter.__module__}.{adapter.__qualname__}",
+                    "pythonExecutable": sys.executable,
+                }
+                emptyReport = {
+                    "toolName": toolName,
+                    "label": adapter.toolLabel or toolName,
+                    "status": "Not checked",
+                    "available": None,
+                    "version": None,
+                    "location": None,
+                    "diagnostic": None,
+                    "details": {},
+                }
+                checkedAt = None
+                reportSource = "none"
+
+                if validate:
+                    try:
+                        checked = adapter.getStatus(
+                            configuration=deepcopy(configuration),
+                            timeout=timeout,
+                            cacheDirectory=cacheDirectory,
+                        )
+                        report = validateReport(checked, toolName)
+
+                    except Exception as error:
+                        # A failed fresh check replaces an older success.
+                        report = {
+                            **emptyReport,
+                            "status": "Check failed",
+                            "diagnostic": f"{type(error).__name__}: {error}",
+                        }
+
+                    checkedAt = datetime.now(timezone.utc).isoformat()
+                    reportSource = "fresh"
+                    cachedProfiles[profileName] = {
+                        "context": context,
+                        "checkedAt": checkedAt,
+                        # Keep the cache small. Fresh returned reports retain
+                        # details; command provenance remains in existing logs.
+                        "report": {**report, "details": {}},
+                    }
+
+                else:
+                    cached = cachedProfiles.get(profileName)
+
+                    if cached is None:
+                        report = emptyReport
+                    else:
+                        if (
+                            type(cached) is not dict
+                            or set(cached) != {"context", "checkedAt", "report"}
+                            or type(cached["context"]) is not dict
+                            or not isinstance(cached["checkedAt"], str)
+                        ):
+                            raise ValueError(
+                                f"Invalid cached status for {toolName!r}/{profileName!r}."
+                            )
+
+                        previousReport = validateReport(cached["report"], toolName)
+
+                        if cached["context"] == context:
+                            report = previousReport
+                            checkedAt = cached["checkedAt"]
+                            reportSource = "cached"
+                        else:
+                            report = {
+                                **emptyReport,
+                                "status": "Needs recheck",
+                                "diagnostic": "Configuration, adapter, or Python environment changed.",
+                            }
+                            reportSource = "stale"
+
+                reports.append({
+                    **report,
+                    "installation": profileName,
+                    "isDefault": profileName == entry["defaultInstallation"],
+                    "configuration": configuration,
+                    "checkedAt": checkedAt,
+                    "reportSource": reportSource,
+                })
+
+            if validate:
+                statusDocument["tools"][toolName] = cachedProfiles
+
+        if validate:
+            if cls._readToolSettings(configPath) != configurationDocument:
+                raise ValueError("Configuration changed during validation; status was not saved.")
+            cls._writeToolSettings(statusPath, statusDocument)
+
+        return _copyProvenance(reports)
+
+    @classmethod
+    def print(cls, *, validate=False, verbose=False, timeout=10.0, cacheDirectory=None, configFile=None):
+        """Print all registered tools and their installation profiles.
+
+        Cached checks are labeled explicitly. validate=True refreshes each
+        displayed installation and saves its latest result. No installation
+        or automatic version switching occurs.
+        """
+        import builtins
+
+        if type(verbose) is not bool:
+            raise TypeError("verbose must be Boolean.")
+
+        reports = cls.getToolReports(
+            validate=validate,
+            timeout=timeout,
+            cacheDirectory=cacheDirectory,
+            configFile=configFile,
+        )
+        path = cls._toolSettingsPath(configFile)
+
+        def line(value, limit=80):
+            text = " ".join(str(value).split())
+            return text if len(text) <= limit else text[:limit - 1] + "…"
+
+        headings = ("Tool", "Installation", "Status", "Check", "Version", "Location")
+        rows = [
+            (
+                line(report["label"], 20),
+                line(report["installation"] + (" *" if report["isDefault"] else ""), 24),
+                line(report["status"], 24),
+                report["reportSource"],
+                line(report["version"] or "—", 40),
+                line(report["location"] or "—", 100),
+            )
+            for report in reports
+        ]
+
+        builtins.print(f"\nTool configuration: {path}")
+        builtins.print("* = default installation; cached = previous check, not fresh validation.")
+
+        if rows:
+            widths = [max(len(headings[index]), *(len(row[index]) for row in rows)) for index in range(5)]
+            builtins.print()
+            builtins.print("  ".join(headings[index].ljust(widths[index]) for index in range(5)) + "  " + headings[5])
+            for row in rows:
+                builtins.print("  ".join(row[index].ljust(widths[index]) for index in range(5)) + "  " + row[5])
+        else:
+            builtins.print("No registered tool adapters.")
+
+        for report in reports:
+            label = f"{report['label']} / {report['installation']}"
+            if report["diagnostic"]:
+                builtins.print(f"\n{label}: {line(report['diagnostic'], 1000)}")
+
+            if verbose:
+                builtins.print(f"\n{label}")
+                builtins.print(f"  Checked: {report['checkedAt'] or 'Not checked'}")
+                for field, value in report["configuration"].items():
+                    automatic = value is None or isinstance(value, str) and not value.strip()
+                    builtins.print(f"  {field}: {'Automatic/default' if automatic else repr(value)}")
+                if report["version"]:
+                    builtins.print(f"  Full reported version: {line(report['version'], 2000)}")
+                if report["location"]:
+                    builtins.print(f"  Location: {line(report['location'], 2000)}")
+
+        if cls is pglExternalTool:
+            document = cls._readToolSettings(path)
+            unknown = sorted(set(document["tools"]) - set(cls.registeredTools()))
+            if unknown:
+                builtins.print("\nSaved configuration without a loaded adapter:")
+                for name in unknown: builtins.print(f"  {name}")
+
+        return reports
+    
+    @classmethod
+    def printInstallationNotice(cls):
+        """Display post-installation instructions before installation starts.
+
+        Shared by tool installers. Does not validate, install, or modify settings.
+        The reminder applies after a successful installation, not cancellation.
+        """
+        from .pglMessages import pglMessages
+
+        className = cls.__name__
+        command = (
+            f"from {cls.__module__} import {className}\n"
+            f"{className}.print(validate=True, timeout=120)"
+        )
+
+        pglMessages.print(
+            f"\nIMPORTANT — AFTER INSTALLING {cls.toolLabel or className}\n\n"
+            "After installation completes successfully:\n"
+            "  1. Restart your notebook kernel.\n"
+            "  2. Run the following command to validate the installation "
+            "and refresh its saved status:\n\n"
+            f"{command}\n",
+            emphasize=True,
+        )
+    
+    
 ################################################################
 # AFNI tools
 ################################################################
@@ -1297,14 +2294,22 @@ class pglAFNI(pglExternalTool):
 
     Installation and typed scientific command adapters are not implemented yet.
     """
-
+    toolName = "afni"
+    toolLabel = "AFNI"
+    multipleInstallations = False
     installationURL = "https://afni.nimh.nih.gov/pub/dist/doc/htmldoc/background_install/main_toc.html"
+    resolvedLocationField = "directory"
+    
 
-    def __init__(self, *, directory=None):
-        super().__init__(executable="afni", directory=directory)
+    def __init__(self, *, directory=None, installation=None):
+        """Select an AFNI installation without probing or advancing setup."""
+        super().__init__(
+            executable="afni",
+            directory=directory,
+            installation=installation,
+        )
         self.lastResult = None
         self.lastAvailability = None
-
     ################################################################
     # Check availability, including managed installation progress
     ################################################################
@@ -1884,7 +2889,7 @@ Installation documentation:
         KeyboardInterrupt and SystemExit propagate.
         """
         from .pglMessages import pglMessages
-
+        self.printInstallationNotice()
         try:
             installation = pglAFNIInstallation(installPath)
             decision = installation.getResumeStatus(stage=stage)
@@ -2982,6 +3987,75 @@ Installation documentation:
         except Exception as error:
             pglMessages.warning(f"MRI viewer could not be opened: {type(error).__name__}: {error}")
             return None
+        
+    @classmethod
+    def getStatus(cls, *, configuration=None, timeout=10.0, cacheDirectory=None):
+        """Adapt the existing AFNI availability check to the shared report.
+
+        Preserves managed-installation checks, version probes, diagnostic logs,
+        and failure handling. Does not install software or advance setup.
+
+        A temporary adapter instance is used; existing scientific adapters are
+        not reconfigured. Probe provenance remains available in report details.
+
+        The existing AFNI checker may print diagnostics. Its output is not
+        suppressed or redirected merely to make the summary table quieter.
+        """
+        import math
+        from pathlib import Path
+
+        if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout must be positive and finite.")
+
+        configuration = cls.getConfiguration() if configuration is None else _copyProvenance(configuration)
+        settings = cls._settingsFromValues(configuration)
+        directory = settings.directory
+        selectedDirectory = str(Path(directory).expanduser().absolute()) if directory.strip() else None
+
+        probe = cls(directory=selectedDirectory)
+
+        # A supplied configuration may intentionally request automatic discovery
+        # even when the machine's default file contains another directory.
+        # Override only this new probe instance, never saved settings.
+        probe.directory = selectedDirectory
+        probe.configurationSource = "saved" if selectedDirectory is not None else "automatic"
+
+        available = bool(probe.checkAvailable(
+            timeout=timeout,
+            cacheDirectory=cacheDirectory,
+        ))
+        details = _copyProvenance(probe.lastAvailability or {})
+
+        error = details.get("error")
+        if isinstance(error, dict):
+            diagnostic = error.get("message")
+        elif error is None:
+            diagnostic = None
+        else:
+            diagnostic = str(error)
+
+        installationStatus = details.get("installationStatus")
+        if available:
+            status = "Available"
+        elif installationStatus is not None and installationStatus != "verified":
+            status = "Setup incomplete"
+        else:
+            status = "Unavailable"
+
+        # Prefer the resolved directory reported by the actual probe.
+        # A requested/configured path is not proof of resolution.
+        location = details.get("executableDirectory")
+
+        return {
+            "toolName": cls.toolName,
+            "label": cls.toolLabel or cls.toolName,
+            "status": status,
+            "available": available,
+            "version": details.get("reportedVersion"),
+            "location": location,
+            "diagnostic": diagnostic,
+            "details": details,
+        }
     
 ################################################################
 # AFNI installation state and administrator-stage launcher
@@ -4736,41 +5810,260 @@ PREPARED SCRIPT
 ################################################################
 # MATLAB viewer access
 ################################################################
-class pglMATLAB:
-    """Launch MATLAB-based viewers without running a processing action."""
+class pglMATLAB(pglExternalTool):
+    """MATLAB installations, explicit validation, and the existing mlrVol viewer.
 
-    ################################################################
-    # Open an image using mlrVol
-    ################################################################
+    Configuration supports named installation profiles with one saved default.
+
+    Construction resolves the executable but does not launch MATLAB.
+    getStatus() explicitly launches a short MATLAB batch command to establish
+    runtime availability and report the actual version.
+
+    The viewer remains a separate interactive operation, not a scientific
+    batch invocation. It opens an independent copy of the supplied NIfTI.
+
+    No automatic installation, license changes, PATH edits, or MATLAB startup
+    edits are performed.
+    """
+
+    toolName = "matlab"
+    toolLabel = "MATLAB"
+    multipleInstallations = True
+    resolvedLocationField = "executable"
+
+    configurationFields = {
+        "executable": {
+            "type": "path",
+            "default": "",
+            "label": "MATLAB executable",
+            "help": (
+                "Full path to MATLAB's executable, such as "
+                "/Applications/MATLAB_R2026b.app/bin/matlab. "
+                "Blank searches PATH, then /Applications on macOS. "
+                "Multiple discovered installations require an explicit choice."
+            ),
+        },
+    }
+
     @staticmethod
-    def viewer(inputImage, *, matlabExecutable=None, mlrDirectory=None, cacheDirectory=None):
+    def _findExecutable(executable=None):
+        """Resolve MATLAB without launching it or changing configuration.
+
+        An explicit path is authoritative: an invalid path never falls back.
+
+        Automatic discovery:
+            PATH first.
+            If absent on macOS, /Applications/MATLAB*.app/bin/matlab.
+            Multiple macOS candidates are rejected rather than version-sorted
+            into an implicit selection.
+        """
+        import os
+        import shutil
+        import sys
+        from pathlib import Path
+
+        if executable is not None:
+            text = os.fspath(executable)
+            if (
+                not isinstance(text, str) or not text.strip()
+                or any(character in text for character in ("\x00", "\n", "\r"))
+            ):
+                raise ValueError("MATLAB executable must be a nonblank local path.")
+
+            expanded = Path(text).expanduser()
+            if not expanded.is_absolute():
+                raise ValueError("Specify the full absolute path to MATLAB's executable.")
+
+            candidate = expanded
+
+        else:
+            discovered = shutil.which("matlab")
+            candidate = Path(discovered).absolute() if discovered is not None else None
+
+            if candidate is None and sys.platform == "darwin":
+                candidates = [
+                    path for path in sorted(Path("/Applications").glob("MATLAB*.app/bin/matlab"))
+                    if path.is_file() and os.access(path, os.X_OK)
+                ]
+
+                if len(candidates) == 1:
+                    candidate = candidates[0]
+                elif len(candidates) > 1:
+                    choices = "\n".join(str(path) for path in candidates)
+                    raise ValueError(
+                        "Multiple MATLAB installations were found. Configure a "
+                        "profile with an explicit executable:\n" + choices
+                    )
+
+            if candidate is None:
+                raise FileNotFoundError(
+                    "MATLAB was not found. Configure its full executable path."
+                )
+
+        if not candidate.is_file() or not os.access(candidate, os.X_OK):
+            raise FileNotFoundError(f"MATLAB executable is unavailable: {candidate}")
+
+        # Keep the invocation path, including a caller-selected symlink.
+        # The command runner independently resolves and identifies its target.
+        return candidate.absolute()
+
+    def __init__(self, *, matlabExecutable=None, installation=None):
+        """Select an explicit executable, named profile, or saved default.
+
+        Explicit executable and named installation are mutually exclusive.
+        Does not launch MATLAB or establish license/runtime availability.
+        """
+        if matlabExecutable is not None and installation is not None:
+            raise ValueError("Supply matlabExecutable or installation, not both.")
+
+        if matlabExecutable is not None:
+            selectedExecutable = matlabExecutable
+            selectionSource = "explicit"
+            selectedProfile = None
+
+        else:
+            configuration = type(self).getConfiguration(installation=installation)
+            configured = configuration["executable"]
+            selectedExecutable = configured if configured.strip() else None
+            selectionSource = "profile" if installation is not None else ("saved" if selectedExecutable else "automatic")
+
+            document = type(self)._readToolSettings(type(self)._toolSettingsPath())
+            profiles = type(self)._getInstallationProfiles(document)
+            selectedProfile = profiles["defaultInstallation"] if installation is None else installation
+
+        executable = self._findExecutable(selectedExecutable)
+
+        # Explicit executable path prevents the generic runner from applying
+        # executable-directory defaults or resolving a different installation.
+        super().__init__(executable=str(executable))
+        self.configurationSource = selectionSource
+        self.installation = selectedProfile
+        self.lastResult = None
+
+    @classmethod
+    def getStatus(cls, *, configuration=None, timeout=10.0, cacheDirectory=None):
+        """Probe the selected MATLAB runtime and return a common tool report.
+
+        Launches MATLAB with -batch and a fixed version-printing expression.
+        This can initialize MATLAB, run startup.m, and check out a license.
+
+        timeout is a subprocess deadline. MATLAB startup may need substantially
+        longer than the generic 10-second tool default; explicitly request a
+        suitable timeout when validating MATLAB installations.
+
+        Probe stdout/stderr and executable identity use the existing command
+        runner. No source paths are interpolated into MATLAB code.
+
+        An executable that exists but cannot run is not reported as available.
+        Missing configuration/runtime failures are returned as status records.
+        KeyboardInterrupt and SystemExit propagate.
+        """
+        import math
+
+        if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout must be positive and finite.")
+
+        configuration = cls.getConfiguration() if configuration is None else _copyProvenance(configuration)
+        settings = cls._settingsFromValues(configuration)
+
+        report = {
+            "toolName": cls.toolName,
+            "label": cls.toolLabel,
+            "status": "Unavailable",
+            "available": False,
+            "version": None,
+            "location": None,
+            "diagnostic": None,
+            "details": {},
+        }
+        result = None
+
+        try:
+            configured = settings.executable
+            executable = cls._findExecutable(configured if configured.strip() else None)
+            report["location"] = str(executable)
+
+            # Generic runner with an explicit path: do not consult another
+            # profile or silently resolve another MATLAB during this probe.
+            runner = pglExternalTool(executable=str(executable))
+            result = runner._runCommand(
+                arguments=[
+                    "-batch",
+                    "fprintf('PGL_MATLAB_VERSION:%s\\n',version); "
+                    "fprintf('PGL_MATLAB_RELEASE:%s\\n',version('-release'));",
+                ],
+                timeout=timeout,
+                cacheDirectory=cacheDirectory,
+            )
+
+            # Scan incrementally: startup messages may precede the markers.
+            # Bound diagnostic processing rather than loading arbitrary logs.
+            found = {}
+            with result.stdoutPath.open("rb") as source:
+                remaining = 4 * 1024 * 1024
+                while remaining > 0:
+                    line = source.readline(min(65536, remaining))
+                    if not line: break
+                    remaining -= len(line)
+                    text = line.decode("utf-8", errors="replace").strip()
+
+                    for marker, field in (
+                        ("PGL_MATLAB_VERSION:", "version"),
+                        ("PGL_MATLAB_RELEASE:", "release"),
+                    ):
+                        if text.startswith(marker):
+                            value = text[len(marker):].strip()
+                            if not value or field in found:
+                                raise ValueError("MATLAB returned empty or repeated version markers.")
+                            found[field] = value
+
+            if set(found) != {"version", "release"}:
+                raise ValueError("MATLAB exited successfully without the expected version report.")
+
+            report["status"] = "Available"
+            report["available"] = True
+            report["version"] = f"{found['release']} — {found['version']}"
+            report["details"] = {
+                "release": found["release"],
+                "version": found["version"],
+                "probe": result.provenance,
+            }
+
+        except Exception as error:
+            if isinstance(error, pglToolExecutionError):
+                result = error.result
+
+            report["diagnostic"] = f"{type(error).__name__}: {error}"
+            if result is not None:
+                report["details"] = {"probe": result.provenance}
+
+        return _copyProvenance(report)
+
+    @classmethod
+    def viewer(cls, inputImage, *, matlabExecutable=None, installation=None, mlrDirectory=None, cacheDirectory=None):
         """Open a copy of an image in a new MATLAB desktop using mlrVol.
 
-        matlabExecutable:
-            Full path to MATLAB's bin/matlab executable.
-            None searches PATH, then /Applications/MATLAB*.app on macOS.
-            Multiple installations require an explicit choice.
+        MATLAB selection:
+            matlabExecutable: explicit full executable path.
+            installation: explicit saved profile.
+            Neither: saved default profile, then its discovery policy.
+
+        Explicit path and installation cannot both be supplied.
 
         mlrDirectory:
             Optional directory containing mlrVol.m.
-            None uses MATLAB's normal startup/path configuration.
+            None retains MATLAB's normal startup/path configuration.
             Other mrTools dependencies must also be on MATLAB's path.
 
-        cacheDirectory:
-            Optional parent directory for the viewer copy and startup logs.
-            None uses the system temporary directory.
+        Returns a launcher process, or None after a warning on failure.
+        Launch does not establish that MATLAB successfully loaded the image.
 
-        Returns a launcher process, or None after a warning on launch failure.
-        Process launch does not establish that MATLAB loaded the image.
-
-        Opens an independent file copy because mlrVol supports editing/saving.
-        The copy and logs remain after closure; no automatic cleanup occurs.
-        Closing mlrVol does not close the new MATLAB desktop.
+        Viewer copy and startup logs are retained. Closing mlrVol does not
+        close the MATLAB desktop. No acquisition files are modified.
         """
         import os
         import shutil
         import subprocess
-        import sys
         import tempfile
         from pathlib import Path
 
@@ -4781,26 +6074,10 @@ class pglMATLAB:
             if not source.is_file() or not source.name.lower().endswith((".nii", ".nii.gz")):
                 raise ValueError("inputImage must be an existing local .nii or .nii.gz file.")
 
-            # Do not silently choose between multiple MATLAB installations.
-            if matlabExecutable is None:
-                matlabExecutable = shutil.which("matlab")
-
-                if matlabExecutable is None and sys.platform == "darwin":
-                    candidates = sorted(Path("/Applications").glob("MATLAB*.app/bin/matlab"))
-                    candidates = [path for path in candidates if path.is_file()]
-
-                    if len(candidates) == 1:
-                        matlabExecutable = candidates[0]
-                    elif len(candidates) > 1:
-                        choices = "\n".join(str(path) for path in candidates)
-                        raise ValueError(f"Choose matlabExecutable explicitly from:\n{choices}")
-
-            if matlabExecutable is None:
-                raise FileNotFoundError("MATLAB was not found. Supply its full bin/matlab path.")
-
-            executable = Path(matlabExecutable).expanduser().resolve()
-            if not executable.is_file() or not os.access(executable, os.X_OK):
-                raise ValueError(f"MATLAB executable is unavailable: {executable}")
+            tool = cls(
+                matlabExecutable=matlabExecutable,
+                installation=installation,
+            )
 
             mlrPath = None
             if mlrDirectory is not None:
@@ -4825,12 +6102,12 @@ class pglMATLAB:
                 dir=None if cacheRoot is None else str(cacheRoot),
             ))
 
-            # Use a real copy, never a hard link or symlink to acquisition data.
+            # Real copy: mlrVol can edit/save, so never pass an acquisition
+            # hard link or a shared source path as its writable image.
             viewerImage = workingDirectory / source.name
             pglMessages.message(f"Creating an independent viewer copy of {source.name}...")
             shutil.copyfile(source, viewerImage)
 
-            # Pass paths as environment data, not interpolated MATLAB source.
             environment = dict(os.environ)
             environment["PGL_MLRVOL_IMAGE"] = str(viewerImage)
             environment["PGL_MLRVOL_DIRECTORY"] = "" if mlrPath is None else str(mlrPath)
@@ -4853,12 +6130,12 @@ class pglMATLAB:
             stderrPath = workingDirectory / "stderr.log"
             matlabLog = workingDirectory / "matlab.log"
 
-            # Use -r, not -batch, so the interactive desktop stays open.
-            # GUI viewing is separate from recorded scientific execution.
+            # Interactive GUI launch remains separate from scientific batch
+            # execution. -r leaves the desktop open; -batch would terminate it.
             with stdoutPath.open("xb") as stdout, stderrPath.open("xb") as stderr:
                 process = subprocess.Popen(
                     [
-                        str(executable),
+                        tool.executable,
                         "-desktop",
                         "-logfile", str(matlabLog),
                         "-r", matlabCommand,
@@ -4873,6 +6150,8 @@ class pglMATLAB:
 
             pglMessages.message(
                 f"MATLAB viewer process started for {source.name}.\n"
+                f"Executable: {tool.executable}\n"
+                f"Installation profile: {tool.installation or '(explicit executable)'}\n"
                 f"Launcher process: {process.pid}\n"
                 f"Viewer copy and startup logs: {workingDirectory}"
             )
@@ -4880,4 +6159,396 @@ class pglMATLAB:
 
         except Exception as error:
             pglMessages.warning(f"mlrVol viewer could not be launched: {type(error).__name__}: {error}")
+            return None
+        
+class pglGLMsingle(pglExternalTool):
+    """GLMsingle in the active Python environment.
+
+    Configuration, construction, and cached printing never install software.
+    Explicit validation probes a fresh process using sys.executable.
+    Explicit installation requires confirmation and uses the same interpreter.
+
+    A source checkout is an installation input, never an implicit sys.path edit.
+    Multiple Python environments or imported versions are not managed here.
+    """
+
+    toolName = "glmsingle"
+    toolLabel = "GLMsingle"
+    multipleInstallations = False
+    resolvedLocationField = None
+
+    # An installed package directory is not necessarily an installable checkout,
+    # so do not prefill sourceDirectory from a discovered package location.
+    configurationFields = {
+        "sourceDirectory": {
+            "type": "path",
+            "default": "~/proj",
+            "label": "Installation parent directory",
+            "help": (
+                "Choose the parent folder for installation. PGL downloads the "
+                "official GitHub repository into a GLMsingle subfolder: selecting "
+                "~/proj creates ~/proj/GLMsingle. Do not select the GLMsingle "
+                "subfolder itself. Blank uses ~/proj. Other folders inside the "
+                "parent are untouched; an existing nonempty GLMsingle subfolder "
+                "will not be overwritten."
+            ),
+        },
+        "editableInstall": {
+            "type": "bool",
+            "default": False,
+            "label": "Editable installation",
+            "help": (
+                "Install against the downloaded GLMsingle checkout so subsequent "
+                "source edits affect execution. Otherwise use a normal pip installation."
+            ),
+        },
+    }
+
+    officialSource = "git+https://github.com/cvnlab/GLMsingle.git"
+
+    def __init__(self):
+        """Create an adapter without importing GLMsingle or launching commands."""
+        import sys
+
+        super().__init__(executable=sys.executable)
+        self.lastResult = None
+        self.lastAvailability = None
+
+    @classmethod
+    def _settingsFromValues(cls, values):
+        """Validate installation preferences without requiring an existing checkout."""
+        return super()._settingsFromValues(values)
+    
+    @classmethod
+    def getStatus(cls, *, configuration=None, timeout=10.0, cacheDirectory=None):
+        """Check GLMsingle in a fresh process using the active interpreter.
+
+        Imports the fitting API but does not instantiate a model or fit data.
+        Reports package location, distribution version when available, and the
+        actual fit() signature.
+
+        A fresh subprocess avoids importing or replacing GLMsingle in the
+        notebook merely to inspect availability. The report describes a fresh
+        process in this environment, not a previously cached notebook import.
+
+        Importing package code is part of explicit validation. No installation,
+        sys.path modification, or automatic dependency repair occurs.
+        """
+        import json
+        import math
+        import sys
+        from uuid import uuid4
+
+        if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout must be positive and finite.")
+
+        configuration = cls.getConfiguration() if configuration is None else _copyProvenance(configuration)
+        cls._settingsFromValues(configuration)
+
+        report = {
+            "toolName": cls.toolName,
+            "label": cls.toolLabel,
+            "status": "Unavailable",
+            "available": False,
+            "version": None,
+            "location": None,
+            "diagnostic": None,
+            "details": {"pythonExecutable": sys.executable},
+        }
+
+        marker = f"PGL_GLMSINGLE_{uuid4().hex}:"
+
+        # Fixed Python code; marker is supplied as an argument, not interpolated.
+        probeCode = r'''
+import importlib
+import inspect
+import json
+import sys
+from importlib import metadata
+from pathlib import Path
+
+record = {
+    "status": "Unavailable",
+    "available": False,
+    "version": None,
+    "location": None,
+    "diagnostic": None,
+    "fitSignature": None,
+}
+
+try:
+    package = importlib.import_module("glmsingle")
+    implementation = importlib.import_module("glmsingle.glmsingle")
+    model = getattr(implementation, "GLM_single", None)
+
+    if not inspect.isclass(model) or not callable(getattr(model, "fit", None)):
+        raise TypeError("Expected glmsingle.glmsingle.GLM_single with a callable fit().")
+
+    filename = getattr(implementation, "__file__", None)
+    if filename:
+        record["location"] = str(Path(filename).resolve())
+
+    try:
+        record["version"] = metadata.version("glmsingle")
+    except metadata.PackageNotFoundError:
+        value = getattr(package, "__version__", None)
+        if isinstance(value, str):
+            record["version"] = value
+
+    record["fitSignature"] = str(inspect.signature(model.fit))
+    record["available"] = True
+    record["status"] = "Available"
+
+except ModuleNotFoundError as error:
+    record["status"] = "Not installed" if error.name == "glmsingle" else "Broken import"
+    record["diagnostic"] = f"{type(error).__name__}: {error}"
+
+except Exception as error:
+    record["status"] = "Broken import"
+    record["diagnostic"] = f"{type(error).__name__}: {error}"
+
+print(sys.argv[1] + json.dumps(record, allow_nan=False), flush=True)
+'''
+
+        result = None
+
+        try:
+            runner = pglExternalTool(executable=sys.executable)
+            result = runner._runCommand(
+                arguments=["-c", probeCode, marker],
+                timeout=timeout,
+                cacheDirectory=cacheDirectory,
+            )
+
+            with result.stdoutPath.open("rb") as source:
+                content = source.read(1024 * 1024 + 1)
+            if len(content) > 1024 * 1024:
+                raise ValueError("GLMsingle probe output exceeds 1 MiB.")
+
+            matches = [
+                line[len(marker):]
+                for line in content.decode("utf-8", errors="replace").splitlines()
+                if line.startswith(marker)
+            ]
+            if len(matches) != 1:
+                raise ValueError("GLMsingle probe did not return one identifiable report.")
+
+            checked = json.loads(matches[0])
+            if (
+                type(checked) is not dict
+                or set(checked) != {
+                    "status", "available", "version", "location",
+                    "diagnostic", "fitSignature",
+                }
+                or type(checked["available"]) is not bool
+            ):
+                raise ValueError("Malformed GLMsingle probe report.")
+
+            for field in ("status", "version", "location", "diagnostic", "fitSignature"):
+                if checked[field] is not None and not isinstance(checked[field], str):
+                    raise ValueError(f"Invalid GLMsingle probe field {field!r}.")
+
+            report.update({
+                key: checked[key]
+                for key in ("status", "available", "version", "location", "diagnostic")
+            })
+            report["details"].update({
+                "fitSignature": checked["fitSignature"],
+                "probe": result.provenance,
+            })
+
+        except Exception as error:
+            if isinstance(error, pglToolExecutionError):
+                result = error.result
+
+            report["status"] = "Check failed"
+            report["available"] = False
+            report["diagnostic"] = f"{type(error).__name__}: {error}"
+
+            if result is not None:
+                report["details"]["probe"] = result.provenance
+
+        return _copyProvenance(report)
+
+    def install(self, *, timeout=None, cacheDirectory=None):
+        """Download GLMsingle from GitHub and install into active Python.
+
+        Uses the configured parent directory, defaulting to ~/proj, and creates
+        a GLMsingle subfolder. That subfolder must be absent or empty.
+        Existing sibling files and directories are untouched.
+        
+        Steps:
+            Confirm source, destination, interpreter, and commands.
+            Clone the official repository into the selected directory.
+            Record the checked-out commit.
+            Install that checkout using sys.executable -m pip.
+
+        Existing nonempty directories are never overwritten, pulled, reset,
+        or deleted. Failed clones/installations may leave files for diagnosis.
+
+        Git and pip output is printed live and retained by the existing command
+        runner. No shell commands or sys.path modifications are used.
+
+        Installation requires Git on PATH and network access. Package build
+        code executes, and pip may download or change dependencies.
+
+        Returns the pip command result, or None on cancellation or a handled
+        command failure. Restart the kernel and validate afterward.
+        """
+        import math
+        import os
+        import shlex
+        import sys
+        from pathlib import Path
+
+        from .pglDialog import pglDialogs
+        from .pglMessages import pglMessages
+        self.printInstallationNotice()
+
+        recorder = getExecutionRecorder()
+        if recorder is not None and recorder.actionID is not None:
+            raise RuntimeError("Install GLMsingle before starting scientific actions.")
+
+        if timeout is not None and (
+            type(timeout) not in (int, float)
+            or not math.isfinite(timeout)
+            or timeout <= 0
+        ):
+            raise ValueError("timeout must be positive and finite, or None.")
+
+        settings = type(self)._settingsFromValues(type(self).getConfiguration())
+        destinationText = settings.sourceDirectory.strip() or "~/proj"
+        destination = Path(destinationText).expanduser().absolute() / "GLMsingle"
+        
+        if "://" in destinationText or "::" in destinationText:
+            raise ValueError("The installation directory must be an ordinary local path.")
+
+        def requireUnusedDestination():
+            """Warn and refuse installation without modifying existing contents."""
+            if destination.is_symlink():
+                message = f"Installation cancelled: the destination is a symlink: {destination}"
+            elif destination.exists() and not destination.is_dir():
+                message = f"Installation cancelled: the destination is not a directory: {destination}"
+            elif destination.exists() and any(destination.iterdir()):
+                message = (
+                    f"Installation cancelled: the directory is not empty: {destination}\n"
+                    "Existing contents were not changed. If GLMsingle is already "
+                    "installed, validate it with:\n"
+                    "pglGLMsingle.print(validate=True, timeout=120)"
+                )
+            else:
+                return True
+
+            pglMessages.warning(message)
+            return False
+
+        if not requireUnusedDestination(): return None
+
+        repository = "https://github.com/cvnlab/GLMsingle.git"
+
+        # Resolve Git before requesting approval or creating directories.
+        gitRunner = pglExternalTool(executable="git")
+        gitExecutable = gitRunner._resolveExecutable("git", dict(os.environ))
+        gitRunner = pglExternalTool(executable=str(gitExecutable))
+        pythonRunner = pglExternalTool(executable=sys.executable)
+
+        cloneArguments = ["clone", "--", repository, str(destination)]
+        pipArguments = ["-m", "pip", "install"]
+        if settings.editableInstall:
+            pipArguments.append("-e")
+        pipArguments.append(str(destination))
+
+        details = (
+            f"Repository:\n{repository}\n\n"
+            f"Download/install directory:\n{destination}\n\n"
+            f"Python environment:\n{sys.executable}\n\n"
+            "Commands:\n"
+            f"{shlex.join([str(gitExecutable), *cloneArguments])}\n"
+            f"{shlex.join([sys.executable, *pipArguments])}\n\n"
+            "The repository's current default branch will be downloaded. Its "
+            "exact commit will be reported before installation.\n\n"
+            "Pip executes package build code and may download or change "
+            "dependencies. Existing nonempty directories will not be replaced.\n\n"
+            "Restart the notebook kernel after installation."
+        )
+
+        if not pglDialogs.confirm(
+            "Download and install GLMsingle?",
+            title="Install GLMsingle",
+            details=details,
+            confirmButtonText="Download and install",
+        ):
+            return None
+
+        self.lastResult = None
+        self.lastInstallationResults = []
+
+        def runStep(runner, arguments, *, cwd=None):
+            try:
+                result = runner._runCommand(
+                    arguments=arguments,
+                    cwd=cwd,
+                    timeout=timeout,
+                    cacheDirectory=cacheDirectory,
+                    streamOutput=True,
+                )
+            except pglToolExecutionError as error:
+                self.lastResult = error.result
+                self.lastInstallationResults.append(error.result)
+                raise
+
+            self.lastResult = result
+            self.lastInstallationResults.append(result)
+            return result
+
+        try:
+            # Recheck after the dialog, before modifying the filesystem.
+            if not requireUnusedDestination(): return None
+            destination.parent.mkdir(parents=True, exist_ok=True)
+
+            pglMessages.message(f"Downloading GLMsingle into {destination}")
+            runStep(gitRunner, cloneArguments)
+
+            pglMessages.message("Downloaded GLMsingle commit:")
+            commitResult = runStep(
+                gitRunner,
+                ["rev-parse", "HEAD"],
+                cwd=destination,
+            )
+            commit = commitResult.stdoutPath.read_text(encoding="utf-8").strip()
+            self.lastInstallationCommit = commit
+
+            if not any((destination / name).is_file() for name in ("pyproject.toml", "setup.py")):
+                raise ValueError(
+                    "The downloaded repository has no supported Python package "
+                    "definition at its root. The checkout and logs were retained; "
+                    "pip was not run."
+                )
+
+            pglMessages.message(f"Installing GLMsingle into {sys.executable}")
+            result = runStep(pythonRunner, pipArguments)
+
+            pglMessages.message(
+                f"GLMsingle download and pip installation completed.\n"
+                f"Checkout: {destination}\n"
+                f"Commit: {commit}\n"
+                f"Pip logs: {result.logDirectory}\n"
+                "Restart the kernel, then validate GLMsingle."
+            )
+            return result
+
+        except Exception as error:
+            logDirectories = [
+                str(result.logDirectory)
+                for result in self.lastInstallationResults
+                if result.logDirectory is not None
+            ]
+            logText = "\n".join(logDirectories) or "(No command logs were created.)"
+
+            pglMessages.warning(
+                f"GLMsingle installation did not complete: {type(error).__name__}: {error}\n"
+                f"Command logs:\n{logText}\n"
+                "Downloaded files, if any, were retained. Nothing was automatically deleted.",
+                level=1,
+            )
             return None

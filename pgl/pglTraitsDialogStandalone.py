@@ -5,39 +5,47 @@
 #         by: JLG
 #       date: Jul 18, 2026
 ################################################################
-
-################################################################
-# inport
-################################################################
 import sys
-from PySide6.QtWidgets import QApplication, QDialog
-from pgl.pglDialog import _pglTraitsDialog
+
+from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
+
+from pgl.pglDialog import _pglTraitsDialog, pglToolDialog
 from pgl.pglSerialize import pglSerialize
 
-################################################################
-# main function
-################################################################
-def main():
-    # takes as input the serialized settings filename
-    # and the desired output - these will be tmp
-    # files and facilitate the transfer of settings
-    # to and from this function from jupyter
-    inFile = sys.argv[1]      # settings to edit
-    outFile = sys.argv[2]     # where to write result (only if OK)
-    requestedWidth = int(sys.argv[3]) if len(sys.argv) > 3 else None
 
+def main():
+    """Open either a serialized settings dialog or a portable tool editor."""
+    import json
+    from pathlib import Path
+
+    toolMode = len(sys.argv) > 1 and sys.argv[1] == "--tool-schema"
+    arguments = sys.argv[2:] if toolMode else sys.argv[1:]
+
+    if len(arguments) not in (2, 3):
+        raise ValueError("Expected input filename, output filename, and optional width.")
+
+    inFile, outFile = arguments[:2]
+    requestedWidth = int(arguments[2]) if len(arguments) == 3 else None
     if requestedWidth is not None and requestedWidth <= 0:
         raise ValueError("Dialog width must be positive.")
 
-    # load the settings
-    settings = pglSerialize.load(inFile)
+    document = None
 
-    # setup dialog
+    if toolMode:
+        
+
+        document = pglToolDialog.validate(
+            json.loads(Path(inFile).read_text(encoding="utf-8"))
+        )
+        settings = pglToolDialog.build(document)
+        title = f"{document['label']} — installation settings"
+    else:
+        settings = pglSerialize.load(inFile)
+        title = "Settings"
+
     app = QApplication.instance() or QApplication(sys.argv)
-    dlg = _pglTraitsDialog(settings)
+    dlg = _pglTraitsDialog(settings, title=title)
 
-    # Apply the optional width after the normal interface has been built.
-    # Preserve the existing height and keep the window within the screen.
     if requestedWidth is not None:
         screen = dlg.screen() or app.primaryScreen()
 
@@ -55,12 +63,35 @@ def main():
         else:
             dlg.resize(max(requestedWidth, dlg.minimumWidth()), dlg.height())
 
-    # start dialog, and handle returns
-    if dlg.exec() == QDialog.Accepted:
-        dlg.settings.save(outFile)   # user hit OK -> write result
-        sys.exit(0)
-    else:
-        sys.exit(1)                  # user hit Cancel -> no output file
+    while True:
+        if dlg.exec() != QDialog.Accepted:
+            return 1
+
+        if not toolMode:
+            dlg.settings.save(outFile)
+            return 0
+
+        try:
+            # Duplicate names or invalid defaults must not be silently saved.
+            edited = pglToolDialog.extract(document, dlg.settings)
+        except (TypeError, ValueError) as error:
+            QMessageBox.warning(dlg, "Invalid tool configuration", str(error))
+            continue
+
+        Path(outFile).write_text(
+            json.dumps(edited, ensure_ascii=False, allow_nan=False),
+            encoding="utf-8",
+        )
+        return 0
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        exitCode = main()
+    except Exception:
+        import traceback
+
+        traceback.print_exc()
+        exitCode = 2
+
+    sys.exit(exitCode)

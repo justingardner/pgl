@@ -291,8 +291,10 @@ class pglMessages:
     # plain print
     #################################################################
     @classmethod
-    def print(cls, str="", flush=True, messageType='pgl', verbose=True, end="\n"):
+    def print(cls, str="", flush=True, messageType='pgl', verbose=True, emphasize=False, end="\n"):
         # do not print if the messageType is disabled or verbose is false
         if not cls._shouldPrint(messageType, verbose): return        
         
+        if emphasize:print("+="*40)
         print(str,flush=flush,end=end)
+        if emphasize:print("+="*40)
