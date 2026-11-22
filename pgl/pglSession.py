@@ -2846,6 +2846,27 @@ class pglSession(pglActionable):
             pglMessages.printHeader(f"Run {index}", fillChar="-")
             run.print(verbose=verbose)
 
+    def printDatabase(
+        self, *, details=False, measureMatrixBundles=False,
+        storageOptionsByBackend=None, sslRootCert=None,
+    ):
+        """Print storage associated with this session's saved checkpoint.
+
+        Default output summarizes files by run/category and file type.
+        details=True additionally lists individual files and storage locations.
+        measureMatrixBundles=True reads/hashes matrix bundles to measure them.
+
+        All inspection and printing is delegated to pglDatabase.
+        """
+        from .pglDatabase import pglDatabase
+
+        return pglDatabase.printSessionDatabase(
+            self,
+            details=details,
+            measureMatrixBundles=measureMatrixBundles,
+            storageOptionsByBackend=storageOptionsByBackend,
+            sslRootCert=sslRootCert,
+        )
     def display(self):
         """Display every behavioral run and its tasks."""
         if not self.runs:
