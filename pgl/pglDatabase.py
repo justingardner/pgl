@@ -701,10 +701,11 @@ class pglDatabase:
         """Load a completed checkpoint with retained caller-side payload access.
 
         Resolves configuration, selects the checkpoint-contract loader,
-        restores annotations, and binds the saved history baseline.
+        restores annotations/publication metadata, and binds the saved
+        history baseline.
 
         Supports legacy raw/derived contracts, derived v2 matrix products,
-        derived v3 file attachments, and derived MRI v1 checkpoints.
+        derived v3 file attachments, and derived MRI v1/v2 checkpoints.
 
         Scientific fields remain deferred where supported. Derived files
         are restored as unopened references; their bytes are downloaded only
@@ -724,6 +725,9 @@ class pglDatabase:
         cacheDirectory overrides settings.cacheDir for MNE or v3 checkpoints.
         includeDeleted permits inspection without restoring lifecycle state.
         Does not publish or modify database records.
+
+        The final printed overview resolves behavioral settings/data for
+        labels and acquisition timestamps through session.info().
         """
         from .pglPostgres import pglPostgres
 
@@ -769,6 +773,7 @@ class pglDatabase:
                     pglMessages.warning("Cannot load session: could not resolve PGL settings.", level=0)
                     return None
 
+                pglMessages.message(f"Loading sessionID={sessionID} from {resolvedSettings.name} database: {resolvedSettings.databasePath}, username={resolvedSettings.username}")
                 postgres = pglPostgres.fromSettings(settings=resolvedSettings)
 
             except (TypeError, ValueError) as error:
@@ -827,7 +832,7 @@ class pglDatabase:
                                 "pgl.derived.mri.v1",
                                 "pgl.derived.mri.v2",
                             )
-                            
+
                             # V3 behavioral sessions need a cache independently
                             # of MNE. Resolve its location without creating it.
                             resolvedCache = (
@@ -839,6 +844,9 @@ class pglDatabase:
                         else:
                             raise ValueError(f"Unsupported checkpoint origin/contract: {origin!r}, {contractVersion!r}")
 
+                        # Read publication attribution in the same SQL snapshot.
+                        # Validate it before constructing retained payload readers.
+                        publicationInfo = cls._getCheckpointPublicationInfo(connection, postgres, sessionID)
                         session = loader(connection, postgres, sessionID, **loadOptions)
 
             # SQL and its tunnel have closed. The returned session retains
@@ -851,7 +859,14 @@ class pglDatabase:
             session.sessionID = sessionID
             session.description = checkpoint[2]
             session.checkpointName = checkpoint[3]
+
+            for name, value in publicationInfo.items():
+                setattr(session, name, value)
+
             cls._bindCheckpointBaseline(session, sessionID, postgres)
+
+            # Keep overview failures inside the cleanup boundary too.
+            session.print(headerOnly=True)
 
         except psycopg.Error as error:
             closeFailedLoad()
@@ -862,7 +877,6 @@ class pglDatabase:
             closeFailedLoad()
             raise
 
-        session.print()
         return session
 
     # ++++++++++++++++++++++++++++++ saveSession ++++++++++++++++++++++++++++++
@@ -5220,6 +5234,70 @@ class pglDatabase:
         baseline = cls._prepareCheckpointBaseline(session, sessionID, postgres)
         session._checkpointBaseline = baseline
 
+    @staticmethod
+    def _getCheckpointPublicationInfo(connection, postgres, sessionID):
+        """Read publication metadata for a completed checkpoint.
+
+        Uses the caller's connection and transaction. Does not modify records
+        or access payloads. Deleted checkpoints may be inspected; the calling
+        load/save operation owns visibility and lifecycle validation.
+
+        Returns the completion timestamp in the recorded saving timezone.
+        Without a recorded timezone, returns UTC and leaves the timezone
+        field None so displays can identify that historical limitation.
+
+        Missing completion timestamps remain None, not created_at fallbacks.
+        Invalid stored timezone names or naive database timestamps raise.
+        """
+        from datetime import timezone
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+        if type(sessionID) is not int or not 0 <= sessionID <= 9223372036854775807:
+            raise ValueError("sessionID must be a nonnegative PostgreSQL bigint.")
+
+        sessions = sql.Identifier(postgres.databaseSchema, "session")
+        users = sql.Identifier(postgres.databaseSchema, "users")
+
+        statement = sql.SQL("""
+            SELECT checkpoint.completed_at, checkpoint.saved_timezone,
+                   creator.username
+            FROM {} AS checkpoint
+            JOIN {} AS creator ON creator.user_id = checkpoint.created_by
+            WHERE checkpoint.session_id = %s
+              AND checkpoint.status = 'complete'
+        """).format(sessions, users)
+
+        record = connection.execute(statement, (sessionID,)).fetchone()
+
+        if record is None:
+            raise ValueError(f"Completed checkpoint publication metadata is unavailable: {sessionID}")
+
+        completedAt, savedTimezone, savedBy = record
+        displayTimezone = timezone.utc
+
+        if savedTimezone is not None:
+            if not isinstance(savedTimezone, str) or not savedTimezone or savedTimezone != savedTimezone.strip():
+                raise ValueError(f"Checkpoint {sessionID}: invalid saved timezone {savedTimezone!r}.")
+
+            try:
+                displayTimezone = ZoneInfo(savedTimezone)
+            except (ValueError, ZoneInfoNotFoundError) as error:
+                raise ValueError(f"Checkpoint {sessionID}: saved timezone {savedTimezone!r} is unavailable or invalid.") from error
+
+        if completedAt is not None:
+            if completedAt.utcoffset() is None:
+                raise ValueError(f"Checkpoint {sessionID}: completed_at must include timezone information.")
+
+            # Ignore the SQL connection's display timezone. Use the recorded
+            # publisher timezone, or explicitly use UTC for historical rows.
+            completedAt = completedAt.astimezone(displayTimezone)
+
+        return {
+            "checkpointSavedDateTime": completedAt.isoformat() if completedAt is not None else None,
+            "checkpointSavedTimezone": savedTimezone,
+            "checkpointSavedBy": savedBy,
+        }
+
     # +++++++++++++++++++++ _getCheckpointHistoryBoundary +++++++++++++++++++++
     # Direct callers in this module: _loadPipelineInput, _selectAncestralReplayInput,
     # getSessionPipeline, saveSession.
@@ -5700,7 +5778,7 @@ class pglDatabase:
 
                 # Install only after all matched identities have resolved.
                 session.scanRunCorrespondence = record
-                pglMessages.message(f"Restored {len(resolved)} scan/run matches by acquisition identity; no matching action was replayed.")
+                #pglMessages.message(f"Restored {len(resolved)} scan/run matches by acquisition identity; no matching action was replayed.")
 
             # Older checkpoints leave correspondence unset.
             filesystem._ownsAccess = ownsAccess

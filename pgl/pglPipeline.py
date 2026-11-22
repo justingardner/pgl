@@ -569,11 +569,32 @@ class pglActionHistory(pglTraitSettings):
 
         captureErrors = capture.captureErrors
         streams = {}
+        owners = list(owners)
+
+        # Readable attachment names; execution identity stays in consoleKey.
+        import re
+        actionLabel = re.sub(r"[^A-Za-z0-9_-]+", "_", self.actionName or "action").strip("_") or "action"
+        usedNames = {
+            name for owner in owners
+            for name in getattr(owner, "derivedFiles", {})
+        }
+        for logStreams in logs.values():
+            if not isinstance(logStreams, dict): continue
+            for logRecord in logStreams.values():
+                if isinstance(logRecord, dict) and logRecord.get("attachmentName"):
+                    usedNames.add(logRecord["attachmentName"])
 
         for stream in ("stdout", "stderr"):
-            attachmentName = f"action.{self.actionID}.console.{stream}"
+            baseName = f"{actionLabel}_{stream}"
+            attachmentName = f"{baseName}.log"
+            suffix = 2
+            while attachmentName in usedNames:
+                attachmentName = f"{baseName}_v{suffix}.log"
+                suffix += 1
+            usedNames.add(attachmentName)
             record = {
                 "attachmentName": attachmentName,
+                "displayName": attachmentName,
                 "archiveStatus": "unavailable",
             }
             streams[stream] = record
@@ -909,23 +930,102 @@ class pglActionable(pglTraitSettings):
     # Find a committed named scientific product
     ################################################################
     def getProduct(self, name=None, *, productID=None):
-        """Inspect a committed product without reading payloads.
+        """Get a committed product by name, kind, history index, or exact ID.
 
-        Supply exactly one of name or productID.
+        Integer:
+            Zero-based actionHistory index. Select from that execution's products.
 
-        Name selection resolves the current explicitly superseding version.
-        Unrelated duplicate names and competing replacements are ambiguous.
-        No timestamp or newest-product heuristic is used.
+        String:
+            Exact product names take precedence and retain existing explicit
+            supersession semantics. Otherwise interpret the string as a kind.
 
-        ID selection resolves that exact historical version unchanged.
+        Multiple candidates:
+            Open the existing item-selection dialog and require one selection.
+            Cancellation returns None.
 
-        Returns pglDerivedProduct, or None after a warning.
+        Explicit productID:
+            Resolve that exact product without a dialog.
 
-        This inspection method does not record consumption. Scientific actions
-        should resolve their declared pglProductSelector instead.
+        Does not load payloads, rerun producers, or record scientific consumption.
+        Scientific actions should continue using pglProductSelector directly.
         """
+        from numbers import Integral
+
         try:
-            return pglProductSelector(name, productID=productID)._resolve(self)
+            if productID is not None:
+                if name is not None: raise ValueError("Supply either name or productID, not both.")
+                return pglProductSelector(productID=productID)._resolve(self)
+
+            if isinstance(name, bool):
+                raise TypeError("Supply a product name, kind, or integer history index—not a Boolean.")
+
+            historyIndex = None
+            if isinstance(name, Integral):
+                historyIndex = int(name)
+                if not 0 <= historyIndex < len(self.actionHistory):
+                    raise ValueError(f"History index {historyIndex} is outside this object's action history.")
+            elif not isinstance(name, str) or not name.strip():
+                raise ValueError("Supply a product name, kind, integer history index, or productID.")
+
+            candidates = [
+                (index, entry, record)
+                for index, entry in enumerate(self.actionHistory)
+                if entry.actionStatus == pglActionStatus.SUCCESS
+                for record in entry.actionProducts
+                if record.get("recordStatus") == "committed"
+            ]
+
+            if historyIndex is not None:
+                candidates = [item for item in candidates if item[0] == historyIndex]
+                selectionLabel = f"action {historyIndex}"
+            else:
+                # Preserve established name/supersession semantics rather than
+                # interpreting an existing name as a kind.
+                if any(record.get("name") == name for _, _, record in candidates):
+                    return pglProductSelector(name)._resolve(self)
+
+                candidates = [item for item in candidates if item[2].get("kind") == name]
+                selectionLabel = f"kind {name!r}"
+
+            matches = []
+            seenIDs = set()
+            for index, entry, record in candidates:
+                identifier = record.get("productID")
+                if not isinstance(identifier, str) or not identifier.strip():
+                    raise ValueError("A matching committed product lacks its productID.")
+                if identifier in seenIDs: continue
+                seenIDs.add(identifier)
+                matches.append((index, entry, record))
+
+            if not matches:
+                if historyIndex is not None:
+                    raise ValueError(f"Action history entry {historyIndex} has no committed products from a successful execution.")
+                raise ValueError(f"No committed product has name or kind {name!r}.")
+
+            if len(matches) == 1:
+                selected = matches[0][2]
+            else:
+                from .pglDialog import pglDialogs
+
+                labels = []
+                for index, entry, record in matches:
+                    productName = " ".join(str(record.get("name") or "(unnamed)").split())
+                    kind = " ".join(str(record.get("kind") or "unspecified").split())
+                    actionName = " ".join(str(entry.actionName).split())
+                    dateTime = " ".join(str(entry.runDateTime).split())
+                    labels.append(f"{productName} [{kind}] — action {index}: {actionName} — {dateTime}")
+
+                positions = pglDialogs.selectItems(labels, title=f"Select one product — {selectionLabel}")
+                if positions is None or len(positions) == 0: return None
+                if len(positions) != 1:
+                    pglMessages.warning("Select exactly one product.", level=1)
+                    return None
+
+                selected = matches[positions[0]][2]
+
+            # Exact-ID resolution retains ordinary provenance checks and owner binding.
+            return pglProductSelector(productID=selected["productID"])._resolve(self)
+
         except Exception as error:
             pglMessages.warning(f"Derived product was not selected: {error}")
             return None
@@ -1074,36 +1174,32 @@ class pglActionable(pglTraitSettings):
         return kindWidth, countWidth
 
     def _printProductRows(self, entry, *, widths, details=False, verbose=False):
-        """Print aligned summaries and optional product retrieval commands.
+        """Print readable recorded products without opening scientific payloads.
 
-        verbose controls technical summary metadata.
-        details explicitly requests individual products and copyable commands.
-
-        Exact-ID commands select the recorded version, not a newer product
-        with the same name. Retrieval still validates provenance and payloads.
-        Commands use 'session' as the example variable name.
-
-        Reads history metadata only; does not open or verify payload files.
+        Exact-ID retrieval commands preserve historical product selection.
+        UUIDs remain available for identity, not as primary artifact labels.
         """
+        import mimetypes
+        from pathlib import Path
+
         if type(verbose) is not bool or type(details) is not bool:
             raise TypeError("verbose and details must be Boolean.")
 
         kindWidth, countWidth = widths
         rows = self._productSummaryRows(entry, verbose=verbose)
-
         for kind, count, description in rows:
             pglMessages.print(f"    {kind:<{kindWidth}}  {count:>{countWidth}}  {description}")
 
         if not details:
             if rows:
-                # Preserve the original history index in filtered views.
                 indices = [index for index, candidate in enumerate(self.actionHistory) if candidate is entry]
-                if len(indices) == 1:
-                    pglMessages.print(f"    Inspect/get: session.printDataProducts({indices[0]})")
+                if len(indices) == 1: pglMessages.print(f"    Inspect/get: session.printDataProducts({indices[0]})")
             return
 
-        # Exact identities are useful here because this is an explicitly
-        # requested retrieval view, rather than the compact history listing.
+        derivedFiles = getattr(self, "derivedFiles", {})
+        imageExtensions = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+        imageTypes = {"image/png", "image/jpeg", "image/tiff", "image/bmp"}
+
         for product in entry.actionProducts:
             name = self._productDisplayText(product.get("name") or "(unnamed)")
             kind = self._productDisplayText(product.get("kind") or "unspecified")
@@ -1111,41 +1207,77 @@ class pglActionable(pglTraitSettings):
             identifier = product.get("productID")
             committed = entry.actionStatus == pglActionStatus.SUCCESS and product.get("recordStatus") == "committed"
             canSelect = committed and isinstance(identifier, str) and bool(identifier.strip())
+            metadata = product.get("metadata", {})
 
             pglMessages.print(f"        {name} [{kind}] | {status}")
-
             if canSelect:
                 pglMessages.print(f"            Get: product = session.getProduct(productID={identifier!r})")
+                pglMessages.print("            Display: product.display()")
             else:
-                pglMessages.print("            Get: unavailable through getProduct() — no committed selectable record")
+                pglMessages.print("            Get: unavailable — no committed selectable record")
 
-            artifacts = product.get("artifacts", {})
-            roleWidth = max([1, *(len(self._productDisplayText(role)) for role in artifacts)])
+            labels = {
+                item["role"]: item["relativePath"]
+                for item in metadata.get("supportArtifacts", [])
+                if isinstance(item, dict) and "role" in item and "relativePath" in item
+            }
 
-            for role, artifact in artifacts.items():
-                roleText = self._productDisplayText(role)
+            for role, artifact in product.get("artifacts", {}).items():
+                attachmentName = artifact.get("attachmentName") or ""
+                attachment = derivedFiles.get(attachmentName) or {}
+                label = labels.get(role, role)
+                recordedType = artifact.get("mediaType") or attachment.get("mediaType")
+                inferredType = mimetypes.guess_type(str(label))[0]
+                typeText = recordedType or (f"{inferredType} (inferred)" if inferredType else "type not recorded")
                 size = artifact.get("size_bytes")
                 sizeText = f"{size:,} bytes" if type(size) is int else "size not recorded"
-                pglMessages.print(f"            {roleText:<{roleWidth}}  {sizeText}")
+                pglMessages.print(f"            {self._productDisplayText(label)} | {typeText} | {sizeText}")
 
                 if canSelect:
                     pglMessages.print(f"                File: product.getFile(role={role!r})")
+                    mediaType = str(recordedType or "").split(";", 1)[0].strip().lower()
+                    extension = Path(str(label)).suffix.lower() or Path(attachmentName).suffix.lower()
+                    if mediaType in imageTypes or (mediaType in ("", "application/octet-stream") and extension in imageExtensions):
+                        pglMessages.print(f"                Show: product.displayArtifacts(role={role!r})")
 
                 if verbose:
-                    attachmentName = self._productDisplayText(artifact.get("attachmentName") or "(not recorded)")
-                    pglMessages.print(f"                Attachment: {attachmentName}")
+                    pglMessages.print(f"                Role: {role}")
+                    pglMessages.print(f"                Attachment: {self._productDisplayText(attachmentName)}")
 
-        # Command logs use the attachment interface, not getProduct().
+            # MRI-owned analysis matrices and declared replacement matrices.
+            matrices = metadata.get("matrices", [])
+            replacements = metadata.get("imageReplacements", {})
+            if isinstance(replacements, dict): matrices = [*matrices, *replacements.get("stages", [])]
+
+            mri = getattr(self, "mri", None)
+            mriMatrices = getattr(mri, "dataMatrices", {}) if mri is not None else getattr(self, "dataMatrices", {})
+            for declaration in matrices:
+                if not isinstance(declaration, dict) or not declaration.get("matrixName"): continue
+                matrixName = declaration["matrixName"]
+                shape = declaration.get("shape")
+                dimensions = declaration.get("dimensions")
+                dtype = declaration.get("dtype")
+                retained = matrixName in mriMatrices
+                description = []
+                if shape is not None: description.append(f"shape={tuple(shape)}")
+                if dimensions is not None: description.append(f"dimensions={tuple(dimensions)}")
+                if dtype is not None: description.append(f"dtype={dtype}")
+                description.append("attached" if retained else "not attached here")
+                pglMessages.print(f"            {self._productDisplayText(matrixName)} | matrix | {'; '.join(description)}")
+                if retained:
+                    container = "session.mri.dataMatrices" if mri is not None else "session.dataMatrices"
+                    pglMessages.print(f"                Matrix: {container}[{matrixName!r}]")
+                if verbose: pglMessages.print(f"                UUID: {declaration.get('matrixUUID', '(not recorded)')}")
+
+        # Log records retain their execution/invocation identities independently.
         for invocationID, stream, record in self._historyLogRecords(entry):
             attachmentName = record.get("attachmentName")
             status = self._productDisplayText(record.get("archiveStatus") or "unspecified")
-            pglMessages.print(f"        {stream:<6}  {status}")
-
+            label = record.get("displayName") or attachmentName or f"{entry.actionName}_{stream}.log"
+            pglMessages.print(f"        {self._productDisplayText(label)} | text/plain | {status}")
             if record.get("archiveStatus") == "archived" and isinstance(attachmentName, str) and attachmentName:
                 pglMessages.print(f"            File: session.getDerivedFile({attachmentName!r})")
-
-            if verbose:
-                pglMessages.print(f"            Invocation: {self._productDisplayText(invocationID)}")
+            if verbose: pglMessages.print(f"            Invocation: {self._productDisplayText(invocationID)}")
 
     def _printRecordedProducts(self, actionIndex=None, *, details=False):
         """Print only producing executions, retaining original history indices."""
@@ -1718,44 +1850,41 @@ class pglDerivedProduct:
     # Display a recorded scientific product
     ################################################################
     def display(self, **options):
-        """Display this product using its kind-specific adapter.
+        """Display a saved product using registered, action-specific, or default code.
 
-        Uses the bound owner without automatically reloading a session.
-        Options are validated against the adapter before payload access.
+        Precedence:
+            Explicit runtime kind adapter.
+            Installed producing action's displayProduct class method.
+            Base action display (existing motion adapters or generic saved images).
 
-        Built-in kinds:
-            rigidMotion: per-volume motion figures.
-            runAlignment: between-run summaries, one per selected group.
+        Resolves classes through the existing trusted action resolver. Saved source
+        text is never executed and no action instance is constructed.
 
-        Registered runtime adapters take precedence over built-ins.
-
-        Dependency, option, metadata, and integrity failures warn at the
-        default stopping level. Adapters separately handle recoverable
-        rendering failures with level=1.
-
-        Returns the adapter's figures/viewer/result, or None on refusal.
+        Legacy history without class identity uses the generic/base implementation.
         """
+        import inspect
+
         try:
+            owner = self._requireOwner()
+            entry = self._findProducingAction(owner)
             adapter = type(self)._displayAdapters.get(self.kind)
 
-            if adapter is None and self.kind in ("rigidMotion", "runAlignment"):
-                from .pglMRI import pglMRITransforms
-
-                adapter = {
-                    "rigidMotion": pglMRITransforms.displayMotionProduct,
-                    "runAlignment": pglMRITransforms.displayRunAlignmentProduct,
-                }[self.kind]
-
             if adapter is None:
-                raise ValueError(f"No display adapter is registered for product kind {self.kind!r}.")
+                actionClass = pglAction
+                code = entry.actionCode
+                if isinstance(code, dict) and code.get("module") and code.get("qualname"):
+                    resolved = pglPipeline._resolveActionClass(code["module"], code["qualname"])
+                    if resolved is not None:
+                        actionClass = resolved
+                    else:
+                        pglMessages.warning("Producing action class unavailable; using the default product display.", level=1)
+                adapter = actionClass.displayProduct
 
             try:
                 inspect.signature(adapter).bind(self, **options)
             except TypeError as error:
-                raise ValueError(f"Invalid display options for product kind {self.kind!r}: {error}") from error
+                raise ValueError(f"Invalid display options for {self.kind!r}: {error}") from error
 
-            owner = self._requireOwner()
-            self._findProducingAction(owner)
             return adapter(self, **options)
 
         except Exception as error:
@@ -1908,6 +2037,77 @@ class pglDerivedProduct:
                 f"{type(error).__name__}: {error}"
             )
             return False
+
+    def displayArtifacts(self, role=None, *, cacheDirectory=None, show=True):
+        """Display saved raster images through verified artifact retrieval.
+
+        With role=None, displays all supported image artifacts.
+        Explicit role selects one image. Unsupported files remain retrievable
+        through getFile(); they are never executed or unpickled for display.
+
+        Returns Matplotlib figures. show=False leaves presentation to the caller.
+        """
+        from pathlib import Path
+        import matplotlib.image as mpimg
+        import matplotlib.pyplot as plt
+
+        if type(show) is not bool: raise TypeError("show must be Boolean.")
+        owner = self._requireOwner()
+        self._findProducingAction(owner)
+        artifacts = self._record.get("artifacts", {})
+        labels = {
+            item["role"]: item["relativePath"]
+            for item in self.metadata.get("supportArtifacts", [])
+            if isinstance(item, dict) and "role" in item and "relativePath" in item
+        }
+        imageTypes = {"image/png", "image/jpeg", "image/tiff", "image/bmp"}
+        imageExtensions = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+
+        if role is not None and (not isinstance(role, str) or role not in artifacts):
+            raise ValueError(f"Unknown image artifact role: {role!r}.")
+
+        selected = []
+        for artifactRole, artifact in artifacts.items():
+            if role is not None and artifactRole != role: continue
+            attachmentName = artifact.get("attachmentName", "")
+            attachment = owner.derivedFiles.get(attachmentName) or {}
+            mediaType = artifact.get("mediaType") or attachment.get("mediaType") or ""
+            mediaType = str(mediaType).split(";", 1)[0].strip().lower()
+            label = labels.get(artifactRole, artifactRole)
+
+            # Recorded media type is authoritative when specific; filename fallback
+            # supports attachments with missing or generic binary media types.
+            extension = Path(label).suffix.lower() or Path(attachmentName).suffix.lower()
+            supported = mediaType in imageTypes or (
+                mediaType in ("", "application/octet-stream") and extension in imageExtensions
+            )
+            if supported: selected.append((artifactRole, label))
+            elif role is not None: raise ValueError(f"{role!r} is not a supported raster image; use getFile().")
+
+        if not selected:
+            pglMessages.message(f"Product {self.name!r} has no supported saved image artifacts.")
+            return []
+
+        figures = []
+        for artifactRole, label in selected:
+            figure = None
+            try:
+                path = self.getFile(role=artifactRole, cacheDirectory=cacheDirectory)
+                if path is None: raise ValueError("Image artifact could not be retrieved.")
+                image = mpimg.imread(path)
+                height, width = image.shape[:2]
+                figure, axis = plt.subplots(figsize=(10, max(2, min(14, 10 * height / width))))
+                axis.imshow(image, cmap="gray" if image.ndim == 2 else None)
+                axis.set_axis_off()
+                axis.set_title(f"{self.name} — {Path(label).name}")
+                figure.tight_layout()
+                if show: plt.show(block=False)
+                figures.append(figure)
+            except Exception as error:
+                if figure is not None: plt.close(figure)
+                pglMessages.warning(f"Could not display {label!r}: {type(error).__name__}: {error}", level=1)
+
+        return figures
  
 ########################
 # class pglAction
@@ -2653,6 +2853,23 @@ class pglAction(pglActionable):
                 "Inspect MRI attachments before saving; no payload files were deleted.",
                 level=1,
             )
+
+    @classmethod
+    def displayProduct(cls, product, **options):
+        """Default saved-product presentation; subclasses may extend with super().
+
+        Uses installed display code, never executes saved source, and does not
+        instantiate/configure actions or run scientific processing.
+        """
+        if product.kind in ("rigidMotion", "runAlignment") and "role" not in options:
+            from .pglMRI import pglMRITransforms
+            adapter = {
+                "rigidMotion": pglMRITransforms.displayMotionProduct,
+                "runAlignment": pglMRITransforms.displayRunAlignmentProduct,
+            }[product.kind]
+            return adapter(product, **options)
+
+        return product.displayArtifacts(**options)
 
 ########################
 # class pglDeferredAction

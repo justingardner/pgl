@@ -2378,7 +2378,14 @@ class pglMRI(pglActionable):
                 if product.productID not in dependencies:
                     dependencies.append(product.productID)
 
-            matrixName = f"image.{productID}.{scanUUID}"
+            # Readable attachment name; stable scientific identities remain in provenance.
+            baseName = f"{outputName}_scan{index}"
+            matrixName = baseName
+            suffix = 2
+            while matrixName in attachments:
+                matrixName = f"{baseName}_v{suffix}"
+                suffix += 1
+            
             candidate = {
                 "scanUUID": scanUUID,
                 "stageID": f"product:{productID}:{matrixName}",

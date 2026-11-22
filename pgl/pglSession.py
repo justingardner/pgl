@@ -2292,6 +2292,9 @@ class pglSession(pglActionable):
     sessionID = Int(default_value=None, allow_none=True, help="Most recently loaded or successfully saved database checkpoint ID", serialize=False)
     description = Unicode(default_value=None, allow_none=True, help="Checkpoint description carried forward by saveSession; an empty string clears it.", serialize=False)
     checkpointName = Unicode(default_value=None, allow_none=True, help="Short checkpoint label carried forward by saveSession; an empty string clears it.", serialize=False)
+    checkpointSavedDateTime = Unicode(default_value=None, allow_none=True, help="Recorded checkpoint completion time as an ISO timestamp").tag(serialize=False)
+    checkpointSavedTimezone = Unicode(default_value=None, allow_none=True, help="IANA timezone recorded by the checkpoint publisher; None means not recorded").tag(serialize=False)
+    checkpointSavedBy = Unicode(default_value=None, allow_none=True, help="Database username associated with the checkpoint creator").tag(serialize=False)
     runs = List(Instance(pglRun), allow_none=True, help="List of behavioral runs")
     mne = Instance(pglMNE, allow_none=True, help="MEG/EEG data")
     mri = Instance(pglMRI, allow_none=True, default_value=None, help="MRI data", serialize=False)
@@ -2299,7 +2302,7 @@ class pglSession(pglActionable):
     derivedFiles = Dict(default_value={}, help="Named derived file attachments; persisted explicitly through session checkpoint integration", serialize=False)
     # Persisted explicitly through saveScanRunMatches(), not session checkpoints.
     scanRunCorrespondence = Dict(default_value=None,allow_none=True,help="Validated MRI scan UUID ↔ behavioral data UUID correspondence; None means not configured.",serialize=False)
-  
+    
     selectedFilesystem = Instance(AbstractFileSystem,allow_none=True,default_value=None,help="Filesystem used to load the selected behavioral runs", serialize=False)
   
     # Explicit labels apply only when there are no behavioral runs.
@@ -2521,23 +2524,230 @@ class pglSession(pglActionable):
 
         return sessionID
 
+    def info(self):
+        """Return a dictionary describing the current working session.
+
+        Includes checkpoint annotations and cached publication metadata.
+        Does not query the database; publication metadata is restored by the
+        database loader/save coordinator.
+
+        Acquisition time is the earliest available run.data.startDateTime.
+        Each run retains its own timestamp. Times are ISO-formatted strings,
+        or None when unavailable.
+
+        Resolves behavioral experimentSettings and data, which may load
+        behavioral events. Does not load tasks, MNE/MRI payloads, or derived
+        products. Does not resolve scan/run correspondence.
+
+        Invalid acquisition timestamps raise. Mixing timezone-aware and
+        timezone-naive acquisition timestamps raises rather than guessing
+        their order. Naive timestamps are compared as recorded local times.
+
+        Acquisition dates for MNE/MRI-only sessions are not extracted here.
+        Returns new dictionaries/lists, not references to session collections.
+        """
+        from datetime import datetime
+
+        runs = list(self.runs or [])
+        labels = self.getSessionLabels()
+
+        # Preserve first-occurrence order and missing labels.
+        experimentNames = list(dict.fromkeys(record["experimentName"] for record in labels))
+        subjectIDs = list(dict.fromkeys(record["subjectID"] for record in labels))
+
+        protocol = getattr(self.filesystem, "protocol", None)
+        if isinstance(protocol, (tuple, list)): protocol = list(protocol)
+
+        runInformation = []
+        acquisitionTimes = []
+
+        for record in labels:
+            runIndex = record["runIndex"]
+            if runIndex is None: continue
+
+            run = runs[runIndex]
+            data = run.data
+            acquisitionTime = None
+            startDateTime = data.startDateTime if data is not None else None
+
+            if startDateTime is not None:
+                if not isinstance(startDateTime, str):
+                    raise TypeError(f"Run {runIndex}: startDateTime must be an ISO-formatted string.")
+
+                dateText = startDateTime.strip()
+
+                if dateText:
+                    # Support the ISO UTC suffix on older Python versions too.
+                    if dateText.endswith("Z"): dateText = dateText[:-1] + "+00:00"
+
+                    try:
+                        acquisitionTime = datetime.fromisoformat(dateText)
+                    except ValueError as error:
+                        raise ValueError(f"Run {runIndex}: invalid ISO startDateTime {startDateTime!r}.") from error
+
+                    acquisitionTimes.append(acquisitionTime)
+
+            runInformation.append({
+                **record,
+                "fullDataPath": run.fullDataPath,
+                "filesystemPrefix": run.filesystemPrefix,
+                "acquisitionDateTime": acquisitionTime.isoformat() if acquisitionTime is not None else None,
+            })
+
+        acquisitionTime = None
+
+        if acquisitionTimes:
+            # Do not silently interpret missing timezone information as UTC.
+            timezoneStates = {value.utcoffset() is not None for value in acquisitionTimes}
+
+            if len(timezoneStates) > 1:
+                raise ValueError("Cannot determine session acquisition time: behavioral startDateTime values mix timestamps with and without timezones.")
+
+            acquisitionTime = min(acquisitionTimes)
+
+        # A session without a checkpoint ID must not report stale attribution
+        # if the caller has explicitly cleared its identity.
+        hasCheckpoint = self.sessionID is not None
+
+        return {
+            "sessionID": self.sessionID,
+            "checkpointName": self.checkpointName,
+            "description": self.description,
+            "checkpointSavedDateTime": self.checkpointSavedDateTime if hasCheckpoint else None,
+            "checkpointSavedTimezone": self.checkpointSavedTimezone if hasCheckpoint else None,
+            "checkpointSavedBy": self.checkpointSavedBy if hasCheckpoint else None,
+            "acquisitionDateTime": acquisitionTime.isoformat() if acquisitionTime is not None else None,
+            "experimentName": experimentNames[0] if len(experimentNames) == 1 else None,
+            "subjectID": subjectIDs[0] if len(subjectIDs) == 1 else None,
+            "experimentNames": experimentNames,
+            "subjectIDs": subjectIDs,
+            "nRuns": len(runs),
+            "runs": runInformation,
+            "filesystemProtocol": protocol,
+            "filesystemPrefix": self.filesystemPrefix,
+            "hasMNE": self.mne is not None,
+            "hasMRI": self.mri is not None,
+            "nScans": len(self.mri.scans) if self.mri is not None else 0,
+            "dataMatrixNames": list(self.dataMatrices),
+            "derivedFileNames": list(self.derivedFiles),
+            # Configured does not mean resolved or verified against the
+            # current collections.
+            "hasScanRunCorrespondence": self.scanRunCorrespondence is not None,
+        }
+        
+    @staticmethod
+    def _formatAcquisitionDateTime(value):
+        """Format acquisition time with its offset and a likely abbreviation.
+
+        An offset cannot uniquely identify a geographic timezone, so inferred
+        abbreviations are explicitly marked 'likely'.
+
+        Prefer the caller's local abbreviation when its offset matches at the
+        acquisition instant. Otherwise use common regional conventions.
+
+        Preserves the recorded clock time and offset. Naive timestamps remain
+        timezone unspecified. Does not modify stored acquisition metadata.
+        """
+        from datetime import datetime
+
+        if value is None: return "Unknown"
+
+        dateText = value[:-1] + "+00:00" if value.endswith("Z") else value
+        dateTime = datetime.fromisoformat(dateText)
+        offset = dateTime.utcoffset()
+
+        if offset is None:
+            timezoneText = "(timezone unspecified)"
+        elif offset.total_seconds() == 0:
+            timezoneText = "UTC"
+        else:
+            totalSeconds = offset.total_seconds()
+            hours, remainder = divmod(abs(totalSeconds), 3600)
+            minutes, seconds = divmod(remainder, 60)
+            sign = "+" if totalSeconds > 0 else "-"
+            timezoneText = f"UTC{sign}{int(hours)}:{int(minutes):02d}"
+            if seconds: timezoneText += f":{seconds:09.6f}".rstrip("0").rstrip(".")
+
+            abbreviation = None
+
+            # Local context is a useful guess, but is not acquisition provenance.
+            localTime = dateTime.astimezone()
+            localName = localTime.tzname() or ""
+
+            if localTime.utcoffset() == offset and localName.isalpha() and localName not in ("UTC", "GMT"):
+                abbreviation = localName
+
+            if abbreviation is None:
+                from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+                # Preference order is intentionally heuristic. Named zones
+                # supply date-appropriate daylight-saving abbreviations.
+                candidateZones = (
+                    "America/Los_Angeles",
+                    "America/Denver",
+                    "America/Chicago",
+                    "America/New_York",
+                    "America/Halifax",
+                    "America/St_Johns",
+                    "America/Anchorage",
+                    "Pacific/Honolulu",
+                    "Europe/London",
+                    "Europe/Paris",
+                    "Europe/Helsinki",
+                    "Asia/Kolkata",
+                    "Asia/Tokyo",
+                    "Australia/Sydney",
+                    "Australia/Adelaide",
+                    "Australia/Perth",
+                    "Pacific/Auckland",
+                )
+
+                for zoneName in candidateZones:
+                    try:
+                        candidateTime = dateTime.astimezone(ZoneInfo(zoneName))
+                    except ZoneInfoNotFoundError:
+                        continue
+
+                    candidateName = candidateTime.tzname() or ""
+
+                    if candidateTime.utcoffset() == offset and candidateName.isalpha():
+                        abbreviation = candidateName
+                        break
+
+            if abbreviation is not None: timezoneText += f" ({abbreviation})"
+
+        # Avoid platform-specific strftime flags for unpadded day/hour.
+        dateText = f"{dateTime.strftime('%B')} {dateTime.day}, {dateTime.year}"
+        timeText = dateTime.strftime("%I:%M %p").lstrip("0")
+        return f"{dateText} at {timeText} {timezoneText}"
     
-    def print(self, verbose=False, *, runNum=None):
-        """Print the session overview, description, labels, and selected runs.
+    def print(self, verbose=False, *, runNum=None, headerOnly=False):
+        """Print the session overview and selected behavioral runs.
+
+        Includes checkpoint name, completion time, and recorded creator.
+        Saved timestamps use the recorded publisher timezone when available;
+        otherwise they use the local timezone of the running Python process.
+
+        Acquisition timestamps retain their recorded timezone information.
 
         runNum=None prints all runs.
         runNum=0 selects the first run.
         Negative indices count from the end: -1 selects the last run.
 
-        Run headings retain one-based display numbering.
+        Run headings use zero-based collection indices.
         Invalid run selections warn and return without printing the overview.
 
-        Resolves behavioral experiment settings to display current labels.
-        Does not load MNE payloads or query the database.
+        Uses info(), resolving behavioral settings/data even for headerOnly.
+        Individual run printing may load additional behavioral contents.
+        Does not query the database or load MNE/MRI payloads.
+        Does not modify timestamps or stored timezone metadata.
         """
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
         runs = self.runs or []
 
-        # Validate and normalize before displaying any session information.
+        # Validate and normalize before gathering or displaying information.
         if runNum is not None:
             if type(runNum) is not int:
                 pglMessages.warning("runNum must be an integer or None.", level=1)
@@ -2550,37 +2760,80 @@ class pglSession(pglActionable):
                 return
             if runNum < 0: runNum += runCount
 
-        pglMessages.printHeader("Session")
+        sessionInfo = self.info()
 
-        protocol = getattr(self.filesystem, "protocol", None)
+        # Escape control characters for display, not in the returned info.
+        def displayText(value):
+            return str(value).replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t")
 
-        if isinstance(protocol, (tuple, list)):
-            protocol = ", ".join(protocol)
+        def displayLabels(values):
+            return ", ".join(displayText(value) if value is not None else "Unknown" for value in values) or "Unknown"
 
-        information = {
-            "Source checkpoint": self.sessionID if self.sessionID is not None else "Not set",
-        }
+        def displayDate(value, *, checkpoint=False, timezoneName=None):
+            if value is None: return "Unknown"
 
-        if self.description is not None and self.description.strip():
-            information["Description"] = self.description.replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t")
+            dateText = value[:-1] + "+00:00" if value.endswith("Z") else value
+            dateTime = datetime.fromisoformat(dateText)
 
-        information["Runs"] = len(runs)
-        information["Filesystem"] = protocol or "Not set"
-        information["MEG/EEG data"] = "Attached" if self.mne is not None else "None"
-        information["MRI data"] = (f"{len(self.mri.scans)} scans" if self.mri is not None else "None")
+            if checkpoint:
+                if dateTime.utcoffset() is None:
+                    raise ValueError("Checkpoint completion time must include timezone information.")
+
+                if timezoneName is None:
+                    # No recorded publisher timezone: display in the caller's
+                    # local timezone without inventing saved provenance.
+                    dateTime = dateTime.astimezone()
+                    timezoneText = dateTime.tzname()
+                else:
+                    dateTime = dateTime.astimezone(ZoneInfo(timezoneName))
+                    timezoneText = f"{dateTime.tzname()} ({timezoneName})"
+            else:
+                # Acquisition-local context is exactly what was recorded.
+                timezoneText = dateTime.tzname() if dateTime.utcoffset() is not None else "(timezone unspecified)"
+
+            # Avoid platform-specific strftime flags for unpadded day/hour.
+            dateText = f"{dateTime.strftime('%B')} {dateTime.day}, {dateTime.year}"
+            timeText = dateTime.strftime("%I:%M %p").lstrip("0")
+            return f"{dateText} at {timeText} {timezoneText}"
+
+        sessionID = sessionInfo["sessionID"]
+        checkpointName = sessionInfo["checkpointName"]
+        information = {}
+        
+        information["Acquired"] = self._formatAcquisitionDateTime(sessionInfo["acquisitionDateTime"])
+        information["Experiment"] = displayLabels(sessionInfo["experimentNames"])
+        information["Subject"] = displayLabels(sessionInfo["subjectIDs"])
+        information["Runs"] = sessionInfo["nRuns"]
+        information["MEG/EEG data"] = "Attached" if sessionInfo["hasMNE"] else "None"
+        information["MRI data"] = f"{sessionInfo['nScans']} scans" if sessionInfo["hasMRI"] else "None"
+
+        information["Checkpoint"] = displayText(checkpointName) if checkpointName is not None and checkpointName.strip() else "Not set"
+
+        if sessionInfo["description"] is not None and sessionInfo["description"].strip():
+            information["Description"] = displayText(sessionInfo["description"])
+
+
+        if sessionID is None:
+            information["Checkpoint saved"] = "Not saved"
+            information["Saved by"] = "Not saved"
+        else:
+            information["Checkpoint saved"] = displayDate(
+                sessionInfo["checkpointSavedDateTime"],
+                checkpoint=True,
+                timezoneName=sessionInfo["checkpointSavedTimezone"],
+            )
+            savedBy = sessionInfo["checkpointSavedBy"]
+            information["Saved by"] = displayText(savedBy) if savedBy else "Unknown"
+
+
+        pglMessages.printHeader(f"Session {sessionID if sessionID is not None else 'Not set'}")
         labelWidth = max(len(label) for label in information)
 
         for label, value in information.items():
             pglMessages.print(f"  {label:<{labelWidth}} : {value}")
 
-        labels = self.getSessionLabels()
-        pairs = list(dict.fromkeys((record["experimentName"], record["subjectID"]) for record in labels))
-
-        pglMessages.print()
-        pglMessages.printHeader("Experiment and subject", fillChar="-")
-
-        for experimentName, subjectID in pairs:
-            pglMessages.print(f"  {experimentName if experimentName is not None else 'Unknown'} / {subjectID if subjectID is not None else 'Unknown'}")
+        pglMessages.printHeader()
+        if headerOnly: return
 
         # Preserve original run numbering when displaying only one run.
         selectedRuns = enumerate(runs) if runNum is None else [(runNum, runs[runNum])]
