@@ -380,6 +380,12 @@ class pglActionHistory(pglTraitSettings):
     @classmethod
     def fromJSONdict(cls, data, type="all", filename=None):
         """Restore history without creating new execution provenance."""
+        # Validate only the new representation. Legacy records retain
+        # their original fields and are never assigned inferred identities.
+        inputRecord = data.get("actionInput", {})
+        if isinstance(inputRecord, dict) and inputRecord.get("kind") == "actionInputs":
+            cls.validateActionInputs(inputRecord)
+
         obj = cls()
         obj.updateTraitsFromDict(data, filename=filename)
 
@@ -648,6 +654,211 @@ class pglActionHistory(pglTraitSettings):
                     f"Action {self.actionID} {stream} log preservation: {record['error']}",
                     level=1,
                 )
+
+
+    @staticmethod
+    def captureActionInputs(args, kwargs, *, replayInput=None):
+        """Capture supplied working inputs before scientific execution.
+
+        Inspect direct arguments and built-in list/tuple/dict containers.
+        Do not traverse arbitrary objects, resolve payloads, or read defaults.
+
+        Saved references come only from storage-established session binding.
+        They identify a saved source, not the complete current working state.
+
+        String dictionary keys retain their existing path representation.
+        Other dictionary keys use {"mappingKey": key}; the existing PGL codec
+        preserves supported key types, including tuples.
+
+        Configuration-only dictionaries impose no key-serialization requirement.
+        A key on a path to a scientific input must be supported by the PGL codec.
+
+        Cyclic container back-references are skipped on the active traversal path.
+        Shared containers reached through separate argument paths are inspected
+        separately. This records finite simple paths, not infinite cyclic paths.
+
+        Pipeline replay metadata remains separate inside actionInput.
+        Does not modify arguments, history, or database preferences.
+        """
+        from .pglDatabase import pglDatabase
+        from .pglSession import pglSession
+
+        inputs = []
+        activeContainers = set()
+
+        def visit(value, path):
+            if isinstance(value, pglActionable) and not isinstance(value, pglAction):
+                reference = (
+                    pglDatabase._getBoundCheckpointReference(value)
+                    if isinstance(value, pglSession) else None
+                )
+                inputs.append({
+                    "path": deepcopy(path),
+                    "objectClass": f"{type(value).__module__}.{type(value).__qualname__}",
+                    "state": "workingObject",
+                    "checkpoint": reference,
+                })
+                return
+
+            # Do not invoke custom collection iteration or inspect arbitrary
+            # attributes merely to discover provenance.
+            if type(value) not in (list, tuple, dict): return
+
+            identity = id(value)
+            if identity in activeContainers: return
+
+            activeContainers.add(identity)
+            try:
+                if type(value) is dict:
+                    for key, child in value.items():
+                        component = key if type(key) is str else {"mappingKey": key}
+                        visit(child, [*path, component])
+                else:
+                    for index, child in enumerate(value):
+                        visit(child, [*path, index])
+            finally:
+                activeContainers.remove(identity)
+
+        for index, value in enumerate(args):
+            visit(value, ["args", index])
+        for name, value in kwargs.items():
+            visit(value, ["kwargs", name])
+
+        record = {
+            "version": 2,
+            "kind": "actionInputs",
+            "inputs": inputs,
+            "replayInput": deepcopy({} if replayInput is None else replayInput),
+        }
+        pglActionHistory.validateActionInputs(record)
+        return record
+
+    @staticmethod
+    def validateActionInputs(record):
+        """Validate new input provenance without connecting or changing records.
+
+        Legacy string-keyed paths remain valid. Typed mapping-key components
+        delegate key validation and encoding to the existing PGL codec.
+
+        The PGL serializer—not plain json.dumps—is the persistence contract for
+        records containing tuple keys. Do not coerce keys into display strings.
+
+        Legacy actionInput records remain governed by their existing contracts.
+        """
+        import json
+        from types import SimpleNamespace
+        from uuid import UUID
+
+        from .pglDatabase import pglDatabase
+        from .pglSerialize import pglSerialize, _pglValidateMappingKey
+
+        if type(record) is not dict or set(record) != {"version", "kind", "inputs", "replayInput"}:
+            raise ValueError("Invalid action-input provenance fields.")
+        if type(record["version"]) is not int or record["version"] != 2 or record["kind"] != "actionInputs":
+            raise ValueError("Unsupported action-input provenance version or kind.")
+        if type(record["inputs"]) is not list:
+            raise ValueError("Action inputs must be a list.")
+
+        seenPaths = set()
+        for item in record["inputs"]:
+            if type(item) is not dict or set(item) != {"path", "objectClass", "state", "checkpoint"}:
+                raise ValueError("Invalid working-input provenance fields.")
+            if item["state"] != "workingObject":
+                raise ValueError("Action inputs must describe working objects.")
+
+            path = item["path"]
+            if type(path) is not list or len(path) < 2:
+                raise ValueError("Action input requires an argument path.")
+            if path[0] == "args":
+                if type(path[1]) is not int or path[1] < 0:
+                    raise ValueError("Invalid positional argument path.")
+            elif path[0] == "kwargs":
+                if type(path[1]) is not str:
+                    raise ValueError("Invalid keyword argument path.")
+            else:
+                raise ValueError("Unknown action argument path root.")
+
+            for position, component in enumerate(path[2:], start=2):
+                if type(component) is str: continue
+                if type(component) is int and component >= 0: continue
+
+                if type(component) is not dict or set(component) != {"mappingKey"}:
+                    raise ValueError("Unsupported action argument path component.")
+
+                key = component["mappingKey"]
+                if type(key) is str:
+                    raise ValueError("String mapping keys must use the existing direct path representation.")
+
+                _pglValidateMappingKey(key, f"actionInput.path[{position}].mappingKey")
+
+            # Encode through the shared codec so typed keys cannot collide with
+            # string keys or sequence indices. No arbitrary scientific values
+            # are serialized here.
+            encodedPath = pglSerialize.toJSON(SimpleNamespace(path=path), strict=True)
+            pathKey = json.dumps(json.loads(encodedPath), sort_keys=True, separators=(",", ":"), allow_nan=False)
+            if pathKey in seenPaths:
+                raise ValueError("Duplicate action input argument path.")
+            seenPaths.add(pathKey)
+
+            if not isinstance(item["objectClass"], str) or not item["objectClass"].strip():
+                raise ValueError("Action input requires an object class label.")
+
+            reference = item["checkpoint"]
+            if reference is None: continue
+            if type(reference) is not dict or set(reference) != {"databaseID", "sessionID", "databaseName"}:
+                raise ValueError("Invalid action checkpoint reference.")
+
+            sessionID = reference["sessionID"]
+            if type(sessionID) is not int or not 0 <= sessionID <= 9223372036854775807:
+                raise ValueError("Action checkpoint sessionID must be a nonnegative PostgreSQL bigint.")
+
+            databaseID = reference["databaseID"]
+            if not isinstance(databaseID, str):
+                raise ValueError("Action checkpoint databaseID must be a UUID string.")
+            try:
+                parsed = UUID(databaseID)
+            except (ValueError, AttributeError):
+                raise ValueError("Invalid action checkpoint databaseID.") from None
+            if str(parsed) != databaseID or parsed.int == 0:
+                raise ValueError("Action checkpoint databaseID must be canonical and nonzero.")
+
+            label = reference["databaseName"]
+            if (
+                not isinstance(label, str) or not label.strip()
+                or any(character in label for character in ("\x00", "\n", "\r"))
+            ):
+                raise ValueError("Invalid action checkpoint databaseName label.")
+
+        replay = record["replayInput"]
+        if type(replay) is not dict:
+            raise ValueError("Pipeline replay input must be a dictionary.")
+
+        if replay:
+            if replay == {"version": 1, "kind": "workingObject"}:
+                if type(replay["version"]) is not int:
+                    raise ValueError("Invalid working-object replay input version.")
+            else:
+                pglDatabase._validatePipelineReplayInput(replay)
+
+        return record
+
+    @staticmethod
+    def getRecordedReplayInput(record):
+        """Read pipeline replay metadata without rewriting historical records.
+
+        Legacy histories store replay metadata directly in actionInput.
+        New histories preserve it inside the version-2 actionInputs record.
+        Ordinary working-source references are never promoted to replay inputs.
+        """
+        if type(record) is not dict:
+            raise ValueError("Action input must be a dictionary.")
+
+        if record.get("kind") == "actionInputs":
+            pglActionHistory.validateActionInputs(record)
+            return deepcopy(record["replayInput"])
+
+        return deepcopy(record)
+
            
 
 ########################
@@ -1403,20 +1614,26 @@ class pglProductSelector(pglSerialize):
         )
 
     def resolve(self, owner):
-        """Resolve this dependency and record consumption inside an action.
+        """Resolve a product and record its consuming owner's saved source.
 
         Reads product/history metadata only, not payload files.
 
         Inside an action:
-            Records the exact resolved product and producing execution.
-            Failures raise internally so the action stops.
+            Records the selector, exact product record, and optional
+            database-qualified checkpoint of the supplied session owner.
+            Failures raise internally so scientific execution stops.
 
         Outside an action:
-            Returns the product for inspection.
+            Returns the product for inspection without recording consumption.
             Ordinary failures warn and return None.
 
-        Does not automatically run a producer, choose the latest product,
-        substitute another name, or regenerate discarded files.
+        The owner checkpoint identifies the saved source beneath its working
+        state. It does not establish that this product was saved there.
+        Unbound owners have no checkpoint reference; defaults are never used
+        to infer their database.
+
+        Original product metadata and historical producer references remain
+        unchanged. No producer is automatically run or payload regenerated.
         """
         from .pglExternalTools import getExecutionRecorder
 
@@ -1426,7 +1643,18 @@ class pglProductSelector(pglSerialize):
             product = self._resolve(owner)
 
             if recorder is not None and recorder.actionID is not None:
-                recorder.recordProductInput(self.toJSONdict(), product.record)
+                from .pglDatabase import pglDatabase
+                from .pglSession import pglSession
+
+                checkpoint = (
+                    pglDatabase._getBoundCheckpointReference(owner)
+                    if isinstance(owner, pglSession) else None
+                )
+                recorder.recordProductInput(
+                    self.toJSONdict(),
+                    product.record,
+                    checkpoint=checkpoint,
+                )
 
             return product
 
@@ -2312,7 +2540,11 @@ class pglAction(pglActionable):
                 self.status = pglActionStatus.RUNNING
 
                 try:
+                    # Capture input bindings before scientific execution.
+                    # No settings/default-database lookup is performed.
+                    inputRecord = pglActionHistory.captureActionInputs(args, kwargs, replayInput=getattr(self, "_pipelineExecutionInput", {}))
                     entry = pglActionHistory(self)
+                    entry.actionInput = inputRecord
                     recorder = pglExecutionRecorder(actionID=entry.actionID)
                     entry.actionEnvironment = recorder.exportEnvironment()
                     self.actionHistory.append(entry)
@@ -4160,7 +4392,8 @@ class pglPipeline(pglAction):
                 if entry.parentActionID is not None or entry.actionStatus != pglActionStatus.SUCCESS:
                     continue
 
-                if entry.actionInput.get("kind") == "checkpoint":
+                replayInput = pglActionHistory.getRecordedReplayInput(entry.actionInput)
+                if replayInput.get("kind") == "checkpoint":
                     candidates.append((index, entry))
 
             if not candidates:
@@ -4174,7 +4407,7 @@ class pglPipeline(pglAction):
                 return pipeline
 
             sourceIndex, sourceEntry = candidates[0]
-            inputRecord = deepcopy(sourceEntry.actionInput)
+            inputRecord = pglActionHistory.getRecordedReplayInput(sourceEntry.actionInput)
             pglDatabase._validatePipelineReplayInput(inputRecord)
             boundary = inputRecord["historyCount"]
 
