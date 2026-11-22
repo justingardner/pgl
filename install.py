@@ -32,12 +32,13 @@ import sys
 
 ROOT = Path(__file__).resolve().parent
 
+# (yaml, env name, native: "required" | "optional" | "never")
 PROFILES = {
-    "analysis": ("pgl.yml", "pgl", False),
-    "mne": ("pgl_mne.yml", "pgl_mne", False),
-    "native": ("pgl_macos.yml", "pgl_macos", True),
+    "analysis": ("pgl.yml", "pgl", "never"),
+    "mne": ("pgl_mne.yml", "pgl_mne", "never"),
+    "mri": ("pgl_mri.yml", "pgl_mri", "optional"),
+    "native": ("pgl_macos.yml", "pgl_macos", "required"),
 }
-
 
 def find_conda():
     # CONDA_EXE can locate Conda even when its executable is not on PATH.
