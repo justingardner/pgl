@@ -14540,44 +14540,145 @@ class pglDatabase:
 
     @classmethod
     def status(cls, postgres=None, *, settings=None, settingsName=None):
-        """Print application connectivity and migration status; return None.
+        """Print database information, connectivity, and migration status.
 
-        Uses default PGL settings unless settings or settingsName is supplied.
-        An explicit postgres object may be supplied instead.
+        Prints databaseName, databasePath, and username before checking status.
+        Uses the configured application connection, including SSH transport.
 
-        Opens the configured application connection, including SSH transport,
-        and reads migration history. Does not install, initialize, start,
-        create, migrate, or change database permissions.
+        Does not install, initialize, start, create, migrate, or change database
+        permissions. Prints repair guidance on failure. Returns None.
 
         Reads the saved application password, or prompts if none is available.
         Never saves or deletes PostgreSQL credentials. A rejected password is
-        attempted once; rerun the check after correcting the credentials.
+        attempted once.
 
         Successful connection confirms PostgreSQL is reachable and accepting
         application connections. Failure does not prove the server is stopped.
 
-        Migration status reflects recorded history and shipped migration files;
-        it does not audit every schema object or application permission.
+        Migration status verifies recorded versions, names, and checksums
+        against shipped files; it does not audit every schema object or grant.
         """
         from .pglPostgres import pglPostgres
 
         if postgres is not None and (settings is not None or settingsName is not None):
             raise ValueError("Supply either postgres or PGL settings, not both.")
 
+        # Repair examples must target the same configuration, not silently
+        # fall back to the user's default database.
+        if postgres is not None:
+            settingsArguments = None
+            retryCall = "pglDatabase.status(postgres=postgres)"
+            migrationCall = "pglDatabase.applyMigrations(postgres=postgres)"
+            initCall = "pglDatabase.initDatabase(postgres=postgres)"
+            postgresSetup = ""
+        else:
+            if settings is not None:
+                settingsArguments = "settings=settings"
+            elif settingsName is not None:
+                settingsArguments = f"settingsName={settingsName!r}"
+            else:
+                settingsArguments = ""
+
+            retryCall = f"pglDatabase.status({settingsArguments})"
+            migrationCall = f"pglDatabase.applyMigrations({settingsArguments})"
+            initCall = f"pglDatabase.initDatabase({settingsArguments})"
+            postgresSetup = f"postgres = pglPostgres.fromSettings({settingsArguments})\n"
+
         if postgres is None:
-            postgres = pglPostgres.fromSettings(settings=settings, settingsName=settingsName)
+            resolvedSettings = cls.getSettings(settings=settings, settingsName=settingsName)
+
+            if resolvedSettings is None:
+                pglMessages.warning(
+                    "Cannot check database: could not resolve PGL settings.\n"
+                    "Fix the selected settings profile, or supply a valid settings/settingsName argument.\n"
+                    f"Then rerun {retryCall}."
+                )
+                return
+
+            pglMessages.message(
+                f"Checking database: databaseName={resolvedSettings.name}, "
+                f"databasePath={resolvedSettings.databasePath}, username={resolvedSettings.username}"
+            )
+
+            try:
+                postgres = pglPostgres.fromSettings(settings=resolvedSettings)
+            except (TypeError, ValueError) as error:
+                pglMessages.warning(
+                    f"Invalid PostgreSQL configuration: {error}\n"
+                    "Correct the configuration at the selected databasePath, then rerun status()."
+                )
+                return
 
             if postgres is None:
-                pglMessages.warning("PostgreSQL configuration unavailable. Connectivity and migrations were not checked.")
+                pglMessages.warning(
+                    "PostgreSQL configuration unavailable. Connectivity and migrations were not checked.\n"
+                    "Check databasePath and configuration-file permissions in the selected settings.\n"
+                    f"For a new locally managed installation, run {initCall} on the installation machine.\n"
+                    "For a remote database, restore access to its existing configuration; do not initialize a replacement locally."
+                )
                 return
+
+        else:
+            if not isinstance(postgres, pglPostgres):
+                raise TypeError("postgres must be a pglPostgres instance.")
+
+            pglMessages.message(
+                f"Checking database: databaseName={postgres.databaseName}, "
+                f"databasePath=(not supplied; explicit postgres), username={postgres.databaseUser}"
+            )
 
         if not isinstance(postgres, pglPostgres):
             raise TypeError("postgres must be a pglPostgres instance.")
 
-        postgres._validateValues()
-        pglMessages.message("✅ PostgreSQL configuration loaded and valid.")
-        pglMessages.message(f"Database: {postgres.databaseName}.{postgres.databaseSchema}")
-        pglMessages.message(f"Endpoint: {postgres.connectionHost}:{postgres.connectionPort} ({postgres.connectionTransport})")
+        try:
+            postgres._validateValues()
+        except (TypeError, ValueError) as error:
+            pglMessages.warning(
+                f"Invalid PostgreSQL configuration: {error}\n"
+                "Correct the indicated configuration value, then rerun status()."
+            )
+            return
+
+        pglMessages.message("✅ PostgreSQL configuration is valid.")
+
+        isLocalManagementTarget = (
+            not getattr(postgres, "_configurationLoadedRemotely", False)
+            and postgres.connectionTransport == "direct"
+            and postgres.connectionHost == postgres.postgresHost
+            and postgres.connectionPort == postgres.postgresPort
+        )
+
+        if isLocalManagementTarget:
+            connectionHelp = (
+                "If the locally managed server is stopped, use the same configuration:\n"
+                f"{postgresSetup}"
+                "postgres.status()  # Inspect the local server process.\n"
+                "postgres.start()   # Start it if stopped.\n"
+                f"Then rerun {retryCall}.\n"
+                "If the server is running, check the configured host/port, credentials, and database name.\n"
+                f"If this installation has not been set up, run {initCall}.\n"
+                "Local server management requires the supported macOS/Homebrew environment."
+            )
+            migrationHelp = f"Run {migrationCall}, then rerun {retryCall}."
+            initializationHelp = f"Run {initCall}, then rerun {retryCall}."
+        else:
+            connectionHelp = (
+                "Check the configured database endpoint, network access, and credentials.\n"
+                "For SSH transport, also check the SSH hostname, username, authentication, and tunnel access.\n"
+                "If PostgreSQL is stopped, run postgres.status() and postgres.start() on the installation machine "
+                "using that machine's locally managed configuration—not this remote client configuration.\n"
+                f"Then rerun {retryCall}."
+            )
+            migrationHelp = (
+                "On the installation machine, load its matching locally managed configuration as postgres, "
+                "then run pglDatabase.applyMigrations(postgres=postgres).\n"
+                f"Then rerun {retryCall} from this client."
+            )
+            initializationHelp = (
+                "On the installation machine, verify the intended installation and load its matching local "
+                "configuration as postgres, then run pglDatabase.initDatabase(postgres=postgres).\n"
+                "Do not initialize a replacement database on this client."
+            )
 
         # Read credentials ourselves so connect() cannot delete a rejected
         # saved password or save a newly entered one during a status check.
@@ -14596,7 +14697,7 @@ class pglDatabase:
                 password = postgres._askPassword(f"PostgreSQL password for {databaseUser}: ")
 
             if not password:
-                pglMessages.message("Database check cancelled. Connectivity and migrations were not checked.")
+                pglMessages.message(f"Database status check cancelled. To try again, run {retryCall}.")
                 return
 
             # Explicit credentials get one attempt, without credential-store
@@ -14605,7 +14706,7 @@ class pglDatabase:
                 password = None
 
                 if connection is None:
-                    pglMessages.message("Database check cancelled. Connectivity and migrations were not checked.")
+                    pglMessages.message(f"Database status check cancelled. To try again, run {retryCall}.")
                     return
 
                 pglMessages.message("✅ PostgreSQL is reachable and accepting connections.")
@@ -14614,7 +14715,11 @@ class pglDatabase:
                 try:
                     migrations = cls._readMigrations()
                 except (OSError, ValueError) as error:
-                    pglMessages.warning(f"Could not read the available migrations. Migration status is unknown.\n{error}")
+                    pglMessages.warning(
+                        f"Could not read the available migrations. Migration status is unknown.\n{error}\n"
+                        "Restore the migration files shipped with this pgl version, or repair the pgl installation.\n"
+                        "Do not edit previously applied migrations or fabricate missing migration files."
+                    )
                     return
 
                 migrationTable = sql.Identifier(postgres.databaseSchema, "schema_migrations")
@@ -14623,10 +14728,30 @@ class pglDatabase:
                 try:
                     history = connection.execute(sql.SQL("SELECT version, name, checksum FROM {} ORDER BY version").format(migrationTable)).fetchall()
                 except psycopg.errors.UndefinedTable:
-                    pglMessages.warning("Migration history table is missing. Schema migration status cannot be verified.")
+                    pglMessages.warning(
+                        "Migration history table is missing. Schema migration status cannot be verified.\n"
+                        "First confirm that this is the intended database and schema.\n"
+                        f"For a new, uninitialized database: {initializationHelp}\n"
+                        "For an existing populated schema, investigate or restore the missing history before applying migrations; "
+                        "do not assume its existing tables are unmigrated."
+                    )
                     return
+                except psycopg.errors.InsufficientPrivilege:
+                    pglMessages.warning(
+                        "The application user cannot read migration history. Migration status is unknown.\n"
+                        "Confirm that the configured application user is correct.\n"
+                        f"To reapply the managed application grants: {migrationHelp}"
+                    )
+                    return
+                except psycopg.OperationalError:
+                    # Connection failures get endpoint/startup guidance below.
+                    raise
                 except psycopg.Error as error:
-                    pglMessages.warning(f"Could not read migration history. Migration status is unknown.\n{error}")
+                    pglMessages.warning(
+                        f"Could not read migration history. Migration status is unknown.\n{error}\n"
+                        "Have the database administrator inspect the migration history table and the reported SQL error.\n"
+                        "Do not delete or rewrite migration history to bypass this check."
+                    )
                     return
 
                 availableVersions = [migration["version"] for migration in migrations]
@@ -14635,7 +14760,12 @@ class pglDatabase:
                 # Match the migration runner's prefix check: reject gaps,
                 # unknown versions, and history ahead of this installation.
                 if appliedVersions != availableVersions[:len(appliedVersions)]:
-                    pglMessages.warning("Database migration history does not match the available migration files. Check that the correct pgl version is installed.")
+                    pglMessages.warning(
+                        "Database migration history does not match the available migration files.\n"
+                        "Confirm the selected database and install the pgl version matching its migration history.\n"
+                        "If history contains gaps or unexpected entries, have the administrator investigate or restore it.\n"
+                        "Do not delete migration records or rerun migration SQL manually."
+                    )
                     return
 
                 appliedByVersion = {version: (name, checksum) for version, name, checksum in history}
@@ -14647,7 +14777,11 @@ class pglDatabase:
                         expected = (migration["name"], migration["checksum"])
 
                         if appliedByVersion[version] != expected:
-                            pglMessages.warning(f"Previously applied migration has changed: {migration['name']}. Restore the original file and put changes in a new migration.")
+                            pglMessages.warning(
+                                f"Previously applied migration has changed: {migration['name']}.\n"
+                                "Restore the original migration file from the matching pgl release or repository revision.\n"
+                                "Put intended schema changes in a new migration; do not change the recorded checksum."
+                            )
                             return
 
                 pendingMigrations = [migration["name"] for migration in migrations if migration["version"] not in appliedByVersion]
@@ -14656,18 +14790,347 @@ class pglDatabase:
                     pendingText = "\n".join(f"    {migrationName}" for migrationName in pendingMigrations)
                     pglMessages.warning(
                         f"Schema is not up to date: {len(pendingMigrations)} pending migration(s).\n"
-                        f"{pendingText}\n"
-                        "Run pglDatabase.applyMigrations(...) on the installation machine with the matching local configuration."
+                        f"{pendingText}\n{migrationHelp}"
                     )
                 else:
                     pglMessages.message(f"✅ Schema is up to date: {len(history)} migration(s) verified.")
 
         except psycopg.OperationalError as error:
-            pglMessages.warning(f"Could not complete the database connection check. Migration status is unknown; this does not necessarily mean PostgreSQL is stopped.\n{error}")
+            passwordRejected = error.sqlstate == "28P01" or "password authentication failed" in str(error).lower()
+
+            if passwordRejected:
+                pglMessages.warning(
+                    f"PostgreSQL rejected the application password for {postgres.databaseUser!r}.\n{error}\n"
+                    "Correct the application password in the OS credential store, or have the administrator reset "
+                    "the application role password and update your saved credential to match.\n"
+                    f"Then rerun {retryCall}. This status check did not change stored credentials."
+                )
+            else:
+                pglMessages.warning(
+                    f"Could not complete the database connection check. Migration status is unknown.\n{error}\n"
+                    "A failed connection does not necessarily mean PostgreSQL is stopped.\n"
+                    f"{connectionHelp}"
+                )
+
         except RuntimeError as error:
-            # connect() validates database identity and schema access before
-            # yielding. Such a failure does not establish that the server is down.
-            pglMessages.warning(f"Database connection validation failed. Migration status is unknown.\n{error}")
+            # connect() checks database identity and schema access before yielding.
+            pglMessages.warning(
+                f"Database connection validation failed. Migration status is unknown.\n{error}\n"
+                "Verify that the configured endpoint, database, schema, and application user identify the intended installation.\n"
+                f"For an installation that has not been initialized: {initializationHelp}\n"
+                f"If its schema exists but application access needs repair: {migrationHelp}"
+            )
+
+        finally:
+            # Drop this local reference; Python does not guarantee secure erasure.
+            password = None
+            
+    @classmethod
+    def status(cls, postgres=None, *, settings=None, settingsName=None):
+        """Print database information, connectivity, and migration status.
+
+        Prints a header and aligned databaseName, databasePath, and username
+        fields before checking status. Uses the configured application
+        connection, including SSH transport.
+
+        Does not install, initialize, start, create, migrate, or change database
+        permissions. Prints repair guidance on failure. Returns None.
+
+        Reads the saved application password, or prompts if none is available.
+        Never saves or deletes PostgreSQL credentials. A rejected password is
+        attempted once.
+
+        Successful connection confirms PostgreSQL is reachable and accepting
+        application connections. Failure does not prove the server is stopped.
+
+        Migration status verifies recorded versions, names, and checksums
+        against shipped files; it does not audit every schema object or grant.
+        """
+        from .pglPostgres import pglPostgres
+
+        def printStatusHeader(databaseName, databasePath, username):
+            """Print the header and aligned configuration fields."""
+            pglMessages.printHeader("Database status")
+
+            fields = (
+                ("databaseName", databaseName),
+                ("databasePath", databasePath),
+                ("username", username),
+            )
+            fieldWidth = max(len(name) for name, _ in fields)
+
+            for name, value in fields:
+                pglMessages.print(f"{name:<{fieldWidth}} = {value}")
+
+            pglMessages.print("")
+
+        if postgres is not None and (settings is not None or settingsName is not None):
+            raise ValueError("Supply either postgres or PGL settings, not both.")
+
+        # Repair examples must target the same configuration, not silently
+        # fall back to the user's default database.
+        if postgres is not None:
+            retryCall = "pglDatabase.status(postgres=postgres)"
+            migrationCall = "pglDatabase.applyMigrations(postgres=postgres)"
+            initCall = "pglDatabase.initDatabase(postgres=postgres)"
+            postgresSetup = ""
+        else:
+            if settings is not None:
+                settingsArguments = "settings=settings"
+            elif settingsName is not None:
+                settingsArguments = f"settingsName={settingsName!r}"
+            else:
+                settingsArguments = ""
+
+            retryCall = f"pglDatabase.status({settingsArguments})"
+            migrationCall = f"pglDatabase.applyMigrations({settingsArguments})"
+            initCall = f"pglDatabase.initDatabase({settingsArguments})"
+            postgresSetup = f"postgres = pglPostgres.fromSettings({settingsArguments})\n"
+
+        if postgres is None:
+            resolvedSettings = cls.getSettings(settings=settings, settingsName=settingsName)
+
+            if resolvedSettings is None:
+                printStatusHeader(
+                    databaseName=settingsName if settingsName is not None else "(unresolved)",
+                    databasePath="(unresolved)",
+                    username="(unresolved)",
+                )
+                pglMessages.warning(
+                    "Cannot check database: could not resolve PGL settings.\n"
+                    "Fix the selected settings profile, or supply a valid settings/settingsName argument.\n"
+                    f"Then rerun {retryCall}."
+                )
+                return
+
+            printStatusHeader(
+                databaseName=resolvedSettings.name,
+                databasePath=resolvedSettings.databasePath,
+                username=resolvedSettings.username,
+            )
+
+            try:
+                postgres = pglPostgres.fromSettings(settings=resolvedSettings)
+            except (TypeError, ValueError) as error:
+                pglMessages.warning(
+                    f"Invalid PostgreSQL configuration: {error}\n"
+                    "Correct the configuration at the selected databasePath, then rerun status()."
+                )
+                return
+
+            if postgres is None:
+                pglMessages.warning(
+                    "PostgreSQL configuration unavailable. Connectivity and migrations were not checked.\n"
+                    "Check databasePath and configuration-file permissions in the selected settings.\n"
+                    f"For a new locally managed installation, run {initCall} on the installation machine.\n"
+                    "For a remote database, restore access to its existing configuration; do not initialize a replacement locally."
+                )
+                return
+
+        else:
+            if not isinstance(postgres, pglPostgres):
+                raise TypeError("postgres must be a pglPostgres instance.")
+
+            printStatusHeader(
+                databaseName=postgres.databaseName,
+                databasePath="(not supplied; explicit postgres)",
+                username=postgres.databaseUser,
+            )
+
+        if not isinstance(postgres, pglPostgres):
+            raise TypeError("postgres must be a pglPostgres instance.")
+
+        try:
+            postgres._validateValues()
+        except (TypeError, ValueError) as error:
+            pglMessages.warning(
+                f"Invalid PostgreSQL configuration: {error}\n"
+                "Correct the indicated configuration value, then rerun status()."
+            )
+            return
+
+        pglMessages.print("✅ PostgreSQL configuration is valid.")
+
+        isLocalManagementTarget = (
+            not getattr(postgres, "_configurationLoadedRemotely", False)
+            and postgres.connectionTransport == "direct"
+            and postgres.connectionHost == postgres.postgresHost
+            and postgres.connectionPort == postgres.postgresPort
+        )
+
+        if isLocalManagementTarget:
+            connectionHelp = (
+                "If the locally managed server is stopped, use the same configuration:\n"
+                f"{postgresSetup}"
+                "postgres.status()  # Inspect the local server process.\n"
+                "postgres.start()   # Start it if stopped.\n"
+                f"Then rerun {retryCall}.\n"
+                "If the server is running, check the configured host/port, credentials, and database name.\n"
+                f"If this installation has not been set up, run {initCall}.\n"
+                "Local server management requires the supported macOS/Homebrew environment."
+            )
+            migrationHelp = f"Run {migrationCall}, then rerun {retryCall}."
+            initializationHelp = f"Run {initCall}, then rerun {retryCall}."
+        else:
+            connectionHelp = (
+                "Check the configured database endpoint, network access, and credentials.\n"
+                "For SSH transport, also check the SSH hostname, username, authentication, and tunnel access.\n"
+                "If PostgreSQL is stopped, run postgres.status() and postgres.start() on the installation machine "
+                "using that machine's locally managed configuration—not this remote client configuration.\n"
+                f"Then rerun {retryCall}."
+            )
+            migrationHelp = (
+                "On the installation machine, load its matching locally managed configuration as postgres, "
+                "then run pglDatabase.applyMigrations(postgres=postgres).\n"
+                f"Then rerun {retryCall} from this client."
+            )
+            initializationHelp = (
+                "On the installation machine, verify the intended installation and load its matching local "
+                "configuration as postgres, then run pglDatabase.initDatabase(postgres=postgres).\n"
+                "Do not initialize a replacement database on this client."
+            )
+
+        # Read credentials ourselves so connect() cannot delete a rejected
+        # saved password or save a newly entered one during a status check.
+        password = None
+
+        try:
+            service, databaseUser = postgres._passwordStoreIdentity(user=postgres.databaseUser)
+
+            try:
+                store = postgres._passwordStore()
+                password = store.get_password(service, databaseUser)
+            except Exception as error:
+                pglMessages.warning(f"Could not read the saved PostgreSQL password ({type(error).__name__}). Please enter it instead.", level=1)
+
+            if not password:
+                password = postgres._askPassword(f"PostgreSQL password for {databaseUser}: ")
+
+            if not password:
+                pglMessages.message(f"Database status check cancelled. To try again, run {retryCall}.")
+                return
+
+            # Explicit credentials get one attempt, without credential-store
+            # writes, deletion, or PostgreSQL authentication retries.
+            with postgres.connect(password=password, rememberPassword=False, useSavedPassword=False) as connection:
+                password = None
+
+                if connection is None:
+                    pglMessages.message(f"Database status check cancelled. To try again, run {retryCall}.")
+                    return
+
+                pglMessages.print("✅ PostgreSQL is reachable and accepting connections.")
+                pglMessages.print("✅ Application database and configured schema are accessible.")
+
+                try:
+                    migrations = cls._readMigrations()
+                except (OSError, ValueError) as error:
+                    pglMessages.warning(
+                        f"Could not read the available migrations. Migration status is unknown.\n{error}\n"
+                        "Restore the migration files shipped with this pgl version, or repair the pgl installation.\n"
+                        "Do not edit previously applied migrations or fabricate missing migration files."
+                    )
+                    return
+
+                migrationTable = sql.Identifier(postgres.databaseSchema, "schema_migrations")
+
+                # Read only: never prepare a missing schema/history table.
+                try:
+                    history = connection.execute(sql.SQL("SELECT version, name, checksum FROM {} ORDER BY version").format(migrationTable)).fetchall()
+                except psycopg.errors.UndefinedTable:
+                    pglMessages.warning(
+                        "Migration history table is missing. Schema migration status cannot be verified.\n"
+                        "First confirm that this is the intended database and schema.\n"
+                        f"For a new, uninitialized database: {initializationHelp}\n"
+                        "For an existing populated schema, investigate or restore the missing history before applying migrations; "
+                        "do not assume its existing tables are unmigrated."
+                    )
+                    return
+                except psycopg.errors.InsufficientPrivilege:
+                    pglMessages.warning(
+                        "The application user cannot read migration history. Migration status is unknown.\n"
+                        "Confirm that the configured application user is correct.\n"
+                        f"To reapply the managed application grants: {migrationHelp}"
+                    )
+                    return
+                except psycopg.OperationalError:
+                    # Connection failures get endpoint/startup guidance below.
+                    raise
+                except psycopg.Error as error:
+                    pglMessages.warning(
+                        f"Could not read migration history. Migration status is unknown.\n{error}\n"
+                        "Have the database administrator inspect the migration history table and the reported SQL error.\n"
+                        "Do not delete or rewrite migration history to bypass this check."
+                    )
+                    return
+
+                availableVersions = [migration["version"] for migration in migrations]
+                appliedVersions = [row[0] for row in history]
+
+                # Match the migration runner's prefix check: reject gaps,
+                # unknown versions, and history ahead of this installation.
+                if appliedVersions != availableVersions[:len(appliedVersions)]:
+                    pglMessages.warning(
+                        "Database migration history does not match the available migration files.\n"
+                        "Confirm the selected database and install the pgl version matching its migration history.\n"
+                        "If history contains gaps or unexpected entries, have the administrator investigate or restore it.\n"
+                        "Do not delete migration records or rerun migration SQL manually."
+                    )
+                    return
+
+                appliedByVersion = {version: (name, checksum) for version, name, checksum in history}
+
+                for migration in migrations:
+                    version = migration["version"]
+
+                    if version in appliedByVersion:
+                        expected = (migration["name"], migration["checksum"])
+
+                        if appliedByVersion[version] != expected:
+                            pglMessages.warning(
+                                f"Previously applied migration has changed: {migration['name']}.\n"
+                                "Restore the original migration file from the matching pgl release or repository revision.\n"
+                                "Put intended schema changes in a new migration; do not change the recorded checksum."
+                            )
+                            return
+
+                pendingMigrations = [migration["name"] for migration in migrations if migration["version"] not in appliedByVersion]
+
+                if pendingMigrations:
+                    pendingText = "\n".join(f"    {migrationName}" for migrationName in pendingMigrations)
+                    pglMessages.warning(
+                        f"Schema is not up to date: {len(pendingMigrations)} pending migration(s).\n"
+                        f"{pendingText}\n{migrationHelp}"
+                    )
+                else:
+                    pglMessages.print(f"✅ Schema is up to date: {len(history)} migration(s) verified.")
+
+        except psycopg.OperationalError as error:
+            passwordRejected = error.sqlstate == "28P01" or "password authentication failed" in str(error).lower()
+
+            if passwordRejected:
+                pglMessages.warning(
+                    f"PostgreSQL rejected the application password for {postgres.databaseUser!r}.\n{error}\n"
+                    "Correct the application password in the OS credential store, or have the administrator reset "
+                    "the application role password and update your saved credential to match.\n"
+                    f"Then rerun {retryCall}. This status check did not change stored credentials."
+                )
+            else:
+                pglMessages.warning(
+                    f"Could not complete the database connection check. Migration status is unknown.\n{error}\n"
+                    "A failed connection does not necessarily mean PostgreSQL is stopped.\n"
+                    f"{connectionHelp}"
+                )
+
+        except RuntimeError as error:
+            # connect() checks database identity and schema access before yielding.
+            pglMessages.warning(
+                f"Database connection validation failed. Migration status is unknown.\n{error}\n"
+                "Verify that the configured endpoint, database, schema, and application user identify the intended installation.\n"
+                f"For an installation that has not been initialized: {initializationHelp}\n"
+                f"If its schema exists but application access needs repair: {migrationHelp}"
+            )
+
         finally:
             # Drop this local reference; Python does not guarantee secure erasure.
             password = None
