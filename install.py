@@ -1,5 +1,26 @@
 #!/usr/bin/env python3
-"""Create or update a Conda environment and install PGL."""
+"""
+Install PGL (requires Conda / Miniforge).
+
+Run from the PGL repository folder:
+
+    python install.py all        # Install all environments; skip native on non-Macs.
+    python install.py analysis   # General analysis: pgl
+    python install.py mne        # Analysis with MNE: pgl_mne
+    python install.py native     # macOS graphics/acquisition: pgl_macos
+
+Already installed? Add --update:
+    python install.py all --update
+
+On macOS, native builds require Apple's compiler tools:
+    xcode-select --install
+
+After installation, activate the environment you want:
+    conda activate pgl           # Or pgl_mne / pgl_macos
+
+No activation is needed before installation. Use python3 if needed.
+PGL is installed in editable mode; keep this repository folder in place.
+"""
 
 import argparse
 import os
@@ -66,68 +87,79 @@ def run(command, env=None):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
         "profile",
-        choices=sorted(PROFILES),
-        help="analysis, analysis with MNE, or native macOS acquisition",
+        choices=("all",) + tuple(PROFILES),
+        help="Install all environments or choose one profile.",
     )
     parser.add_argument(
         "--update",
         action="store_true",
-        help="Update an existing environment instead of creating a new one.",
+        help="Update existing environments instead of creating new ones.",
     )
     args = parser.parse_args()
 
-    yaml_name, environment_name, build_native = PROFILES[args.profile]
-    yaml_path = ROOT / yaml_name
-
-    if not yaml_path.is_file():
-        raise RuntimeError("Environment file not found: {}".format(yaml_path))
-
     conda = find_conda()
+    profiles = list(PROFILES) if args.profile == "all" else [args.profile]
+    selectedProfiles = []
 
-    if build_native:
+    for profile in profiles:
+        yamlName, environmentName, buildNative = PROFILES[profile]
+
+        # Skip native profiles only when installing all on Windows/Linux.
+        # An explicit native request still reports the platform requirement.
+        if args.profile == "all" and buildNative and sys.platform != "darwin":
+            print(f"Skipping {environmentName}: requires macOS.", flush=True)
+            continue
+
+        yamlPath = ROOT / yamlName
+        if not yamlPath.is_file():
+            raise RuntimeError(f"Environment file not found: {yamlPath}")
+
+        selectedProfiles.append((yamlPath, environmentName, buildNative))
+
+    # Check prerequisites before creating or updating any environments.
+    if any(buildNative for _, _, buildNative in selectedProfiles):
         check_native_requirements()
 
-    run([
-        conda,
-        "env",
-        "update" if args.update else "create",
-        "--name",
-        environment_name,
-        "--file",
-        str(yaml_path),
-    ])
+    for yamlPath, environmentName, buildNative in selectedProfiles:
+        print(f"\nInstalling PGL in: {environmentName}", flush=True)
 
-    # Apply the build option only to the installation subprocess.
-    # This overrides any inherited value without changing the user's shell.
-    build_env = os.environ.copy()
-    build_env["PGL_BUILD_NATIVE"] = "1" if build_native else "0"
+        run([
+            conda,
+            "env",
+            "update" if args.update else "create",
+            "--name",
+            environmentName,
+            "--file",
+            str(yamlPath),
+        ])
 
-    run([
-        conda,
-        "run",
-        "--no-capture-output",
-        "--name",
-        environment_name,
-        "python",
-        "-m",
-        "pip",
-        "install",
-        "--no-deps",
-        "--no-build-isolation",
-        "-e",
-        str(ROOT),
-    ], env=build_env)
+        # Apply the build option only to the installation subprocess.
+        # This overrides any inherited value without changing the user's shell.
+        buildEnv = os.environ.copy()
+        buildEnv["PGL_BUILD_NATIVE"] = "1" if buildNative else "0"
 
-    print("\nPGL installed in Conda environment: {}".format(environment_name))
-    print(
-        "Run Python with: conda run --no-capture-output -n {} python".format(
-            environment_name
-        )
-    )
+        run([
+            conda,
+            "run",
+            "--no-capture-output",
+            "--name",
+            environmentName,
+            "python",
+            "-m",
+            "pip",
+            "install",
+            "--no-deps",
+            "--no-build-isolation",
+            "-e",
+            str(ROOT),
+        ], env=buildEnv)
 
+    print("\nInstallation complete. Activate an environment with:")
+    for _, environmentName, _ in selectedProfiles:
+        print(f"    conda activate {environmentName}")
 
 if __name__ == "__main__":
     try:
