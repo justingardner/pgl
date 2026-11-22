@@ -15,6 +15,7 @@ BASE = [
     "scipy",
     "xarray",
     "pyarrow",
+    "h5py",
     "fsspec",
     "paramiko",
     "psycopg>=3,<4",
@@ -50,13 +51,46 @@ MACOS = [
     "psutil",
     "pyserial",
     "pynput",
-    "h5py",
 ]
 
 # Install via pip after Conda packages. PyObjC provides the Apple
 # framework bindings used by graphics settings.
 MACOS_PIP = [
     "pyobjc; sys_platform == 'darwin'",
+]
+
+# MRI analysis, array storage, and remote filesystem access.
+# h5py is supplied by MACOS in the combined MRI environment below.
+MRI = [
+    "nibabel",
+    "scikit-learn",
+    "numba",
+    "dask",
+    "zarr>=2.18,<3",
+    "numcodecs<0.16",
+    "sshfs",
+]
+
+# Preserve the additional interfaces and integrations in the current
+# MRI environment until a code audit establishes which are optional.
+MRI_INTEGRATIONS = [
+    "gspread",
+    "google-auth-oauthlib",
+    "oauth2client",
+    "gradio",
+    "pysimplegui=4.60.5",
+    "requests",
+    "pyyaml",
+]
+
+# Preserve pip-installed MRI services and hardware bindings.
+# GLMsingle is installed separately from its source checkout.
+# labjack-ljm also requires the system LJM driver for hardware access.
+MRI_PIP = [
+    "flywheel-sdk",
+    "fracridge",
+    "labjack-ljm",
+    "pypng",
 ]
 
 ENVIRONMENTS = {
@@ -67,6 +101,11 @@ ENVIRONMENTS = {
     "pgl_mne": {
         "conda": BASE + TOOLS + MNE,
         "pip": BASE_PIP,
+    },
+    "pgl_mri": {
+        # Preserve MRI analysis plus the current graphics/hardware dependencies.
+        "conda": BASE + TOOLS + MACOS + MRI + MRI_INTEGRATIONS,
+        "pip": BASE_PIP + MACOS_PIP + MRI_PIP,
     },
     "pgl_macos": {
         "conda": BASE + TOOLS + MACOS,
