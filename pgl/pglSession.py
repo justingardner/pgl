@@ -3908,7 +3908,7 @@ class pglSession(pglActionable):
             current._bindSession(self)
             
     def export(
-        self, *, databaseName,
+        self, databaseName, *, 
         sourceStorageOptionsByBackend=None, destinationStorageOptions=None,
         sourceSSLRootCert=None, destinationSSLRootCert=None,
         lockTimeoutSeconds=30.0, ioTimeoutSeconds=60, connectTimeoutSeconds=10,
