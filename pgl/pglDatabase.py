@@ -724,7 +724,8 @@ class pglDatabase:
 
         cacheDirectory overrides settings.cacheDir for MNE or v3 checkpoints.
         includeDeleted permits inspection without restoring lifecycle state.
-        Does not publish or modify database records.
+        Requires current migration history and a persistent schema identity.
+        Does not apply migrations, publish, or modify database records.
 
         The final printed overview resolves behavioral settings/data for
         labels and acquisition timestamps through session.info().
@@ -747,14 +748,26 @@ class pglDatabase:
         checkpoint = None
 
         def closeFailedLoad():
-            """Release privately loaded resources without opening lazy fields."""
+            """Release privately loaded session/MRI resources without opening arrays."""
             if session is None: return
 
-            for matrix in session.dataMatrices.values():
-                try:
-                    matrix.close()
-                except Exception:
-                    pass
+            # Both collections contain already-attached matrix wrappers. Accessing
+            # these dictionaries does not resolve matrix.data or MRI scan payloads.
+            collections = [session.dataMatrices]
+            mri = getattr(session, "mri", None)
+            if mri is not None: collections.append(mri.dataMatrices)
+
+            # Shared wrappers should be closed once. One close failure must not
+            # prevent the remaining matrices or checkpoint filesystem from closing.
+            closedMatrices = set()
+            for matrices in collections:
+                for matrix in matrices.values():
+                    if id(matrix) in closedMatrices: continue
+                    closedMatrices.add(id(matrix))
+                    try:
+                        matrix.close()
+                    except Exception:
+                        pass
 
             # Derived-file backings borrow this filesystem too. Do not
             # materialize those files or resolve MNE fields during cleanup.
@@ -787,6 +800,7 @@ class pglDatabase:
 
                 with connection.transaction():
                     connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+                    databaseID = cls._requireStableDatabaseIdentity(connection, postgres)
 
                     table = sql.Identifier(postgres.databaseSchema, "session")
                     statement = sql.SQL("SELECT origin, contract_version, description, checkpoint_name FROM {} WHERE session_id = %s AND (%s OR deleted_at IS NULL)").format(table)
@@ -848,6 +862,8 @@ class pglDatabase:
                         # Validate it before constructing retained payload readers.
                         publicationInfo = cls._getCheckpointPublicationInfo(connection, postgres, sessionID)
                         session = loader(connection, postgres, sessionID, **loadOptions)
+                        pendingBinding = cls._prepareCheckpointBinding(sessionID, postgres, databaseID=databaseID, databaseName=resolvedSettings.name)
+                        pendingPostgres = postgres.withTimeouts()
 
             # SQL and its tunnel have closed. The returned session retains
             # independently owned contexts for deferred payload reads.
@@ -864,6 +880,8 @@ class pglDatabase:
                 setattr(session, name, value)
 
             cls._bindCheckpointBaseline(session, sessionID, postgres)
+            session._checkpointBinding = pendingBinding
+            session._checkpointPostgres = pendingPostgres
 
             # Keep overview failures inside the cleanup boundary too.
             session.print(headerOnly=True)
@@ -902,6 +920,7 @@ class pglDatabase:
         Expected operational failures warn and return None.
         Integrity/programming errors and KeyboardInterrupt propagate.
         Payload writes are not transactional.
+        Requires current migrations; never applies migrations automatically.
         """
         from time import perf_counter
 
@@ -928,6 +947,8 @@ class pglDatabase:
 
         cls._getCheckpointHistoryBoundary(session)
         originalBaseline = deepcopy(session._checkpointBaseline)
+        originalReference = cls._getBoundCheckpointReference(session)
+        originalBinding = deepcopy(session._checkpointBinding)
         originalSessionID = session.sessionID
         resolvedParentID = originalSessionID if parentSessionID is None else parentSessionID
 
@@ -991,6 +1012,9 @@ class pglDatabase:
                 if originalBaseline and originalBaseline["databaseIdentity"] != cls._checkpointDatabaseIdentity(postgres):
                     raise ValueError("The selected database differs from this session's checkpoint baseline.")
 
+                if originalBinding and originalBinding["databaseIdentity"] != cls._checkpointDatabaseIdentity(postgres):
+                    raise ValueError("The selected database differs from this session's saved-checkpoint endpoint.")
+
                 if backendID is None and not postgres.storageLocations:
                     pglMessages.warning("Cannot save session: no storageLocations are configured.", level=0)
                     return None
@@ -1005,6 +1029,9 @@ class pglDatabase:
 
                     with connection.transaction():
                         connection.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                        databaseID = cls._requireStableDatabaseIdentity(connection, postgres)
+                        if originalReference is not None and originalReference["databaseID"] != databaseID:
+                            raise ValueError("The database UUID differs from this session's saved-checkpoint identity.")
 
                         # Acquire before backend registration, user creation,
                         # matrix publication, or checkpoint row locks.
@@ -1042,7 +1069,12 @@ class pglDatabase:
                         if session.checkpointName != originalCheckpointName or session.description != originalDescription:
                             raise ValueError("Working checkpoint annotations changed while saving.")
 
+                        if session._checkpointBinding != originalBinding:
+                            raise ValueError("Working saved-checkpoint binding changed while saving.")
+
                         pendingBaseline = cls._prepareCheckpointBaseline(session, sessionID, postgres)
+                        pendingBinding = cls._prepareCheckpointBinding(sessionID, postgres, databaseID=databaseID, databaseName=resolvedSettings.name)
+                        pendingPostgres = postgres.withTimeouts()
 
                         progress(0.98, "Committing checkpoint transaction")
                         commitAttempted = True
@@ -1056,6 +1088,8 @@ class pglDatabase:
                 session.checkpointName = resolvedCheckpointName
                 session.description = resolvedDescription
                 session._checkpointBaseline = pendingBaseline
+                session._checkpointBinding = pendingBinding
+                session._checkpointPostgres = pendingPostgres
 
                 progress.finish(f"Checkpoint {sessionID} saved")
 
@@ -1110,6 +1144,10 @@ class pglDatabase:
         SQL changes are transactional; payload writes are not.
         Failure during commit can leave its outcome uncertain to this client.
         No automatic retry, connection termination, or payload deletion occurs.
+
+        Requires current migrations; never applies them automatically.
+        Binds sessionID and saved source identity after connection cleanup,
+        without establishing or replacing a working-history baseline.
         """
         from time import perf_counter
 
@@ -1139,6 +1177,11 @@ class pglDatabase:
                 )
                 return None
         
+        originalReference = cls._getBoundCheckpointReference(session)
+        originalBinding = deepcopy(session._checkpointBinding)
+        originalSessionID = session.sessionID
+        originalBaseline = deepcopy(session._checkpointBaseline)
+
         sessionID = None
         commitAttempted = False
         commitConfirmed = False
@@ -1251,6 +1294,9 @@ class pglDatabase:
                     progress(None, "Database identity mismatch")
                     return None
 
+                if originalBinding and originalBinding["databaseIdentity"] != cls._checkpointDatabaseIdentity(postgres):
+                    raise ValueError("The selected database differs from this session's saved-checkpoint endpoint.")
+
                 if backendID is None and not postgres.storageLocations:
                     pglMessages.warning("Cannot save raw session: no storageLocations are configured in the PostgreSQL configuration.", level=0)
                     progress(None, "No storage destination configured")
@@ -1265,6 +1311,10 @@ class pglDatabase:
                         return None
 
                     with connection.transaction():
+                        databaseID = cls._requireStableDatabaseIdentity(connection, postgres)
+                        if originalReference is not None and originalReference["databaseID"] != databaseID:
+                            raise ValueError("The database UUID differs from this session's saved-checkpoint identity.")
+
                         if backendID is None:
                             operation = "resolving storage destination and acquiring its registration lock"
                             progress(0.03, "Resolving storage destination / acquiring registration lock")
@@ -1278,6 +1328,13 @@ class pglDatabase:
                         progress(0.05, "Preparing raw checkpoint")
                         sessionID = cls._saveRawSession(connection, postgres, session, createdBy, backendID, storageOptions=storageOptions, progress=progress)
 
+                        # Prepare binding before commit; installation on the
+                        # working object waits for connection cleanup below.
+                        if session.sessionID != originalSessionID or session._checkpointBinding != originalBinding or session._checkpointBaseline != originalBaseline:
+                            raise ValueError("Working checkpoint bookkeeping changed while saving raw acquisition contents.")
+                        pendingBinding = cls._prepareCheckpointBinding(sessionID, postgres, databaseID=databaseID, databaseName=resolvedSettings.name)
+                        pendingPostgres = postgres.withTimeouts()
+
                         operation = "committing the checkpoint transaction"
                         progress(0.98, "Committing transaction")
                         commitAttempted = True
@@ -1285,6 +1342,12 @@ class pglDatabase:
                     commitConfirmed = True
                     operation = "closing the PostgreSQL connection and tunnel"
                     progress(0.99, "Closing PostgreSQL connection and tunnel")
+
+                # Raw publication identifies an acquisition checkpoint,
+                # not a new history boundary for the current working state.
+                session.sessionID = sessionID
+                session._checkpointBinding = pendingBinding
+                session._checkpointPostgres = pendingPostgres
 
                 progress.finish(f"Raw checkpoint {sessionID} saved")
 
@@ -14114,6 +14177,277 @@ class pglDatabase:
         pglMessages.message(f"Scientific schema ready: {postgres.databaseName}.{postgres.databaseSchema}")
         return True
 
+    @staticmethod
+    def _compareMigrationHistory(migrations, history):
+        """Compare repository migrations with applied history without I/O.
+
+        Returns a report containing every detected compatibility problem.
+        An exact complete match is required for compatibility.
+
+        Local migration metadata must itself be valid and consecutive.
+        Database history problems are reported rather than repaired.
+
+        Neither input is modified. SQL text is excluded from the report.
+        """
+        if not isinstance(migrations, (list, tuple)) or not migrations:
+            raise ValueError("A nonempty repository migration inventory is required.")
+        if not isinstance(history, (list, tuple)):
+            raise TypeError("Migration history must be a list or tuple.")
+
+        available = []
+
+        for position, migration in enumerate(migrations, start=1):
+            if not isinstance(migration, dict):
+                raise ValueError("Repository migration records must be dictionaries.")
+
+            version = migration.get("version")
+            name = migration.get("name")
+            checksum = migration.get("checksum")
+
+            if type(version) is not int or version != position:
+                raise ValueError("Repository migrations must be consecutive from version 1.")
+            if not isinstance(name, str) or re.fullmatch(rf"{version:04d}_[a-z0-9_]+", name) is None:
+                raise ValueError("Repository migration name disagrees with its version.")
+            if not isinstance(checksum, str) or re.fullmatch(r"[0-9a-f]{64}", checksum) is None:
+                raise ValueError("Repository migration checksum is invalid.")
+
+            available.append({"version": version, "name": name, "checksum": checksum})
+
+        applied = []
+        issues = []
+
+        def addIssue(code, message):
+            issues.append({"code": code, "message": message})
+
+        for row in history:
+            if not isinstance(row, (list, tuple)) or len(row) != 3:
+                addIssue("invalidHistory", "Migration history contains a malformed row.")
+                continue
+
+            version, name, checksum = row
+
+            if (
+                type(version) is not int or version < 1
+                or not isinstance(name, str) or not name
+                or not isinstance(checksum, str)
+                or re.fullmatch(r"[0-9a-f]{64}", checksum) is None
+            ):
+                addIssue("invalidHistory", "Migration history contains invalid version/name/checksum values.")
+                continue
+
+            applied.append({"version": version, "name": name, "checksum": checksum})
+
+        versions = [record["version"] for record in applied]
+        consecutive = versions == list(range(1, len(applied) + 1))
+
+        if not consecutive:
+            addIssue(
+                "nonconsecutiveHistory",
+                "Database migration history is not consecutive from version 1. "
+                "Review and repair migration history administratively; do not infer missing applications.",
+            )
+
+        availableByVersion = {record["version"]: record for record in available}
+
+        for record in applied:
+            expected = availableByVersion.get(record["version"])
+
+            if expected is None:
+                addIssue(
+                    "databaseNewer",
+                    f"Database migration {record['version']} is unknown to this checkout. "
+                    "Update the client checkout to the database's migration set before proceeding.",
+                )
+                continue
+
+            if record["name"] != expected["name"] or record["checksum"] != expected["checksum"]:
+                addIssue(
+                    "migrationMismatch",
+                    f"Applied migration {record['version']} has a different name or checksum. "
+                    "Restore the original applied migration file and introduce changes in a new migration. "
+                    "Do not rewrite applied checksums to conceal the mismatch.",
+                )
+
+        # Call migrations 'pending' only when the applied inventory is a
+        # verified prefix. Corrupt or newer history is not merely pending.
+        pending = []
+        if not issues and len(applied) < len(available):
+            pending = [dict(record) for record in available[len(applied):]]
+            addIssue(
+                "pendingMigrations",
+                "Required migrations are pending: "
+                + ", ".join(record["name"] for record in pending)
+                + ". Update PGL on the installation machine and run initialization there "
+                "using that machine's local server settings. Do not blindly administer "
+                "a remote destination from the exporting client.",
+            )
+
+        return {
+            "compatible": not issues,
+            "available": available,
+            "applied": applied,
+            "pending": pending,
+            "issues": issues,
+        }
+
+    @staticmethod
+    def _requireMigrationInspectionTransaction(connection):
+        """Require a caller-owned transaction without changing its settings.
+
+        Read-only inspection callers should use REPEATABLE READ, READ ONLY.
+        Publication callers may revalidate inside their write transaction.
+
+        This check performs no SQL and does not start or finish a transaction.
+        """
+        from psycopg.pq import TransactionStatus
+
+        if connection.info.transaction_status != TransactionStatus.INTRANS:
+            raise ValueError("Migration/identity inspection requires an active caller-owned transaction.")
+
+    @classmethod
+    def _inspectMigrationCompatibility(cls, connection, postgres, *, migrations=None):
+        """Inspect configured schema and migration history using reads only.
+
+        The caller owns the connection, snapshot, and transaction.
+        No initialization, migration application, grants, or settings writes.
+
+        Returns a compatibility report for accessible metadata.
+        Missing schema/history and denied schema usage are explicit blockers.
+
+        SQL permission, connection, and malformed-table errors propagate with
+        their original categories. They must not be translated into 'pending
+        migrations'. A SQL failure may abort the caller's transaction.
+
+        A report is a snapshot, not authorization for later publication.
+        Revalidate after approval under the eventual publication protocol.
+        """
+        from psycopg.rows import tuple_row
+
+        cls._requireMigrationInspectionTransaction(connection)
+        migrations = cls._readMigrations() if migrations is None else migrations
+
+        # Validate the local inventory even when the configured schema is absent.
+        report = cls._compareMigrationHistory(migrations, [])
+        report.update({
+            "schema": postgres.databaseSchema,
+            "schemaExists": False,
+            "historyExists": False,
+        })
+
+        def blocked(code, message):
+            # No applied history was read; do not label it an empty database
+            # with pending migrations.
+            report.update({
+                "compatible": False,
+                "applied": None,
+                "pending": [],
+                "issues": [{"code": code, "message": message}],
+            })
+            return report
+
+        with connection.cursor(row_factory=tuple_row) as cursor:
+            cursor.execute("""
+                SELECT namespace.oid,
+                       pg_catalog.has_schema_privilege(namespace.oid, 'USAGE')
+                FROM pg_catalog.pg_namespace AS namespace
+                WHERE namespace.nspname = %s
+            """, (postgres.databaseSchema,))
+            schemaRecord = cursor.fetchone()
+
+            if schemaRecord is None:
+                return blocked(
+                    "missingSchema",
+                    "The configured scientific schema does not exist. Check database/schema "
+                    "selection and installation state; no schema was created.",
+                )
+
+            report["schemaExists"] = True
+            schemaOID, canUseSchema = schemaRecord
+
+            if canUseSchema is not True:
+                return blocked(
+                    "schemaAccessDenied",
+                    "The connected role lacks USAGE on the configured schema. "
+                    "Fix access permissions; this is not a pending-migration diagnosis.",
+                )
+
+            cursor.execute("""
+                SELECT relation.relkind
+                FROM pg_catalog.pg_class AS relation
+                WHERE relation.relnamespace = %s
+                  AND relation.relname = 'schema_migrations'
+            """, (schemaOID,))
+            historyRecord = cursor.fetchone()
+
+            if historyRecord is None:
+                return blocked(
+                    "missingHistory",
+                    "The configured schema has no migration history table. "
+                    "Review configuration and installation state administratively; "
+                    "compatibility cannot be inferred from existing scientific tables.",
+                )
+
+            report["historyExists"] = True
+
+            if historyRecord != ("r",):
+                return blocked(
+                    "invalidHistoryRelation",
+                    "schema_migrations is not an ordinary table matching the migration runner's contract.",
+                )
+
+            # Do not suppress SELECT permission failures or infer empty history
+            # from inaccessible metadata.
+            table = sql.Identifier(postgres.databaseSchema, "schema_migrations")
+            cursor.execute(sql.SQL("SELECT version, name, checksum FROM {} ORDER BY version").format(table))
+            history = cursor.fetchall()
+
+        compared = cls._compareMigrationHistory(migrations, history)
+        report.update(compared)
+        return report
+
+    @classmethod
+    def _readStableDatabaseID(cls, connection, postgres):
+        """Read the persistent scientific-schema UUID without generating one.
+
+        The caller must first establish migration compatibility and own the
+        transaction. This helper reads identity only; it does not certify
+        migration compatibility by itself.
+
+        Returns a canonical UUID string.
+        Missing/inaccessible tables propagate their original SQL errors.
+        Missing or malformed identity rows raise ValueError.
+
+        Restored continuations retain identity. Independently writable clones
+        are not distinguishable merely because they copied this UUID.
+        """
+        from psycopg.rows import tuple_row
+
+        cls._requireMigrationInspectionTransaction(connection)
+        table = sql.Identifier(postgres.databaseSchema, "schema_identity")
+
+        with connection.cursor(row_factory=tuple_row) as cursor:
+            cursor.execute(sql.SQL("SELECT singleton, database_id::text FROM {}").format(table))
+            rows = cursor.fetchall()
+
+        if len(rows) != 1 or rows[0][0] is not True:
+            raise ValueError("Scientific schema must contain exactly one valid identity row.")
+
+        databaseID = rows[0][1]
+        if not isinstance(databaseID, str):
+            raise ValueError("Scientific schema identity must be a canonical UUID string.")
+
+        try:
+            canonicalID = str(uuid.UUID(databaseID))
+        except (ValueError, AttributeError):
+            raise ValueError("Scientific schema identity contains an invalid UUID.") from None
+
+        if canonicalID != databaseID or uuid.UUID(databaseID).int == 0:
+            raise ValueError("Scientific schema identity must be a canonical nonzero UUID.")
+
+        return databaseID
+    
+    
+
     # ++++++++++++++++++++++++++++ _readMigrations ++++++++++++++++++++++++++++
     # Direct callers in this module: _initDatabaseSchema.
     @classmethod
@@ -14251,7 +14585,10 @@ class pglDatabase:
 
         Dataset products and membership are protected by publication guards.
         Matrix revision records permit registration and reads, not mutation.
-        Reporting views and migration history remain read-only.
+        Reporting views, migration history, and schema identity are read-only.
+
+        Stable identity changes require an explicit administrative procedure;
+        ordinary application publication cannot replace the schema UUID.
         """
         schema = sql.Identifier(postgres.databaseSchema)
         application = sql.Identifier(postgres.databaseUser)
@@ -14278,14 +14615,16 @@ class pglDatabase:
             table = sql.Identifier(postgres.databaseSchema, name)
             connection.execute(sql.SQL("GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE {} TO {}").format(table, application))
 
-        # Published matrix records are append-only. Triggers additionally
-        # reject mutation by callers with broader table permissions.
-        matrixTable = sql.Identifier(postgres.databaseSchema, "matrix_revisions")
-        connection.execute(sql.SQL("REVOKE ALL PRIVILEGES ON TABLE {} FROM {}").format(matrixTable, application))
-        connection.execute(sql.SQL("GRANT SELECT, INSERT ON TABLE {} TO {}").format(matrixTable, application))
+        # Published matrix records and export mappings are append-only.
+        # Triggers additionally reject row mutation by broader-permission callers.
+        for name in ("matrix_revisions", "session_export_mappings"):
+            table = sql.Identifier(postgres.databaseSchema, name)
+            connection.execute(sql.SQL("REVOKE ALL PRIVILEGES ON TABLE {} FROM {}").format(table, application))
+            connection.execute(sql.SQL("GRANT SELECT, INSERT ON TABLE {} TO {}").format(table, application))
 
         readOnlyTables = [
             "schema_migrations",
+            "schema_identity",
             "session_subjects",
             "raw_sessions",
             "session_subjects_including_deleted",
@@ -14299,6 +14638,7442 @@ class pglDatabase:
 
         connection.execute(sql.SQL("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA {} TO {}").format(schema, application))
 
+    @classmethod
+    def _inspectCheckpointReference(cls, connection, postgres, reference, *, includeDeleted=False):
+        """Inspect a qualified checkpoint reference in the caller's database.
+
+        Caller responsibilities:
+            Establish migration compatibility first.
+            Own a consistent transaction.
+            Apply verification policy before authorizing foreign reuse/load.
+
+        Local references resolve directly by stable schema UUID.
+        Foreign references resolve only through session_export_mappings.
+        A missing foreign mapping never falls back to a same-numbered local ID.
+
+        Returns metadata and explicit destination state. Foreign verification
+        evidence is returned unchanged for a separate validator; its presence
+        alone does not establish payload equivalence or trusted provenance.
+
+        includeDeleted controls inspection visibility, not restoration.
+        Incomplete checkpoints are always reported as blocked.
+
+        Does not load scientific objects, open payloads, change records,
+        start/commit transactions, or resolve database profiles.
+        SQL access errors propagate rather than being reported as no match.
+        """
+        from psycopg.rows import tuple_row
+        from uuid import UUID
+
+        if type(includeDeleted) is not bool:
+            raise ValueError("includeDeleted must be Boolean.")
+
+        if type(reference) is not dict or set(reference) != {"databaseID", "sessionID", "databaseName"}:
+            raise ValueError("Expected a database-qualified checkpoint reference.")
+
+        databaseID = reference["databaseID"]
+        if not isinstance(databaseID, str):
+            raise ValueError("databaseID must be a canonical UUID string.")
+
+        try:
+            parsedID = UUID(databaseID)
+        except (ValueError, AttributeError):
+            raise ValueError("Invalid databaseID.") from None
+
+        if str(parsedID) != databaseID or parsedID.int == 0:
+            raise ValueError("databaseID must be canonical and nonzero.")
+
+        sourceSessionID = reference["sessionID"]
+        if type(sourceSessionID) is not int or not 0 <= sourceSessionID <= 9223372036854775807:
+            raise ValueError("sessionID must be a nonnegative PostgreSQL bigint.")
+
+        databaseName = reference["databaseName"]
+        if (
+            not isinstance(databaseName, str) or not databaseName.strip()
+            or any(character in databaseName for character in ("\x00", "\n", "\r"))
+        ):
+            raise ValueError("databaseName must be a nonblank profile label without NUL or newlines.")
+
+        # This checks transaction ownership and reads actual schema identity.
+        # Profile labels and connection endpoints never determine localness.
+        destinationDatabaseID = cls._readStableDatabaseID(connection, postgres)
+        local = databaseID == destinationDatabaseID
+        result = {
+            "reference": deepcopy(reference),
+            "destinationDatabaseID": destinationDatabaseID,
+            "resolutionKind": "local" if local else "exportMapping",
+            "destinationSessionID": None,
+            "state": None,
+            "checkpoint": None,
+            "mapping": None,
+            "requiresVerification": not local,
+        }
+
+        sessions = sql.Identifier(postgres.databaseSchema, "session")
+        mappings = sql.Identifier(postgres.databaseSchema, "session_export_mappings")
+
+        with connection.cursor(row_factory=tuple_row) as cursor:
+            if local:
+                destinationSessionID = sourceSessionID
+            else:
+                statement = sql.SQL("""
+                    SELECT destination_session_id, source_database_name,
+                           source_manifest_hash, destination_manifest_hash,
+                           source_contract_version, destination_contract_version,
+                           verification, registered_by, registered_at
+                    FROM {}
+                    WHERE source_database_id = %s::uuid
+                      AND source_session_id = %s
+                """).format(mappings)
+                cursor.execute(statement, (databaseID, sourceSessionID))
+                mappingRow = cursor.fetchone()
+
+                if mappingRow is None:
+                    result["state"] = "unmapped"
+                    return result
+
+                mappingNames = (
+                    "destinationSessionID", "sourceDatabaseName",
+                    "sourceManifestHash", "destinationManifestHash",
+                    "sourceContractVersion", "destinationContractVersion",
+                    "verification", "registeredBy", "registeredAt",
+                )
+                result["mapping"] = deepcopy(dict(zip(mappingNames, mappingRow)))
+                destinationSessionID = mappingRow[0]
+
+            result["destinationSessionID"] = destinationSessionID
+            statement = sql.SQL("""
+                SELECT status, deleted_at, manifest_hash, contract_version,
+                       checkpoint_name, description, completed_at,
+                       parent_session_id, root_session_id
+                FROM {}
+                WHERE session_id = %s
+            """).format(sessions)
+            cursor.execute(statement, (destinationSessionID,))
+            checkpointRow = cursor.fetchone()
+
+        if checkpointRow is None:
+            result["state"] = "missingDestination"
+            return result
+
+        checkpointNames = (
+            "status", "deletedAt", "manifestHash", "contractVersion",
+            "checkpointName", "description", "completedAt",
+            "parentSessionID", "rootSessionID",
+        )
+        checkpoint = dict(zip(checkpointNames, checkpointRow))
+        result["checkpoint"] = checkpoint
+
+        # Validate catalog correspondence even for a hidden/deleted row.
+        mapping = result["mapping"]
+        if mapping is not None and (
+            mapping["destinationManifestHash"] != checkpoint["manifestHash"]
+            or mapping["destinationContractVersion"] != checkpoint["contractVersion"]
+        ):
+            result["state"] = "inconsistentMapping"
+        elif checkpoint["status"] != "complete":
+            result["state"] = "incompleteDestination"
+        elif checkpoint["manifestHash"] is None or checkpoint["completedAt"] is None:
+            result["state"] = "invalidCompletion"
+        elif checkpoint["deletedAt"] is not None and not includeDeleted:
+            result["state"] = "deletedDestination"
+        else:
+            # 'candidate' means catalog-eligible only. In particular, foreign
+            # mappings still require evidence validation before resolution.
+            result["state"] = "candidate"
+
+        return result
+
+    @classmethod
+    def _readExportAncestry(cls, connection, postgres, sessionID, *, maxCheckpoints=10000):
+        """Read active completed ancestry in raw-root-to-selected order.
+
+        Requires a caller-owned REPEATABLE READ or SERIALIZABLE, READ ONLY
+        transaction. Does not start, commit, or change transaction settings.
+
+        Follows parent links only. Siblings and dataset memberships are not
+        included. Historical action-input dependencies are inspected separately.
+
+        Validates:
+            Session IDs and noncyclic ancestry.
+            Active completed status.
+            Raw-root and derived-parent relationships.
+            Consistent root IDs, manifest hashes, and publication timestamps.
+
+        Returns independent catalog metadata dictionaries. Contract support,
+        manifest bytes, file/product inventories, and source dependencies
+        require subsequent inspection; this helper does not establish them.
+
+        No payload access, SQL writes, or explicit publication locks.
+        SQL errors propagate. Missing/deleted/incomplete ancestors block export.
+        """
+        from psycopg.rows import tuple_row
+
+        if type(sessionID) is not int or not 0 <= sessionID <= 9223372036854775807:
+            raise ValueError("sessionID must be a nonnegative PostgreSQL bigint.")
+        if type(maxCheckpoints) is not int or maxCheckpoints <= 0:
+            raise ValueError("maxCheckpoints must be a positive integer.")
+
+        cls._requireMigrationInspectionTransaction(connection)
+        table = sql.Identifier(postgres.databaseSchema, "session")
+        names = (
+            "sessionID", "parentSessionID", "rootSessionID",
+            "origin", "kind", "status", "deletedAt",
+            "contractVersion", "manifestHash", "checkpointName",
+            "description", "completedAt", "createdBy",
+        )
+        statement = sql.SQL("""
+            SELECT session_id, parent_session_id, root_session_id,
+                   origin, kind, status, deleted_at,
+                   contract_version, manifest_hash, checkpoint_name,
+                   description, completed_at, created_by
+            FROM {}
+            WHERE session_id = %s
+        """).format(table)
+
+        records = []
+        visited = set()
+        currentID = sessionID
+
+        with connection.cursor(row_factory=tuple_row) as cursor:
+            cursor.execute("SHOW transaction_isolation")
+            isolation = cursor.fetchone()[0]
+            cursor.execute("SHOW transaction_read_only")
+            readOnly = cursor.fetchone()[0]
+
+            if isolation not in ("repeatable read", "serializable") or readOnly != "on":
+                raise ValueError("Export ancestry inspection requires a consistent read-only transaction.")
+
+            while currentID is not None:
+                if currentID in visited:
+                    raise ValueError("Export ancestry contains a cycle.")
+                if len(records) >= maxCheckpoints:
+                    raise ValueError("Export ancestry exceeds maxCheckpoints; review its depth before increasing the limit.")
+
+                visited.add(currentID)
+                cursor.execute(statement, (currentID,))
+                row = cursor.fetchone()
+                if row is None:
+                    raise ValueError(f"Required export checkpoint {currentID} does not exist.")
+
+                record = dict(zip(names, row))
+                if type(record["sessionID"]) is not int or record["sessionID"] != currentID:
+                    raise ValueError("Export ancestry lookup returned an inconsistent checkpoint ID.")
+
+                for field in ("rootSessionID", "createdBy"):
+                    value = record[field]
+                    if type(value) is not int or not 0 <= value <= 9223372036854775807:
+                        raise ValueError(f"Checkpoint {currentID}: invalid {field}.")
+
+                parentID = record["parentSessionID"]
+                if parentID is not None and (type(parentID) is not int or not 0 <= parentID <= 9223372036854775807):
+                    raise ValueError(f"Checkpoint {currentID}: invalid parent ID.")
+
+                if record["deletedAt"] is not None:
+                    raise ValueError(f"Required export checkpoint {currentID} is deleted.")
+                if record["status"] != "complete":
+                    raise ValueError(f"Required export checkpoint {currentID} is incomplete.")
+
+                digest = record["manifestHash"]
+                if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                    raise ValueError(f"Checkpoint {currentID}: invalid manifest hash.")
+
+                completedAt = record["completedAt"]
+                if completedAt is None or not callable(getattr(completedAt, "utcoffset", None)) or completedAt.utcoffset() is None:
+                    raise ValueError(f"Checkpoint {currentID}: missing or invalid completion timestamp.")
+
+                contract = record["contractVersion"]
+                if not isinstance(contract, str) or not contract.strip():
+                    raise ValueError(f"Checkpoint {currentID}: missing contract version.")
+
+                if record["origin"] == "raw":
+                    if record["kind"] != "acquired" or parentID is not None or record["rootSessionID"] != currentID:
+                        raise ValueError(f"Checkpoint {currentID}: invalid raw-root lineage.")
+                elif record["origin"] == "derived":
+                    if record["kind"] != "processed" or parentID is None or parentID == currentID or record["rootSessionID"] == currentID:
+                        raise ValueError(f"Checkpoint {currentID}: invalid derived lineage.")
+                else:
+                    raise ValueError(f"Checkpoint {currentID}: unsupported origin.")
+
+                records.append(record)
+                currentID = parentID
+
+        records.reverse()
+        root = records[0]
+        if root["origin"] != "raw":
+            raise ValueError("Export ancestry does not begin with a raw root.")
+
+        for position, record in enumerate(records):
+            if record["rootSessionID"] != root["sessionID"]:
+                raise ValueError("Export ancestry has inconsistent root IDs.")
+            if position and record["parentSessionID"] != records[position - 1]["sessionID"]:
+                raise ValueError("Export ancestry has a broken parent chain.")
+
+        return records
+
+    @classmethod
+    def _readExportCheckpointManifest(cls, connection, postgres, checkpoint, *, storageOptionsByBackend=None):
+        """Read a saved export manifest and verify its exact catalog inventory.
+
+        checkpoint:
+            One record returned by _readExportAncestry() in the same snapshot.
+
+        Requires a consistent read-only transaction. Migration compatibility
+        must already have been established by the enclosing export coordinator.
+
+        Uses the existing verified metadata reader, canonical encoding,
+        manifest validators, and matrix-link verifier.
+
+        Checks every file link, including manifest.json, against its expected
+        identity and role. Deleted links/content and unexpected links block
+        export rather than disappearing through query filtering.
+
+        Returns the verified manifest without constructing scientific objects.
+        Reads manifest bytes only, not history or scientific payload arrays.
+        Does not establish current availability of every payload or verify
+        complete matrix-bundle bytes. Those are subsequent inventory steps.
+
+        Does not write SQL, copy files, or retain a SQL/payload connection.
+        """
+        from psycopg.rows import tuple_row
+
+        cls._requireMigrationInspectionTransaction(connection)
+
+        if type(checkpoint) is not dict:
+            raise TypeError("checkpoint must be an ancestry record.")
+
+        sessionID = checkpoint.get("sessionID")
+        if type(sessionID) is not int or not 0 <= sessionID <= 9223372036854775807:
+            raise ValueError("Checkpoint sessionID must be a nonnegative PostgreSQL bigint.")
+
+        expectedHash = checkpoint.get("manifestHash")
+        if not isinstance(expectedHash, str) or re.fullmatch(r"[0-9a-f]{64}", expectedHash) is None:
+            raise ValueError("Checkpoint ancestry record has an invalid manifest hash.")
+
+        origin = checkpoint.get("origin")
+        contract = checkpoint.get("contractVersion")
+        if origin not in ("raw", "derived"):
+            raise ValueError("Unsupported export checkpoint origin.")
+        if not isinstance(contract, str) or not contract:
+            raise ValueError("Missing export checkpoint contract.")
+
+        sessions = sql.Identifier(postgres.databaseSchema, "session")
+        links = sql.Identifier(postgres.databaseSchema, "session_files")
+        files = sql.Identifier(postgres.databaseSchema, "files")
+
+        with connection.cursor(row_factory=tuple_row) as cursor:
+            cursor.execute("SHOW transaction_isolation")
+            isolation = cursor.fetchone()[0]
+            cursor.execute("SHOW transaction_read_only")
+            readOnly = cursor.fetchone()[0]
+            if isolation not in ("repeatable read", "serializable") or readOnly != "on":
+                raise ValueError("Export manifest inspection requires a consistent read-only transaction.")
+
+            # Do not trust a caller-supplied ancestry record without checking
+            # that it describes this checkpoint in the current SQL snapshot.
+            cursor.execute(sql.SQL("""
+                SELECT origin, contract_version, manifest_hash, status, deleted_at
+                FROM {} WHERE session_id = %s
+            """).format(sessions), (sessionID,))
+            if cursor.fetchone() != (origin, contract, expectedHash, "complete", None):
+                raise ValueError("Export ancestry record differs from the active completed checkpoint.")
+
+        content, identity = cls._readReplayMetadataFile(
+            connection,
+            postgres,
+            sessionID,
+            "manifest.json",
+            storageOptionsByBackend=storageOptionsByBackend,
+            maxBytes=16 * 1024 * 1024,
+        )
+        if identity != {"sha256": expectedHash, "size_bytes": len(content)}:
+            raise ValueError("Export manifest identity differs from checkpoint ancestry.")
+        if hashlib.sha256(content).hexdigest() != expectedHash:
+            raise ValueError("Export manifest bytes differ from checkpoint ancestry.")
+
+        manifest = json.loads(content)
+        if not isinstance(manifest, dict):
+            raise ValueError("Export manifest must contain a JSON object.")
+        if cls.encodeRawManifest(manifest) != content:
+            raise ValueError("Export manifest is not canonically encoded.")
+        if manifest.get("contract_version") != contract:
+            raise ValueError("Export manifest contract differs from its catalog record.")
+
+        if (origin, contract) == ("raw", "pgl.raw.behavior.v1"):
+            cls.validateRawManifest(manifest)
+        else:
+            cls._validateSessionBundleManifest(manifest, origin=origin)
+
+        payloadRole = "acquisition" if origin == "raw" else "derived"
+        expectedFiles = {
+            record["name"]: (
+                record["sha256"],
+                record["size_bytes"],
+                "history" if record["name"] == "history.json" else payloadRole,
+            )
+            for record in manifest["files"]
+        }
+        expectedFiles["manifest.json"] = (expectedHash, len(content), "manifest")
+
+        with connection.cursor(row_factory=tuple_row) as cursor:
+            # LEFT JOIN makes a missing content row an explicit integrity
+            # failure, even if an externally altered schema lost its FK.
+            cursor.execute(sql.SQL("""
+                SELECT link.name, content.file_id, content.sha256,
+                       content.size_bytes, link.role,
+                       link.deleted_at, content.deleted_at
+                FROM {} AS link
+                LEFT JOIN {} AS content ON content.file_id = link.file_id
+                WHERE link.session_id = %s
+                ORDER BY link.name
+            """).format(links, files), (sessionID,))
+            rows = cursor.fetchall()
+
+        actualFiles = {}
+        for name, fileID, digest, size, role, linkDeletedAt, contentDeletedAt in rows:
+            if name in actualFiles:
+                raise ValueError("Export checkpoint contains duplicate logical file links.")
+            if fileID is None:
+                raise ValueError(f"Export checkpoint file {name!r} has no content identity.")
+            if linkDeletedAt is not None or contentDeletedAt is not None:
+                raise ValueError(f"Export checkpoint file {name!r} has a deleted link or content identity.")
+            actualFiles[name] = (digest, size, role)
+
+        if actualFiles != expectedFiles:
+            raise ValueError("Export checkpoint file links do not exactly match its manifest.")
+
+        # An empty declaration must still reject hidden extra product links.
+        # Existing validation supports legacy and MRI owner-aware records.
+        cls._verifySessionProducts(connection, postgres, sessionID, manifest.get("products", []))
+        return manifest
+    
+    @classmethod
+    def _readExportFileInventory(cls, connection, postgres, checkpoint, *, storageOptionsByBackend=None):
+        """Inventory checkpoint files and eligible registered source locations.
+
+        Reuses _readExportCheckpointManifest() for snapshot, contract, manifest,
+        exact file-link, and matrix-link validation.
+
+        Includes manifest.json itself and preserves logical roles/subjects.
+        Locations are catalog-eligible candidates, not newly verified bytes.
+        Missing candidates block export; failed access must not silently
+        substitute unrelated paths or a same-numbered backend elsewhere.
+
+        Returns:
+            manifest: Verified saved manifest.
+            files: Sorted logical file records with content IDs and locations.
+            logicalBytes: Sum over logical links, including repeated content.
+            uniqueContentBytes: Sum over distinct file IDs in this checkpoint.
+            matrixInventoryComplete: False; separate bundle inventory required.
+
+        Byte counts are file-only and are not total export-size estimates.
+        Matrix bundles are not included in session_files.
+
+        Reads manifest bytes and SQL metadata only. Does not open scientific
+        payloads, connect to candidate locations, write records, or copy files.
+        Caller owns the consistent read-only transaction and migration checks.
+        """
+        from psycopg.rows import tuple_row
+
+        manifest = cls._readExportCheckpointManifest(
+            connection,
+            postgres,
+            checkpoint,
+            storageOptionsByBackend=storageOptionsByBackend,
+        )
+        sessionID = checkpoint["sessionID"]
+        links = sql.Identifier(postgres.databaseSchema, "session_files")
+        files = sql.Identifier(postgres.databaseSchema, "files")
+        locations = sql.Identifier(postgres.databaseSchema, "storage_locations")
+        backends = sql.Identifier(postgres.databaseSchema, "storage_backends")
+
+        with connection.cursor(row_factory=tuple_row) as cursor:
+            cursor.execute(sql.SQL("""
+                SELECT link.name, content.file_id, content.sha256,
+                       content.size_bytes, link.role, link.subject_id
+                FROM {} AS link
+                JOIN {} AS content ON content.file_id = link.file_id
+                WHERE link.session_id = %s
+                ORDER BY link.name
+            """).format(links, files), (sessionID,))
+            fileRows = cursor.fetchall()
+            fileIDs = sorted({row[1] for row in fileRows})
+
+            # Prior validation established an exact nonempty inventory,
+            # including the manifest. Do not turn missing links into an
+            # apparently successful empty transfer.
+            if not fileIDs:
+                raise ValueError("Export checkpoint has no registered file inventory.")
+
+            cursor.execute(sql.SQL("""
+                SELECT location.file_id, backend.backend_id,
+                       backend.name, backend.kind, backend.url_prefix,
+                       location.object_key, location.priority,
+                       location.verified_at
+                FROM {} AS location
+                JOIN {} AS backend ON backend.backend_id = location.backend_id
+                WHERE location.file_id = ANY(%s::bigint[])
+                  AND location.deleted_at IS NULL
+                  AND location.status = 'present'
+                  AND location.verified_at IS NOT NULL
+                  AND backend.is_active
+                ORDER BY location.file_id, location.priority,
+                         backend.backend_id, location.object_key
+            """).format(locations, backends), (fileIDs,))
+            locationRows = cursor.fetchall()
+
+        locationsByFile = {}
+        for fileID, backendID, backendName, kind, root, key, priority, verifiedAt in locationRows:
+            if (
+                not isinstance(key, str) or not key
+                or key.startswith("/") or "\\" in key or "\x00" in key
+                or any(part in ("", ".", "..") for part in key.split("/"))
+            ):
+                raise ValueError("Export source contains an invalid storage object key.")
+            if (
+                not isinstance(root, str) or not root.strip()
+                or any(character in root for character in ("\x00", "\n", "\r"))
+            ):
+                raise ValueError("Export source contains an invalid registered storage root.")
+
+            locationsByFile.setdefault(fileID, []).append({
+                "backendID": backendID,
+                "backendName": backendName,
+                "backendKind": kind,
+                "registeredRoot": root,
+                "objectKey": key,
+                "priority": priority,
+                "verifiedAt": verifiedAt,
+            })
+
+        inventory = []
+        identities = {}
+        missingNames = []
+
+        for name, fileID, digest, size, role, subjectID in fileRows:
+            identity = (digest, size)
+            if fileID in identities and identities[fileID] != identity:
+                raise ValueError("Export inventory has conflicting identities for one content ID.")
+            identities[fileID] = identity
+
+            candidates = locationsByFile.get(fileID, [])
+            if not candidates:
+                missingNames.append(name)
+
+            inventory.append({
+                "name": name,
+                "fileID": fileID,
+                "sha256": digest,
+                "size_bytes": size,
+                "role": role,
+                "subjectID": subjectID,
+                "locations": deepcopy(candidates),
+            })
+
+        if missingNames:
+            examples = ", ".join(repr(name) for name in missingNames[:5])
+            extra = f"; plus {len(missingNames) - 5} more" if len(missingNames) > 5 else ""
+            raise ValueError(
+                f"Export checkpoint {sessionID} has files without eligible "
+                f"registered locations: {examples}{extra}."
+            )
+
+        return {
+            "manifest": manifest,
+            "files": inventory,
+            "logicalBytes": sum(record["size_bytes"] for record in inventory),
+            "uniqueContentBytes": sum(size for _, size in identities.values()),
+            "matrixInventoryComplete": False,
+        }
+        
+    @classmethod
+    def _readExportMatrixInventory(cls, connection, postgres, checkpoint, *, storageOptionsByBackend=None):
+        """Inventory registered matrix products without opening their bundles.
+
+        Reuses verified checkpoint-manifest and exact product-link checks.
+        Caller owns the consistent read-only transaction and migration checks.
+
+        Ownership:
+            MRI-v2 records explicitly identify session or MRI ownership.
+            Legacy records remain session-owned, regardless of their names.
+
+        Returns independent attachment records and distinct revision records.
+        Shared revisions are inventoried once without losing attachment names.
+
+        Catalog descriptor validation is not payload verification. No Zarr
+        metadata/chunks are opened, no arrays computed, and no bundle sizes
+        guessed. Complete stored-bundle enumeration and byte verification
+        remain required before transfer/publication.
+
+        Reads checkpoint manifest bytes and SQL metadata only.
+        Does not write SQL, resolve matrix storage access, or copy payloads.
+        """
+        from psycopg.rows import tuple_row
+
+        manifest = cls._readExportCheckpointManifest(
+            connection,
+            postgres,
+            checkpoint,
+            storageOptionsByBackend=storageOptionsByBackend,
+        )
+        owned = manifest["contract_version"] == "pgl.derived.mri.v2"
+        declared = manifest.get("products", [])
+        validated = (
+            cls._validateOwnedMatrixRecords(declared)
+            if owned else cls._validateSessionProductRecords(declared)
+        )
+
+        attachments = [
+            {
+                "catalogName": record["name"],
+                "owner": record["owner"] if owned else "session",
+                "localName": record["localName"] if owned else record["name"],
+                "matrixRevisionID": record["matrixRevisionID"],
+            }
+            for record in validated
+        ]
+
+        products = sql.Identifier(postgres.databaseSchema, "session_products")
+        revisions = sql.Identifier(postgres.databaseSchema, "matrix_revisions")
+        backends = sql.Identifier(postgres.databaseSchema, "storage_backends")
+
+        # LEFT JOIN makes absent catalog dependencies explicit. Never silently
+        # omit a link because its revision/backend cannot be resolved.
+        statement = sql.SQL("""
+            SELECT product.product_name,
+                   product.matrix_revision_id::text,
+                   revision.contract_version,
+                   revision.descriptor,
+                   revision.backend_id,
+                   revision.object_key,
+                   backend.name,
+                   backend.kind,
+                   backend.url_prefix,
+                   backend.is_active
+            FROM {} AS product
+            LEFT JOIN {} AS revision
+              ON revision.matrix_revision_id = product.matrix_revision_id
+            LEFT JOIN {} AS backend
+              ON backend.backend_id = revision.backend_id
+            WHERE product.session_id = %s
+            ORDER BY product.product_name
+        """).format(products, revisions, backends)
+
+        with connection.cursor(row_factory=tuple_row) as cursor:
+            cursor.execute(statement, (checkpoint["sessionID"],))
+            rows = cursor.fetchall()
+
+        expected = {record["catalogName"]: record["matrixRevisionID"] for record in attachments}
+        actual = {}
+        revisionsByID = {}
+
+        for name, revisionID, contract, descriptor, backendID, key, backendName, kind, root, active in rows:
+            if name in actual:
+                raise ValueError("Export matrix inventory contains duplicate product links.")
+            actual[name] = revisionID
+
+            if expected.get(name) != revisionID:
+                raise ValueError("Export matrix link differs from its manifest declaration.")
+            if contract != pglStorage.MATRIX_CONTRACT:
+                raise ValueError("Export matrix revision is missing or has an unsupported contract.")
+            if type(backendID) is not int or not 0 <= backendID <= 9223372036854775807:
+                raise ValueError("Export matrix has an invalid backend ID.")
+            if active is not True:
+                raise ValueError("Export matrix backend is missing or inactive.")
+            if (
+                not isinstance(key, str) or not key
+                or key.startswith("/") or "\\" in key or "\x00" in key
+                or any(part in ("", ".", "..") for part in key.split("/"))
+            ):
+                raise ValueError("Export matrix has an invalid backend-relative bundle path.")
+            if (
+                not isinstance(root, str) or not root.strip()
+                or any(character in root for character in ("\x00", "\n", "\r"))
+            ):
+                raise ValueError("Export matrix has an invalid registered storage root.")
+
+            # Reuse the standalone descriptor contract. Encoding additionally
+            # rejects values that cannot be preserved as canonical metadata.
+            pglStorage._validateMatrixDescriptor(descriptor)
+            cls.encodeRawManifest(descriptor)
+            if descriptor["matrixRevisionID"] != revisionID:
+                raise ValueError("Export matrix descriptor identifies another revision.")
+            if descriptor["contractVersion"] != contract:
+                raise ValueError("Export matrix descriptor disagrees with its registered contract.")
+
+            revision = {
+                "matrixRevisionID": revisionID,
+                "contractVersion": contract,
+                "descriptor": deepcopy(descriptor),
+                "backendID": backendID,
+                "backendName": backendName,
+                "backendKind": kind,
+                "registeredRoot": root,
+                "objectKey": key,
+            }
+
+            previous = revisionsByID.get(revisionID)
+            if previous is not None and cls.encodeRawManifest(previous) != cls.encodeRawManifest(revision):
+                raise ValueError("Export matrix catalog contains conflicting records for one revision.")
+            revisionsByID[revisionID] = revision
+
+        if actual != expected:
+            raise ValueError("Export matrix links do not exactly match the manifest.")
+
+        return {
+            "attachments": attachments,
+            "revisions": [revisionsByID[key] for key in sorted(revisionsByID)],
+            "bundleInventoryComplete": not revisionsByID,
+            "bundleBytes": 0 if not revisionsByID else None,
+        }
+        
+    @classmethod
+    def _readExportMatrixBundleInventory(
+        cls, connection, postgres, checkpoint, *, requireAllChunks,
+        storageOptionsByBackend=None,
+        progress=None,
+    ):
+        """Inventory registered matrix bundles through database-qualified access.
+
+        Reuses _readExportMatrixInventory() for manifest/catalog validation and
+        pglDatabaseAccess for caller-specific resolution of registered roots.
+
+        Caller owns the consistent read-only SQL transaction and migration
+        checks. The filesystem is not part of that SQL snapshot; concurrent
+        payload mutation remains unsupported.
+
+        requireAllChunks:
+            Required explicit Boolean forwarded to layout validation.
+            True requires every grid chunk.
+            False reports missing grid chunks without interpreting their values.
+
+        Returns the catalog inventory with:
+            revisions:
+                Existing distinct revision records, each extended with
+                bundleInventory: descriptor, files, bundleBytes, and layout.
+            bundleBytes:
+                Sum over distinct revision records, not attachment links.
+                This is not physical-storage deduplication across revisions.
+
+        Preserves the catalog reader's bundleInventoryComplete value:
+            Empty inventories remain vacuously complete.
+            Nonempty inventories are NOT promoted to complete here.
+
+        Hashes establish current observed bytes, not publication-time integrity.
+        No codec decoding, scientific-value verification, transfer, publication,
+        or destination mapping verification is performed.
+
+        Owns a bounded payload-access context. Closes it on success or failure.
+        Does not load scientific matrices, resolve ordinary settings profiles,
+        write SQL, copy payloads, delete files, or modify catalog records.
+        Errors propagate; failed access never substitutes another location.
+        Optional progress is a pglProgress-compatible call/section reporter.
+        Ranges allocate work, not elapsed-time estimates. Helpers never
+        finish the enclosing operation. The public caller supplies a
+        display-failure-isolated adapter; direct callback errors propagate.
+
+        """
+        from copy import deepcopy
+        import posixpath
+
+        if type(requireAllChunks) is not bool:
+            raise TypeError("requireAllChunks must be an explicit Boolean.")
+
+        catalog = cls._readExportMatrixInventory(
+            connection,
+            postgres,
+            checkpoint,
+            storageOptionsByBackend=storageOptionsByBackend,
+        )
+        result = deepcopy(catalog)
+
+        # An empty catalog requires no matrix payload access.
+        if not result["revisions"]:
+            if progress is not None: progress(1, "No registered matrix bundles")
+            return result
+
+        with pglDatabaseAccess(postgres, storageOptionsByBackend) as access:
+            for index, revision in enumerate(result["revisions"]):
+                count = len(result["revisions"])
+                bundleProgress = (
+                    progress.section(index / count, (index + 1) / count,
+                                     label=f"Matrix {index + 1}/{count}")
+                    if progress is not None else None
+                )
+                filesystem, root = access.resolve(
+                    revision["backendID"],
+                    revision["registeredRoot"],
+                )
+                bundlePath = posixpath.join(root, revision["objectKey"])
+
+                revision["bundleInventory"] = (
+                    pglStorage.inventoryDataMatrixBundleLayout(
+                        bundlePath,
+                        filesystem=filesystem,
+                        expectedDescriptor=revision["descriptor"],
+                        requireAllChunks=requireAllChunks,
+                        progress=bundleProgress,
+                    )
+                )
+
+        result["bundleBytes"] = sum(
+            revision["bundleInventory"]["bundleBytes"]
+            for revision in result["revisions"]
+        )
+        if progress is not None: progress(1, "Registered matrix inventory verified")
+        return result
+    
+    @classmethod
+    def _copyExportCheckpointFiles(
+        cls, inventory, destinationPath, *, sourceAccess,
+        destinationFilesystem=None, destinationStorageOptions=None, progress=None,
+    ):
+        """Copy saved checkpoint files without reconstructing scientific objects.
+
+        inventory:
+            Result of _readExportFileInventory() from a migration-checked,
+            consistent source snapshot. Structural checks here do not establish
+            that arbitrary caller-supplied records came from that inspection.
+
+        sourceAccess:
+            Borrowed pglDatabaseAccess for the source database. Its database
+            association must match the inventory's origin, as established by
+            the enclosing coordinator. Never closed by this method.
+
+        Source selection:
+            Use the first listed eligible location for each logical file.
+            Preserve the inventory's priority ordering. Resolution, reading,
+            or verification failures propagate; no fallback is attempted.
+
+        destinationPath:
+            Exact new checkpoint-file directory. Parent must already exist.
+            Existing destinations are rejected. Matrix bundles are separate.
+
+        Returns:
+            destinationPath: Filesystem-qualified destination.
+            manifest: Independent copy of the unchanged saved manifest.
+            files: Sorted logical names and verified SHA-256/size identities.
+            fileBytes: Sum over logical files, including manifest.json.
+            sourceLocations: Selected source location for each logical name.
+
+        Copies manifest.json last, then enumerates and hashes the destination.
+        Final verification requires the exact declared directory/file sets.
+        A late failure may leave manifest.json present: successful return,
+        not marker presence alone, is required before catalog registration.
+
+        Does not load scientific objects, regenerate history, query/write SQL,
+        register mappings, transfer matrices, close filesystems, or delete files.
+
+        Local paths receive explicit symlink checks. Generic backend safety
+        depends on authoritative listings and exclusive-create semantics.
+        Concurrent mutation/writers are unsupported; verification is not an
+        atomic snapshot. No publication-time matrix integrity is implied.
+        Optional progress:
+            A pglProgress-compatible reporter supporting call() and section().
+            Reports this helper's work only; never finishes the parent display.
+            Caller callback errors propagate like the existing hash/copy helpers.
+
+        """
+        from copy import deepcopy
+        from pathlib import Path
+        import hashlib
+        import posixpath
+        import re
+
+        from fsspec.implementations.local import LocalFileSystem
+
+        if not isinstance(sourceAccess, pglDatabaseAccess):
+            raise TypeError("sourceAccess must be a pglDatabaseAccess instance.")
+        if type(inventory) is not dict:
+            raise TypeError("inventory must be a dictionary.")
+
+        inventory = deepcopy(inventory)
+        manifest = inventory.get("manifest")
+        if type(manifest) is not dict:
+            raise ValueError("Export inventory lacks a manifest.")
+
+        contract = manifest.get("contract_version")
+        if contract == "pgl.raw.behavior.v1":
+            cls.validateRawManifest(manifest)
+            origin = "raw"
+        elif contract in ("pgl.raw.session.v1", "pgl.raw.session.v2"):
+            cls.validateRawSessionManifest(manifest)
+            origin = "raw"
+        else:
+            cls.validateDerivedManifest(manifest)
+            origin = "derived"
+
+        def validatePath(value, label):
+            if (
+                not isinstance(value, str) or not value
+                or value.startswith("/") or "\\" in value
+                or any(character in value for character in ("\x00", "\n", "\r"))
+                or any(part in ("", ".", "..") for part in value.split("/"))
+            ):
+                raise ValueError(f"Invalid {label}: {value!r}")
+
+        def requireLocalSafe(filesystem, path):
+            """Do not resolve symlinks away before checking their ancestors."""
+            if isinstance(filesystem, LocalFileSystem):
+                localPath = Path(path).absolute()
+                for candidate in (localPath, *localPath.parents):
+                    if candidate.is_symlink():
+                        raise ValueError(f"Symlinked export path: {candidate}")
+
+        directories = set(manifest["directories"])
+        for name in directories: validatePath(name, "manifest directory")
+
+        manifestBytes = cls.encodeRawManifest(manifest)
+        manifestIdentity = {
+            "sha256": hashlib.sha256(manifestBytes).hexdigest(),
+            "size_bytes": len(manifestBytes),
+        }
+        expectedFiles = {
+            record["name"]: {
+                "sha256": record["sha256"],
+                "size_bytes": record["size_bytes"],
+            }
+            for record in manifest["files"]
+        }
+        if "manifest.json" in expectedFiles:
+            raise ValueError("manifest.json is reserved for the saved manifest.")
+        expectedFiles["manifest.json"] = manifestIdentity
+
+        for name in expectedFiles: validatePath(name, "logical filename")
+
+        # Explicitly require a complete, non-conflicting directory tree.
+        if directories.intersection(expectedFiles):
+            raise ValueError("A destination path cannot be both file and directory.")
+        for name in directories | set(expectedFiles):
+            parent = posixpath.dirname(name)
+            if parent and parent not in directories:
+                raise ValueError(f"Missing declared parent directory: {name}")
+
+        fileRecords = inventory.get("files")
+        if type(fileRecords) is not list:
+            raise ValueError("Export inventory files must be a list.")
+
+        recordsByName = {}
+        selectedLocations = {}
+        payloadRole = "acquisition" if origin == "raw" else "derived"
+
+        for record in fileRecords:
+            if type(record) is not dict:
+                raise ValueError("Invalid export file record.")
+            name = record.get("name")
+            validatePath(name, "inventory filename")
+            if name in recordsByName:
+                raise ValueError("Duplicate export inventory filename.")
+
+            identity = {
+                "sha256": record.get("sha256"),
+                "size_bytes": record.get("size_bytes"),
+            }
+            if (
+                not isinstance(identity["sha256"], str)
+                or re.fullmatch(r"[0-9a-f]{64}", identity["sha256"]) is None
+                or type(identity["size_bytes"]) is not int
+                or not 0 <= identity["size_bytes"] <= 9223372036854775807
+                or identity != expectedFiles.get(name)
+            ):
+                raise ValueError(f"Export file identity differs from manifest: {name}")
+
+            role = (
+                "manifest" if name == "manifest.json"
+                else "history" if name == "history.json"
+                else payloadRole
+            )
+            if record.get("role") != role:
+                raise ValueError(f"Export file role differs from manifest: {name}")
+
+            locations = record.get("locations")
+            if type(locations) is not list or not locations:
+                raise ValueError(f"Export file has no source locations: {name}")
+
+            # Do not sort, try alternatives, or interpret labels as identity.
+            location = locations[0]
+            if type(location) is not dict:
+                raise ValueError(f"Invalid selected source location: {name}")
+
+            backendID = location.get("backendID")
+            root = location.get("registeredRoot")
+            if type(backendID) is not int or not 0 <= backendID <= 9223372036854775807:
+                raise ValueError("Invalid selected source backend ID.")
+            if (
+                not isinstance(root, str) or not root.strip()
+                or any(character in root for character in ("\x00", "\n", "\r"))
+            ):
+                raise ValueError("Invalid selected registered root.")
+            validatePath(location.get("objectKey"), "source object key")
+
+            recordsByName[name] = record
+            selectedLocations[name] = deepcopy(location)
+
+        if set(recordsByName) != set(expectedFiles):
+            raise ValueError("Export file set differs from the saved manifest.")
+
+        destinationFilesystem, destinationRoot = pglStorage._resolveStoragePath(
+            destinationPath,
+            filesystem=destinationFilesystem,
+            storageOptions=destinationStorageOptions,
+            label="checkpoint export destination",
+        )
+        destinationRoot = destinationRoot.rstrip("/")
+        if not destinationRoot:
+            raise ValueError("Checkpoint destination cannot be the filesystem root.")
+
+        requireLocalSafe(destinationFilesystem, destinationRoot)
+        if destinationFilesystem.exists(destinationRoot):
+            raise FileExistsError(destinationRoot)
+
+        parent = posixpath.dirname(destinationRoot) or "."
+        if not destinationFilesystem.isdir(parent):
+            raise NotADirectoryError(parent)
+
+        # Resolve every selected location before creating output. The access
+        # context caches backend/root pairs. No payload bytes are read here.
+        sources = {}
+        for name in sorted(expectedFiles):
+            location = selectedLocations[name]
+            filesystem, root = sourceAccess.resolve(
+                location["backendID"], location["registeredRoot"],
+            )
+            sourcePath = posixpath.join(root, location["objectKey"])
+            requireLocalSafe(filesystem, sourcePath)
+
+            sameNamespace = filesystem is destinationFilesystem
+            if (
+                isinstance(filesystem, LocalFileSystem)
+                and isinstance(destinationFilesystem, LocalFileSystem)
+            ):
+                sameNamespace = True
+                comparedSource = str(Path(sourcePath).absolute())
+                comparedDestination = str(Path(destinationRoot).absolute())
+            else:
+                comparedSource = sourcePath
+                comparedDestination = destinationRoot
+
+            if sameNamespace:
+                comparedSource = posixpath.normpath(comparedSource)
+                comparedDestination = posixpath.normpath(comparedDestination)
+                if (
+                    comparedSource == comparedDestination
+                    or comparedSource.startswith(comparedDestination.rstrip("/") + "/")
+                    or comparedDestination.startswith(comparedSource.rstrip("/") + "/")
+                ):
+                    raise ValueError("Destination overlaps a selected source file.")
+
+            sources[name] = (filesystem, sourcePath)
+
+        requireLocalSafe(destinationFilesystem, destinationRoot)
+        if destinationFilesystem.exists(destinationRoot):
+            raise FileExistsError(destinationRoot)
+        destinationFilesystem.makedirs(destinationRoot, exist_ok=False)
+
+        # Preserve declared empty directories as well as file parents.
+        for name in sorted(directories, key=lambda value: (value.count("/"), value)):
+            path = posixpath.join(destinationRoot, name)
+            requireLocalSafe(destinationFilesystem, path)
+            destinationFilesystem.makedirs(path, exist_ok=False)
+
+        copyOrder = sorted(set(expectedFiles) - {"manifest.json"}) + ["manifest.json"]
+        copyWork = [{"name": name, **expectedFiles[name]} for name in copyOrder]
+        copyProgress = progress.section(0, 0.75) if progress is not None else None
+        for item, fileProgress in pglProgress.fileSections(copyWork, copyProgress):
+            name = item["name"]
+            filesystem, sourcePath = sources[name]
+            requireLocalSafe(filesystem, sourcePath)
+            requireLocalSafe(
+                destinationFilesystem, posixpath.join(destinationRoot, name),
+            )
+            pglStorage.copyVerifiedFile(
+                filesystem, sourcePath,
+                destinationFilesystem, destinationRoot,
+                expectedFiles[name],
+                objectKey=name,
+                progress=fileProgress,
+            )
+
+        def listDestination():
+            """Require authoritative immediate-child listings and exact contents."""
+            pending = [destinationRoot]
+            observedDirectories = set()
+            observedFiles = {}
+
+            while pending:
+                current = pending.pop()
+                requireLocalSafe(destinationFilesystem, current)
+                for entry in destinationFilesystem.ls(current, detail=True):
+                    path = destinationFilesystem._strip_protocol(entry["name"])
+                    if posixpath.dirname(path.rstrip("/")) != current:
+                        raise ValueError("Destination listing returned a non-child entry.")
+
+                    name = posixpath.relpath(path, destinationRoot)
+                    validatePath(name, "destination entry")
+                    requireLocalSafe(destinationFilesystem, path)
+                    kind = entry.get("type")
+                    if entry.get("islink") or kind in ("link", "symlink"):
+                        raise ValueError(f"Symlinked destination entry: {name}")
+
+                    if kind == "directory":
+                        if name not in directories or name in observedDirectories:
+                            raise ValueError(f"Unexpected or duplicate destination directory: {name}")
+                        observedDirectories.add(name)
+                        pending.append(path)
+                    elif kind == "file":
+                        if name not in expectedFiles or name in observedFiles:
+                            raise ValueError(f"Unexpected or duplicate destination file: {name}")
+                        size = entry.get("size")
+                        if type(size) is not int or size < 0:
+                            raise ValueError("Invalid destination file size.")
+                        observedFiles[name] = size
+                    else:
+                        raise ValueError(f"Unsupported destination entry: {name}")
+
+            if observedDirectories != directories or set(observedFiles) != set(expectedFiles):
+                raise ValueError("Destination contents differ from the declared inventory.")
+            return observedFiles
+
+        if progress is not None: progress(0.75, "Checking complete checkpoint file inventory")
+        before = listDestination()
+        verifiedFiles = []
+        verifyWork = [
+            {"name": name, **expectedFiles[name]}
+            for name in sorted(expectedFiles)
+        ]
+        verifyProgress = progress.section(0.75, 0.99) if progress is not None else None
+        for item, fileProgress in pglProgress.fileSections(verifyWork, verifyProgress):
+            name = item["name"]
+            path = posixpath.join(destinationRoot, name)
+            requireLocalSafe(destinationFilesystem, path)
+            identity = pglStorage.hashFile(
+                destinationFilesystem, path,
+                progress=fileProgress, expectedSize=item["size_bytes"],
+                description="Verifying complete checkpoint copy",
+            )
+            if identity != expectedFiles[name] or identity["size_bytes"] != before[name]:
+                raise ValueError(f"Final destination identity mismatch: {name}")
+            verifiedFiles.append({"name": name, **identity})
+
+        if listDestination() != before:
+            raise ValueError("Destination listing changed during final verification.")
+        if progress is not None: progress(1, "Checkpoint file copy verified")
+
+        return {
+            "destinationPath": destinationFilesystem.unstrip_protocol(destinationRoot),
+            "manifest": manifest,
+            "files": verifiedFiles,
+            "fileBytes": sum(record["size_bytes"] for record in verifiedFiles),
+            "sourceLocations": [
+                {"name": name, "location": selectedLocations[name]}
+                for name in sorted(selectedLocations)
+            ],
+        }
+        
+    @classmethod
+    def _compareExportManifestIdentity(cls, sourceManifest, destinationManifest):
+        """Require identical validated manifests for byte-preserving export.
+
+        Accepts parsed source and destination manifest dictionaries.
+
+        Supports the explicitly listed existing raw and derived contracts.
+        Uses existing contract validators and canonical manifest encoding.
+        Does not normalize contracts, rewrite references, or mutate inputs.
+
+        Returns:
+            contractVersion: Unchanged checkpoint contract.
+            sha256: SHA-256 of the identical canonical manifest bytes.
+            size_bytes: Length of those canonical bytes.
+
+        Caller responsibilities:
+            Bind each supplied document to its actual stored manifest bytes
+            and checkpoint catalog identity.
+            Independently verify files, matrix bundles, attachment ownership,
+            destination lineage, and database-qualified checkpoint mappings.
+
+        Document identity alone does NOT establish stored-byte equality,
+        scientific validity, source authenticity, or checkpoint equivalence.
+        The return value is not mapping verification evidence or authorization
+        to resolve a foreign checkpoint.
+
+        Does not query SQL, read/write payloads, deserialize scientific objects,
+        register mappings, or change bundleInventoryComplete.
+        """
+        from copy import deepcopy
+        import hashlib
+
+        rawContracts = {
+            "pgl.raw.behavior.v1",
+            "pgl.raw.session.v1",
+            "pgl.raw.session.v2",
+        }
+        derivedContracts = {
+            "pgl.derived.behavior.v1",
+            "pgl.derived.behavior.v2",
+            "pgl.derived.behavior.v3",
+            "pgl.derived.session.v1",
+            "pgl.derived.session.v2",
+            "pgl.derived.session.v3",
+            "pgl.derived.mri.v1",
+            "pgl.derived.mri.v2",
+        }
+
+        def validatedBytes(manifest, label):
+            """Validate an independent document without constructing payloads."""
+            if type(manifest) is not dict:
+                raise TypeError(f"{label} manifest must be a dictionary.")
+
+            manifest = deepcopy(manifest)
+            contract = manifest.get("contract_version")
+            if (
+                not isinstance(contract, str)
+                or contract not in rawContracts | derivedContracts
+            ):
+                raise ValueError(f"Unsupported {label} export manifest contract.")
+
+            if contract == "pgl.raw.behavior.v1":
+                cls.validateRawManifest(manifest)
+            elif contract in rawContracts:
+                cls.validateRawSessionManifest(manifest)
+            else:
+                cls.validateDerivedManifest(manifest)
+
+            return contract, cls.encodeRawManifest(manifest)
+
+        sourceContract, sourceBytes = validatedBytes(sourceManifest, "source")
+        destinationContract, destinationBytes = validatedBytes(
+            destinationManifest, "destination",
+        )
+
+        if sourceContract != destinationContract:
+            raise ValueError("Source and destination manifest contracts differ.")
+        if sourceBytes != destinationBytes:
+            raise ValueError(
+                "Source and destination manifests differ under byte-preserving export."
+            )
+
+        return {
+            "contractVersion": sourceContract,
+            "sha256": hashlib.sha256(sourceBytes).hexdigest(),
+            "size_bytes": len(sourceBytes),
+        }
+        
+    @classmethod
+    def _compareExportFileInventory(cls, sourceInventory, destinationInventory):
+        """Compare checkpoint file catalogs for byte-preserving export.
+
+        Inputs:
+            Inventory dictionaries with manifest/files fields using the
+            _readExportFileInventory() representation.
+
+        Requires:
+            Identical validated canonical manifests.
+            Exact logical filenames, hashes, sizes, roles, and subject IDs.
+            Valid database-local file IDs, without conflicting content
+            identities for one ID within either catalog.
+
+        Permits:
+            Different database-local file IDs, storage locations, backend
+            IDs, verification timestamps, and location priority order.
+            Different input file-record ordering.
+
+        Returns:
+            manifestIdentity: Result of _compareExportManifestIdentity().
+            files: Sorted common logical identities, roles, and subject IDs.
+            logicalBytes: Sum over logical links, including manifest.json.
+
+        File IDs are checked within each database, never matched across them.
+        Subject IDs are compared exactly as catalog strings; no subject
+        renaming or identity-equivalence inference is performed.
+
+        Locations and cached aggregate totals are deliberately not compared.
+        Their eligibility, accessibility, and actual bytes require separate
+        verification. This method does not establish current payload integrity.
+
+        Does not compare matrix attachments or SQL lineage, construct mapping
+        verification evidence, authorize foreign resolution, query SQL, read
+        payloads, mutate inputs, or change bundleInventoryComplete.
+        """
+        from copy import deepcopy
+
+        if type(sourceInventory) is not dict or type(destinationInventory) is not dict:
+            raise TypeError("Source and destination inventories must be dictionaries.")
+
+        sourceInventory = deepcopy(sourceInventory)
+        destinationInventory = deepcopy(destinationInventory)
+
+        manifestIdentity = cls._compareExportManifestIdentity(
+            sourceInventory.get("manifest"),
+            destinationInventory.get("manifest"),
+        )
+        manifest = sourceInventory["manifest"]
+        contract = manifestIdentity["contractVersion"]
+        payloadRole = "acquisition" if contract.startswith("pgl.raw.") else "derived"
+
+        expectedFiles = {
+            record["name"]: {
+                "sha256": record["sha256"],
+                "size_bytes": record["size_bytes"],
+                "role": "history" if record["name"] == "history.json" else payloadRole,
+            }
+            for record in manifest["files"]
+        }
+        if "manifest.json" in expectedFiles:
+            raise ValueError("manifest.json is reserved for the checkpoint manifest.")
+
+        expectedFiles["manifest.json"] = {
+            "sha256": manifestIdentity["sha256"],
+            "size_bytes": manifestIdentity["size_bytes"],
+            "role": "manifest",
+        }
+
+        def projectFiles(inventory, label):
+            """Validate local identity bookkeeping and project portable fields."""
+            records = inventory.get("files")
+            if type(records) is not list:
+                raise ValueError(f"{label} inventory files must be a list.")
+
+            projected = {}
+            identitiesByID = {}
+            requiredFields = {
+                "name", "fileID", "sha256", "size_bytes", "role", "subjectID",
+            }
+
+            for record in records:
+                if type(record) is not dict or not requiredFields.issubset(record):
+                    raise ValueError(f"Invalid {label} file record.")
+
+                name = record["name"]
+                if not isinstance(name, str) or name not in expectedFiles:
+                    raise ValueError(f"Unexpected {label} logical filename: {name!r}")
+                if name in projected:
+                    raise ValueError(f"Duplicate {label} logical filename: {name!r}")
+
+                fileID = record["fileID"]
+                if type(fileID) is not int or not 0 <= fileID <= 9223372036854775807:
+                    raise ValueError(f"Invalid {label} database-local file ID.")
+
+                digest = record["sha256"]
+                size = record["size_bytes"]
+                role = record["role"]
+                if (
+                    not isinstance(digest, str)
+                    or type(size) is not int
+                    or not 0 <= size <= 9223372036854775807
+                    or not isinstance(role, str)
+                    or {
+                        "sha256": digest,
+                        "size_bytes": size,
+                        "role": role,
+                    } != expectedFiles[name]
+                ):
+                    raise ValueError(
+                        f"{label} file identity or role differs from manifest: {name}"
+                    )
+
+                identity = (digest, size)
+                if fileID in identitiesByID and identitiesByID[fileID] != identity:
+                    raise ValueError(
+                        f"{label} file ID has conflicting content identities: {fileID}"
+                    )
+                identitiesByID[fileID] = identity
+
+                subjectID = record["subjectID"]
+                if subjectID is not None and (
+                    not isinstance(subjectID, str)
+                    or not subjectID.strip()
+                    or "\x00" in subjectID
+                ):
+                    raise ValueError(f"Invalid {label} subject ID: {name}")
+
+                projected[name] = {
+                    "name": name,
+                    "sha256": digest,
+                    "size_bytes": size,
+                    "role": role,
+                    "subjectID": subjectID,
+                }
+
+            if set(projected) != set(expectedFiles):
+                raise ValueError(f"{label} file set differs from the manifest.")
+
+            return [projected[name] for name in sorted(projected)]
+
+        sourceFiles = projectFiles(sourceInventory, "Source")
+        destinationFiles = projectFiles(destinationInventory, "Destination")
+
+        if sourceFiles != destinationFiles:
+            raise ValueError("Source and destination file subject associations differ.")
+
+        return {
+            "manifestIdentity": manifestIdentity,
+            "files": sourceFiles,
+            "logicalBytes": sum(record["size_bytes"] for record in sourceFiles),
+        }
+        
+    @classmethod
+    def _compareExportMatrixInventory(
+        cls, sourceInventory, destinationInventory, *,
+        sourceManifest, destinationManifest,
+    ):
+        """Compare matrix attachments, descriptors, and captured byte identities.
+
+        Inputs:
+            Matrix inventories in the _readExportMatrixBundleInventory()
+            representation, plus their corresponding saved manifests.
+
+        Requires:
+            Identical validated manifests.
+            Exact manifest-declared attachment names, ownership, local names,
+            and revision UUIDs.
+            Exactly the referenced distinct revisions, without duplicates.
+            Valid matching catalog and bundle descriptors.
+            Identical sorted stored-file SHA-256/size records.
+            Correct per-bundle and aggregate byte totals.
+
+        Permits:
+            Different destination backend IDs, roots, object keys, and backend
+            labels. Attachment/revision list order does not affect comparison.
+
+        Returns:
+            manifestIdentity: Common canonical manifest identity.
+            attachments: Sorted portable attachment records.
+            revisions: Sorted revision identities, descriptors, and byte records.
+            bundleBytes: Sum over distinct revisions, not attachment links.
+
+        This compares captured evidence, not current filesystems. Caller must
+        obtain inventories using the actual byte/layout inventory helpers and
+        enforce the chosen chunk-coverage policy independently.
+
+        Supplied layout reports and bundleInventoryComplete flags are not
+        evidence of fresh verification and are deliberately not promoted or
+        returned. Matching invented inventories can still describe nonexistent
+        or invalid payloads.
+
+        Does not query SQL, read payloads, decode chunks, validate mapped
+        checkpoint lineage, register mappings, authorize foreign resolution,
+        mutate inputs, or establish publication-time integrity.
+        """
+        from copy import deepcopy
+        import re
+
+        if type(sourceInventory) is not dict or type(destinationInventory) is not dict:
+            raise TypeError("Source and destination matrix inventories must be dictionaries.")
+
+        sourceInventory = deepcopy(sourceInventory)
+        destinationInventory = deepcopy(destinationInventory)
+
+        manifestIdentity = cls._compareExportManifestIdentity(
+            sourceManifest, destinationManifest,
+        )
+        manifest = deepcopy(sourceManifest)
+        owned = manifest["contract_version"] == "pgl.derived.mri.v2"
+        declared = manifest.get("products", [])
+        validated = (
+            cls._validateOwnedMatrixRecords(declared)
+            if owned else cls._validateSessionProductRecords(declared)
+        )
+        expectedAttachments = {
+            record["name"]: {
+                "catalogName": record["name"],
+                "owner": record["owner"] if owned else "session",
+                "localName": record["localName"] if owned else record["name"],
+                "matrixRevisionID": record["matrixRevisionID"],
+            }
+            for record in validated
+        }
+        expectedRevisionIDs = {
+            record["matrixRevisionID"] for record in expectedAttachments.values()
+        }
+
+        def validateName(name):
+            """Require the same portable relative filename form as byte inventory."""
+            if (
+                not isinstance(name, str) or not name
+                or name.startswith("/") or "\\" in name
+                or any(character in name for character in ("\x00", "\n", "\r"))
+                or any(part in ("", ".", "..") for part in name.split("/"))
+            ):
+                raise ValueError(f"Invalid matrix inventory filename: {name!r}")
+
+        def projectInventory(inventory, label):
+            """Validate correspondence without consulting a filesystem."""
+            attachments = inventory.get("attachments")
+            revisions = inventory.get("revisions")
+            if type(attachments) is not list or type(revisions) is not list:
+                raise ValueError(f"{label} matrix attachments/revisions must be lists.")
+
+            actualAttachments = {}
+            attachmentFields = {"catalogName", "owner", "localName", "matrixRevisionID"}
+            for record in attachments:
+                if type(record) is not dict or set(record) != attachmentFields:
+                    raise ValueError(f"Invalid {label} matrix attachment record.")
+
+                name = record["catalogName"]
+                if not isinstance(name, str) or name not in expectedAttachments:
+                    raise ValueError(f"Unexpected {label} matrix attachment.")
+                if name in actualAttachments:
+                    raise ValueError(f"Duplicate {label} matrix attachment.")
+                if record != expectedAttachments[name]:
+                    raise ValueError(f"{label} matrix attachment differs from manifest.")
+                actualAttachments[name] = dict(record)
+
+            if set(actualAttachments) != set(expectedAttachments):
+                raise ValueError(f"{label} matrix attachments do not cover the manifest.")
+
+            projectedRevisions = {}
+            for revision in revisions:
+                if type(revision) is not dict:
+                    raise ValueError(f"Invalid {label} matrix revision record.")
+
+                revisionID = revision.get("matrixRevisionID")
+                if not isinstance(revisionID, str) or revisionID not in expectedRevisionIDs:
+                    raise ValueError(f"Unexpected {label} matrix revision.")
+                if revisionID in projectedRevisions:
+                    raise ValueError(f"Duplicate {label} matrix revision.")
+                if revision.get("contractVersion") != pglStorage.MATRIX_CONTRACT:
+                    raise ValueError(f"Unsupported {label} matrix contract.")
+
+                descriptor = revision.get("descriptor")
+                pglStorage._validateMatrixDescriptor(descriptor)
+                descriptorBytes = pglStorage.encodeJSON(descriptor)
+                if descriptor["matrixRevisionID"] != revisionID:
+                    raise ValueError(f"{label} descriptor identifies another revision.")
+
+                bundle = revision.get("bundleInventory")
+                if type(bundle) is not dict:
+                    raise ValueError(f"{label} revision lacks a captured bundle inventory.")
+
+                bundleDescriptor = bundle.get("descriptor")
+                pglStorage._validateMatrixDescriptor(bundleDescriptor)
+                if pglStorage.encodeJSON(bundleDescriptor) != descriptorBytes:
+                    raise ValueError(f"{label} catalog and bundle descriptors differ.")
+
+                files = bundle.get("files")
+                if type(files) is not list:
+                    raise ValueError(f"{label} matrix files must be a list.")
+
+                names = []
+                projectedFiles = []
+                for record in files:
+                    if type(record) is not dict or set(record) != {
+                        "name", "sha256", "size_bytes",
+                    }:
+                        raise ValueError(f"Invalid {label} matrix file record.")
+
+                    name = record["name"]
+                    validateName(name)
+                    if name != "matrix.json" and not name.startswith("data.zarr/"):
+                        raise ValueError(f"Unexpected {label} matrix bundle filename.")
+
+                    digest = record["sha256"]
+                    size = record["size_bytes"]
+                    if (
+                        not isinstance(digest, str)
+                        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                        or type(size) is not int or size < 0
+                    ):
+                        raise ValueError(f"Invalid {label} matrix byte identity.")
+
+                    names.append(name)
+                    projectedFiles.append(dict(record))
+
+                if names != sorted(set(names)):
+                    raise ValueError(f"{label} matrix filenames must be unique and sorted.")
+
+                requiredNames = {
+                    "matrix.json",
+                    "data.zarr/.zgroup",
+                    "data.zarr/.zattrs",
+                    "data.zarr/.zmetadata",
+                }
+                if not requiredNames.issubset(names):
+                    raise ValueError(f"{label} matrix inventory lacks required metadata files.")
+
+                bundleBytes = sum(record["size_bytes"] for record in projectedFiles)
+                if (
+                    type(bundle.get("bundleBytes")) is not int
+                    or bundle["bundleBytes"] != bundleBytes
+                ):
+                    raise ValueError(f"{label} matrix bundle byte total is inconsistent.")
+
+                projectedRevisions[revisionID] = {
+                    "matrixRevisionID": revisionID,
+                    "contractVersion": revision["contractVersion"],
+                    "descriptor": deepcopy(descriptor),
+                    "files": projectedFiles,
+                    "bundleBytes": bundleBytes,
+                }
+
+            if set(projectedRevisions) != expectedRevisionIDs:
+                raise ValueError(f"{label} matrix revisions do not cover the manifest.")
+
+            bundleBytes = sum(
+                revision["bundleBytes"] for revision in projectedRevisions.values()
+            )
+            if (
+                type(inventory.get("bundleBytes")) is not int
+                or inventory["bundleBytes"] != bundleBytes
+            ):
+                raise ValueError(f"{label} aggregate matrix byte total is inconsistent.")
+
+            return {
+                "attachments": [
+                    actualAttachments[name] for name in sorted(actualAttachments)
+                ],
+                "revisions": [
+                    projectedRevisions[key] for key in sorted(projectedRevisions)
+                ],
+                "bundleBytes": bundleBytes,
+            }
+
+        source = projectInventory(sourceInventory, "Source")
+        destination = projectInventory(destinationInventory, "Destination")
+
+        if pglStorage.encodeJSON(source) != pglStorage.encodeJSON(destination):
+            raise ValueError("Source and destination captured matrix inventories differ.")
+
+        return {"manifestIdentity": manifestIdentity, **source}
+    
+    @classmethod
+    def _compareExportCheckpointLineage(
+        cls, sourceAncestry, destinationAncestry, *,
+        sourceDatabaseID, destinationDatabaseID, sessionIDMapping,
+    ):
+        """Compare complete checkpoint chains under an explicit export mapping.
+
+        Ancestries:
+            Root-to-selected record lists using _readExportAncestry() fields.
+            Both must describe active, completed, noncyclic chains.
+
+        sessionIDMapping:
+            Dictionary of source-local integer IDs to destination-local integer
+            IDs. Must cover exactly both chains, with one-to-one correspondence.
+            No numeric-ID fallback, partial mapping, or ancestry collapse.
+
+        Requires:
+            Distinct canonical nonzero database UUIDs.
+            Consistent raw-root/derived-parent structure on both sides.
+            Mapped parent/root relationships.
+            Matching manifest hashes, contracts, origin, and kind.
+
+        Returns:
+            sourceDatabaseID / destinationDatabaseID.
+            checkpoints: Root-to-selected portable correspondence records.
+
+        Publication timestamps must be timezone-aware but need not match.
+        Creator IDs, annotations, and other catalog fields are not compared.
+        This does not define their eventual export preservation policy.
+
+        Caller must bind database UUIDs and ancestry records to actual checked
+        database snapshots. Matching supplied records alone cannot establish
+        their authenticity or current visibility.
+
+        Does not inspect manifests/payloads, check historical action-input
+        dependencies, compare all session metadata, register mappings, produce
+        authorization evidence, or resolve foreign references.
+
+        Does not query SQL, mutate inputs, or change transaction settings.
+        """
+        from copy import deepcopy
+        from datetime import datetime
+        from uuid import UUID
+        import re
+
+        def validateDatabaseID(value, label):
+            if not isinstance(value, str):
+                raise ValueError(f"{label} must be a canonical nonzero UUID.")
+            try:
+                parsed = UUID(value)
+            except (ValueError, AttributeError) as error:
+                raise ValueError(f"Invalid {label}.") from error
+            if str(parsed) != value or parsed.int == 0:
+                raise ValueError(f"{label} must be a canonical nonzero UUID.")
+
+        def validateSessionID(value, label):
+            if type(value) is not int or not 0 <= value <= 9223372036854775807:
+                raise ValueError(f"{label} must be a nonnegative PostgreSQL bigint.")
+
+        validateDatabaseID(sourceDatabaseID, "sourceDatabaseID")
+        validateDatabaseID(destinationDatabaseID, "destinationDatabaseID")
+        if sourceDatabaseID == destinationDatabaseID:
+            raise ValueError("Cross-database lineage comparison requires distinct database UUIDs.")
+
+        if type(sessionIDMapping) is not dict:
+            raise TypeError("sessionIDMapping must be a dictionary.")
+        sessionIDMapping = deepcopy(sessionIDMapping)
+
+        for sourceID, destinationID in sessionIDMapping.items():
+            validateSessionID(sourceID, "Mapping source session ID")
+            validateSessionID(destinationID, "Mapping destination session ID")
+        if len(set(sessionIDMapping.values())) != len(sessionIDMapping):
+            raise ValueError("Lineage mapping must be one-to-one.")
+
+        def validateAncestry(records, label):
+            """Validate the chain itself before comparing its mapped identity."""
+            if type(records) is not list or not records:
+                raise ValueError(f"{label} ancestry must be a nonempty list.")
+
+            records = deepcopy(records)
+            requiredFields = {
+                "sessionID", "parentSessionID", "rootSessionID",
+                "origin", "kind", "status", "deletedAt",
+                "manifestHash", "contractVersion", "completedAt",
+            }
+            seen = set()
+            rootID = None
+            previousID = None
+
+            for index, record in enumerate(records):
+                if type(record) is not dict or not requiredFields.issubset(record):
+                    raise ValueError(f"Invalid {label} ancestry record.")
+
+                sessionID = record["sessionID"]
+                parentID = record["parentSessionID"]
+                validateSessionID(sessionID, f"{label} session ID")
+                validateSessionID(record["rootSessionID"], f"{label} root ID")
+                if parentID is not None:
+                    validateSessionID(parentID, f"{label} parent ID")
+                if sessionID in seen:
+                    raise ValueError(f"{label} ancestry contains duplicate session IDs.")
+                seen.add(sessionID)
+
+                if record["status"] != "complete" or record["deletedAt"] is not None:
+                    raise ValueError(f"{label} ancestry must be active and complete.")
+
+                completedAt = record["completedAt"]
+                if (
+                    not isinstance(completedAt, datetime)
+                    or completedAt.tzinfo is None
+                    or completedAt.utcoffset() is None
+                ):
+                    raise ValueError(f"{label} completion timestamp must be timezone-aware.")
+
+                digest = record["manifestHash"]
+                if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                    raise ValueError(f"Invalid {label} manifest hash.")
+                contract = record["contractVersion"]
+                if (
+                    not isinstance(contract, str) or not contract.strip()
+                    or any(character in contract for character in ("\x00", "\n", "\r"))
+                ):
+                    raise ValueError(f"Invalid {label} contract version.")
+
+                if index == 0:
+                    rootID = sessionID
+                    if (
+                        record["origin"] != "raw"
+                        or record["kind"] != "acquired"
+                        or parentID is not None
+                        or record["rootSessionID"] != sessionID
+                    ):
+                        raise ValueError(f"{label} ancestry has an invalid raw root.")
+                elif (
+                    record["origin"] != "derived"
+                    or record["kind"] != "processed"
+                    or parentID != previousID
+                    or record["rootSessionID"] != rootID
+                ):
+                    raise ValueError(f"{label} ancestry has an invalid derived parent/root chain.")
+
+                previousID = sessionID
+
+            return records
+
+        source = validateAncestry(sourceAncestry, "Source")
+        destination = validateAncestry(destinationAncestry, "Destination")
+
+        sourceIDs = {record["sessionID"] for record in source}
+        destinationIDs = {record["sessionID"] for record in destination}
+        if (
+            set(sessionIDMapping) != sourceIDs
+            or set(sessionIDMapping.values()) != destinationIDs
+        ):
+            raise ValueError("Lineage mapping must cover exactly both ancestry chains.")
+
+        mappedOrder = [sessionIDMapping[record["sessionID"]] for record in source]
+        if mappedOrder != [record["sessionID"] for record in destination]:
+            raise ValueError("Mapped ancestry order differs from destination ancestry.")
+
+        checkpoints = []
+        for sourceRecord, destinationRecord in zip(source, destination):
+            sourceParent = sourceRecord["parentSessionID"]
+            expectedParent = (
+                None if sourceParent is None else sessionIDMapping[sourceParent]
+            )
+            expectedRoot = sessionIDMapping[sourceRecord["rootSessionID"]]
+            if (
+                destinationRecord["parentSessionID"] != expectedParent
+                or destinationRecord["rootSessionID"] != expectedRoot
+            ):
+                raise ValueError("Mapped parent/root relationships differ.")
+
+            for field in ("origin", "kind", "contractVersion", "manifestHash"):
+                if sourceRecord[field] != destinationRecord[field]:
+                    raise ValueError(f"Mapped checkpoint {field} differs.")
+
+            checkpoints.append({
+                "sourceSessionID": sourceRecord["sessionID"],
+                "destinationSessionID": destinationRecord["sessionID"],
+                "sourceParentSessionID": sourceParent,
+                "destinationParentSessionID": expectedParent,
+                "sourceRootSessionID": sourceRecord["rootSessionID"],
+                "destinationRootSessionID": expectedRoot,
+                "origin": sourceRecord["origin"],
+                "kind": sourceRecord["kind"],
+                "contractVersion": sourceRecord["contractVersion"],
+                "manifestHash": sourceRecord["manifestHash"],
+            })
+
+        return {
+            "sourceDatabaseID": sourceDatabaseID,
+            "destinationDatabaseID": destinationDatabaseID,
+            "checkpoints": checkpoints,
+        }
+        
+    @classmethod
+    def _inspectExportHistoryReferences(
+        cls, history, *, sourceDatabaseID, sourceSessionIDs,
+    ):
+        """Check structured action-input references for the initial export scope.
+
+        history:
+            Metadata restored through _readSessionHistory(). Do not pass raw
+            JSON in place of restored history: argument paths may contain
+            typed mapping keys encoded by the PGL serializer.
+
+        sourceDatabaseID / sourceSessionIDs:
+            Explicit source UUID and selected ancestry IDs established by the
+            caller's database inspection. This method does not verify SQL.
+
+        Initial supported scope:
+            Version-2 actionInputs records.
+            Empty replay metadata or an explicit workingObject replay marker.
+            Qualified checkpoint inputs entirely within the selected source
+            ancestry. Null references are reported as unbound working inputs.
+            No recorded product consumption.
+
+        Rejects:
+            Missing/legacy/unspecified action inputs.
+            Endpoint-based checkpoint replay records.
+            External or out-of-scope qualified references.
+            Nonempty actionProductInputs, whose product availability requires
+            a separate verification implementation.
+
+        Empty action history is supported. An absent history file is a
+        separate manifest-contract case, not an empty history inferred here.
+
+        Returns structured checkpoint-reference coverage and unbound-input
+        positions. This is NOT universal dependency completeness, replay
+        portability, mapping evidence, or foreign-resolution authorization.
+
+        Preserves historical references and labels without rewriting them.
+        Does not query SQL, resolve products, read scientific payloads, mutate
+        history, or infer saved product membership from owner references.
+        """
+        from copy import deepcopy
+        from uuid import UUID
+
+        from .pglPipeline import pglActionable, pglActionHistory
+
+        if not isinstance(history, pglActionable):
+            raise TypeError("history must be restored pglActionable metadata.")
+
+        if not isinstance(sourceDatabaseID, str):
+            raise ValueError("sourceDatabaseID must be a canonical nonzero UUID.")
+        try:
+            parsedID = UUID(sourceDatabaseID)
+        except (ValueError, AttributeError) as error:
+            raise ValueError("Invalid sourceDatabaseID.") from error
+        if str(parsedID) != sourceDatabaseID or parsedID.int == 0:
+            raise ValueError("sourceDatabaseID must be a canonical nonzero UUID.")
+
+        if type(sourceSessionIDs) is not list or not sourceSessionIDs:
+            raise ValueError("sourceSessionIDs must be a nonempty list.")
+        if any(
+            type(value) is not int or not 0 <= value <= 9223372036854775807
+            for value in sourceSessionIDs
+        ):
+            raise ValueError("Source session IDs must be nonnegative PostgreSQL bigints.")
+        if len(set(sourceSessionIDs)) != len(sourceSessionIDs):
+            raise ValueError("Source session IDs must be unique.")
+        selectedIDs = set(sourceSessionIDs)
+
+        entries = history.actionHistory
+        references = []
+        unboundInputs = []
+
+        for actionIndex, entry in enumerate(entries):
+            if not isinstance(entry, pglActionHistory):
+                raise TypeError("History contains an unsupported action-history object.")
+
+            productInputs = entry.actionProductInputs
+            if type(productInputs) is not list:
+                raise ValueError("Recorded product inputs must be a list.")
+            if productInputs:
+                raise ValueError(
+                    f"Action {actionIndex}: product-consumption verification "
+                    "is not implemented for this export scope."
+                )
+
+            # Work on copies: validation and reporting must not edit history.
+            record = deepcopy(entry.actionInput)
+            if (
+                type(record) is not dict
+                or record.get("kind") != "actionInputs"
+            ):
+                raise ValueError(
+                    f"Action {actionIndex}: legacy or unspecified action inputs "
+                    "are unsupported by this export scope."
+                )
+            pglActionHistory.validateActionInputs(record)
+
+            replay = record["replayInput"]
+            if replay and replay != {"version": 1, "kind": "workingObject"}:
+                raise ValueError(
+                    f"Action {actionIndex}: checkpoint replay metadata requires "
+                    "separate endpoint-portability verification."
+                )
+
+            for inputIndex, item in enumerate(record["inputs"]):
+                position = {
+                    "actionIndex": actionIndex,
+                    "inputIndex": inputIndex,
+                }
+                reference = item["checkpoint"]
+                if reference is None:
+                    unboundInputs.append(position)
+                    continue
+
+                if (
+                    reference["databaseID"] != sourceDatabaseID
+                    or reference["sessionID"] not in selectedIDs
+                ):
+                    raise ValueError(
+                        f"Action {actionIndex}, input {inputIndex}: checkpoint "
+                        "reference is outside the selected source ancestry."
+                    )
+
+                references.append({
+                    **position,
+                    "checkpoint": deepcopy(reference),
+                })
+
+        return {
+            "sourceDatabaseID": sourceDatabaseID,
+            "sourceSessionIDs": list(sourceSessionIDs),
+            "actionCount": len(entries),
+            "checkpointReferences": references,
+            "unboundWorkingInputs": unboundInputs,
+            "structuredCheckpointReferencesCovered": True,
+            "dependencyCompletenessEstablished": False,
+        }
+        
+    @classmethod
+    def _prepareExportSessionMetadata(
+        cls, sourceRecord, sourceCreator, sourceManifest, *,
+        sourceDatabaseID, verifiedLabels,
+    ):
+        """Project source metadata for the initial byte-preserving export path.
+
+        sourceRecord:
+            Full JSON-compatible session row, using SQL column names.
+            Timestamp fields must use timezone-aware ISO-8601 strings, as
+            returned by PostgreSQL to_jsonb(session). This is not an ancestry
+            record or a native tuple containing Python datetime objects.
+
+        sourceCreator:
+            Exact fields: sourceUserID, username, displayName.
+            Identifies the source creator only. Does not authorize creation,
+            matching, or impersonation of a destination user.
+
+        verifiedLabels:
+            Labels independently read/verified from archived checkpoint
+            metadata. Must agree with sourceRecord.meta.pgl_session_labels.
+            This method checks correspondence, not how labels were obtained.
+
+        Returns:
+            preservedFields:
+                Source acquisition/descriptive fields and complete meta object.
+            sourceProvenance:
+                Source-qualified full catalog snapshot and creator description.
+            destinationManagedFields:
+                Column names the publication coordinator must allocate/set.
+
+        Original publication timestamps and saved_timezone are retained in
+        sourceProvenance, not copied into destination publication fields.
+        Historical payload bytes are neither regenerated nor rewritten.
+
+        Initial scope requires explicit catalog labels. Unknown columns,
+        missing columns, or unsupported representations block projection.
+        Source/destination lineage and other comparison helpers remain separate.
+
+        This is a proposed publication projection, not a mapping verification
+        document, schema migration, or proof of source authenticity. Persisting
+        sourceProvenance requires the later versioned evidence protocol.
+
+        Does not query/write SQL, create users, read payloads, mutate inputs,
+        select a destination actor/timezone, or authorize foreign resolution.
+        """
+        from copy import deepcopy
+        from datetime import datetime
+        from uuid import UUID
+
+        expectedFields = {
+            "session_id", "root_session_id", "parent_session_id",
+            "origin", "kind", "instrument", "ingest_method", "acquired_at",
+            "manifest_hash", "modalities", "status", "description", "meta",
+            "contract_version", "created_by", "created_at", "started_at",
+            "completed_at", "deleted_at", "checkpoint_name", "saved_timezone",
+        }
+        if type(sourceRecord) is not dict or set(sourceRecord) != expectedFields:
+            raise ValueError("Source session metadata has missing or unsupported columns.")
+        if type(sourceCreator) is not dict or set(sourceCreator) != {
+            "sourceUserID", "username", "displayName",
+        }:
+            raise ValueError("Invalid source creator metadata.")
+
+        sourceRecord = deepcopy(sourceRecord)
+        sourceCreator = deepcopy(sourceCreator)
+        sourceManifest = deepcopy(sourceManifest)
+        verifiedLabels = deepcopy(verifiedLabels)
+
+        if not isinstance(sourceDatabaseID, str):
+            raise ValueError("sourceDatabaseID must be a canonical nonzero UUID.")
+        try:
+            parsedID = UUID(sourceDatabaseID)
+        except (ValueError, AttributeError) as error:
+            raise ValueError("Invalid sourceDatabaseID.") from error
+        if str(parsedID) != sourceDatabaseID or parsedID.int == 0:
+            raise ValueError("sourceDatabaseID must be a canonical nonzero UUID.")
+
+        def validateID(value, label):
+            if type(value) is not int or not 0 <= value <= 9223372036854775807:
+                raise ValueError(f"{label} must be a nonnegative PostgreSQL bigint.")
+
+        def validateText(value, label, *, nullable=True, nonblank=False):
+            if value is None and nullable: return
+            if (
+                not isinstance(value, str) or "\x00" in value
+                or (nonblank and not value.strip())
+            ):
+                raise ValueError(f"Invalid {label}.")
+
+        def parseTimestamp(value, label, *, nullable):
+            """Validate JSON timestamp representation without rewriting it."""
+            if value is None and nullable: return None
+            if not isinstance(value, str):
+                raise ValueError(f"{label} must be a timezone-aware ISO timestamp.")
+            try:
+                parsed = datetime.fromisoformat(value)
+            except ValueError as error:
+                raise ValueError(f"Invalid {label} timestamp.") from error
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                raise ValueError(f"{label} must be a timezone-aware ISO timestamp.")
+            return parsed
+
+        for field in ("session_id", "root_session_id", "created_by"):
+            validateID(sourceRecord[field], field)
+        parentID = sourceRecord["parent_session_id"]
+        if parentID is not None: validateID(parentID, "parent_session_id")
+        validateID(sourceCreator["sourceUserID"], "sourceUserID")
+        if sourceCreator["sourceUserID"] != sourceRecord["created_by"]:
+            raise ValueError("Source creator does not match the session creator ID.")
+
+        validateText(sourceCreator["username"], "source username", nullable=False, nonblank=True)
+        validateText(sourceCreator["displayName"], "source display name")
+        for field in ("instrument", "description", "checkpoint_name"):
+            validateText(sourceRecord[field], field)
+        if sourceRecord["ingest_method"] not in (None, "manual", "automated"):
+            raise ValueError("Unsupported source ingest method.")
+        savedTimezone = sourceRecord["saved_timezone"]
+        validateText(savedTimezone, "saved_timezone", nonblank=True)
+        if savedTimezone is not None and savedTimezone != savedTimezone.strip():
+            raise ValueError("saved_timezone must not contain surrounding whitespace.")
+
+        if sourceRecord["status"] != "complete" or sourceRecord["deleted_at"] is not None:
+            raise ValueError("Source checkpoint must be active and complete.")
+
+        parseTimestamp(sourceRecord["created_at"], "created_at", nullable=False)
+        startedAt = parseTimestamp(sourceRecord["started_at"], "started_at", nullable=True)
+        completedAt = parseTimestamp(sourceRecord["completed_at"], "completed_at", nullable=False)
+        parseTimestamp(sourceRecord["acquired_at"], "acquired_at", nullable=True)
+        if startedAt is not None and completedAt < startedAt:
+            raise ValueError("Source completion precedes its publication start.")
+
+        manifestIdentity = cls._compareExportManifestIdentity(sourceManifest, sourceManifest)
+        contract = manifestIdentity["contractVersion"]
+        if (
+            sourceRecord["contract_version"] != contract
+            or sourceRecord["manifest_hash"] != manifestIdentity["sha256"]
+        ):
+            raise ValueError("Source catalog manifest identity differs from the supplied manifest.")
+
+        raw = contract.startswith("pgl.raw.")
+        expectedOrigin, expectedKind = ("raw", "acquired") if raw else ("derived", "processed")
+        if (sourceRecord["origin"], sourceRecord["kind"]) != (expectedOrigin, expectedKind):
+            raise ValueError("Source origin/kind disagrees with its manifest contract.")
+
+        sessionID = sourceRecord["session_id"]
+        rootID = sourceRecord["root_session_id"]
+        if raw:
+            if parentID is not None or rootID != sessionID:
+                raise ValueError("Invalid raw source lineage.")
+        elif parentID is None or parentID == sessionID or rootID == sessionID:
+            raise ValueError("Invalid derived source lineage.")
+
+        modalities = sourceRecord["modalities"]
+        expectedModalities = set()
+        if sourceManifest["runs"]: expectedModalities.add("behavior")
+        if "mne" in sourceManifest: expectedModalities.add("mne")
+        if "mri" in sourceManifest: expectedModalities.add("mri")
+        if (
+            type(modalities) is not list
+            or any(not isinstance(value, str) for value in modalities)
+            or len(modalities) != len(set(modalities))
+            or set(modalities) != expectedModalities
+        ):
+            raise ValueError("Source modalities disagree with manifest contents.")
+
+        metadata = sourceRecord["meta"]
+        if type(metadata) is not dict or "pgl_session_labels" not in metadata:
+            raise ValueError("Initial export requires explicit source catalog labels.")
+
+        cls._validateSessionLabelMetadata(
+            verifiedLabels, runCount=len(sourceManifest["runs"]),
+        )
+        cls._validateSessionLabelMetadata(
+            metadata["pgl_session_labels"], runCount=len(sourceManifest["runs"]),
+        )
+        if pglStorage.encodeJSON(metadata["pgl_session_labels"]) != pglStorage.encodeJSON(verifiedLabels):
+            raise ValueError("Source catalog labels differ from verified archived labels.")
+
+        # Reject unsupported JSON values while preserving every original meta
+        # field. Arbitrary metadata is retained, not interpreted as dependencies.
+        pglStorage.encodeJSON(sourceRecord)
+        pglStorage.encodeJSON(sourceCreator)
+
+        preservedNames = (
+            "instrument", "ingest_method", "acquired_at", "modalities",
+            "description", "checkpoint_name", "meta",
+        )
+        managedNames = (
+            "session_id", "root_session_id", "parent_session_id",
+            "origin", "kind", "contract_version", "manifest_hash",
+            "status", "deleted_at", "created_by", "created_at",
+            "started_at", "completed_at", "saved_timezone",
+        )
+
+        return {
+            "preservedFields": {
+                name: deepcopy(sourceRecord[name]) for name in preservedNames
+            },
+            "sourceProvenance": {
+                "sourceDatabaseID": sourceDatabaseID,
+                "sourceSessionID": sessionID,
+                "sessionMetadata": sourceRecord,
+                "creator": sourceCreator,
+            },
+            "destinationManagedFields": list(managedNames),
+        }
+        
+    @classmethod
+    def _buildExportMappingEvidence(
+        cls, *,
+        sourceDatabaseID, destinationDatabaseID,
+        sourceRecord, sourceCreator, destinationRecord, destinationCreator,
+        sourceManifest, destinationManifest,
+        sourceFiles, destinationFiles,
+        sourceMatrices, destinationMatrices,
+        sourceAncestry, destinationAncestry, sessionIDMapping,
+        verifiedLabels, history,
+    ):
+        """Build internally checked byte-preserving export evidence.
+
+        Initial scope:
+            pgl.raw.behavior.v1 and pgl.derived.behavior.v3.
+            Unchanged manifests, checkpoint files, matrix revisions/descriptors.
+            Explicit one-to-one root-to-selected lineage mapping.
+            The existing bounded history-reference policy.
+
+        Inputs must be caller observations from the checked source snapshot
+        and destination publication transaction. File/matrix inventories must
+        come from the corresponding catalog and payload verification steps.
+
+        history:
+            None only when the validated raw manifest has no history file.
+            Otherwise metadata restored from the verified saved history bytes.
+            This method does not independently bind an arbitrary history
+            object to those bytes; the coordinator must establish that binding.
+
+        Re-runs existing comparison/projection helpers. Requires the selected
+        source and destination catalog records to agree with their ancestry
+        records, and preserved destination metadata to match source metadata.
+
+        Returns an independent JSON-compatible document for the future
+        session_export_mappings.verification protocol.
+
+        This is an application-attestation builder, not proof that supplied
+        observations were collected, storage was hashed, or SQL rows exist.
+        Strict grid coverage is a REQUIRED publication policy, not a check
+        performed by this pure builder. Supplied layout flags are not trusted.
+
+        No verification timestamps are fabricated. Destination publication
+        timestamps retain their original meaning. Editable annotations are
+        captured as publication snapshots, not permanent reuse constraints.
+
+        Does not query SQL, hash/read payloads, decode chunks, register mappings,
+        authorize foreign resolution, mutate inputs, or establish authenticity.
+        Structural validation and actual destination-binding checks remain
+        separate required implementation steps.
+        """
+        from copy import deepcopy
+        from datetime import datetime
+
+        sourceRecord = deepcopy(sourceRecord)
+        destinationRecord = deepcopy(destinationRecord)
+        sourceManifest = deepcopy(sourceManifest)
+        destinationManifest = deepcopy(destinationManifest)
+
+        manifestIdentity = cls._compareExportManifestIdentity(
+            sourceManifest, destinationManifest,
+        )
+        if manifestIdentity["contractVersion"] not in {
+            "pgl.raw.behavior.v1", "pgl.derived.behavior.v3",
+        }:
+            raise ValueError("Mapping evidence v1 supports only the initial behavioral contracts.")
+
+        # Inventories must describe these exact manifests, not a different
+        # internally consistent pair passed alongside them.
+        for label, inventory, manifest in (
+            ("Source", sourceFiles, sourceManifest),
+            ("Destination", destinationFiles, destinationManifest),
+        ):
+            if type(inventory) is not dict:
+                raise TypeError(f"{label} file inventory must be a dictionary.")
+            cls._compareExportManifestIdentity(manifest, inventory.get("manifest"))
+
+        fileComparison = cls._compareExportFileInventory(
+            sourceFiles, destinationFiles,
+        )
+        matrixComparison = cls._compareExportMatrixInventory(
+            sourceMatrices, destinationMatrices,
+            sourceManifest=sourceManifest,
+            destinationManifest=destinationManifest,
+        )
+        lineage = cls._compareExportCheckpointLineage(
+            sourceAncestry, destinationAncestry,
+            sourceDatabaseID=sourceDatabaseID,
+            destinationDatabaseID=destinationDatabaseID,
+            sessionIDMapping=sessionIDMapping,
+        )
+
+        sourceProjection = cls._prepareExportSessionMetadata(
+            sourceRecord, sourceCreator, sourceManifest,
+            sourceDatabaseID=sourceDatabaseID,
+            verifiedLabels=verifiedLabels,
+        )
+        destinationProjection = cls._prepareExportSessionMetadata(
+            destinationRecord, destinationCreator, destinationManifest,
+            sourceDatabaseID=destinationDatabaseID,
+            verifiedLabels=verifiedLabels,
+        )
+        if (
+            pglStorage.encodeJSON(sourceProjection["preservedFields"])
+            != pglStorage.encodeJSON(destinationProjection["preservedFields"])
+        ):
+            raise ValueError("Destination preserved metadata differs from source.")
+
+        sourceID = sourceRecord["session_id"]
+        destinationID = destinationRecord["session_id"]
+        if sessionIDMapping.get(sourceID) != destinationID:
+            raise ValueError("Selected catalog records disagree with the explicit mapping.")
+
+        # The full-chain comparator validates chain shape. Here bind the
+        # selected records to that chain instead of trusting unrelated reports.
+        fieldPairs = (
+            ("session_id", "sessionID"),
+            ("parent_session_id", "parentSessionID"),
+            ("root_session_id", "rootSessionID"),
+            ("origin", "origin"),
+            ("kind", "kind"),
+            ("status", "status"),
+            ("deleted_at", "deletedAt"),
+            ("manifest_hash", "manifestHash"),
+            ("contract_version", "contractVersion"),
+        )
+        for label, record, ancestry in (
+            ("Source", sourceRecord, sourceAncestry),
+            ("Destination", destinationRecord, destinationAncestry),
+        ):
+            matches = [
+                item for item in ancestry
+                if item["sessionID"] == record["session_id"]
+            ]
+            if len(matches) != 1:
+                raise ValueError(f"{label} selected record is absent from its ancestry.")
+            checkpoint = matches[0]
+            if any(record[column] != checkpoint[field] for column, field in fieldPairs):
+                raise ValueError(f"{label} selected metadata differs from its ancestry.")
+            if datetime.fromisoformat(record["completed_at"]) != checkpoint["completedAt"]:
+                raise ValueError(f"{label} completion time differs from its ancestry.")
+
+        historyFiles = [
+            record for record in fileComparison["files"]
+            if record["name"] == "history.json"
+        ]
+        if not historyFiles:
+            if manifestIdentity["contractVersion"] != "pgl.raw.behavior.v1" or history is not None:
+                raise ValueError("History absence does not match the supported raw contract.")
+            historyEvidence = {
+                "state": "absentUnderContract",
+                "identity": None,
+                "referenceInspection": None,
+            }
+        else:
+            if len(historyFiles) != 1 or history is None:
+                raise ValueError("Verified restored history is required for this manifest.")
+            inspection = cls._inspectExportHistoryReferences(
+                history,
+                sourceDatabaseID=sourceDatabaseID,
+                sourceSessionIDs=[item["sessionID"] for item in sourceAncestry],
+            )
+            historyEvidence = {
+                "state": "present",
+                "identity": {
+                    field: historyFiles[0][field]
+                    for field in ("sha256", "size_bytes")
+                },
+                "referenceInspection": inspection,
+            }
+
+        destinationPublication = {
+            "creator": deepcopy(destinationCreator),
+            **{
+                name: destinationRecord[name]
+                for name in (
+                    "created_at", "started_at", "completed_at", "saved_timezone",
+                )
+            },
+        }
+        evidence = {
+            "contractVersion": "pgl.session.export.bytePreserving.v1",
+            "source": {
+                "databaseID": sourceDatabaseID,
+                "sessionID": sourceID,
+                "manifestHash": manifestIdentity["sha256"],
+                "contractVersion": manifestIdentity["contractVersion"],
+            },
+            "destination": {
+                "databaseID": destinationDatabaseID,
+                "sessionID": destinationID,
+                "manifestHash": manifestIdentity["sha256"],
+                "contractVersion": manifestIdentity["contractVersion"],
+            },
+            "manifest": sourceManifest,
+            "lineage": lineage,
+            "sourceProvenance": sourceProjection["sourceProvenance"],
+            "preservedMetadataAtPublication": sourceProjection["preservedFields"],
+            "destinationPublication": destinationPublication,
+            "files": {
+                "records": fileComparison["files"],
+                "logicalBytes": fileComparison["logicalBytes"],
+            },
+            "matrices": {
+                field: matrixComparison[field]
+                for field in ("attachments", "revisions", "bundleBytes")
+            },
+            "history": historyEvidence,
+            "verificationPolicy": {
+                "transferMode": "bytePreserving",
+                "requiredMatrixCoverage": "allGridChunks",
+                "historyReferencePolicy": "selectedAncestryActionInputsV2NoProductConsumption",
+                "evidenceMeaning": "callerAttestationWithInternalCorrespondenceChecks",
+                "dependencyCompletenessEstablished": False,
+                "scientificValuesVerified": False,
+                "publicationTimeMatrixIntegrityEstablished": False,
+                "sourceAuthenticityEstablishedByDocument": False,
+                "atomicFilesystemSQLPublication": False,
+                "foreignResolutionAuthorizedByDocument": False,
+            },
+        }
+
+        # Require canonical JSON encodability without changing native historical
+        # values or inventing string representations for unsupported objects.
+        pglStorage.encodeJSON(evidence)
+        return deepcopy(evidence)
+    
+    @classmethod
+    def _validateExportMappingEvidence(cls, evidence):
+        """Validate the persisted initial byte-preserving evidence document.
+
+        Supports pgl.session.export.bytePreserving.v1 for behavioral chains:
+            Raw root: pgl.raw.behavior.v1.
+            Derived checkpoints: pgl.derived.behavior.v3.
+
+        Checks exact document fields, JSON types, qualified identities,
+        manifest correspondence, explicit lineage, source metadata projection,
+        file/matrix identities and totals, bounded history-reference reports,
+        destination publication metadata, and fixed verification limitations.
+
+        Validates stored facts directly. Does not fabricate catalog records,
+        restored histories, timestamps, or verification observations.
+
+        Returns an independent copy of the validated document.
+        Errors propagate; unsupported forms are rejected.
+
+        IMPORTANT:
+            Structurally consistent evidence can still be invented.
+            Successful validation does not establish source authenticity,
+            actual SQL/payload existence, current visibility, scientific
+            validity, performed byte verification, or foreign authorization.
+
+        Caller must separately bind this document to its mapping-table row,
+        the actual destination database/checkpoint/lineage, and the required
+        destination catalog/payload checks.
+
+        No SQL, filesystem access, scientific restoration, mapping insertion,
+        input mutation, or bundleInventoryComplete promotion.
+        """
+        from copy import deepcopy
+        from datetime import datetime
+        from uuid import UUID
+        import math
+        import re
+
+        def requireFields(value, fields, label):
+            if type(value) is not dict or set(value) != set(fields):
+                raise ValueError(f"{label}: missing or unexpected fields.")
+
+        def requireJSON(value, active):
+            """Reject non-JSON Python values rather than silently coercing them."""
+            if value is None or type(value) in (str, bool, int): return
+            if type(value) is float:
+                if not math.isfinite(value): raise ValueError("Evidence contains nonfinite JSON.")
+                return
+            if type(value) not in (dict, list):
+                raise ValueError("Evidence must contain only plain JSON types.")
+            if id(value) in active: raise ValueError("Evidence contains a cycle.")
+            active.add(id(value))
+            try:
+                children = value.values() if type(value) is dict else value
+                if type(value) is dict and any(type(key) is not str for key in value):
+                    raise ValueError("Evidence JSON keys must be strings.")
+                for child in children: requireJSON(child, active)
+            finally:
+                active.remove(id(value))
+
+        def requireEqual(left, right, label):
+            # Canonical comparison distinguishes JSON true from integer 1.
+            if pglStorage.encodeJSON(left) != pglStorage.encodeJSON(right):
+                raise ValueError(f"{label}: values disagree.")
+
+        def validateID(value, label):
+            if type(value) is not int or not 0 <= value <= 9223372036854775807:
+                raise ValueError(f"{label}: invalid PostgreSQL bigint.")
+
+        def validateCount(value, label):
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{label}: invalid count/size.")
+
+        def validateUUID(value, label):
+            if type(value) is not str:
+                raise ValueError(f"{label}: invalid UUID.")
+            try:
+                parsed = UUID(value)
+            except ValueError as error:
+                raise ValueError(f"{label}: invalid UUID.") from error
+            if str(parsed) != value or not parsed.int:
+                raise ValueError(f"{label}: UUID must be canonical and nonzero.")
+
+        def validateText(value, label, *, nullable=False):
+            if value is None and nullable: return
+            if (
+                type(value) is not str or not value.strip()
+                or any(character in value for character in ("\x00", "\n", "\r"))
+            ):
+                raise ValueError(f"{label}: invalid text.")
+
+        def validateHash(value, label):
+            if type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+                raise ValueError(f"{label}: invalid SHA-256.")
+
+        def validatePath(value):
+            if (
+                type(value) is not str or not value or value.startswith("/")
+                or "\\" in value
+                or any(character in value for character in ("\x00", "\n", "\r"))
+                or any(part in ("", ".", "..") for part in value.split("/"))
+            ):
+                raise ValueError("Invalid evidence-relative file path.")
+
+        def parseTimestamp(value, label, *, nullable=False):
+            if value is None and nullable: return None
+            if type(value) is not str:
+                raise ValueError(f"{label}: expected ISO timestamp.")
+            try:
+                parsed = datetime.fromisoformat(value)
+            except ValueError as error:
+                raise ValueError(f"{label}: invalid timestamp.") from error
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                raise ValueError(f"{label}: timestamp must be timezone-aware.")
+            return parsed
+
+        requireJSON(evidence, set())
+        requireFields(evidence, {
+            "contractVersion", "source", "destination", "manifest", "lineage",
+            "sourceProvenance", "preservedMetadataAtPublication",
+            "destinationPublication", "files", "matrices", "history",
+            "verificationPolicy",
+        }, "Evidence")
+        if evidence["contractVersion"] != "pgl.session.export.bytePreserving.v1":
+            raise ValueError("Unsupported mapping evidence contract.")
+        evidence = deepcopy(evidence)
+
+        expectedPolicy = {
+            "transferMode": "bytePreserving",
+            "requiredMatrixCoverage": "allGridChunks",
+            "historyReferencePolicy": "selectedAncestryActionInputsV2NoProductConsumption",
+            "evidenceMeaning": "callerAttestationWithInternalCorrespondenceChecks",
+            "dependencyCompletenessEstablished": False,
+            "scientificValuesVerified": False,
+            "publicationTimeMatrixIntegrityEstablished": False,
+            "sourceAuthenticityEstablishedByDocument": False,
+            "atomicFilesystemSQLPublication": False,
+            "foreignResolutionAuthorizedByDocument": False,
+        }
+        requireEqual(evidence["verificationPolicy"], expectedPolicy, "Verification policy")
+
+        manifest = evidence["manifest"]
+        manifestIdentity = cls._compareExportManifestIdentity(manifest, manifest)
+        if manifestIdentity["contractVersion"] not in {
+            "pgl.raw.behavior.v1", "pgl.derived.behavior.v3",
+        }:
+            raise ValueError("Unsupported evidence manifest contract.")
+
+        for label in ("source", "destination"):
+            endpoint = evidence[label]
+            requireFields(endpoint, {
+                "databaseID", "sessionID", "manifestHash", "contractVersion",
+            }, label)
+            validateUUID(endpoint["databaseID"], f"{label} database")
+            validateID(endpoint["sessionID"], f"{label} session")
+            validateHash(endpoint["manifestHash"], f"{label} manifest")
+            requireEqual(
+                [endpoint["manifestHash"], endpoint["contractVersion"]],
+                [manifestIdentity["sha256"], manifestIdentity["contractVersion"]],
+                f"{label} manifest binding",
+            )
+
+        source = evidence["source"]
+        destination = evidence["destination"]
+        if source["databaseID"] == destination["databaseID"]:
+            raise ValueError("Evidence requires distinct source/destination databases.")
+
+        lineage = evidence["lineage"]
+        requireFields(lineage, {
+            "sourceDatabaseID", "destinationDatabaseID", "checkpoints",
+        }, "Lineage")
+        requireEqual(
+            [lineage["sourceDatabaseID"], lineage["destinationDatabaseID"]],
+            [source["databaseID"], destination["databaseID"]],
+            "Lineage database binding",
+        )
+        chain = lineage["checkpoints"]
+        if type(chain) is not list or not chain:
+            raise ValueError("Evidence lineage must be a nonempty list.")
+
+        sourceIDs, destinationIDs = [], []
+        for index, record in enumerate(chain):
+            requireFields(record, {
+                "sourceSessionID", "destinationSessionID",
+                "sourceParentSessionID", "destinationParentSessionID",
+                "sourceRootSessionID", "destinationRootSessionID",
+                "origin", "kind", "contractVersion", "manifestHash",
+            }, "Lineage checkpoint")
+            for field in (
+                "sourceSessionID", "destinationSessionID",
+                "sourceRootSessionID", "destinationRootSessionID",
+            ):
+                validateID(record[field], field)
+            for field in ("sourceParentSessionID", "destinationParentSessionID"):
+                if record[field] is not None: validateID(record[field], field)
+            validateHash(record["manifestHash"], "Lineage manifest")
+
+            if (
+                record["sourceSessionID"] in sourceIDs
+                or record["destinationSessionID"] in destinationIDs
+            ):
+                raise ValueError("Lineage mapping must be one-to-one without duplicate IDs.")
+            sourceIDs.append(record["sourceSessionID"])
+            destinationIDs.append(record["destinationSessionID"])
+
+            if index == 0:
+                requireEqual(
+                    [record["origin"], record["kind"], record["contractVersion"]],
+                    ["raw", "acquired", "pgl.raw.behavior.v1"],
+                    "Raw lineage contract",
+                )
+                expectedParents = [None, None]
+            else:
+                requireEqual(
+                    [record["origin"], record["kind"], record["contractVersion"]],
+                    ["derived", "processed", "pgl.derived.behavior.v3"],
+                    "Derived lineage contract",
+                )
+                expectedParents = [sourceIDs[index - 1], destinationIDs[index - 1]]
+
+            requireEqual(
+                [record["sourceParentSessionID"], record["destinationParentSessionID"]],
+                expectedParents, "Lineage parent relationships",
+            )
+            requireEqual(
+                [record["sourceRootSessionID"], record["destinationRootSessionID"]],
+                [sourceIDs[0], destinationIDs[0]], "Lineage root relationships",
+            )
+
+        if source["sessionID"] not in sourceIDs:
+            raise ValueError("Selected source checkpoint is absent from lineage.")
+        selected = chain[sourceIDs.index(source["sessionID"])]
+        requireEqual(
+            [selected["destinationSessionID"], selected["manifestHash"], selected["contractVersion"]],
+            [destination["sessionID"], source["manifestHash"], source["contractVersion"]],
+            "Selected lineage binding",
+        )
+
+        provenance = evidence["sourceProvenance"]
+        requireFields(provenance, {
+            "sourceDatabaseID", "sourceSessionID", "sessionMetadata", "creator",
+        }, "Source provenance")
+        requireEqual(
+            [provenance["sourceDatabaseID"], provenance["sourceSessionID"]],
+            [source["databaseID"], source["sessionID"]],
+            "Source provenance binding",
+        )
+        sourceMetadata = provenance["sessionMetadata"]
+        if (
+            type(sourceMetadata) is not dict
+            or type(sourceMetadata.get("meta")) is not dict
+            or "pgl_session_labels" not in sourceMetadata["meta"]
+        ):
+            raise ValueError("Source evidence lacks explicit catalog labels.")
+
+        # Reuse metadata representation checks. These embedded labels are NOT
+        # independently verified here; only stored internal consistency is tested.
+        projection = cls._prepareExportSessionMetadata(
+            sourceMetadata, provenance["creator"], manifest,
+            sourceDatabaseID=source["databaseID"],
+            verifiedLabels=sourceMetadata["meta"]["pgl_session_labels"],
+        )
+        requireEqual(projection["sourceProvenance"], provenance, "Source metadata projection")
+        requireEqual(
+            projection["preservedFields"], evidence["preservedMetadataAtPublication"],
+            "Preserved metadata snapshot",
+        )
+        for column, field in (
+            ("session_id", "sourceSessionID"),
+            ("parent_session_id", "sourceParentSessionID"),
+            ("root_session_id", "sourceRootSessionID"),
+            ("origin", "origin"), ("kind", "kind"),
+            ("manifest_hash", "manifestHash"), ("contract_version", "contractVersion"),
+        ):
+            requireEqual(sourceMetadata[column], selected[field], "Source metadata/lineage binding")
+
+        publication = evidence["destinationPublication"]
+        requireFields(publication, {
+            "creator", "created_at", "started_at", "completed_at", "saved_timezone",
+        }, "Destination publication")
+        creator = publication["creator"]
+        requireFields(creator, {"sourceUserID", "username", "displayName"}, "Destination creator")
+        # Retain the builder's existing creator representation. Here sourceUserID
+        # is the observed destination creator ID, not a source-database user ID.
+        validateID(creator["sourceUserID"], "Destination creator ID")
+        if (
+            type(creator["username"]) is not str or not creator["username"].strip()
+            or "\x00" in creator["username"]
+        ):
+            raise ValueError("Invalid destination creator username.")
+        if creator["displayName"] is not None and (
+            type(creator["displayName"]) is not str or "\x00" in creator["displayName"]
+        ):
+            raise ValueError("Invalid destination creator display name.")
+        parseTimestamp(publication["created_at"], "Destination creation")
+        started = parseTimestamp(publication["started_at"], "Destination start", nullable=True)
+        completed = parseTimestamp(publication["completed_at"], "Destination completion")
+        if started is not None and completed < started:
+            raise ValueError("Destination completion precedes start.")
+        timezoneName = publication["saved_timezone"]
+        if timezoneName is not None:
+            validateText(timezoneName, "Destination timezone")
+            if timezoneName != timezoneName.strip():
+                raise ValueError("Destination timezone has surrounding whitespace.")
+
+        files = evidence["files"]
+        requireFields(files, {"records", "logicalBytes"}, "Files")
+        if type(files["records"]) is not list:
+            raise ValueError("Evidence file records must be a list.")
+        payloadRole = "acquisition" if selected["origin"] == "raw" else "derived"
+        expectedFiles = {
+            item["name"]: {
+                "sha256": item["sha256"], "size_bytes": item["size_bytes"],
+                "role": "history" if item["name"] == "history.json" else payloadRole,
+            }
+            for item in manifest["files"]
+        }
+        if "manifest.json" in expectedFiles:
+            raise ValueError("Reserved manifest filename in payload inventory.")
+        expectedFiles["manifest.json"] = {
+            "sha256": manifestIdentity["sha256"],
+            "size_bytes": manifestIdentity["size_bytes"],
+            "role": "manifest",
+        }
+        names = []
+        for record in files["records"]:
+            requireFields(record, {
+                "name", "sha256", "size_bytes", "role", "subjectID",
+            }, "File record")
+            validatePath(record["name"])
+            validateHash(record["sha256"], "File identity")
+            validateID(record["size_bytes"], "File size")
+            if record["name"] not in expectedFiles:
+                raise ValueError("Unexpected evidence file.")
+            requireEqual(
+                {key: record[key] for key in ("sha256", "size_bytes", "role")},
+                expectedFiles[record["name"]], "File/manifest correspondence",
+            )
+            subject = record["subjectID"]
+            if subject is not None and (
+                type(subject) is not str or not subject.strip() or "\x00" in subject
+            ):
+                raise ValueError("Invalid evidence subject ID.")
+            names.append(record["name"])
+        if names != sorted(expectedFiles):
+            raise ValueError("Evidence files must exactly cover the manifest in sorted order.")
+        validateCount(files["logicalBytes"], "Logical bytes")
+        if files["logicalBytes"] != sum(item["size_bytes"] for item in files["records"]):
+            raise ValueError("Evidence logical byte total differs.")
+
+        matrices = evidence["matrices"]
+        requireFields(matrices, {"attachments", "revisions", "bundleBytes"}, "Matrices")
+        if type(matrices["attachments"]) is not list or type(matrices["revisions"]) is not list:
+            raise ValueError("Evidence matrix collections must be lists.")
+        products = cls._validateSessionProductRecords(manifest.get("products", []))
+        expectedAttachments = sorted([
+            {
+                "catalogName": item["name"], "owner": "session",
+                "localName": item["name"], "matrixRevisionID": item["matrixRevisionID"],
+            }
+            for item in products
+        ], key=lambda item: item["catalogName"])
+        requireEqual(matrices["attachments"], expectedAttachments, "Matrix attachment correspondence")
+        expectedRevisionIDs = sorted({item["matrixRevisionID"] for item in products})
+        revisionIDs = []
+
+        for revision in matrices["revisions"]:
+            requireFields(revision, {
+                "matrixRevisionID", "contractVersion", "descriptor", "files", "bundleBytes",
+            }, "Matrix revision")
+            validateUUID(revision["matrixRevisionID"], "Matrix revision")
+            if revision["contractVersion"] != pglStorage.MATRIX_CONTRACT:
+                raise ValueError("Unsupported matrix evidence contract.")
+            pglStorage._validateMatrixDescriptor(revision["descriptor"])
+            if revision["descriptor"]["matrixRevisionID"] != revision["matrixRevisionID"]:
+                raise ValueError("Matrix descriptor identifies another revision.")
+            if type(revision["files"]) is not list:
+                raise ValueError("Matrix byte records must be a list.")
+
+            matrixNames = []
+            for record in revision["files"]:
+                requireFields(record, {"name", "sha256", "size_bytes"}, "Matrix file")
+                validatePath(record["name"])
+                if record["name"] != "matrix.json" and not record["name"].startswith("data.zarr/"):
+                    raise ValueError("Unexpected matrix bundle filename.")
+                validateHash(record["sha256"], "Matrix file hash")
+                validateCount(record["size_bytes"], "Matrix file size")
+                matrixNames.append(record["name"])
+            if matrixNames != sorted(set(matrixNames)):
+                raise ValueError("Matrix filenames must be unique and sorted.")
+            if not {
+                "matrix.json", "data.zarr/.zgroup", "data.zarr/.zattrs", "data.zarr/.zmetadata",
+            }.issubset(matrixNames):
+                raise ValueError("Matrix evidence lacks required metadata files.")
+            validateCount(revision["bundleBytes"], "Matrix bundle bytes")
+            if revision["bundleBytes"] != sum(item["size_bytes"] for item in revision["files"]):
+                raise ValueError("Matrix bundle byte total differs.")
+            revisionIDs.append(revision["matrixRevisionID"])
+
+        if revisionIDs != expectedRevisionIDs:
+            raise ValueError("Matrix revisions must exactly cover declared products in sorted order.")
+        validateCount(matrices["bundleBytes"], "Aggregate matrix bytes")
+        if matrices["bundleBytes"] != sum(item["bundleBytes"] for item in matrices["revisions"]):
+            raise ValueError("Aggregate matrix byte total differs.")
+
+        history = evidence["history"]
+        requireFields(history, {"state", "identity", "referenceInspection"}, "History")
+        historyIdentity = expectedFiles.get("history.json")
+        if historyIdentity is None:
+            requireEqual(history, {
+                "state": "absentUnderContract",
+                "identity": None,
+                "referenceInspection": None,
+            }, "Absent history")
+            if source["contractVersion"] != "pgl.raw.behavior.v1":
+                raise ValueError("Unsupported history absence.")
+        else:
+            if history["state"] != "present":
+                raise ValueError("Manifest requires present history evidence.")
+            requireEqual(
+                history["identity"],
+                {key: historyIdentity[key] for key in ("sha256", "size_bytes")},
+                "History file binding",
+            )
+            report = history["referenceInspection"]
+            requireFields(report, {
+                "sourceDatabaseID", "sourceSessionIDs", "actionCount",
+                "checkpointReferences", "unboundWorkingInputs",
+                "structuredCheckpointReferencesCovered", "dependencyCompletenessEstablished",
+            }, "History reference inspection")
+            requireEqual(
+                [report["sourceDatabaseID"], report["sourceSessionIDs"]],
+                [source["databaseID"], sourceIDs], "History scope",
+            )
+            requireEqual(
+                [report["structuredCheckpointReferencesCovered"], report["dependencyCompletenessEstablished"]],
+                [True, False], "History verification limits",
+            )
+            validateCount(report["actionCount"], "History action count")
+            positions = set()
+
+            for field in ("checkpointReferences", "unboundWorkingInputs"):
+                records = report[field]
+                if type(records) is not list:
+                    raise ValueError("History input reports must be lists.")
+                orderedPositions = []
+                for record in records:
+                    fields = {"actionIndex", "inputIndex"}
+                    if field == "checkpointReferences": fields.add("checkpoint")
+                    requireFields(record, fields, "History input position")
+                    validateCount(record["actionIndex"], "Action index")
+                    validateCount(record["inputIndex"], "Input index")
+                    if record["actionIndex"] >= report["actionCount"]:
+                        raise ValueError("History action index is outside action count.")
+                    position = (record["actionIndex"], record["inputIndex"])
+                    if position in positions:
+                        raise ValueError("Duplicate or overlapping history input positions.")
+                    positions.add(position)
+                    orderedPositions.append(position)
+
+                    if field == "checkpointReferences":
+                        reference = record["checkpoint"]
+                        requireFields(reference, {
+                            "databaseID", "sessionID", "databaseName",
+                        }, "History checkpoint")
+                        validateUUID(reference["databaseID"], "History database")
+                        validateID(reference["sessionID"], "History session")
+                        validateText(reference["databaseName"], "History database label")
+                        if (
+                            reference["databaseID"] != source["databaseID"]
+                            or reference["sessionID"] not in sourceIDs
+                        ):
+                            raise ValueError("History reference is outside declared lineage.")
+                if orderedPositions != sorted(orderedPositions):
+                    raise ValueError("History input positions must be ordered.")
+
+        pglStorage.encodeJSON(evidence)
+        return evidence
+    
+    @classmethod
+    def _verifyExportDestinationCatalog(cls, connection, postgres, evidence):
+        """Bind validated export evidence to actual destination catalog records.
+
+        Transaction modes:
+            REPEATABLE READ / SERIALIZABLE, READ ONLY for inspection.
+            READ COMMITTED with an already-held session publication lock for
+            publication. Does not acquire that lock or change transactions.
+
+        Checks migration compatibility and actual stable database UUID, the
+        complete recorded destination chain, selected checkpoint metadata and
+        publication fields, exact file links, and matrix attachments/descriptors.
+
+        Later checkpoint_name/description edits are permitted. Source metadata
+        and original annotation snapshots in evidence remain unchanged.
+
+        File locations must be catalog-eligible; matrix backends must be active.
+        Catalog eligibility is NOT a fresh payload-byte verification.
+
+        Returns a bounded catalog-binding result explicitly requiring payload
+        verification. Does not insert/read an export mapping row or authorize
+        foreign resolution. Mapping-row correspondence remains separate.
+
+        Source authenticity and the historical verification claims cannot be
+        established from destination catalogs alone.
+
+        No payload access, scientific loading, writes, commits, lock acquisition,
+        automatic cleanup, or mutation of the supplied evidence.
+        """
+        from datetime import datetime
+
+        from psycopg.rows import tuple_row
+
+        checked = cls._validateExportMappingEvidence(evidence)
+        cls._requireMigrationInspectionTransaction(connection)
+
+        sessions = sql.Identifier(postgres.databaseSchema, "session")
+        links = sql.Identifier(postgres.databaseSchema, "session_files")
+        files = sql.Identifier(postgres.databaseSchema, "files")
+        locations = sql.Identifier(postgres.databaseSchema, "storage_locations")
+        backends = sql.Identifier(postgres.databaseSchema, "storage_backends")
+        products = sql.Identifier(postgres.databaseSchema, "session_products")
+        revisions = sql.Identifier(postgres.databaseSchema, "matrix_revisions")
+
+        with connection.cursor(row_factory=tuple_row) as cursor:
+            cursor.execute("SHOW transaction_isolation")
+            isolation = cursor.fetchone()[0]
+            cursor.execute("SHOW transaction_read_only")
+            readOnly = cursor.fetchone()[0]
+
+            if isolation in ("repeatable read", "serializable") and readOnly == "on":
+                pass
+            elif isolation == "read committed" and readOnly == "off":
+                # Verify ownership of the already-acquired relation lock.
+                # A normal RowExclusiveLock from INSERT is not sufficient.
+                cursor.execute(sql.SQL("""
+                    /* exportDestinationPublicationLock */
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM pg_catalog.pg_locks AS held
+                        WHERE held.pid = pg_catalog.pg_backend_pid()
+                          AND held.locktype = 'relation'
+                          AND held.relation = %s::regclass
+                          AND held.granted
+                          AND held.mode IN (
+                              'ShareRowExclusiveLock',
+                              'ExclusiveLock',
+                              'AccessExclusiveLock'
+                          )
+                    )
+                """), (sessions.as_string(connection),))
+                if cursor.fetchone() != (True,):
+                    raise ValueError("Destination catalog verification requires the publication lock.")
+            else:
+                raise ValueError("Unsupported transaction mode for destination catalog verification.")
+
+        actualDatabaseID = cls._requireStableDatabaseIdentity(connection, postgres)
+        if actualDatabaseID != checked["destination"]["databaseID"]:
+            raise ValueError("Actual destination database UUID differs from evidence.")
+
+        expectedChain = checked["lineage"]["checkpoints"]
+        destinationIDs = [record["destinationSessionID"] for record in expectedChain]
+        destinationID = checked["destination"]["sessionID"]
+
+        with connection.cursor(row_factory=tuple_row) as cursor:
+            cursor.execute(sql.SQL("""
+                /* exportDestinationSessionRows */
+                SELECT checkpoint.session_id, to_jsonb(checkpoint)
+                FROM {} AS checkpoint
+                WHERE checkpoint.session_id = ANY(%s::bigint[])
+                ORDER BY checkpoint.session_id
+            """).format(sessions), (destinationIDs,))
+            sessionRows = cursor.fetchall()
+
+        actualSessions = {}
+        for sessionID, record in sessionRows:
+            if (
+                type(sessionID) is not int or sessionID in actualSessions
+                or type(record) is not dict or record.get("session_id") != sessionID
+            ):
+                raise ValueError("Invalid or duplicate destination session catalog record.")
+            actualSessions[sessionID] = record
+
+        if set(actualSessions) != set(destinationIDs):
+            raise ValueError("Destination catalog does not contain the exact evidence chain.")
+
+        def requireEqual(actual, expected, label):
+            if pglStorage.encodeJSON(actual) != pglStorage.encodeJSON(expected):
+                raise ValueError(f"Destination {label} differs from evidence.")
+
+        def parseTimestamp(value, label):
+            if type(value) is not str:
+                raise ValueError(f"Invalid destination {label} timestamp.")
+            try:
+                result = datetime.fromisoformat(value)
+            except ValueError as error:
+                raise ValueError(f"Invalid destination {label} timestamp.") from error
+            if result.tzinfo is None or result.utcoffset() is None:
+                raise ValueError(f"Destination {label} timestamp must be timezone-aware.")
+            return result
+
+        for expected in expectedChain:
+            actual = actualSessions[expected["destinationSessionID"]]
+            if actual.get("status") != "complete" or actual.get("deleted_at") is not None:
+                raise ValueError("Destination lineage contains an inactive or incomplete checkpoint.")
+
+            for column, field in (
+                ("parent_session_id", "destinationParentSessionID"),
+                ("root_session_id", "destinationRootSessionID"),
+                ("origin", "origin"),
+                ("kind", "kind"),
+                ("contract_version", "contractVersion"),
+                ("manifest_hash", "manifestHash"),
+            ):
+                if column not in actual:
+                    raise ValueError(f"Destination lineage lacks {column}.")
+                requireEqual(actual[column], expected[field], f"lineage {column}")
+            parseTimestamp(actual.get("completed_at"), "completion")
+
+        actual = actualSessions[destinationID]
+        sourceMetadata = checked["sourceProvenance"]["sessionMetadata"]
+        if set(actual) != set(sourceMetadata):
+            raise ValueError("Destination session schema differs from the supported metadata columns.")
+
+        for field, value in checked["preservedMetadataAtPublication"].items():
+            # These annotations are explicitly editable after completion.
+            if field in ("checkpoint_name", "description"): continue
+            requireEqual(actual[field], value, f"preserved {field}")
+
+        publication = checked["destinationPublication"]
+        requireEqual(
+            actual["created_by"], publication["creator"]["sourceUserID"],
+            "publication creator ID",
+        )
+        requireEqual(actual["saved_timezone"], publication["saved_timezone"], "saved timezone")
+        for field in ("created_at", "started_at", "completed_at"):
+            actualValue, expectedValue = actual[field], publication[field]
+            if actualValue is None or expectedValue is None:
+                requireEqual(actualValue, expectedValue, field)
+            elif parseTimestamp(actualValue, field) != parseTimestamp(expectedValue, field):
+                raise ValueError(f"Destination publication {field} differs from evidence.")
+
+        # Creator labels are snapshots, not cross-database identity authority.
+        # The actual immutable destination creator ID is bound above; label
+        # edits in users do not invalidate an otherwise matching checkpoint.
+
+        with connection.cursor(row_factory=tuple_row) as cursor:
+            cursor.execute(sql.SQL("""
+                /* exportDestinationFileRows */
+                SELECT link.name, content.file_id, content.sha256,
+                       content.size_bytes, link.role, link.subject_id,
+                       link.deleted_at, content.deleted_at,
+                       EXISTS (
+                           SELECT 1
+                           FROM {} AS location
+                           JOIN {} AS backend ON backend.backend_id = location.backend_id
+                           WHERE location.file_id = content.file_id
+                             AND location.deleted_at IS NULL
+                             AND location.status = 'present'
+                             AND location.verified_at IS NOT NULL
+                             AND backend.is_active
+                       )
+                FROM {} AS link
+                LEFT JOIN {} AS content ON content.file_id = link.file_id
+                WHERE link.session_id = %s
+                ORDER BY link.name
+            """).format(locations, backends, links, files), (destinationID,))
+            fileRows = cursor.fetchall()
+
+        actualFiles = []
+        seenNames = set()
+        identitiesByID = {}
+        for name, fileID, digest, size, role, subjectID, linkDeleted, contentDeleted, eligible in fileRows:
+            if (
+                not isinstance(name, str) or name in seenNames
+                or type(fileID) is not int or fileID < 0
+                or type(size) is not int or size < 0
+            ):
+                raise ValueError("Invalid destination file catalog record.")
+            if linkDeleted is not None or contentDeleted is not None or eligible is not True:
+                raise ValueError("Destination file lacks active catalog links/content/locations.")
+            identity = (digest, size)
+            if fileID in identitiesByID and identitiesByID[fileID] != identity:
+                raise ValueError("Destination file ID has conflicting identities.")
+            identitiesByID[fileID] = identity
+            seenNames.add(name)
+            actualFiles.append({
+                "name": name, "sha256": digest, "size_bytes": size,
+                "role": role, "subjectID": subjectID,
+            })
+
+        requireEqual(actualFiles, checked["files"]["records"], "file catalog")
+
+        with connection.cursor(row_factory=tuple_row) as cursor:
+            cursor.execute(sql.SQL("""
+                /* exportDestinationMatrixRows */
+                SELECT product.product_name, product.matrix_revision_id::text,
+                       revision.contract_version, revision.descriptor,
+                       revision.backend_id, revision.object_key,
+                       backend.url_prefix, backend.is_active
+                FROM {} AS product
+                LEFT JOIN {} AS revision
+                  ON revision.matrix_revision_id = product.matrix_revision_id
+                LEFT JOIN {} AS backend ON backend.backend_id = revision.backend_id
+                WHERE product.session_id = %s
+                ORDER BY product.product_name
+            """).format(products, revisions, backends), (destinationID,))
+            matrixRows = cursor.fetchall()
+
+        expectedRevisions = {
+            record["matrixRevisionID"]: record
+            for record in checked["matrices"]["revisions"]
+        }
+        actualAttachments = []
+        seenProducts = set()
+        observedRevisions = {}
+
+        for name, revisionID, contract, descriptor, backendID, key, root, active in matrixRows:
+            if not isinstance(name, str) or name in seenProducts:
+                raise ValueError("Invalid or duplicate destination matrix attachment.")
+            if revisionID not in expectedRevisions:
+                raise ValueError("Unexpected destination matrix revision.")
+            if type(backendID) is not int or backendID < 0 or active is not True:
+                raise ValueError("Destination matrix backend is missing, invalid, or inactive.")
+            if (
+                not isinstance(key, str) or not key or key.startswith("/")
+                or "\\" in key
+                or any(character in key for character in ("\x00", "\n", "\r"))
+                or any(part in ("", ".", "..") for part in key.split("/"))
+                or not isinstance(root, str) or not root.strip()
+                or any(character in root for character in ("\x00", "\n", "\r"))
+            ):
+                raise ValueError("Invalid destination matrix storage location.")
+
+            expected = expectedRevisions[revisionID]
+            requireEqual(contract, expected["contractVersion"], "matrix contract")
+            requireEqual(descriptor, expected["descriptor"], "matrix descriptor")
+            location = {
+                "backendID": backendID, "objectKey": key, "registeredRoot": root,
+            }
+            if revisionID in observedRevisions:
+                requireEqual(location, observedRevisions[revisionID], "shared matrix location")
+            observedRevisions[revisionID] = location
+            seenProducts.add(name)
+            actualAttachments.append({
+                "catalogName": name, "owner": "session", "localName": name,
+                "matrixRevisionID": revisionID,
+            })
+
+        requireEqual(
+            actualAttachments, checked["matrices"]["attachments"],
+            "matrix attachments",
+        )
+        if set(observedRevisions) != set(expectedRevisions):
+            raise ValueError("Destination matrix revisions do not exactly cover evidence.")
+
+        return {
+            "destinationDatabaseID": actualDatabaseID,
+            "destinationSessionID": destinationID,
+            "catalogBindingChecked": True,
+            "lineageCheckpointCount": len(destinationIDs),
+            "fileCount": len(actualFiles),
+            "matrixRevisionCount": len(observedRevisions),
+            "payloadBytesVerified": False,
+            "requiresPayloadVerification": True,
+            "mappingRowBindingChecked": False,
+            "foreignResolutionAuthorized": False,
+        }
+        
+    @classmethod
+    def _verifyExportDestinationPayloads(
+        cls, connection, postgres, evidence, *, storageOptionsByBackend=None,
+        progress=None,
+    ):
+        """Verify current destination bytes against validated mapping evidence.
+
+        Requires the transaction/locking conditions enforced by
+        _verifyExportDestinationCatalog(). Rechecks that binding after I/O.
+
+        Checkpoint files:
+            Select the first eligible catalog location in priority/backend/key
+            order. Hash every logical file against evidence. No fallback.
+
+        Matrices:
+            Resolve each distinct registered revision and verify its descriptor,
+            exact stored-file inventory, and strict grid-chunk coverage.
+
+        Returns selected locations and actual verified byte totals. Does not
+        persist verification results or refresh catalog verification timestamps.
+
+        Owns a bounded pglDatabaseAccess context. Closes it on success/failure.
+        Local selected paths receive ancestor-symlink checks.
+
+        Catalog checks and hashing are not an atomic snapshot. Concurrent
+        payload mutation is unsupported. Generic backend safety depends on
+        accurate listings and metadata.
+
+        Does not establish source authenticity, integrity since original matrix
+        publication, scientific decoding/value validity, or universal dependency
+        completeness. Does not bind a mapping-table row or authorize foreign
+        resolution, even when all destination bytes match.
+
+        No SQL writes, copying, cleanup, scientific loading, or commits.
+        Optional progress is a pglProgress-compatible call/section reporter.
+        Ranges allocate work, not elapsed-time estimates. Helpers never
+        finish the enclosing operation. The public caller supplies a
+        display-failure-isolated adapter; direct callback errors propagate.
+
+        """
+        from pathlib import Path
+        import posixpath
+
+        from fsspec.implementations.local import LocalFileSystem
+        from psycopg.rows import tuple_row
+
+        if progress is not None: progress(0, "Checking destination catalog and payload locations")
+        checked = cls._validateExportMappingEvidence(evidence)
+        catalogBefore = cls._verifyExportDestinationCatalog(connection, postgres, checked)
+        sessionID = checked["destination"]["sessionID"]
+
+        links = sql.Identifier(postgres.databaseSchema, "session_files")
+        files = sql.Identifier(postgres.databaseSchema, "files")
+        locations = sql.Identifier(postgres.databaseSchema, "storage_locations")
+        backends = sql.Identifier(postgres.databaseSchema, "storage_backends")
+        revisions = sql.Identifier(postgres.databaseSchema, "matrix_revisions")
+        products = sql.Identifier(postgres.databaseSchema, "session_products")
+
+        with connection.cursor(row_factory=tuple_row) as cursor:
+            cursor.execute(sql.SQL("""
+                /* exportDestinationPayloadFileLocations */
+                SELECT link.name, content.sha256, content.size_bytes,
+                       backend.backend_id, backend.url_prefix, location.object_key
+                FROM {} AS link
+                JOIN {} AS content ON content.file_id = link.file_id
+                JOIN {} AS location ON location.file_id = content.file_id
+                JOIN {} AS backend ON backend.backend_id = location.backend_id
+                WHERE link.session_id = %s
+                  AND link.deleted_at IS NULL
+                  AND content.deleted_at IS NULL
+                  AND location.deleted_at IS NULL
+                  AND location.status = 'present'
+                  AND location.verified_at IS NOT NULL
+                  AND backend.is_active
+                ORDER BY link.name, location.priority,
+                         backend.backend_id, location.object_key
+            """).format(links, files, locations, backends), (sessionID,))
+            fileRows = cursor.fetchall()
+
+            cursor.execute(sql.SQL("""
+                /* exportDestinationPayloadMatrixLocations */
+                SELECT revision.matrix_revision_id::text,
+                       revision.contract_version, revision.descriptor,
+                       revision.backend_id, backend.url_prefix, revision.object_key
+                FROM {} AS revision
+                JOIN {} AS backend ON backend.backend_id = revision.backend_id
+                WHERE backend.is_active
+                  AND EXISTS (
+                      SELECT 1 FROM {} AS product
+                      WHERE product.session_id = %s
+                        AND product.matrix_revision_id = revision.matrix_revision_id
+                  )
+                ORDER BY revision.matrix_revision_id
+            """).format(revisions, backends, products), (sessionID,))
+            matrixRows = cursor.fetchall()
+
+        def validateLocation(backendID, root, key):
+            if type(backendID) is not int or not 0 <= backendID <= 9223372036854775807:
+                raise ValueError("Invalid destination payload backend ID.")
+            if (
+                not isinstance(root, str) or not root.strip()
+                or any(character in root for character in ("\x00", "\n", "\r"))
+                or not isinstance(key, str) or not key or key.startswith("/")
+                or "\\" in key
+                or any(character in key for character in ("\x00", "\n", "\r"))
+                or any(part in ("", ".", "..") for part in key.split("/"))
+            ):
+                raise ValueError("Invalid destination payload location.")
+            return {"backendID": backendID, "registeredRoot": root, "objectKey": key}
+
+        def requireLocalSafe(filesystem, path):
+            if isinstance(filesystem, LocalFileSystem):
+                localPath = Path(path).absolute()
+                for candidate in (localPath, *localPath.parents):
+                    if candidate.is_symlink():
+                        raise ValueError(f"Symlinked destination payload path: {candidate}")
+
+        expectedFiles = {record["name"]: record for record in checked["files"]["records"]}
+        selectedFiles = {}
+        for name, digest, size, backendID, root, key in fileRows:
+            if name not in expectedFiles:
+                raise ValueError("Unexpected destination payload file link.")
+            expected = expectedFiles[name]
+            if (
+                type(size) is not int
+                or digest != expected["sha256"] or size != expected["size_bytes"]
+            ):
+                raise ValueError("Destination payload catalog identity differs from evidence.")
+            if name not in selectedFiles:
+                selectedFiles[name] = validateLocation(backendID, root, key)
+
+        if set(selectedFiles) != set(expectedFiles):
+            raise ValueError("Destination files lack eligible registered payload locations.")
+
+        expectedMatrices = {
+            record["matrixRevisionID"]: record
+            for record in checked["matrices"]["revisions"]
+        }
+        selectedMatrices = {}
+        for revisionID, contract, descriptor, backendID, root, key in matrixRows:
+            if revisionID not in expectedMatrices or revisionID in selectedMatrices:
+                raise ValueError("Unexpected or duplicate destination matrix location.")
+            expected = expectedMatrices[revisionID]
+            if (
+                contract != expected["contractVersion"]
+                or pglStorage.encodeJSON(descriptor) != pglStorage.encodeJSON(expected["descriptor"])
+            ):
+                raise ValueError("Destination matrix catalog differs from evidence.")
+            selectedMatrices[revisionID] = validateLocation(backendID, root, key)
+
+        if set(selectedMatrices) != set(expectedMatrices):
+            raise ValueError("Destination matrix revisions lack eligible locations.")
+
+        fileResults = []
+        matrixResults = []
+        fileWork = [expectedFiles[name] for name in sorted(expectedFiles)]
+        matrixWork = [
+            {"name": revisionID, "size_bytes": expectedMatrices[revisionID]["bundleBytes"]}
+            for revisionID in sorted(expectedMatrices)
+        ]
+        fileWeight = sum(max(1, record["size_bytes"]) for record in fileWork)
+        matrixWeight = sum(max(1, record["size_bytes"]) for record in matrixWork)
+        # Floating-point rounding must not exceed the next section's endpoint.
+        split = min(0.95, max(0.05, 0.05 + 0.90 * fileWeight / max(1, fileWeight + matrixWeight)))
+        filesProgress = progress.section(0.05, split) if progress is not None else None
+        matricesProgress = progress.section(split, 0.95) if progress is not None else None
+        with pglDatabaseAccess(postgres, storageOptionsByBackend) as access:
+            for item, fileProgress in pglProgress.fileSections(fileWork, filesProgress):
+                name = item["name"]
+                location = selectedFiles[name]
+                filesystem, root = access.resolve(
+                    location["backendID"], location["registeredRoot"],
+                )
+                path = posixpath.join(root, location["objectKey"])
+                requireLocalSafe(filesystem, path)
+                actual = pglStorage.hashFile(
+                    filesystem, path, progress=fileProgress,
+                    expectedSize=expectedFiles[name]["size_bytes"],
+                    description="Verifying destination file",
+                )
+                expected = {
+                    field: expectedFiles[name][field]
+                    for field in ("sha256", "size_bytes")
+                }
+                if actual != expected:
+                    raise ValueError(f"Destination payload bytes differ from evidence: {name}")
+                fileResults.append({"name": name, **actual, "location": location})
+
+            for item, matrixProgress in pglProgress.fileSections(matrixWork, matricesProgress):
+                revisionID = item["name"]
+                expected = expectedMatrices[revisionID]
+                location = selectedMatrices[revisionID]
+                filesystem, root = access.resolve(
+                    location["backendID"], location["registeredRoot"],
+                )
+                path = posixpath.join(root, location["objectKey"])
+                requireLocalSafe(filesystem, path)
+                actual = pglStorage.inventoryDataMatrixBundleLayout(
+                    path,
+                    filesystem=filesystem,
+                    expectedDescriptor=expected["descriptor"],
+                    expectedFiles=expected["files"],
+                    requireAllChunks=True,
+                    progress=matrixProgress,
+                )
+                if actual["bundleBytes"] != expected["bundleBytes"]:
+                    raise ValueError("Verified destination matrix byte total differs from evidence.")
+                matrixResults.append({
+                    "matrixRevisionID": revisionID,
+                    "bundleBytes": actual["bundleBytes"],
+                    "location": location,
+                })
+
+        if progress is not None: progress(0.95, "Rechecking destination catalog after payload hashing")
+        catalogAfter = cls._verifyExportDestinationCatalog(connection, postgres, checked)
+        if catalogAfter != catalogBefore:
+            raise ValueError("Destination catalog binding changed during payload verification.")
+        if progress is not None: progress(1, "Destination payload bytes verified")
+
+        return {
+            "destinationDatabaseID": checked["destination"]["databaseID"],
+            "destinationSessionID": sessionID,
+            "files": fileResults,
+            "matrices": matrixResults,
+            "logicalFileBytes": sum(record["size_bytes"] for record in fileResults),
+            "matrixBundleBytes": sum(record["bundleBytes"] for record in matrixResults),
+            "payloadBytesVerified": True,
+            "strictMatrixCoverageChecked": True,
+            "mappingRowBindingChecked": False,
+            "foreignResolutionAuthorized": False,
+        }
+        
+    @classmethod
+    def _validateExportMappingBinding(cls, inspection):
+        """Check mapping/evidence correspondence in a foreign-reference inspection.
+
+        inspection:
+            Result of _inspectCheckpointReference() for a foreign reference.
+            Must be an active completed candidate requiring verification.
+
+        Validates:
+            Requested source-qualified reference against evidence.
+            Actual inspected destination UUID and selected checkpoint ID.
+            Mapping source/destination manifest hashes and contracts.
+            Selected destination parent/root, origin-independent contract/hash
+            identity, completion timestamp, and current active completed state.
+            Mapping registration metadata representation.
+
+        Profile labels are descriptive, not identity authority.
+        Mapping registeredBy need not equal the destination checkpoint creator.
+        Current checkpoint annotations may differ from publication snapshots.
+
+        Returns validated evidence and explicit bindings, without authorizing
+        foreign resolution or claiming catalog/payload verification.
+
+        This is pure correspondence validation of supplied observations.
+        The caller must obtain inspection from the actual destination database
+        in an appropriate transaction, then perform current destination catalog
+        and payload verification under the intended authorization policy.
+
+        Does not query SQL, inspect other mapping rows in the chain, validate
+        source authenticity, insert mappings, mutate inspection, or change
+        requiresVerification in the original inspector result.
+        """
+        from copy import deepcopy
+        from datetime import datetime
+
+        requiredFields = {
+            "reference", "destinationDatabaseID", "resolutionKind",
+            "destinationSessionID", "state", "checkpoint", "mapping",
+            "requiresVerification",
+        }
+        if type(inspection) is not dict or set(inspection) != requiredFields:
+            raise ValueError("Invalid checkpoint-reference inspection fields.")
+        inspection = deepcopy(inspection)
+
+        if (
+            inspection["resolutionKind"] != "exportMapping"
+            or inspection["state"] != "candidate"
+            or inspection["requiresVerification"] is not True
+        ):
+            raise ValueError("Mapping binding requires an unverified foreign candidate.")
+
+        def requireFields(value, fields, label):
+            if type(value) is not dict or set(value) != set(fields):
+                raise ValueError(f"Invalid {label} fields.")
+
+        def requireEqual(actual, expected, label):
+            if pglStorage.encodeJSON(actual) != pglStorage.encodeJSON(expected):
+                raise ValueError(f"{label} differs from mapping evidence.")
+
+        def validateLabel(value, label):
+            if (
+                type(value) is not str or not value.strip()
+                or any(character in value for character in ("\x00", "\n", "\r"))
+            ):
+                raise ValueError(f"Invalid {label}.")
+
+        def requireTimestamp(value, label):
+            if (
+                not isinstance(value, datetime)
+                or value.tzinfo is None or value.utcoffset() is None
+            ):
+                raise ValueError(f"{label} must be a timezone-aware datetime.")
+
+        reference = inspection["reference"]
+        requireFields(reference, {"databaseID", "sessionID", "databaseName"}, "reference")
+        validateLabel(reference["databaseName"], "reference database label")
+
+        mapping = inspection["mapping"]
+        requireFields(mapping, {
+            "destinationSessionID", "sourceDatabaseName",
+            "sourceManifestHash", "destinationManifestHash",
+            "sourceContractVersion", "destinationContractVersion",
+            "verification", "registeredBy", "registeredAt",
+        }, "mapping")
+        validateLabel(mapping["sourceDatabaseName"], "mapping source label")
+        if (
+            type(mapping["registeredBy"]) is not int
+            or not 0 <= mapping["registeredBy"] <= 9223372036854775807
+        ):
+            raise ValueError("Invalid mapping registrant ID.")
+        requireTimestamp(mapping["registeredAt"], "Mapping registration time")
+
+        evidence = cls._validateExportMappingEvidence(mapping["verification"])
+        source = evidence["source"]
+        destination = evidence["destination"]
+
+        requireEqual(reference["databaseID"], source["databaseID"], "Requested source database")
+        requireEqual(reference["sessionID"], source["sessionID"], "Requested source session")
+        requireEqual(
+            inspection["destinationDatabaseID"], destination["databaseID"],
+            "Inspected destination database",
+        )
+        requireEqual(
+            inspection["destinationSessionID"], destination["sessionID"],
+            "Inspected destination session",
+        )
+        requireEqual(
+            mapping["destinationSessionID"], destination["sessionID"],
+            "Mapping destination session",
+        )
+        for field, expected in (
+            ("sourceManifestHash", source["manifestHash"]),
+            ("destinationManifestHash", destination["manifestHash"]),
+            ("sourceContractVersion", source["contractVersion"]),
+            ("destinationContractVersion", destination["contractVersion"]),
+        ):
+            requireEqual(mapping[field], expected, field)
+
+        checkpoint = inspection["checkpoint"]
+        requireFields(checkpoint, {
+            "status", "deletedAt", "manifestHash", "contractVersion",
+            "checkpointName", "description", "completedAt",
+            "parentSessionID", "rootSessionID",
+        }, "checkpoint")
+        if checkpoint["status"] != "complete" or checkpoint["deletedAt"] is not None:
+            # includeDeleted=True may still produce a candidate; it must not
+            # make a deleted destination eligible for this binding operation.
+            raise ValueError("Mapping destination must be active and complete.")
+
+        requireEqual(checkpoint["manifestHash"], destination["manifestHash"], "Checkpoint manifest")
+        requireEqual(
+            checkpoint["contractVersion"], destination["contractVersion"],
+            "Checkpoint contract",
+        )
+        selected = next(
+            record for record in evidence["lineage"]["checkpoints"]
+            if record["sourceSessionID"] == source["sessionID"]
+        )
+        requireEqual(
+            checkpoint["parentSessionID"], selected["destinationParentSessionID"],
+            "Checkpoint parent",
+        )
+        requireEqual(
+            checkpoint["rootSessionID"], selected["destinationRootSessionID"],
+            "Checkpoint root",
+        )
+        requireTimestamp(checkpoint["completedAt"], "Checkpoint completion time")
+        if checkpoint["completedAt"] != datetime.fromisoformat(
+            evidence["destinationPublication"]["completed_at"]
+        ):
+            raise ValueError("Checkpoint completion time differs from mapping evidence.")
+
+        return {
+            "sourceDatabaseID": source["databaseID"],
+            "sourceSessionID": source["sessionID"],
+            "destinationDatabaseID": destination["databaseID"],
+            "destinationSessionID": destination["sessionID"],
+            "evidence": evidence,
+            "mappingRowCorrespondenceChecked": True,
+            "requiresDestinationVerification": True,
+            "foreignResolutionAuthorized": False,
+        }
+        
+    @classmethod
+    def _inspectExistingSessionExport(
+        cls, connection, postgres, reference, *, storageOptionsByBackend=None,
+        progress=None,
+    ):
+        """Inspect an existing foreign export without publishing or repairing it.
+
+        Requires a caller-owned REPEATABLE READ or SERIALIZABLE, READ ONLY
+        transaction. Checks migration compatibility and destination identity.
+
+        Initial reconciliation policy:
+            No selected mapping: return state='unmapped'.
+            Selected mapping exists: require every source-qualified mapping in
+            its recorded chain. Each must contain the same recorded full chain
+            and agree on its selected source/destination binding.
+
+        Runs mapping-row correspondence, actual destination catalog checks, and
+        fresh destination payload verification for every checkpoint in the chain.
+
+        Returns:
+            state: 'unmapped' or 'verifiedExistingExport'.
+            Selected source reference and destination identity.
+            Per-checkpoint mapping bindings and payload verification results.
+
+        An unmapped selected reference does not assert that the destination has
+        no related raw manifests, matrices, or partial earlier exports.
+
+        Successful reconciliation establishes current destination correspondence
+        to stored application evidence. It does not contact or authenticate the
+        source, compare its current annotations, establish scientific validity,
+        authorize publication/reuse, or authorize foreign-reference loading.
+
+        Different recorded export scopes are rejected by this initial policy;
+        merging overlapping independently verified exports is not implemented.
+
+        Reads SQL and payloads only. Does not acquire publication locks, modify
+        transaction settings, insert mappings, retry publication, repair records,
+        delete files, or mutate the supplied reference.
+        Optional progress is a pglProgress-compatible call/section reporter.
+        Ranges allocate work, not elapsed-time estimates. Helpers never
+        finish the enclosing operation. The public caller supplies a
+        display-failure-isolated adapter; direct callback errors propagate.
+
+        """
+        from copy import deepcopy
+
+        from psycopg.rows import tuple_row
+
+        cls._requireMigrationInspectionTransaction(connection)
+        with connection.cursor(row_factory=tuple_row) as cursor:
+            cursor.execute("SHOW transaction_isolation")
+            isolation = cursor.fetchone()[0]
+            cursor.execute("SHOW transaction_read_only")
+            readOnly = cursor.fetchone()[0]
+        if isolation not in ("repeatable read", "serializable") or readOnly != "on":
+            raise ValueError("Existing export inspection requires a consistent read-only transaction.")
+
+        destinationDatabaseID = cls._requireStableDatabaseIdentity(connection, postgres)
+        selectedInspection = cls._inspectCheckpointReference(
+            connection, postgres, deepcopy(reference),
+        )
+        if selectedInspection["resolutionKind"] != "exportMapping":
+            raise ValueError("Existing export inspection requires a foreign checkpoint reference.")
+
+        result = {
+            "reference": deepcopy(selectedInspection["reference"]),
+            "destinationDatabaseID": destinationDatabaseID,
+            "destinationSessionID": selectedInspection["destinationSessionID"],
+            "state": None,
+            "checkpoints": [],
+            "sourceRevalidated": False,
+            "publicationAuthorized": False,
+            "reuseAuthorized": False,
+            "foreignResolutionAuthorized": False,
+        }
+        if selectedInspection["state"] == "unmapped":
+            result["state"] = "unmapped"
+            if progress is not None: progress(1, "Selected checkpoint has no export mapping")
+            return result
+
+        selectedBinding = cls._validateExportMappingBinding(selectedInspection)
+        lineage = selectedBinding["evidence"]["lineage"]
+        lineageBytes = pglStorage.encodeJSON(lineage)
+
+        # An inspector's metadata query identifies the real destination UUID;
+        # retain the explicit match instead of relying only on supplied evidence.
+        if selectedBinding["destinationDatabaseID"] != destinationDatabaseID:
+            raise ValueError("Selected export binding identifies a different destination database.")
+
+        bindings = []
+        for checkpoint in lineage["checkpoints"]:
+            sourceID = checkpoint["sourceSessionID"]
+            chainReference = {
+                "databaseID": selectedBinding["sourceDatabaseID"],
+                "sessionID": sourceID,
+                "databaseName": selectedInspection["reference"]["databaseName"],
+            }
+            inspection = cls._inspectCheckpointReference(
+                connection, postgres, chainReference,
+            )
+            binding = cls._validateExportMappingBinding(inspection)
+
+            if (
+                binding["sourceDatabaseID"] != selectedBinding["sourceDatabaseID"]
+                or binding["destinationDatabaseID"] != destinationDatabaseID
+                or binding["sourceSessionID"] != sourceID
+                or binding["destinationSessionID"] != checkpoint["destinationSessionID"]
+            ):
+                raise ValueError("Existing export chain contains a conflicting mapping.")
+            if pglStorage.encodeJSON(binding["evidence"]["lineage"]) != lineageBytes:
+                raise ValueError("Existing export mappings have different recorded chain scopes.")
+
+            # Match the selected mapping seen at entry as well. A consistent SQL
+            # snapshot protects catalog reads, not external payload mutation.
+            if sourceID == selectedBinding["sourceSessionID"]:
+                if pglStorage.encodeJSON(binding["evidence"]) != pglStorage.encodeJSON(
+                    selectedBinding["evidence"]
+                ):
+                    raise ValueError("Selected mapping evidence changed during inspection.")
+            bindings.append(binding)
+
+        # Establish the full mapping chain before doing expensive payload I/O.
+        work = [
+            {
+                "name": f"Checkpoint {binding['sourceSessionID']}",
+                "size_bytes": (
+                    binding["evidence"]["files"]["logicalBytes"]
+                    + binding["evidence"]["matrices"]["bundleBytes"]
+                ),
+                "binding": binding,
+            }
+            for binding in bindings
+        ]
+        payloadProgress = progress.section(0.05, 0.99) if progress is not None else None
+        for item, checkpointProgress in pglProgress.fileSections(work, payloadProgress):
+            binding = item["binding"]
+            payloads = cls._verifyExportDestinationPayloads(
+                connection, postgres, binding["evidence"],
+                storageOptionsByBackend=storageOptionsByBackend,
+                progress=checkpointProgress,
+            )
+            if (
+                payloads["destinationDatabaseID"] != destinationDatabaseID
+                or payloads["destinationSessionID"] != binding["destinationSessionID"]
+                or payloads["payloadBytesVerified"] is not True
+                or payloads["strictMatrixCoverageChecked"] is not True
+            ):
+                raise ValueError("Existing export payload verification returned inconsistent results.")
+
+            result["checkpoints"].append({
+                "sourceSessionID": binding["sourceSessionID"],
+                "destinationSessionID": binding["destinationSessionID"],
+                "mappingBinding": binding,
+                "payloadVerification": payloads,
+            })
+
+        result["state"] = "verifiedExistingExport"
+        if progress is not None: progress(1, "Existing destination export verified")
+        return result
+    
+    @classmethod
+    def _verifyExportCurrentSource(
+        cls, connection, postgres, reconciliation, *,
+        storageOptionsByBackend=None,
+        progress=None,
+    ):
+        """Verify current source observations against a reconciled export scope.
+
+        reconciliation:
+            Result of _inspectExistingSessionExport() with
+            state='verifiedExistingExport'.
+
+        Requires a caller-owned REPEATABLE READ or SERIALIZABLE, READ ONLY
+        transaction. Revalidates source migrations and stable database UUID.
+
+        Checks:
+            Exact source ancestry matching the recorded full export chain.
+            Current manifests and logical file identities/roles/subjects.
+            Every current source file against its registered/evidence identity.
+            Matrix descriptors, attachments, stored bytes, and strict coverage.
+            Complete source metadata and creator snapshot.
+
+        Source location policy:
+            First eligible file location in catalog order, without fallback.
+            Matrix locations use the existing bundle inventory coordinator.
+
+        Metadata policy:
+            Exact recorded source snapshot, including editable annotations and
+            creator labels. Timestamp strings compare by timezone-aware instant.
+            Drift blocks verification; no refresh or annotation-update policy
+            is inferred.
+
+        Does not reauthenticate a supplied reconciliation result or freshly
+        reverify the destination. The caller must obtain destination
+        reconciliation independently through the real inspection path.
+
+        Exact history bytes are checked through their file identity. This does
+        not rerun history restoration or establish universal dependency closure.
+
+        Owns bounded source payload access. No SQL writes, publication, mapping
+        insertion, repair, cleanup, source authentication, or authorization for
+        reuse/foreign loading.
+
+        Source and destination SQL snapshots are independent. Filesystem
+        hashing is not atomic; concurrent payload mutation remains unsupported.
+        Optional progress is a pglProgress-compatible call/section reporter.
+        Ranges allocate work, not elapsed-time estimates. Helpers never
+        finish the enclosing operation. The public caller supplies a
+        display-failure-isolated adapter; direct callback errors propagate.
+
+        """
+        from copy import deepcopy
+        from datetime import datetime, timezone
+        from pathlib import Path
+        import posixpath
+
+        from fsspec.implementations.local import LocalFileSystem
+        from psycopg.rows import tuple_row
+
+        cls._requireMigrationInspectionTransaction(connection)
+        with connection.cursor(row_factory=tuple_row) as cursor:
+            cursor.execute("SHOW transaction_isolation")
+            isolation = cursor.fetchone()[0]
+            cursor.execute("SHOW transaction_read_only")
+            readOnly = cursor.fetchone()[0]
+        if isolation not in ("repeatable read", "serializable") or readOnly != "on":
+            raise ValueError("Current-source verification requires a consistent read-only transaction.")
+
+        if (
+            type(reconciliation) is not dict
+            or reconciliation.get("state") != "verifiedExistingExport"
+            or type(reconciliation.get("checkpoints")) is not list
+            or not reconciliation["checkpoints"]
+        ):
+            raise ValueError("Current-source verification requires a reconciled existing export.")
+        reconciliation = deepcopy(reconciliation)
+
+        def requireEqual(actual, expected, label):
+            if pglStorage.encodeJSON(actual) != pglStorage.encodeJSON(expected):
+                raise ValueError(f"{label} differs from recorded export evidence.")
+
+        documents = []
+        for item in reconciliation["checkpoints"]:
+            if type(item) is not dict or type(item.get("mappingBinding")) is not dict:
+                raise ValueError("Invalid reconciled checkpoint binding.")
+            binding = item["mappingBinding"]
+            document = cls._validateExportMappingEvidence(binding.get("evidence"))
+            for field in ("sourceSessionID", "destinationSessionID"):
+                endpoint = "source" if field == "sourceSessionID" else "destination"
+                requireEqual(item.get(field), document[endpoint]["sessionID"], field)
+                requireEqual(binding.get(field), document[endpoint]["sessionID"], field)
+            requireEqual(
+                binding.get("sourceDatabaseID"), document["source"]["databaseID"],
+                "Reconciled source UUID",
+            )
+            requireEqual(
+                binding.get("destinationDatabaseID"), document["destination"]["databaseID"],
+                "Reconciled destination UUID",
+            )
+            documents.append(document)
+
+        lineage = documents[0]["lineage"]
+        chain = lineage["checkpoints"]
+        sourceDatabaseID = lineage["sourceDatabaseID"]
+        destinationDatabaseID = lineage["destinationDatabaseID"]
+
+        requireEqual(
+            reconciliation.get("destinationDatabaseID"), destinationDatabaseID,
+            "Reconciliation destination",
+        )
+        reference = reconciliation.get("reference")
+        if type(reference) is not dict:
+            raise ValueError("Reconciliation lacks its selected reference.")
+        requireEqual(reference.get("databaseID"), sourceDatabaseID, "Selected source database")
+        selected = [
+            item for item in chain if item["sourceSessionID"] == reference.get("sessionID")
+        ]
+        if len(selected) != 1:
+            raise ValueError("Selected source reference is outside the recorded chain.")
+        requireEqual(
+            reconciliation.get("destinationSessionID"),
+            selected[0]["destinationSessionID"], "Selected destination",
+        )
+
+        requireEqual(
+            [document["source"]["sessionID"] for document in documents],
+            [item["sourceSessionID"] for item in chain],
+            "Reconciled full-chain coverage",
+        )
+        for document, item in zip(documents, chain):
+            requireEqual(document["lineage"], lineage, "Recorded chain scope")
+            requireEqual(
+                document["destination"]["sessionID"], item["destinationSessionID"],
+                "Recorded destination mapping",
+            )
+
+        actualSourceID = cls._requireStableDatabaseIdentity(connection, postgres)
+        if actualSourceID != sourceDatabaseID:
+            raise ValueError("Actual source database UUID differs from recorded export evidence.")
+
+        ancestry = cls._readExportAncestry(
+            connection, postgres, chain[-1]["sourceSessionID"],
+        )
+        requireEqual(
+            [item["sessionID"] for item in ancestry],
+            [item["sourceSessionID"] for item in chain],
+            "Current source ancestry scope",
+        )
+
+        def normalizeTimes(record):
+            """Preserve all fields while comparing timestamps by instant."""
+            if type(record) is not dict:
+                raise ValueError("Source metadata must contain a catalog object.")
+            result = deepcopy(record)
+            for field in (
+                "created_at", "started_at", "completed_at", "acquired_at", "deleted_at",
+            ):
+                if field not in result:
+                    raise ValueError(f"Source metadata lacks {field}.")
+                value = result[field]
+                if value is None: continue
+                if type(value) is not str:
+                    raise ValueError(f"Invalid source timestamp representation: {field}")
+                try:
+                    parsed = datetime.fromisoformat(value)
+                except ValueError as error:
+                    raise ValueError(f"Invalid source timestamp: {field}") from error
+                if parsed.tzinfo is None or parsed.utcoffset() is None:
+                    raise ValueError(f"Source timestamp must be timezone-aware: {field}")
+                result[field] = parsed.astimezone(timezone.utc).isoformat()
+            return result
+
+        def validateLocation(location):
+            if type(location) is not dict:
+                raise ValueError("Invalid source payload location.")
+            backendID = location.get("backendID")
+            root = location.get("registeredRoot")
+            key = location.get("objectKey")
+            if type(backendID) is not int or not 0 <= backendID <= 9223372036854775807:
+                raise ValueError("Invalid source backend ID.")
+            if (
+                not isinstance(root, str) or not root.strip()
+                or any(character in root for character in ("\x00", "\n", "\r"))
+                or not isinstance(key, str) or not key or key.startswith("/")
+                or "\\" in key
+                or any(character in key for character in ("\x00", "\n", "\r"))
+                or any(part in ("", ".", "..") for part in key.split("/"))
+            ):
+                raise ValueError("Invalid selected source payload path.")
+            return {"backendID": backendID, "registeredRoot": root, "objectKey": key}
+
+        sessions = sql.Identifier(postgres.databaseSchema, "session")
+        users = sql.Identifier(postgres.databaseSchema, "users")
+        results = []
+
+        work = [
+            {
+                "name": f"Source checkpoint {checkpoint['sessionID']}",
+                "size_bytes": document["files"]["logicalBytes"] + document["matrices"]["bundleBytes"],
+                "checkpoint": checkpoint, "expectedChain": expectedChain, "document": document,
+            }
+            for checkpoint, expectedChain, document in zip(ancestry, chain, documents)
+        ]
+        sourceProgress = progress.section(0.02, 0.99) if progress is not None else None
+        with pglDatabaseAccess(postgres, storageOptionsByBackend) as access:
+            for item, checkpointProgress in pglProgress.fileSections(work, sourceProgress):
+                checkpoint = item["checkpoint"]
+                expectedChain = item["expectedChain"]
+                document = item["document"]
+                sessionID = checkpoint["sessionID"]
+                for actualField, recordedField in (
+                    ("sessionID", "sourceSessionID"),
+                    ("parentSessionID", "sourceParentSessionID"),
+                    ("rootSessionID", "sourceRootSessionID"),
+                    ("origin", "origin"), ("kind", "kind"),
+                    ("manifestHash", "manifestHash"),
+                    ("contractVersion", "contractVersion"),
+                ):
+                    requireEqual(
+                        checkpoint[actualField], expectedChain[recordedField],
+                        f"Source checkpoint {sessionID} {actualField}",
+                    )
+
+                with connection.cursor(row_factory=tuple_row) as cursor:
+                    cursor.execute(sql.SQL("""
+                        SELECT to_jsonb(checkpoint)
+                        FROM {} AS checkpoint WHERE session_id = %s
+                    """).format(sessions), (sessionID,))
+                    row = cursor.fetchone()
+                    if row is None: raise ValueError("Source checkpoint metadata is absent.")
+                    metadata = row[0]
+                    cursor.execute(sql.SQL("""
+                        SELECT user_id, username, display_name
+                        FROM {} WHERE user_id = %s
+                    """).format(users), (metadata["created_by"],))
+                    creatorRow = cursor.fetchone()
+                if creatorRow is None:
+                    raise ValueError("Source creator record is absent.")
+
+                provenance = document["sourceProvenance"]
+                requireEqual(
+                    normalizeTimes(metadata),
+                    normalizeTimes(provenance["sessionMetadata"]),
+                    f"Source checkpoint {sessionID} metadata snapshot",
+                )
+                creator = dict(zip(
+                    ("sourceUserID", "username", "displayName"), creatorRow,
+                ))
+                requireEqual(creator, provenance["creator"], "Source creator snapshot")
+
+                currentFiles = cls._readExportFileInventory(
+                    connection, postgres, checkpoint,
+                    storageOptionsByBackend=storageOptionsByBackend,
+                )
+                manifest = currentFiles["manifest"]
+                cls._compareExportManifestIdentity(manifest, document["manifest"])
+                projectedFiles = cls._compareExportFileInventory(currentFiles, currentFiles)
+                requireEqual({
+                    "records": projectedFiles["files"],
+                    "logicalBytes": projectedFiles["logicalBytes"],
+                }, document["files"], "Current source file catalog")
+
+                verifiedFiles = []
+                fileWeight = sum(max(1, record["size_bytes"]) for record in currentFiles["files"])
+                matrixWeight = sum(
+                    max(1, revision["bundleBytes"])
+                    for revision in document["matrices"]["revisions"]
+                )
+                # Floating-point rounding must not exceed the next section's endpoint.
+                split = min(0.95, max(0.05, 0.05 + 0.90 * fileWeight / max(1, fileWeight + matrixWeight)))
+                filesProgress = (
+                    checkpointProgress.section(0.05, split)
+                    if checkpointProgress is not None else None
+                )
+                for record, fileProgress in pglProgress.fileSections(
+                    currentFiles["files"], filesProgress,
+                ):
+                    candidates = record.get("locations")
+                    if type(candidates) is not list or not candidates:
+                        raise ValueError("Source file lacks an eligible location.")
+                    location = validateLocation(candidates[0])
+                    filesystem, root = access.resolve(
+                        location["backendID"], location["registeredRoot"],
+                    )
+                    path = posixpath.join(root, location["objectKey"])
+                    if isinstance(filesystem, LocalFileSystem):
+                        localPath = Path(path).absolute()
+                        for candidate in (localPath, *localPath.parents):
+                            if candidate.is_symlink():
+                                raise ValueError(f"Symlinked source payload path: {candidate}")
+                    actual = pglStorage.hashFile(
+                        filesystem, path, progress=fileProgress,
+                        expectedSize=record["size_bytes"],
+                        description="Verifying current source file",
+                    )
+                    requireEqual(
+                        actual,
+                        {field: record[field] for field in ("sha256", "size_bytes")},
+                        f"Current source bytes: {record['name']}",
+                    )
+                    verifiedFiles.append({
+                        "name": record["name"], **actual, "location": location,
+                    })
+
+                currentMatrices = cls._readExportMatrixBundleInventory(
+                    connection, postgres, checkpoint, requireAllChunks=True,
+                    storageOptionsByBackend=storageOptionsByBackend,
+                    progress=(
+                        checkpointProgress.section(split, 0.99)
+                        if checkpointProgress is not None else None
+                    ),
+                )
+                projectedMatrices = cls._compareExportMatrixInventory(
+                    currentMatrices, currentMatrices,
+                    sourceManifest=manifest, destinationManifest=manifest,
+                )
+                requireEqual({
+                    field: projectedMatrices[field]
+                    for field in ("attachments", "revisions", "bundleBytes")
+                }, document["matrices"], "Current source matrix inventory")
+
+                results.append({
+                    "sourceSessionID": sessionID,
+                    "destinationSessionID": document["destination"]["sessionID"],
+                    "manifestIdentity": projectedFiles["manifestIdentity"],
+                    "files": verifiedFiles,
+                    "logicalFileBytes": projectedFiles["logicalBytes"],
+                    "matrixBundleBytes": projectedMatrices["bundleBytes"],
+                    "metadataSnapshotMatches": True,
+                    "creatorSnapshotMatches": True,
+                })
+
+        if progress is not None: progress(1, "Current source correspondence verified")
+        return {
+            "sourceDatabaseID": sourceDatabaseID,
+            "destinationDatabaseID": destinationDatabaseID,
+            "state": "sourceMatchesRecordedExport",
+            "checkpoints": results,
+            "sourcePayloadBytesVerified": True,
+            "sourceMetadataPolicy": "exactSnapshotIncludingAnnotationsAndCreatorLabels",
+            "destinationReverifiedByThisCall": False,
+            "publicationAuthorized": False,
+            "reuseAuthorized": False,
+            "foreignResolutionAuthorized": False,
+        }
+        
+    @classmethod
+    def _inspectSessionExportDecision(
+        cls, sourceConnection, sourcePostgres,
+        destinationConnection, destinationPostgres, sessionID, *,
+        sourceDatabaseName,
+        sourceStorageOptionsByBackend=None,
+        destinationStorageOptionsByBackend=None,
+        progress=None,
+    ):
+        """Inspect the initial export decision without publishing or authorizing.
+
+        Caller owns consistent read-only transactions in both databases:
+            REPEATABLE READ or SERIALIZABLE, READ ONLY.
+
+        Initial contract scope:
+            pgl.raw.behavior.v1 root.
+            pgl.derived.behavior.v3 descendants.
+
+        Outcomes:
+            verifiedExistingExport:
+                Existing recorded export scope reconciles at destination and
+                current source matches its recorded evidence. No implicit
+                permission to reuse, load, or publish.
+
+            conflict:
+                With no selected mapping, required ancestry mappings or
+                raw-manifest/matrix UUID matches block new publication.
+                No repair, overwrite, automatic reuse, or scope merging.
+
+            newExportCandidate:
+                No inspected catalog conflicts. This is not publication-ready:
+                source file bytes, matrix layout/bytes, archived labels,
+                metadata projection, and supported history dependencies still
+                require the normal verification/preparation stages.
+
+        Existing selected mappings are reconciled using their full recorded
+        scope, which may extend beyond the selected checkpoint's ancestry.
+        Source revalidation checks that recorded scope. Scope is never silently
+        shortened or merged.
+
+        Catalog conflicts are snapshot observations. Publication must recheck
+        identity, eligibility, and conflicts under its destination lock.
+
+        No new transaction, SQL writes, publication locks, destination creation,
+        transfers, retries, cleanup, or ordinary-profile lookup. Reads source
+        manifests when inventorying unmapped matrix catalogs; existing-export
+        verification reads source and destination payloads.
+
+        Verification/access failures propagate rather than becoming conflict-
+        free outcomes. No source-authenticity or foreign-loading authorization
+        is established. Cross-database snapshots/filesystems are not atomic.
+        Optional progress is a pglProgress-compatible call/section reporter.
+        Ranges allocate work, not elapsed-time estimates. Helpers never
+        finish the enclosing operation. The public caller supplies a
+        display-failure-isolated adapter; direct callback errors propagate.
+
+        """
+        from copy import deepcopy
+
+        from psycopg.rows import tuple_row
+
+        if type(sessionID) is not int or not 0 <= sessionID <= 9223372036854775807:
+            raise ValueError("sessionID must be a nonnegative PostgreSQL bigint.")
+        if (
+            type(sourceDatabaseName) is not str or not sourceDatabaseName.strip()
+            or any(character in sourceDatabaseName for character in ("\x00", "\n", "\r"))
+        ):
+            raise ValueError("sourceDatabaseName must be a nonblank display label.")
+
+        for label, connection in (
+            ("Source", sourceConnection), ("Destination", destinationConnection),
+        ):
+            cls._requireMigrationInspectionTransaction(connection)
+            with connection.cursor(row_factory=tuple_row) as cursor:
+                cursor.execute("SHOW transaction_isolation")
+                isolation = cursor.fetchone()[0]
+                cursor.execute("SHOW transaction_read_only")
+                readOnly = cursor.fetchone()[0]
+            if isolation not in ("repeatable read", "serializable") or readOnly != "on":
+                raise ValueError(f"{label} export decision requires a consistent read-only transaction.")
+
+        sourceDatabaseID = cls._requireStableDatabaseIdentity(sourceConnection, sourcePostgres)
+        destinationDatabaseID = cls._requireStableDatabaseIdentity(
+            destinationConnection, destinationPostgres,
+        )
+        if sourceDatabaseID == destinationDatabaseID:
+            raise ValueError("Export decision requires distinct source and destination UUIDs.")
+
+        ancestry = cls._readExportAncestry(sourceConnection, sourcePostgres, sessionID)
+        for index, checkpoint in enumerate(ancestry):
+            expectedContract = (
+                "pgl.raw.behavior.v1" if index == 0 else "pgl.derived.behavior.v3"
+            )
+            if checkpoint["contractVersion"] != expectedContract:
+                raise ValueError("Unsupported checkpoint contract for the initial export decision.")
+
+        reference = {
+            "databaseID": sourceDatabaseID,
+            "sessionID": sessionID,
+            "databaseName": sourceDatabaseName,
+        }
+        reconciliation = cls._inspectExistingSessionExport(
+            destinationConnection, destinationPostgres, reference,
+            storageOptionsByBackend=destinationStorageOptionsByBackend,
+            progress=progress.section(0, 0.50) if progress is not None else None,
+        )
+
+        result = {
+            "sourceReference": reference,
+            "destinationDatabaseID": destinationDatabaseID,
+            "requestedAncestrySessionIDs": [item["sessionID"] for item in ancestry],
+            "state": None,
+            "conflicts": {
+                "ancestryMappings": [],
+                "activeRawManifestMatches": [],
+                "matrixRevisionCollisions": [],
+            },
+            "existingExport": None,
+            "currentSourceVerification": None,
+            "matrixRevisionIDs": [],
+            "newExportPreparationComplete": False,
+            "publicationTimeRecheckRequired": True,
+            "publicationAuthorized": False,
+            "reuseAuthorized": False,
+            "foreignResolutionAuthorized": False,
+        }
+
+        if reconciliation["state"] == "verifiedExistingExport":
+            sourceCheck = cls._verifyExportCurrentSource(
+                sourceConnection, sourcePostgres, reconciliation,
+                storageOptionsByBackend=sourceStorageOptionsByBackend,
+                progress=progress.section(0.50, 1) if progress is not None else None,
+            )
+            if (
+                sourceCheck["state"] != "sourceMatchesRecordedExport"
+                or sourceCheck["sourceDatabaseID"] != sourceDatabaseID
+                or sourceCheck["destinationDatabaseID"] != destinationDatabaseID
+            ):
+                raise ValueError("Existing-export source verification returned inconsistent identities.")
+
+            result.update({
+                "state": "verifiedExistingExport",
+                "existingExport": reconciliation,
+                "currentSourceVerification": sourceCheck,
+                "matrixRevisionIDs": sorted({
+                    revision["matrixRevisionID"]
+                    for checkpoint in reconciliation["checkpoints"]
+                    for revision in checkpoint["mappingBinding"]["evidence"]["matrices"]["revisions"]
+                }),
+            })
+            return deepcopy(result)
+
+        if reconciliation["state"] != "unmapped":
+            raise ValueError("Unexpected existing-export reconciliation state.")
+
+        # An unmapped selected checkpoint does not imply unmapped ancestors.
+        # Do not verify/reuse partial exports automatically.
+        for checkpoint in ancestry:
+            inspected = cls._inspectCheckpointReference(
+                destinationConnection, destinationPostgres,
+                {**reference, "sessionID": checkpoint["sessionID"]},
+            )
+            if (
+                inspected["resolutionKind"] != "exportMapping"
+                or inspected["destinationDatabaseID"] != destinationDatabaseID
+            ):
+                raise ValueError("Unexpected ancestry-reference inspection identity.")
+            if inspected["state"] != "unmapped":
+                result["conflicts"]["ancestryMappings"].append({
+                    "sourceSessionID": checkpoint["sessionID"],
+                    "destinationSessionID": inspected["destinationSessionID"],
+                    "state": inspected["state"],
+                    "mappingPresent": inspected["mapping"] is not None,
+                })
+
+        # Reuse the source catalog reader: it checks manifest bytes and exact
+        # product links without opening matrix arrays or claiming chunk coverage.
+        revisionsByID = {}
+        for checkpoint in ancestry:
+            matrixCatalog = cls._readExportMatrixInventory(
+                sourceConnection, sourcePostgres, checkpoint,
+                storageOptionsByBackend=sourceStorageOptionsByBackend,
+            )
+            for revision in matrixCatalog["revisions"]:
+                revisionID = revision["matrixRevisionID"]
+                if revisionID in revisionsByID:
+                    if pglStorage.encodeJSON(revisionsByID[revisionID]) != pglStorage.encodeJSON(revision):
+                        raise ValueError("Source ancestry contains conflicting matrix revision records.")
+                revisionsByID[revisionID] = deepcopy(revision)
+
+        revisionIDs = sorted(revisionsByID)
+        result["matrixRevisionIDs"] = revisionIDs
+        sessions = sql.Identifier(destinationPostgres.databaseSchema, "session")
+        revisions = sql.Identifier(destinationPostgres.databaseSchema, "matrix_revisions")
+
+        with destinationConnection.cursor(row_factory=tuple_row) as cursor:
+            cursor.execute(sql.SQL("""
+                /* exportDecisionRawConflicts */
+                SELECT session_id, status, contract_version
+                FROM {}
+                WHERE origin = 'raw'
+                  AND deleted_at IS NULL
+                  AND manifest_hash = %s
+                ORDER BY session_id
+            """).format(sessions), (ancestry[0]["manifestHash"],))
+            result["conflicts"]["activeRawManifestMatches"] = [
+                {
+                    "destinationSessionID": row[0],
+                    "status": row[1],
+                    "contractVersion": row[2],
+                }
+                for row in cursor.fetchall()
+            ]
+
+            if revisionIDs:
+                cursor.execute(sql.SQL("""
+                    /* exportDecisionMatrixConflicts */
+                    SELECT matrix_revision_id::text, backend_id, object_key
+                    FROM {}
+                    WHERE matrix_revision_id = ANY(%s::uuid[])
+                    ORDER BY matrix_revision_id
+                """).format(revisions), (revisionIDs,))
+                result["conflicts"]["matrixRevisionCollisions"] = [
+                    {
+                        "matrixRevisionID": row[0],
+                        "backendID": row[1],
+                        "objectKey": row[2],
+                    }
+                    for row in cursor.fetchall()
+                ]
+
+        result["state"] = (
+            "conflict" if any(result["conflicts"].values()) else "newExportCandidate"
+        )
+        if progress is not None: progress(1, "Export catalog decision inspected")
+        return deepcopy(result)
+    
+    @classmethod
+    def _registerVerifiedSessionExportMapping(
+        cls, connection, postgres, evidence, *,
+        sourceDatabaseName, registeredBy, storageOptionsByBackend=None,
+        progress=None,
+    ):
+        """Verify destination bytes and register one immutable export mapping.
+
+        Caller responsibilities:
+            Own an explicit READ COMMITTED, READ WRITE transaction.
+            Acquire the existing checkpoint publication lock before writes.
+            Establish source authenticity/access and collect verified source
+            observations under the intended export protocol.
+            Build evidence from those observations and actual destination rows.
+            Commit the outer transaction and handle uncertain commit outcomes.
+
+        Revalidates evidence, then invokes destination catalog/payload
+        verification, which also checks actual database UUID, migrations,
+        transaction mode, and the caller-held publication lock.
+
+        Inserts a new mapping without ON CONFLICT, replacement, or reuse.
+        Existing source-qualified keys raise the original SQL error.
+
+        Reads the inserted mapping through _inspectCheckpointReference() and
+        validates exact evidence/registrant correspondence before returning.
+
+        Returns:
+            mappingBinding: Validated uncommitted mapping correspondence.
+            payloadVerification: Fresh destination verification observations.
+
+        Uses a savepoint. Failures roll back this method's SQL insertion only;
+        previously created outer-transaction records remain the caller's
+        responsibility. Does not commit, copy/delete payloads, repair mappings,
+        alter evidence, or authorize foreign loading.
+
+        Destination correspondence is not source authentication. A caller must
+        not submit arbitrary JSON as proof of source equivalence. Registration
+        is an application attestation, not independent proof of its history.
+
+        No implicit retries: duplicate conflicts and SQL/access errors propagate.
+        A successful return does not mean the outer transaction has committed.
+        Optional progress is a pglProgress-compatible call/section reporter.
+        Reports only this helper's verification/registration work; never
+        finishes the enclosing export. Work ranges are not time estimates.
+        Public callers supply a display-failure-isolated reporter; direct
+        callback errors propagate. No success update precedes read-back
+        validation or successful exit from this helper's savepoint.
+
+        """
+        from psycopg.pq import TransactionStatus
+        from psycopg.types.json import Jsonb
+        from psycopg.rows import tuple_row
+
+        if connection.info.transaction_status != TransactionStatus.INTRANS:
+            raise ValueError("Mapping registration requires an active caller-owned transaction.")
+        if (
+            type(sourceDatabaseName) is not str or not sourceDatabaseName.strip()
+            or any(character in sourceDatabaseName for character in ("\x00", "\n", "\r"))
+        ):
+            raise ValueError("sourceDatabaseName must be a nonblank display label.")
+        if type(registeredBy) is not int or not 0 <= registeredBy <= 9223372036854775807:
+            raise ValueError("registeredBy must be a nonnegative PostgreSQL bigint.")
+
+        with connection.cursor(row_factory=tuple_row) as cursor:
+            cursor.execute("SHOW transaction_isolation")
+            isolation = cursor.fetchone()[0]
+            cursor.execute("SHOW transaction_read_only")
+            readOnly = cursor.fetchone()[0]
+        if isolation != "read committed" or readOnly != "off":
+            raise ValueError("Mapping registration requires READ COMMITTED, READ WRITE.")
+
+        checked = cls._validateExportMappingEvidence(evidence)
+        source = checked["source"]
+        destination = checked["destination"]
+        reference = {
+            "databaseID": source["databaseID"],
+            "sessionID": source["sessionID"],
+            "databaseName": sourceDatabaseName,
+        }
+        mappings = sql.Identifier(postgres.databaseSchema, "session_export_mappings")
+
+        if progress is not None: progress(0, "Verifying destination before mapping registration")
+        with connection.transaction():
+            # This performs real destination checks and requires the existing
+            # publication lock. Do not replace it with evidence flags.
+            payloadVerification = cls._verifyExportDestinationPayloads(
+                connection, postgres, checked,
+                storageOptionsByBackend=storageOptionsByBackend,
+                **({"progress": progress.section(0.05, 0.90, label="Verifying mapping destination")} if progress is not None else {}),
+            )
+            if (
+                payloadVerification["destinationDatabaseID"] != destination["databaseID"]
+                or payloadVerification["destinationSessionID"] != destination["sessionID"]
+                or payloadVerification["payloadBytesVerified"] is not True
+                or payloadVerification["strictMatrixCoverageChecked"] is not True
+            ):
+                raise ValueError("Destination verification returned inconsistent mapping identities.")
+
+            if progress is not None: progress(0.90, "Registering immutable mapping and checking read-back")
+            with connection.cursor(row_factory=tuple_row) as cursor:
+                cursor.execute(sql.SQL("""
+                    INSERT INTO {} (
+                        source_database_id, source_session_id,
+                        destination_session_id, source_database_name,
+                        source_manifest_hash, destination_manifest_hash,
+                        source_contract_version, destination_contract_version,
+                        verification, registered_by
+                    )
+                    VALUES (%s::uuid, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """).format(mappings), (
+                    source["databaseID"], source["sessionID"],
+                    destination["sessionID"], sourceDatabaseName,
+                    source["manifestHash"], destination["manifestHash"],
+                    source["contractVersion"], destination["contractVersion"],
+                    Jsonb(checked), registeredBy,
+                ))
+
+            inspection = cls._inspectCheckpointReference(
+                connection, postgres, reference,
+            )
+            binding = cls._validateExportMappingBinding(inspection)
+            if (
+                pglStorage.encodeJSON(binding["evidence"])
+                != pglStorage.encodeJSON(checked)
+                or inspection["mapping"]["registeredBy"] != registeredBy
+                or inspection["mapping"]["sourceDatabaseName"] != sourceDatabaseName
+            ):
+                raise ValueError("Registered mapping read-back differs from the supplied attestation.")
+
+        if progress is not None: progress(1, 'Export mapping registered; outer transaction uncommitted')
+        return {
+            "mappingBinding": binding,
+            "payloadVerification": payloadVerification,
+            "outerCommitConfirmed": False,
+            "foreignResolutionAuthorized": False,
+        }
+        
+    @classmethod
+    def _registerExportRawCheckpoint(
+        cls, connection, postgres, *,
+        sourceDatabaseID, sourceRecord, sourceCreator, manifest,
+        expectedDestinationDatabaseID, createdBy, backendID, objectPrefix,
+        savedTimezone, accessContext,
+        progress=None,
+    ):
+        """Register a prepared byte-preserving raw behavioral export.
+
+        Initial scope:
+            pgl.raw.behavior.v1, with manual/automated ingest_method.
+            All saved files already exist under backendID/objectPrefix.
+            Explicit source metadata and destination UUID supplied by caller.
+
+        Requires:
+            Caller-owned READ COMMITTED, READ WRITE transaction.
+            Existing checkpoint publication lock acquired before writes.
+            Tuple-row connection conventions used by existing registration
+            helpers.
+            Borrowed destination pglDatabaseAccess matching postgres.
+
+        Before allocation:
+            Validate migrations/destination UUID and source qualification.
+            Reject existing source mapping or active raw-manifest match.
+            Verify stored canonical manifest bytes.
+            Read bounded, hash-verified archived label metadata.
+            Project source metadata using independently extracted labels.
+
+        Registration:
+            Allocate raw checkpoint, preserve projected metadata, register
+            verified file locations/links, require no products, and complete.
+            Recheck completion and preserved metadata before returning.
+
+        Uses a savepoint. Errors roll back SQL performed inside this method;
+        outer-transaction work remains the caller's responsibility. Sequence
+        allocations may remain consumed after rollback.
+
+        Does not enumerate unexpected physical files outside the declared
+        inventory. The transfer/preparation layer is responsible for the exact
+        destination directory inventory. Concurrent mutation is unsupported.
+
+        Caller must establish actual source metadata/manifest authenticity.
+        This method verifies prepared destination bytes, not a live source.
+
+        Returns destination ID/hash/metadata and the source metadata projection.
+        Source provenance is returned, not durably stored here.
+
+        No commit, mapping insertion, copying, deletion, scientific loading,
+        retry/reuse, or foreign-resolution authorization. Does not close the
+        borrowed access context or its filesystem.
+        Optional progress is a pglProgress-compatible call/section reporter.
+        Reports only this helper's verification/registration work; never
+        finishes the enclosing export. Work ranges are not time estimates.
+        Public callers supply a display-failure-isolated reporter; direct
+        callback errors propagate. No success update precedes read-back
+        validation or successful exit from this helper's savepoint.
+
+        """
+        from copy import deepcopy
+        from datetime import datetime
+        from pathlib import Path
+        from uuid import UUID
+        from zoneinfo import ZoneInfo
+        import hashlib
+        import io
+        import posixpath
+
+        from fsspec.implementations.local import LocalFileSystem
+        from psycopg.pq import TransactionStatus
+        from psycopg.rows import tuple_row
+        from psycopg.types.json import Jsonb
+
+        if connection.info.transaction_status != TransactionStatus.INTRANS:
+            raise ValueError("Raw export registration requires an active caller-owned transaction.")
+
+        def validateUUID(value, label):
+            if type(value) is not str:
+                raise ValueError(f"Invalid {label}.")
+            try:
+                parsed = UUID(value)
+            except ValueError as error:
+                raise ValueError(f"Invalid {label}.") from error
+            if str(parsed) != value or not parsed.int:
+                raise ValueError(f"{label} must be canonical and nonzero.")
+
+        def validateID(value, label):
+            if type(value) is not int or not 0 <= value <= 9223372036854775807:
+                raise ValueError(f"{label} must be a nonnegative PostgreSQL bigint.")
+
+        def validatePath(value):
+            if (
+                type(value) is not str or not value or value.startswith("/")
+                or "\\" in value
+                or any(character in value for character in ("\x00", "\n", "\r"))
+                or any(part in ("", ".", "..") for part in value.split("/"))
+            ):
+                raise ValueError("Invalid raw export relative path.")
+
+        validateUUID(sourceDatabaseID, "sourceDatabaseID")
+        validateUUID(expectedDestinationDatabaseID, "expectedDestinationDatabaseID")
+        if sourceDatabaseID == expectedDestinationDatabaseID:
+            raise ValueError("Raw export requires distinct source and destination UUIDs.")
+        validateID(createdBy, "createdBy")
+        validateID(backendID, "backendID")
+        validatePath(objectPrefix)
+
+        if type(savedTimezone) is not str or not savedTimezone or savedTimezone != savedTimezone.strip():
+            raise ValueError("savedTimezone must be an explicit timezone name.")
+        ZoneInfo(savedTimezone)
+
+        if not isinstance(accessContext, pglDatabaseAccess):
+            raise TypeError("accessContext must be a pglDatabaseAccess instance.")
+        if cls._checkpointDatabaseIdentity(accessContext._postgres) != cls._checkpointDatabaseIdentity(postgres):
+            raise ValueError("Borrowed payload access belongs to another configured database.")
+
+        sourceRecord = deepcopy(sourceRecord)
+        sourceCreator = deepcopy(sourceCreator)
+        manifest = deepcopy(manifest)
+        if type(sourceRecord) is not dict:
+            raise ValueError("Source record must be a dictionary.")
+        validateID(sourceRecord.get("session_id"), "Source session ID")
+        if sourceRecord.get("ingest_method") not in ("manual", "automated"):
+            raise ValueError("Initial raw export registration requires manual or automated ingest.")
+
+        cls.validateRawManifest(manifest)
+        for name in manifest["directories"]: validatePath(name)
+        for record in manifest["files"]: validatePath(record["name"])
+        if "manifest.json" in {record["name"] for record in manifest["files"]}:
+            raise ValueError("manifest.json is reserved for the checkpoint manifest.")
+
+        manifestBytes = cls.encodeRawManifest(manifest)
+        if len(manifestBytes) > pglStorage.MAX_METADATA_BYTES:
+            raise ValueError("Raw export manifest exceeds the metadata size limit.")
+        manifestIdentity = {
+            "sha256": hashlib.sha256(manifestBytes).hexdigest(),
+            "size_bytes": len(manifestBytes),
+        }
+        sessions = sql.Identifier(postgres.databaseSchema, "session")
+        mappings = sql.Identifier(postgres.databaseSchema, "session_export_mappings")
+        backends = sql.Identifier(postgres.databaseSchema, "storage_backends")
+        users = sql.Identifier(postgres.databaseSchema, "users")
+
+        with connection.cursor(row_factory=tuple_row) as cursor:
+            cursor.execute("SHOW transaction_isolation")
+            isolation = cursor.fetchone()[0]
+            cursor.execute("SHOW transaction_read_only")
+            readOnly = cursor.fetchone()[0]
+            if isolation != "read committed" or readOnly != "off":
+                raise ValueError("Raw export registration requires READ COMMITTED, READ WRITE.")
+
+            cursor.execute("""
+                /* exportRawPublicationLock */
+                SELECT EXISTS (
+                    SELECT 1 FROM pg_catalog.pg_locks
+                    WHERE pid = pg_catalog.pg_backend_pid()
+                      AND locktype = 'relation'
+                      AND relation = %s::regclass
+                      AND granted
+                      AND mode IN (
+                          'ShareRowExclusiveLock', 'ExclusiveLock', 'AccessExclusiveLock'
+                      )
+                )
+            """, (sessions.as_string(connection),))
+            if cursor.fetchone() != (True,):
+                raise ValueError("Raw export registration requires the publication lock.")
+
+        if cls._requireStableDatabaseIdentity(connection, postgres) != expectedDestinationDatabaseID:
+            raise ValueError("Actual destination UUID differs from expected destination.")
+
+        if progress is not None: progress(0, "Checking prepared raw export and archived labels")
+        with connection.transaction():
+            with connection.cursor(row_factory=tuple_row) as cursor:
+                cursor.execute(sql.SQL("""
+                    /* exportRawMappingConflict */
+                    SELECT 1 FROM {}
+                    WHERE source_database_id = %s::uuid AND source_session_id = %s
+                """).format(mappings), (sourceDatabaseID, sourceRecord["session_id"]))
+                if cursor.fetchone() is not None:
+                    raise ValueError("Source checkpoint already has an export mapping.")
+
+                cursor.execute(sql.SQL("""
+                    /* exportRawManifestConflict */
+                    SELECT session_id FROM {}
+                    WHERE origin = 'raw' AND deleted_at IS NULL AND manifest_hash = %s
+                """).format(sessions), (manifestIdentity["sha256"],))
+                if cursor.fetchone() is not None:
+                    raise ValueError("An active raw checkpoint already has this manifest.")
+
+                cursor.execute(sql.SQL("""
+                    /* exportRawActor */
+                    SELECT user_id FROM {} WHERE user_id = %s FOR SHARE
+                """).format(users), (createdBy,))
+                if cursor.fetchone() != (createdBy,):
+                    raise ValueError("Destination publication actor is absent.")
+
+                cursor.execute(sql.SQL("""
+                    /* exportRawBackend */
+                    SELECT url_prefix, is_active FROM {} WHERE backend_id = %s FOR SHARE
+                """).format(backends), (backendID,))
+                backend = cursor.fetchone()
+                if backend is None or backend[1] is not True:
+                    raise ValueError("Destination backend is absent or inactive.")
+
+            filesystem, root = accessContext.resolve(backendID, backend[0])
+            bundlePath = posixpath.join(root, objectPrefix)
+
+            def requireLocalSafe(path):
+                if isinstance(filesystem, LocalFileSystem):
+                    localPath = Path(path).absolute()
+                    for candidate in (localPath, *localPath.parents):
+                        if candidate.is_symlink():
+                            raise ValueError(f"Symlinked prepared raw export path: {candidate}")
+
+            requireLocalSafe(bundlePath)
+            if not filesystem.isdir(bundlePath):
+                raise NotADirectoryError(bundlePath)
+
+            expectedFiles = {
+                record["name"]: {
+                    "sha256": record["sha256"], "size_bytes": record["size_bytes"],
+                }
+                for record in manifest["files"]
+            }
+            expectedFiles["manifest.json"] = manifestIdentity
+
+            def readVerifiedMetadata(name):
+                if name not in expectedFiles:
+                    raise ValueError(f"Undeclared archived metadata: {name}")
+                expected = expectedFiles[name]
+                if expected["size_bytes"] > pglStorage.MAX_METADATA_BYTES:
+                    raise ValueError(f"Archived metadata exceeds the read limit: {name}")
+                path = posixpath.join(bundlePath, name)
+                requireLocalSafe(path)
+                with filesystem.open(path, "rb") as handle:
+                    content = handle.read(expected["size_bytes"] + 1)
+                if {
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                    "size_bytes": len(content),
+                } != expected:
+                    raise ValueError(f"Prepared archived metadata identity mismatch: {name}")
+                return content
+
+            if readVerifiedMetadata("manifest.json") != manifestBytes:
+                raise ValueError("Prepared manifest differs from supplied canonical manifest.")
+
+            class VerifiedLabelView:
+                """Borrow access and expose bounded verified metadata only."""
+                def open(self, name, mode="rt", **kwargs):
+                    if mode not in ("r", "rt", "rb"):
+                        raise ValueError("Archived label view is read-only.")
+                    content = readVerifiedMetadata(name)
+                    stream = io.BytesIO(content)
+                    if mode == "rb": return stream
+                    return io.TextIOWrapper(stream, encoding=kwargs.get("encoding", "utf-8"))
+
+            labels = cls._behaviorLabelMetadata(manifest, VerifiedLabelView())
+            projection = cls._prepareExportSessionMetadata(
+                sourceRecord, sourceCreator, manifest,
+                sourceDatabaseID=sourceDatabaseID, verifiedLabels=labels,
+            )
+            preserved = projection["preservedFields"]
+
+            sessionID = cls.createRawCheckpoint(
+                connection, postgres, createdBy,
+                description=preserved["description"],
+                ingestMethod=preserved["ingest_method"],
+            )
+            columns = list(preserved)
+            values = [
+                Jsonb(preserved[name]) if name == "meta" else preserved[name]
+                for name in columns
+            ]
+            with connection.cursor(row_factory=tuple_row) as cursor:
+                cursor.execute(sql.SQL("""
+                    /* exportRawPreserveMetadata */
+                    UPDATE {} SET {}, saved_timezone = %s
+                    WHERE session_id = %s AND status = 'in_progress'
+                      AND deleted_at IS NULL
+                    RETURNING session_id
+                """).format(
+                    sessions,
+                    sql.SQL(", ").join(
+                        sql.SQL("{} = %s").format(sql.Identifier(name)) for name in columns
+                    ),
+                ), (*values, savedTimezone, sessionID))
+                if cursor.fetchone() != (sessionID,):
+                    raise ValueError("Raw export metadata projection failed.")
+
+            staged = [
+                {**record, "object_key": posixpath.join(objectPrefix, record["name"])}
+                for record in manifest["files"]
+            ]
+            storedManifest = {
+                **manifestIdentity,
+                "object_key": posixpath.join(objectPrefix, "manifest.json"),
+            }
+            registeredID = cls.registerStagedRawCheckpoint(
+                connection, postgres, createdBy, backendID,
+                manifest, staged, storedManifest,
+                sessionID=sessionID, accessContext=accessContext,
+                **({"progress": progress.section(0.10, 0.90, label="Registering raw files")} if progress is not None else {}),
+            )
+            if registeredID != sessionID:
+                raise ValueError("Raw registration returned a different checkpoint ID.")
+            if progress is not None: progress(0.90, "Checking raw products and completing checkpoint")
+            cls._verifySessionProducts(connection, postgres, sessionID, [])
+            completedHash = cls.completeRawCheckpoint(connection, postgres, sessionID, manifest)
+            if completedHash != manifestIdentity["sha256"]:
+                raise ValueError("Raw completion returned a different manifest identity.")
+
+            with connection.cursor(row_factory=tuple_row) as cursor:
+                cursor.execute(sql.SQL("""
+                    /* exportRawCompletedMetadata */
+                    SELECT to_jsonb(checkpoint) FROM {} AS checkpoint WHERE session_id = %s
+                """).format(sessions), (sessionID,))
+                row = cursor.fetchone()
+            if row is None:
+                raise ValueError("Completed raw export metadata is absent.")
+            actual = row[0]
+            if (
+                type(actual) is not dict
+                or set(actual) != set(sourceRecord)
+                or actual["session_id"] != sessionID
+                or actual["parent_session_id"] is not None
+                or actual["root_session_id"] != sessionID
+                or actual["origin"] != "raw" or actual["kind"] != "acquired"
+                or actual["status"] != "complete" or actual["deleted_at"] is not None
+                or actual["manifest_hash"] != completedHash
+                or actual["contract_version"] != manifest["contract_version"]
+                or actual["created_by"] != createdBy
+                or actual["saved_timezone"] != savedTimezone
+                or actual["completed_at"] is None
+            ):
+                raise ValueError("Completed raw export catalog binding is inconsistent.")
+
+            for field, expected in preserved.items():
+                observed = actual[field]
+                # PostgreSQL may render timestamptz with another display offset.
+                if field == "acquired_at" and expected is not None and observed is not None:
+                    if datetime.fromisoformat(observed) != datetime.fromisoformat(expected):
+                        raise ValueError("Preserved raw acquired_at differs.")
+                elif pglStorage.encodeJSON(observed) != pglStorage.encodeJSON(expected):
+                    raise ValueError(f"Preserved raw metadata differs: {field}")
+
+        if progress is not None: progress(1, 'Raw checkpoint registered; outer transaction uncommitted')
+        return {
+            "destinationDatabaseID": expectedDestinationDatabaseID,
+            "destinationSessionID": sessionID,
+            "manifestHash": completedHash,
+            "destinationMetadata": deepcopy(actual),
+            "sourceMetadataProjection": projection,
+            "outerCommitConfirmed": False,
+            "mappingInserted": False,
+            "foreignResolutionAuthorized": False,
+        }
+        
+    @classmethod
+    def _verifyExportDerivedParent(
+        cls, connection, postgres, parentEvidence, *,
+        sourceDatabaseID, sourceRecord, expectedDestinationDatabaseID,
+        storageOptionsByBackend=None,
+        progress=None,
+    ):
+        """Bind an intended derived export to its verified destination parent.
+
+        Initial child scope:
+            pgl.derived.behavior.v3.
+
+        sourceRecord:
+            Source child's catalog metadata, obtained by the coordinator from
+            its checked source snapshot. Only child identity/lineage/state and
+            contract are checked here. Full metadata/manifest correspondence
+            remains the derived registrar's responsibility.
+
+        parentEvidence:
+            Valid byte-preserving evidence selecting the source child's direct
+            parent and its corresponding destination checkpoint.
+            May describe a broader recorded export chain than the parent alone.
+
+        Checks source/destination UUID qualification and direct-parent/root
+        correspondence before destination I/O. Then invokes the existing
+        destination verifier for actual catalog and fresh payload checks.
+
+        Supports a destination parent completed earlier in the caller's current
+        publication transaction. Does not require its mapping row to have been
+        inserted yet. Transaction/lock requirements are enforced by the
+        destination verifier.
+
+        Returns:
+            destinationParentSessionID / destinationRootSessionID.
+            Source parent/root IDs and both qualified database identities.
+            The fresh parent payload-verification result.
+
+        This does not authorize parent reuse or merging separate exports.
+        The enclosing coordinator must decide whether this is a newly published
+        parent or an explicitly permitted existing parent.
+
+        Caller must authenticate the source observations and construct truthful
+        parent evidence. Destination agreement cannot authenticate a fabricated
+        source parent claim.
+
+        No child allocation, SQL writes, mapping registration, commit, copying,
+        cleanup, history rewriting, or foreign-resolution authorization.
+        Does not mutate supplied records.
+        Optional progress is a pglProgress-compatible call/section reporter.
+        Reports only this helper's verification/registration work; never
+        finishes the enclosing export. Work ranges are not time estimates.
+        Public callers supply a display-failure-isolated reporter; direct
+        callback errors propagate. No success update precedes read-back
+        validation or successful exit from this helper's savepoint.
+
+        """
+        from copy import deepcopy
+        from uuid import UUID
+
+        def validateUUID(value, label):
+            if type(value) is not str:
+                raise ValueError(f"Invalid {label}.")
+            try:
+                parsed = UUID(value)
+            except ValueError as error:
+                raise ValueError(f"Invalid {label}.") from error
+            if str(parsed) != value or not parsed.int:
+                raise ValueError(f"{label} must be canonical and nonzero.")
+
+        def validateID(value, label):
+            if type(value) is not int or not 0 <= value <= 9223372036854775807:
+                raise ValueError(f"{label} must be a nonnegative PostgreSQL bigint.")
+
+        validateUUID(sourceDatabaseID, "sourceDatabaseID")
+        validateUUID(expectedDestinationDatabaseID, "expectedDestinationDatabaseID")
+        if sourceDatabaseID == expectedDestinationDatabaseID:
+            raise ValueError("Derived export requires distinct database UUIDs.")
+
+        if type(sourceRecord) is not dict:
+            raise TypeError("Source child metadata must be a dictionary.")
+        sourceRecord = deepcopy(sourceRecord)
+        requiredFields = {
+            "session_id", "parent_session_id", "root_session_id",
+            "origin", "kind", "status", "deleted_at", "contract_version",
+        }
+        if not requiredFields.issubset(sourceRecord):
+            raise ValueError("Source child metadata lacks required lineage fields.")
+
+        for field in ("session_id", "parent_session_id", "root_session_id"):
+            validateID(sourceRecord[field], field)
+        childID = sourceRecord["session_id"]
+        parentID = sourceRecord["parent_session_id"]
+        rootID = sourceRecord["root_session_id"]
+        if childID in (parentID, rootID):
+            raise ValueError("Source child cannot be its own parent or root.")
+        if (
+            sourceRecord["origin"] != "derived"
+            or sourceRecord["kind"] != "processed"
+            or sourceRecord["status"] != "complete"
+            or sourceRecord["deleted_at"] is not None
+            or sourceRecord["contract_version"] != "pgl.derived.behavior.v3"
+        ):
+            raise ValueError("Expected an active completed derived behavioral-v3 source child.")
+
+        checked = cls._validateExportMappingEvidence(parentEvidence)
+        if (
+            checked["source"]["databaseID"] != sourceDatabaseID
+            or checked["destination"]["databaseID"] != expectedDestinationDatabaseID
+        ):
+            raise ValueError("Parent evidence database qualification differs from the export.")
+        if checked["source"]["sessionID"] != parentID:
+            raise ValueError("Parent evidence does not select the source child's direct parent.")
+
+        chain = checked["lineage"]["checkpoints"]
+        selectedParent = next(
+            record for record in chain if record["sourceSessionID"] == parentID
+        )
+        if selectedParent["sourceRootSessionID"] != rootID:
+            raise ValueError("Source child root differs from the recorded parent root.")
+
+        # Evidence may include the child already, as happens when inspecting an
+        # existing full-chain export. If present, it must corroborate this edge.
+        recordedChildren = [
+            record for record in chain if record["sourceSessionID"] == childID
+        ]
+        if recordedChildren:
+            recordedChild = recordedChildren[0]
+            if (
+                recordedChild["sourceParentSessionID"] != parentID
+                or recordedChild["sourceRootSessionID"] != rootID
+                or recordedChild["origin"] != sourceRecord["origin"]
+                or recordedChild["kind"] != sourceRecord["kind"]
+                or recordedChild["contractVersion"] != sourceRecord["contract_version"]
+            ):
+                raise ValueError("Source child contradicts the parent evidence's recorded lineage.")
+
+        destinationParentID = checked["destination"]["sessionID"]
+        destinationRootID = selectedParent["destinationRootSessionID"]
+
+        if progress is not None: progress(0, "Checking exported parent catalog and bytes")
+        verification = cls._verifyExportDestinationPayloads(
+            connection, postgres, checked,
+            storageOptionsByBackend=storageOptionsByBackend,
+            **({"progress": progress.section(0.05, 0.95, label="Verifying exported parent")} if progress is not None else {}),
+        )
+        if (
+            verification["destinationDatabaseID"] != expectedDestinationDatabaseID
+            or verification["destinationSessionID"] != destinationParentID
+            or verification["payloadBytesVerified"] is not True
+            or verification["strictMatrixCoverageChecked"] is not True
+        ):
+            raise ValueError("Destination parent verification returned inconsistent results.")
+
+        if progress is not None: progress(1, 'Derived parent correspondence and destination bytes verified')
+        return {
+            "sourceDatabaseID": sourceDatabaseID,
+            "sourceParentSessionID": parentID,
+            "sourceRootSessionID": rootID,
+            "destinationDatabaseID": expectedDestinationDatabaseID,
+            "destinationParentSessionID": destinationParentID,
+            "destinationRootSessionID": destinationRootID,
+            "parentPayloadVerification": verification,
+            "parentReuseAuthorized": False,
+            "foreignResolutionAuthorized": False,
+        }
+        
+    @classmethod
+    def _registerExportDerivedCheckpoint(
+        cls, connection, postgres, *,
+        sourceDatabaseID, sourceRecord, sourceCreator, manifest,
+        sourceMatrixInventory, parentEvidence,
+        expectedDestinationDatabaseID, createdBy, backendID, objectPrefix,
+        savedTimezone, accessContext, parentStorageOptionsByBackend=None,
+        progress=None,
+    ):
+        """Register a prepared byte-preserving derived behavioral-v3 checkpoint.
+
+        Caller must:
+            Supply authentic source catalog/manifest/matrix observations.
+            Own a READ COMMITTED, READ WRITE transaction and publication lock.
+            Supply truthful parent evidence from the checked publication scope.
+            Register intended matrix revisions before calling this method.
+            Provide all saved checkpoint files under backendID/objectPrefix.
+            Decide parent/matrix reuse policy independently.
+
+        Before child allocation:
+            Check destination migrations/UUID, mapping conflict, actor/backend.
+            Verify direct-parent/root correspondence and parent destination bytes.
+            Verify bounded manifest/history/label bytes and metadata projection.
+            Check supported history references within parent evidence scope plus
+            this child; this is scope coverage, not proof every mapping exists.
+            Compare actual matrix catalogs and freshly verified bundles against
+            the supplied source matrix inventory.
+
+        Registration/completion uses existing helpers inside a savepoint.
+        Failures roll back this method's SQL; caller work remains outside it.
+        Sequence values may remain consumed.
+
+        Tuple-row conventions are required by delegated registration helpers.
+        accessContext is borrowed for child and matrix payload access.
+        Parent verification owns its bounded access separately; caller runtime
+        options for that access are supplied as parentStorageOptionsByBackend.
+
+        Exact physical directory enumeration remains a transfer/preparation
+        responsibility. Concurrent payload mutation is unsupported.
+
+        Returns destination metadata, source projection, parent/history/matrix
+        verification observations. Does not commit, copy/delete files, allocate
+        matrix UUIDs, insert mappings, authorize reuse/foreign loading, or persist
+        source provenance. No scientific arrays are opened or decoded.
+        Optional progress is a pglProgress-compatible call/section reporter.
+        File/bundle verification uses captured byte weights where known;
+        metadata and registration phases use explicit work allocations,
+        not elapsed-time estimates. This helper never calls finish().
+        Success means this helper returned, not that SQL was committed.
+        Public calls supply a display-failure-isolated progress adapter.
+
+        """
+        from copy import deepcopy
+        from datetime import datetime
+        from pathlib import Path
+        from uuid import UUID
+        from zoneinfo import ZoneInfo
+        import io
+        import posixpath
+
+        from fsspec.implementations.local import LocalFileSystem
+        from psycopg.pq import TransactionStatus
+        from psycopg.rows import tuple_row
+        from psycopg.types.json import Jsonb
+
+        if connection.info.transaction_status != TransactionStatus.INTRANS:
+            raise ValueError("Derived export requires an active caller-owned transaction.")
+
+        def validateID(value, label):
+            if type(value) is not int or not 0 <= value <= 9223372036854775807:
+                raise ValueError(f"Invalid {label}.")
+
+        def validateUUID(value):
+            if type(value) is not str:
+                raise ValueError("Export database UUID must be a string.")
+            try:
+                parsed = UUID(value)
+            except ValueError as error:
+                raise ValueError("Invalid export database UUID.") from error
+            if str(parsed) != value or not parsed.int:
+                raise ValueError("Export database UUID must be canonical and nonzero.")
+
+        def validatePath(value):
+            if (
+                type(value) is not str or not value or value.startswith("/")
+                or "\\" in value
+                or any(character in value for character in ("\x00", "\n", "\r"))
+                or any(part in ("", ".", "..") for part in value.split("/"))
+            ):
+                raise ValueError("Invalid derived export relative path.")
+
+        def requireEqual(actual, expected, label):
+            if pglStorage.encodeJSON(actual) != pglStorage.encodeJSON(expected):
+                raise ValueError(f"Derived export {label} differs.")
+
+        validateUUID(sourceDatabaseID)
+        validateUUID(expectedDestinationDatabaseID)
+        if sourceDatabaseID == expectedDestinationDatabaseID:
+            raise ValueError("Derived export requires distinct database UUIDs.")
+        validateID(createdBy, "publication actor")
+        validateID(backendID, "destination backend")
+        validatePath(objectPrefix)
+        if type(savedTimezone) is not str or not savedTimezone or savedTimezone != savedTimezone.strip():
+            raise ValueError("An explicit publication timezone is required.")
+        ZoneInfo(savedTimezone)
+
+        if not isinstance(accessContext, pglDatabaseAccess):
+            raise TypeError("accessContext must be a pglDatabaseAccess instance.")
+        if cls._checkpointDatabaseIdentity(accessContext._postgres) != cls._checkpointDatabaseIdentity(postgres):
+            raise ValueError("Borrowed access belongs to another configured database.")
+
+        sourceRecord = deepcopy(sourceRecord)
+        sourceCreator = deepcopy(sourceCreator)
+        manifest = deepcopy(manifest)
+        sourceMatrixInventory = deepcopy(sourceMatrixInventory)
+        parentEvidence = cls._validateExportMappingEvidence(parentEvidence)
+
+        if type(sourceRecord) is not dict:
+            raise ValueError("Source child metadata must be a dictionary.")
+        validateID(sourceRecord.get("session_id"), "source child ID")
+        if sourceRecord.get("ingest_method") not in ("manual", "automated"):
+            raise ValueError("Initial derived export requires manual or automated ingest.")
+        if type(manifest) is not dict or manifest.get("contract_version") != "pgl.derived.behavior.v3":
+            raise ValueError("Initial derived registrar supports behavioral-v3 only.")
+        cls.validateDerivedManifest(manifest)
+        for name in manifest["directories"]: validatePath(name)
+        for record in manifest["files"]: validatePath(record["name"])
+
+        manifestIdentity = cls._compareExportManifestIdentity(manifest, manifest)
+        manifestBytes = cls.encodeRawManifest(manifest)
+        if len(manifestBytes) > pglStorage.MAX_METADATA_BYTES:
+            raise ValueError("Derived export manifest exceeds the metadata limit.")
+
+        # Validate supplied captured inventory structure and exact attachment
+        # coverage now. This self-comparison does not authenticate source bytes.
+        cls._compareExportMatrixInventory(
+            sourceMatrixInventory, sourceMatrixInventory,
+            sourceManifest=manifest, destinationManifest=manifest,
+        )
+
+        sessions = sql.Identifier(postgres.databaseSchema, "session")
+        mappings = sql.Identifier(postgres.databaseSchema, "session_export_mappings")
+        backends = sql.Identifier(postgres.databaseSchema, "storage_backends")
+        users = sql.Identifier(postgres.databaseSchema, "users")
+        revisions = sql.Identifier(postgres.databaseSchema, "matrix_revisions")
+
+        with connection.cursor(row_factory=tuple_row) as cursor:
+            cursor.execute("SHOW transaction_isolation")
+            isolation = cursor.fetchone()[0]
+            cursor.execute("SHOW transaction_read_only")
+            readOnly = cursor.fetchone()[0]
+            if isolation != "read committed" or readOnly != "off":
+                raise ValueError("Derived export requires READ COMMITTED, READ WRITE.")
+            cursor.execute("""
+                /* exportDerivedPublicationLock */
+                SELECT EXISTS (
+                    SELECT 1 FROM pg_catalog.pg_locks
+                    WHERE pid = pg_catalog.pg_backend_pid()
+                      AND locktype = 'relation' AND relation = %s::regclass
+                      AND granted
+                      AND mode IN (
+                          'ShareRowExclusiveLock', 'ExclusiveLock', 'AccessExclusiveLock'
+                      )
+                )
+            """, (sessions.as_string(connection),))
+            if cursor.fetchone() != (True,):
+                raise ValueError("Derived export requires the publication lock.")
+
+        if cls._requireStableDatabaseIdentity(connection, postgres) != expectedDestinationDatabaseID:
+            raise ValueError("Actual destination UUID differs from expected destination.")
+
+        if progress is not None: progress(0, "Checking derived export conflicts and parent")
+        with connection.transaction():
+            with connection.cursor(row_factory=tuple_row) as cursor:
+                cursor.execute(sql.SQL("""
+                    /* exportDerivedMappingConflict */
+                    SELECT 1 FROM {}
+                    WHERE source_database_id = %s::uuid AND source_session_id = %s
+                """).format(mappings), (sourceDatabaseID, sourceRecord["session_id"]))
+                if cursor.fetchone() is not None:
+                    raise ValueError("Source child already has an export mapping.")
+                cursor.execute(sql.SQL("""
+                    /* exportDerivedActor */
+                    SELECT user_id FROM {} WHERE user_id = %s FOR SHARE
+                """).format(users), (createdBy,))
+                if cursor.fetchone() != (createdBy,):
+                    raise ValueError("Destination publication actor is absent.")
+                cursor.execute(sql.SQL("""
+                    /* exportDerivedBackend */
+                    SELECT url_prefix, is_active FROM {} WHERE backend_id = %s FOR SHARE
+                """).format(backends), (backendID,))
+                backend = cursor.fetchone()
+                if backend is None or backend[1] is not True:
+                    raise ValueError("Destination backend is absent or inactive.")
+
+            parent = cls._verifyExportDerivedParent(
+                connection, postgres, parentEvidence,
+                sourceDatabaseID=sourceDatabaseID,
+                sourceRecord=sourceRecord,
+                expectedDestinationDatabaseID=expectedDestinationDatabaseID,
+                storageOptionsByBackend=parentStorageOptionsByBackend,
+                **({"progress": progress.section(0, 0.20, label="Checking parent")} if progress is not None else {}),
+            )
+
+            if progress is not None:
+                progress(0.20, "Verifying prepared derived history and archived labels")
+            filesystem, root = accessContext.resolve(backendID, backend[0])
+            bundlePath = posixpath.join(root, objectPrefix)
+
+            def requireLocalSafe(filesystem, path):
+                if isinstance(filesystem, LocalFileSystem):
+                    localPath = Path(path).absolute()
+                    for candidate in (localPath, *localPath.parents):
+                        if candidate.is_symlink():
+                            raise ValueError(f"Symlinked derived export path: {candidate}")
+
+            requireLocalSafe(filesystem, bundlePath)
+            if not filesystem.isdir(bundlePath): raise NotADirectoryError(bundlePath)
+
+            expectedFiles = {
+                record["name"]: {
+                    "sha256": record["sha256"], "size_bytes": record["size_bytes"],
+                }
+                for record in manifest["files"]
+            }
+            if "manifest.json" in expectedFiles:
+                raise ValueError("manifest.json is reserved.")
+            expectedFiles["manifest.json"] = {
+                "sha256": manifestIdentity["sha256"],
+                "size_bytes": manifestIdentity["size_bytes"],
+            }
+
+            def readMetadata(name):
+                import hashlib
+                if name not in expectedFiles:
+                    raise ValueError(f"Undeclared prepared metadata: {name}")
+                expected = expectedFiles[name]
+                if expected["size_bytes"] > pglStorage.MAX_METADATA_BYTES:
+                    raise ValueError("Prepared metadata exceeds the read limit.")
+                path = posixpath.join(bundlePath, name)
+                requireLocalSafe(filesystem, path)
+                with filesystem.open(path, "rb") as handle:
+                    content = handle.read(expected["size_bytes"] + 1)
+                if {
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                    "size_bytes": len(content),
+                } != expected:
+                    raise ValueError(f"Prepared derived metadata identity mismatch: {name}")
+                return content
+
+            if readMetadata("manifest.json") != manifestBytes:
+                raise ValueError("Prepared derived manifest is not the expected canonical bytes.")
+
+            class VerifiedMetadataView:
+                def open(self, name, mode="rt", **kwargs):
+                    if mode not in ("r", "rt", "rb"):
+                        raise ValueError("Prepared metadata view is read-only.")
+                    stream = io.BytesIO(readMetadata(name))
+                    if mode == "rb": return stream
+                    return io.TextIOWrapper(stream, encoding=kwargs.get("encoding", "utf-8"))
+
+            view = VerifiedMetadataView()
+            labels = cls._behaviorLabelMetadata(manifest, view)
+            history, historyLabels = cls._readSessionHistory(view, len(manifest["runs"]))
+            requireEqual(historyLabels, labels, "history/archived labels")
+
+            scope = [
+                item["sourceSessionID"] for item in parentEvidence["lineage"]["checkpoints"]
+            ]
+            if sourceRecord["session_id"] not in scope:
+                scope.append(sourceRecord["session_id"])
+            historyReferences = cls._inspectExportHistoryReferences(
+                history, sourceDatabaseID=sourceDatabaseID, sourceSessionIDs=scope,
+            )
+            projection = cls._prepareExportSessionMetadata(
+                sourceRecord, sourceCreator, manifest,
+                sourceDatabaseID=sourceDatabaseID, verifiedLabels=labels,
+            )
+
+            expectedRevisions = {
+                item["matrixRevisionID"]: item
+                for item in sourceMatrixInventory["revisions"]
+            }
+            actualRevisions = []
+            matrixWork = [
+                {
+                    "name": revisionID,
+                    "size_bytes": expectedRevisions[revisionID]["bundleInventory"]["bundleBytes"],
+                }
+                for revisionID in sorted(expectedRevisions)
+            ]
+            matrixRange = progress.section(0.25, 0.55) if progress is not None else None
+            for matrixItem, matrixProgress in pglProgress.fileSections(matrixWork, matrixRange):
+                revisionID = matrixItem["name"]
+                expected = expectedRevisions[revisionID]
+                with connection.cursor(row_factory=tuple_row) as cursor:
+                    cursor.execute(sql.SQL("""
+                        /* exportDerivedMatrix */
+                        SELECT revision.contract_version, revision.descriptor,
+                               revision.backend_id, revision.object_key,
+                               backend.url_prefix, backend.is_active
+                        FROM {} AS revision
+                        JOIN {} AS backend ON backend.backend_id = revision.backend_id
+                        WHERE revision.matrix_revision_id = %s::uuid
+                        -- Revision rows are immutable; the application role
+                        -- intentionally has SELECT/INSERT only on them.
+                        -- Lock the mutable backend to protect active status.
+                        FOR SHARE OF backend
+                    """).format(revisions, backends), (revisionID,))
+                    row = cursor.fetchone()
+                if row is None or row[5] is not True:
+                    raise ValueError("Expected registered matrix is absent or inactive.")
+                contract, descriptor, matrixBackendID, key, registeredRoot, _ = row
+                validateID(matrixBackendID, "matrix backend ID")
+                validatePath(key)
+                if (
+                    type(registeredRoot) is not str or not registeredRoot.strip()
+                    or any(character in registeredRoot for character in ("\x00", "\n", "\r"))
+                ):
+                    raise ValueError("Invalid registered matrix root.")
+                requireEqual(contract, expected["contractVersion"], "matrix contract")
+                requireEqual(descriptor, expected["descriptor"], "matrix descriptor")
+                matrixFS, matrixRoot = accessContext.resolve(matrixBackendID, registeredRoot)
+                matrixPath = posixpath.join(matrixRoot, key)
+                requireLocalSafe(matrixFS, matrixPath)
+                inventory = pglStorage.inventoryDataMatrixBundleLayout(
+                    matrixPath, filesystem=matrixFS,
+                    expectedDescriptor=expected["descriptor"],
+                    expectedFiles=expected["bundleInventory"]["files"],
+                    requireAllChunks=True,
+                    **({"progress": matrixProgress} if matrixProgress is not None else {}),
+                )
+                actualRevisions.append({
+                    "matrixRevisionID": revisionID,
+                    "contractVersion": contract,
+                    "descriptor": descriptor,
+                    "bundleInventory": inventory,
+                })
+
+            actualMatrixInventory = {
+                "attachments": [
+                    {
+                        "catalogName": item["name"], "owner": "session",
+                        "localName": item["name"],
+                        "matrixRevisionID": item["matrixRevisionID"],
+                    }
+                    for item in manifest["products"]
+                ],
+                "revisions": actualRevisions,
+                "bundleBytes": sum(
+                    item["bundleInventory"]["bundleBytes"] for item in actualRevisions
+                ),
+            }
+            matrixComparison = cls._compareExportMatrixInventory(
+                sourceMatrixInventory, actualMatrixInventory,
+                sourceManifest=manifest, destinationManifest=manifest,
+            )
+
+            if progress is not None:
+                progress(0.55, "Allocating derived checkpoint and preserving metadata")
+            preserved = projection["preservedFields"]
+            sessionID = cls.createDerivedCheckpoint(
+                connection, postgres, createdBy, parent["destinationParentSessionID"],
+                description=preserved["description"],
+                ingestMethod=preserved["ingest_method"],
+                checkpointName=preserved["checkpoint_name"],
+                contractVersion=manifest["contract_version"],
+                modalities=preserved["modalities"],
+            )
+            columns = list(preserved)
+            values = [
+                Jsonb(preserved[name]) if name == "meta" else preserved[name]
+                for name in columns
+            ]
+            with connection.cursor(row_factory=tuple_row) as cursor:
+                cursor.execute(sql.SQL("""
+                    /* exportDerivedPreserveMetadata */
+                    UPDATE {} SET {}, saved_timezone = %s
+                    WHERE session_id = %s AND status = 'in_progress' AND deleted_at IS NULL
+                    RETURNING session_id
+                """).format(
+                    sessions,
+                    sql.SQL(", ").join(
+                        sql.SQL("{} = %s").format(sql.Identifier(name)) for name in columns
+                    ),
+                ), (*values, savedTimezone, sessionID))
+                if cursor.fetchone() != (sessionID,):
+                    raise ValueError("Derived metadata projection failed.")
+
+            registeredID = cls._registerSessionBundleFiles(
+                connection, postgres, sessionID, backendID, manifest,
+                objectPrefix=objectPrefix, origin="derived", accessContext=accessContext,
+                **({"progress": progress.section(0.55, 0.90, label="Registering derived files")} if progress is not None else {}),
+            )
+            if registeredID != sessionID:
+                raise ValueError("Derived file registration returned another checkpoint ID.")
+            if progress is not None:
+                progress(0.90, "Registering matrix attachments and completing derived checkpoint")
+            cls._registerSessionProducts(connection, postgres, sessionID, manifest["products"])
+            completedHash = cls._completeSessionBundleCheckpoint(
+                connection, postgres, sessionID, manifest, origin="derived",
+            )
+            if completedHash != manifestIdentity["sha256"]:
+                raise ValueError("Derived completion returned a different manifest hash.")
+
+            with connection.cursor(row_factory=tuple_row) as cursor:
+                cursor.execute(sql.SQL("""
+                    /* exportDerivedCompletedMetadata */
+                    SELECT to_jsonb(checkpoint) FROM {} AS checkpoint WHERE session_id = %s
+                """).format(sessions), (sessionID,))
+                row = cursor.fetchone()
+            if row is None or type(row[0]) is not dict:
+                raise ValueError("Completed derived checkpoint metadata is absent.")
+            actual = row[0]
+            if set(actual) != set(sourceRecord):
+                raise ValueError("Completed derived metadata columns differ from supported schema.")
+            expectedBindings = {
+                "session_id": sessionID,
+                "parent_session_id": parent["destinationParentSessionID"],
+                "root_session_id": parent["destinationRootSessionID"],
+                "origin": "derived", "kind": "processed",
+                "status": "complete", "deleted_at": None,
+                "manifest_hash": completedHash,
+                "contract_version": manifest["contract_version"],
+                "created_by": createdBy, "saved_timezone": savedTimezone,
+            }
+            for field, value in expectedBindings.items():
+                requireEqual(actual[field], value, f"completed {field}")
+            if actual["completed_at"] is None:
+                raise ValueError("Derived completion timestamp is absent.")
+            for field, expected in preserved.items():
+                observed = actual[field]
+                if field == "acquired_at" and expected is not None and observed is not None:
+                    if datetime.fromisoformat(observed) != datetime.fromisoformat(expected):
+                        raise ValueError("Preserved derived acquired_at differs.")
+                else:
+                    requireEqual(observed, expected, f"preserved {field}")
+
+        if progress is not None:
+            progress(1, "Derived checkpoint registered; outer transaction uncommitted")
+        return {
+            "destinationDatabaseID": expectedDestinationDatabaseID,
+            "destinationSessionID": sessionID,
+            "manifestHash": completedHash,
+            "destinationMetadata": deepcopy(actual),
+            "sourceMetadataProjection": projection,
+            "parentVerification": parent,
+            "historyReferences": historyReferences,
+            "matrixComparison": matrixComparison,
+            "outerCommitConfirmed": False,
+            "mappingInserted": False,
+            "foreignResolutionAuthorized": False,
+        }
+
+    @classmethod
+    def _registerExportMatrixRevision(
+        cls, connection, postgres, *,
+        sourceDatabaseID, expectedDescriptor, expectedFiles,
+        expectedDestinationDatabaseID, createdBy, backendID, objectKey,
+        accessContext,
+        progress=None,
+    ):
+        """Verify and register one prepared byte-preserving matrix revision.
+
+        Caller must:
+            Obtain authentic source descriptor and captured file identities.
+            Copy the unchanged bundle to the explicit destination objectKey.
+            Own a READ COMMITTED, READ WRITE transaction and publication lock.
+            Decide whether publication is permitted by the enclosing plan.
+
+        Requires distinct source/destination schema UUIDs. Checks destination
+        migration compatibility and actual UUID before registration.
+
+        Rejects any existing revision UUID or registered backend/objectKey.
+        No overwrite, relocation, automatic reuse, or ON CONFLICT fallback.
+
+        Verifies the destination descriptor, exact stored-file identities, and
+        strict grid-chunk coverage before insertion. Does not allocate a new
+        revision UUID or rewrite provenance.
+
+        Locks the mutable backend row through the transaction. Immutable
+        matrix_revisions rows are not row-locked: the application intentionally
+        has SELECT/INSERT privileges only on that table.
+
+        Uses a savepoint. Failures roll back this method's SQL insertion;
+        outer-transaction work and prepared payload files are retained.
+
+        Returns the actual registered revision fields and verified bundle
+        inventory. Successful return does not imply an outer commit.
+
+        Supplied source identity/bytes are caller observations, not independently
+        authenticated here. No publication-time source integrity, scientific
+        decoding, or value equivalence is established.
+
+        No copying, product-link creation, mapping insertion, commit, deletion,
+        retry/reuse authorization, or closing of borrowed payload access.
+        Concurrent payload mutation is unsupported.
+        Optional progress is a pglProgress-compatible call/section reporter.
+        Reports only this helper's verification/registration work; never
+        finishes the enclosing export. Work ranges are not time estimates.
+        Public callers supply a display-failure-isolated reporter; direct
+        callback errors propagate. No success update precedes read-back
+        validation or successful exit from this helper's savepoint.
+
+        """
+        from copy import deepcopy
+        from pathlib import Path
+        from uuid import UUID
+        import posixpath
+
+        from fsspec.implementations.local import LocalFileSystem
+        from psycopg.pq import TransactionStatus
+        from psycopg.rows import tuple_row
+        from psycopg.types.json import Jsonb
+
+        if connection.info.transaction_status != TransactionStatus.INTRANS:
+            raise ValueError("Matrix export registration requires an active caller-owned transaction.")
+
+        def validateUUID(value, label):
+            if type(value) is not str:
+                raise ValueError(f"Invalid {label}.")
+            try:
+                parsed = UUID(value)
+            except ValueError as error:
+                raise ValueError(f"Invalid {label}.") from error
+            if str(parsed) != value or not parsed.int:
+                raise ValueError(f"{label} must be canonical and nonzero.")
+
+        def validateID(value, label):
+            if type(value) is not int or not 0 <= value <= 9223372036854775807:
+                raise ValueError(f"{label} must be a nonnegative PostgreSQL bigint.")
+
+        validateUUID(sourceDatabaseID, "sourceDatabaseID")
+        validateUUID(expectedDestinationDatabaseID, "expectedDestinationDatabaseID")
+        if sourceDatabaseID == expectedDestinationDatabaseID:
+            raise ValueError("Matrix export requires distinct database UUIDs.")
+        validateID(createdBy, "createdBy")
+        validateID(backendID, "backendID")
+
+        if (
+            type(objectKey) is not str or not objectKey or objectKey.startswith("/")
+            or "\\" in objectKey
+            or any(character in objectKey for character in ("\x00", "\n", "\r"))
+            or any(part in ("", ".", "..") for part in objectKey.split("/"))
+        ):
+            raise ValueError("Invalid destination matrix object key.")
+
+        if not isinstance(accessContext, pglDatabaseAccess):
+            raise TypeError("accessContext must be a pglDatabaseAccess instance.")
+        if cls._checkpointDatabaseIdentity(accessContext._postgres) != cls._checkpointDatabaseIdentity(postgres):
+            raise ValueError("Borrowed matrix access belongs to another configured database.")
+
+        expectedDescriptor = deepcopy(expectedDescriptor)
+        expectedFiles = deepcopy(expectedFiles)
+        pglStorage._validateMatrixDescriptor(expectedDescriptor)
+        pglStorage.encodeJSON(expectedDescriptor)
+        if type(expectedFiles) is not list:
+            raise TypeError("expectedFiles must be a captured file-inventory list.")
+
+        revisionID = expectedDescriptor["matrixRevisionID"]
+        contract = expectedDescriptor["contractVersion"]
+        sessions = sql.Identifier(postgres.databaseSchema, "session")
+        revisions = sql.Identifier(postgres.databaseSchema, "matrix_revisions")
+        backends = sql.Identifier(postgres.databaseSchema, "storage_backends")
+        users = sql.Identifier(postgres.databaseSchema, "users")
+
+        with connection.cursor(row_factory=tuple_row) as cursor:
+            cursor.execute("SHOW transaction_isolation")
+            isolation = cursor.fetchone()[0]
+            cursor.execute("SHOW transaction_read_only")
+            readOnly = cursor.fetchone()[0]
+            if isolation != "read committed" or readOnly != "off":
+                raise ValueError("Matrix export registration requires READ COMMITTED, READ WRITE.")
+
+            cursor.execute("""
+                /* exportMatrixPublicationLock */
+                SELECT EXISTS (
+                    SELECT 1 FROM pg_catalog.pg_locks
+                    WHERE pid = pg_catalog.pg_backend_pid()
+                      AND locktype = 'relation' AND relation = %s::regclass
+                      AND granted
+                      AND mode IN (
+                          'ShareRowExclusiveLock', 'ExclusiveLock', 'AccessExclusiveLock'
+                      )
+                )
+            """, (sessions.as_string(connection),))
+            if cursor.fetchone() != (True,):
+                raise ValueError("Matrix export registration requires the publication lock.")
+
+        if cls._requireStableDatabaseIdentity(connection, postgres) != expectedDestinationDatabaseID:
+            raise ValueError("Actual destination UUID differs from expected destination.")
+
+        if progress is not None: progress(0, "Checking matrix registration conflicts and backend")
+        with connection.transaction():
+            with connection.cursor(row_factory=tuple_row) as cursor:
+                cursor.execute(sql.SQL("""
+                    /* exportMatrixConflict */
+                    SELECT matrix_revision_id::text, backend_id, object_key
+                    FROM {}
+                    WHERE matrix_revision_id = %s::uuid
+                       OR (backend_id = %s AND object_key = %s)
+                """).format(revisions), (revisionID, backendID, objectKey))
+                if cursor.fetchone() is not None:
+                    raise ValueError("Destination matrix revision UUID or registered path already exists.")
+
+                cursor.execute(sql.SQL("""
+                    /* exportMatrixActor */
+                    SELECT user_id FROM {} WHERE user_id = %s FOR SHARE
+                """).format(users), (createdBy,))
+                if cursor.fetchone() != (createdBy,):
+                    raise ValueError("Destination matrix publication actor is absent.")
+
+                cursor.execute(sql.SQL("""
+                    /* exportMatrixBackend */
+                    SELECT url_prefix, is_active FROM {} WHERE backend_id = %s FOR SHARE
+                """).format(backends), (backendID,))
+                backend = cursor.fetchone()
+                if backend is None or backend[1] is not True:
+                    raise ValueError("Destination matrix backend is absent or inactive.")
+
+            registeredRoot = backend[0]
+            if (
+                type(registeredRoot) is not str or not registeredRoot.strip()
+                or any(character in registeredRoot for character in ("\x00", "\n", "\r"))
+            ):
+                raise ValueError("Invalid destination matrix registered root.")
+
+            filesystem, root = accessContext.resolve(backendID, registeredRoot)
+            bundlePath = posixpath.join(root, objectKey)
+            if isinstance(filesystem, LocalFileSystem):
+                localPath = Path(bundlePath).absolute()
+                for candidate in (localPath, *localPath.parents):
+                    if candidate.is_symlink():
+                        raise ValueError(f"Symlinked destination matrix path: {candidate}")
+
+            # The inventory helper validates expectedFiles completely, hashes
+            # actual bytes, and checks layout. No scientific arrays are opened.
+            inventory = pglStorage.inventoryDataMatrixBundleLayout(
+                bundlePath,
+                filesystem=filesystem,
+                expectedDescriptor=expectedDescriptor,
+                expectedFiles=expectedFiles,
+                requireAllChunks=True,
+                **({"progress": progress.section(0.05, 0.90, label="Verifying matrix bundle")} if progress is not None else {}),
+            )
+
+            if progress is not None: progress(0.90, "Registering verified matrix revision and checking read-back")
+            with connection.cursor(row_factory=tuple_row) as cursor:
+                cursor.execute(sql.SQL("""
+                    /* exportMatrixInsert */
+                    INSERT INTO {} (
+                        matrix_revision_id, backend_id, object_key,
+                        contract_version, descriptor, created_by
+                    )
+                    VALUES (%s::uuid, %s, %s, %s, %s, %s)
+                """).format(revisions), (
+                    revisionID, backendID, objectKey, contract,
+                    Jsonb(expectedDescriptor), createdBy,
+                ))
+
+                # A catalog read-back is separate from the preceding byte check.
+                # No revision row lock or extra UPDATE privilege is required.
+                cursor.execute(sql.SQL("""
+                    /* exportMatrixReadback */
+                    SELECT matrix_revision_id::text, backend_id, object_key,
+                           contract_version, descriptor, created_by
+                    FROM {} WHERE matrix_revision_id = %s::uuid
+                """).format(revisions), (revisionID,))
+                row = cursor.fetchone()
+
+            if row is None:
+                raise ValueError("Registered matrix revision is absent on read-back.")
+            actual = dict(zip(
+                ("matrixRevisionID", "backendID", "objectKey",
+                 "contractVersion", "descriptor", "createdBy"),
+                row,
+            ))
+            expected = {
+                "matrixRevisionID": revisionID,
+                "backendID": backendID,
+                "objectKey": objectKey,
+                "contractVersion": contract,
+                "descriptor": expectedDescriptor,
+                "createdBy": createdBy,
+            }
+            if pglStorage.encodeJSON(actual) != pglStorage.encodeJSON(expected):
+                raise ValueError("Registered matrix read-back differs from the supplied revision.")
+
+        if progress is not None: progress(1, 'Matrix revision registered; outer transaction uncommitted')
+        return {
+            "destinationDatabaseID": expectedDestinationDatabaseID,
+            "revision": deepcopy(actual),
+            "registeredRoot": registeredRoot,
+            "bundleInventory": inventory,
+            "outerCommitConfirmed": False,
+            "productLinksCreated": False,
+            "mappingInserted": False,
+            "reuseAuthorized": False,
+            "foreignResolutionAuthorized": False,
+        }
+        
+    @classmethod
+    def _registerPreparedSessionExport(
+        cls, connection, postgres, *,
+        sourceDatabaseID, sourceDatabaseName, expectedDestinationDatabaseID,
+        preparedCheckpoints, matrixObjectKeys,
+        createdBy, backendID, savedTimezone, accessContext,
+        storageOptionsByBackend=None,
+        progress=None,
+    ):
+        """Publish a prepared behavioral chain inside a caller transaction.
+
+        preparedCheckpoints:
+            Nonempty root-to-selected list of dictionaries containing exactly:
+                metadata: Full source session row in JSON-compatible form.
+                creator: Source creator description.
+                files: _readExportFileInventory() result.
+                matrices: _readExportMatrixBundleInventory() result.
+                objectPrefix: Prepared destination checkpoint-file directory,
+                    relative to backendID's registered root.
+
+            Initial contracts: raw.behavior.v1 followed by derived.behavior.v3.
+            Caller must obtain source observations from a checked source
+            snapshot and establish source authenticity/transfer scope.
+
+        matrixObjectKeys:
+            Exact dictionary of distinct matrix revision UUIDs to prepared
+            destination bundle paths, relative to backendID's registered root.
+            Shared revisions are registered once; conflicting observations fail.
+
+        Requires:
+            Explicit caller-owned READ COMMITTED, READ WRITE transaction.
+            Publication lock already held before publication writes.
+            Existing destination actor/backend and matching borrowed access.
+            Prepared bytes already copied and exact physical inventories
+            checked by the transfer layer. No concurrent payload mutation.
+
+        Rechecks conflicts for the entire requested scope before its SQL writes.
+        Verifies prepared manifest/labels/history and uses production raw,
+        matrix, derived, and mapping registrars. Parent evidence is built for
+        the published prefix; final mapping evidence uses the complete chain.
+
+        One outer savepoint covers all SQL performed by this method. Any later
+        failure removes the entire attempt, preserving earlier caller work.
+        Sequence allocations may remain consumed. Files are never removed.
+
+        Returns actual session mapping, full-chain evidence, and mapping
+        registration results. Does not commit or confirm an outer commit.
+
+        No automatic reuse/merging, transfer, backend/user creation, schema
+        changes, source SQL access, repair, cleanup, or foreign authorization.
+        Runtime storage options are forwarded separately, never serialized.
+        The borrowed access context is not closed.
+        Optional progress is a pglProgress-compatible call/section reporter.
+        File/bundle verification uses captured byte weights where known;
+        metadata and registration phases use explicit work allocations,
+        not elapsed-time estimates. This helper never calls finish().
+        Success means this helper returned, not that SQL was committed.
+        Public calls supply a display-failure-isolated progress adapter.
+
+        """
+        from copy import deepcopy
+        from datetime import datetime
+        from pathlib import Path
+        from uuid import UUID
+        from zoneinfo import ZoneInfo
+        import hashlib
+        import io
+        import posixpath
+
+        from fsspec.implementations.local import LocalFileSystem
+        from psycopg.pq import TransactionStatus
+        from psycopg.rows import tuple_row
+
+        if connection.info.transaction_status != TransactionStatus.INTRANS:
+            raise ValueError("Prepared export requires an active caller-owned transaction.")
+
+        def validateUUID(value):
+            if type(value) is not str:
+                raise ValueError("Export database UUID must be a string.")
+            try:
+                parsed = UUID(value)
+            except ValueError as error:
+                raise ValueError("Invalid export database UUID.") from error
+            if str(parsed) != value or not parsed.int:
+                raise ValueError("Export database UUID must be canonical and nonzero.")
+
+        def validateID(value):
+            if type(value) is not int or not 0 <= value <= 9223372036854775807:
+                raise ValueError("Invalid export catalog ID.")
+
+        def validatePath(value):
+            if (
+                type(value) is not str or not value or value.startswith("/")
+                or "\\" in value
+                or any(character in value for character in ("\x00", "\n", "\r"))
+                or any(part in ("", ".", "..") for part in value.split("/"))
+            ):
+                raise ValueError("Invalid prepared export path.")
+
+        def requireEqual(actual, expected, label):
+            if pglStorage.encodeJSON(actual) != pglStorage.encodeJSON(expected):
+                raise ValueError(f"Prepared export {label} differs.")
+
+        validateUUID(sourceDatabaseID)
+        validateUUID(expectedDestinationDatabaseID)
+        if sourceDatabaseID == expectedDestinationDatabaseID:
+            raise ValueError("Prepared export requires distinct database UUIDs.")
+        validateID(createdBy)
+        validateID(backendID)
+        if (
+            type(sourceDatabaseName) is not str or not sourceDatabaseName.strip()
+            or any(character in sourceDatabaseName for character in ("\x00", "\n", "\r"))
+        ):
+            raise ValueError("Invalid source database display label.")
+        if type(savedTimezone) is not str or not savedTimezone or savedTimezone != savedTimezone.strip():
+            raise ValueError("Explicit destination publication timezone required.")
+        ZoneInfo(savedTimezone)
+        if not isinstance(accessContext, pglDatabaseAccess):
+            raise TypeError("accessContext must be a pglDatabaseAccess instance.")
+        if cls._checkpointDatabaseIdentity(accessContext._postgres) != cls._checkpointDatabaseIdentity(postgres):
+            raise ValueError("Borrowed export access belongs to another configuration.")
+        if type(preparedCheckpoints) is not list or not preparedCheckpoints:
+            raise ValueError("Prepared export requires a nonempty checkpoint list.")
+        if type(matrixObjectKeys) is not dict:
+            raise TypeError("matrixObjectKeys must be a dictionary.")
+
+        prepared = deepcopy(preparedCheckpoints)
+        matrixObjectKeys = deepcopy(matrixObjectKeys)
+        sourceAncestry = []
+        sourceIDs = []
+        expectedRevisions = {}
+        prefixes = []
+
+        def ancestryRecord(metadata):
+            fields = (
+                ("session_id", "sessionID"),
+                ("parent_session_id", "parentSessionID"),
+                ("root_session_id", "rootSessionID"),
+                ("origin", "origin"), ("kind", "kind"), ("status", "status"),
+                ("deleted_at", "deletedAt"), ("manifest_hash", "manifestHash"),
+                ("contract_version", "contractVersion"),
+            )
+            return {
+                **{target: metadata[source] for source, target in fields},
+                "completedAt": datetime.fromisoformat(metadata["completed_at"]),
+            }
+
+        for index, item in enumerate(prepared):
+            if type(item) is not dict or set(item) != {
+                "metadata", "creator", "files", "matrices", "objectPrefix",
+            }:
+                raise ValueError("Invalid prepared checkpoint fields.")
+            metadata = item["metadata"]
+            if type(metadata) is not dict:
+                raise ValueError("Prepared source metadata must be a dictionary.")
+            sourceID = metadata.get("session_id")
+            validateID(sourceID)
+            if sourceID in sourceIDs:
+                raise ValueError("Duplicate prepared source checkpoint.")
+            validatePath(item["objectPrefix"])
+            prefixes.append(item["objectPrefix"])
+
+            manifest = item["files"]["manifest"]
+            expectedContract = "pgl.raw.behavior.v1" if index == 0 else "pgl.derived.behavior.v3"
+            if manifest.get("contract_version") != expectedContract:
+                raise ValueError("Unsupported prepared checkpoint contract/order.")
+            cls._compareExportManifestIdentity(manifest, manifest)
+            cls._compareExportFileInventory(item["files"], item["files"])
+            cls._compareExportMatrixInventory(
+                item["matrices"], item["matrices"],
+                sourceManifest=manifest, destinationManifest=manifest,
+            )
+            # Structural projection now; labels are independently read below.
+            cls._prepareExportSessionMetadata(
+                metadata, item["creator"], manifest,
+                sourceDatabaseID=sourceDatabaseID,
+                verifiedLabels=metadata["meta"]["pgl_session_labels"],
+            )
+            if metadata["ingest_method"] not in ("manual", "automated"):
+                raise ValueError("Prepared export requires manual or automated ingest.")
+            if index == 0:
+                if metadata["parent_session_id"] is not None or metadata["root_session_id"] != sourceID:
+                    raise ValueError("Invalid prepared raw root.")
+            elif (
+                metadata["parent_session_id"] != sourceIDs[-1]
+                or metadata["root_session_id"] != sourceIDs[0]
+            ):
+                raise ValueError("Prepared ancestry must be one complete ordered parent chain.")
+            sourceIDs.append(sourceID)
+            sourceAncestry.append(ancestryRecord(metadata))
+
+            for revision in item["matrices"]["revisions"]:
+                revisionID = revision["matrixRevisionID"]
+                # Storage locations may differ; scientific/captured identity may not.
+                identity = {
+                    key: revision[key]
+                    for key in ("matrixRevisionID", "contractVersion", "descriptor")
+                }
+                identity["bundleInventory"] = {
+                    key: revision["bundleInventory"][key]
+                    for key in ("descriptor", "files", "bundleBytes")
+                }
+                if revisionID in expectedRevisions:
+                    requireEqual(identity, expectedRevisions[revisionID], "shared matrix observation")
+                expectedRevisions[revisionID] = identity
+
+        if set(matrixObjectKeys) != set(expectedRevisions):
+            raise ValueError("Prepared matrix paths do not exactly cover distinct revisions.")
+        for key in matrixObjectKeys.values(): validatePath(key)
+        allPaths = sorted(prefixes + list(matrixObjectKeys.values()))
+        for index, path in enumerate(allPaths):
+            for other in allPaths[index + 1:]:
+                if other == path or other.startswith(path + "/"):
+                    raise ValueError("Prepared checkpoint/matrix directories overlap.")
+
+        sessions = sql.Identifier(postgres.databaseSchema, "session")
+        users = sql.Identifier(postgres.databaseSchema, "users")
+        backends = sql.Identifier(postgres.databaseSchema, "storage_backends")
+        mappings = sql.Identifier(postgres.databaseSchema, "session_export_mappings")
+        revisions = sql.Identifier(postgres.databaseSchema, "matrix_revisions")
+        products = sql.Identifier(postgres.databaseSchema, "session_products")
+        links = sql.Identifier(postgres.databaseSchema, "session_files")
+        files = sql.Identifier(postgres.databaseSchema, "files")
+
+        with connection.cursor(row_factory=tuple_row) as cursor:
+            cursor.execute("SHOW transaction_isolation")
+            isolation = cursor.fetchone()[0]
+            cursor.execute("SHOW transaction_read_only")
+            readOnly = cursor.fetchone()[0]
+            if isolation != "read committed" or readOnly != "off":
+                raise ValueError("Prepared export requires READ COMMITTED, READ WRITE.")
+            cursor.execute("""
+                SELECT EXISTS (
+                    SELECT 1 FROM pg_catalog.pg_locks
+                    WHERE pid = pg_catalog.pg_backend_pid()
+                      AND locktype = 'relation' AND relation = %s::regclass
+                      AND granted AND mode IN (
+                          'ShareRowExclusiveLock', 'ExclusiveLock', 'AccessExclusiveLock'
+                      )
+                )
+            """, (sessions.as_string(connection),))
+            if cursor.fetchone() != (True,):
+                raise ValueError("Prepared export requires the publication lock.")
+        if cls._requireStableDatabaseIdentity(connection, postgres) != expectedDestinationDatabaseID:
+            raise ValueError("Actual prepared-export destination UUID differs.")
+
+        if progress is not None: progress(0, "Checking complete export publication scope")
+        with connection.transaction():
+            with connection.cursor(row_factory=tuple_row) as cursor:
+                cursor.execute(sql.SQL("""
+                    SELECT source_session_id FROM {}
+                    WHERE source_database_id = %s::uuid
+                      AND source_session_id = ANY(%s::bigint[])
+                """).format(mappings), (sourceDatabaseID, sourceIDs))
+                if cursor.fetchone() is not None:
+                    raise ValueError("Prepared export scope already contains a mapping.")
+                cursor.execute(sql.SQL("""
+                    SELECT session_id FROM {}
+                    WHERE origin = 'raw' AND deleted_at IS NULL AND manifest_hash = %s
+                """).format(sessions), (prepared[0]["metadata"]["manifest_hash"],))
+                if cursor.fetchone() is not None:
+                    raise ValueError("Prepared export root manifest already exists.")
+                if expectedRevisions:
+                    cursor.execute(sql.SQL("""
+                        SELECT matrix_revision_id FROM {}
+                        WHERE matrix_revision_id = ANY(%s::uuid[])
+                           OR (backend_id = %s AND object_key = ANY(%s::text[]))
+                    """).format(revisions), (
+                        sorted(expectedRevisions), backendID, list(matrixObjectKeys.values()),
+                    ))
+                    if cursor.fetchone() is not None:
+                        raise ValueError("Prepared export matrix revision/path conflict.")
+                cursor.execute(sql.SQL(
+                    "SELECT user_id, username, display_name FROM {} WHERE user_id = %s FOR SHARE"
+                ).format(users), (createdBy,))
+                actorRow = cursor.fetchone()
+                if actorRow is None: raise ValueError("Prepared export actor is absent.")
+                destinationCreator = dict(zip(
+                    ("sourceUserID", "username", "displayName"), actorRow,
+                ))
+                cursor.execute(sql.SQL(
+                    "SELECT url_prefix, is_active FROM {} WHERE backend_id = %s FOR SHARE"
+                ).format(backends), (backendID,))
+                backend = cursor.fetchone()
+                if backend is None or backend[1] is not True:
+                    raise ValueError("Prepared export backend is absent or inactive.")
+
+            filesystem, root = accessContext.resolve(backendID, backend[0])
+
+            def readPreparedMetadata(item, name):
+                manifest = item["files"]["manifest"]
+                identities = {
+                    record["name"]: {
+                        "sha256": record["sha256"], "size_bytes": record["size_bytes"],
+                    }
+                    for record in manifest["files"]
+                }
+                if name == "manifest.json":
+                    content = cls.encodeRawManifest(manifest)
+                    expected = {
+                        "sha256": hashlib.sha256(content).hexdigest(), "size_bytes": len(content),
+                    }
+                else:
+                    if name not in identities: raise ValueError("Undeclared prepared metadata.")
+                    expected = identities[name]
+                if expected["size_bytes"] > pglStorage.MAX_METADATA_BYTES:
+                    raise ValueError("Prepared metadata exceeds the read limit.")
+                validatePath(name)
+                path = posixpath.join(root, item["objectPrefix"], name)
+                if isinstance(filesystem, LocalFileSystem):
+                    localPath = Path(path).absolute()
+                    for candidate in (localPath, *localPath.parents):
+                        if candidate.is_symlink():
+                            raise ValueError("Symlinked prepared export metadata.")
+                with filesystem.open(path, "rb") as handle:
+                    content = handle.read(expected["size_bytes"] + 1)
+                requireEqual({
+                    "sha256": hashlib.sha256(content).hexdigest(), "size_bytes": len(content),
+                }, expected, "prepared metadata bytes")
+                return content
+
+            class PreparedView:
+                def __init__(self, item): self.item = item
+                def open(self, name, mode="rt", **kwargs):
+                    if mode not in ("r", "rt", "rb"):
+                        raise ValueError("Prepared metadata view is read-only.")
+                    stream = io.BytesIO(readPreparedMetadata(self.item, name))
+                    if mode == "rb": return stream
+                    return io.TextIOWrapper(stream, encoding=kwargs.get("encoding", "utf-8"))
+
+            if progress is not None:
+                progress(0.01, "Rechecking prepared manifests, labels, and history")
+            # Reconstruct only history metadata, never scientific arrays.
+            labelsByID, historyByID = {}, {}
+            for index, item in enumerate(prepared):
+                sourceID = sourceIDs[index]
+                manifest = item["files"]["manifest"]
+                if readPreparedMetadata(item, "manifest.json") != cls.encodeRawManifest(manifest):
+                    raise ValueError("Prepared manifest is not the expected canonical bytes.")
+                view = PreparedView(item)
+                labels = cls._behaviorLabelMetadata(manifest, view)
+                history = None
+                if index:
+                    history, historyLabels = cls._readSessionHistory(view, len(manifest["runs"]))
+                    requireEqual(historyLabels, labels, "history labels")
+                    # Initial policy requires inputs within the current prefix.
+                    cls._inspectExportHistoryReferences(
+                        history, sourceDatabaseID=sourceDatabaseID,
+                        sourceSessionIDs=sourceIDs[:index + 1],
+                    )
+                cls._prepareExportSessionMetadata(
+                    item["metadata"], item["creator"], manifest,
+                    sourceDatabaseID=sourceDatabaseID, verifiedLabels=labels,
+                )
+                labelsByID[sourceID], historyByID[sourceID] = labels, history
+
+            sessionMapping = {}
+            destinationAncestry = []
+            observations = {}
+            temporaryEvidence = {}
+            registeredMatrices = {}
+
+            def readObservation(item, destinationID, observationProgress=None):
+                """Read actual uncommitted catalogs and verify matrix bytes."""
+                manifest = item["files"]["manifest"]
+                with connection.cursor(row_factory=tuple_row) as cursor:
+                    cursor.execute(sql.SQL(
+                        "SELECT to_jsonb(checkpoint) FROM {} AS checkpoint WHERE session_id = %s"
+                    ).format(sessions), (destinationID,))
+                    row = cursor.fetchone()
+                    if row is None: raise ValueError("Published checkpoint metadata disappeared.")
+                    metadata = row[0]
+                    cursor.execute(sql.SQL("""
+                        SELECT link.name, content.file_id, content.sha256,
+                               content.size_bytes, link.role, link.subject_id
+                        FROM {} AS link JOIN {} AS content ON content.file_id = link.file_id
+                        WHERE link.session_id = %s ORDER BY link.name
+                    """).format(links, files), (destinationID,))
+                    fileRecords = [
+                        dict(zip(
+                            ("name", "fileID", "sha256", "size_bytes", "role", "subjectID"), record,
+                        ))
+                        for record in cursor.fetchall()
+                    ]
+                    cursor.execute(sql.SQL("""
+                        SELECT product.product_name, revision.matrix_revision_id::text,
+                               revision.contract_version, revision.descriptor,
+                               revision.backend_id, revision.object_key,
+                               backend.url_prefix, backend.is_active
+                        FROM {} AS product
+                        LEFT JOIN {} AS revision
+                          ON revision.matrix_revision_id = product.matrix_revision_id
+                        LEFT JOIN {} AS backend ON backend.backend_id = revision.backend_id
+                        WHERE product.session_id = %s ORDER BY product.product_name
+                    """).format(products, revisions, backends), (destinationID,))
+                    productRows = cursor.fetchall()
+
+                attachments, actualRevisions = [], {}
+                for productIndex, (
+                    name, revisionID, contract, descriptor,
+                    actualBackend, key, registeredRoot, active,
+                ) in enumerate(productRows):
+                    observedMatrixProgress = (
+                        observationProgress.section(
+                            productIndex / len(productRows),
+                            (productIndex + 1) / len(productRows),
+                            label=f"Rechecking registered matrix {productIndex + 1}/{len(productRows)}",
+                        )
+                        if observationProgress is not None else None
+                    )
+                    if revisionID not in expectedRevisions or active is not True:
+                        raise ValueError("Unexpected/inactive actual matrix product.")
+                    requireEqual(
+                        [actualBackend, key, registeredRoot],
+                        [backendID, matrixObjectKeys[revisionID], backend[0]],
+                        "matrix registration location",
+                    )
+                    expected = expectedRevisions[revisionID]
+                    requireEqual(descriptor, expected["descriptor"], "matrix descriptor")
+                    matrixFS, matrixRoot = accessContext.resolve(actualBackend, registeredRoot)
+                    inventory = pglStorage.inventoryDataMatrixBundleLayout(
+                        posixpath.join(matrixRoot, key), filesystem=matrixFS,
+                        expectedDescriptor=descriptor,
+                        expectedFiles=expected["bundleInventory"]["files"],
+                        requireAllChunks=True,
+                        **({"progress": observedMatrixProgress} if observedMatrixProgress is not None else {}),
+                    )
+                    attachments.append({
+                        "catalogName": name, "owner": "session", "localName": name,
+                        "matrixRevisionID": revisionID,
+                    })
+                    actualRevisions[revisionID] = {
+                        "matrixRevisionID": revisionID, "contractVersion": contract,
+                        "descriptor": descriptor, "bundleInventory": inventory,
+                    }
+                if observationProgress is not None:
+                    observationProgress(1, "Actual checkpoint catalog observations verified")
+                return {
+                    "metadata": metadata,
+                    "files": {"manifest": manifest, "files": fileRecords},
+                    "matrices": {
+                        "attachments": attachments,
+                        "revisions": [actualRevisions[key] for key in sorted(actualRevisions)],
+                        "bundleBytes": sum(
+                            value["bundleInventory"]["bundleBytes"]
+                            for value in actualRevisions.values()
+                        ),
+                    },
+                }
+
+            def buildEvidence(index, scopeLength):
+                item = prepared[index]
+                sourceID = sourceIDs[index]
+                observed = observations[sourceID]
+                scopeIDs = sourceIDs[:scopeLength]
+                return cls._buildExportMappingEvidence(
+                    sourceDatabaseID=sourceDatabaseID,
+                    destinationDatabaseID=expectedDestinationDatabaseID,
+                    sourceRecord=item["metadata"], sourceCreator=item["creator"],
+                    destinationRecord=observed["metadata"],
+                    destinationCreator=destinationCreator,
+                    sourceManifest=item["files"]["manifest"],
+                    destinationManifest=observed["files"]["manifest"],
+                    sourceFiles=item["files"], destinationFiles=observed["files"],
+                    sourceMatrices=item["matrices"], destinationMatrices=observed["matrices"],
+                    sourceAncestry=sourceAncestry[:scopeLength],
+                    destinationAncestry=destinationAncestry[:scopeLength],
+                    sessionIDMapping={key: sessionMapping[key] for key in scopeIDs},
+                    verifiedLabels=labelsByID[sourceID], history=historyByID[sourceID],
+                )
+
+            checkpointWork = [
+                {
+                    "name": f"Publishing source checkpoint {sourceIDs[index]}",
+                    "size_bytes": (
+                        sum(record["size_bytes"] for record in item["files"]["files"])
+                        + item["matrices"]["bundleBytes"]
+                    ),
+                    "index": index,
+                    "checkpoint": item,
+                }
+                for index, item in enumerate(prepared)
+            ]
+            checkpointRange = progress.section(0.05, 0.75) if progress is not None else None
+            for workItem, checkpointProgress in pglProgress.fileSections(
+                checkpointWork, checkpointRange,
+            ):
+                index = workItem["index"]
+                item = workItem["checkpoint"]
+                sourceID = sourceIDs[index]
+                matrixWork = [
+                    {
+                        "name": revision["matrixRevisionID"],
+                        "size_bytes": revision["bundleInventory"]["bundleBytes"],
+                        "revision": revision,
+                    }
+                    for revision in item["matrices"]["revisions"]
+                ]
+                matrixRange = (
+                    checkpointProgress.section(0, 0.25)
+                    if checkpointProgress is not None else None
+                )
+                for matrixItem, matrixProgress in pglProgress.fileSections(matrixWork, matrixRange):
+                    revision = matrixItem["revision"]
+                    revisionID = revision["matrixRevisionID"]
+                    if revisionID in registeredMatrices: continue
+                    registeredMatrices[revisionID] = cls._registerExportMatrixRevision(
+                        connection, postgres,
+                        sourceDatabaseID=sourceDatabaseID,
+                        expectedDescriptor=revision["descriptor"],
+                        expectedFiles=revision["bundleInventory"]["files"],
+                        expectedDestinationDatabaseID=expectedDestinationDatabaseID,
+                        createdBy=createdBy, backendID=backendID,
+                        objectKey=matrixObjectKeys[revisionID], accessContext=accessContext,
+                        **({"progress": matrixProgress} if matrixProgress is not None else {}),
+                    )
+
+                common = {
+                    "sourceDatabaseID": sourceDatabaseID,
+                    "sourceRecord": item["metadata"], "sourceCreator": item["creator"],
+                    "manifest": item["files"]["manifest"],
+                    "expectedDestinationDatabaseID": expectedDestinationDatabaseID,
+                    "createdBy": createdBy, "backendID": backendID,
+                    "objectPrefix": item["objectPrefix"], "savedTimezone": savedTimezone,
+                    "accessContext": accessContext,
+                }
+                if checkpointProgress is not None:
+                    common["progress"] = checkpointProgress.section(
+                        0.25, 0.80, label=f"Registering checkpoint {sourceID}",
+                    )
+                if index == 0:
+                    registered = cls._registerExportRawCheckpoint(connection, postgres, **common)
+                else:
+                    registered = cls._registerExportDerivedCheckpoint(
+                        connection, postgres, **common,
+                        sourceMatrixInventory=item["matrices"],
+                        parentEvidence=temporaryEvidence[sourceIDs[index - 1]],
+                        parentStorageOptionsByBackend=storageOptionsByBackend,
+                    )
+                destinationID = registered["destinationSessionID"]
+                sessionMapping[sourceID] = destinationID
+                observations[sourceID] = readObservation(
+                    item, destinationID,
+                    observationProgress=(
+                        checkpointProgress.section(0.80, 0.95)
+                        if checkpointProgress is not None else None
+                    ),
+                )
+                destinationAncestry.append(ancestryRecord(observations[sourceID]["metadata"]))
+                prefixEvidence = buildEvidence(index, index + 1)
+                cls._validateExportMappingEvidence(prefixEvidence)
+                temporaryEvidence[sourceID] = prefixEvidence
+                if checkpointProgress is not None:
+                    checkpointProgress(1, "Checkpoint and prefix evidence checked; uncommitted")
+
+            # Do not persist prefix evidence: every mapping must attest the
+            # same final chain, including the root's mapping.
+            evidenceByID = {}
+            for index, sourceID in enumerate(sourceIDs):
+                if progress is not None:
+                    progress(
+                        0.75 + 0.05 * index / len(sourceIDs),
+                        f"Building full-chain evidence for checkpoint {sourceID}",
+                    )
+                evidence = buildEvidence(index, len(prepared))
+                cls._validateExportMappingEvidence(evidence)
+                evidenceByID[sourceID] = evidence
+
+            mappingResults = {}
+            mappingWork = [
+                {
+                    "name": f"Mapping source checkpoint {sourceID}",
+                    "size_bytes": (
+                        evidenceByID[sourceID]["files"]["logicalBytes"]
+                        + evidenceByID[sourceID]["matrices"]["bundleBytes"]
+                    ),
+                    "sourceID": sourceID,
+                }
+                for sourceID in sourceIDs
+            ]
+            mappingRange = progress.section(0.80, 0.99) if progress is not None else None
+            for workItem, mappingProgress in pglProgress.fileSections(mappingWork, mappingRange):
+                sourceID = workItem["sourceID"]
+                mappingResults[sourceID] = cls._registerVerifiedSessionExportMapping(
+                    connection, postgres, evidenceByID[sourceID],
+                    sourceDatabaseName=sourceDatabaseName, registeredBy=createdBy,
+                    storageOptionsByBackend=storageOptionsByBackend,
+                    **({"progress": mappingProgress} if mappingProgress is not None else {}),
+                )
+
+        if progress is not None:
+            progress(1, "Prepared export registered; outer transaction uncommitted")
+        return {
+            "sourceDatabaseID": sourceDatabaseID,
+            "destinationDatabaseID": expectedDestinationDatabaseID,
+            "sessionIDMapping": sessionMapping,
+            "evidenceBySourceSessionID": evidenceByID,
+            "mappingRegistrations": mappingResults,
+            "outerCommitConfirmed": False,
+            "foreignResolutionAuthorized": False,
+        }
+        
+    @classmethod
+    def _prepareSessionExportPayloads(
+        cls, connection, postgres, sessionID, destinationPath, *,
+        expectedSourceDatabaseID,
+        sourceStorageOptionsByBackend=None,
+        destinationFilesystem=None, destinationStorageOptions=None,
+        progress=None,
+    ):
+        """Inspect a source chain and copy prepared byte-preserving payloads.
+
+        Requires caller-owned REPEATABLE READ or SERIALIZABLE, READ ONLY.
+        Checks source migration compatibility and the expected stable UUID.
+
+        Initial contracts:
+            pgl.raw.behavior.v1 root.
+            pgl.derived.behavior.v3 descendants.
+
+        destinationPath:
+            Exact fresh preparation directory; its parent must already exist.
+            It is not an existing destination backend to merge or overwrite.
+            Caller resolves/authorizes the intended destination storage.
+
+        Produces:
+            checkpoints/checkpoint-<source ID>/...
+            matrices/matrix-<revision UUID>/...
+
+        Returns preparedCheckpoints and matrixObjectKeys in the representation
+        required by _registerPreparedSessionExport(), plus transfer observations.
+
+        Source files use the first eligible catalog location without fallback.
+        Distinct matrix revisions are copied once; conflicting captured
+        observations fail. All bundles require strict grid-chunk coverage.
+
+        Copied metadata is read with bounded, hash-verified reads for independent
+        label extraction and supported history-reference inspection. Scientific
+        arrays are never constructed or decoded.
+
+        Source snapshots remain the caller's responsibility until publication
+        policy has established the required source stability. Independent SQL
+        snapshots and filesystems are not an atomic cross-database snapshot.
+        Concurrent payload mutation/writers are unsupported.
+
+        Rejects detectable local symlinks and overlap with selected source roots
+        when filesystem namespace identity is known. Arbitrarily aliased remote
+        namespaces cannot be identified generically.
+
+        Owns bounded source pglDatabaseAccess. Does not close the destination
+        filesystem, including one resolved by fsspec.
+
+        No destination SQL, mapping insertion, commit, retries, reuse, deletion,
+        rollback of files, or publication/foreign-loading authorization.
+        Failures retain created directories and copied/partial files.
+        Optional progress is a pglProgress-compatible call/section reporter.
+        Source inventory uses checkpoint-count allocation until byte totals
+        are known; subsequent transfers are weighted by captured bytes.
+        These ranges allocate work, not elapsed-time estimates. This helper
+        never finishes the enclosing export display. Public calls supply
+        a display-failure-isolated adapter; direct callback errors propagate.
+
+        """
+        from copy import deepcopy
+        from pathlib import Path
+        from uuid import UUID
+        import hashlib
+        import io
+        import posixpath
+
+        from fsspec.implementations.local import LocalFileSystem
+        from psycopg.rows import tuple_row
+
+        if progress is not None: progress(0, "Checking source identity and preparation destination")
+        cls._requireMigrationInspectionTransaction(connection)
+        with connection.cursor(row_factory=tuple_row) as cursor:
+            cursor.execute("SHOW transaction_isolation")
+            isolation = cursor.fetchone()[0]
+            cursor.execute("SHOW transaction_read_only")
+            readOnly = cursor.fetchone()[0]
+        if isolation not in ("repeatable read", "serializable") or readOnly != "on":
+            raise ValueError("Export preparation requires a consistent read-only source transaction.")
+
+        if type(expectedSourceDatabaseID) is not str:
+            raise ValueError("Expected source UUID must be a string.")
+        try:
+            parsedID = UUID(expectedSourceDatabaseID)
+        except ValueError as error:
+            raise ValueError("Invalid expected source UUID.") from error
+        if str(parsedID) != expectedSourceDatabaseID or not parsedID.int:
+            raise ValueError("Expected source UUID must be canonical and nonzero.")
+        if cls._requireStableDatabaseIdentity(connection, postgres) != expectedSourceDatabaseID:
+            raise ValueError("Actual source UUID differs from expected source.")
+
+        ancestry = cls._readExportAncestry(connection, postgres, sessionID)
+        for index, checkpoint in enumerate(ancestry):
+            expectedContract = (
+                "pgl.raw.behavior.v1" if index == 0 else "pgl.derived.behavior.v3"
+            )
+            if checkpoint["contractVersion"] != expectedContract:
+                raise ValueError("Unsupported source contract for initial export preparation.")
+
+        destinationFilesystem, destinationRoot = pglStorage._resolveStoragePath(
+            destinationPath,
+            filesystem=destinationFilesystem,
+            storageOptions=destinationStorageOptions,
+            label="export preparation destination",
+        )
+        destinationRoot = destinationRoot.rstrip("/")
+        if not destinationRoot:
+            raise ValueError("Export preparation cannot target the filesystem root.")
+
+        def requireLocalSafe(filesystem, path):
+            if isinstance(filesystem, LocalFileSystem):
+                localPath = Path(path).absolute()
+                for candidate in (localPath, *localPath.parents):
+                    if candidate.is_symlink():
+                        raise ValueError(f"Symlinked export preparation path: {candidate}")
+
+        def requireNewDestination():
+            requireLocalSafe(destinationFilesystem, destinationRoot)
+            if destinationFilesystem.exists(destinationRoot):
+                raise FileExistsError(destinationRoot)
+            parent = posixpath.dirname(destinationRoot) or "."
+            requireLocalSafe(destinationFilesystem, parent)
+            if not destinationFilesystem.isdir(parent):
+                raise NotADirectoryError(parent)
+
+        requireNewDestination()
+        sessions = sql.Identifier(postgres.databaseSchema, "session")
+        users = sql.Identifier(postgres.databaseSchema, "users")
+        prepared = []
+        revisionsByID = {}
+        matrixObjectKeys = {}
+        transferObservations = []
+
+        with pglDatabaseAccess(postgres, sourceStorageOptionsByBackend) as sourceAccess:
+            def checkSourceOverlap(backendID, registeredRoot):
+                sourceFS, sourceRoot = sourceAccess.resolve(backendID, registeredRoot)
+                requireLocalSafe(sourceFS, sourceRoot)
+                bothLocal = (
+                    isinstance(sourceFS, LocalFileSystem)
+                    and isinstance(destinationFilesystem, LocalFileSystem)
+                )
+                if bothLocal:
+                    sourcePath = str(Path(sourceRoot).absolute())
+                    targetPath = str(Path(destinationRoot).absolute())
+                elif sourceFS is destinationFilesystem:
+                    sourcePath, targetPath = sourceRoot, destinationRoot
+                else:
+                    return
+
+                sourcePath = posixpath.normpath(sourcePath)
+                targetPath = posixpath.normpath(targetPath)
+                if (
+                    sourcePath == targetPath
+                    or targetPath.startswith(sourcePath.rstrip("/") + "/")
+                    or sourcePath.startswith(targetPath.rstrip("/") + "/")
+                ):
+                    raise ValueError("Preparation destination overlaps a selected source storage root.")
+
+            # Capture and structurally check the complete source scope before
+            # creating any destination output. Matrix inventory hashes source
+            # bundles but does not open scientific arrays.
+            for checkpointIndex, checkpoint in enumerate(ancestry):
+                sourceID = checkpoint["sessionID"]
+                checkpointProgress = (
+                    progress.section(
+                        0.20 * checkpointIndex / len(ancestry),
+                        0.20 * (checkpointIndex + 1) / len(ancestry),
+                        label=f"Inventory source checkpoint {sourceID}",
+                    )
+                    if progress is not None else None
+                )
+                if checkpointProgress is not None:
+                    checkpointProgress(0, "Reading source manifest and catalog")
+                fileInventory = cls._readExportFileInventory(
+                    connection, postgres, checkpoint,
+                    storageOptionsByBackend=sourceStorageOptionsByBackend,
+                )
+                matrixInventory = cls._readExportMatrixBundleInventory(
+                    connection, postgres, checkpoint, requireAllChunks=True,
+                    storageOptionsByBackend=sourceStorageOptionsByBackend,
+                    progress=(
+                        checkpointProgress.section(0.05, 0.95)
+                        if checkpointProgress is not None else None
+                    ),
+                )
+                with connection.cursor(row_factory=tuple_row) as cursor:
+                    cursor.execute(sql.SQL(
+                        "SELECT to_jsonb(checkpoint) FROM {} AS checkpoint WHERE session_id = %s"
+                    ).format(sessions), (sourceID,))
+                    row = cursor.fetchone()
+                    if row is None: raise ValueError("Source metadata is absent.")
+                    metadata = row[0]
+                    cursor.execute(sql.SQL(
+                        "SELECT user_id, username, display_name FROM {} WHERE user_id = %s"
+                    ).format(users), (metadata["created_by"],))
+                    creatorRow = cursor.fetchone()
+                if creatorRow is None:
+                    raise ValueError("Source creator metadata is absent.")
+                creator = dict(zip(("sourceUserID", "username", "displayName"), creatorRow))
+
+                manifest = fileInventory["manifest"]
+                cls._compareExportFileInventory(fileInventory, fileInventory)
+                cls._compareExportMatrixInventory(
+                    matrixInventory, matrixInventory,
+                    sourceManifest=manifest, destinationManifest=manifest,
+                )
+                # Structural metadata check only here; labels are independently
+                # extracted from verified destination metadata below.
+                cls._prepareExportSessionMetadata(
+                    metadata, creator, manifest,
+                    sourceDatabaseID=expectedSourceDatabaseID,
+                    verifiedLabels=metadata["meta"]["pgl_session_labels"],
+                )
+                if metadata["ingest_method"] not in ("manual", "automated"):
+                    raise ValueError("Initial preparation requires manual or automated ingest.")
+
+                for record in fileInventory["files"]:
+                    location = record["locations"][0]
+                    checkSourceOverlap(location["backendID"], location["registeredRoot"])
+                for revision in matrixInventory["revisions"]:
+                    checkSourceOverlap(revision["backendID"], revision["registeredRoot"])
+                    revisionID = revision["matrixRevisionID"]
+                    if revisionID in revisionsByID:
+                        if pglStorage.encodeJSON(revisionsByID[revisionID]) != pglStorage.encodeJSON(revision):
+                            raise ValueError("Conflicting source observations for a shared matrix revision.")
+                    revisionsByID[revisionID] = deepcopy(revision)
+
+                prepared.append({
+                    "metadata": metadata,
+                    "creator": creator,
+                    "files": fileInventory,
+                    "matrices": matrixInventory,
+                    "objectPrefix": f"checkpoints/checkpoint-{sourceID}",
+                })
+                if checkpointProgress is not None:
+                    checkpointProgress(1, "Source checkpoint inventory captured")
+
+            checkpointWork = [
+                {
+                    "name": f"Checkpoint {item['metadata']['session_id']}",
+                    "size_bytes": sum(
+                        record["size_bytes"] for record in item["files"]["files"]
+                    ),
+                    "checkpoint": item,
+                }
+                for item in prepared
+            ]
+            matrixWork = [
+                {
+                    "name": revisionID,
+                    "size_bytes": revisionsByID[revisionID]["bundleInventory"]["bundleBytes"],
+                }
+                for revisionID in sorted(revisionsByID)
+            ]
+            checkpointWeight = sum(max(1, item["size_bytes"]) for item in checkpointWork)
+            matrixWeight = sum(max(1, item["size_bytes"]) for item in matrixWork)
+            transferSplit = (
+                0.20 + 0.75 * checkpointWeight
+                / max(1, checkpointWeight + matrixWeight)
+            )
+            checkpointTransferProgress = (
+                progress.section(0.20, transferSplit)
+                if progress is not None else None
+            )
+            matrixTransferProgress = (
+                progress.section(transferSplit, 0.95)
+                if progress is not None else None
+            )
+
+            requireNewDestination()
+            destinationFilesystem.makedirs(destinationRoot, exist_ok=False)
+            for directory in ("checkpoints", "matrices"):
+                requireLocalSafe(
+                    destinationFilesystem, posixpath.join(destinationRoot, directory),
+                )
+                destinationFilesystem.makedirs(
+                    posixpath.join(destinationRoot, directory), exist_ok=False,
+                )
+
+            for workItem, checkpointProgress in pglProgress.fileSections(
+                checkpointWork, checkpointTransferProgress,
+            ):
+                item = workItem["checkpoint"]
+                destinationBundle = posixpath.join(destinationRoot, item["objectPrefix"])
+                copied = cls._copyExportCheckpointFiles(
+                    item["files"], destinationBundle,
+                    sourceAccess=sourceAccess,
+                    destinationFilesystem=destinationFilesystem,
+                    progress=checkpointProgress,
+                )
+                transferObservations.append({
+                    "sourceSessionID": item["metadata"]["session_id"],
+                    "fileCount": len(copied["files"]),
+                    "logicalFileBytes": copied["fileBytes"],
+                })
+
+            for workItem, matrixProgress in pglProgress.fileSections(
+                matrixWork, matrixTransferProgress,
+            ):
+                revisionID = workItem["name"]
+                revision = revisionsByID[revisionID]
+                matrixKey = f"matrices/matrix-{revisionID}"
+                sourceFS, sourceRoot = sourceAccess.resolve(
+                    revision["backendID"], revision["registeredRoot"],
+                )
+                copied = pglStorage.copyDataMatrixBundle(
+                    posixpath.join(sourceRoot, revision["objectKey"]),
+                    posixpath.join(destinationRoot, matrixKey),
+                    sourceFilesystem=sourceFS,
+                    destinationFilesystem=destinationFilesystem,
+                    expectedDescriptor=revision["descriptor"],
+                    expectedFiles=revision["bundleInventory"]["files"],
+                    requireAllChunks=True,
+                    progress=matrixProgress,
+                )
+                if copied["inventory"] != revision["bundleInventory"]:
+                    raise ValueError("Transferred matrix inventory differs from captured source.")
+                matrixObjectKeys[revisionID] = matrixKey
+
+            def readMetadata(item, name):
+                manifest = item["files"]["manifest"]
+                records = {record["name"]: record for record in manifest["files"]}
+                if name == "manifest.json":
+                    canonical = cls.encodeRawManifest(manifest)
+                    expected = {
+                        "sha256": hashlib.sha256(canonical).hexdigest(),
+                        "size_bytes": len(canonical),
+                    }
+                else:
+                    if name not in records:
+                        raise ValueError("Undeclared copied metadata.")
+                    expected = {
+                        key: records[name][key] for key in ("sha256", "size_bytes")
+                    }
+                if expected["size_bytes"] > pglStorage.MAX_METADATA_BYTES:
+                    raise ValueError("Copied metadata exceeds the read limit.")
+                path = posixpath.join(destinationRoot, item["objectPrefix"], name)
+                requireLocalSafe(destinationFilesystem, path)
+                with destinationFilesystem.open(path, "rb") as handle:
+                    content = handle.read(expected["size_bytes"] + 1)
+                if {
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                    "size_bytes": len(content),
+                } != expected:
+                    raise ValueError("Copied metadata changed or differs from source inventory.")
+                return content
+
+            class MetadataView:
+                def __init__(self, item): self.item = item
+                def open(self, name, mode="rt", **kwargs):
+                    if mode not in ("r", "rt", "rb"):
+                        raise ValueError("Preparation metadata view is read-only.")
+                    stream = io.BytesIO(readMetadata(self.item, name))
+                    if mode == "rb": return stream
+                    return io.TextIOWrapper(stream, encoding=kwargs.get("encoding", "utf-8"))
+
+            historyReports = []
+            sourceIDs = [item["metadata"]["session_id"] for item in prepared]
+            for index, item in enumerate(prepared):
+                if progress is not None:
+                    progress(
+                        0.95 + 0.04 * index / len(prepared),
+                        f"Checking copied labels and history for checkpoint {sourceIDs[index]}",
+                    )
+                manifest = item["files"]["manifest"]
+                if readMetadata(item, "manifest.json") != cls.encodeRawManifest(manifest):
+                    raise ValueError("Copied manifest is not the expected canonical bytes.")
+                view = MetadataView(item)
+                labels = cls._behaviorLabelMetadata(manifest, view)
+                cls._prepareExportSessionMetadata(
+                    item["metadata"], item["creator"], manifest,
+                    sourceDatabaseID=expectedSourceDatabaseID,
+                    verifiedLabels=labels,
+                )
+                historyReport = None
+                if index:
+                    history, historyLabels = cls._readSessionHistory(view, len(manifest["runs"]))
+                    if pglStorage.encodeJSON(historyLabels) != pglStorage.encodeJSON(labels):
+                        raise ValueError("Copied history and archived settings labels differ.")
+                    historyReport = cls._inspectExportHistoryReferences(
+                        history, sourceDatabaseID=expectedSourceDatabaseID,
+                        sourceSessionIDs=sourceIDs[:index + 1],
+                    )
+                historyReports.append({
+                    "sourceSessionID": sourceIDs[index],
+                    "historyInspection": historyReport,
+                })
+
+        if progress is not None: progress(1, "Export payload preparation verified")
+        return {
+            "sourceDatabaseID": expectedSourceDatabaseID,
+            "selectedSourceSessionID": sessionID,
+            "destinationPath": destinationFilesystem.unstrip_protocol(destinationRoot),
+            "preparedCheckpoints": prepared,
+            "matrixObjectKeys": matrixObjectKeys,
+            "checkpointTransfers": transferObservations,
+            "historyInspections": historyReports,
+            "publicationTimeRecheckRequired": True,
+            "publicationAuthorized": False,
+            "reuseAuthorized": False,
+            "foreignResolutionAuthorized": False,
+        }
+        
+    @classmethod
+    def _resolveSessionExportConfiguration(
+        cls, session, databaseName, *,
+        lockTimeoutSeconds=30.0, ioTimeoutSeconds=60, connectTimeoutSeconds=10,
+    ):
+        """Resolve a saved-session export's explicit runtime configurations.
+
+        Public intent:
+            session.export(databaseName="destinationProfile")
+
+        Source:
+            Uses only storage-established checkpoint binding and the retained
+            _checkpointPostgres configuration. Never resolves the source by
+            its display label or by the current default profile.
+
+        Destination:
+            Loads only the explicitly named PGL profile. Does not create a
+            default profile, change the default, or create a missing profile.
+            Uses that profile's creator username and PostgreSQL configuration.
+
+        Validates retained source endpoint correspondence before destination
+        profile discovery. Numeric sessionID alone is not sufficient.
+
+        Returns independent source/destination PostgreSQL configuration copies,
+        a source checkpoint reference, destination profile labels, and username.
+        Runtime credentials/configuration must not be serialized into evidence
+        or indiscriminately logged by the caller.
+
+        Does not open SQL connections, read scientific data, detect dirty
+        working values, save a session, resolve payload filesystems, register
+        backends, publish, or change the session's binding.
+
+        Reading the named destination profile/configuration can involve its
+        configured filesystem. Configuration/authentication errors propagate.
+
+        Does not establish the actual destination UUID, source authenticity,
+        backend availability, or publication eligibility. Those require live
+        inspection before any payload creation.
+
+        A destination without storageLocations is returned as configured:
+        existing-export reconciliation may still be possible. A new export
+        must reject missing destination storage before preparation.
+        """
+        from copy import deepcopy
+
+        from .pglPostgres import pglPostgres
+        from .pglSession import pglSession
+
+        if not isinstance(session, pglSession):
+            raise TypeError("session must be a pglSession.")
+        if (
+            type(databaseName) is not str or not databaseName.strip()
+            or databaseName != databaseName.strip()
+            or any(character in databaseName for character in ("\x00", "\n", "\r"))
+        ):
+            raise ValueError("databaseName must explicitly name a destination profile.")
+
+        pglPostgres.validateTimeouts(
+            lockTimeoutSeconds=lockTimeoutSeconds,
+            ioTimeoutSeconds=ioTimeoutSeconds,
+            connectTimeoutSeconds=connectTimeoutSeconds,
+        )
+
+        reference = cls._getBoundCheckpointReference(session)
+        if reference is None:
+            raise ValueError(
+                "Export requires a saved checkpoint with a database binding. "
+                "Save or reload the intended source checkpoint first."
+            )
+
+        binding = cls._validateCheckpointBinding(session._checkpointBinding)
+        sourceConfiguration = getattr(session, "_checkpointPostgres", None)
+        if not isinstance(sourceConfiguration, pglPostgres):
+            raise ValueError(
+                "The saved source PostgreSQL configuration is unavailable. "
+                "Reload the intended checkpoint; export will not infer a source profile."
+            )
+
+        # Snapshot configurations, not live connections or scientific objects.
+        sourcePostgres = sourceConfiguration.withTimeouts(
+            lockTimeoutSeconds=lockTimeoutSeconds,
+            ioTimeoutSeconds=ioTimeoutSeconds,
+            connectTimeoutSeconds=connectTimeoutSeconds,
+        )
+        if (
+            cls._checkpointDatabaseIdentity(sourcePostgres)
+            != binding["databaseIdentity"]
+        ):
+            raise ValueError(
+                "Retained source configuration differs from the saved checkpoint endpoint. "
+                "Reload the intended source rather than retargeting its configuration."
+            )
+
+        # Never call getSettings() with neither an explicit name nor settings:
+        # that branch may create/change defaults.
+        destinationSettings = cls.getSettings(settingsName=databaseName)
+        if destinationSettings is None:
+            raise ValueError("The explicitly named destination profile could not be loaded.")
+        if not isinstance(destinationSettings, pglDatabaseSettings):
+            raise TypeError("Destination profile is not pglDatabaseSettings.")
+
+        username = destinationSettings.username
+        if type(username) is not str or not username.strip() or "\x00" in username:
+            raise ValueError("The destination profile needs a valid publication username.")
+        destinationLabel = destinationSettings.name
+        if (
+            type(destinationLabel) is not str or not destinationLabel.strip()
+            or any(character in destinationLabel for character in ("\x00", "\n", "\r"))
+        ):
+            raise ValueError("The destination profile has an invalid display name.")
+
+        destinationConfiguration = pglPostgres.fromSettings(settings=destinationSettings)
+        if destinationConfiguration is None:
+            raise ValueError("The destination profile's PostgreSQL configuration is unavailable.")
+        if not isinstance(destinationConfiguration, pglPostgres):
+            raise TypeError("Destination configuration is not pglPostgres.")
+
+        destinationPostgres = destinationConfiguration.withTimeouts(
+            lockTimeoutSeconds=lockTimeoutSeconds,
+            ioTimeoutSeconds=ioTimeoutSeconds,
+            connectTimeoutSeconds=connectTimeoutSeconds,
+        )
+
+        return {
+            "sourceReference": deepcopy(reference),
+            "sourcePostgres": sourcePostgres,
+            "destinationPostgres": destinationPostgres,
+            "destinationProfileName": databaseName,
+            "destinationDisplayName": destinationLabel,
+            "username": username,
+        }
+        
+    @staticmethod
+    def _confirmSessionExportPlan(decision, *, destinationProfileName):
+        """Confirm a new export without destination writes or publication locks.
+
+        The decision supplies the source ancestry and distinct matrix IDs.
+        No total transfer size is invented: catalog-only decision inspection
+        has not established a complete byte inventory.
+
+        Existing/conflicting exports are not confirmation candidates.
+        Only literal True from the shared dialog authorizes continuation.
+        Dialog cancellation/failure returns False; interrupts propagate.
+        """
+        if type(decision) is not dict or decision.get("state") != "newExportCandidate":
+            raise ValueError("Only a new-export candidate can be confirmed.")
+
+        source = decision["sourceReference"]
+        ancestry = decision["requestedAncestrySessionIDs"]
+        matrices = decision["matrixRevisionIDs"]
+        details = "\n".join([
+            f"Source profile label: {source['databaseName']!r}",
+            f"Source database UUID: {source['databaseID']}",
+            f"Selected saved checkpoint: {source['sessionID']}",
+            f"Saved ancestry, root to selected: {', '.join(map(str, ancestry))}",
+            f"Checkpoint count: {len(ancestry)}",
+            f"Distinct matrix revisions: {len(matrices)}",
+            "",
+            f"Destination profile: {destinationProfileName!r}",
+            f"Destination database UUID: {decision['destinationDatabaseID']}",
+            "Storage: first configured destination payload location.",
+            "Output: a newly generated export-<UUID> directory; no overwrite.",
+            "",
+            "Transfer size: not yet inventoried; no byte estimate is claimed.",
+            "Preparation and repeated integrity verification may take time.",
+            "The current implementation holds the destination publication lock during transfer.",
+            "",
+            "Only SAVED checkpoint contents are exported.",
+            "Unsaved working edits are excluded; the working source binding stays unchanged.",
+            "Source-qualified historical provenance is preserved.",
+            "",
+            "Approval permits attempting new destination publication.",
+            "Identities and conflicts are checked again during publication.",
+            "Failures may leave retained partial/unregistered payloads.",
+            "An uncertain commit must be inspected before any retry.",
+            "No automatic cleanup, overwrite, or repair is performed.",
+        ])
+        return pglDialogs.confirm(
+            "Export the selected saved checkpoint and its ancestry?",
+            title="Confirm database session export",
+            details=details,
+            confirmButtonText="Export saved checkpoint",
+            copyText="Copy export plan",
+        ) is True
+
+    @staticmethod
+    def _warnSessionExportFailure(error, outcome):
+        """Report export failure without leaking backend exception text.
+
+        Presentation only: does not suppress/reclassify the original exception,
+        retry, connect, repair, or delete anything. Caller guards warning failures.
+        The full original exception and exportOutcome remain available.
+        """
+        if outcome.get("commitConfirmed"):
+            status = (
+                "Destination publication COMMITTED. It was not rolled back. "
+                "Subsequent verification or resource cleanup did not finish successfully."
+            )
+            if outcome.get("postCommitVerificationPassed"):
+                status += " Independent post-commit verification had already passed."
+            recovery = (
+                "Inspect the existing destination mappings before doing anything else. "
+                "Do not republish or delete its payload directory to resolve this error."
+            )
+        elif outcome.get("commitAttempted"):
+            status = (
+                "Commit was attempted, but this client did not confirm its outcome. "
+                "The destination may already contain the completed export."
+            )
+            recovery = (
+                "Restore access and inspect the source-qualified destination mappings "
+                "before retrying. Do not assume rollback or start another publication blindly."
+            )
+        else:
+            status = (
+                "The final destination commit was not attempted. "
+                "Transaction/resource cleanup was attempted; prepared files may remain."
+            )
+            recovery = (
+                "Resolve the reported issue and inspect any retained preparation output "
+                "before another attempt. Do not overwrite or automatically delete it."
+            )
+
+        sqlstate = getattr(error, "sqlstate", None)
+        if isinstance(error, KeyboardInterrupt):
+            advice = "The operation was interrupted."
+        elif isinstance(error, TimeoutError) or sqlstate in {"55P03", "57014"}:
+            advice = (
+                "A wait or operation timed out. Check connectivity and active PostgreSQL "
+                "locks; do not terminate another session without reviewing its work."
+            )
+        elif isinstance(error, PermissionError) or sqlstate in {"28000", "28P01", "42501"}:
+            advice = "Check the selected profile's credentials and database/storage permissions."
+        elif isinstance(error, FileExistsError):
+            advice = "An output location already exists. Retain it for review; export does not overwrite."
+        elif isinstance(error, FileNotFoundError):
+            advice = (
+                "Check configured storage roots, mounts, and registered payload availability. "
+                "Restore missing files from a trusted copy rather than altering hashes."
+            )
+        elif isinstance(error, (ConnectionError, psycopg.OperationalError, psycopg.InterfaceError)):
+            advice = "Check PostgreSQL availability, network/VPN connectivity, and configured transport."
+        elif isinstance(error, (ValueError, TypeError)):
+            advice = (
+                "Review the original exception for the exact configuration, contract, "
+                "identity, or integrity mismatch. Do not bypass validation to proceed."
+            )
+        elif isinstance(error, OSError):
+            advice = "Check storage availability, free space, mounts, and read/write permissions."
+        else:
+            advice = (
+                "Retain the traceback and report the failure before retrying; "
+                "an unexpected implementation or dependency error may have occurred."
+            )
+
+        identifiers = []
+        reference = outcome.get("sourceReference")
+        if type(reference) is dict:
+            identifiers.append(
+                f"Source checkpoint: {reference.get('sessionID')} "
+                f"in schema UUID {reference.get('databaseID')}."
+            )
+        if outcome.get("destinationDatabaseID"):
+            identifiers.append(f"Destination schema UUID: {outcome['destinationDatabaseID']}.")
+        if outcome.get("destinationBackendID") is not None:
+            identifiers.append(f"Destination backend ID: {outcome['destinationBackendID']}.")
+        if outcome.get("preparationObjectPrefix"):
+            identifiers.append(
+                f"Retained preparation prefix: {outcome['preparationObjectPrefix']} "
+                "(relative to the configured backend root)."
+            )
+        if outcome.get("sessionIDMapping"):
+            identifiers.append(f"Allocated source-to-destination IDs: {outcome['sessionIDMapping']}.")
+
+        pglMessages.warning(
+            f"Session export stopped during {outcome.get('phase', 'unknown phase')} "
+            f"({type(error).__name__}).\n"
+            f"{status}\n{advice}\n{recovery}\n"
+            + "\n".join(identifiers)
+            + "\nThe original exception retains exportOutcome where available. "
+              "No automatic retry, connection termination, or payload deletion occurred.",
+            level=2,
+        )
+
+    @classmethod
+    def exportSession(
+        cls, session, *, databaseName,
+        sourceStorageOptionsByBackend=None, destinationStorageOptions=None,
+        sourceSSLRootCert=None, destinationSSLRootCert=None,
+        lockTimeoutSeconds=30.0, ioTimeoutSeconds=60, connectTimeoutSeconds=10,
+    ):
+        """Export a session's selected SAVED checkpoint to a named profile.
+
+        Public wrapper:
+            session.export(databaseName="labArchive")
+
+        Does not save working edits, switch the session's source binding, or
+        infer source identity from the current default profile.
+
+        Initial scope:
+            Raw behavioral-v1 root and derived behavioral-v3 descendants.
+            No automatic partial-export merging, conflicting revision reuse,
+            overwrite, repair, or retry.
+
+        Returns:
+            state='verifiedExistingExport':
+                Existing destination and current source verified; no new writes.
+            state='conflict':
+                Initial decision found blockers; no preparation/publication.
+            state='cancelled':
+                New-export confirmation was declined or unavailable. No
+                publication connection, lock, destination writes, or output.
+            state='exported':
+                New publication committed and independently verified through
+                a new read-only destination connection.
+
+        Internal transaction sequence:
+            Consistent read-only source snapshot.
+            Separate destination read-only decision transaction, closed first.
+            READ COMMITTED destination publication transaction and lock.
+            Configured-backend registration, fresh preparation, actor resolution,
+            prepared publication, payload-access closure, then commit.
+            New read-only destination connection for post-commit verification.
+
+        The initial implementation holds the destination publication lock
+        throughout preparation/transfer. This favors explicit ownership and
+        rollback boundaries over concurrent-writer throughput.
+
+        A configured destination root must already exist. Preparation creates
+        a fresh generated child directory. Failed/partial output is retained.
+
+        Confirmation/progress:
+            New exports require pglDialogs.confirm before publication access.
+            Verification paths report actual streamed-byte progress.
+            Preparation and publication report streamed copying/hashing,
+            catalog registration, evidence construction, and mapping verification.
+            Ranges allocate work rather than predict elapsed time. Only this
+            outer operation reports overall success after verification and cleanup.
+            Confirmation occurs with no destination publication locks.
+
+        Failure:
+            An export-specific warning is displayed without suppressing errors.
+            Original exception propagates. Where supported, exportOutcome is
+            attached to it, with commitAttempted, commitConfirmed, phase,
+            selected identities, allocated mapping, and preparation prefix.
+            Exception notes summarize commit state without runtime credentials.
+            No automatic retry, connection termination, or deletion.
+
+        A failure after confirmed commit does not roll publication back.
+        An unconfirmed commit may already have succeeded.
+        A post-commit verification result does not authorize foreign loading.
+
+        Connection/password handling uses existing pglPostgres.connect().
+        Cancellation produces an exception rather than silently choosing another
+        profile. Runtime storage/authentication options are never returned as
+        evidence or included in exportOutcome.
+
+        Source/destination SQL snapshots and payload hashing are not atomic.
+        Concurrent scientific-payload mutation is unsupported.
+        """
+        from copy import deepcopy
+        from uuid import uuid4
+        import posixpath
+
+        outcome = {
+            "state": "inProgress",
+            "phase": "resolvingConfiguration",
+            "sourceReference": None,
+            "destinationDatabaseID": None,
+            "destinationProfileName": databaseName if type(databaseName) is str else None,
+            "destinationBackendID": None,
+            "preparationObjectPrefix": None,
+            "preparationStarted": False,
+            "confirmationRequested": False,
+            "confirmationAccepted": False,
+            "commitAttempted": False,
+            "commitConfirmed": False,
+            "postCommitVerificationPassed": False,
+            "sessionIDMapping": None,
+            "foreignResolutionAuthorized": False,
+        }
+
+
+        progress = None
+
+
+        class SafeExportProgress:
+            """Isolate ordinary display failures, never operation failures.
+
+            Only the wrapped display methods are inside try/except. Errors
+            raised by hashing, copying, SQL, or validation still propagate.
+            KeyboardInterrupt is not suppressed.
+            """
+            def __init__(self, target):
+                self.target = target
+
+            def __call__(self, fraction=None, description=None):
+                if self.target is None: return
+                try:
+                    self.target(fraction, description)
+                except Exception:
+                    self.target = None
+
+            def section(self, start, end, label=None):
+                if self.target is None: return SafeExportProgress(None)
+                try:
+                    return SafeExportProgress(self.target.section(start, end, label=label))
+                except Exception:
+                    return SafeExportProgress(None)
+
+        def progressSection(start, end, label):
+            if progress is None: return None
+            return SafeExportProgress(progress).section(start, end, label=label)
+
+        def reportProgress(fraction=None, description=None):
+            """A broken display must not change transaction/commit behavior."""
+            if progress is None: return
+            try:
+                progress(fraction, description)
+            except Exception:
+                pass
+
+        def closeProgress(description):
+            if progress is None: return
+            try:
+                progress.close(description)
+            except Exception:
+                pass
+
+        def safeWarning(message):
+            try:
+                pglMessages.warning(message, level=2)
+            except Exception:
+                pass
+
+        def requireConnection(connection, label):
+            if connection is None:
+                raise RuntimeError(f"{label} PostgreSQL connection was cancelled.")
+
+        def requireIdentity(connection, postgres, expected, label):
+            actual = cls._requireStableDatabaseIdentity(connection, postgres)
+            if actual != expected:
+                raise ValueError(f"{label} database UUID changed or differs from expected identity.")
+            return actual
+
+        def requireUnchangedBinding():
+            if cls._getBoundCheckpointReference(session) != sourceReference:
+                raise ValueError("Session saved-checkpoint binding changed during export.")
+
+        try:
+            try:
+                progress = pglProgress("Exporting saved session")
+            except Exception:
+                # Display construction is optional; export safety is not.
+                progress = None
+            reportProgress(None, "Resolving explicit export configurations")
+            if destinationStorageOptions is not None and type(destinationStorageOptions) is not dict:
+                raise TypeError("destinationStorageOptions must be a dictionary or None.")
+            if sourceStorageOptionsByBackend is not None and type(sourceStorageOptionsByBackend) is not dict:
+                raise TypeError("sourceStorageOptionsByBackend must be a dictionary or None.")
+
+            configuration = cls._resolveSessionExportConfiguration(
+                session, databaseName,
+                lockTimeoutSeconds=lockTimeoutSeconds,
+                ioTimeoutSeconds=ioTimeoutSeconds,
+                connectTimeoutSeconds=connectTimeoutSeconds,
+            )
+            sourceReference = deepcopy(configuration["sourceReference"])
+            sourcePostgres = configuration["sourcePostgres"]
+            destinationPostgres = configuration["destinationPostgres"]
+            sourceDatabaseID = sourceReference["databaseID"]
+            sessionID = sourceReference["sessionID"]
+            outcome["sourceReference"] = deepcopy(sourceReference)
+
+            pglMessages.message(
+                f"Exporting saved checkpoint {sessionID} to profile {databaseName!r}. "
+                "Unsaved working edits are not included; the working session remains bound to its source."
+            )
+
+            outcome["phase"] = "openingSource"
+            reportProgress(None, 'Opening source database')
+            with sourcePostgres.connect(sslRootCert=sourceSSLRootCert) as sourceConnection:
+                requireConnection(sourceConnection, "Source")
+                with sourceConnection.transaction():
+                    sourceConnection.execute(
+                        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+                    )
+                    requireIdentity(
+                        sourceConnection, sourcePostgres, sourceDatabaseID, "Source",
+                    )
+
+                    outcome["phase"] = "inspectingDestination"
+                    reportProgress(None, 'Inspecting destination and checking existing export')
+                    with destinationPostgres.connect(
+                        sslRootCert=destinationSSLRootCert,
+                    ) as decisionConnection:
+                        requireConnection(decisionConnection, "Destination decision")
+                        with decisionConnection.transaction():
+                            decisionConnection.execute(
+                                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+                            )
+                            destinationDatabaseID = cls._requireStableDatabaseIdentity(
+                                decisionConnection, destinationPostgres,
+                            )
+                            if destinationDatabaseID == sourceDatabaseID:
+                                raise ValueError("Export requires different source/destination database UUIDs.")
+                            outcome["destinationDatabaseID"] = destinationDatabaseID
+                            # Choose the display range from a cheap catalog-only
+                            # inspection in this same consistent SQL snapshot.
+                            # Actual mapping/evidence/payload verification still
+                            # belongs to the normal decision helper below.
+                            progressInspection = cls._inspectCheckpointReference(
+                                decisionConnection, destinationPostgres, sourceReference,
+                            )
+                            decisionProgressEnd = (
+                                0.99 if progressInspection["state"] == "candidate"
+                                else 0.15
+                            )
+                            decision = cls._inspectSessionExportDecision(
+                                sourceConnection, sourcePostgres,
+                                decisionConnection, destinationPostgres, sessionID,
+                                sourceDatabaseName=sourceReference["databaseName"],
+                                sourceStorageOptionsByBackend=sourceStorageOptionsByBackend,
+                                # Existing export locations may span backends;
+                                # the simple API uses their configured access defaults.
+                                destinationStorageOptionsByBackend=None,
+                                progress=progressSection(0.02, decisionProgressEnd, "Inspecting export"),
+                            )
+
+                    if (
+                        decision["sourceReference"]["databaseID"] != sourceDatabaseID
+                        or decision["sourceReference"]["sessionID"] != sessionID
+                        or decision["destinationDatabaseID"] != destinationDatabaseID
+                    ):
+                        raise ValueError("Export decision returned inconsistent database/checkpoint identities.")
+
+                    if decision["state"] in ("verifiedExistingExport", "conflict"):
+                        requireUnchangedBinding()
+                        finalState = decision["state"]
+                        operationResult = {"decision": decision}
+                        if finalState == "conflict":
+                            conflicts = decision.get("conflicts", {})
+                            summary = ", ".join(
+                                f"{name}: {len(records)}"
+                                for name, records in conflicts.items() if records
+                            )
+                            safeWarning(
+                                "Export blocked by destination catalog conflicts. "
+                                + (summary + ". " if summary else "")
+                                + "No new payloads or checkpoint records were created. "
+                                "Review the returned decision; automatic merging and overwrite are not supported."
+                            )
+                        else:
+                            reportProgress(None, "Existing export verified; no new publication")
+                    elif decision["state"] == "newExportCandidate":
+                        if not destinationPostgres.storageLocations:
+                            raise ValueError("New export requires a configured destination storage location.")
+
+                        outcome["phase"] = "awaitingConfirmation"
+                        reportProgress(None, 'Awaiting confirmation; no publication lock held')
+                        outcome["confirmationRequested"] = True
+                        approved = cls._confirmSessionExportPlan(
+                            decision, destinationProfileName=databaseName,
+                        )
+                        if approved is not True:
+                            requireUnchangedBinding()
+                            finalState = "cancelled"
+                            operationResult = {"decision": decision}
+                        else:
+                            outcome["confirmationAccepted"] = True
+                            outcome["phase"] = "openingPublication"
+                            reportProgress(None, 'Opening destination publication connection')
+                            with destinationPostgres.connect(
+                                sslRootCert=destinationSSLRootCert,
+                            ) as publicationConnection:
+                                requireConnection(publicationConnection, "Destination publication")
+                                with publicationConnection.transaction():
+                                    publicationConnection.execute(
+                                        "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE"
+                                    )
+                                    requireIdentity(
+                                        publicationConnection, destinationPostgres,
+                                        destinationDatabaseID, "Destination",
+                                    )
+                                    outcome["phase"] = "acquiringPublicationLock"
+                                    reportProgress(None, 'Waiting for destination publication lock')
+                                    cls._acquireCheckpointPublicationLock(
+                                        publicationConnection, destinationPostgres,
+                                        progress=progressSection(0.15, 0.15, "Waiting for publication lock"),
+                                    )
+
+                                    # This helper may insert a backend. Keep that
+                                    # insertion in the same transaction as publication.
+                                    backendID = cls._getConfiguredStorageBackend(
+                                        publicationConnection, destinationPostgres,
+                                        storageOptions=destinationStorageOptions,
+                                    )
+                                    outcome["destinationBackendID"] = backendID
+                                    backends = sql.Identifier(
+                                        destinationPostgres.databaseSchema, "storage_backends",
+                                    )
+                                    backend = publicationConnection.execute(
+                                        sql.SQL(
+                                            "SELECT url_prefix, is_active FROM {} "
+                                            "WHERE backend_id = %s FOR SHARE"
+                                        ).format(backends),
+                                        (backendID,),
+                                    ).fetchone()
+                                    if backend is None or backend[1] is not True:
+                                        raise ValueError("Configured export backend is absent or inactive.")
+
+                                    runtimeOptions = {
+                                        backendID: dict(destinationStorageOptions or {})
+                                    }
+                                    objectPrefix = f"export-{uuid4()}"
+                                    outcome["preparationObjectPrefix"] = objectPrefix
+
+                                    with pglDatabaseAccess(
+                                        destinationPostgres, runtimeOptions,
+                                    ) as destinationAccess:
+                                        filesystem, root = destinationAccess.resolve(
+                                            backendID, backend[0],
+                                        )
+                                        outcome["phase"] = "preparingPayloads"
+                                        reportProgress(None, 'Inventorying, copying, and verifying saved payloads')
+                                        outcome["preparationStarted"] = True
+                                        preparation = cls._prepareSessionExportPayloads(
+                                            sourceConnection, sourcePostgres, sessionID,
+                                            posixpath.join(root, objectPrefix),
+                                            expectedSourceDatabaseID=sourceDatabaseID,
+                                            sourceStorageOptionsByBackend=sourceStorageOptionsByBackend,
+                                            destinationFilesystem=filesystem,
+                                            progress=progressSection(0.15, 0.60, "Preparing export payloads"),
+                                        )
+
+                                        # Preparation paths are relative to its new
+                                        # directory. Registration paths are relative
+                                        # to the backend root, so prefix them once.
+                                        prepared = deepcopy(preparation["preparedCheckpoints"])
+                                        for item in prepared:
+                                            item["objectPrefix"] = posixpath.join(
+                                                objectPrefix, item["objectPrefix"],
+                                            )
+                                        matrixObjectKeys = {
+                                            revisionID: posixpath.join(objectPrefix, key)
+                                            for revisionID, key in preparation["matrixObjectKeys"].items()
+                                        }
+
+                                        requireUnchangedBinding()
+                                        outcome["phase"] = "publishingPreparedExport"
+                                        reportProgress(None, 'Registering checkpoints, matrices, evidence, and mappings')
+                                        createdBy = cls.getOrCreateUser(
+                                            publicationConnection, destinationPostgres,
+                                            configuration["username"],
+                                        )
+                                        publication = cls._registerPreparedSessionExport(
+                                            publicationConnection, destinationPostgres,
+                                            sourceDatabaseID=sourceDatabaseID,
+                                            sourceDatabaseName=sourceReference["databaseName"],
+                                            expectedDestinationDatabaseID=destinationDatabaseID,
+                                            preparedCheckpoints=prepared,
+                                            matrixObjectKeys=matrixObjectKeys,
+                                            createdBy=createdBy, backendID=backendID,
+                                            savedTimezone="UTC",
+                                            accessContext=destinationAccess,
+                                            storageOptionsByBackend=runtimeOptions,
+                                            **({"progress": progressSection(0.60, 0.85, "Publishing and verifying export")} if progress is not None else {}),
+                                        )
+                                        outcome["sessionIDMapping"] = deepcopy(
+                                            publication["sessionIDMapping"]
+                                        )
+                                        requireUnchangedBinding()
+                                        outcome["phase"] = "closingPublicationPayloadAccess"
+                                        reportProgress(None, 'Closing publication payload access before commit')
+
+                                    # Never set attempted before payload-access exit.
+                                    outcome["phase"] = "committingDestination"
+                                    reportProgress(None, 'Committing destination publication')
+                                    outcome["commitAttempted"] = True
+                                outcome["commitConfirmed"] = True
+                                outcome["phase"] = "closingPublicationConnection"
+                                reportProgress(None, 'Closing committed publication connection')
+
+                            # A fresh connection must see the committed rows.
+                            outcome["phase"] = "verifyingCommittedExport"
+                            reportProgress(None, 'Independently verifying committed export and current source')
+                            with destinationPostgres.connect(
+                                sslRootCert=destinationSSLRootCert,
+                            ) as verificationConnection:
+                                requireConnection(verificationConnection, "Post-commit verification")
+                                with verificationConnection.transaction():
+                                    verificationConnection.execute(
+                                        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+                                    )
+                                    requireIdentity(
+                                        verificationConnection, destinationPostgres,
+                                        destinationDatabaseID, "Post-commit destination",
+                                    )
+                                    reconciliation = cls._inspectExistingSessionExport(
+                                        verificationConnection, destinationPostgres,
+                                        sourceReference,
+                                        storageOptionsByBackend=runtimeOptions,
+                                        progress=progressSection(0.85, 0.93, "Verifying committed destination"),
+                                    )
+                                    if reconciliation["state"] != "verifiedExistingExport":
+                                        raise ValueError("Committed export did not reconcile.")
+                                    observedMapping = {
+                                        item["sourceSessionID"]: item["destinationSessionID"]
+                                        for item in reconciliation["checkpoints"]
+                                    }
+                                    if observedMapping != publication["sessionIDMapping"]:
+                                        raise ValueError("Post-commit mapping differs from the published allocation.")
+                                    for item in reconciliation["checkpoints"]:
+                                        sourceID = item["sourceSessionID"]
+                                        observedEvidence = item["mappingBinding"]["evidence"]
+                                        expectedEvidence = publication["evidenceBySourceSessionID"][sourceID]
+                                        if pglStorage.encodeJSON(observedEvidence) != pglStorage.encodeJSON(expectedEvidence):
+                                            raise ValueError("Post-commit mapping evidence differs from publication.")
+
+                                    sourceVerification = cls._verifyExportCurrentSource(
+                                        sourceConnection, sourcePostgres, reconciliation,
+                                        storageOptionsByBackend=sourceStorageOptionsByBackend,
+                                        progress=progressSection(0.93, 0.99, "Rechecking source"),
+                                    )
+                                    if (
+                                        sourceVerification["state"] != "sourceMatchesRecordedExport"
+                                        or sourceVerification["sourceDatabaseID"] != sourceDatabaseID
+                                        or sourceVerification["destinationDatabaseID"] != destinationDatabaseID
+                                    ):
+                                        raise ValueError("Post-commit source correspondence is inconsistent.")
+                            outcome["postCommitVerificationPassed"] = True
+                            finalState = "exported"
+                            operationResult = {
+                                "sessionIDMapping": deepcopy(publication["sessionIDMapping"]),
+                                "destinationSessionID": publication["sessionIDMapping"][sessionID],
+                                "verificationScope": [
+                                    item["sourceSessionID"] for item in reconciliation["checkpoints"]
+                                ],
+                            }
+                    else:
+                        raise ValueError("Unsupported export decision state.")
+
+                    outcome["phase"] = "closingSourceSnapshot"
+                    reportProgress(None, 'Closing source inspection transaction')
+                outcome["phase"] = "closingSourceConnection"
+                reportProgress(None, 'Closing source connection')
+
+            outcome["phase"] = "complete"
+            outcome["state"] = finalState
+            if finalState in ("exported", "verifiedExistingExport"):
+                if progress is not None:
+                    try:
+                        progress.finish(
+                            "Export committed and verified" if finalState == "exported"
+                            else "Existing export verified; no new writes"
+                        )
+                    except Exception:
+                        pass
+            elif finalState == "cancelled":
+                reportProgress(None, "Export cancelled; no destination publication attempted")
+                closeProgress("Cancelled")
+            else:
+                reportProgress(None, "Export blocked; inspect returned conflicts")
+                closeProgress("Blocked")
+            return {**deepcopy(outcome), **operationResult}
+
+        except BaseException as error:
+            outcome["state"] = (
+                "committedButOperationFailed" if outcome["commitConfirmed"]
+                else "commitOutcomeUnconfirmed" if outcome["commitAttempted"]
+                else "failedBeforeCommit"
+            )
+            # Retain original error category/traceback. Configuration dictionaries,
+            # passwords, signed access URLs, and storage options are excluded.
+            try:
+                error.exportOutcome = deepcopy(outcome)
+            except Exception:
+                pass
+            try:
+                error.add_note(
+                    "PGL export outcome: "
+                    f"{outcome['state']}; phase={outcome['phase']}; "
+                    f"commitAttempted={outcome['commitAttempted']}; "
+                    f"commitConfirmed={outcome['commitConfirmed']}; "
+                    f"postCommitVerificationPassed={outcome['postCommitVerificationPassed']}. "
+                    "Prepared payloads are retained. No automatic retry or cleanup occurred."
+                )
+            except Exception:
+                pass
+            try:
+                cls._warnSessionExportFailure(error, outcome)
+            except Exception:
+                # Reporting must never replace the original export exception.
+                pass
+            closeProgress("Interrupted" if isinstance(error, KeyboardInterrupt) else "Failed")
+            raise
+
+        finally:
+            closeProgress(None)
 
     # -------------------------------------------------------------------------
     # Lifecycle exception types
@@ -15313,6 +23088,153 @@ class pglDatabase:
             }
             for record in validated
         ]
+
+
+    @classmethod
+    def _requireStableDatabaseIdentity(cls, connection, postgres):
+        """Require current migration history, then read the persistent UUID.
+
+        Uses the caller's transaction. No migrations, grants, or schema writes.
+        SQL access failures retain their original exception categories.
+
+        Public load/save coordinators call this before accessing checkpoint
+        payloads or performing publication writes.
+        """
+        report = cls._inspectMigrationCompatibility(connection, postgres)
+
+        if not report["compatible"]:
+            details = "\n".join(issue["message"] for issue in report["issues"])
+            raise RuntimeError(
+                "Scientific database migration compatibility could not be established.\n"
+                + details
+            )
+
+        return cls._readStableDatabaseID(connection, postgres)
+
+    @staticmethod
+    def _validateCheckpointBinding(binding):
+        """Validate runtime binding metadata without reading settings or SQL.
+
+        This record identifies the selected saved checkpoint, not the complete
+        current scientific state. Unsaved working changes may exist.
+
+        Runtime endpoint checks remain distinct from durable provenance.
+        Returns an independent copy; never upgrades a legacy history record.
+        """
+        expectedFields = {"version", "checkpoint", "databaseIdentity"}
+
+        if type(binding) is not dict or set(binding) != expectedFields:
+            raise ValueError("Invalid saved-checkpoint binding fields.")
+        if type(binding["version"]) is not int or binding["version"] != 1:
+            raise ValueError("Unsupported saved-checkpoint binding version.")
+
+        reference = binding["checkpoint"]
+        if type(reference) is not dict or set(reference) != {"databaseID", "sessionID", "databaseName"}:
+            raise ValueError("Invalid database-qualified checkpoint reference.")
+
+        sessionID = reference["sessionID"]
+        if type(sessionID) is not int or not 0 <= sessionID <= 9223372036854775807:
+            raise ValueError("Bound sessionID must be a nonnegative PostgreSQL bigint.")
+
+        databaseID = reference["databaseID"]
+        if not isinstance(databaseID, str):
+            raise ValueError("Bound databaseID must be a canonical UUID string.")
+
+        try:
+            parsedID = uuid.UUID(databaseID)
+        except (ValueError, AttributeError):
+            raise ValueError("Bound databaseID is invalid.") from None
+
+        if str(parsedID) != databaseID or parsedID.int == 0:
+            raise ValueError("Bound databaseID must be a canonical nonzero UUID.")
+
+        databaseName = reference["databaseName"]
+        if (
+            not isinstance(databaseName, str) or not databaseName.strip()
+            or any(character in databaseName for character in ("\x00", "\n", "\r"))
+        ):
+            raise ValueError("Bound databaseName must be a nonblank profile label without NUL or newlines.")
+
+        identity = binding["databaseIdentity"]
+        if type(identity) is not dict:
+            raise ValueError("Bound runtime database identity must be a dictionary.")
+
+        fields = {"transport", "host", "port", "database", "schema"}
+        if identity.get("transport") == "ssh":
+            fields.update({"sshHost", "sshPort", "sshUser"})
+        elif identity.get("transport") != "direct":
+            raise ValueError("Unsupported bound database transport.")
+
+        if set(identity) != fields:
+            raise ValueError("Invalid bound runtime database identity fields.")
+
+        for name in ("host", "database", "schema"):
+            if not isinstance(identity[name], str) or not identity[name].strip() or "\x00" in identity[name]:
+                raise ValueError(f"Invalid bound database endpoint field: {name}.")
+
+        for name in ("port", "sshPort"):
+            if name in identity and (type(identity[name]) is not int or not 1 <= identity[name] <= 65535):
+                raise ValueError(f"Invalid bound database endpoint port: {name}.")
+
+        if identity["transport"] == "ssh":
+            if not isinstance(identity["sshHost"], str) or not identity["sshHost"].strip() or "\x00" in identity["sshHost"]:
+                raise ValueError("Invalid bound SSH host.")
+            if not isinstance(identity["sshUser"], str) or "\x00" in identity["sshUser"]:
+                raise ValueError("Invalid bound SSH user.")
+
+        return deepcopy(binding)
+
+    @classmethod
+    def _prepareCheckpointBinding(cls, sessionID, postgres, *, databaseID, databaseName):
+        """Prepare a binding without modifying a working session.
+
+        databaseID must have been read from the caller's verified SQL snapshot.
+        databaseName is the resolved PGL profile label, not the SQL database name.
+
+        Saves prepare this before commit and install it after cleanup.
+        No scientific history boundary is inferred, including for raw saves.
+        """
+        binding = {
+            "version": 1,
+            "checkpoint": {
+                "databaseID": databaseID,
+                "sessionID": sessionID,
+                "databaseName": databaseName,
+            },
+            "databaseIdentity": cls._checkpointDatabaseIdentity(postgres),
+        }
+        return cls._validateCheckpointBinding(binding)
+
+    @classmethod
+    def _getBoundCheckpointReference(cls, session):
+        """Return the selected saved-checkpoint reference, or None if unbound.
+
+        Reads runtime bookkeeping only. Never consults the current default
+        database, opens payloads, or changes history.
+
+        A numeric sessionID without this binding does not establish a source
+        database. Existing pre-update working sessions should be reloaded.
+
+        A reference identifies the saved checkpoint beneath a working object;
+        it is not a claim that every current scientific value was saved there.
+        """
+        binding = getattr(session, "_checkpointBinding", {})
+
+        if type(binding) is not dict:
+            raise ValueError("Invalid saved-checkpoint binding.")
+        if not binding: return None
+
+        validated = cls._validateCheckpointBinding(binding)
+        sessionID = getattr(session, "sessionID", None)
+
+        if type(sessionID) is not int or sessionID != validated["checkpoint"]["sessionID"]:
+            raise ValueError(
+                "Working sessionID differs from its saved-checkpoint binding. "
+                "Reload the intended checkpoint rather than manually retargeting its ID."
+            )
+
+        return validated["checkpoint"]
+
     
     
 

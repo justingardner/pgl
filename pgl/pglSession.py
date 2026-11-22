@@ -2290,6 +2290,9 @@ class pglSession(pglActionable):
     filesystem = Instance(AbstractFileSystem, allow_none=True, serialize=False, help="Filesystem for serialization")
     filesystemPrefix = Unicode(allow_none=True, default_value="", help="Filesystem protocol prefix", visible=False)
     sessionID = Int(default_value=None, allow_none=True, help="Most recently loaded or successfully saved database checkpoint ID", serialize=False)
+    # Saved source identity is separate from the history baseline: raw saves
+    # bind a checkpoint without asserting a new working-history boundary.
+    _checkpointBinding = Dict(default_value={}, help="Storage-managed saved-checkpoint identity; not a dirty-state detector").tag(serialize=False)
     description = Unicode(default_value=None, allow_none=True, help="Checkpoint description carried forward by saveSession; an empty string clears it.", serialize=False)
     checkpointName = Unicode(default_value=None, allow_none=True, help="Short checkpoint label carried forward by saveSession; an empty string clears it.", serialize=False)
     checkpointSavedDateTime = Unicode(default_value=None, allow_none=True, help="Recorded checkpoint completion time as an ISO timestamp").tag(serialize=False)
@@ -2506,7 +2509,8 @@ class pglSession(pglActionable):
         Returns a completed/reused checkpoint ID, or None for rejection,
         cancellation, unavailable configuration, or handled operational failure.
 
-        Assigns self.sessionID only after successful publication and cleanup.
+        The database coordinator binds self.sessionID and saved source identity
+        only after successful publication and connection cleanup.
         Does not bind a new history baseline or clear action history.
 
         SQL writes are transactional; payload writes are not.
@@ -2519,9 +2523,8 @@ class pglSession(pglActionable):
 
         sessionID = pglDatabase.saveRawSession(self, settings=settings, settingsName=settingsName, backendID=backendID, storageOptions=storageOptions, sslRootCert=sslRootCert, allowMissingMetadata=allowMissingMetadata, lockTimeoutSeconds=lockTimeoutSeconds, ioTimeoutSeconds=ioTimeoutSeconds, connectTimeoutSeconds=connectTimeoutSeconds)
 
-        if sessionID is not None:
-            self.sessionID = sessionID
-
+        # Identity assignment belongs to the database coordinator, which
+        # has the verified schema UUID and resolved source configuration.
         return sessionID
 
     def info(self):
@@ -3903,3 +3906,41 @@ class pglSession(pglActionable):
 
         if current is not None:
             current._bindSession(self)
+            
+    def export(
+        self, *, databaseName,
+        sourceStorageOptionsByBackend=None, destinationStorageOptions=None,
+        sourceSSLRootCert=None, destinationSSLRootCert=None,
+        lockTimeoutSeconds=30.0, ioTimeoutSeconds=60, connectTimeoutSeconds=10,
+    ):
+        """Export the selected saved checkpoint to a named database profile.
+
+        Typical use:
+            result = session.export(databaseName="labArchive")
+
+        Exports saved contents and required ancestry—not unsaved working edits.
+        Does not save the working session or switch its source binding.
+
+        Existing verified exports return without republishing. Partial exports
+        and catalog conflicts are reported without overwrite or automatic reuse.
+
+        New exports may commit destination checkpoints and immutable mappings.
+        Failures propagate with exportOutcome information where available.
+        An uncertain commit must be inspected before retrying; a confirmed
+        commit is not undone by a later verification or cleanup failure.
+
+        Payloads and diagnostics are never automatically deleted.
+        Advanced runtime options are optional; ordinary profile defaults apply.
+        """
+        from .pglDatabase import pglDatabase
+
+        return pglDatabase.exportSession(
+            self, databaseName=databaseName,
+            sourceStorageOptionsByBackend=sourceStorageOptionsByBackend,
+            destinationStorageOptions=destinationStorageOptions,
+            sourceSSLRootCert=sourceSSLRootCert,
+            destinationSSLRootCert=destinationSSLRootCert,
+            lockTimeoutSeconds=lockTimeoutSeconds,
+            ioTimeoutSeconds=ioTimeoutSeconds,
+            connectTimeoutSeconds=connectTimeoutSeconds,
+        )

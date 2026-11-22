@@ -526,21 +526,37 @@ class pglExecutionRecorder:
     ################################################################
     # Record an explicitly resolved scientific dependency
     ################################################################
-    def recordProductInput(self, selector, product):
-        """Record exact product metadata consumed through an explicit selector.
+    def recordProductInput(self, selector, product, *, checkpoint=None):
+        """Record exact product consumption and optional saved-owner identity.
 
-        Called by selector resolution, not manually by each scientific action.
-        Copies metadata so later caller edits cannot change provenance.
+        Called by product-selector resolution inside an action.
 
-        Does not read or verify payload bytes. Artifact access must still use
-        the recorded identities and the storage verification interface.
+        checkpoint:
+            Optional database-qualified saved checkpoint of the supplied
+            working session owner. Its presence does not prove that an
+            unsaved product already exists in that checkpoint.
+
+            None means no qualified saved-owner reference was established.
+            Never infer identity from current database settings.
+
+        New records use schemaVersion=2. Existing historical records are not
+        rewritten, and original product metadata is preserved unchanged.
+
+        Repeated identical consumption is deduplicated. Consumption through
+        different checkpoint identities remains distinct, including equal
+        numeric session IDs in different databases.
+
+        Does not read payloads, connect to SQL, or establish scientific validity.
         """
+        from uuid import UUID
+
         self._requireOpen()
         if self._actionID is None:
             raise ValueError("Product consumption recording requires an action execution.")
 
         selector = _copyProvenance(selector)
         product = _copyProvenance(product)
+        checkpoint = None if checkpoint is None else _copyProvenance(checkpoint)
 
         if type(selector) is not dict or type(product) is not dict:
             raise TypeError("Product selection and record must be dictionaries.")
@@ -551,15 +567,43 @@ class pglExecutionRecorder:
             if not isinstance(product.get(field), str) or not product[field].strip():
                 raise ValueError(f"Consumed product has no usable {field}.")
 
+        if checkpoint is not None:
+            if type(checkpoint) is not dict or set(checkpoint) != {"databaseID", "sessionID", "databaseName"}:
+                raise ValueError("Invalid consumed-product checkpoint reference.")
+
+            sessionID = checkpoint["sessionID"]
+            if type(sessionID) is not int or not 0 <= sessionID <= 9223372036854775807:
+                raise ValueError("Consumed-product sessionID must be a nonnegative PostgreSQL bigint.")
+
+            databaseID = checkpoint["databaseID"]
+            if not isinstance(databaseID, str):
+                raise ValueError("Consumed-product databaseID must be a canonical UUID string.")
+
+            try:
+                parsedID = UUID(databaseID)
+            except (ValueError, AttributeError):
+                raise ValueError("Invalid consumed-product databaseID.") from None
+
+            if str(parsedID) != databaseID or parsedID.int == 0:
+                raise ValueError("Consumed-product databaseID must be canonical and nonzero.")
+
+            databaseName = checkpoint["databaseName"]
+            if (
+                not isinstance(databaseName, str) or not databaseName.strip()
+                or any(character in databaseName for character in ("\x00", "\n", "\r"))
+            ):
+                raise ValueError("Consumed-product databaseName must be a nonblank profile label without NUL or newlines.")
+
         record = {
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "selector": selector,
             "product": product,
+            "checkpoint": checkpoint,
         }
         inputs = getattr(self, "_productInputs", [])
 
-        # Repeated use of the same selector/product is one declared dependency.
-        # Different selectors resolving to the same product remain explicit.
+        # Preserve the existing selector/product distinctions and additionally
+        # distinguish the saved owner through which consumption occurred.
         if record not in inputs:
             self._productInputs = [*inputs, record]
 

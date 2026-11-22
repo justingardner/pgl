@@ -293,6 +293,771 @@ class pglStorage:
         except BaseException:
             opened.close()
             raise
+        
+    @classmethod
+    def inventoryDataMatrixBundle(cls, dataPath, *, filesystem=None, storageOptions=None, expectedDescriptor=None, expectedFiles=None, progress=None):
+        """Inventory current matrix-bundle bytes without opening scientific arrays.
+
+        Reads bounded JSON metadata and streams every stored file for SHA-256.
+        Requires individual Zarr metadata to match consolidated metadata.
+
+        expectedDescriptor:
+            Optional catalog descriptor to compare structurally.
+
+        expectedFiles:
+            Optional prior inventory: sorted records containing exactly
+            name, sha256, and size_bytes. Requires exact file-set/byte equality.
+
+        Returns:
+            descriptor: Validated standalone publication descriptor.
+            files: Sorted bundle-relative byte identities.
+            bundleBytes: Sum of actual hashed file sizes.
+
+        This establishes an observed stored-byte inventory, NOT complete Zarr
+        semantic validity, required-chunk coverage, or integrity since original
+        publication. Those require additional validation or trusted prior hashes.
+
+        Detectable symlinks and special entries are rejected. Generic backend
+        safety depends on accurate ls() metadata; local paths receive explicit
+        symlink checks. Listings must be authoritative and complete.
+
+        Concurrent mutation is unsupported. Repeated listing/size checks detect
+        some changes but do not provide an atomic filesystem snapshot.
+
+        Does not query SQL, decode chunks, construct matrices, write files, or
+        close a caller-supplied filesystem. Errors propagate.
+        Optional progress:
+            A pglProgress-compatible reporter supporting call() and section().
+            Reports this helper's work only; never finishes the parent display.
+            Caller callback errors propagate like the existing hash/copy helpers.
+
+        """
+        from copy import deepcopy
+        from .pglProgress import pglProgress
+
+        if progress is not None: progress(0, "Listing and validating matrix metadata")
+
+        from fsspec.implementations.local import LocalFileSystem
+
+        filesystem, root = cls._resolveStoragePath(
+            dataPath,
+            filesystem=filesystem,
+            storageOptions=storageOptions,
+            label="matrix bundle",
+        )
+        root = root.rstrip("/")
+        if not root: raise ValueError("A matrix bundle cannot be the filesystem root.")
+
+        def validateName(name):
+            """Require a portable bundle-relative POSIX filename."""
+            if (
+                not isinstance(name, str) or not name
+                or name.startswith("/") or "\\" in name
+                or any(character in name for character in ("\x00", "\n", "\r"))
+                or any(part in ("", ".", "..") for part in name.split("/"))
+            ):
+                raise ValueError(f"Invalid matrix inventory filename: {name!r}")
+
+        def requireLocalPathSafe(path):
+            """Reject local symlinks, including symlinked ancestor directories."""
+            if isinstance(filesystem, LocalFileSystem):
+                localPath = Path(path).absolute()
+                for candidate in (localPath, *localPath.parents):
+                    if candidate.is_symlink():
+                        raise ValueError(f"Symlinked matrix inventory path: {candidate}")
+
+        def listFiles():
+            """Enumerate through immediate children without silently skipping entries."""
+            requireLocalPathSafe(root)
+            if not filesystem.isdir(root): raise NotADirectoryError(root)
+
+            pending = [root]
+            visited = set()
+            files = {}
+
+            while pending:
+                directory = pending.pop()
+                if directory in visited: raise ValueError("Repeated matrix bundle directory.")
+                visited.add(directory)
+
+                for entry in filesystem.ls(directory, detail=True):
+                    path = filesystem._strip_protocol(entry["name"])
+                    relativeName = posixpath.relpath(path, root)
+                    validateName(relativeName)
+
+                    # A backend must return immediate children of this directory.
+                    if posixpath.dirname(path.rstrip("/")) != directory:
+                        raise ValueError("Backend listing returned a non-child bundle entry.")
+
+                    requireLocalPathSafe(path)
+                    if entry.get("islink") or entry.get("type") in ("link", "symlink"):
+                        raise ValueError(f"Symlink inside matrix bundle: {relativeName}")
+
+                    if relativeName != "matrix.json" and relativeName != "data.zarr" and not relativeName.startswith("data.zarr/"):
+                        raise ValueError(f"Unexpected matrix bundle entry: {relativeName}")
+
+                    kind = entry.get("type")
+                    if kind == "directory":
+                        if relativeName == "matrix.json":
+                            raise ValueError("matrix.json must be a file.")
+                        pending.append(path)
+                    elif kind == "file":
+                        if relativeName == "data.zarr":
+                            raise ValueError("data.zarr must be a directory.")
+                        if relativeName in files:
+                            raise ValueError("Duplicate matrix bundle filename.")
+                        size = entry.get("size")
+                        if type(size) is not int or size < 0:
+                            raise ValueError("Backend returned an invalid file size.")
+                        files[relativeName] = size
+                    else:
+                        raise ValueError(f"Unsupported bundle entry type: {relativeName}")
+
+            required = {
+                "matrix.json",
+                "data.zarr/.zgroup",
+                "data.zarr/.zattrs",
+                "data.zarr/.zmetadata",
+            }
+            if not required.issubset(files):
+                raise ValueError("Matrix bundle lacks required descriptor/Zarr metadata.")
+
+            return files
+
+        def readJSON(name):
+            """Read bounded metadata, rejecting duplicate keys and nonfinite numbers."""
+            def uniqueKeys(pairs):
+                result = {}
+                for key, value in pairs:
+                    if key in result: raise ValueError(f"Duplicate JSON key in {name}: {key!r}")
+                    result[key] = value
+                return result
+
+            def rejectConstant(value):
+                raise ValueError(f"Invalid JSON constant in {name}: {value}")
+
+            with filesystem.open(posixpath.join(root, name), "rb") as source:
+                content = source.read(cls.MAX_METADATA_BYTES + 1)
+            if len(content) > cls.MAX_METADATA_BYTES:
+                raise ValueError(f"Matrix metadata exceeds the size limit: {name}")
+
+            document = json.loads(content, object_pairs_hook=uniqueKeys, parse_constant=rejectConstant)
+            # Also reject nonfinite numbers produced by oversized JSON exponents.
+            cls.encodeJSON(document)
+            return document, {
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "size_bytes": len(content),
+            }
+
+        # Validate prior verification evidence before any payload hashing.
+        priorFiles = None
+        if expectedFiles is not None:
+            if type(expectedFiles) is not list:
+                raise TypeError("expectedFiles must be a list or None.")
+
+            priorFiles = {}
+            names = []
+            for record in expectedFiles:
+                if type(record) is not dict or set(record) != {"name", "sha256", "size_bytes"}:
+                    raise ValueError("Invalid expected matrix file record.")
+                name = record["name"]
+                validateName(name)
+                if not isinstance(record["sha256"], str) or re.fullmatch(r"[0-9a-f]{64}", record["sha256"]) is None:
+                    raise ValueError("Invalid expected matrix SHA-256.")
+                if type(record["size_bytes"]) is not int or record["size_bytes"] < 0:
+                    raise ValueError("Invalid expected matrix file size.")
+                names.append(name)
+                priorFiles[name] = dict(record)
+
+            if names != sorted(set(names)):
+                raise ValueError("Expected matrix filenames must be unique and sorted.")
+
+        if expectedDescriptor is not None:
+            cls._validateMatrixDescriptor(expectedDescriptor)
+            expectedDescriptor = deepcopy(expectedDescriptor)
+
+        before = listFiles()
+        descriptor, descriptorIdentity = readJSON("matrix.json")
+        cls._validateMatrixDescriptor(descriptor)
+
+        if expectedDescriptor is not None and cls.encodeJSON(descriptor) != cls.encodeJSON(expectedDescriptor):
+            raise ValueError("Stored matrix descriptor differs from catalog metadata.")
+
+        consolidated, consolidatedIdentity = readJSON("data.zarr/.zmetadata")
+        if (
+            type(consolidated) is not dict
+            or set(consolidated) != {"metadata", "zarr_consolidated_format"}
+            or type(consolidated["zarr_consolidated_format"]) is not int
+            or consolidated["zarr_consolidated_format"] != 1
+            or type(consolidated["metadata"]) is not dict
+        ):
+            raise ValueError("Unsupported consolidated Zarr metadata.")
+
+        metadata = consolidated["metadata"]
+        metadataNames = set()
+        metadataIdentities = {
+            "matrix.json": descriptorIdentity,
+            "data.zarr/.zmetadata": consolidatedIdentity,
+        }
+
+        for relativeName, expectedDocument in metadata.items():
+            validateName(relativeName)
+            if posixpath.basename(relativeName) not in {".zgroup", ".zattrs", ".zarray"}:
+                raise ValueError("Unexpected consolidated Zarr metadata key.")
+
+            name = f"data.zarr/{relativeName}"
+            if name not in before:
+                raise ValueError(f"Consolidated metadata has no stored counterpart: {name}")
+
+            document, identity = readJSON(name)
+            if type(document) is not dict:
+                raise ValueError(f"Zarr metadata must contain an object: {name}")
+            if cls.encodeJSON(document) != cls.encodeJSON(expectedDocument):
+                raise ValueError(f"Consolidated and individual metadata disagree: {name}")
+
+            metadataNames.add(name)
+            metadataIdentities[name] = identity
+
+        actualMetadataNames = {
+            name for name in before
+            if name.startswith("data.zarr/")
+            and posixpath.basename(name) in {".zgroup", ".zattrs", ".zarray"}
+        }
+        if metadataNames != actualMetadataNames:
+            raise ValueError("Consolidated metadata does not cover all stored Zarr metadata.")
+
+        group = metadata.get(".zgroup")
+        if type(group) is not dict or type(group.get("zarr_format")) is not int or group["zarr_format"] != 2:
+            raise ValueError("Expected a Zarr format 2 root group.")
+
+        records = []
+        work = [
+            {"name": name, "size_bytes": before[name]}
+            for name in sorted(before)
+        ]
+        hashProgress = progress.section(0.05, 0.95) if progress is not None else None
+        for item, fileProgress in pglProgress.fileSections(work, hashProgress):
+            name = item["name"]
+            identity = cls.hashFile(
+                filesystem, posixpath.join(root, name),
+                progress=fileProgress, expectedSize=before[name],
+                description="Hashing stored matrix file",
+            )
+            if identity["size_bytes"] != before[name]:
+                raise ValueError(f"Matrix file size changed during inventory: {name}")
+            if name in metadataIdentities and identity != metadataIdentities[name]:
+                raise ValueError(f"Matrix metadata changed during inventory: {name}")
+
+            record = {"name": name, **identity}
+            if priorFiles is not None and priorFiles.get(name) != record:
+                raise ValueError(f"Matrix bytes differ from the expected inventory: {name}")
+            records.append(record)
+
+        if priorFiles is not None and set(priorFiles) != set(before):
+            raise ValueError("Matrix file set differs from the expected inventory.")
+        if progress is not None: progress(0.95, "Rechecking matrix file inventory")
+        if listFiles() != before:
+            raise ValueError("Matrix file inventory changed while hashing.")
+        if progress is not None: progress(1, "Matrix byte inventory verified")
+
+        return {
+            "descriptor": descriptor,
+            "files": records,
+            "bundleBytes": sum(record["size_bytes"] for record in records),
+        }
+        
+    @classmethod
+    def inventoryDataMatrixBundleLayout(
+        cls, dataPath, *, requireAllChunks, filesystem=None,
+        storageOptions=None, expectedDescriptor=None, expectedFiles=None, progress=None,
+    ):
+        """Inventory stored bytes and validate the supported matrix chunk layout.
+
+        Reuses inventoryDataMatrixBundle(); does not change its byte-inventory
+        contract. Supports a flat Zarr-v2 group containing portable arrays.
+
+        requireAllChunks:
+            Required explicit Boolean policy.
+            True: reject absent grid chunks, including an absent scalar chunk.
+            False: report absent grid chunks without interpreting their values.
+
+            Strict coverage is an eligibility policy, not proof that a sparse
+            Zarr store is corrupt. No missing scientific values are inferred.
+
+        Returns the existing descriptor/files/bundleBytes fields plus:
+            layout:
+                policy and aggregate chunk counts.
+                arrays: sorted per-array schema and chunk counts.
+
+        Validates:
+            Flat group/array hierarchy and consolidated metadata coverage
+            through the existing byte-inventory helper.
+            Array shape, chunks, portable stored dtype, order, and separator.
+            xarray dimension metadata and consistent dimension lengths.
+            DataArray valueName correspondence.
+            Canonical chunk keys, dimensionality, bounds, and optional coverage.
+
+        Codec configurations receive structural checks only. Fill-value
+        semantics, codec availability, encoded chunk contents, scientific
+        values, and complete xarray reconstruction are NOT validated.
+
+        Metadata read here is bound to the returned byte inventory by SHA-256.
+        Concurrent mutation remains unsupported; this is not an atomic snapshot.
+
+        Does not query SQL, decode chunks, construct matrices, write files,
+        close caller-owned filesystems, or set bundleInventoryComplete.
+        Optional progress:
+            A pglProgress-compatible reporter supporting call() and section().
+            Reports this helper's work only; never finishes the parent display.
+            Caller callback errors propagate like the existing hash/copy helpers.
+
+        """
+        import hashlib
+        import json
+        import math
+        import posixpath
+        import re
+
+        import numpy as np
+
+        if type(requireAllChunks) is not bool:
+            raise TypeError("requireAllChunks must be an explicit Boolean.")
+
+        filesystem, root = cls._resolveStoragePath(
+            dataPath,
+            filesystem=filesystem,
+            storageOptions=storageOptions,
+            label="matrix bundle",
+        )
+        root = root.rstrip("/")
+
+        inventory = cls.inventoryDataMatrixBundle(
+            root,
+            filesystem=filesystem,
+            expectedDescriptor=expectedDescriptor,
+            expectedFiles=expectedFiles,
+            progress=progress.section(0, 0.90) if progress is not None else None,
+        )
+        if progress is not None: progress(0.90, "Validating matrix array and chunk layout")
+        records = {record["name"]: record for record in inventory["files"]}
+
+        # The existing helper parsed this exact metadata with bounded reads,
+        # duplicate-key rejection, and strict JSON validation. Bind this second
+        # read to those inventoried bytes before using its contents.
+        metadataName = "data.zarr/.zmetadata"
+        with filesystem.open(posixpath.join(root, metadataName), "rb") as source:
+            content = source.read(cls.MAX_METADATA_BYTES + 1)
+
+        if len(content) > cls.MAX_METADATA_BYTES:
+            raise ValueError("Consolidated Zarr metadata exceeds the size limit.")
+
+        metadataRecord = records[metadataName]
+        if (
+            len(content) != metadataRecord["size_bytes"]
+            or hashlib.sha256(content).hexdigest() != metadataRecord["sha256"]
+        ):
+            raise ValueError("Consolidated metadata changed after byte inventory.")
+
+        metadata = json.loads(content)["metadata"]
+
+        def validateSchemaName(value, label):
+            """Use the writer's portable variable/dimension name restrictions."""
+            if (
+                not isinstance(value, str) or not value or value in (".", "..")
+                or any(character in value for character in ("/", "\\", "\x00"))
+            ):
+                raise ValueError(f"Invalid {label}: {value!r}")
+
+        def validateCodecConfig(config, label):
+            """Check configuration structure without importing/constructing codecs."""
+            if (
+                type(config) is not dict
+                or not isinstance(config.get("id"), str)
+                or not config["id"]
+            ):
+                raise ValueError(f"Invalid {label} codec configuration.")
+
+        # saveDataMatrix writes an xarray Dataset at the root, not nested groups.
+        arrayNames = set()
+        for name in metadata:
+            if name in (".zgroup", ".zattrs"): continue
+
+            parts = name.split("/")
+            if len(parts) != 2 or parts[1] not in (".zarray", ".zattrs"):
+                raise ValueError(f"Unsupported matrix metadata hierarchy: {name}")
+
+            validateSchemaName(parts[0], "array name")
+            arrayNames.add(parts[0])
+
+        arrays = {}
+        dimensionSizes = {}
+        requiredFields = {
+            "zarr_format", "shape", "chunks", "dtype", "compressor",
+            "fill_value", "order", "filters",
+        }
+        allowedFields = requiredFields | {"dimension_separator"}
+
+        for arrayName in sorted(arrayNames):
+            arrayKey = f"{arrayName}/.zarray"
+            attrsKey = f"{arrayName}/.zattrs"
+
+            if arrayKey not in metadata or attrsKey not in metadata:
+                raise ValueError(f"Array lacks .zarray or .zattrs metadata: {arrayName}")
+
+            array = metadata[arrayKey]
+            attrs = metadata[attrsKey]
+
+            if (
+                not requiredFields.issubset(array)
+                or not set(array).issubset(allowedFields)
+                or type(array["zarr_format"]) is not int
+                or array["zarr_format"] != 2
+            ):
+                raise ValueError(f"Unsupported Zarr array metadata: {arrayName}")
+
+            shape = array["shape"]
+            chunks = array["chunks"]
+            if (
+                type(shape) is not list or type(chunks) is not list
+                or len(shape) != len(chunks)
+                or any(type(size) is not int or size < 0 for size in shape)
+                or any(type(size) is not int or size <= 0 for size in chunks)
+            ):
+                raise ValueError(f"Invalid array shape/chunks: {arrayName}")
+
+            # Validate dtype metadata only; do not allocate an array.
+            dtypeText = array["dtype"]
+            if not isinstance(dtypeText, str):
+                raise ValueError(f"Unsupported stored dtype: {arrayName}")
+
+            try:
+                dtype = np.dtype(dtypeText)
+            except (TypeError, ValueError) as error:
+                raise ValueError(f"Invalid stored dtype: {arrayName}") from error
+
+            if (
+                dtype.fields is not None or dtype.subdtype is not None
+                or dtype.kind not in "biufU" or dtype.itemsize <= 0
+                or (dtype.kind == "f" and dtype.itemsize not in (2, 4, 8))
+            ):
+                raise ValueError(f"Unsupported stored dtype for {arrayName}: {dtypeText}")
+
+            order = array["order"]
+            separator = array.get("dimension_separator", ".")
+            if order not in ("C", "F") or separator not in (".", "/"):
+                raise ValueError(f"Invalid array order or dimension separator: {arrayName}")
+
+            if array["compressor"] is not None:
+                validateCodecConfig(array["compressor"], f"{arrayName} compressor")
+
+            filters = array["filters"]
+            if filters is not None:
+                if type(filters) is not list:
+                    raise ValueError(f"Invalid filters for array: {arrayName}")
+                for config in filters:
+                    validateCodecConfig(config, f"{arrayName} filter")
+
+            dimensions = attrs.get("_ARRAY_DIMENSIONS")
+            if type(dimensions) is not list or len(dimensions) != len(shape):
+                raise ValueError(f"Invalid _ARRAY_DIMENSIONS for array: {arrayName}")
+
+            for dimension, size in zip(dimensions, shape):
+                validateSchemaName(dimension, "dimension name")
+                if dimension in dimensionSizes and dimensionSizes[dimension] != size:
+                    raise ValueError(f"Inconsistent stored dimension length: {dimension}")
+                dimensionSizes[dimension] = size
+
+            chunkGrid = [
+                (size + chunk - 1) // chunk
+                for size, chunk in zip(shape, chunks)
+            ]
+            arrays[arrayName] = {
+                "name": arrayName,
+                "shape": list(shape),
+                "chunks": list(chunks),
+                "dimensions": list(dimensions),
+                "dtype": dtypeText,
+                "order": order,
+                "dimensionSeparator": separator,
+                "chunkGrid": chunkGrid,
+                # Scalars have one grid chunk; zero-length axes yield zero.
+                "expectedChunkCount": math.prod(chunkGrid),
+                "observedChunkCount": 0,
+            }
+
+        descriptor = inventory["descriptor"]
+        if descriptor["kind"] == "DataArray" and descriptor["valueName"] not in arrays:
+            raise ValueError("DataArray descriptor valueName has no stored array.")
+
+        metadataFiles = {
+            "matrix.json", "data.zarr/.zmetadata",
+            *(f"data.zarr/{name}" for name in metadata),
+        }
+
+        for name in records:
+            if name in metadataFiles: continue
+
+            if not name.startswith("data.zarr/"):
+                raise ValueError(f"Unexpected matrix file: {name}")
+
+            relativeName = name[len("data.zarr/"):]
+            parts = relativeName.split("/", 1)
+            if len(parts) != 2 or parts[0] not in arrays:
+                raise ValueError(f"Stored file has no owning array: {name}")
+
+            array = arrays[parts[0]]
+            chunkKey = parts[1]
+
+            if not array["shape"]:
+                if chunkKey != "0":
+                    raise ValueError(f"Invalid scalar chunk key: {name}")
+            else:
+                coordinates = chunkKey.split(array["dimensionSeparator"])
+                if (
+                    len(coordinates) != len(array["shape"])
+                    or any(
+                        re.fullmatch(r"0|[1-9][0-9]*", coordinate) is None
+                        for coordinate in coordinates
+                    )
+                ):
+                    raise ValueError(f"Invalid chunk key: {name}")
+
+                if any(
+                    int(coordinate) >= bound
+                    for coordinate, bound in zip(coordinates, array["chunkGrid"])
+                ):
+                    raise ValueError(f"Chunk coordinate outside array grid: {name}")
+
+            array["observedChunkCount"] += 1
+
+        arrayReports = []
+        for arrayName in sorted(arrays):
+            array = arrays[arrayName]
+            array["missingChunkCount"] = (
+                array["expectedChunkCount"] - array["observedChunkCount"]
+            )
+
+            # Canonical keys and unique filenames guarantee unique coordinates.
+            # Count equality therefore establishes grid coverage without building
+            # or iterating over every theoretically possible chunk coordinate.
+            if array["missingChunkCount"] < 0:
+                raise ValueError(f"Too many stored chunks for array: {arrayName}")
+
+            if requireAllChunks and array["missingChunkCount"]:
+                raise ValueError(
+                    f"Strict chunk coverage failed for {arrayName}: "
+                    f"{array['missingChunkCount']} grid chunk(s) absent."
+                )
+
+            arrayReports.append(array)
+
+        expectedCount = sum(array["expectedChunkCount"] for array in arrayReports)
+        observedCount = sum(array["observedChunkCount"] for array in arrayReports)
+        if progress is not None: progress(1, "Matrix byte inventory and layout verified")
+
+        return {
+            **inventory,
+            "layout": {
+                "requireAllChunks": requireAllChunks,
+                "allGridChunksPresent": expectedCount == observedCount,
+                "expectedChunkCount": expectedCount,
+                "observedChunkCount": observedCount,
+                "missingChunkCount": expectedCount - observedCount,
+                "arrays": arrayReports,
+            },
+        }
+        
+    @classmethod
+    def copyDataMatrixBundle(
+        cls, dataPath, destinationPath, *, expectedDescriptor, expectedFiles,
+        requireAllChunks, sourceFilesystem=None, destinationFilesystem=None,
+        sourceStorageOptions=None, destinationStorageOptions=None, progress=None,
+    ):
+        """Copy a matrix bundle unchanged against previously captured identities.
+
+        destinationPath:
+            Exact new bundle path, not a parent directory. Its parent must
+            already exist. Existing destinations are rejected, never reused.
+
+        expectedDescriptor / expectedFiles:
+            Required catalog/publication descriptor and captured byte inventory.
+            Source preflight, streamed copying, read-back verification, and
+            final destination inventory must agree with this evidence.
+
+        requireAllChunks:
+            Required explicit Boolean coverage policy. Passed unchanged to
+            source and destination layout validation.
+
+        Returns:
+            destinationPath: Filesystem-qualified copied bundle path.
+            inventory: Verified destination descriptor/files/bytes/layout.
+
+        Copies stored bytes without generating a revision UUID, rewriting
+        provenance, decoding chunks, or constructing scientific arrays.
+
+        Copies matrix.json last, but this is NOT atomic publication. A failure
+        during or after its copy may leave a descriptor at the destination.
+        Successful return is required before later catalog registration.
+        No SQL registration or bundleInventoryComplete promotion occurs here.
+
+        Failure retains all created directories and partial files. Nothing is
+        deleted, rolled back, retried, or silently substituted.
+
+        Local destination paths receive ancestor-symlink checks. Generic
+        backend safety depends on authoritative metadata and exclusive-create
+        semantics. Concurrent writers/mutation and aliased remote namespaces
+        are unsupported. Overlap checks cover local paths and matching
+        filesystem instances; they do not establish arbitrary remote identity.
+
+        Does not close caller-supplied or fsspec-resolved filesystems.
+        Errors propagate.
+        Optional progress:
+            A pglProgress-compatible reporter supporting call() and section().
+            Reports this helper's work only; never finishes the parent display.
+            Caller callback errors propagate like the existing hash/copy helpers.
+
+        """
+        from copy import deepcopy
+        from .pglProgress import pglProgress
+        from pathlib import Path
+        import posixpath
+
+        from fsspec.implementations.local import LocalFileSystem
+
+        if type(requireAllChunks) is not bool:
+            raise TypeError("requireAllChunks must be an explicit Boolean.")
+        if expectedDescriptor is None or expectedFiles is None:
+            raise ValueError("A captured descriptor and file inventory are required.")
+
+        # Snapshot caller evidence before filesystem work. The inventory helper
+        # validates its full structure, ordering, hashes, and catalog contract.
+        expectedDescriptor = deepcopy(expectedDescriptor)
+        expectedFiles = deepcopy(expectedFiles)
+
+        sourceFilesystem, sourceRoot = cls._resolveStoragePath(
+            dataPath,
+            filesystem=sourceFilesystem,
+            storageOptions=sourceStorageOptions,
+            label="source matrix bundle",
+        )
+        destinationFilesystem, destinationRoot = cls._resolveStoragePath(
+            destinationPath,
+            filesystem=destinationFilesystem,
+            storageOptions=destinationStorageOptions,
+            label="destination matrix bundle",
+        )
+        sourceRoot = sourceRoot.rstrip("/")
+        destinationRoot = destinationRoot.rstrip("/")
+
+        if not sourceRoot or not destinationRoot:
+            raise ValueError("A matrix bundle cannot be the filesystem root.")
+
+        def requireDestinationSafe(path):
+            """Reject local symlinked ancestors without resolving them away."""
+            if isinstance(destinationFilesystem, LocalFileSystem):
+                localPath = Path(path).absolute()
+                for candidate in (localPath, *localPath.parents):
+                    if candidate.is_symlink():
+                        raise ValueError(f"Symlinked matrix destination path: {candidate}")
+
+        def pathsOverlap(first, second):
+            """Compare normalized paths within an already identified namespace."""
+            first = posixpath.normpath(first)
+            second = posixpath.normpath(second)
+            return (
+                first == second
+                or first.startswith(second.rstrip("/") + "/")
+                or second.startswith(first.rstrip("/") + "/")
+            )
+
+        requireDestinationSafe(destinationRoot)
+
+        bothLocal = (
+            isinstance(sourceFilesystem, LocalFileSystem)
+            and isinstance(destinationFilesystem, LocalFileSystem)
+        )
+        if bothLocal:
+            first = str(Path(sourceRoot).absolute())
+            second = str(Path(destinationRoot).absolute())
+            if pathsOverlap(first, second):
+                raise ValueError("Source and destination matrix paths must not overlap.")
+        elif sourceFilesystem is destinationFilesystem:
+            if pathsOverlap(sourceRoot, destinationRoot):
+                raise ValueError("Source and destination matrix paths must not overlap.")
+
+        if destinationFilesystem.exists(destinationRoot):
+            raise FileExistsError(destinationRoot)
+
+        parent = posixpath.dirname(destinationRoot) or "."
+        requireDestinationSafe(parent)
+        if not destinationFilesystem.isdir(parent):
+            raise NotADirectoryError(
+                f"Matrix destination parent must already exist: {parent}"
+            )
+
+        # Fail before creating a destination if the source no longer matches
+        # the evidence captured by export inspection.
+        sourceInventory = cls.inventoryDataMatrixBundleLayout(
+            sourceRoot,
+            filesystem=sourceFilesystem,
+            expectedDescriptor=expectedDescriptor,
+            expectedFiles=expectedFiles,
+            requireAllChunks=requireAllChunks,
+            progress=progress.section(0, 0.20) if progress is not None else None,
+        )
+
+        # These checks are defensive, not a concurrency/atomicity guarantee.
+        requireDestinationSafe(destinationRoot)
+        if destinationFilesystem.exists(destinationRoot):
+            raise FileExistsError(destinationRoot)
+        destinationFilesystem.makedirs(destinationRoot, exist_ok=False)
+        requireDestinationSafe(destinationRoot)
+
+        records = sourceInventory["files"]
+        descriptorRecord = next(
+            record for record in records if record["name"] == "matrix.json"
+        )
+        copyOrder = [
+            record for record in records if record["name"] != "matrix.json"
+        ] + [descriptorRecord]
+
+        copyProgress = progress.section(0.20, 0.80) if progress is not None else None
+        for record, fileProgress in pglProgress.fileSections(copyOrder, copyProgress):
+            name = record["name"]
+            target = posixpath.join(destinationRoot, name)
+            requireDestinationSafe(target)
+
+            cls.copyVerifiedFile(
+                sourceFilesystem,
+                posixpath.join(sourceRoot, name),
+                destinationFilesystem,
+                destinationRoot,
+                {
+                    "sha256": record["sha256"],
+                    "size_bytes": record["size_bytes"],
+                },
+                objectKey=name,
+                progress=fileProgress,
+            )
+
+        # Check the complete observed destination file set, metadata, hashes,
+        # and layout rather than relying solely on per-file copy success.
+        destinationInventory = cls.inventoryDataMatrixBundleLayout(
+            destinationRoot,
+            filesystem=destinationFilesystem,
+            expectedDescriptor=expectedDescriptor,
+            expectedFiles=expectedFiles,
+            requireAllChunks=requireAllChunks,
+            progress=progress.section(0.80, 0.99) if progress is not None else None,
+        )
+        if destinationInventory != sourceInventory:
+            raise ValueError("Copied matrix inventory differs from source preflight.")
+        if progress is not None: progress(1, "Matrix bundle copy verified")
+
+        return {
+            "destinationPath": destinationFilesystem.unstrip_protocol(destinationRoot),
+            "inventory": destinationInventory,
+        }
 
     # ---------------------------------------------------------------------
     # Figures: individual export and row collection
