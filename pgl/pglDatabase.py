@@ -2644,35 +2644,28 @@ class pglDatabase:
         cls, session, *, details=False, measureMatrixBundles=False,
         storageOptionsByBackend=None, sslRootCert=None,
     ):
-        """Print saved-checkpoint storage totals followed by grouped contents.
+        """Print saved-checkpoint storage totals, grouped files, and matrices.
 
-        Default:
-            Print totals first.
-            Combine behavioral files across all runs, grouped by extension.
-            Summarize other checkpoint files by category and extension.
-            List matrix directories for stored-file counts and reported sizes,
-            without reading or hashing matrix contents.
+        All behavioral runs are combined in the summary. MRI matrix labels use
+        saved provenance matched to the saved MRI descriptor's zero-based scan
+        order, never the current working session's potentially edited order.
 
-        details=True additionally prints individual checkpoint files and
-        storage locations, followed by stored files for each matrix revision.
+        Default matrix sizes come from filesystem listings. Small manifest/MRI
+        metadata files are read and verified, but matrix/image contents are not.
+        measureMatrixBundles=True additionally hashes/verifies matrix bundles.
 
-        measureMatrixBundles=True additionally performs the existing strict
-        matrix integrity scan. Listing and hashing are separate observations,
-        not an atomic storage snapshot.
+        details=True shows individual files, locations, original attachment
+        names, and full revision/product/scan identifiers.
 
-        Uses the retained database binding, never an ordinary/default profile.
-        Requires current migrations and active completed ancestry.
+        Uses the retained saved binding, never a default profile. Requires
+        current migrations and active completed ancestry. Normal authentication
+        applies; inspection failures propagate.
 
-        File sizes come from catalog identities. Matrix sizes come from
-        filesystem metadata and are not allocated disk-block measurements.
-
-        Totals deduplicate file IDs and matrix revision IDs. They exclude
+        Totals count distinct file IDs and matrix revision IDs. They exclude
         replicas, PostgreSQL storage, unsaved changes, and ancestor-only files.
         Shared content is not exclusive storage ownership.
 
-        Does not modify SQL, payloads, or session binding. Normal connection
-        authentication applies. Inspection failures propagate.
-        Prints information and returns None.
+        Does not modify SQL, payloads, or session binding. Returns None.
         """
         from .pglMessages import pglMessages
         from .pglPostgres import pglPostgres
@@ -2684,7 +2677,6 @@ class pglDatabase:
 
         reference = cls._getBoundCheckpointReference(session)
         postgres = getattr(session, "_checkpointPostgres", None)
-
         if reference is None or postgres is None:
             pglMessages.warning(
                 "This session has no retained saved-checkpoint database binding.\n"
@@ -2693,13 +2685,13 @@ class pglDatabase:
             return
 
         if not isinstance(postgres, pglPostgres):
-            raise TypeError("The retained database configuration must be a pglPostgres instance.")
+            raise TypeError("The retained configuration must be a pglPostgres instance.")
 
         binding = cls._validateCheckpointBinding(session._checkpointBinding)
         if cls._checkpointDatabaseIdentity(postgres) != binding["databaseIdentity"]:
             raise ValueError(
                 "Retained PostgreSQL configuration differs from the session binding. "
-                "Reload the intended checkpoint rather than retargeting its configuration."
+                "Reload the intended checkpoint."
             )
 
         def formatBytes(size):
@@ -2714,7 +2706,6 @@ class pglDatabase:
             return str(value).replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t")
 
         def printFields(fields):
-            # Keep the colon attached to the label and align the values.
             width = max(len(name) + 1 for name, _ in fields)
             for name, value in fields:
                 pglMessages.print(f"    {name + ':':<{width}} {displayText(value)}")
@@ -2733,11 +2724,10 @@ class pglDatabase:
                 )
                 databaseID = cls._requireStableDatabaseIdentity(connection, postgres)
                 if databaseID != reference["databaseID"]:
-                    raise ValueError("Connected database UUID differs from the saved session binding.")
+                    raise ValueError("Connected database UUID differs from the session binding.")
 
                 ancestry = cls._readExportAncestry(connection, postgres, checkpointID)
                 checkpoint = ancestry[-1]
-
                 fileInventory = cls._readExportFileInventory(
                     connection, postgres, checkpoint,
                     storageOptionsByBackend=storageOptionsByBackend,
@@ -2756,44 +2746,48 @@ class pglDatabase:
                         storageOptionsByBackend=storageOptionsByBackend,
                     )
 
-        # SQL/tunnel access has closed. Matrix listing owns separate bounded
-        # payload access and does not read file contents.
+                # Resolve labels from the same saved checkpoint/snapshot.
+                # Avoid the extra descriptor read when there are no matrices.
+                scanLabels = (
+                    cls._readSessionDatabaseScanLabels(
+                        connection, postgres, checkpoint, fileInventory["manifest"],
+                        storageOptionsByBackend=storageOptionsByBackend,
+                    )
+                    if matrixInventory["attachments"] else {}
+                )
+
+        # Separate bounded storage access after SQL/tunnel cleanup.
+        revisions = matrixInventory["revisions"]
+        attachments = matrixInventory["attachments"]
+        revisionsByID = {
+            revision["matrixRevisionID"]: revision for revision in revisions
+        }
         matrixStorage = cls._listSessionMatrixStorage(
-            postgres, matrixInventory["revisions"],
+            postgres, revisions,
             storageOptionsByBackend=storageOptionsByBackend,
         )
         manifest = fileInventory["manifest"]
         summary = cls._summarizeSessionDatabaseFiles(
             manifest, fileInventory["files"],
         )
-        attachments = matrixInventory["attachments"]
-        revisions = matrixInventory["revisions"]
 
-        # Combine all behavioral runs for the summary, preserving the original
-        # individual file paths for details=True.
-        runGroupNames = {
-            f"Run {record['index']}" for record in manifest["runs"]
-        }
+        # Combine all behavioral runs; detailed filenames retain run paths.
+        runCount = len(manifest["runs"])
+        runGroupNames = {f"Run {record['index']}" for record in manifest["runs"]}
         behaviorTypes = {}
         behaviorGroup = {
-            "name": f"Behavioral files ({len(manifest['runs'])} runs)",
+            "name": f"Behavioral files ({runCount} {'run' if runCount == 1 else 'runs'})",
             "fileCount": 0,
             "sizeBytes": 0,
             "types": [],
         }
-
         for group in summary["groups"]:
-            if group["name"] not in runGroupNames:
-                continue
-
+            if group["name"] not in runGroupNames: continue
             behaviorGroup["fileCount"] += group["fileCount"]
             behaviorGroup["sizeBytes"] += group["sizeBytes"]
-
             for item in group["types"]:
                 combined = behaviorTypes.setdefault(item["type"], {
-                    "type": item["type"],
-                    "fileCount": 0,
-                    "sizeBytes": 0,
+                    "type": item["type"], "fileCount": 0, "sizeBytes": 0,
                 })
                 combined["fileCount"] += item["fileCount"]
                 combined["sizeBytes"] += item["sizeBytes"]
@@ -2801,7 +2795,6 @@ class pglDatabase:
         behaviorGroup["types"] = [
             behaviorTypes[name] for name in sorted(behaviorTypes)
         ]
-
         displayGroups = []
         behaviorInserted = False
         for group in summary["groups"]:
@@ -2821,13 +2814,9 @@ class pglDatabase:
         unknownSizeCount = sum(
             item["unknownSizeCount"] for item in matrixStorage.values()
         )
-        knownMatrixBytes = sum(
-            item["knownBytes"] for item in matrixStorage.values()
-        )
+        knownMatrixBytes = sum(item["knownBytes"] for item in matrixStorage.values())
         matrixBytes = None if unknownSizeCount else knownMatrixBytes
-        matrixFileCount = sum(
-            item["fileCount"] for item in matrixStorage.values()
-        )
+        matrixFileCount = sum(item["fileCount"] for item in matrixStorage.values())
         totalReferencedBytes = (
             None if matrixBytes is None
             else summary["uniqueFileBytes"] + matrixBytes
@@ -2838,14 +2827,12 @@ class pglDatabase:
             ("Schema", postgres.databaseSchema),
             ("Saved contract", checkpoint["contractVersion"]),
         ])
-
-        # Main summary comes before file-type and matrix attachment listings.
         pglMessages.print("\nStorage summary")
         printFields([
             ("Total referenced size", formatBytes(totalReferencedBytes)),
             ("Distinct file-content size", formatBytes(summary["uniqueFileBytes"])),
             ("Matrix storage", formatBytes(matrixBytes)),
-            ("Behavioral runs", len(manifest["runs"])),
+            ("Behavioral runs", runCount),
             ("File links", summary["fileCount"]),
             ("Distinct file contents", summary["uniqueFileCount"]),
             ("Logical file-link size", formatBytes(summary["logicalBytes"])),
@@ -2860,73 +2847,83 @@ class pglDatabase:
                 f"Known matrix subtotal: {formatBytes(knownMatrixBytes)}."
             )
 
-        emptyRevisions = [
-            revisionID for revisionID, item in matrixStorage.items()
-            if item["fileCount"] == 0
-        ]
-        if emptyRevisions:
+        emptyCount = sum(item["fileCount"] == 0 for item in matrixStorage.values())
+        if emptyCount:
             pglMessages.print(
-                f"\nNo files were returned for {len(emptyRevisions)} registered "
-                "matrix directory/directories. An empty listing does not establish "
-                "a valid matrix bundle."
+                f"\nNo files returned for {emptyCount} registered matrix directory/directories. "
+                "An empty listing does not establish a valid matrix bundle."
             )
 
         pglMessages.print("\nCheckpoint files")
-        groupWidth = max(
-            34,
-            *(len(group["name"]) for group in displayGroups),
-        )
+        groupWidth = max([34] + [len(group["name"]) for group in displayGroups])
         pglMessages.print(
             f"    {'Group / file type':<{groupWidth}} "
             f"{'Files':>8} {'Referenced size':>18}"
         )
-
         for group in displayGroups:
             pglMessages.print(
-                f"    {group['name']:<{groupWidth}} "
-                f"{group['fileCount']:>8,} {formatBytes(group['sizeBytes']):>18}"
+                f"    {group['name']:<{groupWidth}} {group['fileCount']:>8,} "
+                f"{formatBytes(group['sizeBytes']):>18}"
             )
-
-            showTypes = (
+            if (
                 group is behaviorGroup
                 or group["name"] in {
                     "MRI acquisition files", "MNE files",
                     "Derived-file attachments", "Other files",
                 }
                 or len(group["types"]) > 1
-            )
-            if showTypes:
+            ):
                 for item in group["types"]:
                     typeLabel = "    " + item["type"]
                     pglMessages.print(
-                        f"    {typeLabel:<{groupWidth}} "
-                        f"{item['fileCount']:>8,} "
+                        f"    {typeLabel:<{groupWidth}} {item['fileCount']:>8,} "
                         f"{formatBytes(item['sizeBytes']):>18}"
                     )
-
         if not displayGroups:
             pglMessages.print("    (none)")
+
+        # Labels are display aliases only; original catalog identifiers remain.
+        matrixLabels = [
+            cls._sessionMatrixDisplayLabel(
+                attachment,
+                revisionsByID[attachment["matrixRevisionID"]],
+                scanLabels=scanLabels,
+            )
+            for attachment in attachments
+        ]
+        labelCounts = {}
+        for label in matrixLabels:
+            labelCounts[label] = labelCounts.get(label, 0) + 1
+        for index, label in enumerate(matrixLabels):
+            if labelCounts[label] > 1:
+                matrixLabels[index] = f"{label} [attachment {index + 1}]"
 
         pglMessages.print("\nData matrices — stored files")
         if not attachments:
             pglMessages.print("    (none)")
         else:
-            labels = [
-                f"{'MRI' if item['owner'] == 'mri' else 'Session'}."
-                f"{displayText(item['localName'])}"
-                for item in attachments
-            ]
-            labelWidth = max(34, *(len(label) for label in labels))
-            pglMessages.print(
-                f"    {'Attachment':<{labelWidth}} "
-                f"{'Files':>8} {'Stored size':>18}"
-            )
+            # Sort by saved scan number where a unique correspondence exists.
+            # Never use matrix-list order as an inferred acquisition order.
+            def attachmentOrder(index):
+                attachment = attachments[index]
+                revision = revisionsByID[attachment["matrixRevisionID"]]
+                metadata = revision["descriptor"].get("metadata", {})
+                provenance = metadata.get("provenance", {}) if isinstance(metadata, dict) else {}
+                scanID = provenance.get("scanUUID") if isinstance(provenance, dict) else None
+                matches = scanLabels.get(scanID, []) if isinstance(scanID, str) else []
+                if attachment["owner"] == "mri" and len(matches) == 1:
+                    return (0, matches[0]["scanNum"], matrixLabels[index])
+                return (1, 0, matrixLabels[index])
 
+            labelWidth = max([34] + [len(label) for label in matrixLabels])
+            pglMessages.print(
+                f"    {'Attachment':<{labelWidth}} {'Files':>8} {'Stored size':>18}"
+            )
             seenRevisions = set()
-            for attachment, label in zip(attachments, labels):
+            for index in sorted(range(len(attachments)), key=attachmentOrder):
+                attachment = attachments[index]
                 revisionID = attachment["matrixRevisionID"]
                 storage = matrixStorage[revisionID]
-
                 note = (
                     " [shared revision]"
                     if len(attachmentsByRevision[revisionID]) > 1 else ""
@@ -2934,12 +2931,14 @@ class pglDatabase:
                 if revisionID in seenRevisions:
                     note = " [same storage; counted once]"
                 seenRevisions.add(revisionID)
-
                 pglMessages.print(
-                    f"    {label:<{labelWidth}} "
+                    f"    {matrixLabels[index]:<{labelWidth}} "
                     f"{storage['fileCount']:>8,} "
                     f"{formatBytes(storage['sizeBytes']):>18}{note}"
                 )
+
+            if scanLabels:
+                pglMessages.print("    Scan numbers are zero-based positions in the saved checkpoint.")
 
         if details:
             pglMessages.print("\nDatabase connection")
@@ -2954,8 +2953,7 @@ class pglDatabase:
             for record in fileInventory["files"]:
                 pglMessages.print(
                     f"\n    {displayText(record['name'])} — "
-                    f"{formatBytes(record['size_bytes'])} "
-                    f"({record['size_bytes']:,} bytes)"
+                    f"{formatBytes(record['size_bytes'])} ({record['size_bytes']:,} bytes)"
                 )
                 pglMessages.print(
                     f"        File ID: {record['fileID']}; "
@@ -2967,42 +2965,154 @@ class pglDatabase:
                         f"        Backend {location['backendID']}: "
                         f"{displayText(location['registeredRoot'])}"
                     )
-                    pglMessages.print(
-                        f"            Key: {displayText(location['objectKey'])}"
-                    )
+                    pglMessages.print(f"            Key: {displayText(location['objectKey'])}")
 
-            pglMessages.print("\nStored matrix files — each revision once")
+            pglMessages.print("\nMatrix identities and stored files — each revision once")
             for revision in revisions:
                 revisionID = revision["matrixRevisionID"]
-                storage = matrixStorage[revisionID]
-                owners = ", ".join(
-                    f"{item['owner']}.{displayText(item['localName'])}"
-                    for item in attachmentsByRevision.get(revisionID, [])
-                )
+                pglMessages.print(f"\n    Revision: {revisionID}")
 
-                pglMessages.print(f"\n    {owners}")
-                pglMessages.print(f"        Revision: {revisionID}")
+                for attachment in attachmentsByRevision.get(revisionID, []):
+                    pglMessages.print(
+                        f"        Display: {cls._sessionMatrixDisplayLabel(attachment, revision, scanLabels=scanLabels)}"
+                    )
+                    pglMessages.print(
+                        f"        Attachment: {displayText(attachment['owner'])}."
+                        f"{displayText(attachment['localName'])}"
+                    )
+                    pglMessages.print(
+                        f"        Catalog name: {displayText(attachment['catalogName'])}"
+                    )
+
+                metadata = revision["descriptor"].get("metadata", {})
+                provenance = metadata.get("provenance", {}) if isinstance(metadata, dict) else {}
+                if isinstance(provenance, dict):
+                    for key in ("operation", "scanUUID", "productID", "producerActionID"):
+                        if provenance.get(key) is not None:
+                            pglMessages.print(f"        {key}: {displayText(provenance[key])}")
+
                 pglMessages.print(
                     f"        Backend {revision['backendID']}: "
                     f"{displayText(revision['registeredRoot'])}"
                 )
-                pglMessages.print(
-                    f"        Bundle key: {displayText(revision['objectKey'])}"
-                )
-                for record in storage["files"]:
+                pglMessages.print(f"        Bundle key: {displayText(revision['objectKey'])}")
+                for record in matrixStorage[revisionID]["files"]:
                     pglMessages.print(
                         f"        {formatBytes(record['sizeBytes']):>14}  "
                         f"{displayText(record['name'])}"
                     )
 
         pglMessages.print(
-            "\nFile-group sizes count logical links; totals count each file ID and matrix revision once.\n"
-            "Matrix sizes include matrix.json, Zarr metadata, and chunks reported by storage.\n"
+            "\nGroup sizes count logical links; totals count each file ID and matrix revision once.\n"
+            "Matrix sizes include matrix.json, Zarr metadata, and stored chunks.\n"
             "Shared content is not exclusive usage. Replicas, PostgreSQL storage,\n"
             "unsaved changes, and ancestor-only files are excluded."
         )
         if not measureMatrixBundles:
-            pglMessages.print("Matrix sizes were listed without reading or hashing file contents.")
+            pglMessages.print("Matrix sizes were listed without reading or hashing matrix contents.")
+    
+    @classmethod
+    def _readSessionDatabaseScanLabels(
+        cls, connection, postgres, checkpoint, manifest, *,
+        storageOptionsByBackend=None,
+    ):
+        """Read saved MRI scan numbers/names through registered payload access.
+
+        Verifies descriptor bytes against the saved manifest before parsing.
+        Uses the first eligible catalog location without fallback.
+
+        Does not use the replay reader, open acquisition images, or consult
+        potentially edited/reordered working-session scans.
+
+        Returns scanUUID -> list of labels. Duplicate UUIDs remain explicit
+        so display code cannot assign an ambiguous scan number.
+
+        Owns and closes payload access. Does not modify files or SQL records.
+        """
+        import hashlib
+        import io
+        import posixpath
+
+        if "mri" not in manifest:
+            return {}
+
+        descriptorName = "mri/mri.json"
+        maxDescriptorBytes = 64 * 1024 * 1024
+
+        # Existing inventory code binds the manifest to the saved checkpoint,
+        # verifies exact catalog links, and provides eligible storage locations.
+        inventory = cls._readExportFileInventory(
+            connection,
+            postgres,
+            checkpoint,
+            storageOptionsByBackend=storageOptionsByBackend,
+        )
+        cls._compareExportManifestIdentity(manifest, inventory["manifest"])
+
+        declared = [
+            record for record in manifest["files"]
+            if record["name"] == descriptorName
+        ]
+        registered = [
+            record for record in inventory["files"]
+            if record["name"] == descriptorName
+        ]
+        if len(declared) != 1 or len(registered) != 1:
+            raise ValueError("Saved MRI descriptor must have exactly one manifest entry and file link.")
+
+        expected = {
+            key: declared[0][key] for key in ("sha256", "size_bytes")
+        }
+        if {
+            key: registered[0][key] for key in ("sha256", "size_bytes")
+        } != expected:
+            raise ValueError("Registered MRI descriptor identity differs from the manifest.")
+
+        size = expected["size_bytes"]
+        if type(size) is not int or not 0 <= size <= maxDescriptorBytes:
+            raise ValueError("MRI descriptor size is invalid or exceeds the read limit.")
+
+        locations = registered[0]["locations"]
+        if not locations:
+            raise ValueError("Saved MRI descriptor has no eligible storage location.")
+        location = locations[0]
+
+        with pglDatabaseAccess(postgres, storageOptionsByBackend) as access:
+            filesystem, root = access.resolve(
+                location["backendID"], location["registeredRoot"],
+            )
+            path = posixpath.join(root, location["objectKey"])
+
+            with filesystem.open(path, "rb") as handle:
+                content = handle.read(size + 1)
+
+        if (
+            len(content) != size
+            or hashlib.sha256(content).hexdigest() != expected["sha256"]
+        ):
+            raise ValueError("Saved MRI descriptor bytes differ from the manifest identity.")
+
+        class DescriptorView:
+            """Expose only the already-verified descriptor bytes."""
+            def open(self, name, mode="rb", **kwargs):
+                if name != descriptorName or mode != "rb":
+                    raise ValueError("Only read-only MRI descriptor access is supported.")
+                return io.BytesIO(content)
+
+        descriptor = cls._verifyMRIInventory(
+            manifest,
+            DescriptorView(),
+            maxDescriptorBytes=maxDescriptorBytes,
+        )
+
+        scanLabels = {}
+        for scanNum, scan in enumerate(descriptor["scans"]):
+            scanLabels.setdefault(scan["uuid"], []).append({
+                "scanNum": scanNum,
+                "name": scan.get("name"),
+            })
+
+        return scanLabels
     
     @staticmethod
     def _summarizeSessionDatabaseFiles(manifest, records):
@@ -3124,6 +3234,61 @@ class pglDatabase:
             "uniqueFileBytes": sum(size for _, size in uniqueFiles.values()),
         }
         
+    @staticmethod
+    def _sessionMatrixDisplayLabel(attachment, revision, *, scanLabels=None):
+        """Make a readable matrix label using saved provenance and scan order.
+
+        scanLabels comes from the saved checkpoint MRI descriptor, not the
+        working session. Scan numbers are zero-based within that checkpoint.
+
+        UUID matches must be unique. Missing/ambiguous matches retain a short
+        UUID. Stored matrix names, ownership, and identities remain unchanged.
+        """
+        def clean(value):
+            return str(value).replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t")
+
+        owner = attachment["owner"]
+        ownerLabel = "MRI" if owner == "mri" else "Session" if owner == "session" else clean(owner)
+        fallback = f"{ownerLabel}.{clean(attachment['localName'])}"
+
+        descriptor = revision.get("descriptor", {})
+        metadata = descriptor.get("metadata", {}) if isinstance(descriptor, dict) else {}
+        provenance = metadata.get("provenance", {}) if isinstance(metadata, dict) else {}
+
+        if (
+            owner != "mri"
+            or not isinstance(provenance, dict)
+            or provenance.get("operation") != "MRIImageReplacement"
+        ):
+            return fallback
+
+        scanID = provenance.get("scanUUID")
+        if not isinstance(scanID, str) or not scanID:
+            return fallback
+
+        source = provenance.get("sourceProvenance", {})
+        operation = source.get("operation") if isinstance(source, dict) else None
+        if operation == "motionCorrection":
+            description = "motion corrected"
+        elif isinstance(operation, str) and operation.strip():
+            description = clean(operation)
+        else:
+            description = "replacement image"
+
+        matches = [] if scanLabels is None else scanLabels.get(scanID, [])
+        if len(matches) == 1:
+            scan = matches[0]
+            label = f"MRI scan {scan['scanNum']}"
+            name = scan.get("name")
+
+            # Do not repeat a UUID as though it were a helpful scan name.
+            if isinstance(name, str) and name.strip() and name.strip() != scanID:
+                label += f" — {clean(name.strip())}"
+
+            return f"{label} — {description}"
+
+        return f"MRI.{description} [scan {clean(scanID[:8])}]"
+    
     @classmethod
     def _listSessionMatrixStorage(cls, postgres, revisions, *, storageOptionsByBackend=None):
         """List stored matrix files and reported sizes without reading contents.
