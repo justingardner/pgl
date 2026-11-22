@@ -2686,7 +2686,7 @@ class pglAFNI(pglExternalTool):
         Returns a JSON-compatible plan dictionary, or None with a warning
         for unsupported platforms or invalid paths.
 
-        This initial planner supports macOS 12+ on Apple Silicon.
+        Supports macOS 12+ on native Intel or Apple Silicon.
         Other platform adapters can be added without changing the public API.
 
         Does not download scripts, create directories, alter configuration,
@@ -2731,24 +2731,10 @@ class pglAFNI(pglExternalTool):
             if root.exists() and not root.is_dir():
                 raise ValueError(f"installPath exists but is not a directory: {root}")
 
-            system = platform.system()
-            machine = platform.machine()
-            macOSVersion = platform.mac_ver()[0] if system == "Darwin" else None
-
-            if system != "Darwin" or machine.lower() != "arm64":
-                raise ValueError(
-                    f"Automated installation planning is not implemented for "
-                    f"{system} / {machine}. No changes were made.\n"
-                    f"Use the official platform instructions:\n{self.installationURL}"
-                )
-
-            try:
-                majorVersion = int(macOSVersion.split(".", 1)[0])
-            except (AttributeError, ValueError):
-                raise ValueError("Could not establish the macOS version.") from None
-
-            if majorVersion < 12:
-                raise ValueError("This installation procedure requires macOS 12 or newer.")
+            recipe = _getAFNIInstallationPlatform()
+            system = recipe["system"]
+            machine = recipe["machine"]
+            macOSVersion = recipe["version"]
 
             executableDirectory = root / "abin"
             buildDirectory = root / "build"
@@ -2764,9 +2750,8 @@ class pglAFNI(pglExternalTool):
             # Their mutable URLs do not establish a pinned installer identity.
             sourceRoot = "https://raw.githubusercontent.com/afni/afni/master/src/other_builds"
             scriptNames = (
-                "OS_notes.macos_12_ARM_a_admin_pt1.zsh",
-                "OS_notes.macos_12_ARM_a_admin_pt2.zsh",
-                "OS_notes.macos_12_ARM_b_user.tcsh",
+                *recipe["adminScripts"],
+                recipe["userWrapper"],
                 "OS_notes.macos_12_b_user.tcsh",
             )
 
@@ -2791,7 +2776,7 @@ Platform
 --------
 System: macOS {macOSVersion}
 Architecture: {machine}
-Installation procedure: official macOS Apple Silicon setup, with explicit
+Installation procedure: official macOS {recipe["label"]} setup, with explicit
 user-level destination adaptations.
 
 Locations
@@ -2807,8 +2792,8 @@ STAGE 1 — ADMINISTRATOR SETUP
 ----------------------------
 Run the official administrator scripts in Terminal, in this order:
 
-  zsh OS_notes.macos_12_ARM_a_admin_pt1.zsh
-  zsh OS_notes.macos_12_ARM_a_admin_pt2.zsh
+  zsh {recipe["adminScripts"][0]}
+  zsh {recipe["adminScripts"][1]}
 
 The reviewed procedure:
 - Runs the official Homebrew installer.
@@ -2848,7 +2833,7 @@ The reviewed procedure:
 - Sets Terminal/XQuartz focus-following preferences.
 - Bootstraps AFNI supporting scripts and atlases.
 - Updates bash, zsh, and tcsh startup files and command completion.
-- Builds package macos_13_ARM using /usr/bin/gcc.
+- Builds package {recipe["package"]} using /usr/bin/gcc.
 - Installs the build into the selected executable directory.
 - Configures R_LIBS when unset and installs AFNI R packages.
 - Adds /opt/X11/bin to shell paths when needed.
@@ -4141,6 +4126,80 @@ Installation documentation:
 ################################################################
 # AFNI installation state and administrator-stage launcher
 ################################################################
+
+def _getAFNIInstallationPlatform():
+    """Select the reviewed native macOS installation recipe.
+
+    Supports macOS 12+ on native Intel x86_64 or Apple Silicon arm64.
+    Rejects Rosetta execution rather than selecting an Intel installation
+    from a translated Python process.
+
+    Uses the official Homebrew prefix for the selected recipe. Does not
+    select an unrelated Homebrew installation from PATH.
+
+    Runs a read-only sysctl probe. Does not install or change settings.
+    """
+    import platform
+    import subprocess
+
+    system = platform.system()
+    machine = platform.machine().lower()
+    version = platform.mac_ver()[0]
+
+    if system != "Darwin":
+        raise ValueError(
+            "Automated AFNI installation supports macOS only. "
+            "For Windows, use AFNI's WSL/Linux installation instructions."
+        )
+    if machine not in ("arm64", "x86_64"):
+        raise ValueError(f"Unsupported macOS architecture: {machine!r}.")
+
+    try:
+        majorVersion = int(version.split(".", 1)[0])
+    except (AttributeError, ValueError):
+        raise ValueError("Could not establish the macOS version.") from None
+    if majorVersion < 12:
+        raise ValueError("This installation procedure requires macOS 12 or newer.")
+
+    # -i ignores an absent key: native Intel systems may not expose it.
+    # A nonzero exit or unexpected output is not treated as native execution.
+    probe = subprocess.run(
+        ["/usr/sbin/sysctl", "-in", "sysctl.proc_translated"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    translated = probe.stdout.strip()
+    if probe.returncode != 0 or translated not in ("", "0", "1"):
+        raise RuntimeError("Could not establish whether Python is running under Rosetta.")
+    if translated == "1":
+        raise ValueError(
+            "AFNI installation from a Rosetta-translated Python process is "
+            "not supported. Restart with a native Apple Silicon Python "
+            "environment before installing."
+        )
+
+    intel = machine == "x86_64"
+    scriptArchitecture = "intel" if intel else "ARM"
+    brewPrefix = "/usr/local" if intel else "/opt/homebrew"
+
+    return {
+        "system": system,
+        "machine": machine,
+        "version": version,
+        "label": "Intel x86_64" if intel else "Apple Silicon",
+        "brewPrefix": brewPrefix,
+        "brewExecutable": brewPrefix + "/bin/brew",
+        "package": "macos_12_x86_64" if intel else "macos_13_ARM",
+        "adminScripts": [
+            f"OS_notes.macos_12_{scriptArchitecture}_a_admin_pt1.zsh",
+            f"OS_notes.macos_12_{scriptArchitecture}_a_admin_pt2.zsh",
+        ],
+        "userWrapper": f"OS_notes.macos_12_{scriptArchitecture}_b_user.tcsh",
+    }
+
+
 class pglAFNIInstallation:
     """Coordinate the supported macOS ARM administrator installation stage.
 
@@ -4411,19 +4470,15 @@ class pglAFNIInstallation:
         from .pglDialog import pglDialogs
         from .pglMessages import pglMessages
 
-        if platform.system() != "Darwin" or platform.machine().lower() != "arm64":
-            raise ValueError("This installer stage currently supports native macOS Apple Silicon only.")
-
-        version = platform.mac_ver()[0]
-        if not version or int(version.split(".", 1)[0]) < 12:
-            raise ValueError("This installer stage requires macOS 12 or newer.")
+        recipe = _getAFNIInstallationPlatform()
+        version = recipe["version"]
 
         if self.readState() is not None:
             raise ValueError("An installation record already exists. Review it before launching another installation.")
 
         scripts = []
 
-        for name in self.scriptNames:
+        for name in recipe["adminScripts"]:
             url = f"{self.sourceRoot}/{name}"
 
             with urllib.request.urlopen(url, timeout=30) as response:
@@ -4451,14 +4506,14 @@ class pglAFNIInstallation:
         details = f"""AFNI ADMINISTRATOR INSTALLATION
 ================================
 
-Platform: macOS {version}, Apple Silicon
+Platform: macOS {version}, {recipe["label"]}
 Installation root: {self.root}
 This stage's scripts and records: {stageDirectory}
 Installer working directory: {Path.home()}
 
 The following official scripts will run unchanged, in order, in Terminal:
-  zsh OS_notes.macos_12_ARM_a_admin_pt1.zsh
-  zsh OS_notes.macos_12_ARM_a_admin_pt2.zsh
+  zsh {recipe["adminScripts"][0]}
+  zsh {recipe["adminScripts"][1]}
 
 Known effects from the reviewed procedure:
 - Install/configure Homebrew and disable Homebrew analytics.
@@ -5181,8 +5236,11 @@ sys.exit(exitCode)
             if request.get("prerequisitesConfirmed") is not True:
                 raise ValueError("Administrator prerequisites/reboot were not acknowledged.")
 
-            if platform.system() != "Darwin" or platform.machine().lower() != "arm64":
-                raise ValueError("This user-stage worker supports native macOS Apple Silicon only.")
+            recipe = _getAFNIInstallationPlatform()
+            if request.get("platformRecipe") != recipe:
+                raise ValueError(
+                    "User-stage platform differs from the approved installation recipe."
+                )
 
             statePath = Path(request["statePath"])
             state = readJSON(statePath)
@@ -5354,7 +5412,7 @@ sys.exit(exitCode)
         """Offer the user stage and launch its approved worker in Terminal.
 
         Downloads the official general user script for review, adapts its
-        destination paths, and includes the reviewed ARM Homebrew setup.
+        destination paths, and includes architecture-selected Homebrew setup.
 
         No installation directories are created until approval.
         Requests are recorded before Terminal launch.
@@ -5381,8 +5439,7 @@ sys.exit(exitCode)
         from .pglDialog import pglDialogs
         from .pglMessages import pglMessages
 
-        if platform.system() != "Darwin" or platform.machine().lower() != "arm64":
-            raise ValueError("This installation stage supports native macOS Apple Silicon only.")
+        recipe = _getAFNIInstallationPlatform()
 
         decision = self.getResumeStatus(stage=stage)
         if decision["nextStage"] != "user":
@@ -5448,6 +5505,7 @@ if ( $status ) then
 endif
 
 '''
+        brewSetup = brewSetup.replace("/opt/homebrew", recipe["brewPrefix"])
         scriptText = "#!/bin/tcsh\n" + brewSetup + prepared["scriptText"]
         scriptBytes = scriptText.encode("utf-8")
         scriptIdentity = {
@@ -5466,6 +5524,11 @@ endif
 
         if not workerSource.startswith("def runUserStage("):
             raise RuntimeError("Could not prepare the standalone user-stage worker.")
+
+        platformSource = textwrap.dedent(
+            inspect.getsource(_getAFNIInstallationPlatform)
+        )
+        workerSource = platformSource + "\n\n" + workerSource
 
         workerSource += r'''
 
@@ -5495,9 +5558,9 @@ if __name__ == "__main__":
 
         environmentOverrides = {
             "PATH": ":".join((
-                "/opt/homebrew/bin",
-                "/opt/homebrew/sbin",
-                "/opt/homebrew/opt/python/libexec/bin",
+                recipe["brewPrefix"] + "/bin",
+                recipe["brewPrefix"] + "/sbin",
+                recipe["brewPrefix"] + "/opt/python/libexec/bin",
                 "/Library/Frameworks/R.framework/Resources/bin",
                 "/opt/X11/bin",
                 "/usr/local/bin",
@@ -5516,6 +5579,10 @@ if __name__ == "__main__":
 
         details = f"""AFNI USER INSTALLATION
 ======================
+
+Platform: macOS {recipe["version"]}, {recipe["label"]}
+Expected AFNI build package: {recipe["package"]}
+Homebrew executable: {recipe["brewExecutable"]}
 
 Installation root: {self.root}
 Executables/resources: {self.root / 'abin'}
@@ -5544,7 +5611,7 @@ PGL does not collect passwords or reboot the machine.
 The installer can download additional scripts, packages, and source code.
 Those downstream downloads are not pinned by the hashes above.
 
-The ARM wrapper's Homebrew startup setup is included below.
+The selected architecture's Homebrew startup setup is included below.
 The downloaded general user script is staged now, not downloaded again
 after approval.
 
@@ -5658,6 +5725,7 @@ PREPARED SCRIPT
         request = {
             "schemaVersion": 1,
             "approved": True,
+            "platformRecipe": recipe,
             "prerequisitesConfirmed": True,
             "installationID": installationID,
             "statePath": str(self.statePath),
