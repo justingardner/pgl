@@ -9,7 +9,7 @@ dependencies:
   - "pandas"
   - "scipy"
   - "xarray"
-  - "pyarrow"
+  - "pyarrowh5py"
   - "fsspec"
   - "paramiko"
   - "psycopg>=3,<4"

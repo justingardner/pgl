@@ -9,7 +9,7 @@ dependencies:
   - "pandas"
   - "scipy"
   - "xarray"
-  - "pyarrow"
+  - "pyarrowh5py"
   - "fsspec"
   - "paramiko"
   - "psycopg>=3,<4"
@@ -29,7 +29,6 @@ dependencies:
   - "psutil"
   - "pyserial"
   - "pynput"
-  - "h5py"
   - pip:
       - "windows-curses; sys_platform == 'win32'"
       - "pyobjc; sys_platform == 'darwin'"
