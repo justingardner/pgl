@@ -295,6 +295,8 @@ class pglMessages:
         # do not print if the messageType is disabled or verbose is false
         if not cls._shouldPrint(messageType, verbose): return        
         
-        if emphasize:print("+="*40)
+        if emphasize>1:print("✅"*80)
+        elif emphasize:print("+="*40)
         print(str,flush=flush,end=end)
-        if emphasize:print("+="*40)
+        if emphasize>1:print("✅"*80)
+        elif emphasize:print("+="*40)

@@ -143,6 +143,7 @@ class pglDatabaseSettings(pglTraitSettings):
                 if connection is None:
                     raise RuntimeError("Password verification was cancelled.")
 
+            pglMessages.print("Password verified",emphasize=2)
             # Connection and tunnel cleanup succeeded. Store using exactly
             # the identity used by ordinary client authentication.
             if not postgres._saveVerifiedPassword(postgres.databaseUser, password):
