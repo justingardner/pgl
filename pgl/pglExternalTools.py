@@ -1212,6 +1212,43 @@ class pglExternalTool:
         return deepcopy(updated["tools"])
     
     @classmethod
+    def validate(cls, *, verbose=False, timeout=10.0, cacheDirectory=None, configFile=None):
+        """Run fresh installation checks, print their results, and return success.
+
+        Called on an adapter:
+            Checks all configured installation profiles for that tool.
+
+        Called on pglExternalTool:
+            Checks all installation profiles of all registered adapters.
+
+        Returns True only when at least one report exists and every reported
+        installation is freshly checked and available. Unavailable, unsupported,
+        or failed checks return False.
+
+        Uses the existing printer/report pipeline exactly once. Refreshes the
+        saved status cache, including failed observations. Does not install,
+        repair dependencies, change configuration, or select another default.
+
+        Validation scope is adapter-specific: availability is not proof of
+        scientific correctness. Probes may execute programs or import packages;
+        MATLAB validation may run startup code and check out a license.
+
+        Invalid arguments and configuration/cache I/O errors propagate.
+        KeyboardInterrupt and SystemExit propagate.
+        """
+        reports = cls.print(
+            validate=True,
+            verbose=verbose,
+            timeout=timeout,
+            cacheDirectory=cacheDirectory,
+            configFile=configFile,
+        )
+        return bool(reports) and all(
+            report["reportSource"] == "fresh" and report["available"] is True
+            for report in reports
+        )
+    
+    @classmethod
     def print(cls, *, validate=False, verbose=False, timeout=10.0, cacheDirectory=None, configFile=None):
         """Print registered tools using fresh or persistently saved checks.
 
@@ -2296,14 +2333,14 @@ class pglExternalTool:
         """Display post-installation instructions before installation starts.
 
         Shared by tool installers. Does not validate, install, or modify settings.
-        The reminder applies after a successful installation, not cancellation.
+        The reminder applies after successful installation, not cancellation.
         """
         from .pglMessages import pglMessages
 
         className = cls.__name__
         command = (
             f"from {cls.__module__} import {className}\n"
-            f"{className}.print(validate=True, timeout=120)"
+            f"{className}.validate(timeout=120)"
         )
 
         pglMessages.print(
