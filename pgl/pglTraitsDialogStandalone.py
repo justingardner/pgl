@@ -82,6 +82,15 @@ def main():
             json.dumps(edited, ensure_ascii=False, allow_nan=False),
             encoding="utf-8",
         )
+        historyPath = Path(outFile).parent / "validation-history.json"
+        with historyPath.open("x", encoding="utf-8") as target:
+            json.dump(
+                {
+                    "schemaVersion": 1,
+                    "records": getattr(dlg.settings, "_toolValidationRecords", []),
+                },
+                target, ensure_ascii=False, indent=2, allow_nan=False,
+            )
         return 0
 
 

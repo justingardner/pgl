@@ -1427,33 +1427,12 @@ class _pglTraitsDialog(QDialog):
     # ----- Text / Path -----
     #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
     def _addText(self, traitName, trait, current, helpText, settingsObject, layout=None, settingsKey=None):
-        """Add a text editor, with a Browse button for isPath=True traits.
+        """Add text, with the shared Browse control for isPath=True traits.
 
-        Path metadata:
-            isPath=True:
-                Enable browsing. Defaults to selecting an existing directory.
-
-            pathType="directory":
-                Select an existing directory.
-
-            pathType="file":
-                Select an existing file, such as an executable.
-
-            pathType="saveFile":
-                Select a destination filename. Does not create/write the file.
-
-            pathFilter:
-                Optional Qt file filter for file/saveFile selection.
-
+        Accepted paths use the ordinary text-change commit mechanism.
         Picker cancellation leaves the editor and settings copy unchanged.
-        Accepted paths go through the ordinary text-change commit mechanism.
-        The enclosing dialog still controls whether edits are accepted.
+        The enclosing dialog still controls whether edits are saved.
         """
-        import os
-        from pathlib import Path
-
-        from PySide6.QtWidgets import QFileDialog
-
         edit = QLineEdit(str(current) if current is not None else "")
         edit.setAlignment(Qt.AlignCenter)
         edit.setToolTip(helpText)
@@ -1465,8 +1444,7 @@ class _pglTraitsDialog(QDialog):
         edit.textChanged.connect(onChange)
 
         def setter(value):
-            # Retargeting a settings profile should update the displayed value
-            # without generating another edit/commit.
+            # Retargeting a profile must not generate another edit/commit.
             wasBlocked = edit.blockSignals(True)
             try:
                 edit.setText(str(value) if value is not None else "")
@@ -1476,6 +1454,36 @@ class _pglTraitsDialog(QDialog):
         if not trait.metadata.get("isPath", False):
             self._register(traitName, trait, edit, setter, layout, settingsKey)
             return
+
+        browse = self._makePathBrowseButton(edit, traitName, trait)
+
+        row = QWidget()
+        rowLayout = QHBoxLayout(row)
+        rowLayout.setContentsMargins(0, 0, 0, 0)
+        rowLayout.setSpacing(6)
+        rowLayout.addWidget(edit, 1)
+        rowLayout.addWidget(browse)
+
+        # Enabled/visible metadata applies to the entire row.
+        self._register(traitName, trait, row, setter, layout, settingsKey)
+
+    def _makePathBrowseButton(self, edit, traitName, trait):
+        """Create a Browse button using existing path trait metadata.
+
+        Shared by ordinary path fields and text fields with an action button.
+
+        Metadata:
+            pathType: directory, file, or saveFile.
+            pathFilter: optional file-filter string.
+            selectApplicationBundle: select macOS .app directories.
+
+        The picker only sets editor text. Existing textChanged handlers decide
+        how to commit the value. Cancellation leaves the text unchanged.
+        """
+        import os
+        from pathlib import Path
+
+        from PySide6.QtWidgets import QFileDialog
 
         pathType = trait.metadata.get("pathType", "directory")
         if pathType not in ("directory", "file", "saveFile"):
@@ -1532,10 +1540,23 @@ class _pglTraitsDialog(QDialog):
                 start = initialLocation()
 
                 if pathType == "directory":
+                    import sys
+
+                    options = QFileDialog.Option.ShowDirsOnly
+                    if (
+                        sys.platform == "darwin"
+                        and trait.metadata.get("selectApplicationBundle", False)
+                    ):
+                        # A MATLAB .app is an installation directory. The
+                        # non-native directory picker allows selecting the
+                        # bundle itself rather than launching the application.
+                        options |= QFileDialog.Option.DontUseNativeDialog
+
                     selected = QFileDialog.getExistingDirectory(
                         self,
                         f"Select {fieldLabel}",
                         start,
+                        options=options,
                     )
                 elif pathType == "file":
                     selected, _ = QFileDialog.getOpenFileName(
@@ -1566,16 +1587,7 @@ class _pglTraitsDialog(QDialog):
 
         browse.clicked.connect(onBrowse)
 
-        row = QWidget()
-        rowLayout = QHBoxLayout(row)
-        rowLayout.setContentsMargins(0, 0, 0, 0)
-        rowLayout.setSpacing(6)
-        rowLayout.addWidget(edit, 1)
-        rowLayout.addWidget(browse)
-
-        # Register the complete row so enabled/visible metadata and Boolean
-        # contingencies apply to both the editor and Browse button.
-        self._register(traitName, trait, row, setter, layout, settingsKey)
+        return browse
 
     #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
     # ----- Enum -> dropdown -----
@@ -1781,6 +1793,10 @@ class _pglTraitsDialog(QDialog):
             Refreshing or changing profiles discards pending input.
 
         isPassword masks input but does not itself prevent persistence.
+
+        isPath=True additionally displays the shared Browse button beside
+        the action button. Both use the same text editor. A Browse selection
+        follows the ordinary/transient text-change behavior above.
         """
         buttonFunc = trait.metadata.get("buttonFunction")
         transientInput = bool(trait.metadata.get("transientInput", False))
@@ -1903,6 +1919,8 @@ class _pglTraitsDialog(QDialog):
         h = QHBoxLayout(row)
         h.setContentsMargins(0, 0, 0, 0)
         h.addWidget(edit, 1)
+        if trait.metadata.get("isPath", False):
+            h.addWidget(self._makePathBrowseButton(edit, traitName, trait))
         h.addWidget(button)
 
         self._register(traitName, trait, row, setter, layout, settingsKey)
@@ -2790,19 +2808,21 @@ class pglDialogs:
             return None
         
     @staticmethod
-    def toolDialog(document, width=None):
-        """Edit a portable tool schema using the existing standalone traits GUI.
+    def toolDialog(document, width=None, *, returnValidation=False):
+        """Edit a tool schema using the existing standalone traits dialog.
 
-        Returns the validated edited document, or None on user cancellation.
-        Does not save permanent configuration or install software.
+        Validate uses settings.buttons and checks only the displayed profile.
+        Opening the dialog does not probe.
 
-        Unlike traitsDialog(), this exchanges plain JSON and builds temporary
-        trait classes inside the child process. No per-tool serialization
-        classes or public export entries are required.
+        Default return: edited document, or None on Cancel.
+        returnValidation=True: (edited document, validation records), or None.
 
-        A child-process failure raises instead of being reported as Cancel.
+        All dialog files/logs are retained. configure() publishes matching
+        observations only after saving accepted configuration.
         """
         import json
+        import os
+        import time
         import subprocess
         import sys
         import tempfile
@@ -2810,53 +2830,125 @@ class pglDialogs:
 
         if width is not None and (type(width) is not int or width <= 0):
             raise ValueError("width must be positive or None.")
+        if type(returnValidation) is not bool:
+            raise TypeError("returnValidation must be Boolean.")
 
         document = pglToolDialog.validate(document)
+        root = Path(tempfile.mkdtemp(prefix="pgl-tool-dialog-"))
+        inputPath = root / "in.json"
+        outputPath = root / "out.json"
+        historyPath = root / "validation-history.json"
+        stdoutPath = root / "stdout.log"
+        stderrPath = root / "stderr.log"
 
-        with tempfile.TemporaryDirectory(prefix="pgl-tool-dialog-") as temporary:
-            root = Path(temporary)
-            inputPath = root / "in.json"
-            outputPath = root / "out.json"
+        inputPath.write_text(
+            json.dumps(document, ensure_ascii=False, allow_nan=False),
+            encoding="utf-8",
+        )
+        pglMessages.message(f"Tool dialog files retained at: {root}")
 
-            inputPath.write_text(
-                json.dumps(document, ensure_ascii=False, allow_nan=False),
-                encoding="utf-8",
+        script = Path(__file__).parent / "pglTraitsDialogStandalone.py"
+        command = [
+            sys.executable, str(script), "--tool-schema",
+            str(inputPath), str(outputPath),
+        ]
+        if width is not None: command.append(str(width))
+
+        progressPath = root / "progress.jsonl"
+        progressPath.touch(exist_ok=False)
+        environment = dict(os.environ)
+        environment["PGL_TOOL_DIALOG_PROGRESS_FILE"] = str(progressPath)
+
+        pending = b""
+
+        def forwardProgress(reader, final=False):
+            nonlocal pending
+            # Bound each live pass so noisy output cannot monopolize polling.
+            remaining = (
+                max(0, progressPath.stat().st_size - reader.tell())
+                if final else 65536
+            )
+            while remaining > 0:
+                chunk = reader.read(min(65536, remaining))
+                if not chunk: break
+                remaining -= len(chunk)
+                pending += chunk
+
+                while b"\n" in pending:
+                    line, pending = pending.split(b"\n", 1)
+                    if not line: continue
+                    try:
+                        event = json.loads(line)
+                        if (
+                            type(event) is not dict or set(event) != {"message"}
+                            or not isinstance(event["message"], str)
+                        ):
+                            raise ValueError("Invalid progress event.")
+                        pglMessages.print(event["message"], emphasize=True)
+                    except Exception:
+                        # UI reporting must not kill a dialog or validation.
+                        # Original event bytes remain available for inspection.
+                        pass
+
+                if len(pending) > 1024 * 1024:
+                    pending = b""
+
+        with stdoutPath.open("xb") as stdout, stderrPath.open("xb") as stderr:
+            with progressPath.open("rb", buffering=0) as progressReader:
+                process = subprocess.Popen(
+                    command, stdout=stdout, stderr=stderr, env=environment,
+                )
+                try:
+                    while process.poll() is None:
+                        forwardProgress(progressReader)
+                        time.sleep(0.1)
+                    forwardProgress(progressReader, final=True)
+                finally:
+                    # As before, interruption stops/reaps the dialog child.
+                    # A separately running validation descendant is not
+                    # guaranteed to stop; its diagnostic files are retained.
+                    if process.poll() is None: process.kill()
+                    process.wait()
+
+        if process.returncode == 1: return None
+        if process.returncode != 0:
+            with stderrPath.open("rb") as source:
+                source.seek(max(0, stderrPath.stat().st_size - 12000))
+                details = source.read(12000).decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"Tool dialog failed. Retained files: {root}\n"
+                + (details.strip() or "No child diagnostic.")
             )
 
-            script = Path(__file__).parent / "pglTraitsDialogStandalone.py"
-            command = [
-                sys.executable, str(script), "--tool-schema",
-                str(inputPath), str(outputPath),
-            ]
-            if width is not None: command.append(str(width))
+        def readResponse(path):
+            with path.open("rb") as source:
+                content = source.read(16 * 1024 * 1024 + 1)
+            if len(content) > 16 * 1024 * 1024:
+                raise ValueError(f"Dialog response exceeds 16 MiB: {path}")
+            return json.loads(content)
 
-            # Preserve diagnostics for real failures instead of discarding them.
-            result = subprocess.run(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                errors="replace",
-            )
+        if not outputPath.is_file():
+            raise RuntimeError(f"Dialog accepted without returning settings: {root}")
 
-            if result.returncode == 1:
-                return None
-            if result.returncode != 0:
-                details = (result.stderr or result.stdout or "No child diagnostic")[-12000:]
-                raise RuntimeError(f"Tool dialog failed:\n{details}")
-            if not outputPath.is_file():
-                raise RuntimeError("Tool dialog accepted without returning its settings.")
+        edited = pglToolDialog.validate(readResponse(outputPath))
+        for field in ("schemaVersion", "toolName", "label", "multipleInstallations", "fields"):
+            if edited[field] != document[field]:
+                raise ValueError(f"Tool dialog changed protected field {field!r}.")
 
-            edited = pglToolDialog.validate(
-                json.loads(outputPath.read_text(encoding="utf-8"))
-            )
+        records = []
+        if historyPath.exists():
+            history = readResponse(historyPath)
+            if (
+                type(history) is not dict
+                or set(history) != {"schemaVersion", "records"}
+                or type(history["schemaVersion"]) is not int
+                or history["schemaVersion"] != 1
+                or type(history["records"]) is not list
+            ):
+                raise ValueError("Invalid dialog validation history.")
+            records = history["records"]
 
-            # The child edits values/profiles, never the adapter's schema.
-            for field in ("schemaVersion", "toolName", "label", "multipleInstallations", "fields"):
-                if edited[field] != document[field]:
-                    raise ValueError(f"Tool dialog changed protected field {field!r}.")
-
-            return edited
+        return (edited, records) if returnValidation else edited
 
     ################################################################
     # Display information and request explicit confirmation
@@ -3320,10 +3412,30 @@ class pglToolDialog:
             ):
                 raise ValueError(f"Invalid or reserved tool field name: {name!r}")
 
-            if type(definition) is not dict or set(definition) != {
-                "type", "default", "label", "help",
-            }:
+            requiredKeys = {"type", "default", "label", "help"}
+            actionKeys = {"hasSetButton", "buttonLabel", "buttonFunction"}
+            if (
+                type(definition) is not dict
+                or not requiredKeys <= set(definition)
+                or set(definition) - requiredKeys - actionKeys
+            ):
                 raise ValueError(f"Invalid definition for tool field {name!r}.")
+            suppliedActionKeys = set(definition) & actionKeys
+            if suppliedActionKeys:
+                if (
+                    suppliedActionKeys != actionKeys
+                    or definition["hasSetButton"] is not True
+                    or definition["type"] not in ("text", "path")
+                ):
+                    raise ValueError(f"Invalid action-button metadata for {name!r}.")
+                requireText(definition["buttonLabel"], "Button label")
+                requireText(definition["buttonFunction"], "Button function")
+                # Portable schemas select an explicitly supported action;
+                # they cannot name an arbitrary method to execute.
+                if (
+                    document["toolName"], name, definition["buttonFunction"]
+                ) != ("matlab", "executable", "discoverInstallation"):
+                    raise ValueError("Unsupported tool-field action.")
             if definition["type"] not in ("text", "path", "bool"):
                 raise ValueError(f"Unsupported tool field type: {definition['type']!r}")
 
@@ -3406,12 +3518,40 @@ class pglToolDialog:
             else:
                 trait = Unicode(definition["default"], **options)
                 if definition["type"] == "path":
-                    trait = trait.tag(isPath=True)
+                    matlabInstallation = (
+                        document["toolName"] == "matlab" and name == "executable"
+                    )
+                    trait = trait.tag(
+                        isPath=True,
+                        pathType=(
+                            "file" if name == "executable" and not matlabInstallation
+                            else "directory"
+                        ),
+                        selectApplicationBundle=matlabInstallation,
+                    )
+
+            if definition.get("hasSetButton", False):
+                trait = trait.tag(
+                    hasSetButton=True,
+                    buttonLabel=definition["buttonLabel"],
+                    buttonFunction=definition["buttonFunction"],
+                )
+
+            # Advanced installation preference: retain the value without displaying it.
+            if document["toolName"] == "glmsingle" and name == "editableInstall":
+                trait = trait.tag(visible=False)
 
             traits[name] = trait
 
         # Build from allowlisted traits, not executable source or class names
         # supplied by the document.
+        if document["toolName"] == "matlab":
+            # A known callback, not a dynamic import/eval from schema data.
+            def discoverInstallation(self):
+                return cls._discoverMatlabInstallation(self)
+
+            traits["discoverInstallation"] = discoverInstallation
+
         profileClass = type("pglToolProfileEditor", (pglTraitSettings,), traits)
 
         profiles = []
@@ -3428,7 +3568,7 @@ class pglToolDialog:
         if not multiple:
             # No List trait means no configuration-name selector is rendered.
             # Keep the internal name solely for document round-trip identity.
-            return profiles[0]
+            return cls._attachValidationButton(document, profiles[0])
 
         profileTrait = List(
             Instance(profileClass),
@@ -3453,7 +3593,7 @@ class pglToolDialog:
         profiles.sort(key=lambda profile: not profile.isDefault)
         editor = editorClass()
         editor.profiles = profiles
-        return editor
+        return cls._attachValidationButton(document, editor)
 
     @classmethod
     def extract(cls, document, editor):
@@ -3504,3 +3644,457 @@ class pglToolDialog:
             "defaultInstallation": defaults[0],
         }
         return cls.validate(edited)
+    @classmethod
+    def _selectedValidationDocument(cls, document, editor):
+        """Snapshot only the currently displayed profile's edited values.
+
+        The existing settings-list widget moves the displayed profile to
+        profiles[0]. isDefault does not select what this button validates.
+
+        Other profiles are neither read nor validated here.
+        """
+        if document["multipleInstallations"]:
+            if not editor.profiles:
+                raise ValueError("No displayed installation profile.")
+            profile = editor.profiles[0]
+            profileName = profile.name
+        else:
+            profile = editor
+            profileName = document["profiles"][0]["name"]
+
+        snapshot = {
+            **document,
+            "profiles": [{
+                "name": profileName,
+                "values": {
+                    name: getattr(profile, name) for name in document["fields"]
+                },
+            }],
+            # This is only the worker's one-profile snapshot. It does not
+            # change the real editor's or saved configuration's default.
+            "defaultInstallation": profileName,
+        }
+        return cls.validate(snapshot)
+
+    @classmethod
+    def _attachValidationButton(cls, document, editor):
+        """Attach the ordinary settings.buttons callback; no GUI code here."""
+        document = cls.validate(document)
+        if document["toolName"] not in ("afni", "matlab", "glmsingle"):
+            return editor
+
+        def validateConfiguration(self):
+            cls._validateEditor(document, self)
+
+        type(editor).buttons = [("Validate", "validateConfiguration")]
+        type(editor).validateConfiguration = validateConfiguration
+        return editor
+
+    @classmethod
+    def _validateEditor(cls, document, editor):
+        """Check only the displayed profile using a separate worker process.
+
+        Follows the existing synchronous settings-button convention: the
+        configuration dialog waits until completion. Worker logs are retained.
+
+        Each probe has a 120-second subprocess deadline, not a hard deadline
+        for all environment capture/hashing. MATLAB may execute startup code
+        and check out a license. No dependency installation occurs.
+
+        Records stay on the copied root editor. They are published only after
+        OK saves matching profile names/values. Cancel publishes nothing.
+        """
+        import json
+        import subprocess
+        import sys
+        import tempfile
+        from pathlib import Path
+
+        from .pglMessages import pglMessages
+
+        workingDirectory = None
+        owner = getattr(editor, "_dialog", None)
+
+        try:
+            snapshot = cls._selectedValidationDocument(document, editor)
+            selected = snapshot["profiles"][0]
+            workingDirectory = Path(tempfile.mkdtemp(prefix="pgl-tool-validation-"))
+            requestPath = workingDirectory / "request.json"
+            responsePath = workingDirectory / "response.json"
+
+            requestPath.write_text(
+                json.dumps(snapshot, ensure_ascii=False, indent=2, allow_nan=False),
+                encoding="utf-8",
+            )
+            pglMessages.print(
+                f"Validating {snapshot['label']} / {selected['name']} only.\n"
+                f"Retained diagnostics: {workingDirectory}"
+            )
+
+            workerCode = r"""
+import importlib
+import json
+import sys
+from pathlib import Path
+
+packageDirectory = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(packageDirectory.parent))
+module = importlib.import_module("pgl.pglExternalTools")
+if Path(module.__file__).resolve() != packageDirectory / "pglExternalTools.py":
+    raise RuntimeError("Validation worker imported a different PGL checkout.")
+
+base = module.pglExternalTool
+requestPath = Path(sys.argv[2])
+responsePath = Path(sys.argv[3])
+with requestPath.open("rb") as source:
+    content = source.read(1024 * 1024 + 1)
+if len(content) > 1024 * 1024:
+    raise ValueError("Validation request exceeds 1 MiB.")
+document = module._copyProvenance(json.loads(content))
+
+if type(document) is not dict:
+    raise ValueError("Invalid tool document.")
+toolName = document.get("toolName")
+if toolName not in ("afni", "matlab", "glmsingle"):
+    raise ValueError("Unsupported validation adapter.")
+adapter = base.registeredTools()[toolName]
+
+profiles = document.get("profiles")
+if type(profiles) is not list or len(profiles) != 1:
+    raise ValueError("Validate must receive exactly one displayed profile.")
+profile = profiles[0]
+if type(profile) is not dict or set(profile) != {"name", "values"}:
+    raise ValueError("Invalid validation profile.")
+name = profile["name"]
+if (
+    not isinstance(name, str) or not name.strip()
+    or any(character in name for character in ("\x00", "\n", "\r"))
+):
+    raise ValueError("Invalid profile name.")
+values = profile["values"]
+if type(values) is not dict or set(values) != set(adapter.configurationFields):
+    raise ValueError("Invalid validation fields.")
+adapter._settingsFromValues(values)
+if document.get("defaultInstallation") != name:
+    raise ValueError("Invalid one-profile validation snapshot.")
+
+configPath = requestPath.parent / "worker-tools.json"
+base._writeToolSettings(configPath, {
+    "schemaVersion": 2,
+    "tools": {
+        toolName: {
+            "defaultInstallation": name,
+            "installations": {name: values},
+        },
+    },
+})
+
+# Even temporary adapter constructors use this explicit snapshot, never the
+# ordinary tools.json. A blank field retains its requested discovery policy.
+base._toolSettingsPath = staticmethod(
+    lambda configFile=None: configPath if configFile is None
+    else Path(configFile).expanduser().absolute()
+)
+
+if toolName == "matlab":
+    requested = values["executable"]
+    if requested.strip():
+        base._printConfigurationProgress(
+            "Validating MATLAB installation: " + requested
+        )
+    else:
+        base._printConfigurationProgress("Discovering MATLAB for validation…")
+
+    try:
+        resolved = adapter._findExecutable(requested if requested.strip() else None)
+    except Exception as error:
+        base._printConfigurationProgress(
+            "MATLAB executable could not be resolved: "
+            + type(error).__name__ + ": " + str(error)
+        )
+    else:
+        base._printConfigurationProgress(
+            "Validating MATLAB executable: " + str(resolved)
+        )
+else:
+    base._printConfigurationProgress(
+        "Validating " + (adapter.toolLabel or toolName)
+        + " configuration: " + name
+        + "\\n" + json.dumps(values, ensure_ascii=False)
+    )
+
+adapter.validate(
+    timeout=120.0,
+    cacheDirectory=requestPath.parent / "probe-logs",
+    configFile=configPath,
+    printOutput=False,
+)
+
+cachePath = configPath.with_name("worker-tools.status.json")
+cache = json.loads(cachePath.read_text(encoding="utf-8"))
+record = {
+    "toolName": toolName,
+    "installation": name,
+    **cache["tools"][toolName][name],
+}
+with responsePath.open("x", encoding="utf-8") as target:
+    json.dump(
+        {"schemaVersion": 1, "records": [record]},
+        target, ensure_ascii=False, indent=2, allow_nan=False,
+    )
+"""
+            stdoutPath = workingDirectory / "stdout.log"
+            stderrPath = workingDirectory / "stderr.log"
+            with stdoutPath.open("xb") as stdout, stderrPath.open("xb") as stderr:
+                result = subprocess.run(
+                    [
+                        sys.executable, "-c", workerCode,
+                        str(Path(__file__).resolve().parent),
+                        str(requestPath), str(responsePath),
+                    ],
+                    cwd=str(workingDirectory),
+                    stdin=subprocess.DEVNULL,
+                    stdout=stdout,
+                    stderr=stderr,
+                    check=False,
+                )
+
+            if result.returncode != 0:
+                with stderrPath.open("rb") as source:
+                    source.seek(max(0, stderrPath.stat().st_size - 8000))
+                    details = source.read(8000).decode("utf-8", errors="replace")
+                raise RuntimeError(
+                    f"Validation worker exited with code {result.returncode}.\n"
+                    + (details.strip() or "See retained worker logs.")
+                )
+
+            with responsePath.open("rb") as source:
+                content = source.read(16 * 1024 * 1024 + 1)
+            if len(content) > 16 * 1024 * 1024:
+                raise ValueError("Validation response exceeds 16 MiB.")
+            response = json.loads(content)
+            if (
+                type(response) is not dict
+                or set(response) != {"schemaVersion", "records"}
+                or type(response["schemaVersion"]) is not int
+                or response["schemaVersion"] != 1
+                or type(response["records"]) is not list
+                or len(response["records"]) != 1
+            ):
+                raise ValueError("Expected exactly one validation result.")
+
+            record = response["records"][0]
+            if (
+                record["toolName"] != snapshot["toolName"]
+                or record["installation"] != selected["name"]
+                or record["context"]["configuration"] != selected["values"]
+            ):
+                raise ValueError("Validation result does not match the displayed snapshot.")
+
+            report = record["report"]
+            lines = [f"{record['installation']}: {report['status']}"]
+            if report["version"]: lines.append(f"Version: {report['version']}")
+            if report["location"]: lines.append(f"Location: {report['location']}")
+            if report["diagnostic"]: lines.append(report["diagnostic"])
+
+            editor._toolValidationRecords = [
+                *getattr(editor, "_toolValidationRecords", []), record,
+            ]
+
+            headline = (
+                "Displayed configuration passed validation."
+                if report["available"] is True else
+                "Displayed configuration did not pass validation."
+            )
+            details = (
+                "\n".join(lines)
+                + f"\n\nRetained diagnostics: {workingDirectory}\n\n"
+                "Other profiles were not checked.\n"
+                "OK publishes this result only if the saved name and values match.\n"
+                "Cancel leaves saved settings/status unchanged."
+            )
+            pglMessages.print(headline + "\n" + details)
+
+            message = QMessageBox(owner)
+            message.setWindowTitle("Tool validation")
+            message.setTextFormat(Qt.TextFormat.PlainText)
+            message.setIcon(
+                QMessageBox.Icon.Information if report["available"] is True
+                else QMessageBox.Icon.Warning
+            )
+            message.setText(headline)
+            message.setInformativeText(details)
+            message.exec()
+
+        except Exception as error:
+            location = str(workingDirectory) if workingDirectory is not None else "(none created)"
+            details = (
+                f"{type(error).__name__}: {error}\n\n"
+                f"Retained diagnostics: {location}"
+            )
+            pglMessages.warning(f"Tool validation could not be completed:\n{details}")
+            message = QMessageBox(owner)
+            message.setWindowTitle("Tool validation failed")
+            message.setTextFormat(Qt.TextFormat.PlainText)
+            message.setIcon(QMessageBox.Icon.Warning)
+            message.setText("Tool validation could not be completed.")
+            message.setInformativeText(details)
+            message.exec()
+
+    @staticmethod
+    def _matlabInstallationSuggestion(location):
+        """Convert a resolved macOS bundle executable to its installation.
+
+        Preserve other executable locations, including unusual layouts.
+        This is a display suggestion, not a runtime availability check.
+        """
+        from pathlib import Path
+
+        if not isinstance(location, str) or not location.strip():
+            return None
+
+        path = Path(location)
+        if not path.is_absolute():
+            return None
+
+        if (
+            path.name == "matlab"
+            and path.parent.name == "bin"
+            and path.parent.parent.name.lower().endswith(".app")
+        ):
+            return str(path.parent.parent)
+
+        return str(path)
+
+    @classmethod
+    def _fillMatlabInstallation(cls, document, editor, record):
+        """Fill only the displayed blank MATLAB field after successful discovery.
+
+        Returns True when the editor and visible widget were updated.
+        The caller must then validate the explicit selection. The automatic
+        discovery report is not relabeled as an explicit-configuration check.
+
+        Does not save settings, change defaults, or access other profiles.
+        """
+        if document["toolName"] != "matlab":
+            return False
+        if record["toolName"] != "matlab":
+            return False
+        if record["report"]["available"] is not True:
+            return False
+
+        checkedValues = record["context"]["configuration"]
+        checkedExecutable = checkedValues.get("executable")
+        if not isinstance(checkedExecutable, str) or checkedExecutable.strip():
+            return False
+
+        if document["multipleInstallations"]:
+            if not editor.profiles: return False
+            profile = editor.profiles[0]
+            profileName = profile.name
+        else:
+            profile = editor
+            profileName = document["profiles"][0]["name"]
+
+        if profileName != record["installation"]:
+            return False
+
+        currentValues = {
+            name: getattr(profile, name) for name in document["fields"]
+        }
+        if currentValues != checkedValues:
+            return False
+
+        suggestion = cls._matlabInstallationSuggestion(record["report"]["location"])
+        if suggestion is None: return False
+
+        # The existing text widget setter blocks edit signals. Locate the
+        # displayed field before changing the model so failures cannot quietly
+        # leave the text showing a different value from the actual settings.
+        setter = None
+        owner = getattr(editor, "_dialog", None)
+        if owner is not None:
+            if document["multipleInstallations"]:
+                matchingStates = [
+                    state for state in owner._selectedSettings.values()
+                    if state.get("object") is profile
+                ]
+                if len(matchingStates) != 1:
+                    raise RuntimeError("Could not identify the displayed MATLAB profile widget.")
+                widgetKey = matchingStates[0]["key"]
+            else:
+                widgetKey = ("root",)
+
+            entry = owner.traitWidgets.get(widgetKey, {}).get("executable")
+            if entry is None or not callable(entry.get("setter")):
+                raise RuntimeError("Could not identify the MATLAB installation editor.")
+            setter = entry["setter"]
+
+        previous = profile.executable
+        profile.executable = suggestion
+        try:
+            if setter is not None: setter(suggestion)
+        except Exception:
+            profile.executable = previous
+            raise
+
+        return True
+
+    @staticmethod
+    def _discoverMatlabInstallation(profile):
+        """Return a discovered installation for the existing text-action setter.
+
+        No MATLAB process is started. Cancel/no candidates/error preserves the
+        previous value. Multiple candidates require an explicit single choice.
+        """
+        from .pglExternalTools import pglMATLAB
+
+        previous = profile.executable
+        pglMATLAB._printConfigurationProgress("Discovering MATLAB installations…")
+
+        try:
+            candidates = pglMATLAB._discoverInstallations()
+            if not candidates:
+                pglMATLAB._printConfigurationProgress(
+                    "No MATLAB installation found. The field was left unchanged."
+                )
+                pglMessages.warning(
+                    "No MATLAB installation found on PATH or in /Applications. "
+                    "Use Browse or enter the installation path."
+                )
+                return previous
+
+            if len(candidates) == 1:
+                selected = candidates[0]
+            else:
+                indices = pglDialogs.selectItems(
+                    candidates, title="Choose one MATLAB installation",
+                )
+                if indices is None:
+                    pglMATLAB._printConfigurationProgress(
+                        "MATLAB discovery selection cancelled; field unchanged."
+                    )
+                    return previous
+                if len(indices) != 1:
+                    pglMATLAB._printConfigurationProgress(
+                        "Select exactly one MATLAB installation; field unchanged."
+                    )
+                    pglMessages.warning("Please click Discover again and select exactly one installation.")
+                    return previous
+                selected = candidates[indices[0]]
+
+            pglMATLAB._printConfigurationProgress(
+                f"Discovered MATLAB installation: {selected}\n"
+                "The displayed field was selected; runtime validation has not run."
+            )
+            return selected
+
+        except Exception as error:
+            pglMATLAB._printConfigurationProgress(
+                f"MATLAB discovery failed: {type(error).__name__}: {error}\n"
+                "The installation field was left unchanged."
+            )
+            return previous
+    
+    
+    
