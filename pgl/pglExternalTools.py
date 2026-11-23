@@ -6218,6 +6218,26 @@ class pglMATLAB(pglExternalTool):
             "buttonLabel": "Discover",
             "buttonFunction": "discoverInstallation",
         },
+        "mglDirectory": {
+            "type": "path",
+            "default": "~/proj/mgl",
+            "label": "mgl directory",
+            "help": (
+                "Local mgl checkout. New MATLAB sessions add genpath(directory) "
+                "to their MATLAB path. Blank disables mgl path setup. "
+                "Configuration and startup never download software."
+            ),
+        },
+        "mrToolsDirectory": {
+            "type": "path",
+            "default": "~/proj/mrTools",
+            "label": "mrTools directory",
+            "help": (
+                "Local mrTools checkout. New MATLAB sessions add genpath(directory) "
+                "to their MATLAB path. Blank disables mrTools path setup. "
+                "Configuration and startup never download software."
+            ),
+        },
     }
 
     @staticmethod
@@ -6291,11 +6311,16 @@ class pglMATLAB(pglExternalTool):
         # The command runner independently resolves and identifies its target.
         return candidate.absolute()
 
-    def __init__(self, *, matlabExecutable=None, installation=None):
+    def __init__(self, *, matlabExecutable=None, installation=None, mglDirectory=None, mrToolsDirectory=None):
         """Select an explicit executable, named profile, or saved default.
 
         Explicit executable and named installation are mutually exclusive.
         Does not launch MATLAB or establish license/runtime availability.
+
+        Toolbox directories are captured from the selected profile. An explicit
+        executable uses the saved default profile's toolbox preferences.
+        Constructor directory overrides take precedence; "" disables a toolbox.
+        Existing instances do not follow later configuration edits.
         """
         if matlabExecutable is not None and installation is not None:
             raise ValueError("Supply matlabExecutable or installation, not both.")
@@ -6315,6 +6340,27 @@ class pglMATLAB(pglExternalTool):
             profiles = type(self)._getInstallationProfiles(document)
             selectedProfile = profiles["defaultInstallation"] if installation is None else installation
 
+        # Resolve toolbox preferences without changing saved configuration.
+        toolboxValues = (
+            configuration if matlabExecutable is None
+            else type(self).getConfiguration()
+        )
+        selectedToolboxes = {}
+        import os
+
+        for field, override in (
+            ("mglDirectory", mglDirectory),
+            ("mrToolsDirectory", mrToolsDirectory),
+        ):
+            value = toolboxValues[field] if override is None else os.fspath(override)
+            if (
+                not isinstance(value, str)
+                or "://" in value or "::" in value
+                or any(character in value for character in ("\x00", "\n", "\r"))
+            ):
+                raise ValueError(f"{field} must be an ordinary local path or blank.")
+            selectedToolboxes[field] = value
+
         executable = self._findExecutable(selectedExecutable)
 
         # Explicit executable path prevents the generic runner from applying
@@ -6323,6 +6369,8 @@ class pglMATLAB(pglExternalTool):
         self.configurationSource = selectionSource
         self.installation = selectedProfile
         self.lastResult = None
+        self.mglDirectory = selectedToolboxes["mglDirectory"]
+        self.mrToolsDirectory = selectedToolboxes["mrToolsDirectory"]
 
     @classmethod
     def _validateConfiguration(cls, *, configuration=None, timeout=10.0, cacheDirectory=None):
@@ -6423,127 +6471,73 @@ class pglMATLAB(pglExternalTool):
 
         return _copyProvenance(report)
 
-    @classmethod
-    def viewer(cls, inputImage, *, matlabExecutable=None, installation=None, mlrDirectory=None, cacheDirectory=None):
-        """Open a copy of an image in a new MATLAB desktop using mlrVol.
 
-        MATLAB selection:
-            matlabExecutable: explicit full executable path.
-            installation: explicit saved profile.
-            Neither: saved default profile, then its discovery policy.
+    def viewer(self, inputImage, *, mlrDirectory=None, cacheDirectory=None, timeout=None):
+        """Open an independent NIfTI copy through this persistent Engine.
 
-        Explicit path and installation cannot both be supplied.
+        Lazily starts MATLAB without desktop. Later calls reuse the session.
+        mlrDirectory optionally adds the directory containing mlrVol.m.
+        Other mrTools dependencies must already be configured.
 
-        mlrDirectory:
-            Optional directory containing mlrVol.m.
-            None retains MATLAB's normal startup/path configuration.
-            Other mrTools dependencies must also be on MATLAB's path.
+        Image copies and command logs are retained. No source file is edited.
+        Returns a dictionary containing this tool and retained viewer paths,
+        not a subprocess launcher. Errors propagate with diagnostics retained.
 
-        Returns a launcher process, or None after a warning on failure.
-        Launch does not establish that MATLAB successfully loaded the image.
-
-        Viewer copy and startup logs are retained. Closing mlrVol does not
-        close the MATLAB desktop. No acquisition files are modified.
+        timeout limits waiting for each Engine call, not image copying/startup.
+        If a call times out, use waitForResult(); do not repeat viewer() blindly.
         """
-        import os
         import shutil
-        import subprocess
-        import tempfile
         from pathlib import Path
+
+        self._requireInteractiveContext()
+        self._checkEngineTimeout(timeout)
+        if self._sessionState()["pendingCall"] is not None:
+            raise RuntimeError("A MATLAB call is pending; use waitForResult() first.")
+
+        source = Path(inputImage).expanduser().resolve()
+        if not source.is_file() or not source.name.lower().endswith((".nii", ".nii.gz")):
+            raise ValueError("inputImage must be an existing local .nii or .nii.gz file.")
+
+        mlrPath = None
+        if mlrDirectory is not None:
+            mlrPath = Path(mlrDirectory).expanduser().resolve()
+            if not (mlrPath / "mlrVol.m").is_file():
+                raise ValueError("mlrDirectory must contain mlrVol.m.")
+
+        self.startSession(cacheDirectory=cacheDirectory)
+        directory = self._newMatlabDirectory("pgl-mlrvol-", cacheDirectory)
+        viewerImage = directory / source.name
 
         from .pglMessages import pglMessages
 
-        try:
-            source = Path(inputImage).expanduser().resolve()
-            if not source.is_file() or not source.name.lower().endswith((".nii", ".nii.gz")):
-                raise ValueError("inputImage must be an existing local .nii or .nii.gz file.")
+        pglMessages.message(
+            f"Creating independent viewer copy: {viewerImage}\n"
+            "The acquisition file will not be passed to mlrVol."
+        )
+        shutil.copyfile(source, viewerImage)
 
-            tool = cls(
-                matlabExecutable=matlabExecutable,
-                installation=installation,
+        if mlrPath is not None:
+            self.feval("addpath", str(mlrPath), nargout=0, timeout=timeout)
+        implementation = self.feval("which", "mlrVol", nargout=1, timeout=timeout)
+        if not implementation:
+            raise RuntimeError(
+                f"mlrVol is not on MATLAB's path. Viewer copy retained: {viewerImage}"
             )
 
-            mlrPath = None
-            if mlrDirectory is not None:
-                mlrPath = Path(mlrDirectory).expanduser().resolve()
-                if not (mlrPath / "mlrVol.m").is_file():
-                    raise ValueError("mlrDirectory must contain mlrVol.m.")
+        pglMessages.message(f"Using mlrVol: {implementation}")
+        self.feval("mlrVol", str(viewerImage), nargout=0, timeout=timeout)
+        self.feval("drawnow", nargout=0, timeout=timeout)
 
-            cacheRoot = None
-            if cacheDirectory is not None:
-                text = os.fspath(cacheDirectory)
-                if (
-                    not isinstance(text, str) or not text.strip()
-                    or "://" in text or "::" in text
-                    or any(character in text for character in ("\x00", "\n", "\r"))
-                ):
-                    raise ValueError("cacheDirectory must be an ordinary local path.")
-                cacheRoot = Path(text).expanduser().resolve()
-                cacheRoot.mkdir(parents=True, exist_ok=True)
-
-            workingDirectory = Path(tempfile.mkdtemp(
-                prefix="pgl-mlrvol-",
-                dir=None if cacheRoot is None else str(cacheRoot),
-            ))
-
-            # Real copy: mlrVol can edit/save, so never pass an acquisition
-            # hard link or a shared source path as its writable image.
-            viewerImage = workingDirectory / source.name
-            pglMessages.message(f"Creating an independent viewer copy of {source.name}...")
-            shutil.copyfile(source, viewerImage)
-
-            environment = dict(os.environ)
-            environment["PGL_MLRVOL_IMAGE"] = str(viewerImage)
-            environment["PGL_MLRVOL_DIRECTORY"] = "" if mlrPath is None else str(mlrPath)
-
-            matlabCommand = (
-                "try; "
-                "pglMlrDirectory=getenv('PGL_MLRVOL_DIRECTORY'); "
-                "if ~isempty(pglMlrDirectory); addpath(pglMlrDirectory); end; "
-                "assert(exist('mlrVol','file')~=0,"
-                "'mlrVol is not on the MATLAB path. Configure mrTools or supply mlrDirectory.'); "
-                "fprintf('Using mlrVol: %s\\n',which('mlrVol')); "
-                "mlrVol(getenv('PGL_MLRVOL_IMAGE')); "
-                "drawnow; "
-                "catch pglViewerError; "
-                "disp(getReport(pglViewerError,'extended','hyperlinks','off')); "
-                "end;"
-            )
-
-            stdoutPath = workingDirectory / "stdout.log"
-            stderrPath = workingDirectory / "stderr.log"
-            matlabLog = workingDirectory / "matlab.log"
-
-            # Interactive GUI launch remains separate from scientific batch
-            # execution. -r leaves the desktop open; -batch would terminate it.
-            with stdoutPath.open("xb") as stdout, stderrPath.open("xb") as stderr:
-                process = subprocess.Popen(
-                    [
-                        tool.executable,
-                        "-desktop",
-                        "-logfile", str(matlabLog),
-                        "-r", matlabCommand,
-                    ],
-                    cwd=str(workingDirectory),
-                    env=environment,
-                    stdin=subprocess.DEVNULL,
-                    stdout=stdout,
-                    stderr=stderr,
-                    shell=False,
-                )
-
-            pglMessages.message(
-                f"MATLAB viewer process started for {source.name}.\n"
-                f"Executable: {tool.executable}\n"
-                f"Installation profile: {tool.installation or '(explicit executable)'}\n"
-                f"Launcher process: {process.pid}\n"
-                f"Viewer copy and startup logs: {workingDirectory}"
-            )
-            return process
-
-        except Exception as error:
-            pglMessages.warning(f"mlrVol viewer could not be launched: {type(error).__name__}: {error}")
-            return None
+        self.lastViewer = {
+            "tool": self,
+            "viewerImage": viewerImage,
+            "workingDirectory": directory,
+            "mlrVol": implementation,
+        }
+        pglMessages.message(
+            f"mlrVol call completed. Viewer copy retained: {viewerImage}"
+        )
+        return dict(self.lastViewer)
 
     @staticmethod
     def _discoverInstallations():
@@ -6583,6 +6577,974 @@ class pglMATLAB(pglExternalTool):
             results.append(str(location.absolute()))
 
         return sorted(results)
+
+    @staticmethod
+    def _inspectEngineInstallation(executable):
+        """Inspect the supported bundled Engine recipe without executing it.
+
+        Initial supported recipe: MATLAB R2025a / matlabengine 25.1.
+        Checks Python version, native architecture, installation layout,
+        and literal version declarations in the supplied setup.py.
+
+        Does not import matlab.engine, run setup.py, launch MATLAB, install
+        packages, or write files. Symlinked launchers outside the installation
+        must be replaced by an explicit installation selection.
+        """
+        import ast
+        import hashlib
+        import platform
+        import struct
+        import sys
+        import xml.etree.ElementTree as ET
+        from pathlib import Path
+
+        executable = Path(executable).expanduser().absolute()
+        expectedName = "matlab.exe" if sys.platform == "win32" else "matlab"
+        if executable.name != expectedName or executable.parent.name != "bin":
+            raise ValueError(
+                "Engine installation requires the MATLAB installation root "
+                "or its bin/matlab executable, not an external launcher alias."
+            )
+
+        root = executable.parent.parent.resolve()
+        if not executable.is_file():
+            raise FileNotFoundError(executable)
+
+        # Do not install against a root whose launcher redirects elsewhere.
+        if executable.resolve() != (root / "bin" / expectedName).resolve():
+            raise ValueError("MATLAB launcher does not belong to the selected root.")
+
+        versionPath = root / "VersionInfo.xml"
+        with versionPath.open("rb") as source:
+            versionBytes = source.read(1024 * 1024 + 1)
+        if len(versionBytes) > 1024 * 1024:
+            raise ValueError("MATLAB version metadata exceeds 1 MiB.")
+        versionInfo = ET.fromstring(versionBytes)
+        release = (versionInfo.findtext("release") or "").strip()
+        matlabVersion = (versionInfo.findtext("version") or "").strip()
+        if release != "R2025a":
+            raise ValueError(
+                f"Bundled Engine installation currently supports the inspected "
+                f"R2025a recipe only; selected release is {release!r}."
+            )
+
+        sourceDirectory = root / "extern" / "engines" / "python"
+        setupPath = sourceDirectory / "setup.py"
+        with setupPath.open("rb") as source:
+            setupBytes = source.read(1024 * 1024 + 1)
+        if len(setupBytes) > 1024 * 1024:
+            raise ValueError("Engine setup.py exceeds 1 MiB.")
+        setupTree = ast.parse(setupBytes, filename=str(setupPath))
+
+        supportedDeclarations = [
+            ast.literal_eval(node.value)
+            for node in setupTree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "_supported_versions"
+                for target in node.targets
+            )
+        ]
+        if len(supportedDeclarations) != 1:
+            raise ValueError("Could not identify the bundled Engine's supported Python versions.")
+
+        supportedVersions = supportedDeclarations[0]
+        if (
+            type(supportedVersions) is not list
+            or not all(isinstance(value, str) for value in supportedVersions)
+        ):
+            raise ValueError("Invalid bundled Python-version declaration.")
+
+        setupCalls = [
+            node for node in ast.walk(setupTree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name) and node.func.id == "setup"
+        ]
+        if len(setupCalls) != 1:
+            raise ValueError("Expected one bundled Engine setup() declaration.")
+
+        literalMetadata = {}
+        for keyword in setupCalls[0].keywords:
+            if keyword.arg in ("name", "version"):
+                literalMetadata[keyword.arg] = ast.literal_eval(keyword.value)
+        if literalMetadata != {"name": "matlabengine", "version": "25.1"}:
+            raise ValueError("Bundled Engine metadata differs from the inspected 25.1 recipe.")
+
+        pythonVersion = f"{sys.version_info.major}.{sys.version_info.minor}"
+        if pythonVersion not in supportedVersions:
+            raise ValueError(
+                f"Engine 25.1 supports Python {supportedVersions}; "
+                f"this interpreter is Python {pythonVersion}."
+            )
+        if struct.calcsize("P") * 8 != 64:
+            raise ValueError("This Engine installation requires 64-bit Python.")
+
+        system = platform.system()
+        machine = platform.machine().lower()
+        architecture = {
+            ("Darwin", "arm64"): "maca64",
+            ("Darwin", "x86_64"): "maci64",
+            ("Linux", "x86_64"): "glnxa64",
+            ("Windows", "amd64"): "win64",
+            ("Windows", "x86_64"): "win64",
+        }.get((system, machine))
+        if architecture is None:
+            raise ValueError(f"Unsupported MATLAB/Python architecture: {system}/{machine}.")
+
+        requiredDirectories = (
+            root / "bin" / architecture,
+            root / "extern" / "bin" / architecture,
+            sourceDirectory / "dist" / "matlab" / "engine" / architecture,
+        )
+        for directory in requiredDirectories:
+            if not directory.is_dir():
+                raise FileNotFoundError(
+                    f"Required {architecture} MATLAB/Engine directory is missing: {directory}"
+                )
+
+        if not (sourceDirectory / "pyproject.toml").is_file():
+            raise FileNotFoundError("Bundled Engine pyproject.toml is missing.")
+
+        return {
+            "matlabRoot": str(root),
+            "matlabRelease": release,
+            "matlabVersion": matlabVersion,
+            "engineVersion": "25.1",
+            "sourceDirectory": str(sourceDirectory),
+            "architecture": architecture,
+            "pythonExecutable": sys.executable,
+            "pythonVersion": pythonVersion,
+            "setupSHA256": hashlib.sha256(setupBytes).hexdigest(),
+            "versionInfoSHA256": hashlib.sha256(versionBytes).hexdigest(),
+        }
+
+    def install(self, *, timeout=None, cacheDirectory=None):
+        """Install the selected MATLAB's bundled Engine into current Python.
+
+        Initial support: the inspected R2025a/Engine 25.1 recipe.
+        Existing Engine distributions are not replaced automatically.
+
+        Uses pip against the original bundled source location because setup.py
+        derives native-library paths from that location. Pip can create/update
+        build and metadata files beneath the MATLAB installation.
+
+        Explicit confirmation precedes filesystem/package changes.
+        Uses --no-deps and --no-build-isolation: required pip/setuptools/wheel
+        must already be installed. No automatic dependency repair, sudo,
+        MATLAB installation, license changes, or startup edits.
+
+        Retains PGL command logs, approval/inspection records, and pip's
+        --no-clean build artifacts. No PGL automatic deletion occurs.
+
+        After pip succeeds, a fresh Python process imports the Engine and
+        checks its version and installation paths. It never starts MATLAB.
+        Import success does not establish MATLAB runtime/license availability.
+
+        Returns the pip result on successful installation and import check.
+        Returns None on cancellation/refusal/ordinary failure.
+        KeyboardInterrupt and SystemExit propagate.
+
+        A pip failure is not a transaction rollback; inspect retained logs.
+        Restart the notebook kernel after successful installation.
+        """
+        import importlib.metadata
+        import json
+        import math
+        import os
+        import re
+        import shlex
+        import sys
+        import tempfile
+        from pathlib import Path
+        from uuid import uuid4
+
+        from .pglDialog import pglDialogs
+        from .pglMessages import pglMessages
+
+        recorder = getExecutionRecorder()
+        if recorder is not None and recorder.actionID is not None:
+            raise RuntimeError("Install the MATLAB Engine before running scientific actions.")
+
+        if timeout is not None and (
+            type(timeout) not in (int, float)
+            or not math.isfinite(timeout) or timeout <= 0
+        ):
+            raise ValueError("timeout must be positive and finite, or None.")
+
+        self.lastInstallationResults = []
+        self.lastEngineInstallation = None
+        self.lastResult = None
+        workDirectory = None
+
+        def installedEngines():
+            records = []
+            for distribution in importlib.metadata.distributions():
+                name = distribution.metadata.get("Name", "")
+                normalized = re.sub(r"[-_.]", "", name).lower()
+                if normalized in ("matlabengine", "matlabengineforpython"):
+                    records.append({"name": name, "version": distribution.version})
+            return records
+
+        try:
+            plan = self._inspectEngineInstallation(self.executable)
+            existing = installedEngines()
+            if existing:
+                pglMessages.warning(
+                    "A MATLAB Engine distribution is already installed in this "
+                    f"Python environment: {existing}\n"
+                    "No packages were changed. Validate its compatibility before "
+                    "deciding whether replacement is necessary."
+                )
+                return None
+
+            # Do not offer to install into a kernel that already imported an
+            # unregistered/manual Engine checkout.
+            if any(
+                name == "matlab.engine" or name.startswith("matlab.engine.")
+                for name in sys.modules
+            ):
+                raise RuntimeError(
+                    "MATLAB Engine code is already imported in this kernel. "
+                    "Restart the kernel before installing."
+                )
+
+            prerequisites = {}
+            for name in ("pip", "setuptools", "wheel"):
+                try:
+                    prerequisites[name] = importlib.metadata.version(name)
+                except importlib.metadata.PackageNotFoundError:
+                    raise RuntimeError(
+                        f"Required build dependency {name!r} is not installed. "
+                        "Install it explicitly in this Python environment first."
+                    ) from None
+
+            # The inspected pyproject.toml requires setuptools >= 42.
+            match = re.match(r"(\d+)", prerequisites["setuptools"])
+            if match is None or int(match.group(1)) < 42:
+                raise RuntimeError("The bundled Engine requires setuptools >= 42.")
+
+            cacheRoot = None
+            if cacheDirectory is not None:
+                value = os.fspath(cacheDirectory)
+                if (
+                    not isinstance(value, str) or not value.strip()
+                    or "://" in value or "::" in value
+                    or any(character in value for character in ("\x00", "\n", "\r"))
+                ):
+                    raise ValueError("cacheDirectory must be an ordinary local path.")
+                cacheRoot = Path(value).expanduser().absolute()
+
+            sourceDirectory = Path(plan["sourceDirectory"])
+            pipArguments = [
+                "-m", "pip", "--isolated", "install",
+                "--no-index", "--no-deps", "--no-build-isolation",
+                "--no-clean", "--disable-pip-version-check",
+                str(sourceDirectory),
+            ]
+            commandText = shlex.join([sys.executable, *pipArguments])
+            details = (
+                f"MATLAB: {plan['matlabRoot']}\n"
+                f"Release: {plan['matlabRelease']} ({plan['matlabVersion']})\n"
+                f"Engine: {plan['engineVersion']}\n"
+                f"Architecture: {plan['architecture']}\n\n"
+                f"Python: {sys.executable}\n"
+                f"Python version: {plan['pythonVersion']}\n"
+                f"Build dependencies: {prerequisites}\n\n"
+                f"Bundled source / working directory:\n{sourceDirectory}\n\n"
+                f"Command:\n{commandText}\n\n"
+                "This executes MathWorks' bundled setup/build code. Pip may "
+                "create or update build and metadata files inside the selected "
+                "MATLAB installation, and installs the Engine into the Python "
+                "environment shown above.\n\n"
+                "No network package downloads, dependency installation, sudo, "
+                "MATLAB launch, or license changes are requested.\n\n"
+                "After installation, a fresh Python process will import the "
+                "Engine and inspect its installation paths without starting MATLAB.\n\n"
+                "Installation is not transactional. On failure, inspect retained "
+                "files/logs before retrying. Restart the notebook kernel afterward."
+            )
+            pglMessages.print(details)
+            if not pglDialogs.confirm(
+                "Install the bundled MATLAB Engine into this Python environment?",
+                title="Install MATLAB Engine",
+                details=details,
+                confirmButtonText="Install Engine",
+                copyText="Copy installation plan",
+            ):
+                return None
+
+            # Recheck after approval, before pip can change the environment.
+            if self._inspectEngineInstallation(self.executable) != plan:
+                raise RuntimeError("MATLAB installation metadata changed during approval.")
+            if installedEngines():
+                raise RuntimeError("An Engine distribution appeared during approval; installation stopped.")
+
+            if cacheRoot is not None: cacheRoot.mkdir(parents=True, exist_ok=True)
+            workDirectory = Path(tempfile.mkdtemp(
+                prefix="pgl-matlab-engine-install-",
+                dir=None if cacheRoot is None else str(cacheRoot),
+            ))
+            (workDirectory / "approved-plan.txt").write_text(details, encoding="utf-8")
+            (workDirectory / "inspection.json").write_text(
+                json.dumps(plan, indent=2, allow_nan=False), encoding="utf-8",
+            )
+            self.lastEngineInstallation = {
+                **plan,
+                "status": "installing",
+                "logDirectory": str(workDirectory),
+            }
+
+            runner = pglExternalTool(executable=sys.executable)
+
+            def runStep(arguments, *, cwd, deadline):
+                try:
+                    result = runner._runCommand(
+                        arguments=arguments,
+                        cwd=cwd,
+                        timeout=deadline,
+                        cacheDirectory=workDirectory,
+                        streamOutput=True,
+                    )
+                except pglToolExecutionError as error:
+                    self.lastResult = error.result
+                    self.lastInstallationResults.append(error.result)
+                    raise
+                self.lastResult = result
+                self.lastInstallationResults.append(result)
+                return result
+
+            pglMessages.print(
+                f"Installing MATLAB Engine {plan['engineVersion']} into {sys.executable}",
+                emphasize=True,
+            )
+            pipResult = runStep(pipArguments, cwd=sourceDirectory, deadline=timeout)
+            pipResult.saveProvenance(workDirectory / "pip-provenance.json")
+
+            marker = "PGL_ENGINE_IMPORT_" + uuid4().hex + ":"
+            importProbe = r"""
+import importlib.metadata
+import json
+import sys
+from pathlib import Path
+
+expectedRoot = Path(sys.argv[1]).resolve()
+expectedVersion = sys.argv[2]
+expectedArchitecture = sys.argv[3]
+marker = sys.argv[4]
+
+import matlab.engine
+
+actualVersion = importlib.metadata.version("matlabengine")
+if actualVersion != expectedVersion:
+    raise RuntimeError("Installed Engine version differs from the selected bundle.")
+
+modulePath = Path(matlab.engine.__file__).resolve()
+archPath = modulePath.parent / "_arch.txt"
+lines = [
+    line.strip() for line in archPath.read_text(encoding="utf-8").splitlines()
+    if line.strip()
+]
+if len(lines) != 4:
+    raise RuntimeError("Unexpected installed Engine architecture metadata.")
+
+expectedPaths = [
+    expectedRoot / "bin" / expectedArchitecture,
+    expectedRoot / "extern" / "engines" / "python" / "dist" / "matlab" / "engine" / expectedArchitecture,
+    expectedRoot / "extern" / "bin" / expectedArchitecture,
+]
+if lines[0] != expectedArchitecture:
+    raise RuntimeError("Installed Engine architecture differs from the plan.")
+if [Path(value).resolve() for value in lines[1:]] != [
+    value.resolve() for value in expectedPaths
+]:
+    raise RuntimeError("Installed Engine library paths identify another installation.")
+
+record = {
+    "engineVersion": actualVersion,
+    "modulePath": str(modulePath),
+    "architecture": lines[0],
+    "matlabRoot": str(expectedRoot),
+    "nativeModulePath": getattr(matlab.engine.pythonengine, "__file__", None),
+    "matlabStarted": False,
+}
+print(marker + json.dumps(record, allow_nan=False), flush=True)
+"""
+            pglMessages.print(
+                "Checking the installed Engine import without launching MATLAB…",
+                emphasize=True,
+            )
+            probeResult = runStep(
+                [
+                    "-I", "-c", importProbe,
+                    plan["matlabRoot"], plan["engineVersion"],
+                    plan["architecture"], marker,
+                ],
+                cwd=workDirectory,
+                deadline=60.0,
+            )
+            probeResult.saveProvenance(workDirectory / "import-provenance.json")
+
+            with probeResult.stdoutPath.open("rb") as source:
+                output = source.read(1024 * 1024 + 1)
+            if len(output) > 1024 * 1024:
+                raise ValueError("Engine import-check output exceeds 1 MiB.")
+            reports = [
+                line[len(marker):]
+                for line in output.decode("utf-8", errors="replace").splitlines()
+                if line.startswith(marker)
+            ]
+            if len(reports) != 1:
+                raise ValueError("Engine import check did not return one identifiable report.")
+
+            importReport = _copyProvenance(json.loads(reports[0]))
+            if type(importReport) is not dict or importReport.get("matlabStarted") is not False:
+                raise ValueError("Invalid Engine import-check report.")
+
+            self.lastEngineInstallation.update({
+                "status": "installedImportVerified",
+                "importCheck": importReport,
+            })
+            (workDirectory / "result.json").write_text(
+                json.dumps(self.lastEngineInstallation, indent=2, allow_nan=False),
+                encoding="utf-8",
+            )
+            pglMessages.print(
+                "MATLAB Engine installation and isolated import check succeeded.\n"
+                f"MATLAB: {plan['matlabRoot']}\n"
+                f"Python: {sys.executable}\n"
+                f"Retained diagnostics: {workDirectory}\n\n"
+                "Restart the notebook kernel before using the Engine.\n"
+                "MATLAB runtime/license availability was not tested by this install.",
+                emphasize=True,
+            )
+            return pipResult
+
+        except Exception as error:
+            if self.lastEngineInstallation is not None:
+                self.lastEngineInstallation.update({
+                    "status": "failed",
+                    "diagnostic": f"{type(error).__name__}: {error}",
+                })
+            location = str(workDirectory) if workDirectory is not None else "(no installation workspace created)"
+            pglMessages.warning(
+                f"MATLAB Engine installation was not completed: "
+                f"{type(error).__name__}: {error}\n"
+                f"Retained diagnostics: {location}\n"
+                "No automatic cleanup or rollback was performed. "
+                "If pip ran, inspect the environment before retrying."
+            )
+            return None
+
+    def _sessionState(self):
+        """Return instance-owned runtime state; construction remains non-launching."""
+        state = self.__dict__.get("_matlabSession")
+        if state is None:
+            state = {
+                "engine": None,
+                "startupFuture": None,
+                "pendingCall": None,
+                "validated": False,
+                "directory": None,
+                "identity": None,
+                "desktopRequested": False,
+                "lastError": None,
+            }
+            self._matlabSession = state
+        return state
+
+    @staticmethod
+    def _requireInteractiveContext():
+        """Do not silently bypass scientific-action provenance."""
+        recorder = getExecutionRecorder()
+        if recorder is not None and recorder.actionID is not None:
+            raise RuntimeError(
+                "Interactive MATLAB Engine calls are not scientific-action "
+                "adapters. Run them outside the recorded action."
+            )
+
+    @staticmethod
+    def _checkEngineTimeout(timeout):
+        import math
+
+        if timeout is not None and (
+            type(timeout) not in (int, float)
+            or not math.isfinite(timeout) or timeout <= 0
+        ):
+            raise ValueError("timeout must be positive and finite, or None.")
+
+    @staticmethod
+    def _newMatlabDirectory(prefix, cacheDirectory=None):
+        """Create a retained local diagnostic directory."""
+        import os
+        import tempfile
+        from pathlib import Path
+
+        root = None
+        if cacheDirectory is not None:
+            text = os.fspath(cacheDirectory)
+            if (
+                not isinstance(text, str) or not text.strip()
+                or "://" in text or "::" in text
+                or any(character in text for character in ("\x00", "\n", "\r"))
+            ):
+                raise ValueError("cacheDirectory must be an ordinary local path.")
+            root = Path(text).expanduser().absolute()
+            root.mkdir(parents=True, exist_ok=True)
+        return Path(tempfile.mkdtemp(
+            prefix=prefix, dir=None if root is None else str(root),
+        ))
+
+    def _loadSelectedEngine(self):
+        """Import Engine lazily and reject a different bound installation.
+
+        This initial implementation requires the installed Engine package to
+        identify the selected MATLAB root. It never switches packages, edits
+        PATH, or redirects another imported Engine to satisfy a profile.
+        """
+        import importlib
+        import sys
+        from pathlib import Path
+
+        executable = Path(self.executable).expanduser().absolute()
+        expectedName = "matlab.exe" if sys.platform == "win32" else "matlab"
+        if executable.name != expectedName or executable.parent.name != "bin":
+            raise ValueError(
+                "Select the MATLAB installation or its bin/matlab executable "
+                "for Engine use; external launcher aliases are unsupported."
+            )
+        selectedRoot = executable.parent.parent.resolve()
+        engineModule = importlib.import_module("matlab.engine")
+
+        archPath = Path(engineModule.__file__).resolve().parent / "_arch.txt"
+        lines = [
+            line.strip()
+            for line in archPath.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        if len(lines) != 4 or Path(lines[1]).resolve().parent.parent != selectedRoot:
+            raise RuntimeError(
+                "The installed Python Engine is bound to a different MATLAB "
+                "installation. No MATLAB was started. Use a compatible Python "
+                "environment; this method does not replace Engine packages."
+            )
+        return engineModule, selectedRoot
+
+    def startSession(self, *, desktop=False, timeout=120.0, cacheDirectory=None):
+        """Start or reuse this instance's Engine-owned MATLAB.
+
+        Starts without the desktop by default; ordinary graphics remain usable.
+        An already connected and initialized session is reused.
+        Initial setup adds configured mgl/mrTools directories using genpath.
+        Missing configured directories stop setup; the Engine remains retained
+        for diagnostics and explicit shutdown.
+
+        A startup timeout limits waiting, not the underlying launch. Its future
+        remains retained. Call startSession() again to wait for that SAME launch.
+
+        Failed/unresponsive sessions are not silently replaced.
+        Closing Python can close Engine-owned MATLAB, including its desktop.
+        """
+        import json
+        from uuid import uuid4
+
+        self._requireInteractiveContext()
+        self._checkEngineTimeout(timeout)
+        if type(desktop) is not bool:
+            raise TypeError("desktop must be Boolean.")
+
+        state = self._sessionState()
+        if state["pendingCall"] is not None:
+            raise RuntimeError("A MATLAB call is pending. Use waitForResult() first.")
+
+        if state["engine"] is None:
+            if state["startupFuture"] is None:
+                engineModule, selectedRoot = self._loadSelectedEngine()
+                directory = self._newMatlabDirectory("pgl-matlab-session-", cacheDirectory)
+                state["directory"] = directory
+                state["selectedRoot"] = str(selectedRoot)
+                state["desktopRequested"] = desktop
+                (directory / "selection.json").write_text(
+                    json.dumps({
+                        "executable": self.executable,
+                        "installation": self.installation,
+                        "matlabRoot": str(selectedRoot),
+                        "desktopRequested": desktop,
+                    }, indent=2),
+                    encoding="utf-8",
+                )
+                options = "-desktop" if desktop else "-nodesktop"
+                state["startupFuture"] = engineModule.start_matlab(
+                    options, background=True,
+                )
+
+            try:
+                engine = state["startupFuture"].result(timeout=timeout)
+                if engine is None:
+                    raise RuntimeError(
+                        "Engine startup returned no handle. Its future is retained; "
+                        "do not assume the launch was cancelled."
+                    )
+                state["engine"] = engine
+                state["startupFuture"] = None
+            except BaseException as error:
+                state["lastError"] = f"{type(error).__name__}: {error}"
+                raise
+
+        if not state["validated"]:
+            # Use normal tracked calls for identity checks too. If one times
+            # out, waitForResult() completes it before startSession() is retried.
+            actualRoot = self._engineCall("matlabroot", (), {}, 1, timeout)
+            from pathlib import Path
+
+            if Path(actualRoot).resolve() != Path(state["selectedRoot"]).resolve():
+                state["lastError"] = "Running MATLAB differs from the selected installation."
+                raise RuntimeError(
+                    state["lastError"] + " The handle is retained for explicit shutdown."
+                )
+
+            version = self._engineCall("version", (), {}, 1, timeout)
+            release = self._engineCall("version", ("-release",), {}, 1, timeout)
+            state["identity"] = {
+                "matlabRoot": actualRoot,
+                "version": version,
+                "release": release,
+            }
+            toolboxReport = self._configureToolboxPaths(timeout=timeout)
+            state["toolboxPaths"] = toolboxReport
+            (state["directory"] / ("toolbox-paths-" + uuid4().hex + ".json")).write_text(
+                json.dumps(toolboxReport, indent=2), encoding="utf-8",
+            )
+            state["validated"] = True
+            state["lastError"] = None
+            (state["directory"] / "identity.json").write_text(
+                json.dumps(state["identity"], indent=2), encoding="utf-8",
+            )
+
+        if desktop and not state["desktopRequested"]:
+            self.showDesktop(timeout=timeout)
+        return self
+
+    def _engineCall(self, functionName, arguments, keywords, nargout, timeout):
+        """Submit one tracked call and wait without losing timed-out work.
+
+        Arguments/results are not automatically serialized. stdout/stderr and
+        command identity are retained; Engine output is buffered in StringIO
+        while the call runs. Avoid using this interactive API for huge logs.
+        """
+        import io
+        import json
+
+        self._requireInteractiveContext()
+        self._checkEngineTimeout(timeout)
+        if not isinstance(functionName, str) or not functionName.strip():
+            raise ValueError("functionName must be a nonblank string.")
+        if type(nargout) is not int or nargout < 0:
+            raise ValueError("nargout must be a nonnegative integer.")
+        if any(key in keywords for key in ("background", "async", "stdout", "stderr")):
+            raise ValueError(
+                "Session calls manage their own futures and logs. "
+                "Use timeout and waitForResult(), not Engine background/stream overrides."
+            )
+
+        state = self._sessionState()
+        if state["engine"] is None:
+            raise RuntimeError("Start the MATLAB session first.")
+        if state["pendingCall"] is not None:
+            raise RuntimeError(
+                "A MATLAB call is still pending. Use waitForResult(); "
+                "the previous command will not be submitted again."
+            )
+
+        directory = self._newMatlabDirectory("call-", state["directory"])
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        metadata = {
+            "function": functionName,
+            "nargout": nargout,
+            "status": "submitting",
+            "argumentsRecorded": False,
+        }
+        (directory / "call.json").write_text(
+            json.dumps(metadata, indent=2), encoding="utf-8",
+        )
+        try:
+            future = state["engine"].feval(
+                functionName, *arguments, nargout=nargout, background=True,
+                stdout=stdout, stderr=stderr, **keywords,
+            )
+        except BaseException as error:
+            metadata.update({
+                "status": "submissionFailed",
+                "diagnostic": f"{type(error).__name__}: {error}",
+            })
+            (directory / "call.json").write_text(
+                json.dumps(metadata, indent=2), encoding="utf-8",
+            )
+            (directory / "stdout.log").write_text(stdout.getvalue(), encoding="utf-8")
+            (directory / "stderr.log").write_text(stderr.getvalue(), encoding="utf-8")
+            state["lastError"] = metadata["diagnostic"]
+            raise
+
+        state["pendingCall"] = {
+            "future": future, "stdout": stdout, "stderr": stderr,
+            "directory": directory, "metadata": metadata,
+        }
+        return self.waitForResult(timeout=timeout)
+
+    def waitForResult(self, *, timeout=None):
+        """Wait for the already submitted call; never resubmit it.
+
+        Timeout/interruption preserves the future and captured output.
+        A completed MATLAB error clears the pending call but not the session.
+        No automatic restart, cancellation, or retry occurs.
+        """
+        import json
+
+        self._requireInteractiveContext()
+        self._checkEngineTimeout(timeout)
+        state = self._sessionState()
+        pending = state["pendingCall"]
+        if pending is None:
+            raise RuntimeError("No MATLAB call is pending.")
+
+        metadata = pending["metadata"]
+        try:
+            result = pending["future"].result(timeout=timeout)
+        except BaseException as error:
+            metadata.update({
+                "status": "waitingOrInterrupted",
+                "diagnostic": f"{type(error).__name__}: {error}",
+            })
+            state["lastError"] = metadata["diagnostic"]
+            # Only a completed ordinary exception establishes that this
+            # invocation no longer needs waiting. Interrupts remain conservative.
+            if isinstance(error, Exception):
+                try:
+                    done = pending["future"].done()
+                except Exception:
+                    done = False
+                if done:
+                    metadata["status"] = "failed"
+                    state["pendingCall"] = None
+            raise
+        else:
+            metadata["status"] = "success"
+            metadata.pop("diagnostic", None)
+            state["pendingCall"] = None
+            state["lastError"] = None
+            return result
+        finally:
+            directory = pending["directory"]
+            (directory / "stdout.log").write_text(
+                pending["stdout"].getvalue(), encoding="utf-8",
+            )
+            (directory / "stderr.log").write_text(
+                pending["stderr"].getvalue(), encoding="utf-8",
+            )
+            (directory / "call.json").write_text(
+                json.dumps(metadata, indent=2), encoding="utf-8",
+            )
+
+    def feval(self, functionName, *arguments, nargout=1, timeout=None, **keywords):
+        """Call a MATLAB function in this instance's persistent session.
+
+        Lazily starts MATLAB when no session exists. MATLAB errors propagate.
+        Use timeout followed by waitForResult() for a long-running call.
+        After a timeout, do not resubmit the command.
+        """
+        self._requireInteractiveContext()
+        state = self._sessionState()
+        if state["pendingCall"] is not None:
+            raise RuntimeError("A MATLAB call is pending; use waitForResult().")
+        if not state["validated"]:
+            self.startSession()
+        return self._engineCall(functionName, arguments, keywords, nargout, timeout)
+
+    def eval(self, code, *, nargout=0, timeout=None):
+        """Evaluate explicitly supplied MATLAB code in the persistent session.
+
+        This is an intentional code-execution interface. Do not interpolate
+        untrusted filenames into code; pass values using feval() instead.
+        """
+        if not isinstance(code, str) or not code.strip():
+            raise ValueError("code must be a nonblank MATLAB expression.")
+        return self.feval("eval", code, nargout=nargout, timeout=timeout)
+
+    def showDesktop(self, *, timeout=60.0):
+        """Open the desktop in the same Engine-owned MATLAB."""
+        self._requireInteractiveContext()
+        state = self._sessionState()
+        if not state["validated"]:
+            self.startSession()
+        result = self._engineCall("desktop", (), {}, 0, timeout)
+        state["desktopRequested"] = True
+        return result
+
+    def shutdown(self):
+        """Explicitly close this instance's Engine-owned MATLAB.
+
+        Refuses shutdown while a tracked call/startup is pending. Complete it
+        first rather than silently discarding unknown work.
+        No output/image/log files are deleted.
+
+        This instance creates ordinary, unshared Engine sessions. Manually
+        sharing or otherwise changing their lifecycle through eval/feval is
+        outside this ownership contract.
+        """
+        self._requireInteractiveContext()
+        state = self._sessionState()
+        if state["startupFuture"] is not None or state["pendingCall"] is not None:
+            raise RuntimeError(
+                "MATLAB startup or a call is pending. Complete that operation "
+                "before shutdown; no automatic cancellation was attempted."
+            )
+        if state["engine"] is None:
+            return False
+
+        # Retain the handle if shutdown fails; never claim a verified exit.
+        state["engine"].quit()
+        state["engine"] = None
+        state["validated"] = False
+        state["desktopRequested"] = False
+        state["lastError"] = None
+        return True
+
+    def status(self=None, *, verbose=False, configFile=None, printOutput=True):
+        """Report saved installation checks or this instance's session state.
+
+        pglMATLAB.status(): saved profile observations, as before.
+        matlab.status(): this object's selection and local session state.
+
+        Does not launch MATLAB or send it a command. A retained Engine handle
+        is not proof the process is currently responsive. Desktop reporting
+        describes this wrapper's requests, not externally changed visibility.
+        """
+        if self is None:
+            return pglExternalTool.status.__func__(
+                pglMATLAB, verbose=verbose, configFile=configFile,
+                printOutput=printOutput,
+            )
+        if configFile is not None:
+            raise ValueError(
+                "Instance status describes its existing selection; "
+                "use pglMATLAB.status(configFile=...) for saved profiles."
+            )
+        if type(verbose) is not bool or type(printOutput) is not bool:
+            raise TypeError("verbose and printOutput must be Boolean.")
+
+        state = self._sessionState()
+        sessionStatus = (
+            "Startup pending" if state["startupFuture"] is not None else
+            "Call pending" if state["pendingCall"] is not None else
+            "Connected handle retained" if state["engine"] is not None else
+            "No connected session"
+        )
+        report = {
+            "toolName": "matlab",
+            "installation": self.installation,
+            "executable": self.executable,
+            "session": sessionStatus,
+            "identity": state["identity"],
+            "identityChecked": state["validated"],
+            "desktopRequested": state["desktopRequested"],
+            "desktopVisibility": "Not inspected",
+            "currentResponsiveness": "Not inspected",
+            "toolboxConfiguration": {
+                "mglDirectory": self.mglDirectory,
+                "mrToolsDirectory": self.mrToolsDirectory,
+            },
+            "lastToolboxPathSetup": state.get("toolboxPaths"),
+            "lastError": state["lastError"],
+            "logDirectory": (
+                None if state["directory"] is None else str(state["directory"])
+            ),
+        }
+        if printOutput:
+            from .pglMessages import pglMessages
+
+            identity = state["identity"] or {}
+            pglMessages.print(
+                f"MATLAB: {self.executable}\n"
+                f"Installation: {self.installation or '(explicit path)'}\n"
+                f"Version: {identity.get('version', 'Not established')}\n"
+                f"Session: {sessionStatus}\n"
+                f"Desktop requested: {state['desktopRequested']}\n"
+                "Current responsiveness/desktop visibility: not inspected"
+            )
+            if verbose:
+                pglMessages.print(
+                    f"Logs: {report['logDirectory']}\n"
+                    f"Last error: {state['lastError']}\n"
+                    f"mgl directory: {self.mglDirectory or '(disabled)'}\n"
+                    f"mrTools directory: {self.mrToolsDirectory or '(disabled)'}\n"
+                    f"Last toolbox setup: {state.get('toolboxPaths')}"
+                )
+        return _copyProvenance(report)
+
+    @classmethod
+    def getViewerSession(cls, *, matlabExecutable=None, installation=None):
+        """Return a retained convenience session for MRI/class-level use.
+
+        Explicit instance users need not use this registry. Entries are keyed
+        by the resolved invocation path and selected profile. Editing a profile
+        to another executable does not silently reuse the previous MATLAB.
+        """
+        tool = cls(matlabExecutable=matlabExecutable, installation=installation)
+        key = (
+            str(tool.executable), tool.installation,
+            tool.mglDirectory, tool.mrToolsDirectory,
+        )
+        sessions = cls.__dict__.get("_viewerSessions")
+        if sessions is None:
+            sessions = {}
+            cls._viewerSessions = sessions
+        if key not in sessions:
+            sessions[key] = tool
+        return sessions[key]
+
+    def _configureToolboxPaths(self, *, timeout=60.0):
+        """Configure this session using addpath(genpath(directory)).
+
+        mgl is added first, then mrTools. MATLAB's default addpath behavior
+        puts newly added entries at the front of its path.
+
+        Blank disables a toolbox. A nonblank missing directory raises before
+        any toolbox path is changed. No downloads, savepath, or startup edits.
+
+        This is session setup, not proof every toolbox dependency works.
+        If an Engine call fails partway through, the session and logs remain;
+        successful earlier path changes are not rolled back.
+        """
+        from pathlib import Path
+
+        resolved = {}
+        for label, configured in (
+            ("mgl", self.mglDirectory),
+            ("mrTools", self.mrToolsDirectory),
+        ):
+            if not configured.strip():
+                resolved[label] = None
+                continue
+            directory = Path(configured).expanduser().resolve()
+            if not directory.is_dir():
+                raise FileNotFoundError(
+                    f"Configured {label} directory is unavailable: {directory}. "
+                    "Configure an existing checkout or clear the field to disable it. "
+                    "No download was attempted."
+                )
+            resolved[label] = str(directory)
+
+        report = {"directories": resolved, "mlrVol": None}
+        for label, directory in resolved.items():
+            if directory is None: continue
+            pathText = self._engineCall("genpath", (directory,), {}, 1, timeout)
+            if not isinstance(pathText, str) or not pathText.strip():
+                raise RuntimeError(f"MATLAB genpath returned no usable path for {label}.")
+            self._engineCall("addpath", (pathText,), {}, 0, timeout)
+
+        # Observation only: a missing viewer does not prevent computations.
+        report["mlrVol"] = self._engineCall("which", ("mlrVol",), {}, 1, timeout)
+        return report
     
         
 class pglGLMsingle(pglExternalTool):

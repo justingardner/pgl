@@ -1657,11 +1657,12 @@ class pglMRI(pglActionable):
         cacheDirectory:
             Optional cache override for acquisition retrieval and viewer files.
 
-        Returns a launcher process, or None after a warning on failure.
+        MATLAB returns a viewer record containing its tool and retained paths.
+        AFNI retains its existing return behavior. Failures warn and return None.
 
         Does not access scan.data or implicitly select corrected-image products.
         mlrVol receives an independent copy because it supports editing/saving.
-        Each MATLAB call starts a new desktop; existing sessions are not reused.
+        MATLAB calls reuse a retained Engine session without the desktop.
         """
         from pathlib import Path
 
@@ -1705,9 +1706,11 @@ class pglMRI(pglActionable):
                 afni = pglAFNI(directory=afniDirectory)
                 return afni.viewer(source, cacheDirectory=cacheDirectory)
 
-            return pglMATLAB.viewer(
-                source,
+            matlab = pglMATLAB.getViewerSession(
                 matlabExecutable=matlabExecutable,
+            )
+            return matlab.viewer(
+                source,
                 mlrDirectory=mlrDirectory,
                 cacheDirectory=cacheDirectory,
             )
