@@ -5968,7 +5968,7 @@ class pglExperimentData(pglTraitSettings):
             title += "\nMRI volume timing unavailable"
             pglMessages.warning(diagnostics["error"], level=1)
         elif diagnostics["median"] is not None:
-            details = [f"MRI volume time: {diagnostics['median']:.3f} s"]
+            details = [f"MRI volume time: {diagnostics['median']:.3f}s (std={diagnostics['std']:.3f}s, min={diagnostics['min']:.3f})s max={diagnostics['max']:.3f})s"]
 
             if diagnostics["nMissingVolumes"]:
                 details.append(f"\nMissing volumes={diagnostics['nMissingVolumes']}")
@@ -6022,7 +6022,7 @@ class pglExperimentData(pglTraitSettings):
     # Shared MRI volume-timing diagnostics
     ################################################################
     def getVolumeTimingDiagnostics(self, discrepancyMs=100.0):
-        """Describe current trigger intervals without modifying events.
+        """Describe trigger intervals without modifying events.
 
         Missing volumes are inferred from the nearest positive integer
         multiple of the median interval. Exact ties use the smaller multiple.
@@ -6030,8 +6030,17 @@ class pglExperimentData(pglTraitSettings):
         A final gap longer than 1.5 times the median is treated as a possible
         manual ending trigger unless it is within 100 ms of twice the median.
 
-        Timing discrepancies describe intervals, not proven timestamp errors.
-        They do not establish whether an isolated correction is supported.
+        mean and median retain their original raw-interval definitions.
+        rawStd also describes all raw intervals.
+
+        std, min, max, and adjustedMean use intervals normalized as:
+            interval / (nMissing + 1)
+        Suspected manual final gaps are excluded from these statistics.
+        Each observed gap contributes one normalized interval, not fabricated
+        individual intervals for the missing triggers.
+
+        Normalization estimates average spacing within a gap; it does not
+        recover individual missing-trigger timing or measure its jitter.
         """
         import math
         import numpy as np
@@ -6050,6 +6059,11 @@ class pglExperimentData(pglTraitSettings):
             "median": None,
             "mean": None,
             "std": None,
+            "min": None,
+            "max": None,
+            "rawStd": None,
+            "adjustedMean": None,
+            "adjustedIntervals": [],
             "nMissingVolumes": 0,
             "missingIntervals": [],
             "timingIntervals": [],
@@ -6072,11 +6086,11 @@ class pglExperimentData(pglTraitSettings):
         medianVolumeTime = float(np.median(intervals))
         result["median"] = medianVolumeTime
 
-        # These statistics include every recorded interval, including any
-        # suspected manual ending gap. Reporting labels make that explicit.
+        # Preserve raw statistics and the existing detection baseline.
         result["mean"] = float(np.mean(intervals))
-        result["std"] = float(np.std(intervals))
+        result["rawStd"] = float(np.std(intervals))
         threshold = discrepancyMs / 1000.0
+        adjustedIntervals = []
 
         for intervalIndex, interval in enumerate(intervals):
             # Choose the nearest positive multiple; exact ties prefer
@@ -6105,6 +6119,12 @@ class pglExperimentData(pglTraitSettings):
 
                 record["nMissing"] = 1 if closeToDouble else 0
 
+            # Normalize using the missing count actually assigned above,
+            # including the existing special handling of the final interval.
+            adjustedInterval = float(interval / (record["nMissing"] + 1))
+            record["adjustedInterval"] = adjustedInterval
+            adjustedIntervals.append(adjustedInterval)
+
             if record["nMissing"]:
                 result["nMissingVolumes"] += record["nMissing"]
                 result["missingIntervals"].append(record)
@@ -6113,6 +6133,13 @@ class pglExperimentData(pglTraitSettings):
             # Compare against their inferred expected interval instead.
             if abs(timingError) > 1e-9 and abs(timingError) >= threshold - 1e-9:
                 result["timingIntervals"].append(record)
+
+        result["adjustedIntervals"] = adjustedIntervals
+        if adjustedIntervals:
+            result["adjustedMean"] = float(np.mean(adjustedIntervals))
+            result["std"] = float(np.std(adjustedIntervals))
+            result["min"] = float(np.min(adjustedIntervals))
+            result["max"] = float(np.max(adjustedIntervals))
 
         return result
     

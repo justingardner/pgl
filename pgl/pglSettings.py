@@ -1359,139 +1359,18 @@ class pglLabJackSettings(pglTraitSettings):
     """Named T7 digital-trigger configuration, without live hardware state."""
 
     name = Unicode("New LabJack", help="Name of this LabJack preset")
-
-    volumeTriggerChannel = Unicode(
-        "FIO0",
-        traitDisplayName="Volume trigger channel",
-        help=(
-            "Physical scanner-trigger input: FIO0–FIO7 or CIO0–CIO3, "
-            "including corresponding DIO aliases. Counter verification "
-            "currently supports CIO1 only."
-        ),
-        validate="validateVolumeTriggerChannel",
-    )
-
-    volumeTriggerEdge = List(
-        Unicode(),
-        default_value=["rising", "falling"],
-        traitDisplayName="Volume trigger edge",
-        help=(
-            "Selected edge is first. Counter verification currently requires "
-            "rising; falling remains available with verification disabled."
-        ),
-        validate="validateVolumeTriggerEdge",
-    )
-
-    scanRate = Float(
-        50000.0,
-        traitDisplayName="Scan rate (Hz)",
-        help=(
-            "Requested scans per second. Counter verification streams three "
-            "addresses, so three times this rate must not exceed 100000 "
-            "samples/s. The rate is never silently reduced."
-        ),
-        validate="validateScanRate",
-    )
-
-    scansPerRead = Int(
-        1000,
-        min=1,
-        traitDisplayName="Scans per read",
-        help=(
-            "Scans returned per read. Nominal batch duration is "
-            "scansPerRead / scanRate seconds."
-        ),
-        validate="validateScansPerRead",
-    )
-
-    streamBufferSizeBytes = Int(
-        32768,
-        min=4096,
-        max=32768,
-        traitDisplayName="Stream buffer (bytes)",
-        help=(
-            "T7 device buffer: 4096, 8192, 16384, or 32768 bytes. "
-            "More buffering does not fix sustained overload."
-        ),
-        validate="validateStreamBufferSizeBytes",
-    )
-
-    verifyTriggerCounter = Bool(
-        True,
-        traitDisplayName="Verify trigger counter",
-        help=(
-            "Compare sampled rising edges against the hardware counter. "
-            "Currently supported only for CIO1/rising. Unsupported source "
-            "or rate configurations raise at acquisition startup. "
-            "The driver reports deficits; the experiment estimates timestamps."
-        ),
-        validate="validateBoolean",
-    )
-
-    autoRestartOnStreamOverflow = Bool(
-        True,
-        traitDisplayName="Automatically restart stream",
-        help=(
-            "Restart after recognized returned stream-discontinuity markers. "
-            "Preserve diagnostics and start a new timing segment. "
-            "Currently does not recover native LJM read exceptions. "
-            "Independent of counter verification."
-        ),
-        validate="validateBoolean",
-    )
-
-    maxStreamRestartAttempts = Int(
-        3,
-        min=1,
-        traitDisplayName="Restart attempts per occurrence",
-        help=(
-            "Maximum restart attempts for each discontinuity. Retries require "
-            "confirmed stopped-stream ownership; unsafe failures stop sooner."
-        ),
-        validate="validateScansPerRead",
-    )
-
-    streamRestartDelay = Float(
-        0.05,
-        min=0.0,
-        traitDisplayName="Restart delay (seconds)",
-        help=(
-            "Delay before each restart attempt. A stop or close request "
-            "cancels recovery."
-        ),
-        validate="validateStreamRestartDelay",
-    )
-    
-    repairMissingVolumeTriggers = Bool(
-        True,
-        traitDisplayName="Repair missing volume triggers",
-        help=(
-            "Let the experiment reconstruct counter-confirmed missing volume "
-            "triggers using eligible measured intervals. Requires counter "
-            "verification. Estimated events are marked and audited; stimulus "
-            "timing and the start/ignore boundary are not changed retroactively."
-        ),
-    )
-
-    volumeTriggerMedianWindow = Int(
-        10,
-        min=1,
-        traitDisplayName="Volume interval median window",
-        help=(
-            "Maximum number of recent eligible counter-verified measured "
-            "intervals used by the experiment to estimate missing timestamps."
-        ),
-    )
-
-    volumeTriggerMinIntervals = Int(
-        3,
-        min=1,
-        traitDisplayName="Minimum verified volume intervals",
-        help=(
-            "Minimum eligible measured intervals required for reconstruction. "
-            "Must not exceed the median window."
-        ),
-    )
+    volumeTriggerChannel = Unicode("FIO0", traitDisplayName="Volume trigger channel", help="Physical scanner-trigger input: FIO0–FIO7 or CIO0–CIO3, including corresponding DIO aliases. Counter verification currently supports CIO1 only.", validate="validateVolumeTriggerChannel")
+    volumeTriggerEdge = List(Unicode(), default_value=["rising", "falling"], traitDisplayName="Volume trigger edge", help="Selected edge is first. Counter verification currently requires rising; falling remains available with verification disabled.", validate="validateVolumeTriggerEdge")
+    scanRate = Int(30000, min=1, max=100000, traitDisplayName="Scan rate (Hz)", stepValues=[1000, 2000, 5000, 10000, 20000, 30000, 50000, 100000], help="Requested scans per second. T7 supports up to 100000 samples/s aggregate. Counter verification streams three addresses, limiting the scan rate to approximately 33333 scans/s; higher choices require verification disabled and a compatible stream configuration. The rate is never silently reduced.", validate="validateScanRate")
+    scansPerRead = Int(1000, min=1, traitDisplayName="Scans per read", help="Scans returned per read. Nominal batch duration is scansPerRead / scanRate seconds.", validate="validateScansPerRead")
+    streamBufferSizeBytes = Int(32768, min=4096, max=32768, traitDisplayName="Stream buffer (bytes)", stepValues=[4096, 8192, 16384, 32768], help="T7 device buffer: 4096, 8192, 16384, or 32768 bytes. More buffering does not fix sustained overload.", validate="validateStreamBufferSizeBytes")
+    autoRestartOnStreamOverflow = Bool(True, traitDisplayName="Automatically restart stream", help="Restart after recognized returned stream-discontinuity markers. Preserve diagnostics and start a new timing segment. Currently does not recover native LJM read exceptions. Independent of counter verification.", validate="validateBoolean")
+    maxStreamRestartAttempts = Int(3, min=1, traitDisplayName="Restart attempts per occurrence", help="Maximum restart attempts for each discontinuity. Retries require confirmed stopped-stream ownership; unsafe failures stop sooner.", validate="validateScansPerRead")
+    streamRestartDelay = Float(0.05, min=0.0, traitDisplayName="Restart delay (seconds)", help="Delay before each restart attempt. A stop or close request cancels recovery.", validate="validateStreamRestartDelay")
+    verifyTriggerCounter = Bool(False, traitDisplayName="Verify trigger counter", help="Compare sampled rising edges against the hardware counter. Currently supported only for CIO1/rising. Unsupported source or rate configurations raise at acquisition startup. The driver reports deficits; the experiment estimates timestamps.", validate="validateBoolean")
+    repairMissingVolumeTriggers = Bool(True, traitDisplayName="Repair missing volume triggers", help="Let the experiment reconstruct counter-confirmed missing volume triggers using eligible measured intervals. Requires counter verification. Estimated events are marked and audited; stimulus timing and the start/ignore boundary are not changed retroactively.")
+    volumeTriggerMedianWindow = Int(10, min=1, contingentOn="repairMissingVolumeTriggers", traitDisplayName="Volume interval median window", help="Maximum number of recent eligible counter-verified measured intervals used by the experiment to estimate missing timestamps.")
+    volumeTriggerMinIntervals = Int(3, min=1,  contingentOn="repairMissingVolumeTriggers", traitDisplayName="Minimum verified volume intervals", help="Minimum eligible measured intervals required for reconstruction. Must not exceed the median window.")
 
     def getVolumeTriggerRepairConfig(self):
         """Return validated experiment-side repair options without mutation."""

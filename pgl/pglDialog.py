@@ -541,20 +541,26 @@ class _pglTraitsDialog(QDialog):
     # Widget factory per trait type
     #########################################
     def _addTraitWidget(self, traitName, trait, settingsObject=None, layout=None, settingsKey=None):
-        
+
         # settingsObject is the object that owns this trait.
         # Defaults to the root dialog settings object.
         if settingsObject is None:
             settingsObject = self.settings
         helpText = self._helpText(traitName, trait)
-        
-        # get the property to read (usualy just the traitName, but if property)
-        # is set there is another property that is used for the trait (like for lazy-loaded properties)
+
+        # Read the backing property when metadata specifies one.
         readName = trait.metadata.get("property", traitName)
         current = getattr(settingsObject, readName)
 
+        # Explicit ordered choices take precedence over ordinary editors.
+        if "stepValues" in trait.metadata:
+            self._addStepValues(
+                traitName, trait, current, helpText,
+                settingsObject, layout, settingsKey,
+            )
+
         # a tuple
-        if isinstance(trait, Tuple):
+        elif isinstance(trait, Tuple):
             self._addTuple(traitName, trait, current, helpText, settingsObject, layout, settingsKey)
 
         # a multi-select list (checkbox rows)
@@ -566,24 +572,31 @@ class _pglTraitsDialog(QDialog):
                 if trait.metadata.get("style") == "dropdown":
                     self._addMultiSelectDropdown(
                         traitName, trait, current, helpText,
-                        settingsObject, layout, settingsKey
+                        settingsObject, layout, settingsKey,
                     )
                 else:
                     self._addMultiSelectList(
                         traitName, trait, current, helpText,
-                        settingsObject, layout, settingsKey
+                        settingsObject, layout, settingsKey,
                     )
-                
+
         # a settings list
         elif isinstance(trait, List) and "settingsListKey" in trait.metadata:
             if not current:
                 # if empty list just move on
                 return
             else:
-                self._addSettingsList(traitName, trait, current, helpText, settingsObject, layout, settingsKey)        
-        
-        # Float with min and max -> slider + spinbox
-        elif isinstance(trait, Float) and trait.min is not None and not math.isinf(trait.max) and not math.isinf(trait.min):
+                self._addSettingsList(traitName, trait, current, helpText, settingsObject, layout, settingsKey)
+
+        # Float with finite min and max -> slider + spinbox.
+        # Check both bounds for None before calling math.isfinite().
+        elif (
+            isinstance(trait, Float)
+            and trait.min is not None
+            and trait.max is not None
+            and math.isfinite(trait.min)
+            and math.isfinite(trait.max)
+        ):
             self._addFloatRange(traitName, trait, current, helpText, settingsObject, layout, settingsKey)
 
         # Float (min only or unbounded)
@@ -601,7 +614,7 @@ class _pglTraitsDialog(QDialog):
         # RGB list
         elif isinstance(trait, List) and trait.metadata.get("isRGB", False):
             self._addRGB(traitName, trait, current, helpText, settingsObject, layout, settingsKey)
-            
+
         # Unicode with button, including path fields with an action
         elif isinstance(trait, Unicode) and trait.metadata.get("hasSetButton", False):
             self._addTextWithSetButton(traitName, trait, current, helpText, settingsObject, layout, settingsKey)
@@ -609,19 +622,19 @@ class _pglTraitsDialog(QDialog):
         # Unicode / Path
         elif isinstance(trait, Unicode):
             self._addText(traitName, trait, current, helpText, settingsObject, layout, settingsKey)
-            
+
         # List with a plot button
         elif isinstance(trait, List) and trait.metadata.get("hasPlotButton", False):
             self._addListWithPlotButton(traitName, trait, current, helpText, settingsObject, layout, settingsKey)
 
         # List -> dropdown
         elif isinstance(trait, List):
-            self._addList(traitName, trait, current, helpText, settingsObject, layout, settingsKey)        
+            self._addList(traitName, trait, current, helpText, settingsObject, layout, settingsKey)
 
         # Enum
         elif isinstance(trait, Enum):
-            self._addEnum(traitName, trait, current, helpText, settingsObject, layout, settingsKey)    
-            
+            self._addEnum(traitName, trait, current, helpText, settingsObject, layout, settingsKey)
+
         # Register optional Boolean dependencies after the widget exists.
         if trait.metadata.get("contingentOn"):
             key = settingsKey if settingsKey is not None else ("root",)
@@ -637,7 +650,211 @@ class _pglTraitsDialog(QDialog):
                     "traitName": traitName,
                     "widget": entry["row"],
                 })
-                self._refreshContingencies()    
+                self._refreshContingencies()
+                
+    
+    #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
+    # ----- Add step values -----
+    #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
+    def _addStepValues(self, traitName, trait, current, helpText,
+                       settingsObject, layout=None, settingsKey=None):
+        """
+        Add an ordered, discrete selector for Int, Float, or Unicode.
+
+        Metadata:
+            stepValues: nonempty list/tuple of distinct values.
+
+        -/+ move one position without wrapping.
+        --/++ select the first/last position.
+        Ordering comes from metadata, not numeric or alphabetical sorting.
+
+        An existing value outside stepValues is displayed without changing
+        the model. From that state, + selects first and - selects last.
+        Endpoint buttons always select their corresponding endpoints.
+
+        Metadata restricts GUI choices, not programmatic trait assignments.
+        Ordinary trait/property validation still runs through _commit().
+        """
+        if not isinstance(trait, (Int, Float, Unicode)):
+            raise TypeError(
+                f"{traitName}: stepValues currently supports Int, Float, "
+                "and Unicode traits."
+            )
+
+        rawValues = trait.metadata["stepValues"]
+        if not isinstance(rawValues, (list, tuple)) or not rawValues:
+            raise ValueError(
+                f"{traitName}: stepValues must be a nonempty list or tuple."
+            )
+
+        values = []
+
+        for value in rawValues:
+            # Reject accidental booleans and lossy integer conversions.
+            if isinstance(trait, Int):
+                if type(value) is not int:
+                    raise TypeError(
+                        f"{traitName}: Int stepValues must contain Python ints."
+                    )
+
+            elif isinstance(trait, Float):
+                if type(value) not in (int, float):
+                    raise TypeError(
+                        f"{traitName}: Float stepValues must contain numbers."
+                    )
+                try:
+                    value = float(value)
+                except (OverflowError, ValueError) as error:
+                    raise ValueError(
+                        f"{traitName}: stepValues contains an invalid float."
+                    ) from error
+                if not math.isfinite(value):
+                    raise ValueError(
+                        f"{traitName}: Float stepValues must be finite."
+                    )
+
+            else:
+                if not isinstance(value, str):
+                    raise TypeError(
+                        f"{traitName}: Unicode stepValues must contain strings."
+                    )
+
+            # Check declared numeric bounds without assigning to the owner.
+            # Custom validators and property setters run only on user edits.
+            if isinstance(trait, (Int, Float)):
+                minimum = getattr(trait, "min", None)
+                maximum = getattr(trait, "max", None)
+                if minimum is not None and value < minimum:
+                    raise ValueError(
+                        f"{traitName}: step value {value!r} is below min."
+                    )
+                if maximum is not None and value > maximum:
+                    raise ValueError(
+                        f"{traitName}: step value {value!r} is above max."
+                    )
+
+            if value in values:
+                raise ValueError(
+                    f"{traitName}: stepValues contains duplicate value {value!r}."
+                )
+            values.append(value)
+
+        # Keep a private, stable sequence; never reorder trait metadata.
+        values = tuple(values)
+        readName = trait.metadata.get("property", traitName)
+
+        row = QWidget()
+        row.setToolTip(helpText)
+
+        rowLayout = QHBoxLayout(row)
+        rowLayout.setContentsMargins(0, 0, 0, 0)
+        rowLayout.setSpacing(6)
+
+        edit = QLineEdit()
+        edit.setObjectName("stepValueDisplay")
+        edit.setReadOnly(True)
+        edit.setAlignment(Qt.AlignCenter)
+
+        buttons = {}
+        buttonDefinitions = (
+            ("first", "--", "First value"),
+            ("previous", "-", "Previous value"),
+            ("next", "+", "Next value"),
+            ("last", "++", "Last value"),
+        )
+
+        for action, label, tooltip in buttonDefinitions:
+            button = QPushButton(label)
+            button.setObjectName(f"stepValues{action.capitalize()}")
+            button.setToolTip(tooltip)
+            button.setAutoDefault(False)
+            button.setDefault(False)
+
+            # Override the dialog's ordinary 84px button minimum.
+            button.setStyleSheet(
+                "QPushButton { min-width: 28px; max-width: 28px; "
+                "padding: 2px 4px; }"
+            )
+            button.setFixedWidth(40)
+
+            if action in ("previous", "next"):
+                button.setAutoRepeat(True)
+                button.setAutoRepeatDelay(300)
+                button.setAutoRepeatInterval(100)
+
+            buttons[action] = button
+
+        rowLayout.addWidget(buttons["first"])
+        rowLayout.addWidget(buttons["previous"])
+        rowLayout.addWidget(edit, 1)
+        rowLayout.addWidget(buttons["next"])
+        rowLayout.addWidget(buttons["last"])
+
+        def valueIndex(value):
+            try:
+                return values.index(value)
+            except ValueError:
+                return -1
+
+        def setter(value):
+            """Refresh without committing, including during proxy retargeting."""
+            index = valueIndex(value)
+            wasBlocked = edit.blockSignals(True)
+            try:
+                edit.setText(str(value))
+            finally:
+                edit.blockSignals(wasBlocked)
+
+            tooltip = helpText
+            if index < 0:
+                note = (
+                    "Current value is not in stepValues. "
+                    "+ selects the first value; - selects the last value."
+                )
+                tooltip = f"{helpText}\n\n{note}" if helpText else note
+            edit.setToolTip(tooltip)
+
+            # Child states remain independent of the row's enabled state,
+            # so enable()/contingentOn still apply to the whole control.
+            buttons["first"].setEnabled(index != 0)
+            buttons["previous"].setEnabled(index != 0)
+            buttons["next"].setEnabled(index != len(values) - 1)
+            buttons["last"].setEnabled(index != len(values) - 1)
+
+        def onAction(action, checked=False):
+            if self._updatingWidget: return
+
+            # Resolve the current model through the proxy at click time.
+            # Do not capture the original profile or rely on stale text.
+            actual = getattr(settingsObject, readName)
+            index = valueIndex(actual)
+
+            if action == "first":
+                targetIndex = 0
+            elif action == "last":
+                targetIndex = len(values) - 1
+            elif action == "previous":
+                targetIndex = len(values) - 1 if index < 0 else max(0, index - 1)
+            else:
+                targetIndex = 0 if index < 0 else min(len(values) - 1, index + 1)
+
+            try:
+                if index != targetIndex:
+                    self._commit(settingsObject, traitName, values[targetIndex])
+            finally:
+                # _commit() catches rejected assignments. Read back the model
+                # so rejection or validator normalization cannot leave a
+                # misleading value displayed.
+                setter(getattr(settingsObject, readName))
+
+        for action, button in buttons.items():
+            button.clicked.connect(partial(onAction, action))
+
+        setter(current)
+        self._register(
+            traitName, trait, row, setter, layout, settingsKey,
+        )
+        
     #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
     # ----- Multi-select list -----
     #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
