@@ -41,29 +41,84 @@ class pglKeyboardMouse(pglDevice):
         self.start(eatKeys)
 
     def start(self, eatKeys=None):
-        '''
-        Start the keyboard listener.
-        '''
+        """Start keyboard capture and optionally configure selective suppression."""
         if self.isRunning(): return
-        pglMessages.message(f"Starting keyboard and mouse event listener.")
-        
-        # start the listener
-        self.listener = pglEventListener()
+        pglMessages.message("Starting keyboard and mouse event listener.")
+
+        # Retain this listener across restarts so pending events are not
+        # silently discarded by replacing its queue.
+        if not hasattr(self, "listener"):
+            self.listener = pglEventListener()
+
         self.listener.start()
-        
-        # if eatKeys are passed in, set them
-        if eatKeys is not None:
-            self.eatKeyCodes = self.listener.setEatKeys(keyString=eatKeys)
-        else:
+
+        try:
             self.eatKeyCodes = []
-    
-    def stop(self):
-        '''
-        Stop the keyboard listener.
-        '''
-        if self.isRunning(): 
+            self.setEatAllKeys(False)
+
+            if eatKeys is None:
+                self.setEatKeys(keyCodes=[])
+            elif isinstance(eatKeys, str):
+                # Named keys should be supplied as list entries.
+                # A single string here is treated as one key name.
+                self.setEatKeys(keyChars=[eatKeys])
+            else:
+                requestedKeys = list(eatKeys)
+                if all(isinstance(key, str) for key in requestedKeys):
+                    self.setEatKeys(keyChars=requestedKeys)
+                else:
+                    self.setEatKeys(keyCodes=requestedKeys)
+
+        except Exception:
             self.listener.stop()
-        pglMessages.message(f"Stopping keyboard listener.")
+            raise
+
+    def stop(self):
+        """Stop owned capture while retaining pending events for a final poll."""
+        listener = getattr(self, "listener", None)
+        if listener is not None: listener.stop()
+        self.eatKeyCodes = []
+        pglMessages.message("Stopping keyboard listener.")
+
+    def poll(self):
+        """Drain captured keyboard events, including after emergency shutdown."""
+        listener = getattr(self, "listener", None)
+        if listener is None: return []
+
+        eventList = []
+        keyEvents = listener.getAllKeyboardEvents()
+
+        for keyEvent in keyEvents:
+            timestamp = keyEvent["timestamp"]
+            keyCode = keyEvent["keyCode"]
+            eventType = keyEvent["eventType"]
+
+            # Normalize numeric-keypad digits to top-row digit key codes.
+            keyCode = {
+                82: 29, 83: 18, 84: 19, 85: 20, 86: 21,
+                87: 23, 88: 22, 89: 26, 91: 28, 92: 25,
+            }.get(keyCode, keyCode)
+
+            shift = keyEvent.get("shift", False)
+            ctrl = keyEvent.get("control", False)
+            alt = keyEvent.get("alt", False)
+            cmd = keyEvent.get("command", False)
+
+            keyChar = keyCodeToChar(keyCode, shift)
+
+            eventList.append(pglEventKeyboard(
+                keyChar=keyChar,
+                keyCode=keyCode,
+                key=keyEvent,
+                eventType=eventType,
+                timestamp=timestamp,
+                shift=shift,
+                ctrl=ctrl,
+                alt=alt,
+                cmd=cmd,
+            ))
+
+        return eventList
         
     def checkAccessibilityPermission(self):
         """
@@ -127,52 +182,6 @@ class pglKeyboardMouse(pglDevice):
         if self.isRunning():
             self.listener.clearQueues()
 
-    def poll(self): 
-        '''
-        Poll the key queue for events.
-        '''
-        eventList = []
-        if not self.isRunning(): return eventList
-
-        # get all keyEvents from listener
-        keyEvents = self.listener.getAllKeyboardEvents()
-        
-        # extract fields from keyEvents
-        for keyEvent in keyEvents:
-            # Extract fields from event dictionary
-            timestamp = keyEvent['timestamp']
-            keyCode = keyEvent['keyCode']
-            eventType = keyEvent['eventType']
-
-            # Normalize numeric-keypad digits to top-row digit key codes.
-            keyCode = {
-                82: 29, 83: 18, 84: 19, 85: 20, 86: 21,
-                87: 23, 88: 22, 89: 26, 91: 28, 92: 25
-            }.get(keyCode, keyCode)
-
-            # Extract modifier keys
-            shift = keyEvent.get('shift', False)
-            ctrl = keyEvent.get('control', False)
-            alt = keyEvent.get('alt', False)
-            cmd = keyEvent.get('command', False)
-            
-            # Convert keycode to character (if possible)
-            keyChar = keyCodeToChar(keyCode, shift)
-            
-            # Create event object
-            eventList.append(pglEventKeyboard(
-                keyChar=keyChar,
-                keyCode=keyCode,
-                key=keyEvent,
-                eventType=eventType,
-                timestamp=timestamp,
-                shift=shift,
-                ctrl=ctrl,
-                alt=alt,
-                cmd=cmd
-            ))
-
-        return eventList
     
     def setEatKeys(self, keyCodes=None, keyChars=None):
         '''
@@ -243,6 +252,43 @@ class pglKeyboardMouse(pglDevice):
         Convert a key code to a character using the keyCodeToChar function.
         '''
         return keyCodeToChar(keyCode, shift)
+    
+    @staticmethod
+    def parseKeyNames(value):
+        """
+        Parse a compact key string or comma-separated key names.
+
+        Examples:
+            "asdf"              -> ["a", "s", "d", "f"]
+            "a,s,d,f,escape"     -> ["a", "s", "d", "f", "escape"]
+            "left"              -> ["left"]
+            "f1"                -> ["f1"]
+            ""                  -> []
+
+        Recognized whole-key names take precedence over character splitting.
+        Preserves order and duplicates; callers decide whether to deduplicate.
+        Does not start a listener or change suppression.
+        """
+        if not isinstance(value, str):
+            raise TypeError("Key specification must be a string")
+
+        text = value.strip()
+        if not text: return []
+
+        if "," in text:
+            keyNames = [key.strip() for key in text.split(",")]
+            if any(not key for key in keyNames):
+                raise ValueError("Comma-separated keys must not contain empty entries")
+        elif charToKeyCode(text) is not None:
+            keyNames = [text]
+        else:
+            keyNames = list(text)
+
+        for keyName in keyNames:
+            if charToKeyCode(keyName) is None:
+                raise ValueError(f"Unknown key: {keyName!r}. Use 'space' for the spacebar.")
+
+        return keyNames
         
 
 #############################

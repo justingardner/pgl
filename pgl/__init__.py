@@ -111,6 +111,8 @@ _EXPORTS = {
  'pglExternalTool': ('.pglExternalTools', 'pglExternalTool'),
  'pglMATLAB': ('.pglExternalTools', 'pglMATLAB'),
  'pglGLMsingle': ('.pglExternalTools', 'pglGLMsingle'),
+ 'pglLabJackSettings': ('.pglSettings', 'pglLabJackSettings'),
+ 'pglLabJackSettingsList': ('.pglSettings', 'pglLabJackSettingsList'),
 }
 
 _resolved_exports = {}

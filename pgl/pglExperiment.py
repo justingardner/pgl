@@ -1118,10 +1118,8 @@ class pglExperiment(pglExperimentBase):
 
             # A comma-separated response list supports keys such as space/F1.
             # Without commas, each character specifies a response key.
-            if ',' in self.settings.responseKeys:
-                self.responseKeysList = [k.strip() for k in self.settings.responseKeys.split(',')]
-            else:
-                self.responseKeysList = list(self.settings.responseKeys)
+            # Share compact-character / named-key syntax with special eat keys.
+            self.responseKeysList = keyboardMouse.parseKeyNames(self.settings.responseKeys)
 
             # Empty or None control keys are disabled.
             def getControlKeyCode(key, settingName):
@@ -1140,13 +1138,9 @@ class pglExperiment(pglExperimentBase):
             if self.settings.manualPreStart and self.state.startKeyCode is None:
                 raise ValueError("manualPreStart requires a startKey.")
             
-            # If eatKeys is set, include only configured keys.
-            if self.settings.eatKeys:
-                eatKeyCodes = self.state.responseKeyCodesList.copy()
-                for keyCode in (self.state.startKeyCode, self.state.endKeyCode, self.state.volumeTriggerKeyCode):
-                    if keyCode is not None: eatKeyCodes.append(keyCode)
-                keyboardMouse.setEatKeys(eatKeyCodes)
-
+            # Apply Experiment, Special, and All; clear unchecked modes.
+            self._configureKeyboardSuppression()
+            
             # Wait half a second for the Metal app to initialize.
             self.pgl.waitSecs(0.5)
 
@@ -1354,8 +1348,9 @@ class pglExperiment(pglExperimentBase):
     # Run with protected saving and finalization
     ################################################################
     def run(self):
-        """Run acquisition, save partial data on failure, and preserve its error."""
-        # Never operate on an incompletely initialized experiment.
+        """Run using the startup repair snapshot; preserve partial saving."""
+        from copy import deepcopy
+
         if not getattr(self, "isInitialized", False):
             pglMessages.warning(
                 "Experiment initialization did not complete. "
@@ -1363,19 +1358,24 @@ class pglExperiment(pglExperimentBase):
             )
             return
 
-        
         if getattr(self, "_recordingReleased", False):
-            raise RuntimeError("This experiment's recording was already saved and released. Create a new experiment.")
+            raise RuntimeError(
+                "This experiment's recording was already saved and released. "
+                "Create a new experiment."
+            )
 
         if not self.state.openScreen:
             self.state.runFinishedWithError = True
-            pglMessages.warning("Screen is not open. Call initScreen() before running the experiment.")
+            pglMessages.warning(
+                "Screen is not open. Call initScreen() before running the experiment."
+            )
             return
 
         if getattr(self, "_runStarted", False):
-            raise RuntimeError("This experiment has already run. Create a new experiment for another run.")
+            raise RuntimeError(
+                "This experiment has already run. Create a new experiment for another run."
+            )
 
-        # Verify ownership before running or cleaning up anything.
         metadata = self._getExperimentRecording()
         if metadata is not None and self.pgl._recordingState != "active":
             raise RuntimeError("The experiment recording is already stopped.")
@@ -1388,38 +1388,67 @@ class pglExperiment(pglExperimentBase):
 
         self.data.saveStatus = "notAttempted"
         self.data.cleanupStatus = "notAttempted"
-        self.data.eyeTrackerSaveStatus = "notAttempted" if self.eyeTracker is not None else "notApplicable"
+        self.data.eyeTrackerSaveStatus = (
+            "notAttempted" if self.eyeTracker is not None else "notApplicable"
+        )
         self.state.runFinishedWithError = True
         self._recordingOutcome = "error"
 
         try:
-            self._run()
+            acquisitionConfig = getattr(self, "_labJackTriggerConfig", None)
+            if acquisitionConfig is None:
+                repairConfig = {"repairMissingVolumeTriggers": False}
+                requestedRepairConfig = None
+            else:
+                snapshot = getattr(self, "_labJackRepairConfig", None)
+                if snapshot is None:
+                    raise RuntimeError(
+                        "LabJack acquisition has no repair-policy snapshot. "
+                        "Initialize a new experiment with the updated initDevices()."
+                    )
+
+                requestedRepairConfig = deepcopy(snapshot)
+                repairConfig = deepcopy(snapshot)
+
+                # Preserve the user's request, but repair cannot operate
+                # without counter verification.
+                repairConfig["repairMissingVolumeTriggers"] = (
+                    repairConfig["repairMissingVolumeTriggers"]
+                    and acquisitionConfig["verifyTriggerCounter"]
+                )
+
+            self.data.volumeTriggerRepairRequested = requestedRepairConfig
+            self._run(**repairConfig)
 
         except (Exception, KeyboardInterrupt, SystemExit) as error:
-            # Preserve unfinished tasks; do not invoke task-ending hooks or
-            # renderer commands before emergency saving.
             self.state.runFinishedWithError = True
-            self._recordingOutcome = "interrupted" if isinstance(error, (KeyboardInterrupt, SystemExit)) else "error"
+            self._recordingOutcome = (
+                "interrupted"
+                if isinstance(error, (KeyboardInterrupt, SystemExit))
+                else "error"
+            )
             self._recordRunError("acquisition", error)
 
             errors = []
-            self._attemptRunAction("record experiment end time", lambda: setattr(self.data, "endTime", self.pgl.getSecs()), errors)
+            self._attemptRunAction(
+                "record experiment end time",
+                lambda: setattr(self.data, "endTime", self.pgl.getSecs()),
+                errors,
+            )
 
             try:
                 self._finalizeRun()
             except (Exception, KeyboardInterrupt, SystemExit) as finalizationError:
                 try:
-                    pglMessages.warning(f"Additional finalization failure: {type(finalizationError).__name__}: {finalizationError}")
+                    pglMessages.warning(
+                        f"Additional finalization failure: "
+                        f"{type(finalizationError).__name__}: {finalizationError}"
+                    )
                 except Exception:
                     pass
-
-            # Preserve the original acquisition exception and traceback.
             raise
 
         else:
-            # "completed" means acquisition returned normally. Existing aborted-
-            # run heuristics remain responsible for trash routing; an end-key
-            # exit is not classified as a Python error.
             self.state.runFinishedWithError = False
             self._recordingOutcome = "completed"
             self._finalizeRun()
@@ -1684,62 +1713,84 @@ class pglExperiment(pglExperimentBase):
         if errors:
             raise errors[0]
     
-    def _run(self):
-        '''
-        Execute the experiment.
+    def _run(
+        self, *,
+        repairMissingVolumeTriggers=True,
+        volumeTriggerMedianWindow=10,
+        volumeTriggerMinIntervals=3,
+    ):
+        """
+        Run the experiment, consuming counter evidence and bounded repairs.
 
-        The public run() method handles saving, exception recovery, and cleanup.
-        No final screen-clear/flush is performed before returning to that save
-        path. Task-ending hooks still run during acquisition so their finalized
-        data can be included in the save.
+        Source events are retained before processing. Counter diagnostics are
+        processed in their delivery order; they are not mistaken for physical
+        triggers at their notification timestamps.
 
-        Keyboard and configured digital edges share scanner-trigger handling.
-        Every accepted trigger in a poll is counted.
-        '''
-        # Default to error; the public wrapper marks successful acquisition.
+        Late repairs cannot retroactively change the start/ignore boundary.
+        """
+        from numbers import Integral
+
+        if type(repairMissingVolumeTriggers) is not bool:
+            raise TypeError("repairMissingVolumeTriggers must be Boolean.")
+        for name, value in (
+            ("volumeTriggerMedianWindow", volumeTriggerMedianWindow),
+            ("volumeTriggerMinIntervals", volumeTriggerMinIntervals),
+        ):
+            if (
+                isinstance(value, (bool, np.bool_))
+                or not isinstance(value, Integral)
+                or value < 1
+            ):
+                raise ValueError(f"{name} must be a positive integer.")
+        if volumeTriggerMinIntervals > volumeTriggerMedianWindow:
+            raise ValueError("Minimum interval history cannot exceed its window.")
+
         self.state.runFinishedWithError = True
-
         if not self.state.openScreen:
-            pglMessages.warning("Screen is not open. Call initScreen() before running the experiment.")
+            pglMessages.warning("Screen is not open. Call initScreen() first.")
             return
 
-        # Start eye tracker recording if we have an eye tracker.
+        self._volumeRepairRuntime = {
+            "enabled": repairMissingVolumeTriggers,
+            "medianWindow": int(volumeTriggerMedianWindow),
+            "minIntervals": int(volumeTriggerMinIntervals),
+            "lastTrustedAnchor": None,
+            "handledMismatchIds": set(),
+            "acceptanceBoundary": None,
+        }
+        if not hasattr(self.data, "volumeTriggerRepairAudit"):
+            self.data.volumeTriggerRepairAudit = []
+        self.data.volumeTriggerRepairConfiguration = {
+            "enabled": repairMissingVolumeTriggers,
+            "medianWindow": int(volumeTriggerMedianWindow),
+            "minIntervals": int(volumeTriggerMinIntervals),
+            "preStartPolicy": "doNotRetroactivelyChangeAcceptanceBoundary",
+        }
+
         if self.eyeTracker is not None: self.eyeTracker.start()
 
-        # Calculate the distinct phases that we will need to cover.
         self.state.phaseNums = sorted({
-            task.settings.phaseNum
-            for task in self.tasks
+            task.settings.phaseNum for task in self.tasks
             if task.settings.phaseNum is not None
         }) or None
         self.state.currentPhaseIndex = 0
-
-        # Initialize variables.
         self.state.experimentDone = False
         self.state.experimentStarted = False
         self.state.volumeNumber = 0
 
-        # Manual pre-start waits for the start key before scanner synchronization.
         manualPreStart = bool(self.settings.manualPreStart)
         manualPreStartVolumes = 0
         ignoreInitialVolumes = self.settings.ignoreInitialVolumes
 
-        # See whether we need to run eye calibration.
         if self.settings.eyetracker is not None: self.calibrateEyeTracker()
-
-        # Check again because acquisition may have failed during task setup
-        # or eye calibration after initScreen() completed.
         self._validateVolumeTriggerSource()
 
-        # Retain, but do not count, digital events already queued before the
-        # experiment's start gate. Do not discard pending keyboard events.
-        #
-        # This drains the software event queue, not the device/LJM buffers.
-        # A later-delivered event can still describe an earlier physical edge.
-        for device in getattr(self, "_experimentInputDevices", []):
-            self.data.events.extend(device.poll())
+        diagnosticTypes = {
+            "digitalInputCounterWindow",
+            "digitalInputMismatch",
+            "digitalInputRecovery",
+        }
 
-        # Disabled keys must not accidentally match an event with keyCode=None.
         def matchesKey(event, keyCode, keydownOnly=False):
             return (
                 keyCode is not None
@@ -1748,24 +1799,35 @@ class pglExperiment(pglExperimentBase):
                 and (not keydownOnly or event.eventType == "keydown")
             )
 
-        def pollEvents():
-            # PGL collects devices in registration order. Sort timestamped
-            # events within this poll while retaining every original event.
-            #
-            # Digital timestamps are estimated, and sorting one batch cannot
-            # guarantee global ordering across delayed deliveries.
+        def retainPolledEvents():
             events = list(self.pgl.poll())
-
-            def eventTime(event):
-                timestamp = getattr(event, "timestamp", None)
-                return timestamp if timestamp is not None else float("inf")
-
-            events.sort(key=eventTime)
             self.data.events.extend(events)
             return events
 
+        def acceptMeasured(event):
+            self._recordVolumeTrigger(event)
+            # Once established, do not move this boundary backward on a
+            # late delivery or reconstructed timestamp.
+            if self._volumeRepairRuntime["acceptanceBoundary"] is None:
+                self._volumeRepairRuntime["acceptanceBoundary"] = event.timestamp
+
+        def processDiagnostics(events):
+            for event in events:
+                if event.type in diagnosticTypes:
+                    self._consumeVolumeCounterDiagnostic(event)
+
+        # Calibration may already have polled and retained counter evidence.
+        # Process it without accepting pre-gate scanner volumes.
+        processDiagnostics(list(self.data.events))
+
+        # Drain queued input events before establishing the run's start gate.
+        for device in getattr(self, "_experimentInputDevices", []):
+            pending = list(device.poll())
+            self.data.events.extend(pending)
+            processDiagnostics(pending)
+
         ################################################################
-        # Wait for a start key or scanner trigger when configured
+        # Wait for manual/start-on-volume gates.
         ################################################################
         if self.state.startKeyCode is not None or self.settings.startOnVolumeTrigger:
             while not self.state.experimentStarted:
@@ -1775,12 +1837,11 @@ class pglExperiment(pglExperimentBase):
                         y=0,
                     )
                 elif self.settings.startOnVolumeTrigger:
-                    if self.settings.startScreen[0] == "blank":
+                    screen = self.settings.startScreen[0]
+                    if screen in ("blank", "fixation cross"):
                         self.pgl.clearScreen(self.settings.backgroundColor)
-                    elif self.settings.startScreen[0] == "fixation cross":
-                        self.pgl.clearScreen(self.settings.backgroundColor)
-                        self.pgl.fixationCross()
-                    elif self.settings.startScreen[0] == "waiting message":
+                        if screen == "fixation cross": self.pgl.fixationCross()
+                    elif screen == "waiting message":
                         self.pgl.text("Waiting for volume trigger to start experiment", y=0)
                 else:
                     self.pgl.text(
@@ -1788,30 +1849,37 @@ class pglExperiment(pglExperimentBase):
                         y=0,
                     )
 
-                # Flush to display text, then poll for events.
                 self.pgl.flush()
-                events = pollEvents()
+                events = retainPolledEvents()
 
-                # Preserve pre-start abort priority: do not start tasks when
-                # the end key is present in the same poll as a start event.
                 if any(matchesKey(event, self.state.endKeyCode) for event in events):
                     self.state.experimentStarted = True
                     self.state.experimentDone = True
+                    processDiagnostics(events)
                     break
 
-                # Process start keys and scanner triggers in timestamp order
-                # within this batch. Do not drop additional triggers after
-                # the first one opens the start gate.
-                for event in events:
+                # Preserve ordering of physical controls within this poll.
+                # Diagnostics are subsequently consumed in their original
+                # order, so their counter history is never timestamp-sorted.
+                controls = [
+                    event for event in events if event.type not in diagnosticTypes
+                ]
+                controls.sort(key=lambda event: (
+                    event.timestamp
+                    if getattr(event, "timestamp", None) is not None
+                    else float("inf")
+                ))
+
+                for event in controls:
                     if matchesKey(event, self.state.startKeyCode, keydownOnly=True):
                         if manualPreStart:
                             manualPreStart = False
                             pglMessages.message(
-                                f"Manual pre-start ended after {manualPreStartVolumes} volumes.",
-                                messageType='experiment',
+                                f"Manual pre-start ended after "
+                                f"{manualPreStartVolumes} volumes.",
+                                messageType="experiment",
                             )
                         else:
-                            # Preserve the existing start-key override.
                             self.state.experimentStarted = True
 
                     if not self.settings.startOnVolumeTrigger: continue
@@ -1825,23 +1893,17 @@ class pglExperiment(pglExperimentBase):
                         if not self.state.experimentStarted:
                             pglMessages.message(
                                 f"Ignored {self.settings.ignoreInitialVolumes} initial volumes.",
-                                messageType='experiment',
+                                messageType="experiment",
                             )
-
                         self.state.experimentStarted = True
-                        self._recordVolumeTrigger(event)
+                        acceptMeasured(event)
+
+                processDiagnostics(events)
 
         else:
-            # No start gate: begin immediately.
             self.state.experimentStarted = True
 
-        ################################################################
-        # Save a pre-start abort without another renderer exchange
-        ################################################################
         if self.state.experimentDone:
-            # An abort at the waiting screen must not start tasks.
-            # Do not clear/flush here: renderer communication could block
-            # before the public run() wrapper gets a chance to save.
             self.data.endTime = self.pgl.getSecs()
             self._reportRunProgress(
                 "Experiment ended before tasks started; proceeding to save."
@@ -1849,46 +1911,45 @@ class pglExperiment(pglExperimentBase):
             return
 
         ################################################################
-        # Start acquisition
+        # Start tasks. Repairs never backdate this transition.
         ################################################################
-
-        # Start the experiment before invoking task start hooks, so a failure
-        # in a start hook still has an experiment start timestamp.
-        pglMessages.message("Experiment started.", messageType='experiment')
+        pglMessages.message("Experiment started.", messageType="experiment")
         self.data.startTime = self.pgl.getSecs()
         self.data.startDateTime = datetime.now().astimezone().isoformat()
 
+        # A manual/immediate start has an explicit host-clock boundary.
+        if self._volumeRepairRuntime["acceptanceBoundary"] is None:
+            self._volumeRepairRuntime["acceptanceBoundary"] = self.data.startTime
+
         if not self.state.phaseNums:
             raise ValueError("Experiment needs at least one task with a phaseNum.")
-
         self.startPhase(phaseNum=self.state.phaseNums[0])
 
         while not self.state.experimentDone:
-            # Poll for events.
-            events = pollEvents()
+            events = retainPolledEvents()
 
-            # End all running tasks when the configured end key is received.
-            # Task-ending hooks may finalize data, so retain them before saving.
             if any(matchesKey(event, self.state.endKeyCode) for event in events):
                 self.state.experimentDone = True
+                processDiagnostics(events)
                 for task in self.currentTasks: task.end()
                 continue
 
-            # Count every scanner trigger, not only the first in this poll.
-            # Source events are already retained in experiment data. Remove
-            # accepted triggers only from response/task-event processing.
             taskEvents = []
             for event in events:
+                if event.type in diagnosticTypes:
+                    continue
                 if self._isVolumeTrigger(event):
-                    self._recordVolumeTrigger(event)
+                    acceptMeasured(event)
                 else:
                     taskEvents.append(event)
-            events = taskEvents
 
-            # Match response keys and preserve their original event timestamps.
+            # Source edges from this poll are already retained and counted.
+            # Late repair placement therefore checks against all of them.
+            processDiagnostics(events)
+
             subjectResponses = [
                 (self.state.responseKeyCodesList.index(event.keyCode), event.timestamp)
-                for event in events
+                for event in taskEvents
                 if (
                     event.type == "keyboard"
                     and event.eventType == "keydown"
@@ -1896,27 +1957,22 @@ class pglExperiment(pglExperimentBase):
                 )
             ]
 
-            # Update tasks in the current phase.
             phaseDone = False
             updateTime = self.pgl.getSecs()
-
             for task in self.currentTasks:
                 task.update(
                     updateTime=updateTime,
                     subjectResponses=subjectResponses,
                     phaseNum=self.state.phaseNum,
                     tasks=self.currentTasks,
-                    events=events,
+                    events=taskEvents,
                 )
                 if task.done(): phaseDone = True
 
-            # Preserve normal acquisition presentation timing.
             if self.flush: self.pgl.flush()
 
-            # Go to the next phase or end the experiment.
             if phaseDone:
                 for task in self.currentTasks: task.end()
-
                 if self.state.currentPhaseIndex >= len(self.state.phaseNums) - 1:
                     self.state.experimentDone = True
                 else:
@@ -1925,33 +1981,19 @@ class pglExperiment(pglExperimentBase):
                         phaseNum=self.state.phaseNums[self.state.currentPhaseIndex]
                     )
 
-        ################################################################
-        # Return directly to saving without a final renderer exchange
-        ################################################################
-
-        # Record acquisition end before saving or device cleanup.
-        # Do not clear/flush the screen here. The public run() wrapper calls
-        # _finalizeRun(), which attempts local saving before screen cleanup.
         self.data.endTime = self.pgl.getSecs()
-        #self._reportRunProgress(
-        #    "Acquisition ended; proceeding to save before screen/device cleanup."
-        #)
     
     def initDigitalIO(self):
         """
-        Initialize experiment-owned digital hardware.
+        Initialize experiment-owned digital hardware once per physical role.
 
-        A LabJack selected for input, output, or both is opened exactly once.
-        Input-only LabJacks also live in digitalIODevices for shared ownership;
-        opening a device does not configure any output pins.
+        LabJack output and LabJack digital trigger share one connection.
+        Opening an input-only device does not configure output pins.
         """
         from .pglLabJack import pglLabJack
 
-        # End existing experiment-owned hardware before replacing its references.
-        # This also stops and unregisters any input reader sharing that hardware.
         self.endDigitalIO()
 
-        # Clear any existing configuration.
         self.state.digitalIODevices = []
         self.state.triggerWords = {}
         self.state.triggers = {}
@@ -1959,35 +2001,35 @@ class pglExperiment(pglExperimentBase):
         self.settings.digitalIOChannels = []
         self._experimentInputDevices = []
 
-        outputNames = list(self.settings.digitalIO)
-        inputNames = {name.casefold() for name in self.settings.devices}
-        needsLabJackInput = "labjack digital trigger" in inputNames
+        selectedNames = list(self.settings.digitalIO)
+        needsLabJackInput = any(
+            name.casefold() == "labjack digital trigger"
+            for name in selectedNames
+        )
 
-        # Preserve output-device ordering. Append input-only hardware afterward.
-        requestedNames = list(outputNames)
-        if needsLabJackInput and not any(name.casefold() == "labjack" for name in requestedNames):
-            requestedNames.append("LabJack")
+        # Validate the requested input configuration before opening hardware.
+        if needsLabJackInput: self.settings.getLabJackPreset()
 
-        initializedNames = set()
+        requestedNames = []
+        for name in selectedNames:
+            hardwareName = "LabJack" if name.casefold() == "labjack digital trigger" else name
+            if not any(existing.casefold() == hardwareName.casefold() for existing in requestedNames):
+                requestedNames.append(hardwareName)
 
         for deviceName in requestedNames:
             normalizedName = deviceName.casefold()
-            if normalizedName in initializedNames: continue
-            initializedNames.add(normalizedName)
 
             if normalizedName == "labjack":
-                # Do not silently open a second connection alongside a separately
-                # registered LabJack whose lifetime this experiment does not own.
                 existingDevices = self.pgl.devicesGet(pglLabJack)
                 if any(device.isActive for device in existingDevices):
                     raise RuntimeError(
                         "A LabJack is already registered outside this experiment. "
-                        "Stop, close, and unregister it before initializing the experiment."
+                        "Stop, close, and unregister it before initialization."
                     )
 
                 labJack = pglLabJack()
 
-                # Keep ownership immediately so initialization recovery can close it.
+                # Retain ownership immediately for initialization recovery.
                 if labJack.isActive:
                     self.state.digitalIODevices.append(labJack)
                     pglMessages.message("LabJack initialized")
@@ -1997,7 +2039,6 @@ class pglExperiment(pglExperimentBase):
                     pglMessages.message("LabJack did not initialize")
 
             elif normalizedName == "datapixx":
-                # Try to initialize the selected digital output device.
                 from .pglVPixx import pglDataPixx
                 dataPixx = pglDataPixx()
 
@@ -2008,7 +2049,7 @@ class pglExperiment(pglExperimentBase):
                     pglMessages.message("DataPixx did not initialize")
 
             else:
-                pglMessages.warning(f"Unknown digitalIO device: {deviceName}") 
+                pglMessages.warning(f"Unknown digitalIO device: {deviceName}")
         
 
     def getDigitalIODevice(self, digitalIODevice = None):
@@ -2312,81 +2353,120 @@ class pglExperiment(pglExperimentBase):
         return True
             
     def initDevices(self):
-        """
-        Start selected experiment inputs and register them for normal polling.
-
-        LabJack input reuses the instance owned by initDigitalIO().
-        No additional hardware connection is opened here.
-        """
+        """Snapshot LabJack acquisition and experiment repair policy together."""
+        from copy import deepcopy
         from .pglLabJack import pglLabJack
 
-        # Stop any previous input acquisition without closing shared hardware.
         self.endDevices()
         self._experimentInputDevices = []
-
-        selectedNames = {name.casefold() for name in self.settings.devices}
+        self._labJackTriggerConfig = None
+        self._labJackAcquisitionId = None
+        self._labJackRepairConfig = None
 
         for deviceName in self.settings.devices:
-            if deviceName.casefold() != "labjack digital trigger":
-                pglMessages.warning(f"Input device is not implemented yet: {deviceName}", level=1)
+            pglMessages.warning(
+                f"Input device is not implemented yet: {deviceName}", level=1,
+            )
 
+        selectedNames = {name.casefold() for name in self.settings.digitalIO}
         if "labjack digital trigger" not in selectedNames: return
+
+        preset = self.settings.getLabJackPreset()
+        config = preset.getDigitalReadConfig()
+        repairConfig = preset.getVolumeTriggerRepairConfig()
 
         labJack = self.getDigitalIODevice(pglLabJack)
         if labJack is None or not labJack.isActive:
-            raise RuntimeError("LabJack digital trigger was selected, but no initialized LabJack is available")
+            raise RuntimeError(
+                "LabJack digital trigger was selected, but no initialized "
+                "LabJack is available"
+            )
 
-        if not self.settings.volumeTriggerEdge:
-            raise ValueError("Select a volumeTriggerEdge")
+        # Both snapshots come from the same preset. Mid-run edits affect neither.
+        self._labJackTriggerConfig = deepcopy(config)
+        self._labJackRepairConfig = deepcopy(repairConfig)
+        self.data.labJackAcquisition = {
+            "presetName": preset.name,
+            "presetUUID": preset.uuid,
+            "requested": deepcopy(config),
+            "volumeTriggerRepair": deepcopy(repairConfig),
+            "actualScanRate": None,
+            "streamBufferSizeBytes": None,
+            "acquisitionId": None,
+            "deviceUUID": str(labJack.uuid),
+            "serialNumber": getattr(labJack, "serialNumber", None),
+        }
 
-        edge = self.settings.volumeTriggerEdge[0]
-        if edge not in {"rising", "falling"}:
-            raise ValueError("Volume trigger edge must be rising or falling")
-
-        # Track ownership before startup so initialization recovery can stop
-        # a partially started acquisition.
+        # Track ownership before startup so partial initialization can stop.
         self._experimentInputDevices.append(labJack)
+        actualRate = labJack.startDigitalRead(**config)
 
-        # These acquisition defaults become settings in a later step.
-        # FIO_STATE capture currently supports only FIO0–FIO7 / DIO0–DIO7.
-        actualRate = labJack.startDigitalRead(
-            channels=self.settings.volumeTriggerChannel,
-            edge=edge,
-            scanRate=100000.0,
-            scansPerRead=100,
-        )
+        if not np.isfinite(actualRate) or actualRate <= 0:
+            raise RuntimeError(f"Invalid actual LabJack scan rate: {actualRate}")
 
-        # Do not silently accept a slower capture rate for these brief pulses.
-        if not np.isclose(actualRate, 100000.0, rtol=1e-6, atol=0):
-            raise RuntimeError(f"Scanner-trigger capture requested 100 kHz but received {actualRate:g} Hz")
+        status = labJack.getDigitalReadStatus()
+        acquisitionId = status.get("acquisitionId")
+        if not isinstance(acquisitionId, str) or not acquisitionId:
+            raise RuntimeError("LabJack startup returned no acquisition identity.")
 
-        # poll() now retrieves the events from this same shared LabJack instance.
+        self._labJackAcquisitionId = acquisitionId
+        self.data.labJackAcquisition.update({
+            "acquisitionId": acquisitionId,
+            "actualScanRate": float(actualRate),
+            "streamBufferSizeBytes": status.get("streamBufferSizeBytes"),
+        })
+
+        previousHistory = getattr(self, "_verifiedVolumeTriggerHistory", None)
+        if previousHistory is not None:
+            if not hasattr(self, "_previousVerifiedVolumeTriggerHistories"):
+                self._previousVerifiedVolumeTriggerHistories = []
+            self._previousVerifiedVolumeTriggerHistories.append(previousHistory)
+
+        self._verifiedVolumeTriggerHistory = {
+            "source": (acquisitionId, config["channels"], config["edge"]),
+            "lastVerifiedTrigger": None,
+            "intervals": [],
+            "handledWindowIds": set(),
+        }
+
+        if not np.isclose(actualRate, config["scanRate"], rtol=1e-6, atol=0):
+            pglMessages.message(
+                f"LabJack requested {config['scanRate']:g} Hz; "
+                f"using device rate {actualRate:g} Hz for timestamps."
+            )
+
         if not self.pgl.devicesAdd(labJack):
             raise RuntimeError("Could not register LabJack input for polling")
 
-        pglMessages.message("LabJack scanner-trigger input initialized")
+        pglMessages.message(
+            f"LabJack scanner-trigger input initialized with preset "
+            f"{preset.name!r}; counter verification="
+            f"{config['verifyTriggerCounter']}, automatic restart="
+            f"{config['autoRestartOnStreamOverflow']}"
+        )
             
 
     def endDevices(self):
         """
-        Stop and unregister experiment input devices without closing hardware.
+        Stop owned inputs, retain queued events, snapshot, then unregister.
 
-        Retain devices whose workers have not stopped so cleanup can be retried.
-        Pending events remain on their device; this method does not consume them.
+        Drain only after both worker and stream have stopped. A latched
+        acquisition error must not prevent retaining already-queued events.
+
+        Shutdown-drained events are retained as source evidence only:
+        no additional accepted volumes or retrospective task updates.
         """
         errors = []
         failedDevices = []
+        devices = list(getattr(self, "_experimentInputDevices", []))
 
-        for device in list(getattr(self, "_experimentInputDevices", [])):
+        for device in devices:
             self._attemptRunAction(
                 "stop experiment digital input",
                 device.stopDigitalRead,
                 errors,
             )
 
-            # A latched acquisition error may be reported even after the worker
-            # stopped. Unregister stopped workers, but retain a running worker
-            # or an unsuccessfully stopped hardware stream for retry.
             try:
                 status = device.getDigitalReadStatus()
             except Exception as error:
@@ -2396,13 +2476,55 @@ class pglExperiment(pglExperimentBase):
                 continue
 
             if status["running"] or status["streamActive"]:
+                # Do not race a live producer or drop ownership.
                 failedDevices.append(device)
                 continue
 
-            self.pgl.devicesRemove(device)
+            try:
+                # LabJack.poll() atomically drains the complete queue before
+                # exposing a retained failure on a subsequent empty poll.
+                # One call is sufficient now that the producer has stopped.
+                pending = list(device.poll())
 
-        # Snapshot before dropping input-device references. Finalization's
-        # existing final data.json write persists these post-shutdown values.
+                if pending:
+                    self.data.events.extend(pending)
+
+                    if not hasattr(self.data, "digitalInputShutdownDrains"):
+                        self.data.digitalInputShutdownDrains = []
+
+                    self.data.digitalInputShutdownDrains.append({
+                        "deviceUUID": str(device.uuid),
+                        "acquisitionId": status.get("acquisitionId"),
+                        "drainedTimestamp": pglTimestamp.getSecs(),
+                        "experimentEndTime": getattr(self.data, "endTime", None),
+                        "eventCount": len(pending),
+                        # Retain direct references as well as data.events.
+                        # Later chronological insertion cannot invalidate
+                        # this association through shifted list indices.
+                        "events": list(pending),
+                        "processing": "retainedSourceOnly",
+                        "reason": "drainedAfterAcquisitionLoop",
+                    })
+
+            except Exception as error:
+                # poll() can expose the same fatal acquisition error already
+                # reported by stopDigitalRead(). Do not hide new drain errors.
+                if status.get("error") is None or status.get("pendingEvents", 0):
+                    errors.append(error)
+                    self._recordRunError("drain stopped digital input", error)
+                    failedDevices.append(device)
+                    continue
+
+            # Snapshot while the device is still available to the experiment.
+            # The final data.json write persists the drained events and
+            # post-shutdown diagnostics after the initial local save.
+            try:
+                self.pgl.devicesRemove(device)
+            except Exception as error:
+                errors.append(error)
+                self._recordRunError("unregister stopped digital input", error)
+                failedDevices.append(device)
+
         self._attemptRunAction(
             "snapshot digital input diagnostics",
             self._snapshotDigitalInputStatus,
@@ -3465,26 +3587,38 @@ class pglExperiment(pglExperimentBase):
         return True
     
     ################################################################
-    # Validate scanner-trigger availability after device initialization
+    # Validate scanner-trigger availability
     ################################################################
     def _validateVolumeTriggerSource(self):
-        """Allow keyboard-only, digital-only, or combined trigger sources."""
-        selectedNames = {name.casefold() for name in self.settings.devices}
+        """Allow a live digital worker to recover between hardware streams."""
+        selectedNames = {name.casefold() for name in self.settings.digitalIO}
         digitalSelected = "labjack digital trigger" in selectedNames
+        config = getattr(self, "_labJackTriggerConfig", None)
 
         if digitalSelected:
+            if config is None:
+                raise RuntimeError("LabJack trigger was selected but has no acquisition configuration")
+
             devices = [
                 device for device in getattr(self, "_experimentInputDevices", [])
                 if device.deviceType == "LabJack"
             ]
             if len(devices) != 1:
-                raise RuntimeError("LabJack scanner input was selected but exactly one input device was not initialized")
+                raise RuntimeError("LabJack scanner input requires exactly one initialized input device")
 
             status = devices[0].getDigitalReadStatus()
             if status["error"] is not None:
                 raise RuntimeError(f"LabJack scanner input failed: {status['error']}")
-            if not status["running"] or not status["streamActive"]:
-                raise RuntimeError("LabJack scanner input is not acquiring")
+            if not status["running"]:
+                raise RuntimeError("LabJack scanner input worker is not running")
+            if not status["streamActive"] and not status.get("recovering", False):
+                raise RuntimeError("LabJack scanner input is neither acquiring nor recovering")
+
+        elif config is not None:
+            raise RuntimeError(
+                "Digital-IO selection changed after LabJack acquisition started. "
+                "Create a new experiment rather than changing an active source."
+            )
 
         if self.settings.startOnVolumeTrigger and self.state.volumeTriggerKeyCode is None and not digitalSelected:
             raise ValueError("startOnVolumeTrigger requires a volumeTriggerKey or an initialized digital trigger device.")
@@ -3494,11 +3628,14 @@ class pglExperiment(pglExperimentBase):
     ################################################################
     def _isVolumeTrigger(self, event):
         """
-        Match one scanner-trigger source event.
+        Match keyboard triggers or the active digital acquisition.
 
-        Keyboard triggers require keydown.
-        Digital triggers require the selected device, physical pin, and edge.
-        This does not deduplicate a physical pulse delivered by two interfaces.
+        Uses the immutable acquisition snapshot, not current preset contents.
+        Stale digital events remain available in data.events but cannot count
+        as scanner volumes for a different acquisition.
+
+        This does not deduplicate a physical pulse delivered through both
+        keyboard and digital interfaces.
         """
         if event.type == "keyboard":
             return (
@@ -3508,60 +3645,32 @@ class pglExperiment(pglExperimentBase):
             )
 
         if event.type != "digitalInput": return False
-        if "labjack digital trigger" not in {name.casefold() for name in self.settings.devices}:
-            return False
         if getattr(event, "deviceType", None) != "LabJack": return False
 
-        # The LabJack reader emits canonical FIO names, including when the
-        # settings used the equivalent DIO0–DIO7 alias.
-        channel = self.settings.volumeTriggerChannel.strip().upper()
-        if channel.startswith("DIO"): channel = "FIO" + channel[3:]
+        config = getattr(self, "_labJackTriggerConfig", None)
+        acquisitionId = getattr(self, "_labJackAcquisitionId", None)
+        if config is None or not acquisitionId: return False
 
         return (
-            event.channel == channel
-            and bool(self.settings.volumeTriggerEdge)
-            and event.eventType == self.settings.volumeTriggerEdge[0]
+            getattr(event, "acquisitionId", None) == acquisitionId
+            and getattr(event, "channel", None) == config["channels"]
+            and getattr(event, "eventType", None) == config["edge"]
         )
 
     ################################################################
-    # Record an accepted scanner trigger without changing its source event
-    ################################################################
-    def _recordVolumeTrigger(self, event):
-        """Increment the volume count and retain source timing provenance."""
-        volumeEvent = pglEventVolumeTrigger(timestamp=event.timestamp)
-
-        # Preserve the existing canonical volumeTrigger event while adding
-        # plain metadata identifying its source and timestamp interpretation.
-        volumeEvent.sourceType = event.type
-
-        if event.type == "digitalInput":
-            volumeEvent.deviceType = event.deviceType
-            volumeEvent.channel = event.channel
-            volumeEvent.edge = event.eventType
-            volumeEvent.sampleIndex = event.sampleIndex
-            volumeEvent.scanRate = event.scanRate
-            volumeEvent.sampleTime = event.sampleTime
-            volumeEvent.timestampMethod = event.timestampMethod
-            volumeEvent.readCompletedTimestamp = getattr(event, "readCompletedTimestamp", None)
-
-        self.state.volumeNumber += 1
-        self.data.events.append(volumeEvent)
-        
-    ################################################################
-    # Snapshot digital acquisition diagnostics into experiment data
+    # Snapshot digital acquisition diagnostics
     ################################################################
     def _snapshotDigitalInputStatus(self):
         """
-        Copy plain digital acquisition diagnostics into experiment data.
+        Retain independent acquisition diagnostics without hardware reads.
 
-        Retains previous snapshots after devices have been unregistered.
-        Does not poll events, access hardware, or stop acquisition.
+        Preserve prior snapshots after unregistering devices.
         """
-        snapshots = dict(getattr(self.data, "digitalInputDiagnostics", {}))
+        from copy import deepcopy
+
+        snapshots = deepcopy(getattr(self.data, "digitalInputDiagnostics", {}))
         devices = list(getattr(self, "_experimentInputDevices", []))
 
-        # Include shared hardware so diagnostics remain available after input
-        # unregistration but before the hardware ownership list is cleared.
         for device in self.state.digitalIODevices:
             if not any(existing is device for existing in devices):
                 devices.append(device)
@@ -3576,24 +3685,24 @@ class pglExperiment(pglExperimentBase):
 
             try:
                 status = getStatus()
-
-                # An output-only LabJack has no digital acquisition to report.
                 if status.get("scanRate") is None and status.get("error") is None:
                     continue
+
+                config = getattr(self, "_labJackTriggerConfig", None) or {}
 
                 snapshots[deviceKey] = {
                     "deviceType": device.deviceType,
                     "deviceDescription": device.deviceDescription,
                     "serialNumber": getattr(device, "serialNumber", None),
                     "snapshotTimestamp": pglTimestamp.getSecs(),
-                    "configuredChannel": self.settings.volumeTriggerChannel,
-                    "configuredEdge": self.settings.volumeTriggerEdge[0] if self.settings.volumeTriggerEdge else None,
+                    "configuredChannel": config.get("channels"),
+                    "configuredEdge": config.get("edge"),
+                    "requestedConfiguration": deepcopy(config),
+                    "acquisition": deepcopy(getattr(self.data, "labJackAcquisition", {})),
                     "status": status,
                 }
 
             except Exception as error:
-                # Preserve any earlier successful snapshot and record the
-                # snapshot failure without retaining its traceback object.
                 record = dict(snapshots.get(deviceKey, {}))
                 record["snapshotError"] = f"{type(error).__name__}: {error}"
                 snapshots[deviceKey] = record
@@ -3603,6 +3712,818 @@ class pglExperiment(pglExperimentBase):
         if errors: raise errors[0]
         return True
 
+    ################################################################
+    # Record an accepted scanner trigger without changing its source event
+    ################################################################
+    def _recordVolumeTrigger(self, event, *, reconstruction=None):
+        """
+        Record an accepted trigger in chronological volume-trigger order.
+
+        Original source events retain their existing order and contents.
+        This method does not decide pre-start/ignored-volume eligibility;
+        callers must apply those gates before recording.
+
+        reconstruction=None:
+            Record an existing measured source event.
+
+        reconstruction=dict:
+            Record an estimated volume using explicitly supplied evidence.
+            event remains the source diagnostic, not a fabricated digital edge.
+
+        Returns:
+            The newly recorded pglEventVolumeTrigger.
+
+        Updates the current volume count only. Does not replay task updates
+        or cause a stimulus transition at the estimated timestamp.
+        """
+        from copy import deepcopy
+        from numbers import Real, Integral
+
+        def validTimestamp(value):
+            return (
+                not isinstance(value, (bool, np.bool_))
+                and isinstance(value, Real)
+                and np.isfinite(value)
+            )
+
+        if reconstruction is not None:
+            if not isinstance(reconstruction, dict):
+                raise TypeError("reconstruction must be a dictionary or None.")
+
+            required = {
+                "timestamp", "mismatchId", "missingEdgeOrdinal",
+                "medianInterval", "supportingObservations",
+            }
+            missing = required.difference(reconstruction)
+            if missing:
+                raise ValueError(f"Missing reconstruction evidence: {sorted(missing)}")
+
+            mismatchId = reconstruction["mismatchId"]
+            ordinal = reconstruction["missingEdgeOrdinal"]
+            interval = reconstruction["medianInterval"]
+
+            if not isinstance(mismatchId, str) or not mismatchId:
+                raise ValueError("mismatchId must be a nonempty string.")
+            if (
+                isinstance(ordinal, (bool, np.bool_))
+                or not isinstance(ordinal, Integral)
+                or ordinal < 0
+            ):
+                raise ValueError("missingEdgeOrdinal must be a nonnegative integer.")
+            if not validTimestamp(interval) or interval <= 0:
+                raise ValueError("medianInterval must be finite and positive.")
+            if not isinstance(reconstruction["supportingObservations"], dict):
+                raise TypeError("supportingObservations must be a dictionary.")
+
+            timestamp = reconstruction["timestamp"]
+        else:
+            timestamp = getattr(event, "timestamp", None)
+
+        if not validTimestamp(timestamp):
+            raise ValueError("Volume-trigger timestamp must be finite.")
+
+        timestamp = float(timestamp)
+        volumeEntries = [
+            (index, entry)
+            for index, entry in enumerate(self.data.events)
+            if entry.type == "volumeTrigger"
+        ]
+
+        # Never sort away corrupt existing data.
+        previousTimestamp = None
+        for _, entry in volumeEntries:
+            existingTimestamp = getattr(entry, "timestamp", None)
+            if not validTimestamp(existingTimestamp):
+                raise ValueError("Existing volume-trigger timestamp is invalid.")
+            if previousTimestamp is not None and existingTimestamp <= previousTimestamp:
+                raise ValueError("Existing volume-trigger timestamps are not strictly increasing.")
+            if existingTimestamp == timestamp:
+                raise ValueError("A volume trigger already exists at this timestamp.")
+            previousTimestamp = existingTimestamp
+
+            if reconstruction is not None and (
+                getattr(entry, "mismatchId", None) == mismatchId
+                and getattr(entry, "missingEdgeOrdinal", None) == ordinal
+            ):
+                raise ValueError("This missing edge has already been reconstructed.")
+
+        volumeEvent = pglEventVolumeTrigger(timestamp=timestamp)
+        volumeEvent.sourceType = event.type
+
+        # Preserve source identity for measured and reconstructed events.
+        for fieldName in ("deviceType", "deviceUUID", "serialNumber", "acquisitionId", "channel"):
+            if hasattr(event, fieldName):
+                setattr(volumeEvent, fieldName, deepcopy(getattr(event, fieldName)))
+
+        if reconstruction is not None:
+            volumeEvent.edge = getattr(event, "edge", None)
+            volumeEvent.isEstimated = True
+            volumeEvent.timestampMethod = "counterConfirmedMedianInterval"
+            volumeEvent.reconstructionReason = "counterEdgeMismatch"
+            volumeEvent.mismatchId = mismatchId
+            volumeEvent.missingEdgeOrdinal = int(ordinal)
+            volumeEvent.medianInterval = float(interval)
+            volumeEvent.supportingObservations = deepcopy(
+                reconstruction["supportingObservations"]
+            )
+            volumeEvent.reconstructionRecordedTimestamp = pglTimestamp.getSecs()
+            volumeEvent.diagnosticTimestamp = getattr(event, "timestamp", None)
+
+            # An estimated trigger has no measured sample location.
+            volumeEvent.sampleIndex = None
+            volumeEvent.sampleTime = None
+            volumeEvent.scanRate = None
+            volumeEvent.segmentId = None
+            volumeEvent.sampleIndexScope = None
+
+        elif event.type == "digitalInput":
+            volumeEvent.edge = event.eventType
+            for fieldName in (
+                "sampleIndex", "scanRate", "sampleTime", "timestampMethod",
+                "readCompletedTimestamp", "segmentId", "sampleIndexScope",
+            ):
+                setattr(volumeEvent, fieldName, deepcopy(getattr(event, fieldName, None)))
+            volumeEvent.isEstimated = bool(getattr(event, "isEstimated", False))
+
+        else:
+            volumeEvent.isEstimated = False
+
+        # Insert before the next volume event, not by globally sorting events.
+        # The relative order of all existing entries is preserved.
+        insertIndex = next(
+            (index for index, entry in volumeEntries if entry.timestamp > timestamp),
+            len(self.data.events),
+        )
+
+        self.data.events.insert(insertIndex, volumeEvent)
+        self.state.volumeNumber += 1
+        return volumeEvent
+        
+    def _getKeyboardSuppressionConfig(self):
+        """
+        Resolve selective suppression and the independent all-key flag.
+
+        Response keys and special keys share parseKeyNames() syntax.
+        Disabled special-key text is retained but not interpreted.
+
+        Validate the complete request before changing listener configuration.
+        """
+        keyboard = self.keyboardMouse
+        keyCodes = []
+
+        def addKeyCode(value, label):
+            if value is None: return
+            if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
+                raise ValueError(f"Invalid key code for {label}: {value!r}")
+            if not 0 <= value <= 65535:
+                raise ValueError(f"Key code outside the supported range for {label}: {value!r}")
+            keyCodes.append(int(value))
+
+        if self.settings.eatKeys:
+            for index, keyCode in enumerate(self.state.responseKeyCodesList):
+                if keyCode is None:
+                    raise ValueError(f"Response key {index + 1} has no valid key code")
+                addKeyCode(keyCode, f"response key {index + 1}")
+
+            for fieldName in ("startKeyCode", "endKeyCode", "volumeTriggerKeyCode"):
+                addKeyCode(getattr(self.state, fieldName), fieldName)
+
+        if self.settings.eatSpecialKeys:
+            keyNames = keyboard.parseKeyNames(self.settings.specialKeysToEat)
+
+            for keyName in keyNames:
+                keyCode = keyboard.charToKeyCode(keyName)
+                if keyCode is None:
+                    raise ValueError(f"Unknown special key to eat: {keyName!r}")
+                addKeyCode(keyCode, keyName)
+
+        return {
+            "keyCodes": sorted(set(keyCodes)),
+            "eatAllKeys": bool(self.settings.eatAllKeys),
+        }
+        
+    ################################################################
+    # Apply keyboard suppression settings
+    ################################################################
+    def _configureKeyboardSuppression(self):
+        """Validate and explicitly replace selective and all-key suppression."""
+        config = self._getKeyboardSuppressionConfig()
+        keyboard = self.keyboardMouse
+
+        if not keyboard.isRunning():
+            raise RuntimeError("Cannot configure suppression: keyboard listener is not running")
+
+        try:
+            # Clear the previous all-key mode before replacing selective keys.
+            keyboard.setEatAllKeys(False)
+            keyboard.setEatKeys(keyCodes=config["keyCodes"])
+            keyboard.setEatAllKeys(config["eatAllKeys"])
+
+        except Exception:
+            # Attempt both releases without replacing the original error.
+            for release in (
+                lambda: keyboard.setEatAllKeys(False),
+                lambda: keyboard.setEatKeys(keyCodes=[]),
+            ):
+                try:
+                    release()
+                except Exception as cleanupError:
+                    pglMessages.warning(f"Could not release keyboard suppression: {cleanupError}")
+            raise
+
+        return config
+    
+    @staticmethod
+    def _estimateMissingVolumeTimes(
+        missingCount, measuredIntervals, anchorTimestamp,
+        lowerTimestamp, upperTimestamp, measuredTimestamps,
+        medianWindow=10, minIntervals=3,
+    ):
+        """
+        Estimate counter-confirmed missing volume timestamps.
+
+        measuredIntervals:
+            Chronologically ordered eligible measured intervals only.
+            The caller must exclude intervals spanning scan gaps, missing
+            counter increments, estimated events, or different sources.
+
+        anchorTimestamp:
+            Trusted measured trigger immediately preceding the missing
+            sequence. This helper handles a consecutive missing sequence;
+            it does not assign missing edges among interspersed observations.
+
+        lowerTimestamp, upperTimestamp:
+            Exclusive supported bounds for the missing sequence.
+
+        measuredTimestamps:
+            All measured trigger timestamps in the relevant placement region,
+            including later-delivered observations.
+
+        Returns:
+            Dictionary containing timestamps or an explicit unresolved reason.
+
+        This helper neither mutates events nor updates the volume count.
+        Sample indices and sample times are never manufactured.
+        """
+        import math
+        from numbers import Integral, Real
+        from statistics import median
+
+        def validTimestamp(value):
+            return (
+                not isinstance(value, (bool, np.bool_))
+                and isinstance(value, Real)
+                and math.isfinite(float(value))
+            )
+
+        def validInteger(value):
+            return (
+                not isinstance(value, (bool, np.bool_))
+                and isinstance(value, Integral)
+            )
+
+        if not validInteger(missingCount) or missingCount < 1:
+            raise ValueError("missingCount must be a positive counter-confirmed integer.")
+        if not validInteger(medianWindow) or medianWindow < 1:
+            raise ValueError("medianWindow must be a positive integer.")
+        if not validInteger(minIntervals) or not 1 <= minIntervals <= medianWindow:
+            raise ValueError("minIntervals must be between 1 and medianWindow.")
+
+        result = {
+            "resolved": False,
+            "reason": None,
+            "missingCount": int(missingCount),
+            "timestamps": [],
+            "medianInterval": None,
+            "intervalsUsed": [],
+            "timestampMethod": "counterConfirmedMedianInterval",
+        }
+
+        def unresolved(reason):
+            result["reason"] = reason
+            return result
+
+        if not all(validTimestamp(value) for value in (
+            anchorTimestamp, lowerTimestamp, upperTimestamp,
+        )):
+            return unresolved("invalidTimestampBounds")
+
+        anchorTimestamp = float(anchorTimestamp)
+        lowerTimestamp = float(lowerTimestamp)
+        upperTimestamp = float(upperTimestamp)
+
+        if not anchorTimestamp <= lowerTimestamp < upperTimestamp:
+            return unresolved("inconsistentTimestampBounds")
+
+        intervals = list(measuredIntervals)[-int(medianWindow):]
+        if any(not validTimestamp(value) or value <= 0 for value in intervals):
+            return unresolved("invalidMeasuredIntervalHistory")
+
+        result["intervalsUsed"] = [float(value) for value in intervals]
+        if len(intervals) < minIntervals:
+            return unresolved("insufficientMeasuredIntervalHistory")
+
+        intervalEstimate = float(median(intervals))
+        result["medianInterval"] = intervalEstimate
+
+        observedTimes = list(measuredTimestamps)
+        if any(not validTimestamp(value) for value in observedTimes):
+            return unresolved("invalidMeasuredTriggerTimestamp")
+        observedTimes = sorted(float(value) for value in observedTimes)
+
+        # This placement rule is valid only for a consecutive missing sequence.
+        # A measured trigger between the anchor and the final estimate would
+        # require a different, explicitly supported assignment of missing edges.
+        finalEstimate = anchorTimestamp + int(missingCount) * intervalEstimate
+        firstEstimate = anchorTimestamp + intervalEstimate
+
+        if not math.isfinite(finalEstimate):
+            return unresolved("nonfiniteEstimatedTimestamp")
+        if firstEstimate <= lowerTimestamp or finalEstimate >= upperTimestamp:
+            return unresolved("estimatesOutsideSupportedWindow")
+
+        if any(anchorTimestamp < timestamp <= finalEstimate for timestamp in observedTimes):
+            return unresolved("measuredTriggerIntersectsMissingSequence")
+
+        # Bound the count by the supported window before allocating a list.
+        timestamps = [
+            anchorTimestamp + index * intervalEstimate
+            for index in range(1, int(missingCount) + 1)
+        ]
+
+        if any(
+            not math.isfinite(timestamp)
+            or not lowerTimestamp < timestamp < upperTimestamp
+            for timestamp in timestamps
+        ):
+            return unresolved("estimatesOutsideSupportedWindow")
+
+        if any(right <= left for left, right in zip(
+            [anchorTimestamp] + timestamps, timestamps,
+        )):
+            return unresolved("estimatedTimestampsNotStrictlyIncreasing")
+
+        result.update({
+            "resolved": True,
+            "reason": "counterEdgeMismatch",
+            "timestamps": timestamps,
+        })
+        return result
+    
+    def _updateVerifiedVolumeTriggerHistory(
+        self, event, *, acquisitionId, medianWindow=10,
+    ):
+        """
+        Maintain experiment-side history from settled counter diagnostics.
+
+        Call for diagnostic events regardless of whether scanner volumes are
+        currently accepted by the experiment's start/ignore gates.
+
+        Eligible intervals require:
+            - Two individually verified measured rising edges.
+            - Same acquisition, channel, edge, and timing segment.
+            - Exactly one counter increment between the verified edges.
+            - No intervening reported mismatch or scan discontinuity.
+
+        Multi-edge matched windows are conservatively excluded because their
+        individual counter-to-edge assignments have not been established.
+
+        Original events are not modified. No volume events are inserted.
+        """
+        from copy import deepcopy
+        from numbers import Integral, Real
+
+        if not isinstance(acquisitionId, str) or not acquisitionId:
+            raise ValueError("acquisitionId must be a nonempty string.")
+        if (
+            isinstance(medianWindow, (bool, np.bool_))
+            or not isinstance(medianWindow, Integral)
+            or medianWindow < 1
+        ):
+            raise ValueError("medianWindow must be a positive integer.")
+
+        config = getattr(self, "_labJackTriggerConfig", None)
+        if config is None:
+            raise RuntimeError("No LabJack acquisition configuration is available.")
+
+        source = (acquisitionId, config["channels"], config["edge"])
+        history = getattr(self, "_verifiedVolumeTriggerHistory", None)
+
+        if history is None:
+            history = {
+                "source": source,
+                "lastVerifiedTrigger": None,
+                "intervals": [],
+                "handledWindowIds": set(),
+            }
+            self._verifiedVolumeTriggerHistory = history
+        elif history["source"] != source:
+            raise RuntimeError(
+                "Verified trigger history belongs to another acquisition. "
+                "Initialize fresh history when starting a new acquisition."
+            )
+
+        def result(outcome, reason):
+            return {
+                "outcome": outcome,
+                "reason": reason,
+                "intervals": deepcopy(history["intervals"]),
+                "lastVerifiedTrigger": deepcopy(history["lastVerifiedTrigger"]),
+            }
+
+        def breakContinuity(reason):
+            # Retain earlier trusted intervals; do not bridge this boundary.
+            history["lastVerifiedTrigger"] = None
+            return result("continuityBroken", reason)
+
+        if getattr(event, "acquisitionId", None) != acquisitionId:
+            return result("ignored", "foreignAcquisition")
+        if getattr(event, "deviceType", None) != "LabJack":
+            return result("ignored", "foreignDevice")
+
+        eventType = getattr(event, "type", None)
+        if eventType == "digitalInputRecovery":
+            if config["channels"] not in getattr(event, "channels", []):
+                return result("ignored", "foreignChannel")
+            return breakContinuity("streamRecovery")
+
+        if eventType not in ("digitalInputCounterWindow", "digitalInputMismatch"):
+            return result("ignored", "notCounterEvidence")
+
+        if (
+            getattr(event, "channel", None) != config["channels"]
+            or getattr(event, "edge", None) != config["edge"]
+        ):
+            return result("ignored", "foreignSource")
+
+        windowId = getattr(event, "windowId", None)
+        if not isinstance(windowId, str) or not windowId:
+            return breakContinuity("missingWindowIdentity")
+        if windowId in history["handledWindowIds"]:
+            return result("ignored", "duplicateWindow")
+        history["handledWindowIds"].add(windowId)
+
+        comparison = getattr(event, "comparison", None)
+        if not isinstance(comparison, dict):
+            return breakContinuity("invalidComparison")
+
+        if eventType == "digitalInputMismatch":
+            return breakContinuity("counterMismatch")
+
+        if (
+            comparison.get("outcome") != "matched"
+            or comparison.get("windowSettled") is not True
+            or comparison.get("counterContinuityVerified") is not True
+            or comparison.get("missingEdgeCount") != 0
+        ):
+            return breakContinuity("unverifiedWindow")
+
+        if (
+            getattr(event, "continuousScanTimeline", None) is not True
+            or getattr(event, "gapRecords", None) != []
+        ):
+            return breakContinuity("scanDiscontinuity")
+
+        observations = getattr(event, "measuredObservations", None)
+        if (
+            not isinstance(observations, list)
+            or len(observations) != 1
+            or comparison.get("counterIncrement") != 1
+            or comparison.get("measuredEdgeCount") != 1
+        ):
+            return breakContinuity("individualEdgeAssignmentUnavailable")
+
+        before = getattr(event, "beforeObservation", None)
+        after = getattr(event, "afterObservation", None)
+        measured = observations[0]
+
+        def integer(value):
+            return (
+                not isinstance(value, (bool, np.bool_))
+                and isinstance(value, Integral)
+            )
+
+        def finiteTime(value):
+            return (
+                not isinstance(value, (bool, np.bool_))
+                and isinstance(value, Real)
+                and np.isfinite(value)
+            )
+
+        for observation in (before, measured, after):
+            if not isinstance(observation, dict):
+                return breakContinuity("invalidObservation")
+            if (
+                not integer(observation.get("segmentId"))
+                or observation["segmentId"] < 0
+                or not integer(observation.get("sampleIndex"))
+                or observation["sampleIndex"] < 0
+                or not finiteTime(observation.get("timestamp"))
+                or not integer(observation.get("counter"))
+                or not 0 <= observation["counter"] <= 0xFFFFFFFF
+            ):
+                return breakContinuity("invalidObservation")
+
+        if not (
+            before["segmentId"] == measured["segmentId"] == after["segmentId"]
+            and before["sampleIndex"] < measured["sampleIndex"] < after["sampleIndex"]
+            and before["timestamp"] < measured["timestamp"] < after["timestamp"]
+            and before.get("inputHigh") is False
+            and measured.get("inputHigh") is True
+            and after.get("inputHigh") is False
+            and after["counter"] - before["counter"] == 1
+            and comparison.get("counterBefore") == before["counter"]
+            and comparison.get("counterAfter") == after["counter"]
+        ):
+            return breakContinuity("inconsistentObservationWindow")
+
+        # Use the settled endpoint's count to identify the verified edge.
+        # The counter read at the HIGH sample can be offset by scan ordering.
+        current = {
+            "timestamp": float(measured["timestamp"]),
+            "sampleIndex": int(measured["sampleIndex"]),
+            "segmentId": int(measured["segmentId"]),
+            "settledCounter": int(after["counter"]),
+            "windowId": windowId,
+        }
+        previous = history["lastVerifiedTrigger"]
+
+        if previous is not None and current["timestamp"] <= previous["timestamp"]:
+            return breakContinuity("outOfOrderVerification")
+
+        eligible = (
+            previous is not None
+            and current["segmentId"] == previous["segmentId"]
+            and current["sampleIndex"] > previous["sampleIndex"]
+            and current["settledCounter"] == previous["settledCounter"] + 1
+        )
+
+        history["lastVerifiedTrigger"] = current
+        if not eligible:
+            return result("baseline", "verifiedMeasuredEdge")
+
+        history["intervals"].append({
+            "interval": current["timestamp"] - previous["timestamp"],
+            "firstTimestamp": previous["timestamp"],
+            "secondTimestamp": current["timestamp"],
+            "firstWindowId": previous["windowId"],
+            "secondWindowId": current["windowId"],
+            "segmentId": current["segmentId"],
+        })
+
+        # Only the working median history is bounded. Original diagnostic
+        # events remain in data.events and are not removed by this method.
+        history["intervals"] = history["intervals"][-int(medianWindow):]
+        return result("intervalAdded", "consecutiveCounterVerifiedMeasuredEdges")
+    
+    def _consumeVolumeCounterDiagnostic(self, event):
+        """
+        Consume counter evidence during pre-start or active acquisition.
+
+        Original diagnostic events must already be retained in data.events.
+
+        Conservative reconstruction:
+            - Same active acquisition/channel/edge.
+            - Settled, counter-confirmed positive deficit.
+            - No measured edges interspersed inside the mismatch window.
+            - Trusted measured anchor and sufficient earlier interval history.
+            - Estimates fit the observation bounds.
+            - Estimates occur after the established acceptance boundary.
+            - No duplicate volume timestamps or repeated mismatch handling.
+
+        Never retroactively opens a start gate or changes task timestamps.
+        """
+        from copy import deepcopy
+        from numbers import Integral, Real
+
+        eventType = getattr(event, "type", None)
+        if eventType not in (
+            "digitalInputCounterWindow",
+            "digitalInputMismatch",
+            "digitalInputRecovery",
+        ):
+            return False
+
+        acquisitionId = getattr(self, "_labJackAcquisitionId", None)
+        config = getattr(self, "_labJackTriggerConfig", None)
+        runtime = getattr(self, "_volumeRepairRuntime", None)
+        if runtime is None:
+            raise RuntimeError("Volume-repair runtime has not been initialized.")
+
+        if (
+            not acquisitionId
+            or config is None
+            or getattr(event, "acquisitionId", None) != acquisitionId
+            or getattr(event, "deviceType", None) != "LabJack"
+        ):
+            return True  # Retained source event, but not this acquisition.
+
+        if eventType == "digitalInputRecovery":
+            if config["channels"] not in getattr(event, "channels", []):
+                return True
+        elif (
+            getattr(event, "channel", None) != config["channels"]
+            or getattr(event, "edge", None) != config["edge"]
+        ):
+            return True
+
+        # Keep trusted anchors separately: history breaks adjacency at a gap,
+        # but an earlier measured anchor may still support bounded placement.
+        snapshot = self._updateVerifiedVolumeTriggerHistory(
+            event,
+            acquisitionId=acquisitionId,
+            medianWindow=runtime["medianWindow"],
+        )
+
+        if eventType == "digitalInputCounterWindow":
+            if snapshot["outcome"] in ("baseline", "intervalAdded"):
+                anchor = snapshot["lastVerifiedTrigger"]
+                if anchor is not None:
+                    runtime["lastTrustedAnchor"] = deepcopy(anchor)
+            return True
+
+        if eventType == "digitalInputRecovery":
+            return True
+
+        mismatchId = getattr(event, "mismatchId", None)
+        audit = {
+            "acquisitionId": acquisitionId,
+            "mismatchId": mismatchId,
+            "diagnosticTimestamp": getattr(event, "timestamp", None),
+            "handledTimestamp": pglTimestamp.getSecs(),
+            "status": "unresolved",
+            "reason": None,
+            "insertedTimestamps": [],
+            "evidence": {
+                "comparison": deepcopy(getattr(event, "comparison", None)),
+                "beforeObservation": deepcopy(getattr(event, "beforeObservation", None)),
+                "afterObservation": deepcopy(getattr(event, "afterObservation", None)),
+                "measuredObservations": deepcopy(getattr(event, "measuredObservations", None)),
+                "gapRecords": deepcopy(getattr(event, "gapRecords", None)),
+            },
+        }
+        self.data.volumeTriggerRepairAudit.append(audit)
+
+        def unresolved(reason):
+            audit["reason"] = reason
+            return True
+
+        if not isinstance(mismatchId, str) or not mismatchId:
+            return unresolved("missingMismatchIdentity")
+        if mismatchId in runtime["handledMismatchIds"]:
+            audit["status"] = "duplicate"
+            return unresolved("mismatchAlreadyHandled")
+        runtime["handledMismatchIds"].add(mismatchId)
+
+        if not runtime["enabled"]:
+            return unresolved("reconstructionDisabled")
+
+        comparison = getattr(event, "comparison", None)
+        count = getattr(event, "missingEdgeCount", None)
+        if (
+            not isinstance(comparison, dict)
+            or comparison.get("outcome") != "missingEdges"
+            or comparison.get("windowSettled") is not True
+            or comparison.get("counterContinuityVerified") is not True
+            or isinstance(count, (bool, np.bool_))
+            or not isinstance(count, Integral)
+            or count <= 0
+            or comparison.get("missingEdgeCount") != count
+        ):
+            return unresolved("missingCountNotVerified")
+
+        if getattr(event, "measuredObservations", None) != []:
+            return unresolved("missingSequenceContainsMeasuredEdges")
+
+        def finiteTime(value):
+            return (
+                not isinstance(value, (bool, np.bool_))
+                and isinstance(value, Real)
+                and np.isfinite(value)
+            )
+
+        before = getattr(event, "beforeObservation", None)
+        after = getattr(event, "afterObservation", None)
+        anchor = runtime["lastTrustedAnchor"]
+
+        if not isinstance(before, dict) or not isinstance(after, dict):
+            return unresolved("missingObservationBounds")
+        if anchor is None:
+            return unresolved("noTrustedMeasuredAnchor")
+
+        lower = before.get("timestamp")
+        upper = after.get("timestamp")
+        if not finiteTime(lower) or not finiteTime(upper) or lower >= upper:
+            return unresolved("invalidObservationBounds")
+
+        # The counter at the preceding boundary must still be the anchor's
+        # settled count. Otherwise missing edges may precede this window.
+        if (
+            anchor["timestamp"] > lower
+            or anchor["settledCounter"] != before.get("counter")
+        ):
+            return unresolved("anchorDoesNotPrecedeMissingSequence")
+
+        # Cross-restart bounds are host-clock estimates, not a repaired scan
+        # timeline. Retain that distinction in the reconstruction evidence.
+        audit["boundsMethod"] = (
+            "continuousSampleTimeline"
+            if getattr(event, "continuousScanTimeline", False)
+            else "segmentedHostClockEstimates"
+        )
+
+        # Only interval history preceding the missing window is eligible.
+        intervalRecords = [
+            record for record in snapshot["intervals"]
+            if record["secondTimestamp"] <= lower
+        ]
+        measuredTimes = [
+            entry.timestamp
+            for entry in self.data.events
+            if (
+                getattr(entry, "type", None) == "digitalInput"
+                and getattr(entry, "acquisitionId", None) == acquisitionId
+                and getattr(entry, "channel", None) == config["channels"]
+                and getattr(entry, "eventType", None) == config["edge"]
+                and finiteTime(getattr(entry, "timestamp", None))
+            )
+        ]
+
+        estimate = self._estimateMissingVolumeTimes(
+            missingCount=int(count),
+            measuredIntervals=[record["interval"] for record in intervalRecords],
+            anchorTimestamp=anchor["timestamp"],
+            lowerTimestamp=lower,
+            upperTimestamp=upper,
+            measuredTimestamps=measuredTimes,
+            medianWindow=runtime["medianWindow"],
+            minIntervals=runtime["minIntervals"],
+        )
+        audit["estimate"] = deepcopy(estimate)
+        if not estimate["resolved"]:
+            return unresolved(estimate["reason"])
+
+        timestamps = estimate["timestamps"]
+        boundary = runtime["acceptanceBoundary"]
+        if boundary is None or any(timestamp <= boundary for timestamp in timestamps):
+            return unresolved("repairWouldChangePreStartOrIgnoredVolumeBoundary")
+        if not self.state.experimentStarted or self.state.experimentDone:
+            return unresolved("experimentNotAcceptingVolumes")
+
+        # Preflight the entire insertion before changing events or counts.
+        existingVolumes = [
+            entry for entry in self.data.events
+            if entry.type == "volumeTrigger"
+        ]
+        existingTimes = [entry.timestamp for entry in existingVolumes]
+        if (
+            any(not finiteTime(value) for value in existingTimes)
+            or any(right <= left for left, right in zip(existingTimes, existingTimes[1:]))
+        ):
+            return unresolved("existingVolumeTimelineInvalid")
+        if any(timestamp in existingTimes for timestamp in timestamps):
+            return unresolved("estimatedTimestampDuplicatesVolume")
+        if any(getattr(entry, "mismatchId", None) == mismatchId for entry in existingVolumes):
+            return unresolved("mismatchAlreadyRepresentedByVolumes")
+
+        evidence = {
+            **deepcopy(audit["evidence"]),
+            "boundsMethod": audit["boundsMethod"],
+            "anchor": deepcopy(anchor),
+            "intervalRecords": deepcopy(intervalRecords),
+        }
+
+        try:
+            for ordinal, timestamp in enumerate(timestamps):
+                self._recordVolumeTrigger(
+                    event,
+                    reconstruction={
+                        "timestamp": timestamp,
+                        "mismatchId": mismatchId,
+                        "missingEdgeOrdinal": ordinal,
+                        "medianInterval": estimate["medianInterval"],
+                        "supportingObservations": evidence,
+                    },
+                )
+                audit["insertedTimestamps"].append(timestamp)
+        except Exception as error:
+            # Do not discard any successfully inserted events on failure.
+            audit["status"] = "partialFailure"
+            audit["reason"] = f"{type(error).__name__}: {error}"
+            raise
+
+        audit["status"] = "reconstructed"
+        audit["reason"] = "counterEdgeMismatch"
+        pglMessages.warning(
+            f"Reconstructed {len(timestamps)} counter-confirmed missing volume "
+            f"trigger(s) using a median interval of "
+            f"{estimate['medianInterval']:.6g} seconds. "
+            "Their timestamps are estimated; earlier stimulus transitions "
+            "have not been changed.",
+            level=2,
+        )
+        return True
+    
 ##############################################
 # Settings for pglTask
 ##############################################

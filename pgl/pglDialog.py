@@ -42,7 +42,226 @@ import traceback
 import re
 from copy import deepcopy
 
+#####################################################################
+# Wrapping layout for compact trait controls
+#####################################################################
+from PySide6.QtWidgets import QLayout
+from PySide6.QtCore import QRect, QSize
 
+
+class _pglTraitFlowLayout(QLayout):
+    """Wrap compact trait controls with centered alignment and accurate height."""
+
+    def __init__(self, parent=None, spacing=12):
+        super().__init__(parent)
+        self._items = []
+
+        # Small vertical allowance prevents controls touching adjacent rows.
+        self.setContentsMargins(0, 3, 0, 3)
+        self.setSpacing(spacing)
+
+    def addItem(self, item):
+        self._items.append(item)
+        self.invalidate()
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, index):
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index):
+        if not 0 <= index < len(self._items): return None
+        item = self._items.pop(index)
+        self.invalidate()
+        return item
+
+    def expandingDirections(self):
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._arrange(QRect(0, 0, width, 0), measureOnly=True)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._arrange(rect, measureOnly=False)
+
+    def _itemMetrics(self, item):
+        """Return the allocated control size and font-aware separation."""
+        widget = item.widget()
+        size = item.sizeHint().expandedTo(item.minimumSize())
+
+        characterGap = (
+            max(1, widget.fontMetrics().horizontalAdvance("  "))
+            if widget is not None else 8
+        )
+        gap = max(0, self.spacing(), characterGap)
+
+        if isinstance(widget, QCheckBox):
+            # Reserve explicit space after the checkbox description.
+            labelPadding = max(1, widget.fontMetrics().horizontalAdvance(" "))
+            size = QSize(size.width() + labelPadding, size.height())
+
+        return size, gap
+
+    def minimumSize(self):
+        """
+        Permit wrapping while reserving enough width for an indivisible item.
+
+        The inline text/controller pair remains one indivisible item.
+        """
+        size = QSize(0, 0)
+
+        for item in self._items:
+            if item.isEmpty(): continue
+            itemSize, _ = self._itemMetrics(item)
+            size = size.expandedTo(itemSize)
+
+        margins = self.contentsMargins()
+        return size + QSize(
+            margins.left() + margins.right(),
+            margins.top() + margins.bottom(),
+        )
+
+    def sizeHint(self):
+        """
+        Report at least the natural height of the tallest control.
+
+        Width remains compact; heightForWidth supplies the wrapped height
+        once the form assigns the actual available width.
+        """
+        return self.minimumSize()
+
+    def _arrange(self, rect, measureOnly):
+        """
+        Measure and place exactly the same wrapped lines.
+
+        Controls on each line are vertically centered relative to the tallest
+        item, including an inline text/checkbox container.
+        """
+        margins = self.contentsMargins()
+        availableWidth = max(
+            0, rect.width() - margins.left() - margins.right()
+        )
+
+        lines = []
+        line = []
+        lineWidth = 0
+        lineHeight = 0
+        lineGap = 0
+        previousGap = 0
+
+        for item in self._items:
+            if item.isEmpty(): continue
+
+            size, gap = self._itemMetrics(item)
+            beforeGap = max(previousGap, gap) if line else 0
+            proposedWidth = lineWidth + beforeGap + size.width()
+
+            if line and proposedWidth > availableWidth:
+                lines.append((line, lineHeight, lineGap))
+                line = []
+                lineWidth = 0
+                lineHeight = 0
+                lineGap = 0
+                previousGap = 0
+                beforeGap = 0
+
+            offsetX = lineWidth + beforeGap
+            line.append((item, size, offsetX))
+            lineWidth = offsetX + size.width()
+            lineHeight = max(lineHeight, size.height())
+            lineGap = max(lineGap, gap)
+            previousGap = gap
+
+        if line:
+            lines.append((line, lineHeight, lineGap))
+
+        y = rect.y() + margins.top()
+        previousLineGap = 0
+
+        for lineIndex, (line, lineHeight, lineGap) in enumerate(lines):
+            if lineIndex:
+                y += max(previousLineGap, lineGap)
+
+            if not measureOnly:
+                for item, size, offsetX in line:
+                    # Center short checkboxes beside the taller inline pair.
+                    itemY = y + (lineHeight - size.height()) // 2
+                    item.setGeometry(QRect(
+                        rect.x() + margins.left() + offsetX,
+                        itemY,
+                        size.width(),
+                        size.height(),
+                    ))
+
+            y += lineHeight
+            previousLineGap = lineGap
+
+        return y - rect.y() + margins.bottom()
+
+
+#####################################################################
+# Preserve per-trait visibility after several controls share a form row
+#####################################################################
+class _pglCompactTraitGroup:
+    """Manage individual controls without hiding their neighboring traits."""
+
+    def __init__(self, formLayout, container, entries, pair=None):
+        self.formLayout = formLayout
+        self.container = container
+        self.entries = entries
+        self.pair = pair
+        self.visibility = {
+            id(entry["widget"]): bool(entry["trait"].metadata.get("visible", True))
+            for entry in entries
+        }
+
+    def setVisible(self, widget, visible):
+        self.visibility[id(widget)] = bool(visible)
+        self.refresh()
+
+    def refresh(self):
+        for entry in self.entries:
+            widget = entry["widget"]
+            widget.setVisible(self.visibility[id(widget)])
+
+        if self.pair is not None:
+            pairWidget, pairEntries = self.pair
+            pairWidget.setVisible(any(
+                self.visibility[id(entry["widget"])]
+                for entry in pairEntries
+            ))
+
+        self.formLayout.setRowVisible(
+            self.container, any(self.visibility.values())
+        )
+        self.container.layout().invalidate()
+        self.container.updateGeometry()
+
+
+class _pglCompactRowLayout:
+    """
+    Adapt existing setRowVisible(widget, visible) calls for grouped controls.
+
+    Other layout operations continue to use the original QFormLayout.
+    """
+
+    def __init__(self, formLayout, group):
+        self.formLayout = formLayout
+        self.group = group
+
+    def setRowVisible(self, widget, visible):
+        if id(widget) in self.group.visibility:
+            self.group.setVisible(widget, visible)
+        else:
+            self.formLayout.setRowVisible(widget, visible)
+
+    def __getattr__(self, name):
+        return getattr(self.formLayout, name)
 
 #######################################
 # _pglTraitsDialog
@@ -70,41 +289,50 @@ class _pglTraitsDialog(QDialog):
         _dialog.visible(traitName, isVisible)
         _dialog.set(traitName, value)
     """
-
     def __init__(self, settings, parent=None, title="Settings"):
         super().__init__(parent)
 
         try:
-            # copy the settings so the original is untouched until OK
+            # Original settings remain untouched until the caller accepts edits.
             self.settings = copy.deepcopy(settings)
-
-            # give the copy a back-reference to this dialog
             self.settings._dialog = self
 
-            # maps traitName -> {'widget', 'row', 'label'} for the trait API
             self.traitWidgets = {}
-            
-            # Fields whose enabled state depends on another Boolean trait.
             self._contingentFields = []
             self._contingentWarnings = set()
+            self._compactGroups = []
 
-            # keep track of whether we are pushing values into widgets so that
-            # we do not create feedback loops when the trait observer fires
             self._updatingWidget = False
-
-            # dialog result flag
             self.accepted_ = False
 
-            # window setup
             self.setWindowTitle(title)
             self.setStyleSheet(self._darkStyle())
-
             self._selectedSettings = {}
 
-            # build the interface
             self._buildUI()
-        except Exception as e:
-            pglMessages.warning(f"Error creating traitsDialog: {e}")
+            self._compactTraitRows()
+            self._refreshContingencies()
+
+            # Scope this change to consolidated checkbox descriptions.
+            # Indicator styling continues to come from the dialog stylesheet.
+            for group in self._compactGroups:
+                for entry in group.entries:
+                    checkbox = entry["widget"]
+                    if isinstance(checkbox, QCheckBox):
+                        checkbox.setStyleSheet(
+                            "QCheckBox { color: #000000; }"
+                            "QCheckBox:disabled { color: #6b7078; }"
+                        )
+
+            # First fit immediately, then repeat once Qt has resolved widget
+            # geometry and the standalone launcher has applied any width.
+            self._fitDialogToContents()
+            QTimer.singleShot(0, self._fitDialogToContents)
+
+        except Exception as error:
+            pglMessages.warning(f"Error creating traitsDialog: {error}")
+            raise
+
 
 
     #########################################
@@ -131,36 +359,32 @@ class _pglTraitsDialog(QDialog):
     #########################################
     # Small trait API for the settings object
     #########################################
-    def enable(self, traitName, isEnabled=True):
-        """Enable or disable the widget(s) for a trait."""
-        entry = self.traitWidgets.get(traitName)
-        if entry is None:
-            return
-        entry['row'].setEnabled(bool(isEnabled))
+    def enable(self, traitName, isEnabled=True, settingsKey=None):
+        """Enable one control without disabling its grouped neighbors."""
+        key = ("root",) if settingsKey is None else settingsKey
+        entry = self.traitWidgets.get(key, {}).get(traitName)
+        if entry is None: return
+        entry["row"].setEnabled(bool(isEnabled))
 
-    def visible(self, traitName, isVisible=True):
-        """Show or hide the widget(s) for a trait."""
-        entry = self.traitWidgets.get(traitName)
-        if entry is None:
-            return
-        entry['row'].setVisible(bool(isVisible))
-        if entry.get('label') is not None:
-            entry['label'].setVisible(bool(isVisible))
+    def visible(self, traitName, isVisible=True, settingsKey=None):
+        """Show/hide one control, respecting compact shared rows."""
+        key = ("root",) if settingsKey is None else settingsKey
+        entry = self.traitWidgets.get(key, {}).get(traitName)
+        if entry is None: return
+        entry["layout"].setRowVisible(entry["widget"], bool(isVisible))
 
-    def set(self, traitName, value):
-        """
-        Set the widget for a trait to a value without re-triggering the
-        settings->dialog callback (guards against feedback loops).
-        """
-        entry = self.traitWidgets.get(traitName)
-        if entry is None:
-            return
+    def set(self, traitName, value, settingsKey=None):
+        """Update a displayed control without committing another model edit."""
+        key = ("root",) if settingsKey is None else settingsKey
+        entry = self.traitWidgets.get(key, {}).get(traitName)
+        if entry is None: return
 
+        previousUpdating = self._updatingWidget
         self._updatingWidget = True
         try:
-            entry['setter'](value)
+            entry["setter"](value)
         finally:
-            self._updatingWidget = False
+            self._updatingWidget = previousUpdating
             
     def _onPlotWindowClosed(self):
         """Reset plot controls when the separate window is closed."""
@@ -1964,46 +2188,48 @@ class _pglTraitsDialog(QDialog):
     #########################################
     # Helpers
     #########################################
-    def _register(self, traitName, trait, widget, setter, layout = None, settingsKey = None):
+    def _register(self, traitName, trait, widget, setter, layout=None, settingsKey=None):
         if layout is None:
             layout = self.formLayout
 
         traitLabel = traitName
         if trait is not None and "traitDisplayName" in trait.metadata:
             traitLabel = trait.metadata["traitDisplayName"]
+
         label = QLabel(traitLabel)
         label.setObjectName("traitLabel")
-        #label.setMinimumWidth(180)          # consistent label column
         label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        
-        # let fields expand to fill the row
-        from PySide6.QtWidgets import QSizePolicy
+
+        if trait is not None:
+            label.setToolTip(self._helpText(traitName, trait))
+
         widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         widget.setMinimumHeight(30)
-        
+
         if settingsKey is None:
             settingsKey = ("root",)
 
         self.traitWidgets.setdefault(settingsKey, {})
-
         self.traitWidgets[settingsKey][traitName] = {
-            'widget': widget,
-            'row': widget,
-            'label': label,
-            'setter': setter,
-            'layout': layout,
+            "widget": widget,
+            "row": widget,
+            "label": label,
+            "setter": setter,
+            "layout": layout,
+            "trait": trait,
+            "traitName": traitName,
+            "settingsKey": settingsKey,
         }
 
         layout.addRow(label, widget)
-        
-        # honor default-visible metadata (row stays built, just hidden)
-        if trait is not None and not trait.metadata.get('visible', True):
+
+        # Keep hidden controls registered for later visibility changes.
+        if trait is not None and not trait.metadata.get("visible", True):
             layout.setRowVisible(widget, False)
-            
-        # honor default-enabled metadata
+
         if trait is not None:
-            isEnabled = trait.metadata.get('enabled', True)
-            widget.setEnabled(bool(isEnabled))
+            widget.setEnabled(bool(trait.metadata.get("enabled", True)))
+
     def addButtonRow(self, name, buttons, displayName=None, layout=None, settingsKey=None):
         row = QWidget()
         h = QHBoxLayout(row)
@@ -2379,6 +2605,334 @@ class _pglTraitsDialog(QDialog):
                     )
 
             field["widget"].setEnabled(enabled)
+            
+    ################################################################
+    # Compact rows explicitly started by existing layout metadata
+    ################################################################
+    def _compactTraitRows(self):
+        """
+        Leave ordinary controls on separate rows by default.
+
+        Explicit group starters:
+            rowLabel on a Boolean:
+                Start a consolidated row containing this Boolean and
+                subsequent consecutive Booleans in the same settings scope.
+
+            inlineContingent=True on a plain text field:
+                Pair it with its immediately following controlling Boolean.
+                Subsequent consecutive Booleans may join the row.
+
+        Group boundaries:
+            A non-Boolean, a different settings scope, another explicit
+            rowLabel, rowBreakBefore, or rowBreakAfter.
+
+        Reuses existing controls, setters, and contingency registrations.
+        No consolidate metadata is used.
+        """
+        form = self.formLayout
+
+        # Match actual form rows to their existing registrations.
+        entriesByWidget = {}
+        for fields in self.traitWidgets.values():
+            for entry in fields.values():
+                if entry["layout"] is form:
+                    entriesByWidget[id(entry["widget"])] = entry
+
+        rows = []
+        for rowIndex in range(form.rowCount()):
+            fieldItem = form.itemAt(rowIndex, QFormLayout.ItemRole.FieldRole)
+            widget = fieldItem.widget() if fieldItem is not None else None
+            rows.append(
+                entriesByWidget.get(id(widget))
+                if widget is not None else None
+            )
+
+        def metadata(entry):
+            trait = entry.get("trait") if entry else None
+            return trait.metadata if trait is not None else {}
+
+        def visible(entry):
+            return entry is not None and bool(metadata(entry).get("visible", True))
+
+        def boolean(entry):
+            return visible(entry) and isinstance(entry.get("trait"), Bool)
+
+        def sameScope(left, right):
+            return (
+                left is not None and right is not None
+                and left["settingsKey"] == right["settingsKey"]
+            )
+
+        plans = []
+        index = 0
+
+        while index < len(rows):
+            first = rows[index]
+            if not visible(first):
+                index += 1
+                continue
+
+            firstMetadata = metadata(first)
+            pairCount = 0
+
+            # Only plain text editors participate in inline pairing.
+            # Composite path/action editors retain their existing layout.
+            inlineText = (
+                isinstance(first.get("trait"), Unicode)
+                and isinstance(first["widget"], QLineEdit)
+                and firstMetadata.get("inlineContingent") is True
+            )
+
+            if inlineText:
+                following = rows[index + 1] if index + 1 < len(rows) else None
+                controllerName = firstMetadata.get("contingentOn")
+
+                if (
+                    boolean(following)
+                    and sameScope(first, following)
+                    and following["traitName"] == controllerName
+                    and not firstMetadata.get("rowBreakAfter", False)
+                    and not metadata(following).get("rowBreakBefore", False)
+                    and "rowLabel" not in metadata(following)
+                ):
+                    members = [first, following]
+                    pairCount = 2
+                else:
+                    pglMessages.warning(
+                        f"{first['traitName']}: inlineContingent requires an "
+                        "immediately following visible controlling Boolean "
+                        "without an intervening row break. Keeping ordinary layout."
+                    )
+                    index += 1
+                    continue
+
+            elif boolean(first) and "rowLabel" in firstMetadata:
+                members = [first]
+
+            else:
+                # Neither existing opt-in mechanism starts a group here.
+                index += 1
+                continue
+
+            nextIndex = index + len(members)
+
+            while nextIndex < len(rows):
+                candidate = rows[nextIndex]
+
+                if metadata(members[-1]).get("rowBreakAfter", False): break
+                if not boolean(candidate): break
+                if not sameScope(first, candidate): break
+                if metadata(candidate).get("rowBreakBefore", False): break
+                if "rowLabel" in metadata(candidate): break
+
+                members.append(candidate)
+                nextIndex += 1
+
+            plans.append((members, pairCount))
+            index = nextIndex
+
+        for members, pairCount in plans:
+            self._makeCompactTraitRow(members, pairCount)
+
+    ################################################################
+    # Build one grouped row from already-registered controls
+    ################################################################
+    def _makeCompactTraitRow(self, entries, pairCount=0):
+        """Move controls without replacing their signals or backing objects."""
+        form = self.formLayout
+        first = entries[0]
+        trait = first["trait"]
+
+        firstRow, role = form.getWidgetPosition(first["widget"])
+        if firstRow < 0:
+            raise RuntimeError("Could not locate a trait row for compact layout")
+
+        # takeRow() removes layout items without deleting their widgets.
+        for entry in entries:
+            removed = form.takeRow(entry["widget"])
+            if removed.fieldItem is None:
+                raise RuntimeError(f"Could not remove row for {entry['traitName']}")
+
+            oldLabel = entry.get("label")
+            if oldLabel is not None:
+                oldLabel.hide()
+                oldLabel.deleteLater()
+
+        container = QWidget()
+        container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        flow = _pglTraitFlowLayout(container)
+
+        pair = None
+        if pairCount:
+            pairWidget = QWidget()
+            pairLayout = QHBoxLayout(pairWidget)
+            pairLayout.setContentsMargins(0, 0, 0, 0)
+            pairLayout.setSpacing(8)
+
+            textEntry, controllerEntry = entries[:2]
+            textWidget = textEntry["widget"]
+            textWidget.setMinimumWidth(160)
+            textWidget.setMaximumWidth(240)
+            textWidget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+
+            controller = controllerEntry["widget"]
+            controller.setText(str(controllerEntry["trait"].metadata.get(
+                "traitDisplayName", controllerEntry["traitName"]
+            )))
+            controller.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+
+            pairLayout.addWidget(textWidget)
+            pairLayout.addWidget(controller)
+            flow.addWidget(pairWidget)
+            pair = (pairWidget, entries[:2])
+
+        for entry in entries[pairCount:]:
+            checkbox = entry["widget"]
+            checkbox.setText(str(entry["trait"].metadata.get(
+                "traitDisplayName", entry["traitName"]
+            )))
+            checkbox.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+            flow.addWidget(checkbox)
+
+        # Existing naming remains the fallback when no row label is supplied.
+        rowLabelText = trait.metadata.get(
+            "rowLabel", trait.metadata.get("traitDisplayName", first["traitName"])
+        )
+        rowLabel = QLabel(str(rowLabelText))
+        rowLabel.setObjectName("traitLabel")
+        rowLabel.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        rowLabel.setToolTip(self._helpText(first["traitName"], trait))
+
+        form.insertRow(firstRow, rowLabel, container)
+
+        group = _pglCompactTraitGroup(form, container, entries, pair=pair)
+        adapter = _pglCompactRowLayout(form, group)
+
+        for entry in entries:
+            # "row" remains the individual field. Contingencies must never
+            # disable the shared container or the controlling checkbox.
+            entry["row"] = entry["widget"]
+            entry["label"] = None
+            entry["layout"] = adapter
+            entry["compactGroup"] = group
+
+        self._compactGroups.append(group)
+        group.refresh()
+        
+    ################################################################
+    # Show all form rows unless limited by the available screen height
+    ################################################################
+    def _fitDialogToContents(self):
+        """
+        Fit the dialog to its current form contents and current width.
+
+        No arbitrary height cap. The screen's available geometry limits the
+        window, leaving a small margin around its frame.
+
+        Called during initial construction and once after Qt resolves layout.
+        Does not repeatedly override subsequent user resizing.
+        """
+        import math
+
+        formWidget = self.formLayout.parentWidget()
+        if formWidget is None: return
+
+        # Find this form's scroll area, not a nested multi-select scroll area.
+        scroll = formWidget.parentWidget()
+        while scroll is not None and not isinstance(scroll, QScrollArea):
+            scroll = scroll.parentWidget()
+        if scroll is None: return
+
+        mainLayout = self.layout()
+        screen = self.screen() or QApplication.primaryScreen()
+        if mainLayout is None or screen is None: return
+
+        available = screen.availableGeometry()
+        screenMargin = 12
+
+        frameWidth = max(0, self.frameGeometry().width() - self.width())
+        frameHeight = max(0, self.frameGeometry().height() - self.height())
+
+        maxClientWidth = max(1, available.width() - 2 * screenMargin - frameWidth)
+        maxClientHeight = max(1, available.height() - 2 * screenMargin - frameHeight)
+
+        # Respect the existing/requested width unless it exceeds the screen.
+        if self.minimumWidth() > maxClientWidth:
+            self.setMinimumWidth(maxClientWidth)
+        if self.minimumHeight() > maxClientHeight:
+            self.setMinimumHeight(maxClientHeight)
+
+        targetWidth = min(self.width(), maxClientWidth)
+        self.resize(targetWidth, min(self.height(), maxClientHeight))
+
+        mainLayout.invalidate()
+        mainLayout.activate()
+
+        # Determine the available form width without a vertical scrollbar.
+        # If scrolling is needed, remeasure with space reserved for it.
+        noScrollWidth = max(
+            1,
+            scroll.width() - 2 * scroll.frameWidth(),
+        )
+
+        def formHeightForWidth(width):
+            self.formLayout.invalidate()
+            if self.formLayout.hasHeightForWidth():
+                height = self.formLayout.totalHeightForWidth(width)
+            else:
+                height = self.formLayout.totalSizeHint().height()
+
+            if height < 0:
+                height = self.formLayout.totalSizeHint().height()
+
+            return max(formWidget.minimumHeight(), int(math.ceil(height)))
+
+        # Account for everything outside the form's scroll viewport:
+        # button bar, main-layout margins, spacing, and scroll-area frame.
+        margins = mainLayout.contentsMargins()
+        outsideHeight = margins.top() + margins.bottom()
+        visibleItems = []
+
+        for index in range(mainLayout.count()):
+            item = mainLayout.itemAt(index)
+            if item.isEmpty(): continue
+            visibleItems.append(item)
+
+            if item.widget() is not scroll:
+                outsideHeight += max(
+                    item.sizeHint().height(),
+                    item.minimumSize().height(),
+                )
+
+        outsideHeight += max(0, len(visibleItems) - 1) * max(0, mainLayout.spacing())
+        outsideHeight += 2 * scroll.frameWidth()
+
+        desiredHeight = formHeightForWidth(noScrollWidth) + outsideHeight
+
+        if desiredHeight > maxClientHeight:
+            scrollbarWidth = scroll.verticalScrollBar().sizeHint().width()
+            desiredHeight = (
+                formHeightForWidth(max(1, noScrollWidth - scrollbarWidth))
+                + outsideHeight
+            )
+
+        targetHeight = min(
+            maxClientHeight,
+            max(self.minimumHeight(), desiredHeight),
+        )
+        self.resize(targetWidth, targetHeight)
+        mainLayout.activate()
+
+        # Keep the resized frame within the available desktop.
+        # Center vertically so growing the window does not push its bottom
+        # offscreen from the earlier, shorter window position.
+        frame = self.frameGeometry()
+        minX = available.left() + screenMargin
+        maxX = available.right() - screenMargin - frame.width() + 1
+
+        x = max(minX, min(frame.left(), maxX))
+        y = available.top() + max(0, (available.height() - frame.height()) // 2)
+        self.move(x, y)
 #####################################################################
 # Helper class uses by settingsList which retargets fields
 #####################################################################

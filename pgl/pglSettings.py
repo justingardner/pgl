@@ -986,6 +986,146 @@ class pglSettingsManager:
             original.settingsList = []
 
         cls._saveModifiedSettings(modified, original)
+        
+    ################################################################
+    # LabJack preset storage
+    ################################################################
+    @classmethod
+    def getLabJackSettingsDir(cls):
+        """Get the directory containing named LabJack acquisition presets."""
+        settingsDir = cls.getPGLSettingsDir() / "labjack"
+        settingsDir.mkdir(parents=True, exist_ok=True)
+        return settingsDir
+
+    ################################################################
+    # Load LabJack presets without automatically publishing changes
+    ################################################################
+    @classmethod
+    def getLabJackSettings(cls, settingsName=None, settings=None, returnSettingsList=False):
+        """
+        Load LabJack acquisition presets.
+
+        Explicit settings take precedence over settingsName.
+        returnSettingsList=True returns all saved presets, default first.
+        With no saved presets, the list is empty and default lookup returns None.
+
+        Reads do not repair defaults or automatically save a new preset.
+        Explicit named lookup remains possible if the overall default
+        selection needs repair in the preset editor.
+        """
+        if not returnSettingsList:
+            if settings is not None:
+                if not isinstance(settings, pglLabJackSettings):
+                    raise TypeError("settings must be pglLabJackSettings")
+                settings.getDigitalReadConfig()
+                return settings
+
+            if settingsName is not None:
+                if not isinstance(settingsName, str):
+                    raise TypeError("settingsName must be a string")
+
+                filename = pglStorage.makeValidFilename(settingsName)
+                if not filename or filename.casefold() == "none":
+                    raise ValueError("Supply a valid LabJack preset name")
+
+                settingsPath = cls.getLabJackSettingsDir() / f"{filename}.json"
+                if not settingsPath.is_file():
+                    raise FileNotFoundError(f"LabJack preset not found: {settingsPath}")
+
+                loaded = pglLabJackSettings.load(filename=settingsPath)
+                if not isinstance(loaded, pglLabJackSettings):
+                    raise ValueError(f"Could not restore LabJack preset: {settingsPath}")
+
+                loaded.getDigitalReadConfig()
+                return loaded
+
+        settingsList = []
+        identities = set()
+
+        for settingsPath in sorted(cls.getLabJackSettingsDir().glob("*.json")):
+            loaded = pglLabJackSettings.load(filename=settingsPath)
+            if not isinstance(loaded, pglLabJackSettings):
+                raise ValueError(f"Could not restore LabJack preset: {settingsPath}")
+
+            loaded.getDigitalReadConfig()
+            if not loaded.uuid or loaded.uuid in identities:
+                raise ValueError(f"Missing or duplicate LabJack preset UUID: {settingsPath}")
+
+            identities.add(loaded.uuid)
+            settingsList.append(loaded)
+
+        if not settingsList:
+            return [] if returnSettingsList else None
+
+        defaults = [preset for preset in settingsList if preset.isDefault]
+
+        if len(defaults) == 1:
+            selectedDefault = defaults[0]
+            settingsList = [selectedDefault] + [
+                preset for preset in settingsList if preset is not selectedDefault
+            ]
+        else:
+            message = (
+                f"Expected one default LabJack preset; found {len(defaults)}. "
+                "Use labJackSettings() to select a default."
+            )
+            if not returnSettingsList: raise ValueError(message)
+            pglMessages.warning(message)
+
+        return settingsList if returnSettingsList else settingsList[0]
+
+    ################################################################
+    # Edit named LabJack presets
+    ################################################################
+    @classmethod
+    def labJackSettings(cls):
+        """Edit named presets; Cancel leaves saved preset files unchanged."""
+        savedSettings = cls.getLabJackSettings(returnSettingsList=True)
+        original = pglLabJackSettingsList(savedSettings)
+
+        modified = pglDialogs.traitsDialog(original)
+        if modified is None: return
+
+        if not isinstance(modified, pglLabJackSettingsList):
+            raise TypeError("LabJack editor returned an unexpected settings type")
+
+        if not modified.settingsList:
+            pglMessages.warning("At least one LabJack preset is required. No presets were saved.")
+            return
+
+        filenames = set()
+        identities = set()
+
+        try:
+            for preset in modified.settingsList:
+                preset.getDigitalReadConfig()
+
+                filename = pglStorage.makeValidFilename(preset.name)
+                if not filename or filename.casefold() == "none":
+                    raise ValueError(
+                        "Preset names must be filename-compatible and different from 'None'."
+                    )
+                if filename.casefold() in filenames:
+                    raise ValueError(f"Conflicting preset filename for {preset.name!r}.")
+                if not preset.uuid or preset.uuid in identities:
+                    raise ValueError(f"Missing or duplicate preset identity for {preset.name!r}.")
+
+                filenames.add(filename.casefold())
+                identities.add(preset.uuid)
+
+            if sum(preset.isDefault for preset in modified.settingsList) != 1:
+                raise ValueError("Select exactly one default LabJack preset.")
+
+        except (TypeError, ValueError) as error:
+            pglMessages.warning(f"{error} No LabJack presets were saved.")
+            return
+
+        # A starter draft is new even if accepted without editing.
+        if not savedSettings: original.settingsList = []
+
+        # Use existing UUID-based save/rename/trash behavior.
+        # Like the existing editors, this is not a multi-file transaction.
+        cls._saveModifiedSettings(modified, original)
 
 
 ##################################################
@@ -1211,6 +1351,344 @@ class pglTraitSettings(HasTraits, pglSerialize):
 
         validateValue(self, type(self).__name__)
         return allValid
+
+##################################################
+# LabJack acquisition settings
+##################################################
+class pglLabJackSettings(pglTraitSettings):
+    """Named T7 digital-trigger configuration, without live hardware state."""
+
+    name = Unicode("New LabJack", help="Name of this LabJack preset")
+
+    volumeTriggerChannel = Unicode(
+        "FIO0",
+        traitDisplayName="Volume trigger channel",
+        help=(
+            "Physical scanner-trigger input: FIO0–FIO7 or CIO0–CIO3, "
+            "including corresponding DIO aliases. Counter verification "
+            "currently supports CIO1 only."
+        ),
+        validate="validateVolumeTriggerChannel",
+    )
+
+    volumeTriggerEdge = List(
+        Unicode(),
+        default_value=["rising", "falling"],
+        traitDisplayName="Volume trigger edge",
+        help=(
+            "Selected edge is first. Counter verification currently requires "
+            "rising; falling remains available with verification disabled."
+        ),
+        validate="validateVolumeTriggerEdge",
+    )
+
+    scanRate = Float(
+        50000.0,
+        traitDisplayName="Scan rate (Hz)",
+        help=(
+            "Requested scans per second. Counter verification streams three "
+            "addresses, so three times this rate must not exceed 100000 "
+            "samples/s. The rate is never silently reduced."
+        ),
+        validate="validateScanRate",
+    )
+
+    scansPerRead = Int(
+        1000,
+        min=1,
+        traitDisplayName="Scans per read",
+        help=(
+            "Scans returned per read. Nominal batch duration is "
+            "scansPerRead / scanRate seconds."
+        ),
+        validate="validateScansPerRead",
+    )
+
+    streamBufferSizeBytes = Int(
+        32768,
+        min=4096,
+        max=32768,
+        traitDisplayName="Stream buffer (bytes)",
+        help=(
+            "T7 device buffer: 4096, 8192, 16384, or 32768 bytes. "
+            "More buffering does not fix sustained overload."
+        ),
+        validate="validateStreamBufferSizeBytes",
+    )
+
+    verifyTriggerCounter = Bool(
+        True,
+        traitDisplayName="Verify trigger counter",
+        help=(
+            "Compare sampled rising edges against the hardware counter. "
+            "Currently supported only for CIO1/rising. Unsupported source "
+            "or rate configurations raise at acquisition startup. "
+            "The driver reports deficits; the experiment estimates timestamps."
+        ),
+        validate="validateBoolean",
+    )
+
+    autoRestartOnStreamOverflow = Bool(
+        True,
+        traitDisplayName="Automatically restart stream",
+        help=(
+            "Restart after recognized returned stream-discontinuity markers. "
+            "Preserve diagnostics and start a new timing segment. "
+            "Currently does not recover native LJM read exceptions. "
+            "Independent of counter verification."
+        ),
+        validate="validateBoolean",
+    )
+
+    maxStreamRestartAttempts = Int(
+        3,
+        min=1,
+        traitDisplayName="Restart attempts per occurrence",
+        help=(
+            "Maximum restart attempts for each discontinuity. Retries require "
+            "confirmed stopped-stream ownership; unsafe failures stop sooner."
+        ),
+        validate="validateScansPerRead",
+    )
+
+    streamRestartDelay = Float(
+        0.05,
+        min=0.0,
+        traitDisplayName="Restart delay (seconds)",
+        help=(
+            "Delay before each restart attempt. A stop or close request "
+            "cancels recovery."
+        ),
+        validate="validateStreamRestartDelay",
+    )
+    
+    repairMissingVolumeTriggers = Bool(
+        True,
+        traitDisplayName="Repair missing volume triggers",
+        help=(
+            "Let the experiment reconstruct counter-confirmed missing volume "
+            "triggers using eligible measured intervals. Requires counter "
+            "verification. Estimated events are marked and audited; stimulus "
+            "timing and the start/ignore boundary are not changed retroactively."
+        ),
+    )
+
+    volumeTriggerMedianWindow = Int(
+        10,
+        min=1,
+        traitDisplayName="Volume interval median window",
+        help=(
+            "Maximum number of recent eligible counter-verified measured "
+            "intervals used by the experiment to estimate missing timestamps."
+        ),
+    )
+
+    volumeTriggerMinIntervals = Int(
+        3,
+        min=1,
+        traitDisplayName="Minimum verified volume intervals",
+        help=(
+            "Minimum eligible measured intervals required for reconstruction. "
+            "Must not exceed the median window."
+        ),
+    )
+
+    def getVolumeTriggerRepairConfig(self):
+        """Return validated experiment-side repair options without mutation."""
+        enabled = self.repairMissingVolumeTriggers
+        window = self.volumeTriggerMedianWindow
+        minimum = self.volumeTriggerMinIntervals
+
+        if type(enabled) is not bool:
+            raise TypeError("repairMissingVolumeTriggers must be Boolean.")
+
+        for name, value in (
+            ("volumeTriggerMedianWindow", window),
+            ("volumeTriggerMinIntervals", minimum),
+        ):
+            if (
+                isinstance(value, (bool, np.bool_))
+                or not isinstance(value, (int, np.integer))
+                or value < 1
+            ):
+                raise ValueError(f"{name} must be a positive integer.")
+
+        if minimum > window:
+            raise ValueError(
+                "volumeTriggerMinIntervals must not exceed volumeTriggerMedianWindow."
+            )
+
+        return {
+            "repairMissingVolumeTriggers": enabled,
+            "volumeTriggerMedianWindow": int(window),
+            "volumeTriggerMinIntervals": int(minimum),
+        }
+
+    ################################################################
+    # Canonical physical input naming
+    ################################################################
+    @staticmethod
+    def normalizeVolumeTriggerChannel(value):
+        """Return a supported canonical input name, or raise ValueError."""
+        if not isinstance(value, str):
+            raise ValueError("Volume trigger channel must be a physical pin name")
+
+        match = re.fullmatch(r"(FIO|CIO|DIO)([0-9]+)", value.strip().upper())
+        if match is None:
+            raise ValueError(f"Invalid LabJack input name: {value!r}")
+
+        group, index = match.group(1), int(match.group(2))
+
+        if group == "FIO" and 0 <= index <= 7: return f"FIO{index}"
+        if group == "CIO" and 0 <= index <= 3: return f"CIO{index}"
+        if group == "DIO" and 0 <= index <= 7: return f"FIO{index}"
+        if group == "DIO" and 16 <= index <= 19: return f"CIO{index - 16}"
+
+        raise ValueError(
+            f"Unsupported LabJack digital input: {value!r}. "
+            "Use FIO0–FIO7 or CIO0–CIO3, or their supported DIO aliases."
+        )
+
+    ################################################################
+    # Dialog validation callbacks
+    ################################################################
+    def validateVolumeTriggerChannel(self, value):
+        try:
+            self.normalizeVolumeTriggerChannel(value)
+            return True
+        except (TypeError, ValueError):
+            return False
+
+    def validateVolumeTriggerEdge(self, value):
+        # The dialog keeps the selected edge first.
+        return (
+            isinstance(value, list)
+            and 1 <= len(value) <= 2
+            and all(isinstance(edge, str) and edge in ("rising", "falling") for edge in value)
+            and len(set(value)) == len(value)
+        )
+
+    def validateScanRate(self, value):
+        if isinstance(value, (bool, np.bool_)): return False
+        try:
+            return bool(np.isfinite(value) and 0 < value <= 100000)
+        except (TypeError, ValueError):
+            return False
+
+    def validateScansPerRead(self, value):
+        return (
+            not isinstance(value, (bool, np.bool_))
+            and isinstance(value, (int, np.integer))
+            and value > 0
+        )
+
+    def validateStreamBufferSizeBytes(self, value):
+        return (
+            not isinstance(value, (bool, np.bool_))
+            and isinstance(value, (int, np.integer))
+            and value in (4096, 8192, 16384, 32768)
+        )
+
+    def validateBoolean(self, value):
+        return type(value) is bool
+
+    def validateStreamRestartDelay(self, value):
+        if isinstance(value, (bool, np.bool_)): return False
+        try:
+            return bool(np.isfinite(value) and value >= 0)
+        except (TypeError, ValueError):
+            return False
+
+    ################################################################
+    # Validate without silently resetting acquisition values
+    ################################################################
+    def getDigitalReadConfig(self):
+        """
+        Return independent, validated acquisition arguments.
+
+        Individual setting validation is separate from the driver's combined
+        hardware-capability validation. This permits editing/loading a preset
+        without silently changing its source or disabling verification.
+
+        startDigitalRead() rejects unsupported pin/edge/rate combinations
+        before configuring hardware.
+        """
+        checks = (
+            ("volumeTriggerChannel", self.validateVolumeTriggerChannel),
+            ("volumeTriggerEdge", self.validateVolumeTriggerEdge),
+            ("scanRate", self.validateScanRate),
+            ("scansPerRead", self.validateScansPerRead),
+            ("streamBufferSizeBytes", self.validateStreamBufferSizeBytes),
+            ("verifyTriggerCounter", self.validateBoolean),
+            ("autoRestartOnStreamOverflow", self.validateBoolean),
+            ("maxStreamRestartAttempts", self.validateScansPerRead),
+            ("streamRestartDelay", self.validateStreamRestartDelay),
+        )
+
+        for fieldName, validator in checks:
+            value = getattr(self, fieldName)
+            if not validator(value):
+                raise ValueError(
+                    f"LabJack preset {self.name!r}: invalid {fieldName}: {value!r}"
+                )
+
+        return {
+            "channels": self.normalizeVolumeTriggerChannel(self.volumeTriggerChannel),
+            "edge": self.volumeTriggerEdge[0],
+            "scanRate": float(self.scanRate),
+            "scansPerRead": int(self.scansPerRead),
+            "streamBufferSizeBytes": int(self.streamBufferSizeBytes),
+            "verifyTriggerCounter": self.verifyTriggerCounter,
+            "autoRestartOnStreamOverflow": self.autoRestartOnStreamOverflow,
+            "maxStreamRestartAttempts": int(self.maxStreamRestartAttempts),
+            "streamRestartDelay": float(self.streamRestartDelay),
+        }
+
+    ################################################################
+    # Persistence
+    ################################################################
+    def save(self, filename=None, filesystem=None, filesystemPrefix=None):
+        """Save a validated preset using the existing JSON serializer."""
+        self.getDigitalReadConfig()
+        if filename is None: filename = self.saveDir()
+        return super().save(
+            filename=filename,
+            filesystem=filesystem,
+            filesystemPrefix=filesystemPrefix,
+        )
+
+    def saveDir(self):
+        """Return the named preset's JSON path."""
+        filename = pglStorage.makeValidFilename(self.name)
+        if not filename or filename.casefold() == "none":
+            raise ValueError("LabJack presets require a filename-compatible name other than 'None'")
+        return pglSettingsManager.getLabJackSettingsDir() / f"{filename}.json"
+
+##################################################
+# LabJack preset editor
+##################################################
+class pglLabJackSettingsList(pglTraitSettings):
+    settingsList = List(
+        Instance(pglLabJackSettings),
+        buttons=True,
+        setDefault=True,
+        settingsListKey="name",
+        traitDisplayName="Choose LabJack preset",
+        help=(
+            "Add, copy, delete, and edit LabJack acquisition presets. "
+            "The explicitly marked default is used when no preset is selected."
+        ),
+    )
+
+    def __init__(self, settingsList=None):
+        super().__init__()
+
+        # Empty storage creates only an editor draft. Cancel must not save it.
+        self.settingsList = (
+            list(settingsList)
+            if settingsList
+            else [pglLabJackSettings(name="Default LabJack", isDefault=True)]
+        )
 
 ##################################################
 # pglToolSettings
@@ -2130,45 +2608,41 @@ class pglSettings(pglTraitSettings):
     startKey = Unicode("space", allow_none=True, help="Key to start experiment")
     endKey = Unicode("escape", allow_none=True, help="Key to end experiment")
     volumeTriggerKey = Unicode("`", allow_none=True, help="Key press that signals scanner volume acquisition trigger")
-    responseKeys = Unicode("1234", help="Keys used for subject responses. Can be a string like \"1234\" or a comma-separated list like 'left,right,up,down' and will map to response 0,1,2,etc")
+    responseKeys = Unicode("1234", help="Keys used for subject responses. Use compact characters such as 1234 or asdf, or comma-separated key names such as left,right,up,down,space,return. Other examples include tab,escape,delete,enter,f1,f2. A recognized single name such as left or space denotes one key. Listed order maps to response 0,1,2,etc.")
+    
     ignoreInitialVolumes = Int(0, min=0, step=1, help="Number of initial volumes to ignore")
-    eatKeys = Bool(True, help="Whether to eat keypresses so they don't propagate to the OS. Will only eat the keys specified above.")
-    startOnVolumeTrigger = Bool(False, help="Whether to start the experiment on a keyboard or digital scanner-volume trigger")
-    startScreen = List(Unicode(), default_value=["fixation cross", "blank", "waiting message"],help="What to show on the screen before the experiment starts.")
+
+    specialKeysToEat = Unicode("", rowLabel="eat keys", traitDisplayName="Special keys", contingentOn="eatSpecialKeys", inlineContingent=True, help="Additional keys to suppress from other applications. Use compact characters such as asdf, or comma-separated key names such as a,s,d,f,left,right,up,down,space,return,tab,escape,delete,f1. A recognized single name such as left or space denotes one key. Keys remain available to the experiment; Escape retains its fail-safe behavior.")
+    eatSpecialKeys = Bool(False, traitDisplayName="Special", help="Suppress the additional keys entered beside this checkbox.")
+    eatKeys = Bool(True, traitDisplayName="Experiment", help="Suppress configured start, end, scanner-volume, and response keys from other applications. Keys remain available to the experiment.")
+    eatAllKeys = Bool(False, traitDisplayName="All", rowBreakAfter=True, help="Suppress all captured keyboard keys from other applications. Escape still releases suppression and remains available to end the experiment.")
+
+    startOnVolumeTrigger = Bool(False, rowLabel='start experiment', help="Whether to start the experiment on a keyboard or digital scanner-volume trigger")
     manualPreStart = Bool(False, help="Whether to manually start the experiment before the volume trigger")
-    closeScreenOnEnd = Bool(True, help="Whether to close the screen when the experiment ends")
     verbose = Bool(False, help="Typically set to False so that only essential messages and warnings are printed during experiment run")
+    startScreen = List(Unicode(), default_value=["fixation cross", "blank", "waiting message"],help="What to show on the screen before the experiment starts.")
+    closeScreenOnEnd = Bool(True, rowLabel='end experiment', help="Whether to close the screen when the experiment ends")
     saveAbortedRunsToTrash = Bool(True, help="When a run is detected as aborted, saves that run into trash of the session directory")
     backgroundColor = List(trait=Float(min=0.0, max=1.0), default_value=[0.5, 0.5, 0.5],minlen=3,maxlen=3,help="Background color as a list of RGB values").tag(isRGB=True)
     stencil = List(Instance(pglStencilSettings),settingsListKey="name",highlightSelector=False,hideAll=True,traitDisplayName="stencil",help="Stencil preset to use. Edit presets with pgl.stencilSettings(). None disables masking.")
-    _digitalIO = List(Instance(pglItem), default_value=[pglItem(name='DATAPixx'),pglItem(name='LabJack')], settingsListKey="name", multiSelect=True, style="dropdown", traitDisplayName="digitalIO", help='Select which devices to use for digital IO',visible=True)
+    _digitalIO = List(Instance(pglItem),settingsListKey="name",multiSelect=True,style="dropdown",traitDisplayName="digitalIO",help="Select digital output devices and scanner-trigger acquisition.",visible=True)
+    labJack = List(Instance(pglLabJackSettings),settingsListKey="name",highlightSelector=False,hideAll=True,traitDisplayName="LabJack preset",help="LabJack trigger-acquisition preset. Edit presets with pgl.labJackSettings(). Selecting a preset does not enable acquisition; select LabJack digital trigger under digitalIO.")        
     _devices = List(Instance(pglItem), settingsListKey="name", multiSelect=True, style="dropdown", traitDisplayName="devices", help="Select input devices for responses and scanner triggers", visible=True)
-
-    # Scanner-trigger configuration for the selected digital trigger device.
-    volumeTriggerChannel = Unicode("FIO0", traitDisplayName="Volume trigger channel", help="Physical digital input connected to the scanner trigger. Use the selected device's channel naming convention, for example FIO0 or EIO0 for LabJack.")
-    volumeTriggerEdge = List(Unicode(), default_value=["rising", "falling"], traitDisplayName="Volume trigger edge", help="Rising detects LOW to HIGH; falling detects HIGH to LOW. Choose the pulse's active edge so each pulse counts once.")    
     eyetracker = List(Unicode(), default_value=['None', 'Eyelink', 'TRACKPixx'], help="Eyetracker")
     
     def __init__(self, refreshDisplays=True):
         super().__init__()
 
-        # Keep refreshDisplays=False free of environment discovery.
-        # fromJSONdict() uses this when restoring recorded settings.
+        # Recorded-settings restoration must not discover current hardware
+        # or replace recorded selections with current presets.
         if refreshDisplays:
             self.reloadDisplays()
             self.reloadStencils()
-            
-    @property
-    def digitalIO(self):
-        return [d.name for d in self._digitalIO if d.isSelected]
-
-    @property
-    def devices(self):
-        return [d.name for d in self._devices if d.isSelected]
+            self.reloadLabJackSettings()
 
     @classmethod
     def load(cls, filename, filesystem=None, refresh=True):
-        """Load settings; use refresh=False to preserve recorded values."""
+        """Load settings; refresh=False preserves embedded recorded values."""
         obj = super().load(filename=filename, filesystem=filesystem)
         if obj is None:
             pglMessages.warning(f"Could not load settings from {filename}")
@@ -2177,11 +2651,117 @@ class pglSettings(pglTraitSettings):
         if refresh:
             obj.reloadDisplays()
             obj.reloadStencils()
-            obj.reconcileDefaults('_digitalIO')
-            obj.reconcileDefaults('_devices')
-            obj.reconcileDefaults('eyetracker')
+            obj.reloadLabJackSettings()
+            obj.reconcileDefaults("_digitalIO")
+            obj.reconcileDefaults("_devices")
+            obj.reconcileDefaults("eyetracker")
 
         return obj
+
+    @classmethod
+    def fromJSONdict(cls, data, type="all", filename=None):
+        """
+        Restore settings without discovering displays or current presets.
+
+        Ordinary loading ignores obsolete top-level LabJack trigger fields.
+        Move the old trigger-device choice to digitalIO, preserving selection.
+
+        Historical settings are not populated with today's LabJack default.
+        Normal load(refresh=True) resolves defaults afterward.
+
+        Strict restoration rejects documents requiring these changes rather
+        than silently discarding or rewriting serialized metadata.
+        """
+        from .pglSerialize import _pglStrictRestorePath
+
+        if not isinstance(data, dict):
+            raise TypeError("Settings restoration requires a dictionary")
+
+        obsoleteFields = {
+            "volumeTriggerChannel",
+            "volumeTriggerEdge",
+            "labJackMigration",
+        }.intersection(data)
+
+        oldDevices = data.get("_devices", [])
+        legacyItems = [
+            item for item in oldDevices
+            if isinstance(item, pglItem)
+            and item.name.casefold() == "labjack digital trigger"
+        ]
+
+        if _pglStrictRestorePath.get() is not None and (obsoleteFields or legacyItems):
+            raise ValueError(
+                "These settings contain obsolete trigger fields or device "
+                "selection metadata. Ordinary loading supports them, but "
+                "strict restoration cannot discard or change that metadata."
+            )
+
+        # Do not mutate the decoded source objects or their selection flags.
+        restoredData = deepcopy(data)
+
+        # Obsolete fields are not acquisition configuration anymore.
+        for fieldName in obsoleteFields: restoredData.pop(fieldName)
+
+        if legacyItems:
+            devices = list(restoredData["_devices"])
+            movedItems = [
+                item for item in devices
+                if isinstance(item, pglItem)
+                and item.name.casefold() == "labjack digital trigger"
+            ]
+            restoredData["_devices"] = [
+                item for item in devices
+                if not (
+                    isinstance(item, pglItem)
+                    and item.name.casefold() == "labjack digital trigger"
+                )
+            ]
+
+            # Preserve ordinary choices when an old document omitted this list.
+            digitalIO = list(restoredData.get("_digitalIO", [
+                pglItem(name="DATAPixx"),
+                pglItem(name="LabJack"),
+                pglItem(name="LabJack digital trigger"),
+            ]))
+
+            matching = [
+                item for item in digitalIO
+                if isinstance(item, pglItem)
+                and item.name.casefold() == "labjack digital trigger"
+            ]
+
+            if not matching:
+                matching = [pglItem(name="LabJack digital trigger")]
+                digitalIO.extend(matching)
+
+            # Preserve an enabled selection from either location.
+            selected = any(item.isSelected for item in movedItems + matching)
+            for item in matching:
+                item.name = "LabJack digital trigger"
+                item.isSelected = selected
+
+            restoredData["_digitalIO"] = digitalIO
+
+        obj = cls(refreshDisplays=False)
+        obj.updateTraitsFromDict(restoredData, filename=filename)
+        return obj
+
+    ################################################################
+    # Default input-device choices
+    ################################################################
+    @default("_devices")
+    def _defaultDevices(self):
+        """Create fresh non-digital input choices for each settings instance."""
+        return [pglItem(name="RESPONSEPixx")]
+            
+    @property
+    def digitalIO(self):
+        return [d.name for d in self._digitalIO if d.isSelected]
+
+    @property
+    def devices(self):
+        return [d.name for d in self._devices if d.isSelected]
     
     @default("username")
     def _defaultUsername(self):
@@ -2190,12 +2770,6 @@ class pglSettings(pglTraitSettings):
         except (ImportError, KeyError, OSError):
             pglMessages.warning("Could not determine the OS username. Set username in pglSettings before saving to the data store.", level=0)
             return ""
-    @classmethod
-    def fromJSONdict(cls, data, type="all", filename=None):
-        """Restore saved values without discovering current displays."""
-        obj = cls(refreshDisplays=False)
-        obj.updateTraitsFromDict(data, filename=filename)
-        return obj
     
     #classmethod
     def reconcileDefaults(self, traitName):
@@ -2382,13 +2956,84 @@ class pglSettings(pglTraitSettings):
         self.stencil = available
         
     ################################################################
-    # Default input-device choices
+    # Default digital-IO choices
     ################################################################
-    @default("_devices")
-    def _defaultDevices(self):
-        """Create fresh device-selection objects for each settings instance."""
-        # Avoid sharing mutable selection objects between settings instances.
-        return [pglItem(name="RESPONSEPixx"), pglItem(name="LabJack digital trigger")]
+    @default("_digitalIO")
+    def _defaultDigitalIO(self):
+        """Create independent input/output selection objects."""
+        return [
+            pglItem(name="DATAPixx"),
+            pglItem(name="LabJack"),
+            pglItem(name="LabJack digital trigger"),
+        ]
+
+    ################################################################
+    # Refresh named presets while preserving explicit selection
+    ################################################################
+    def reloadLabJackSettings(self):
+        """
+        Refresh available presets without replacing a missing selected preset.
+
+        An empty selection resolves to the explicitly marked saved default.
+        Existing selections match by UUID, not by name.
+
+        Does not save or repair preset files.
+        """
+        selected = self.labJack[0] if self.labJack else None
+        available = pglSettingsManager.getLabJackSettings(returnSettingsList=True)
+
+        if selected is None:
+            if not available:
+                self.labJack = []
+                return
+
+            defaults = [preset for preset in available if preset.isDefault]
+            if len(defaults) != 1:
+                raise ValueError("Select exactly one default LabJack preset before using it")
+
+            selected = defaults[0]
+
+        matching = next(
+            (preset for preset in available if preset.uuid == selected.uuid),
+            None,
+        )
+
+        if matching is not None:
+            selected = matching
+        elif available or self.labJack:
+            pglMessages.message(
+                f"Keeping embedded LabJack preset {selected.name!r}; "
+                "its UUID is not present in the saved preset directory."
+            )
+
+        self.labJack = [selected] + [
+            preset for preset in available if preset.uuid != selected.uuid
+        ]
+
+    ################################################################
+    # Resolve a validated acquisition snapshot
+    ################################################################
+    def getLabJackPreset(self):
+        """
+        Return an independent, validated selected LabJack preset.
+
+        No discovery, hardware access, settings mutation, or persistent writes.
+        Normal settings refresh supplies the saved default when unselected.
+        """
+        if not self.labJack:
+            raise ValueError(
+                "No LabJack preset is selected. Create a default with "
+                "labJackSettings(), then reload/select it in settings."
+            )
+
+        selected = self.labJack[0]
+        if not isinstance(selected, pglLabJackSettings):
+            raise TypeError("Selected LabJack preset has an unexpected type")
+
+        selected.getDigitalReadConfig()
+        return deepcopy(selected)    
+
+        
                         
 class pglSettingsList(pglTraitSettings):
 

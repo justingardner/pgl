@@ -747,273 +747,669 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
     ################################################################
     # Start digital acquisition on the existing LabJack connection
     ################################################################
-    def startDigitalRead(self, channels=("FIO0",), edge="rising", scanRate=1000.0, scansPerRead=100):
+    def startDigitalRead(
+        self, channels=("FIO0",), edge="rising", scanRate=1000.0,
+        scansPerRead=100, streamBufferSizeBytes=32768,
+        verifyTriggerCounter=False,
+        autoRestartOnStreamOverflow=True,
+        maxStreamRestartAttempts=3,
+        streamRestartDelay=0.05,
+    ):
         """
-        Start continuous digital acquisition using the existing device handle.
+        Start digital acquisition with explicit verification/recovery policy.
 
-        Supports one bank per acquisition:
-            FIO0–FIO7 / DIO0–DIO7
-            CIO0–CIO3 / DIO16–DIO19
+        Counter verification currently supports the tested CIO1/rising
+        configuration. It adds two stream addresses and rejects requests
+        above 100000 aggregate samples/second.
 
-        Events use canonical FIO or CIO names. Mixed-bank acquisition is
-        explicitly rejected rather than silently reading only some inputs.
-
-        Only one analog or digital stream may run on this device.
-        Pending events must be polled before restarting acquisition.
-
-        Host timestamps use the midpoint of the stream-start call as an
-        estimated sample-zero time. This is not calibrated synchronization.
-
-        Returns:
-            float: Actual scan rate returned by LJM.
-
-        Raises:
-            Exception: Invalid configuration, conflicts, or startup failure.
+        Restart attempts are bounded per discontinuity occurrence.
+        Pending events must be polled before starting another acquisition.
         """
-        import re
+        from uuid import uuid4
+        from copy import deepcopy
+        from .pglSettings import pglLabJackSettings
+
+        for name, value in (
+            ("verifyTriggerCounter", verifyTriggerCounter),
+            ("autoRestartOnStreamOverflow", autoRestartOnStreamOverflow),
+        ):
+            if type(value) is not bool: raise TypeError(f"{name} must be Boolean.")
+
+        if (
+            isinstance(maxStreamRestartAttempts, (bool, np.bool_))
+            or not isinstance(maxStreamRestartAttempts, (int, np.integer))
+            or maxStreamRestartAttempts < 1
+        ):
+            raise ValueError("maxStreamRestartAttempts must be a positive integer.")
+
+        if isinstance(streamRestartDelay, (bool, np.bool_)):
+            raise ValueError("streamRestartDelay must be finite and nonnegative.")
+        streamRestartDelay = float(streamRestartDelay)
+        if not np.isfinite(streamRestartDelay) or streamRestartDelay < 0:
+            raise ValueError("streamRestartDelay must be finite and nonnegative.")
 
         channels = [channels] if isinstance(channels, str) else list(channels)
-        if not channels: raise ValueError("At least one digital input is required")
+        if not channels: raise ValueError("At least one digital input is required.")
         if edge not in {"rising", "falling", "both"}:
-            raise ValueError("edge must be rising, falling, or both")
+            raise ValueError("edge must be rising, falling, or both.")
+
         if isinstance(scanRate, (bool, np.bool_)):
-            raise ValueError("scanRate must be finite and positive")
+            raise ValueError("scanRate must be finite and positive.")
         scanRate = float(scanRate)
         if not np.isfinite(scanRate) or scanRate <= 0:
-            raise ValueError("scanRate must be finite and positive")
-        if isinstance(scansPerRead, bool) or not isinstance(scansPerRead, int) or scansPerRead <= 0:
-            raise ValueError("scansPerRead must be a positive integer")
+            raise ValueError("scanRate must be finite and positive.")
 
-        # Normalize physical aliases before checking input/output conflicts.
+        if (
+            isinstance(scansPerRead, (bool, np.bool_))
+            or not isinstance(scansPerRead, (int, np.integer))
+            or scansPerRead <= 0
+        ):
+            raise ValueError("scansPerRead must be a positive integer.")
+        scansPerRead = int(scansPerRead)
+
+        if (
+            isinstance(streamBufferSizeBytes, (bool, np.bool_))
+            or not isinstance(streamBufferSizeBytes, (int, np.integer))
+            or streamBufferSizeBytes not in (4096, 8192, 16384, 32768)
+        ):
+            raise ValueError("streamBufferSizeBytes must be 4096, 8192, 16384, or 32768.")
+        streamBufferSizeBytes = int(streamBufferSizeBytes)
+
         channelBits = {}
-        selectedBanks = set()
-
+        banks = set()
         for channel in channels:
-            if not isinstance(channel, str): raise ValueError("Channels must be physical pin names")
-            match = re.fullmatch(r"(FIO|CIO|DIO)([0-9]+)", channel.strip().upper())
-            if match is None:
-                raise ValueError("Digital capture supports FIO0–FIO7 / DIO0–DIO7 or CIO0–CIO3 / DIO16–DIO19")
-
-            group, index = match.group(1), int(match.group(2))
-
-            if group == "FIO" and 0 <= index <= 7:
-                bank, localBit, dioBit = "FIO", index, index
-            elif group == "CIO" and 0 <= index <= 3:
-                bank, localBit, dioBit = "CIO", index, 16 + index
-            elif group == "DIO" and 0 <= index <= 7:
-                bank, localBit, dioBit = "FIO", index, index
-            elif group == "DIO" and 16 <= index <= 19:
-                bank, localBit, dioBit = "CIO", index - 16, index
-            else:
-                raise ValueError(f"Unsupported digital input: {channel!r}; use FIO0–FIO7 or CIO0–CIO3")
-
-            name = f"{bank}{localBit}"
+            name = pglLabJackSettings.normalizeVolumeTriggerChannel(channel)
             if name in channelBits: raise ValueError(f"Duplicate physical input: {name}")
-            channelBits[name] = dioBit
-            selectedBanks.add(bank)
+            bank = name[:3]
+            channelBits[name] = int(name[3:]) + (16 if bank == "CIO" else 0)
+            banks.add(bank)
 
-        if len(selectedBanks) != 1:
-            raise ValueError("One digital bank per acquisition is supported; do not mix FIO and CIO inputs")
+        if len(banks) != 1:
+            raise ValueError("Do not mix FIO and CIO inputs in one acquisition.")
 
-        bank = next(iter(selectedBanks))
+        bank = next(iter(banks))
         stateRegister = f"{bank}_STATE"
-        bankShift = 0 if bank == "FIO" else 16
-        bankMask = 255 if bank == "FIO" else 15
+        bankShift = 16 if bank == "CIO" else 0
+        bankMask = 15 if bank == "CIO" else 255
+        scanNames = [stateRegister]
+
+        if verifyTriggerCounter:
+            if channelBits != {"CIO1": 17} or edge != "rising":
+                raise ValueError(
+                    "Counter verification currently supports CIO1/rising only; "
+                    "the selected pin/edge will not be changed."
+                )
+            scanNames += ["DIO17_EF_READ_A", "STREAM_DATA_CAPTURE_16"]
+
+        if scanRate * len(scanNames) > 100000:
+            raise ValueError(
+                f"{len(scanNames)} addresses × {scanRate:g} scans/s exceeds "
+                "100000 aggregate samples/s. The rate was not changed."
+            )
 
         with self._streamControlLock:
-            if self.h is None: raise RuntimeError("LabJack is not connected")
-            if self.type != "T7": raise RuntimeError("This digital reader currently supports T7 only")
+            if self.h is None: raise RuntimeError("LabJack is not connected.")
+            if self.type != "T7": raise RuntimeError("Digital acquisition supports T7 only.")
             if self._digitalThread is not None and self._digitalThread.is_alive():
-                raise RuntimeError("Digital acquisition is already running")
+                raise RuntimeError("Digital acquisition is already running.")
             if self._digitalStreamActive:
-                raise RuntimeError("Previous digital stream did not stop successfully; close and reopen the device")
-            if self.isReading or (self.acquisitionThread is not None and self.acquisitionThread.is_alive()):
-                raise RuntimeError("Cannot start digital acquisition while analog acquisition is active")
+                raise RuntimeError("Previous stream did not stop; close/reopen the device.")
+            if getattr(self, "_digitalCounterRestore", None) is not None:
+                raise RuntimeError("Previous counter restoration is incomplete.")
+            if self.isReading or (
+                self.acquisitionThread is not None and self.acquisitionThread.is_alive()
+            ):
+                raise RuntimeError("Analog acquisition is active.")
 
             with self._digitalEventLock:
                 if self._digitalEvents:
-                    raise RuntimeError("Poll pending digital events before starting another acquisition")
+                    raise RuntimeError("Poll pending events before starting acquisition.")
 
-            # Match the existing output lock order. Configuration and stream
-            # startup must not race a pin-output configuration.
             with self._wordPulseLock:
                 with self._digitalIOLock:
                     outputBits = {config["dioBit"] for config in self.digitalChannels.values()}
-                    conflicts = outputBits.intersection(channelBits.values())
-                    if conflicts:
-                        raise RuntimeError(f"Digital inputs overlap configured output pins: {sorted(conflicts)}")
+                    if outputBits.intersection(channelBits.values()):
+                        raise RuntimeError("Selected inputs overlap configured output pins.")
 
+                    acquisitionId = str(uuid4())
                     with self._digitalEventLock:
+                        # Preserve the previous acquisition's diagnostics.
+                        if self._digitalStats:
+                            if not hasattr(self, "_digitalAcquisitionHistory"):
+                                self._digitalAcquisitionHistory = []
+                            self._digitalAcquisitionHistory.append(deepcopy(self._digitalStats))
+
                         self._digitalError = None
                         self._digitalUnknownReported = 0
                         self._digitalStats = {
+                            "acquisitionId": acquisitionId,
                             "requestedScanRate": scanRate,
                             "scanRate": None,
                             "scansPerRead": scansPerRead,
+                            "requestedStreamBufferSizeBytes": streamBufferSizeBytes,
+                            "originalStreamBufferSizeBytes": None,
+                            "streamBufferSizeBytes": None,
+                            "channels": list(channelBits),
+                            "edge": edge,
                             "stateRegister": stateRegister,
+                            "scanNames": list(scanNames),
                             "bankShift": bankShift,
                             "bankMask": bankMask,
+                            "verifyTriggerCounter": verifyTriggerCounter,
+                            "autoRestartOnStreamOverflow": autoRestartOnStreamOverflow,
+                            "maxStreamRestartAttempts": int(maxStreamRestartAttempts),
+                            "streamRestartDelay": streamRestartDelay,
+                            "samplesReturned": 0,
                             "samplesProcessed": 0,
                             "eventsDetected": 0,
+                            "eventsNotQueued": 0,
                             "unknownSamples": 0,
                             "firstUnknownIndices": [],
+                            "failureBatch": None,
+                            "sampleTimelineValid": True,
+                            "continuousTimelineValid": True,
+                            "firstUncertainSampleIndex": None,
                             "maxDeviceBacklog": 0,
                             "maxLJMBacklog": 0,
                             "maxReadDuration": 0.0,
                             "startCallBefore": None,
                             "startCallAfter": None,
                             "timestampMethod": "streamStartMidpointEstimate",
+                            "recovering": False,
+                            "restartAttempts": 0,
+                            "successfulRestarts": 0,
+                            "recoveryHistory": [],
+                            "counterMismatchHistory": [],
+                            "timingSegments": [],
                         }
 
-                    self._digitalChannelBits = channelBits
                     self._digitalStopEvent.clear()
+                    self._digitalChannelBits = dict(channelBits)
 
                     try:
-                        # Configure only selected pins as inputs.
-                        for bit in channelBits.values(): self.ljm.eReadName(self.h, f"DIO{bit}")
-
-                        self.ljm.eWriteName(self.h, "STREAM_TRIGGER_INDEX", 0)
-                        self.ljm.eWriteName(self.h, "STREAM_CLOCK_SOURCE", 0)
-                        address = self.ljm.nameToAddress(stateRegister)[0]
-
-                        before = pglTimestamp.getSecs()
-                        actualScanRate = self.ljm.eStreamStart(self.h, scansPerRead, 1, [address], scanRate)
-                        self._digitalStreamActive = True
-                        after = pglTimestamp.getSecs()
-
-                        if not np.isfinite(actualScanRate) or actualScanRate <= 0:
-                            raise RuntimeError(f"Invalid actual scan rate: {actualScanRate}")
+                        originalBuffer = self.ljm.eReadName(self.h, "STREAM_BUFFER_SIZE_BYTES")
+                        self.ljm.eWriteName(self.h, "STREAM_BUFFER_SIZE_BYTES", streamBufferSizeBytes)
+                        acceptedBuffer = self.ljm.eReadName(self.h, "STREAM_BUFFER_SIZE_BYTES")
+                        if acceptedBuffer != streamBufferSizeBytes:
+                            raise RuntimeError("Stream buffer readback mismatch.")
 
                         with self._digitalEventLock:
                             self._digitalStats.update({
-                                "scanRate": float(actualScanRate),
+                                "originalStreamBufferSizeBytes": originalBuffer,
+                                "streamBufferSizeBytes": int(acceptedBuffer),
+                            })
+
+                        for bit in channelBits.values(): self.ljm.eReadName(self.h, f"DIO{bit}")
+
+                        if verifyTriggerCounter:
+                            saved = self._configureDigitalCounter(channelBits, edge)
+                            with self._digitalEventLock:
+                                self._digitalStats["originalCounterConfiguration"] = deepcopy(saved)
+
+                        self.ljm.eWriteName(self.h, "STREAM_TRIGGER_INDEX", 0)
+                        self.ljm.eWriteName(self.h, "STREAM_CLOCK_SOURCE", 0)
+                        addresses = self.ljm.namesToAddresses(len(scanNames), scanNames)[0]
+
+                        before = pglTimestamp.getSecs()
+                        actualRate = self.ljm.eStreamStart(
+                            self.h, scansPerRead, len(addresses), addresses, scanRate
+                        )
+                        self._digitalStreamActive = True
+                        after = pglTimestamp.getSecs()
+                        if not np.isfinite(actualRate) or actualRate <= 0:
+                            raise RuntimeError(f"Invalid actual scan rate: {actualRate}")
+
+                        with self._digitalEventLock:
+                            self._digitalStats.update({
+                                "scanRate": float(actualRate),
                                 "startCallBefore": before,
                                 "startCallAfter": after,
                             })
 
-                        # Pass immutable acquisition configuration to the worker.
                         self._digitalThread = threading.Thread(
                             target=self._digitalReadThread,
-                            args=(dict(channelBits), edge, float(actualScanRate), (before + after) / 2, bankShift, bankMask),
+                            args=(
+                                dict(channelBits), edge, float(actualRate),
+                                (before + after) / 2, bankShift, bankMask,
+                            ),
                             name="pglLabJackDigitalInput",
                             daemon=True,
                         )
                         self._digitalThread.start()
 
-                    except BaseException:
-                        # If thread startup failed, there is no worker to stop
-                        # the hardware stream. Preserve the original exception.
-                        if self._digitalStreamActive:
-                            try:
+                    except BaseException as error:
+                        self._setDigitalReadError(f"Startup failed: {type(error).__name__}: {error}")
+                        try:
+                            if self._digitalStreamActive:
                                 self.ljm.eStreamStop(self.h)
                                 self._digitalStreamActive = False
-                            except Exception as cleanupError:
-                                self._setDigitalReadError(f"Startup cleanup failed: {cleanupError}")
-
+                            self._restoreDigitalCounter()
+                        except Exception as cleanupError:
+                            self._setDigitalReadError(f"Startup cleanup failed: {cleanupError}")
                         if not self._digitalStreamActive: self._digitalChannelBits = {}
                         raise
 
-            pglMessages.message(f"LabJack digital input: {', '.join(channelBits)}, {edge}, {stateRegister}, actual scan rate {actualScanRate:g} Hz")
-            return float(actualScanRate)
+        pglMessages.message(
+            f"LabJack digital input: {', '.join(channelBits)}, {edge}, "
+            f"{actualRate:g} scans/s, {len(scanNames)} addresses, "
+            f"counter verification={verifyTriggerCounter}, "
+            f"automatic restart={autoRestartOnStreamOverflow}"
+        )
+        return float(actualRate)
 
-    ################################################################
-    # Read digital samples and queue timestamped edges
-    ################################################################
-    def _digitalReadThread(self, channelBits, edge, scanRate, streamStartTimestamp, bankShift=0, bankMask=255):
-        """Acquire bank-local states and convert them to full DIO bitmasks."""
-        previousState = None
+    def _digitalReadThread(
+        self, channelBits, edge, scanRate, streamStartTimestamp,
+        bankShift=0, bankMask=255,
+    ):
+        """
+        Acquire edges and counter diagnostics using the startup snapshot.
+
+        Returned discontinuity markers trigger bounded stream recovery when
+        enabled. Native read exceptions remain fatal in this implementation.
+
+        Never reset/reconfigure the counter during internal stream recovery.
+        """
+        from copy import deepcopy
+        from .pglEvent import pglEvent
+
+        with self._digitalEventLock:
+            config = deepcopy(self._digitalStats)
+
+        acquisitionId = config["acquisitionId"]
+        verifyCounter = config["verifyTriggerCounter"]
+        scanNames = config["scanNames"]
+        columnCount = len(scanNames)
+        segmentId = 0
         firstSampleIndex = 0
+        previousState = None
+        currentRate = float(scanRate)
+        currentStart = float(streamStartTimestamp)
+        batchRecord = None
+
+        matcher = (
+            pglLabJackCounterMatcher(acquisitionId, "CIO1", 17)
+            if verifyCounter else None
+        )
+
+        def addSegment(before, after):
+            with self._digitalEventLock:
+                self._digitalStats.update({
+                    "currentSegmentId": segmentId,
+                    "segmentSamplesProcessed": 0,
+                    "scanRate": currentRate,
+                })
+                self._digitalStats["timingSegments"].append({
+                    "segmentId": segmentId,
+                    "scanRate": currentRate,
+                    "startTimestamp": currentStart,
+                    "startCallBefore": before,
+                    "startCallAfter": after,
+                    "timestampMethod": "streamStartMidpointEstimate",
+                })
+
+        def queueEvents(events):
+            if not events: return
+            with self._digitalEventLock:
+                available = max(0, self._digitalMaxEvents - len(self._digitalEvents))
+                queued = min(available, len(events))
+                self._digitalEvents.extend(events[:queued])
+                if queued != len(events):
+                    self._digitalStats["eventsNotQueued"] += len(events) - queued
+                    # Preserve payloads, not only a loss count.
+                    self._digitalStats.setdefault("unqueuedEvents", []).extend(events[queued:])
+                    raise RuntimeError("Digital event queue exhausted; unqueued payloads retained.")
+
+        def diagnosticEvent(payload, notificationTime):
+            event = pglEvent(type=payload["type"])
+            for name, value in payload.items(): setattr(event, name, deepcopy(value))
+            event.timestamp = notificationTime
+            event.timestampMethod = "hostDiagnosticNotification"
+            event.deviceType = "LabJack"
+            event.deviceUUID = str(getattr(self, "uuid", ""))
+            event.serialNumber = getattr(self, "serialNumber", None)
+            return event
+
+        def stopStream():
+            # Caller holds _digitalIOLock.
+            if self._digitalStreamActive:
+                self.ljm.eStreamStop(self.h)
+                with self._digitalEventLock:
+                    self._digitalStreamActive = False
+
+        def restartStream(record):
+            """
+            Retry only after hardware is known to be stopped.
+
+            A failed start is followed by stop confirmation. If neither stop
+            nor STREAM_ENABLE readback establishes that state, fail closed.
+            """
+            with self._digitalEventLock:
+                self._digitalStats["recovering"] = True
+
+            with self._digitalIOLock:
+                stopStream()
+
+            lastError = None
+            for attempt in range(1, config["maxStreamRestartAttempts"] + 1):
+                if self._digitalStopEvent.wait(config["streamRestartDelay"]): return None
+
+                attemptRecord = {"attempt": attempt, "outcome": "starting"}
+                with self._digitalEventLock:
+                    record["attempts"].append(attemptRecord)
+                    self._digitalStats["restartAttempts"] += 1
+
+                try:
+                    with self._digitalIOLock:
+                        if self._digitalStopEvent.is_set(): return None
+
+                        self.ljm.eWriteName(
+                            self.h, "STREAM_BUFFER_SIZE_BYTES",
+                            config["streamBufferSizeBytes"],
+                        )
+                        if self.ljm.eReadName(self.h, "STREAM_BUFFER_SIZE_BYTES") != config["streamBufferSizeBytes"]:
+                            raise RuntimeError("Stream buffer readback mismatch during recovery.")
+
+                        if verifyCounter:
+                            # Verification only: do not disable/enable/reset EF.
+                            if (
+                                self.ljm.eReadName(self.h, "DIO17_EF_ENABLE") != 1
+                                or self.ljm.eReadName(self.h, "DIO17_EF_INDEX") != 7
+                            ):
+                                raise RuntimeError("Counter configuration changed during acquisition.")
+
+                        addresses = self.ljm.namesToAddresses(columnCount, scanNames)[0]
+                        before = pglTimestamp.getSecs()
+                        rate = self.ljm.eStreamStart(
+                            self.h, config["scansPerRead"], columnCount,
+                            addresses, config["requestedScanRate"],
+                        )
+                        with self._digitalEventLock:
+                            self._digitalStreamActive = True
+                        after = pglTimestamp.getSecs()
+
+                        if not np.isfinite(rate) or rate <= 0:
+                            raise RuntimeError(f"Invalid restart scan rate: {rate}")
+
+                        if self._digitalStopEvent.is_set():
+                            stopStream()
+                            return None
+
+                    with self._digitalEventLock:
+                        attemptRecord["outcome"] = "restarted"
+                    return float(rate), before, after
+
+                except Exception as error:
+                    lastError = error
+                    with self._digitalEventLock:
+                        attemptRecord.update({
+                            "outcome": "failed",
+                            "error": f"{type(error).__name__}: {error}",
+                        })
+
+                    with self._digitalIOLock:
+                        try:
+                            # A failed start may have partially succeeded.
+                            self.ljm.eStreamStop(self.h)
+                        except Exception:
+                            if self.ljm.eReadName(self.h, "STREAM_ENABLE") != 0:
+                                raise RuntimeError(
+                                    "Failed restart left uncertain stream ownership."
+                                ) from error
+                        with self._digitalEventLock:
+                            self._digitalStreamActive = False
+
+                    # A changed counter configuration is not a retryable overflow.
+                    if verifyCounter:
+                        with self._digitalIOLock:
+                            if (
+                                self.ljm.eReadName(self.h, "DIO17_EF_ENABLE") != 1
+                                or self.ljm.eReadName(self.h, "DIO17_EF_INDEX") != 7
+                            ):
+                                raise RuntimeError(
+                                    "Counter configuration changed; recovery stopped."
+                                ) from error
+
+            raise RuntimeError(
+                f"Restart failed after {config['maxStreamRestartAttempts']} attempts."
+            ) from lastError
+
+        addSegment(config["startCallBefore"], config["startCallAfter"])
 
         try:
             while not self._digitalStopEvent.is_set():
-                # Serialize hardware calls with existing digital output calls.
-                # Do not hold the event-buffer lock during a native read.
+                batchRecord = None
                 with self._digitalIOLock:
                     if self._digitalStopEvent.is_set(): break
-                    readBefore = time.perf_counter()
+                    beforeRead = time.perf_counter()
                     values, deviceBacklog, ljmBacklog = self.ljm.eStreamRead(self.h)
-                    readDuration = time.perf_counter() - readBefore
-                    readCompletedTimestamp = pglTimestamp.getSecs()
+                    readDuration = time.perf_counter() - beforeRead
+                    deliveredAt = pglTimestamp.getSecs()
 
-                batch = np.asarray(values, dtype=np.float64)
-                if batch.ndim != 1 or batch.size == 0:
-                    raise RuntimeError("LJM returned an empty or malformed digital batch")
+                raw = np.asarray(values, dtype=np.float64)
+                batchRecord = {
+                    "segmentId": segmentId,
+                    "firstReturnedSampleIndex": firstSampleIndex,
+                    "readCompletedTimestamp": deliveredAt,
+                    "shape": list(raw.shape),
+                    "values": [
+                        float(value) if np.isfinite(value) else repr(float(value))
+                        for value in raw.reshape(-1)
+                    ],
+                }
+                if raw.ndim != 1 or not raw.size or raw.size % columnCount:
+                    raise RuntimeError("Malformed interleaved digital stream batch.")
 
+                returnedScans = raw.size // columnCount
                 with self._digitalEventLock:
                     stats = self._digitalStats
+                    stats["samplesReturned"] += int(returnedScans)
                     stats["maxReadDuration"] = max(stats["maxReadDuration"], readDuration)
                     stats["maxDeviceBacklog"] = max(stats["maxDeviceBacklog"], int(deviceBacklog))
                     stats["maxLJMBacklog"] = max(stats["maxLJMBacklog"], int(ljmBacklog))
 
-                # Fail explicitly on skipped/malformed samples. Never remove
-                # markers and compress the acquisition timeline.
-                skipped = np.flatnonzero(batch == -9999)
-                if skipped.size:
-                    raise RuntimeError(f"LJM skipped-sample marker at index {firstSampleIndex + int(skipped[0])}")
-
-                invalid = ~np.isfinite(batch) | (batch < 0) | (batch > 65535) | (batch != np.floor(batch))
-                if np.any(invalid):
-                    row = int(np.flatnonzero(invalid)[0])
-                    raise RuntimeError(f"Invalid digital sample at index {firstSampleIndex + row}: {batch[row]}")
-
-                # Preserve the existing gap policy: out-of-bank words are
-                # uncertain, not triggers. Do not mask them into valid samples.
-                unknownRows = np.flatnonzero(batch > bankMask)
-                if unknownRows.size:
-                    with self._digitalEventLock:
-                        self._digitalStats["unknownSamples"] += int(unknownRows.size)
-                        savedIndices = self._digitalStats["firstUnknownIndices"]
-                        remaining = max(0, 100 - len(savedIndices))
-                        savedIndices.extend(int(firstSampleIndex + row) for row in unknownRows[:remaining])
-
-                events = []
-                spanStart = 0
-
-                for spanEnd in list(unknownRows) + [batch.size]:
-                    spanEnd = int(spanEnd)
-
-                    if spanEnd > spanStart:
-                        # CIO_STATE bit 1 becomes full-device DIO bit 17.
-                        # FIO_STATE retains its original bit positions.
-                        decodedStates = batch[spanStart:spanEnd].astype(np.uint32) << bankShift
-
-                        spanEvents, previousState = self._digitalEventsFromSamples(
-                            decodedStates, channelBits, previousState,
-                            firstSampleIndex + spanStart, scanRate,
-                            streamStartTimestamp, edge=edge,
+                if verifyCounter:
+                    rows = self._decodeCounterStream(raw, bankMask)["rows"]
+                else:
+                    rows = []
+                    for offset, value in enumerate(raw):
+                        valid = (
+                            np.isfinite(value) and value == np.floor(value)
+                            and 0 <= value <= bankMask
                         )
-                        events.extend(spanEvents)
+                        classification = (
+                            "valid" if valid else
+                            "ljmDummyScan" if value == -9999 else
+                            "invalidStateFFFF" if value == 65535 else
+                            "malformedScan"
+                        )
+                        rows.append({
+                            "scanOffset": offset,
+                            "classification": classification,
+                            "state": int(value) if valid else None,
+                        })
 
-                    if spanEnd < batch.size:
-                        previousState = None
-                        spanStart = spanEnd + 1
+                invalidOffset = next(
+                    (index for index, row in enumerate(rows) if row["classification"] != "valid"),
+                    len(rows),
+                )
+                prefix = rows[:invalidOffset]
+                events = []
 
-                for event in events:
-                    event.timestampMethod = "streamStartMidpointEstimate"
-                    event.readCompletedTimestamp = readCompletedTimestamp
+                if prefix:
+                    states = np.asarray(
+                        [row["state"] << bankShift for row in prefix],
+                        dtype=np.uint32,
+                    )
+                    edges, previousState = self._digitalEventsFromSamples(
+                        states, channelBits, previousState, firstSampleIndex,
+                        currentRate, currentStart, edge=edge,
+                    )
+                    for event in edges:
+                        event.acquisitionId = acquisitionId
+                        event.segmentId = segmentId
+                        event.sampleIndexScope = "timingSegment"
+                        event.timestampMethod = "streamStartMidpointEstimate"
+                        event.readCompletedTimestamp = deliveredAt
+                        event.isEstimated = False
+                        event.deviceUUID = str(getattr(self, "uuid", ""))
+                    events.extend(edges)
+
+                    if matcher is not None:
+                        for offset, row in enumerate(prefix):
+                            index = firstSampleIndex + offset
+                            reports = matcher.observe(
+                                state=row["state"] << bankShift,
+                                counter=row["counter"],
+                                segmentId=segmentId,
+                                sampleIndex=index,
+                                timestamp=currentStart + index / currentRate,
+                            )
+                            for report in reports:
+                                with self._digitalEventLock:
+                                    self._digitalStats["counterMismatchHistory"].append(deepcopy(report))
+                                events.append(diagnosticEvent(report, deliveredAt))
+
+                    with self._digitalEventLock:
+                        self._digitalStats["eventsDetected"] += len(edges)
+
+                queueEvents(events)
+                firstSampleIndex += len(prefix)
+                with self._digitalEventLock:
+                    self._digitalStats["samplesProcessed"] += len(prefix)
+                    self._digitalStats["segmentSamplesProcessed"] = firstSampleIndex
+
+                if invalidOffset == len(rows):
+                    batchRecord = None
+                    continue
+
+                classification = rows[invalidOffset]["classification"]
+                with self._digitalEventLock:
+                    stats = self._digitalStats
+                    stats["failureBatch"] = deepcopy(batchRecord)
+                    stats["sampleTimelineValid"] = False
+                    stats["continuousTimelineValid"] = False
+                    stats["unknownSamples"] += sum(
+                        row["classification"] != "valid" for row in rows[invalidOffset:]
+                    )
+                    if stats["firstUncertainSampleIndex"] is None:
+                        stats["firstUncertainSampleIndex"] = firstSampleIndex
+                        stats["firstUncertainSegmentId"] = segmentId
+
+                if classification not in ("ljmDummyScan", "invalidStateFFFF"):
+                    raise RuntimeError(f"Invalid digital scan: {classification}")
+
+                record = {
+                    "reason": classification,
+                    "oldSegmentId": segmentId,
+                    "firstUncertainSampleIndex": firstSampleIndex,
+                    "detectedTimestamp": deliveredAt,
+                    "missingScans": None,
+                    "discardedReturnedScans": len(rows) - invalidOffset,
+                    "failureBatch": deepcopy(batchRecord),
+                    "attempts": [],
+                    "outcome": "detected",
+                }
+                with self._digitalEventLock:
+                    self._digitalStats["recoveryHistory"].append(record)
+
+                if not config["autoRestartOnStreamOverflow"]:
+                    raise RuntimeError("Stream discontinuity detected; automatic restart is disabled.")
+
+                try:
+                    restarted = restartStream(record)
+                except Exception as error:
+                    with self._digitalEventLock:
+                        record["outcome"] = "failed"
+                        record["error"] = f"{type(error).__name__}: {error}"
+                    pglMessages.warning(
+                        f"LabJack stream discontinuity detected. Automatic restart failed: "
+                        f"{error}. Diagnostics have been retained.",
+                        level=2,
+                    )
+                    raise
+
+                if restarted is None:
+                    with self._digitalEventLock:
+                        record["outcome"] = "cancelledByStop"
+                    break
+
+                currentRate, before, after = restarted
+                currentStart = (before + after) / 2
+                segmentId += 1
+                firstSampleIndex = 0
+                previousState = None
+
+                if matcher is not None:
+                    matcher.noteGap({
+                        "reason": "streamRestart",
+                        "oldSegmentId": segmentId - 1,
+                        "newSegmentId": segmentId,
+                        "missingScans": None,
+                        "detectedTimestamp": deliveredAt,
+                        "restartTimestamp": after,
+                    }, counterContinuityVerified=True)
 
                 with self._digitalEventLock:
-                    self._digitalStats["eventsDetected"] += len(events)
-                    if len(self._digitalEvents) + len(events) > self._digitalMaxEvents:
-                        raise RuntimeError("Digital event buffer overflow; incoming events were not queued")
+                    record.update({
+                        "outcome": "restarted",
+                        "newSegmentId": segmentId,
+                        "restartTimestamp": after,
+                    })
+                    self._digitalStats["successfulRestarts"] += 1
+                    self._digitalStats["recovering"] = False
+                addSegment(before, after)
 
-                    self._digitalEvents.extend(events)
-                    firstSampleIndex += batch.size
-                    self._digitalStats["samplesProcessed"] = firstSampleIndex
+                queueEvents([diagnosticEvent({
+                    "type": "digitalInputRecovery",
+                    "acquisitionId": acquisitionId,
+                    "channels": list(channelBits),
+                    "oldSegmentId": segmentId - 1,
+                    "segmentId": segmentId,
+                    "reason": classification,
+                    "missingScans": None,
+                    "missingTriggers": None,
+                    "counterVerificationEnabled": verifyCounter,
+                }, after)])
+
+                pglMessages.warning(
+                    f"LabJack stream discontinuity detected. Stream successfully "
+                    f"restarted (timing segment {segmentId}); acquisition is continuing. "
+                    "The interruption and failing batch have been retained.",
+                    level=2,
+                )
+                batchRecord = None
 
         except Exception as error:
+            with self._digitalEventLock:
+                self._digitalStats["sampleTimelineValid"] = False
+                if batchRecord is not None:
+                    self._digitalStats["failureBatch"] = deepcopy(batchRecord)
             self._setDigitalReadError(f"{type(error).__name__}: {error}")
 
         finally:
-            # Stop the stream, but do not close the shared input/output handle.
+            # Preserve an unsettled final window rather than falsely reporting
+            # it as a settled missing-trigger count.
+            if matcher is not None:
+                with self._digitalEventLock:
+                    self._digitalStats["counterFinalPendingWindow"] = {
+                        "anchorObservation": deepcopy(matcher.anchorObservation),
+                        "lastObservation": deepcopy(matcher.previousObservation),
+                        "measuredObservations": deepcopy(matcher.measuredObservations),
+                        "gapRecords": deepcopy(matcher.gapRecords),
+                    }
+
             try:
                 with self._digitalIOLock:
-                    if self._digitalStreamActive:
-                        self.ljm.eStreamStop(self.h)
-                        self._digitalStreamActive = False
+                    stopStream()
+                    self._restoreDigitalCounter()
                     self._digitalChannelBits = {}
             except Exception as error:
-                self._setDigitalReadError(f"Digital stream stop failed: {type(error).__name__}: {error}")
+                self._setDigitalReadError(
+                    f"Digital cleanup failed: {type(error).__name__}: {error}"
+                )
+            finally:
+                with self._digitalEventLock:
+                    self._digitalStats["recovering"] = False
 
     ################################################################
     # Retain worker failures without retaining traceback objects
@@ -1028,30 +1424,16 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
     ################################################################
     def poll(self):
         """
-        Drain queued digital events and warn once per acquisition about gaps.
+        Drain queued digital events before reporting a latched failure.
 
-        All uncertain samples remain counted in getDigitalReadStatus().
-        Already-acquired events are returned before a latched error is raised
-        on a subsequent empty poll. stopDigitalRead() also reports that error.
+        Events captured before an acquisition failure remain available.
+        A subsequent empty poll raises the retained acquisition error.
+        stopDigitalRead() also reports that error.
         """
         with self._digitalEventLock:
             events = self._digitalEvents
             self._digitalEvents = []
             error = self._digitalError
-            unknownCount = self._digitalStats.get("unknownSamples", 0)
-
-            # Avoid repeated warning output in the experiment's polling loop.
-            # startDigitalRead() resets this counter for each acquisition.
-            reportUnknown = unknownCount > 0 and self._digitalUnknownReported == 0
-            self._digitalUnknownReported = unknownCount
-
-        if reportUnknown:
-            pglMessages.warning(
-                "LabJack digital input encountered uncertain samples. "
-                "They are excluded from edge detection; triggers at these gaps "
-                "may be missed. Further occurrences are counted in "
-                "getDigitalReadStatus() without repeating this warning.", level=1
-            )
 
         if events: return events
         if error is not None: raise RuntimeError(f"LabJack digital acquisition failed: {error}")
@@ -1061,10 +1443,11 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
     # Snapshot acquisition diagnostics
     ################################################################
     def getDigitalReadStatus(self):
-        """Return plain diagnostic values, not live buffers or locks."""
+        """Return independent diagnostic values, including any failing batch."""
+        from copy import deepcopy
+
         with self._digitalEventLock:
-            status = dict(self._digitalStats)
-            status["firstUnknownIndices"] = list(status.get("firstUnknownIndices", []))
+            status = deepcopy(self._digitalStats)
             status["pendingEvents"] = len(self._digitalEvents)
             status["error"] = self._digitalError
 
@@ -1104,3 +1487,514 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
                 raise RuntimeError("Digital hardware stream did not stop successfully")
 
             return status
+        
+    @staticmethod
+    def _decodeCounterStream(values, bankMask=15):
+        """
+        Decode interleaved state, counter-low, counter-high stream words.
+
+        The scan list must be:
+            bank state register
+            selected DIO_EF_READ_A
+            STREAM_DATA_CAPTURE_16
+
+        Returns:
+            Dictionary containing every returned scan in original order.
+
+        Full -9999 rows are identified as LJM dummy scans. This classification
+        alone does not authorize timeline recovery: the acquisition worker
+        must establish the applicable LJM missing-scan accounting contract.
+
+        Invalid rows retain their positions and raw words. No edge count,
+        missing-scan count, or missing-trigger timestamp is inferred here.
+        """
+        from numbers import Real
+
+        if (
+            isinstance(bankMask, (bool, np.bool_))
+            or not isinstance(bankMask, (int, np.integer))
+            or bankMask not in (15, 255)
+        ):
+            raise ValueError("bankMask must be 15 for CIO or 255 for FIO.")
+
+        # Reject malformed structure rather than truncating incomplete scans.
+        raw = np.asarray(values, dtype=object)
+        if raw.ndim != 1 or raw.size == 0 or raw.size % 3:
+            raise ValueError(
+                "Counter stream must be a nonempty flat sequence "
+                "containing complete three-word scans."
+            )
+
+        def integerWord(value):
+            if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
+                return None
+            try:
+                number = float(value)
+                if not np.isfinite(number) or number != np.floor(number):
+                    return None
+                return int(number)
+            except (ValueError, TypeError, OverflowError):
+                return None
+
+        rows = []
+        classificationCounts = {}
+
+        for scanOffset, rawRow in enumerate(raw.reshape(-1, 3)):
+            words = [integerWord(value) for value in rawRow]
+            state, lowWord, highWord = words
+
+            # Diagnostic representation preserves numeric values and makes
+            # malformed/nonfinite values printable and JSON-safe.
+            rawWords = [
+                word if word is not None else repr(value)
+                for value, word in zip(rawRow, words)
+            ]
+
+            row = {
+                "scanOffset": scanOffset,
+                "rawWords": rawWords,
+                "classification": None,
+                "state": None,
+                "counter": None,
+            }
+
+            if words == [-9999, -9999, -9999]:
+                classification = "ljmDummyScan"
+            elif -9999 in words:
+                classification = "partialDummyScan"
+            elif any(word is None for word in words):
+                classification = "malformedScan"
+            elif state == 65535:
+                classification = "invalidStateFFFF"
+            elif not (
+                0 <= state <= bankMask
+                and 0 <= lowWord <= 65535
+                and 0 <= highWord <= 65535
+            ):
+                classification = "outOfRangeScan"
+            else:
+                classification = "valid"
+                row["state"] = state
+                row["counter"] = lowWord + (highWord << 16)
+
+            row["classification"] = classification
+            rows.append(row)
+            classificationCounts[classification] = (
+                classificationCounts.get(classification, 0) + 1
+            )
+
+        return {
+            "returnedScanCount": len(rows),
+            "rows": rows,
+            "classificationCounts": classificationCounts,
+        }
+        
+    @staticmethod
+    def _compareTriggerCounterWindow(
+        counterBefore, counterAfter, measuredEdgeCount,
+        *, windowSettled=False, counterContinuityVerified=False,
+        verifiedWrapCount=None,
+    ):
+        """
+        Compare hardware increments with measured rising edges in one window.
+
+        Requirements imposed on the caller:
+            - Counter and sampled edges refer to the same physical source
+              and rising-edge polarity.
+            - Both observations delimit the same comparison window.
+            - windowSettled=True only after state/counter observation ordering
+              has been resolved, including across read-batch boundaries.
+            - Counter continuity must be established independently.
+            - verifiedWrapCount is supplied only when wrap accounting is
+              independently established. A decreasing count alone does not
+              distinguish rollover from reset.
+
+        Returns:
+            A plain diagnostic dictionary.
+
+        No missing-trigger timestamps or scan-gap lengths are inferred.
+        A negative discrepancy never deletes measured events.
+        """
+        from numbers import Integral
+
+        def validInteger(value):
+            return (
+                not isinstance(value, (bool, np.bool_))
+                and isinstance(value, Integral)
+            )
+
+        for fieldName, value in (
+            ("counterBefore", counterBefore),
+            ("counterAfter", counterAfter),
+        ):
+            if not validInteger(value) or not 0 <= value <= 0xFFFFFFFF:
+                raise ValueError(f"{fieldName} must be an unsigned 32-bit integer.")
+
+        if not validInteger(measuredEdgeCount) or measuredEdgeCount < 0:
+            raise ValueError("measuredEdgeCount must be a nonnegative integer.")
+
+        if type(windowSettled) is not bool:
+            raise TypeError("windowSettled must be Boolean.")
+        if type(counterContinuityVerified) is not bool:
+            raise TypeError("counterContinuityVerified must be Boolean.")
+
+        if verifiedWrapCount is not None:
+            if not validInteger(verifiedWrapCount) or verifiedWrapCount < 0:
+                raise ValueError("verifiedWrapCount must be a nonnegative integer or None.")
+
+        counterBefore = int(counterBefore)
+        counterAfter = int(counterAfter)
+        measuredEdgeCount = int(measuredEdgeCount)
+
+        result = {
+            "outcome": None,
+            "reason": None,
+            "counterBefore": counterBefore,
+            "counterAfter": counterAfter,
+            "measuredEdgeCount": measuredEdgeCount,
+            "windowSettled": windowSettled,
+            "counterContinuityVerified": counterContinuityVerified,
+            "verifiedWrapCount": (
+                None if verifiedWrapCount is None else int(verifiedWrapCount)
+            ),
+            "counterIncrement": None,
+            "edgeDeficit": None,
+            "missingEdgeCount": None,
+        }
+
+        def finish(outcome, reason):
+            result["outcome"] = outcome
+            result["reason"] = reason
+            return result
+
+        # Keep boundary discrepancies pending; do not emit settled mismatches.
+        if not windowSettled:
+            return finish("pending", "observationWindowNotSettled")
+
+        if not counterContinuityVerified:
+            return finish("unresolved", "counterContinuityNotVerified")
+
+        if verifiedWrapCount is None:
+            if counterAfter < counterBefore:
+                return finish("unresolved", "counterRolloverOrReset")
+
+            # The caller's continuity contract must also exclude unobserved
+            # complete wraps. Increasing values alone do not prove continuity.
+            counterIncrement = counterAfter - counterBefore
+        else:
+            counterIncrement = (
+                counterAfter - counterBefore
+                + int(verifiedWrapCount) * (1 << 32)
+            )
+            if counterIncrement < 0:
+                return finish("unresolved", "inconsistentWrapAccounting")
+
+        edgeDeficit = counterIncrement - measuredEdgeCount
+        result["counterIncrement"] = counterIncrement
+        result["edgeDeficit"] = edgeDeficit
+
+        if edgeDeficit > 0:
+            result["missingEdgeCount"] = edgeDeficit
+            return finish("missingEdges", "counterEdgeMismatch")
+
+        if edgeDeficit < 0:
+            # Preserve observed edges; do not turn a surplus into an insertion.
+            return finish("unresolved", "sampledEdgesExceedCounter")
+
+        result["missingEdgeCount"] = 0
+        return finish("matched", "counterAndSampledEdgesAgree")
+    
+    def _configureDigitalCounter(self, channelBits, edge):
+        """
+        Configure the tested CIO1 rising-edge high-speed counter.
+
+        Call while holding _digitalIOLock, before starting the stream.
+        Return saved configuration for later restoration.
+
+        Refuse enabled EF consumers rather than disable their shared clocks.
+        """
+        if channelBits != {"CIO1": 17} or edge != "rising":
+            raise ValueError(
+                "Counter verification currently supports the tested "
+                "CIO1/rising configuration only. No pin or edge was substituted."
+            )
+
+        saved = {
+            "counterEnable": self.ljm.eReadName(self.h, "DIO17_EF_ENABLE"),
+            "counterIndex": self.ljm.eReadName(self.h, "DIO17_EF_INDEX"),
+            "clock0Enable": self.ljm.eReadName(self.h, "DIO_EF_CLOCK0_ENABLE"),
+            "clock2Enable": self.ljm.eReadName(self.h, "DIO_EF_CLOCK2_ENABLE"),
+        }
+
+        if saved["counterEnable"] != 0:
+            raise RuntimeError("CIO1 EF is already enabled; refusing to replace it.")
+
+        enabledFeatures = []
+        for bit in range(23):
+            try:
+                enabled = self.ljm.eReadName(self.h, f"DIO{bit}_EF_ENABLE")
+            except Exception as error:
+                # T7 EIO pins have no timer/counter features.
+                if getattr(error, "errorCode", None) != 2550: raise
+                continue
+            if enabled != 0: enabledFeatures.append(f"DIO{bit}")
+
+        if enabledFeatures:
+            raise RuntimeError(
+                "Counter configuration would share hardware with enabled EF "
+                f"features: {', '.join(enabledFeatures)}. Configuration unchanged."
+            )
+
+        # Retain restoration information before writes can partially succeed.
+        self._digitalCounterRestore = saved
+
+        self.ljm.eWriteName(self.h, "DIO_EF_CLOCK0_ENABLE", 0)
+        self.ljm.eWriteName(self.h, "DIO_EF_CLOCK2_ENABLE", 0)
+        self.ljm.eWriteName(self.h, "DIO17_EF_INDEX", 7)
+        self.ljm.eWriteName(self.h, "DIO17_EF_ENABLE", 1)
+
+        checks = {
+            "DIO_EF_CLOCK0_ENABLE": 0,
+            "DIO_EF_CLOCK2_ENABLE": 0,
+            "DIO17_EF_INDEX": 7,
+            "DIO17_EF_ENABLE": 1,
+        }
+        for register, expected in checks.items():
+            actual = self.ljm.eReadName(self.h, register)
+            if actual != expected:
+                raise RuntimeError(f"{register}: expected {expected}, read {actual}")
+
+        return saved
+    
+    def _restoreDigitalCounter(self):
+        """
+        Restore counter/clock configuration after the stream has stopped.
+
+        Call while holding _digitalIOLock. Retain restoration metadata on error.
+        """
+        saved = getattr(self, "_digitalCounterRestore", None)
+        if saved is None: return
+        if self._digitalStreamActive:
+            raise RuntimeError("Cannot restore EF configuration while streaming.")
+
+        # Disable and verify first. Never re-enable shared clocks over a
+        # counter whose shutdown is uncertain.
+        self.ljm.eWriteName(self.h, "DIO17_EF_ENABLE", 0)
+        if self.ljm.eReadName(self.h, "DIO17_EF_ENABLE") != 0:
+            raise RuntimeError("Could not disable CIO1 counter for restoration.")
+
+        errors = []
+        for register, value in (
+            ("DIO17_EF_INDEX", saved["counterIndex"]),
+            ("DIO_EF_CLOCK0_ENABLE", saved["clock0Enable"]),
+            ("DIO_EF_CLOCK2_ENABLE", saved["clock2Enable"]),
+        ):
+            try:
+                self.ljm.eWriteName(self.h, register, value)
+                if self.ljm.eReadName(self.h, register) != value:
+                    raise RuntimeError("Restoration readback mismatch")
+            except Exception as error:
+                errors.append(f"{register}: {type(error).__name__}: {error}")
+
+        if errors: raise RuntimeError("; ".join(errors))
+        self._digitalCounterRestore = None
+    
+class pglLabJackCounterMatcher:
+    """
+    Stateful comparison of sampled rising edges with a hardware counter.
+
+    Supports one rising-edge source. Physical counter configuration and
+    acquisition ownership remain the driver's responsibility.
+
+    Settled boundaries require consecutive LOW samples with equal counts.
+    The initial boundary establishes a baseline; earlier edges are not
+    retrospectively assessed.
+
+    Counter decreases are unresolved rollover/reset observations. This
+    matcher never assumes that a decrease is a rollover.
+
+    Returned diagnostics are dictionaries for the worker to wrap as events.
+    They contain observation bounds, not estimated missing-edge timestamps.
+    """
+
+    def __init__(self, acquisitionId, channel, channelBit):
+        if not isinstance(acquisitionId, str) or not acquisitionId:
+            raise ValueError("acquisitionId must be a nonempty string.")
+        if not isinstance(channel, str) or not channel:
+            raise ValueError("channel must be a nonempty string.")
+        if (
+            isinstance(channelBit, (bool, np.bool_))
+            or not isinstance(channelBit, (int, np.integer))
+            or not 0 <= channelBit < 23
+        ):
+            raise ValueError("channelBit must be an integer from 0 through 22.")
+
+        self.acquisitionId = acquisitionId
+        self.channel = channel
+        self.channelBit = int(channelBit)
+        self.previousObservation = None
+        self.anchorObservation = None
+        self.measuredObservations = []
+        self.gapRecords = []
+        self.counterContinuityVerified = True
+        self.reportNumber = 0
+
+    def noteGap(self, gapInfo, *, counterContinuityVerified):
+        """
+        Break sampled-state continuity without inventing an edge.
+
+        The worker must call this for every discarded/missing scan region
+        and every stream restart. Preserve a counter baseline only when
+        counter continuity across that interruption is established.
+        """
+        from copy import deepcopy
+
+        if not isinstance(gapInfo, dict):
+            raise TypeError("gapInfo must be a dictionary.")
+        if type(counterContinuityVerified) is not bool:
+            raise TypeError("counterContinuityVerified must be Boolean.")
+
+        self.gapRecords.append(deepcopy(gapInfo))
+        self.previousObservation = None
+        self.counterContinuityVerified = (
+            self.counterContinuityVerified and counterContinuityVerified
+        )
+
+    def observe(self, *, state, counter, segmentId, sampleIndex, timestamp):
+        """
+        Consume one valid sample and report settled counter-window evidence.
+
+        state is a full DIO bitmask, not an unshifted CIO_STATE word.
+
+        Matched windows identify measured edges that agree with the counter.
+        They do not, by themselves, certify an interval crossing another
+        window or a gap. The experiment must check interval continuity.
+
+        Diagnostic timestamps are assigned by the worker at delivery.
+        Observation timestamps below describe sampled acquisition positions.
+        """
+        from copy import deepcopy
+        from numbers import Integral, Real
+
+        def validInteger(value):
+            return (
+                not isinstance(value, (bool, np.bool_))
+                and isinstance(value, Integral)
+            )
+
+        if not validInteger(state) or not 0 <= state < (1 << 23):
+            raise ValueError("state must be a valid full DIO bitmask.")
+        if not validInteger(counter) or not 0 <= counter <= 0xFFFFFFFF:
+            raise ValueError("counter must be an unsigned 32-bit integer.")
+        if not validInteger(segmentId) or segmentId < 0:
+            raise ValueError("segmentId must be a nonnegative integer.")
+        if not validInteger(sampleIndex) or sampleIndex < 0:
+            raise ValueError("sampleIndex must be a nonnegative integer.")
+        if (
+            isinstance(timestamp, (bool, np.bool_))
+            or not isinstance(timestamp, Real)
+            or not np.isfinite(timestamp)
+        ):
+            raise ValueError("timestamp must be finite.")
+
+        observation = {
+            "segmentId": int(segmentId),
+            "sampleIndex": int(sampleIndex),
+            "timestamp": float(timestamp),
+            "counter": int(counter),
+            "inputHigh": bool(int(state) & (1 << self.channelBit)),
+        }
+        previous = self.previousObservation
+
+        if previous is not None:
+            if (
+                observation["segmentId"] != previous["segmentId"]
+                or observation["sampleIndex"] != previous["sampleIndex"] + 1
+            ):
+                raise ValueError("Call noteGap() before a discontinuous sample.")
+            if observation["timestamp"] <= previous["timestamp"]:
+                raise ValueError("Within-segment timestamps must increase.")
+
+            if observation["counter"] < previous["counter"]:
+                self.counterContinuityVerified = False
+                self.gapRecords.append({
+                    "reason": "counterRolloverOrReset",
+                    "before": deepcopy(previous),
+                    "after": deepcopy(observation),
+                })
+
+            # Same first-sample baseline behavior as the edge detector.
+            if not previous["inputHigh"] and observation["inputHigh"]:
+                if self.anchorObservation is not None:
+                    self.measuredObservations.append(deepcopy(observation))
+
+        settled = (
+            previous is not None
+            and not previous["inputHigh"]
+            and not observation["inputHigh"]
+            and previous["counter"] == observation["counter"]
+        )
+        self.previousObservation = observation
+        if not settled: return []
+
+        anchor = self.anchorObservation
+        if anchor is None:
+            self._setAnchor(observation)
+            return []
+
+        comparison = pglLabJack._compareTriggerCounterWindow(
+            anchor["counter"],
+            observation["counter"],
+            len(self.measuredObservations),
+            windowSettled=True,
+            counterContinuityVerified=self.counterContinuityVerified,
+        )
+
+        matched = comparison["outcome"] == "matched"
+        hasEvidence = (
+            not matched
+            or bool(self.measuredObservations)
+            or bool(self.gapRecords)
+        )
+
+        diagnostics = []
+        if hasEvidence:
+            self.reportNumber += 1
+            windowId = f"{self.acquisitionId}:{self.reportNumber}"
+            report = {
+                "type": (
+                    "digitalInputCounterWindow"
+                    if matched else "digitalInputMismatch"
+                ),
+                "acquisitionId": self.acquisitionId,
+                "channel": self.channel,
+                "edge": "rising",
+                "windowId": windowId,
+                "comparison": comparison,
+                "missingEdgeCount": comparison["missingEdgeCount"],
+                "beforeObservation": deepcopy(anchor),
+                "afterObservation": deepcopy(observation),
+                "measuredObservations": deepcopy(self.measuredObservations),
+                "gapRecords": deepcopy(self.gapRecords),
+                "continuousScanTimeline": (
+                    not self.gapRecords
+                    and anchor["segmentId"] == observation["segmentId"]
+                ),
+            }
+            if not matched:
+                report["mismatchId"] = windowId
+            diagnostics.append(report)
+
+        # Advance even after a quiet matched window: later reports have
+        # narrow bounds, and a deficit cannot be counted a second time.
+        self._setAnchor(observation)
+        return diagnostics
+
+    def _setAnchor(self, observation):
+        """Start a new comparison window without erasing returned diagnostics."""
+        from copy import deepcopy
+
+        self.anchorObservation = deepcopy(observation)
+        self.measuredObservations = []
+        self.gapRecords = []
+        self.counterContinuityVerified = True

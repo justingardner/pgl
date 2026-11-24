@@ -40,107 +40,140 @@ class pglEventListener:
     def __init__(self):
         self._keyboardQueue = deque()
         self._mouseQueue = deque()
-        self._keyStatus: Dict[int, float] = {}  # keyCode -> last press time
+        self._keyStatus: Dict[int, float] = {}
         self._lock = threading.Lock()
+        self._lifecycleLock = threading.Lock()
         self._running = False
-        
+
         self._lastEscTime = 0.0
         self.DOUBLE_PRESS_WINDOW = 0.5
-        
-        # set this to prevent all keys from passing through to other applications
+        self._stopThread = None
+        self._stopError = None
+
+        # Native code is authoritative for suppression decisions.
         self.eatAllKeys = False
 
-        # Register cleanup
         atexit.register(self.stop)
-    
+
     def start(self) -> None:
-        """
-        Start capturing events.
-        
-        Raises:
-            PermissionError: If accessibility permissions not granted
-            RuntimeError: If listener already running or thread creation failed
-        """
-        if self._running:
-            pglMessages.message("Listener already running")
-            return
-        
-        if _pglEventListener.isRunning():
-            pglMessages.warning("Another listener is already running in this process")
-            self._running = False
-            return
-        
-        _pglEventListener.start(self._eventCallback)
-        self._running = True
-    
+        """Start this listener; preserve queued events until explicitly drained."""
+        with self._lifecycleLock:
+            if self._running and _pglEventListener.isRunning(): return
+
+            if _pglEventListener.isRunning():
+                raise RuntimeError("Another listener is already running in this process")
+
+            self._lastEscTime = 0.0
+            self._stopError = None
+            self.eatAllKeys = False
+
+            _pglEventListener.start(self._eventCallback)
+            self._running = True
+
     def stop(self) -> None:
-        """Stop capturing events and cleanup resources."""
-        if not self._running:
-            return
-        
-        _pglEventListener.stop()
-        self._running = False
-        
-        with self._lock:
-            self._keyboardQueue.clear()
-            self._mouseQueue.clear()
-            self._keyStatus.clear()
-            
+        """
+        Stop owned capture without discarding queued keyboard/mouse events.
+
+        Native stop releases the GIL while waiting for the callback thread.
+        Escape shutdown calls this from a separate helper thread.
+        """
+        with self._lifecycleLock:
+            if not self._running: return
+
+            # Clear suppression before waiting for native shutdown.
+            _pglEventListener.setEatAllKeys(False)
+            _pglEventListener.setEatKeys([])
+            self.eatAllKeys = False
+
+            _pglEventListener.stop()
+            self._running = False
+
+            with self._lock:
+                self._keyStatus.clear()
+
+            # Do not clear event queues here. In particular, the experiment
+            # must still be able to retrieve Escape after emergency shutdown.
+
     def isRunning(self) -> bool:
-        """Check if listener is currently running."""
-        return _pglEventListener.isRunning()
-    
+        """Report whether this instance owns a running native listener."""
+        return self._running and bool(_pglEventListener.isRunning())
+
     def _eventCallback(self, event: Dict) -> bool:
         """
-        Internal callback called from C extension.
-        Runs in separate thread - must be thread-safe!
+        Queue input first; process Escape outside the event-queue lock.
+
+        Native code handles suppression, including unconditional Escape
+        recovery before it waits for the Python callback.
         """
-        eventType = event.get('eventType', '')
-        
+        eventType = event.get("eventType", "")
+        escapePressed = (
+            eventType == "keydown"
+            and event.get("keyCode") == 53
+        )
+
         with self._lock:
-            returnValue = False
-            # handle ESC key for failsafe shutdown
-            if eventType == 'keydown' and event.get('keyCode') == 53:
-                self._handleEscPress()
-                return returnValue
-        
-            if eventType in ('keydown', 'keyup'):
-                keyCode = event['keyCode']
-                
-                # Update key status
-                if eventType == 'keydown':
-                    self._keyStatus[keyCode] = event['timestamp']
-                else:  # keyup
+            if eventType in ("keydown", "keyup"):
+                keyCode = event["keyCode"]
+
+                if eventType == "keydown":
+                    self._keyStatus[keyCode] = event["timestamp"]
+                else:
                     self._keyStatus.pop(keyCode, None)
-                
-                # add to keyboard queue
+
+                # Queue Escape too, before any shutdown can occur.
                 self._keyboardQueue.append(event)
-                returnValue = self.eatAllKeys
-                
-            elif 'mouse' in eventType:
+
+            elif "mouse" in eventType.casefold():
                 self._mouseQueue.append(event)
-        # returning False indicates that the event should be passed through
-        # unless it is an eat key (which is handled in the c-code)
-        return returnValue
-    
-    def _handleEscPress(self) -> None:
+
+        if escapePressed:
+            # Holding Escape must not count as repeated physical presses.
+            self._handleEscPress(isRepeat=bool(event.get("isRepeat", False)))
+
+        # Native code already applies selective/all-key suppression.
+        # Returning eatAllKeys here could reapply stale suppression after
+        # the native fail-safe has cleared it.
+        return False
+
+    def _handleEscPress(self, isRepeat=False) -> None:
         """
-        Handle ESC key press for failsafe shutdown 
-        
-        Single press: Turn off eat keys
-        Double press (within 500ms): Shutdown listener
+        One Escape releases suppression; double Escape requests shutdown.
+
+        Never joins the event thread or acquires the lifecycle lock here.
+        Uses a monotonic clock so wall-clock adjustments cannot affect the
+        double-press interval.
         """
-        timestamp = time.time()
-        
-        if 0 < (timestamp - self._lastEscTime) <= self.DOUBLE_PRESS_WINDOW:
-            # Double ESC press, call stop
-            self.stop()
-            self._lastEscTime = 0
-        else:
-            # Single ESC press, turn off eat keys
-            self.setEatKeys([])
-            self.setEatAllKeys(False)
-            self._lastEscTime = timestamp
+        self.eatAllKeys = False
+        _pglEventListener.setEatAllKeys(False)
+        _pglEventListener.setEatKeys([])
+
+        if isRepeat: return
+
+        timestamp = time.monotonic()
+        doublePress = (
+            self._lastEscTime > 0
+            and 0 < timestamp - self._lastEscTime <= self.DOUBLE_PRESS_WINDOW
+        )
+        self._lastEscTime = 0.0 if doublePress else timestamp
+
+        if not doublePress: return
+        if self._stopThread is not None and self._stopThread.is_alive(): return
+
+        def stopOutsideCallback():
+            try:
+                self.stop()
+            except Exception as error:
+                self._stopError = f"{type(error).__name__}: {error}"
+                pglMessages.warning(
+                    f"Emergency keyboard-listener shutdown failed: {self._stopError}"
+                )
+
+        self._stopThread = threading.Thread(
+            target=stopOutsideCallback,
+            name="pglKeyboardEmergencyStop",
+            daemon=True,
+        )
+        self._stopThread.start()
  
     def getKeyboardEvent(self) -> Optional[Dict]:
         """
