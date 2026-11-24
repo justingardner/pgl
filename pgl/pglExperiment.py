@@ -1719,19 +1719,12 @@ class pglExperiment(pglExperimentBase):
         volumeTriggerMedianWindow=10,
         volumeTriggerMinIntervals=3,
     ):
-        """
-        Run the experiment, consuming counter evidence and bounded repairs.
-
-        Source events are retained before processing. Counter diagnostics are
-        processed in their delivery order; they are not mistaken for physical
-        triggers at their notification timestamps.
-
-        Late repairs cannot retroactively change the start/ignore boundary.
-        """
+        """Run acquisition with cumulative task timing and frame association."""
         from numbers import Integral
 
         if type(repairMissingVolumeTriggers) is not bool:
             raise TypeError("repairMissingVolumeTriggers must be Boolean.")
+
         for name, value in (
             ("volumeTriggerMedianWindow", volumeTriggerMedianWindow),
             ("volumeTriggerMinIntervals", volumeTriggerMinIntervals),
@@ -1742,6 +1735,7 @@ class pglExperiment(pglExperimentBase):
                 or value < 1
             ):
                 raise ValueError(f"{name} must be a positive integer.")
+
         if volumeTriggerMinIntervals > volumeTriggerMedianWindow:
             raise ValueError("Minimum interval history cannot exceed its window.")
 
@@ -1760,12 +1754,15 @@ class pglExperiment(pglExperimentBase):
         }
         if not hasattr(self.data, "volumeTriggerRepairAudit"):
             self.data.volumeTriggerRepairAudit = []
+
         self.data.volumeTriggerRepairConfiguration = {
             "enabled": repairMissingVolumeTriggers,
             "medianWindow": int(volumeTriggerMedianWindow),
             "minIntervals": int(volumeTriggerMinIntervals),
             "preStartPolicy": "doNotRetroactivelyChangeAcceptanceBoundary",
         }
+
+        self._initializeTaskTiming()
 
         if self.eyeTracker is not None: self.eyeTracker.start()
 
@@ -1806,8 +1803,6 @@ class pglExperiment(pglExperimentBase):
 
         def acceptMeasured(event):
             self._recordVolumeTrigger(event)
-            # Once established, do not move this boundary backward on a
-            # late delivery or reconstructed timestamp.
             if self._volumeRepairRuntime["acceptanceBoundary"] is None:
                 self._volumeRepairRuntime["acceptanceBoundary"] = event.timestamp
 
@@ -1816,172 +1811,225 @@ class pglExperiment(pglExperimentBase):
                 if event.type in diagnosticTypes:
                     self._consumeVolumeCounterDiagnostic(event)
 
-        # Calibration may already have polled and retained counter evidence.
-        # Process it without accepting pre-gate scanner volumes.
+        # Process retained evidence without accepting pre-gate volumes.
         processDiagnostics(list(self.data.events))
 
-        # Drain queued input events before establishing the run's start gate.
         for device in getattr(self, "_experimentInputDevices", []):
             pending = list(device.poll())
             self.data.events.extend(pending)
             processDiagnostics(pending)
 
-        ################################################################
-        # Wait for manual/start-on-volume gates.
-        ################################################################
-        if self.state.startKeyCode is not None or self.settings.startOnVolumeTrigger:
-            while not self.state.experimentStarted:
-                if manualPreStart:
-                    self.pgl.text(
-                        f"Press {self.settings.startKey} key to make experiment start",
-                        y=0,
-                    )
-                elif self.settings.startOnVolumeTrigger:
-                    screen = self.settings.startScreen[0]
-                    if screen in ("blank", "fixation cross"):
-                        self.pgl.clearScreen(self.settings.backgroundColor)
-                        if screen == "fixation cross": self.pgl.fixationCross()
-                    elif screen == "waiting message":
-                        self.pgl.text("Waiting for volume trigger to start experiment", y=0)
-                else:
-                    self.pgl.text(
-                        f"Press {self.settings.startKey} key to start experiment",
-                        y=0,
-                    )
+        try:
+            ################################################################
+            # Wait for manual/start-on-volume gates
+            ################################################################
+            if self.state.startKeyCode is not None or self.settings.startOnVolumeTrigger:
+                while not self.state.experimentStarted:
+                    if manualPreStart:
+                        self.pgl.text(
+                            f"Press {self.settings.startKey} key to make experiment start",
+                            y=0,
+                        )
+                    elif self.settings.startOnVolumeTrigger:
+                        screen = self.settings.startScreen[0]
+                        if screen in ("blank", "fixation cross"):
+                            self.pgl.clearScreen(self.settings.backgroundColor)
+                            if screen == "fixation cross": self.pgl.fixationCross()
+                        elif screen == "waiting message":
+                            self.pgl.text("Waiting for volume trigger to start experiment", y=0)
+                    else:
+                        self.pgl.text(
+                            f"Press {self.settings.startKey} key to start experiment",
+                            y=0,
+                        )
 
-                self.pgl.flush()
+                    # Retain a recent presentation for the first task prediction.
+                    self._flushTaskFrame()
+                    events = retainPolledEvents()
+
+                    if any(matchesKey(event, self.state.endKeyCode) for event in events):
+                        self.state.experimentStarted = True
+                        self.state.experimentDone = True
+                        processDiagnostics(events)
+                        break
+
+                    # Physical controls use timestamp order. Diagnostics retain
+                    # their original delivery order.
+                    controls = [
+                        event for event in events
+                        if event.type not in diagnosticTypes
+                    ]
+                    controls.sort(key=lambda event: (
+                        event.timestamp
+                        if getattr(event, "timestamp", None) is not None
+                        else float("inf")
+                    ))
+
+                    for event in controls:
+                        if matchesKey(event, self.state.startKeyCode, keydownOnly=True):
+                            if manualPreStart:
+                                manualPreStart = False
+                                pglMessages.message(
+                                    f"Manual pre-start ended after {manualPreStartVolumes} volumes.",
+                                    messageType="experiment",
+                                )
+                            else:
+                                self.state.experimentStarted = True
+
+                        if not self.settings.startOnVolumeTrigger: continue
+                        if not self._isVolumeTrigger(event): continue
+
+                        if manualPreStart:
+                            manualPreStartVolumes += 1
+                        elif ignoreInitialVolumes > 0:
+                            ignoreInitialVolumes -= 1
+                        else:
+                            if not self.state.experimentStarted:
+                                pglMessages.message(
+                                    f"Ignored {self.settings.ignoreInitialVolumes} initial volumes.",
+                                    messageType="experiment",
+                                )
+                            self.state.experimentStarted = True
+                            acceptMeasured(event)
+
+                    processDiagnostics(events)
+            else:
+                self.state.experimentStarted = True
+
+            if self.state.experimentDone:
+                self.data.endTime = self.pgl.getSecs()
+                self._reportRunProgress(
+                    "Experiment ended before tasks started; proceeding to save."
+                )
+                return
+
+            ################################################################
+            # Start tasks without backdating transition timestamps
+            ################################################################
+            pglMessages.message("Experiment started.", messageType="experiment")
+            self.data.startTime = self.pgl.getSecs()
+            self.data.startDateTime = datetime.now().astimezone().isoformat()
+
+            if self._volumeRepairRuntime["acceptanceBoundary"] is None:
+                self._volumeRepairRuntime["acceptanceBoundary"] = self.data.startTime
+
+            if not self.state.phaseNums:
+                raise ValueError("Experiment needs at least one task with a phaseNum.")
+
+            self._prepareTaskFrame(self.pgl.getSecs())
+            self.startPhase(phaseNum=self.state.phaseNums[0])
+
+            while not self.state.experimentDone:
                 events = retainPolledEvents()
 
                 if any(matchesKey(event, self.state.endKeyCode) for event in events):
-                    self.state.experimentStarted = True
                     self.state.experimentDone = True
                     processDiagnostics(events)
-                    break
 
-                # Preserve ordering of physical controls within this poll.
-                # Diagnostics are subsequently consumed in their original
-                # order, so their counter history is never timestamp-sorted.
-                controls = [
-                    event for event in events if event.type not in diagnosticTypes
-                ]
-                controls.sort(key=lambda event: (
-                    event.timestamp
-                    if getattr(event, "timestamp", None) is not None
-                    else float("inf")
-                ))
-
-                for event in controls:
-                    if matchesKey(event, self.state.startKeyCode, keydownOnly=True):
-                        if manualPreStart:
-                            manualPreStart = False
-                            pglMessages.message(
-                                f"Manual pre-start ended after "
-                                f"{manualPreStartVolumes} volumes.",
-                                messageType="experiment",
-                            )
-                        else:
-                            self.state.experimentStarted = True
-
-                    if not self.settings.startOnVolumeTrigger: continue
-                    if not self._isVolumeTrigger(event): continue
-
-                    if manualPreStart:
-                        manualPreStartVolumes += 1
-                    elif ignoreInitialVolumes > 0:
-                        ignoreInitialVolumes -= 1
-                    else:
-                        if not self.state.experimentStarted:
-                            pglMessages.message(
-                                f"Ignored {self.settings.ignoreInitialVolumes} initial volumes.",
-                                messageType="experiment",
-                            )
-                        self.state.experimentStarted = True
-                        acceptMeasured(event)
-
-                processDiagnostics(events)
-
-        else:
-            self.state.experimentStarted = True
-
-        if self.state.experimentDone:
-            self.data.endTime = self.pgl.getSecs()
-            self._reportRunProgress(
-                "Experiment ended before tasks started; proceeding to save."
-            )
-            return
-
-        ################################################################
-        # Start tasks. Repairs never backdate this transition.
-        ################################################################
-        pglMessages.message("Experiment started.", messageType="experiment")
-        self.data.startTime = self.pgl.getSecs()
-        self.data.startDateTime = datetime.now().astimezone().isoformat()
-
-        # A manual/immediate start has an explicit host-clock boundary.
-        if self._volumeRepairRuntime["acceptanceBoundary"] is None:
-            self._volumeRepairRuntime["acceptanceBoundary"] = self.data.startTime
-
-        if not self.state.phaseNums:
-            raise ValueError("Experiment needs at least one task with a phaseNum.")
-        self.startPhase(phaseNum=self.state.phaseNums[0])
-
-        while not self.state.experimentDone:
-            events = retainPolledEvents()
-
-            if any(matchesKey(event, self.state.endKeyCode) for event in events):
-                self.state.experimentDone = True
-                processDiagnostics(events)
-                for task in self.currentTasks: task.end()
-                continue
-
-            taskEvents = []
-            for event in events:
-                if event.type in diagnosticTypes:
+                    stopTime = self.pgl.getSecs()
+                    errors = []
+                    for task in self.currentTasks:
+                        self._attemptRunAction(
+                            f"stop task {task.settings.taskName}",
+                            lambda task=task: task.end(timestamp=stopTime, reason="userStopped"),
+                            errors,
+                            reportProgress=False,
+                        )
+                    if errors: raise errors[0]
                     continue
-                if self._isVolumeTrigger(event):
-                    acceptMeasured(event)
-                else:
-                    taskEvents.append(event)
 
-            # Source edges from this poll are already retained and counted.
-            # Late repair placement therefore checks against all of them.
-            processDiagnostics(events)
+                taskEvents = []
+                for event in events:
+                    if event.type in diagnosticTypes: continue
+                    if self._isVolumeTrigger(event):
+                        acceptMeasured(event)
+                    else:
+                        taskEvents.append(event)
 
-            subjectResponses = [
-                (self.state.responseKeyCodesList.index(event.keyCode), event.timestamp)
-                for event in taskEvents
-                if (
-                    event.type == "keyboard"
-                    and event.eventType == "keydown"
-                    and event.keyCode in self.state.responseKeyCodesList
-                )
-            ]
+                # Retained source edges are available before late repair placement.
+                processDiagnostics(events)
 
-            phaseDone = False
-            updateTime = self.pgl.getSecs()
-            for task in self.currentTasks:
-                task.update(
-                    updateTime=updateTime,
-                    subjectResponses=subjectResponses,
-                    phaseNum=self.state.phaseNum,
-                    tasks=self.currentTasks,
-                    events=taskEvents,
-                )
-                if task.done(): phaseDone = True
-
-            if self.flush: self.pgl.flush()
-
-            if phaseDone:
-                for task in self.currentTasks: task.end()
-                if self.state.currentPhaseIndex >= len(self.state.phaseNums) - 1:
-                    self.state.experimentDone = True
-                else:
-                    self.state.currentPhaseIndex += 1
-                    self.startPhase(
-                        phaseNum=self.state.phaseNums[self.state.currentPhaseIndex]
+                subjectResponses = [
+                    (self.state.responseKeyCodesList.index(event.keyCode), event.timestamp)
+                    for event in taskEvents
+                    if (
+                        event.type == "keyboard"
+                        and event.eventType == "keydown"
+                        and event.keyCode in self.state.responseKeyCodesList
                     )
+                ]
 
-        self.data.endTime = self.pgl.getSecs()
+                updateTime = self.pgl.getSecs()
+                self._prepareTaskFrame(updateTime)
+
+                phaseDone = False
+                for task in self.currentTasks:
+                    task.update(
+                        updateTime=updateTime,
+                        subjectResponses=subjectResponses,
+                        phaseNum=self.state.phaseNum,
+                        tasks=self.currentTasks,
+                        events=taskEvents,
+                    )
+                    if task.done(): phaseDone = True
+
+                if self.flush: self._flushTaskFrame()
+
+                if phaseDone:
+                    phaseEndTime = self.pgl.getSecs()
+                    errors = []
+
+                    for task in self.currentTasks:
+                        self._attemptRunAction(
+                            f"end phase task {task.settings.taskName}",
+                            lambda task=task: task.end(
+                                timestamp=phaseEndTime, reason="phaseEnded",
+                            ),
+                            errors,
+                            reportProgress=False,
+                        )
+                    if errors: raise errors[0]
+
+                    if self.state.currentPhaseIndex >= len(self.state.phaseNums) - 1:
+                        self.state.experimentDone = True
+                    else:
+                        self.state.currentPhaseIndex += 1
+                        self._prepareTaskFrame(self.pgl.getSecs())
+                        self.startPhase(
+                            phaseNum=self.state.phaseNums[self.state.currentPhaseIndex]
+                        )
+
+            self.data.endTime = self.pgl.getSecs()
+
+        except (Exception, KeyboardInterrupt, SystemExit):
+            # Preserve partial lifecycle evidence without invoking callbacks
+            # that might send drawing commands into an interrupted exchange.
+            failureTime = self.pgl.getSecs()
+
+            for task in self.tasks:
+                if not task._taskActive or task.data.endTime is not None:
+                    continue
+
+                if task._trialActive:
+                    event = pglEventTrial(
+                        task.state.currentTrial,
+                        failureTime,
+                        eventType=pglEventTrial.boundaryType.END,
+                    )
+                    event.completed = False
+                    event.endReason = "acquisitionError"
+                    task.data.events.append(event)
+                    task._trialActive = False
+
+                task.data.endTime = failureTime
+                task.data.endReason = "acquisitionError"
+                task.data.endCallbacksSkipped = True
+                task._taskActive = False
+
+            raise
+
+        finally:
+            self._finishPendingTaskTiming()
     
     def initDigitalIO(self):
         """
@@ -2624,35 +2672,46 @@ class pglExperiment(pglExperimentBase):
         self.eyeTracker.sendMessage(f"pgl: {eventType} taskID={taskID} trialNum={trialNum} segmentNum={segmentNum} timestamp={timestamp} phaseNum={phaseNum}")
 
     def startPhase(self, phaseNum=0):
-        '''
-        Start the current phase of the experiment.
-        '''
-        self.state.phaseNum = phaseNum
-        
-        # starting phase
-        pglMessages.message(f"Starting phase: {self.state.phaseNum+1}/{len(self.state.phaseNums)}",messageType='experiment')
-        
-        # get the current tasks based on the current phase number
-        self.currentTasks = [task for task in self.tasks if task.settings.phaseNum is None or task.settings.phaseNum == self.state.phaseNum]
+        """Start available tasks, skipping empty phases without index confusion."""
+        self.state.currentPhaseIndex = self.state.phaseNums.index(phaseNum)
 
-        # set start time
-        startTime = self.pgl.getSecs()
-        for task in self.currentTasks:
-            if task.start(startTime) == False:
-                # if task start returns Fales, then end it and remove it form the current tasks list
-                pglMessages.warning(f"(pglExperiment:startPhase) Task {task.settings.taskName} failed to start. Ending task.")
-                task.end()
-                self.currentTasks.remove(task)
-            
-        # if there are no currentTasks, it means that all the tasks for this phase have already been completed, so we should move to the next phase    
-        if len(self.currentTasks) == 0:
-            # check if we have ended all phases 
-            if self.state.phaseNum >= len(self.state.phaseNums)-1:
-                self.state.experimentDone = True
-            else:
-                # update phase
-                self.state.currentPhaseIndex += 1
-                self.startPhase(phaseNum=self.state.phaseNums[self.state.currentPhaseIndex])
+        while self.state.currentPhaseIndex < len(self.state.phaseNums):
+            self.state.phaseNum = self.state.phaseNums[self.state.currentPhaseIndex]
+
+            pglMessages.message(
+                f"Starting phase: {self.state.currentPhaseIndex + 1}/{len(self.state.phaseNums)}",
+                messageType='experiment',
+            )
+
+            candidates = [
+                task for task in self.tasks
+                if (
+                    task.data.endTime is None
+                    and (
+                        task.settings.phaseNum is None
+                        or task.settings.phaseNum == self.state.phaseNum
+                    )
+                )
+            ]
+
+            self.currentTasks = []
+            startTime = self.pgl.getSecs()
+
+            for task in candidates:
+                if task.start(startTime) == False:
+                    pglMessages.warning(
+                        f"(pglExperiment:startPhase) Task "
+                        f"{task.settings.taskName} did not start."
+                    )
+                    continue
+                self.currentTasks.append(task)
+
+            if self.currentTasks: return
+
+            self.state.currentPhaseIndex += 1
+
+        self.currentTasks = []
+        self.state.experimentDone = True
 
     def isAbortedRun(self):
         """Decide whether this run should be saved under trash.
@@ -4524,6 +4583,178 @@ class pglExperiment(pglExperimentBase):
         )
         return True
     
+    def _initializeTaskTiming(self):
+        """Initialize lightweight frame prediction without renderer queries."""
+        self._lastTaskPresentation = None
+        self._taskFlushIndex = 0
+        self._taskFrameTiming = None
+
+        frameRate = float(self.pgl.frameRate) if self.flush else None
+        if self.flush and (not math.isfinite(frameRate) or frameRate <= 0):
+            raise ValueError("Visual task timing requires a finite positive cached frameRate.")
+
+        self._taskFrameInterval = 1.0 / frameRate if self.flush else None
+
+        self.data.taskTiming = {
+            "mode": "nearestRefresh" if self.flush else "hostClock",
+            "frameRate": frameRate,
+            "prediction": "lastPresentationPlusCachedRefreshInterval",
+            "clockBasis": "sameAsGetSecs",
+            "flushIndexScope": "experimentManagedRunFlushes",
+            "flushAttempts": 0,
+            "invalidPresentationResults": [],
+        }
+
+    def _prepareTaskFrame(self, updateTime):
+        """Predict a refresh from the last valid presentation when available.
+
+        Missing presentation results do not erase a previously valid reference.
+        Before the first valid reference, use host-clock scheduling without
+        a half-frame allowance. No renderer query is performed here.
+        """
+        if not self.flush or self._lastTaskPresentation is None:
+            self._taskFrameTiming = {
+                "mode": "hostClock",
+                "predictedPresentation": None,
+                "frameInterval": self._taskFrameInterval,
+            }
+            return
+
+        interval = self._taskFrameInterval
+        previous = self._lastTaskPresentation
+        predicted = previous + interval
+
+        # Advance the refresh grid past the current host time.
+        if predicted <= updateTime:
+            missed = math.floor((updateTime - predicted) / interval) + 1
+            predicted += missed * interval
+
+        self._taskFrameTiming = {
+            "mode": "nearestRefresh",
+            "predictedPresentation": float(predicted),
+            "frameInterval": interval,
+        }
+        
+    def _flushTaskFrame(self):
+        """Flush once, accepting optional presentation timing.
+
+        A zero/absent presentation timestamp is not a failed flush.
+        Preserve the last valid presentation for refresh prediction.
+
+        Boundary events belong only to this flush attempt. Missing actual
+        timestamps remain None and are never borrowed from a later frame.
+        """
+        from copy import deepcopy
+        from numbers import Real
+
+        def numericScalar(value):
+            """Normalize a finite scalar or single-element NumPy array."""
+            if isinstance(value, np.ndarray):
+                if value.size != 1 or value.dtype.kind not in "iuf":
+                    return None
+                value = value.item()
+
+            if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
+                return None
+
+            try:
+                value = float(value)
+            except (TypeError, ValueError, OverflowError):
+                return None
+
+            return value if math.isfinite(value) else None
+
+        flushIndex = self._taskFlushIndex
+        self._taskFlushIndex += 1
+        self.data.taskTiming["flushAttempts"] = self._taskFlushIndex
+
+        # Snapshot before sending: never associate these starts with a later flush.
+        associations = []
+        for task in self.tasks:
+            pending = list(task._pendingPresentationEvents)
+            task._pendingPresentationEvents.clear()
+            if pending: associations.append((task, pending))
+
+        returnedTime = None
+        commandResults = None
+        presentedTime = None
+        status = "flushException"
+        failureDetails = None
+
+        try:
+            returnedTime = self.pgl.flush()
+            commandResults = getattr(self.pgl, "commandResults", None)
+
+            if not isinstance(commandResults, dict):
+                status = "missingCommandResults"
+                raise RuntimeError(
+                    f"Flush {flushIndex} returned no command-result dictionary."
+                )
+
+            success = numericScalar(commandResults.get("success"))
+            if success is None or success <= 0:
+                status = "unsuccessfulFlush"
+                raise RuntimeError(
+                    f"Flush {flushIndex} did not report success: "
+                    f"{commandResults.get('success')!r}"
+                )
+
+            candidate = numericScalar(returnedTime)
+
+            if returnedTime is None or candidate == 0:
+                # Expected: successful command, presentation time unavailable.
+                status = "presentationUnavailable"
+
+            elif candidate is None or candidate < 0:
+                status = "invalidPresentation"
+
+            elif (
+                self._lastTaskPresentation is not None
+                and candidate <= self._lastTaskPresentation
+            ):
+                status = "nonIncreasingPresentation"
+
+            else:
+                presentedTime = candidate
+                status = "presented"
+                self._lastTaskPresentation = presentedTime
+
+            # Missing/invalid timing leaves the previous valid reference intact.
+            return presentedTime
+
+        except BaseException as error:
+            failureDetails = f"{type(error).__name__}: {error}"
+            raise
+
+        finally:
+            for task, pending in associations:
+                task._resolveTaskPresentation(
+                    pending, presentedTime, status, flushIndex,
+                )
+
+            # Count expected missing timestamps without copying a large
+            # command-result dictionary for every ordinary unavailable result.
+            counts = self.data.taskTiming.setdefault("presentationStatusCounts", {})
+            counts[status] = counts.get(status, 0) + 1
+
+            if status not in ("presented", "presentationUnavailable"):
+                self.data.taskTiming["invalidPresentationResults"].append({
+                    "flushIndex": flushIndex,
+                    "status": status,
+                    "error": failureDetails,
+                    "returnedPresentation": deepcopy(returnedTime),
+                    "commandResults": deepcopy(commandResults),
+                })
+
+    def _finishPendingTaskTiming(self):
+        """Mark boundaries left without a flush; never manufacture presentation."""
+        for task in self.tasks:
+            pending = list(task._pendingPresentationEvents)
+            task._pendingPresentationEvents.clear()
+            task._resolveTaskPresentation(
+                pending, None, "runEndedBeforeFlush", None,
+            )
+    
 ##############################################
 # Settings for pglTask
 ##############################################
@@ -5231,118 +5462,91 @@ class pglTask(pglTaskBase):
     Class representing a task in the experiment. For example, a fixation task. Or
     a stimulus task which controls when and what stimuli are presented
     '''
+    
     def __init__(self, pgl=None, phaseNum=0):
         self.pgl = pgl
         self.settings = pglTaskSettings()
         self.state = pglTaskState()
         self.data = pglTaskData()
         self.parameters: List[pglParameter] = []
-        
-        # default segment length
+
+        # Default segment length and phase.
         self.settings.seglen = [1.0]
-        
-        # set phaseNum
         self.settings.phaseNum = phaseNum
-        
-        # these get set by update
+
         self.tasks = None
         self.e = None
         self.waitUntilVolumeTrigger = False
 
-    def configure(self, e):
-        '''
-        Configure gets called on tasks, just after initScreen runs so that tasks can use
-        any information needed from the pglExperiment to initialize, 
-        '''
-        pass
+        # Instance-owned runtime timing and lifecycle state.
+        self._thisTrialSeglen = []
+        self._taskActive = False
+        self._trialActive = False
+        self._completedTrials = 0
+        self._taskEnding = False
+        self._segmentJumpRequested = False
+        self._segmentAwaitingPresentation = False
+        self._segmentScheduledStart = None
+        self._segmentStartEvent = None
+        self._pendingTrialStart = None
+        self._pendingPresentationEvents = []
 
     def start(self, startTime):
-        '''
-        Start the task.
-        '''
-        # if task is already started, then do nothing
-        if self.data.startTime is not None:
-            return
+        """Public task-start entry point; subclasses override startTask()."""
+        return self._startTask(startTime)
 
-        # set task start time
+    def _startTask(self, startTime):
+        """Initialize the task once, invoke its callback, then start a trial."""
+        if self.data.endTime is not None: return False
+        if self._taskActive: return True
+
         self.data.startTime = startTime
-        
-        # run overrideable startTask methos
-        if self.startTask(startTime) == False:
-            return False
-        
-        # start trial
+        self._taskActive = True
         self.state.currentTrial = -1
-        self.startTrial(startTime)
-        
-        return True
 
-    def startTask(self, startTime):
-        '''
-        Can be overridden in subclasses to add custom behavior when the task starts.
-        Must return True to run the task as intended, or False to abort running the task
-        '''
-        return True
-    
-    def startSegment(self, updateTime):
-        '''
-        Called exactly once, each time a new segment genuinely starts.
-        Override in subclasses to add custom per-segment behavior
-        (e.g. loading a stimulus). Base implementation does nothing.
-        '''    
+        if self.startTask(startTime) == False:
+            self._endTask(timestamp=startTime, reason="startRejected")
+            return False
+
+        # The callback may explicitly end the task.
+        if self.data.endTime is not None: return False
+
+        if self.settings.nTrials <= 0:
+            self._endTask(timestamp=startTime, reason="completed")
+            return False
+
+        self._startTrial(startTime)
+        return self.data.endTime is None
+
+    def startTrial(self, startTime):
+        """Subclass callback before segment zero starts.
+
+        Parameters, trialVariables, and finalized segment durations are ready.
+        Override modifyTrialSegments() to change the segment durations.
+
+        Do not advance the trial or call _startTrial() from this callback.
+        """
         pass
 
-    def _startSegment(self, updateTime):
-        """Advance a segment or end the trial using its finalized segment list.
-
-        Called by the existing timing and scanner-trigger logic.
-        Override startSegment() for per-segment stimulus behavior, or
-        modifyTrialSegments() to customize timing before the trial begins.
-        """
-        # Preserve the elapsed duration of a segment explicitly jumped
-        # by setting its runtime length to zero.
-        if self.state.currentSegment >= 0 and self._thisTrialSeglen[self.state.currentSegment] == 0:
-            self._thisTrialSeglen[self.state.currentSegment] = updateTime - self.state.segmentStartTime
-
-        # Use this trial's segment count, not the configured default count.
-        if self.state.currentSegment + 1 >= len(self._thisTrialSeglen):
-            self.endTrial(updateTime)
-
-            if self.done(self.state.currentTrial + 1):
-                self.state.currentTrial += 1
-            else:
-                self.startTrial(updateTime)
-
-        else:
-            # Record the new segment before invoking the subclass callback.
-            self.state.currentSegment += 1
-            self.state.segmentStartTime = updateTime
-            self.data.events.append(pglEventSegment(self.state.currentSegment, updateTime))
-
-            if self.settings.saveEyeTracker:
-                self.e.saveEyeTrackerEvent(
-                    eventType="segment",
-                    taskID=self.settings.taskID,
-                    trialNum=self.state.currentTrial,
-                    segmentNum=self.state.currentSegment,
-                    timestamp=updateTime,
-                    phaseNum=self.settings.phaseNum,
-                )
-
-            self.waitUntilVolumeTrigger = False
-            self.startSegment(updateTime)
-            
-    def startTrial(self, startTime):
-        """Initialize trial parameters and timing, then start the first segment."""
+    def _startTrial(self, startTime, *, scheduledStart=None):
+        """Initialize trial bookkeeping and timing, then invoke callbacks."""
         from numbers import Real
+
+        if self.data.endTime is not None: return
+        if self._trialActive:
+            raise RuntimeError("Cannot start a trial while another trial is active.")
 
         self.state.currentTrial += 1
         self.state.currentSegment = -1
-        self.data.events.append(pglEventTrial(self.state.currentTrial, startTime))
         self.state.trialStartTime = startTime
+        self._trialActive = True
+
+        trialEvent = pglEventTrial(self.state.currentTrial, startTime)
+        self.data.events.append(trialEvent)
+        self._pendingTrialStart = trialEvent
 
         if self.settings.saveEyeTracker:
-            self.e.saveEyeTrackerEvent(eventType="trial", taskID=self.settings.taskID, trialNum=self.state.currentTrial, segmentNum=self.state.currentSegment, timestamp=startTime, phaseNum=self.settings.phaseNum)
+            self.e.saveEyeTrackerEvent(eventType="trial", taskID=self.settings.taskID, trialNum=self.state.currentTrial, segmentNum=-1, timestamp=startTime, phaseNum=self.settings.phaseNum)
 
         ################################################################
         # Generate parameters using this task's verbosity
@@ -5351,32 +5555,25 @@ class pglTask(pglTaskBase):
         self.currentParams = self.data.params[-1]
 
         for parameter in self.parameters:
-            # Apply before get(), which can generate and announce a new block.
-            # Recursive propagation also handles nested parameter blocks.
+            # Apply before get(), including nested parameter blocks.
             parameter.setVerbose(self.settings.verbose)
             self.currentParams.update(parameter.get())
 
         self.data.trialVariables.append({})
 
         ################################################################
-        # Randomize timing, then allow trial-specific modifications
+        # Randomize and finalize this trial's segment durations
         ################################################################
         if not (len(self.settings.segmin) == len(self.settings.segmax) == len(self.settings.waitUntilVolumeTrigger) == self.settings.nSegments):
             raise ValueError("Segment bounds and scanner-wait flags must match settings.nSegments.")
 
         proposedSeglen = [
-            float('inf') if math.isinf(minVal) or math.isinf(maxVal)
+            float("inf") if math.isinf(minVal) or math.isinf(maxVal)
             else random.uniform(minVal, maxVal)
             for minVal, maxVal in zip(self.settings.segmin, self.settings.segmax)
         ]
-
-        # Parameters and trial variables are available to the callback.
-        # Call once per trial, before any segment starts.
         modifiedSeglen = self.modifyTrialSegments(proposedSeglen)
 
-        ################################################################
-        # Validate and copy the finalized segment lengths
-        ################################################################
         if not isinstance(modifiedSeglen, (list, tuple, np.ndarray)):
             raise TypeError("modifyTrialSegments() must return a list, tuple, or one-dimensional NumPy array.")
         if isinstance(modifiedSeglen, np.ndarray) and modifiedSeglen.ndim != 1:
@@ -5393,23 +5590,369 @@ class pglTask(pglTaskBase):
             if math.isnan(duration) or duration < 0:
                 raise ValueError(f"Segment {segmentIndex} duration must be nonnegative and not NaN.")
 
-            # Zero and positive infinity retain their existing timing behavior.
             trialSeglen.append(duration)
 
-        # Keep a separate list so callback-owned data cannot alter live timing.
         self._thisTrialSeglen = trialSeglen
 
-        ################################################################
-        # Print routine trial information only when requested
-        ################################################################
         if self.settings.verbose:
             pglMessages.print(f"({self.settings.taskName}) Trial {self.state.currentTrial + 1}: ", end='', messageType='experiment')
             for name, value in self.currentParams.items(): pglMessages.print(f'{name}={value}', end=' ', messageType='experiment')
             pglMessages.print("", end="\n" if self.settings.trialPrintNewline else " ", messageType='experiment')
 
-        # Start segment zero using this trial's finalized timing.
-        self._startSegment(startTime)
+        # Subclasses see parameters and finalized durations before segment zero.
+        self.startTrial(startTime)
+        if self.data.endTime is not None: return
 
+        self._startSegment(startTime, scheduledStart=scheduledStart)
+
+    def _endTrial(self, endTime, *, reason="completed"):
+        """Record one trial END and invoke the subclass endTrial() callback."""
+        if not self._trialActive: return
+
+        # Close bookkeeping before the callback to prevent reentrant duplicates.
+        self._trialActive = False
+        self.waitUntilVolumeTrigger = False
+
+        event = pglEventTrial(
+            self.state.currentTrial,
+            endTime,
+            eventType=pglEventTrial.boundaryType.END,
+        )
+        event.completed = reason == "completed"
+        event.endReason = reason
+        self.data.events.append(event)
+
+        if event.completed: self._completedTrials += 1
+
+        # This timestamp is a lifecycle boundary, not a measured visual offset.
+        self.endTrial(endTime)
+
+    def end(self, *, timestamp=None, reason="stopped"):
+        """Public task-end entry point; subclasses override endTask()."""
+        return self._endTask(timestamp=timestamp, reason=reason)
+
+    def _endTask(self, *, timestamp=None, reason="stopped"):
+        """Close the active trial and task exactly once, even if callbacks fail."""
+        if self.data.endTime is not None or self._taskEnding: return
+        if not self._taskActive: return
+
+        if timestamp is None: timestamp = self.pgl.getSecs()
+
+        self._taskEnding = True
+        errors = []
+
+        try:
+            # Publish task termination before invoking callbacks.
+            self.data.endTime = timestamp
+            self.data.endReason = reason
+            self._taskActive = False
+
+            try:
+                self._endTrial(timestamp, reason=reason)
+            except (Exception, KeyboardInterrupt, SystemExit) as error:
+                errors.append(error)
+
+            # Never attach an unpresented start to some later unrelated frame.
+            pending = list(self._pendingPresentationEvents)
+            self._pendingPresentationEvents.clear()
+            self._resolveTaskPresentation(
+                pending, None, "taskEndedBeforeFlush", None,
+            )
+
+            if self._pendingTrialStart is not None:
+                self._pendingTrialStart.presentationTimestamp = None
+                self._pendingTrialStart.presentationStatus = "taskEndedBeforeSegmentStart"
+                self._pendingTrialStart = None
+
+            try:
+                self.endTask()
+            except (Exception, KeyboardInterrupt, SystemExit) as error:
+                errors.append(error)
+
+            pglMessages.message(f"Ending task {self.settings.taskName}", messageType='experiment')
+
+        finally:
+            self._taskEnding = False
+
+        if errors: raise errors[0]
+
+    def done(self, trialNum=None):
+        """Query completion without invoking callbacks or changing task state."""
+        if self.data.endTime is not None: return True
+        if trialNum is not None: return trialNum >= self.settings.nTrials
+        return self._completedTrials >= self.settings.nTrials
+    
+    def update(self, updateTime, subjectResponses, phaseNum, tasks, events):
+        """Process input, advance at most once, then draw the current segment."""
+        if self.data.endTime is not None: return
+
+        self.tasks = tasks
+        self.state.subjectResponses = []
+        self.state.phaseNum = phaseNum
+
+        self.handleEvents(events)
+        if self.data.endTime is not None: return
+
+        # Give a newly started visual segment a flush opportunity before
+        # considering another transition. Responses and drawing still run.
+        if not self._segmentAwaitingPresentation:
+            duration = self._thisTrialSeglen[self.state.currentSegment]
+            deadline = self._segmentScheduledStart + duration
+            jumpRequested = self._segmentJumpRequested or duration == 0
+
+            if jumpRequested:
+                self._startSegment(updateTime)
+
+            elif self.waitUntilVolumeTrigger:
+                if self.e.state.volumeNumber > self.lastVolumeNumber:
+                    # Intentional scanner synchronization resets the schedule.
+                    self._startSegment(updateTime)
+
+            elif math.isfinite(deadline):
+                frame = getattr(self.e, "_taskFrameTiming", None)
+                visualTiming = bool(
+                    self.e is not None
+                    and getattr(self.e, "flush", False)
+                    and frame is not None
+                    and frame["mode"] == "nearestRefresh"
+                )
+                waitForTrigger = self.settings.waitUntilVolumeTrigger[self.state.currentSegment]
+
+                if visualTiming and not waitForTrigger:
+                    checkTime = (
+                        frame["predictedPresentation"]
+                        + frame["frameInterval"] / 2
+                    )
+                else:
+                    checkTime = updateTime
+
+                # Numerical tolerance only—not an additional frame allowance.
+                tolerance = max(
+                    1e-9,
+                    4 * math.ulp(float(checkTime)),
+                    4 * math.ulp(float(deadline)),
+                )
+
+                if checkTime >= deadline - tolerance:
+                    if waitForTrigger:
+                        self.waitUntilVolumeTrigger = True
+                        self.lastVolumeNumber = self.e.state.volumeNumber
+                    else:
+                        # Do not reset to the late/early actual transition.
+                        self._startSegment(updateTime, scheduledStart=deadline)
+
+        if self.data.endTime is not None: return
+
+        for subjectResponse, timestamp in subjectResponses:
+            self.state.subjectResponses.append(subjectResponse)
+            responseType = self.handleSubjectResponse(subjectResponse, timestamp)
+
+            if responseType is not None:
+                self.data.events.append(
+                    pglEventSubjectResponse(
+                        response=subjectResponse,
+                        timestamp=timestamp,
+                        responseType=responseType,
+                    )
+                )
+
+            if self.data.endTime is not None: return
+
+        self.updateScreen()
+    
+    def _startSegment(self, updateTime, *, scheduledStart=None):
+        """Advance one segment and associate its start with the next flush.
+
+        scheduledStart=None resets the schedule for an initial start,
+        explicit jump, or scanner-trigger transition.
+
+        A supplied scheduledStart preserves the cumulative intended timeline.
+
+        Presentation association does not require an existing presentation
+        reference. Refresh prediction does require one.
+
+        No segment END events are generated.
+        """
+        if self.data.endTime is not None: return
+
+        # Preserve elapsed duration for the existing explicit-zero jump convention.
+        if (
+            self.state.currentSegment >= 0
+            and self._thisTrialSeglen[self.state.currentSegment] == 0
+        ):
+            self._thisTrialSeglen[self.state.currentSegment] = (
+                updateTime - self.state.segmentStartTime
+            )
+
+        if self.state.currentSegment + 1 >= len(self._thisTrialSeglen):
+            self._endTrial(updateTime)
+
+            # An endTrial callback may explicitly stop the task.
+            if self.data.endTime is not None: return
+
+            if self._completedTrials >= self.settings.nTrials:
+                self._endTask(timestamp=updateTime, reason="completed")
+            else:
+                self._startTrial(updateTime, scheduledStart=scheduledStart)
+            return
+
+        self.state.currentSegment += 1
+        self.state.segmentStartTime = updateTime
+        self.waitUntilVolumeTrigger = False
+        self._segmentJumpRequested = False
+
+        frame = getattr(self.e, "_taskFrameTiming", None)
+
+        # Associate starts with experiment-managed flushes even before a
+        # presentation timestamp is available for refresh prediction.
+        trackPresentation = bool(
+            self.e is not None and getattr(self.e, "flush", False)
+        )
+        predictRefresh = bool(
+            trackPresentation
+            and frame is not None
+            and frame["mode"] == "nearestRefresh"
+        )
+
+        predicted = frame["predictedPresentation"] if predictRefresh else None
+        resetSchedule = scheduledStart is None
+
+        # Until the flush returns, use a provisional origin for a reset.
+        # Ordinary transitions always retain their cumulative scheduled origin.
+        if resetSchedule:
+            scheduledStart = predicted if predicted is not None else updateTime
+
+        self._segmentScheduledStart = float(scheduledStart)
+
+        segmentEvent = pglEventSegment(self.state.currentSegment, updateTime)
+        segmentEvent.trialNum = self.state.currentTrial
+        self.data.events.append(segmentEvent)
+        self._segmentStartEvent = segmentEvent
+
+        boundaryEvents = [segmentEvent]
+        if self._pendingTrialStart is not None:
+            boundaryEvents.insert(0, self._pendingTrialStart)
+            self._pendingTrialStart = None
+
+        for event in boundaryEvents:
+            event.scheduleReset = resetSchedule
+
+            # Preserve the provisional origin separately for auditing.
+            event.provisionalScheduledTimestamp = float(scheduledStart)
+            event.scheduledTimestamp = (
+                None if resetSchedule and trackPresentation
+                else float(scheduledStart)
+            )
+
+            event.predictedPresentationTime = predicted
+            event.presentationTimestamp = None
+            event.presentationStatus = (
+                "pending" if trackPresentation else "notTracked"
+            )
+            event.presentationFlushIndex = None
+            event.presentationError = None
+
+            event.scheduleBasis = (
+                "pendingPresentation" if resetSchedule and trackPresentation
+                else "hostClockReset" if resetSchedule
+                else "cumulative"
+            )
+
+        # Give every newly started visual segment one flush opportunity before
+        # advancing again, regardless of whether timing is returned.
+        self._segmentAwaitingPresentation = trackPresentation
+        if trackPresentation:
+            self._pendingPresentationEvents.extend(boundaryEvents)
+
+        if self.settings.saveEyeTracker:
+            self.e.saveEyeTrackerEvent(
+                eventType="segment",
+                taskID=self.settings.taskID,
+                trialNum=self.state.currentTrial,
+                segmentNum=self.state.currentSegment,
+                timestamp=updateTime,
+                phaseNum=self.settings.phaseNum,
+            )
+
+        self.startSegment(updateTime)
+
+    def _resolveTaskPresentation(self, events, presentedTime, status, flushIndex):
+        """Resolve boundary associations for their own flush attempt only.
+
+        Actual presentation timestamps are optional. Missing values remain
+        None; predictions and host-clock fallbacks are labeled separately.
+
+        Only explicit schedule resets can establish a new timing origin.
+        Ordinary timed boundaries retain the cumulative schedule.
+        """
+        for event in events:
+            event.presentationTimestamp = presentedTime
+            event.presentationStatus = status
+            event.presentationFlushIndex = flushIndex
+
+            if event.scheduleReset:
+                if presentedTime is not None:
+                    origin = presentedTime
+                    event.scheduleBasis = "actualPresentationReset"
+
+                elif event.predictedPresentationTime is not None:
+                    # Refresh-grid estimate, not a measured presentation.
+                    origin = event.predictedPresentationTime
+                    event.scheduleBasis = "predictionFallback"
+
+                else:
+                    # No refresh reference was available for this transition.
+                    # Preserve its actual Python transition as the timing origin.
+                    origin = event.timestamp
+                    event.scheduleBasis = "hostClockFallback"
+
+                event.scheduledTimestamp = float(origin)
+
+                if event is self._segmentStartEvent:
+                    self._segmentScheduledStart = float(origin)
+
+            event.presentationError = (
+                float(presentedTime - event.scheduledTimestamp)
+                if (
+                    presentedTime is not None
+                    and event.scheduledTimestamp is not None
+                )
+                else None
+            )
+
+            if event is self._segmentStartEvent:
+                # A completed flush opportunity is sufficient. Do not wait
+                # indefinitely for optional presentation timing.
+                self._segmentAwaitingPresentation = False
+
+    def jumpSegment(self):
+        """Request an intentional transition and reset timing at the next start."""
+        if not self._trialActive or self.data.endTime is not None: return
+        self._segmentJumpRequested = True
+        self._thisTrialSeglen[self.state.currentSegment] = 0
+    
+    def configure(self, e):
+        '''
+        Configure gets called on tasks, just after initScreen runs so that tasks can use
+        any information needed from the pglExperiment to initialize, 
+        '''
+        pass
+
+    def startTask(self, startTime):
+        '''
+        Can be overridden in subclasses to add custom behavior when the task starts.
+        Must return True to run the task as intended, or False to abort running the task
+        '''
+        return True
+    
+    def startSegment(self, updateTime):
+        '''
+        Called exactly once, each time a new segment genuinely starts.
+        Override in subclasses to add custom per-segment behavior
+        (e.g. loading a stimulus). Base implementation does nothing.
+        '''    
+        pass
+            
     def endTrial(self, endTime):
         '''
         End a trial.
@@ -5420,50 +5963,6 @@ class pglTask(pglTaskBase):
         Add a parameter to the task.
         '''
         self.parameters.append(param)
-
-    def update(self, updateTime, subjectResponses, phaseNum, tasks, events):
-        '''
-        Update the task.
-        '''
-        if self.data.endTime is not None: return
-        # store references
-        self.state.subjectResponses = []
-        self.state.phaseNum = phaseNum
-        
-        # custom handling of events
-        self.handleEvents(events)
-        
-        # check for end of segment
-        if self.waitUntilVolumeTrigger:
-            if self.e.state.volumeNumber > self.lastVolumeNumber:
-                # volume trigger received, end segment
-                self._startSegment(updateTime)
-        if  updateTime - self.state.segmentStartTime >= self._thisTrialSeglen[self.state.currentSegment]:
-            # check if we need to wait until volume trigger
-            if self.settings.waitUntilVolumeTrigger[self.state.currentSegment]:
-                self.waitUntilVolumeTrigger = True
-                self.lastVolumeNumber = self.e.state.volumeNumber
-            else:
-                # call startSegment to begin next segment
-                self._startSegment(updateTime)
-        
-        # if there are responses, call response callback
-        if subjectResponses != []:
-            # Pass each subjectResponse in sequence to handleSubjectResponse
-            for subjectResponse, timestamp in subjectResponses:
-                # adding subject response to state
-                self.state.subjectResponses.append(subjectResponse)
-                # call the subject response handler
-                responseType = self.handleSubjectResponse(subjectResponse, timestamp)
-                # save as an event if responseType is not None
-                # responseType can be used to specify different types of responsees
-                # and is defined by the subclass
-                if responseType is not None:
-                    self.data.events.append(pglEventSubjectResponse(response=subjectResponse, timestamp=timestamp, responseType=responseType))
-                
-        # update the screen
-        self.updateScreen()
-
 
     def handleSubjectResponse(self, response, updateTime) -> None:
         '''
@@ -5486,48 +5985,12 @@ class pglTask(pglTaskBase):
         '''
         pass
     
-    def done(self, trialNum=None):
-        '''
-        Check if the task is done.
-        '''
-        # check current trial number by default
-        if trialNum is None: trialNum = self.state.currentTrial
-        # check if we are done
-        taskDone = trialNum >= self.settings.nTrials
-        if taskDone: self.end()
-        return taskDone
-
-    def end(self):
-        '''
-        end of task
-        '''
-        # Guard against calling end() twice
-        if self.data.endTime is not None: return
-
-        # call end task
-        self.endTask()
-        
-        # record end time
-        pglMessages.message(f"Ending task {self.settings.taskName}",messageType='experiment')
-        endTime = self.pgl.getSecs()
-        self.data.endTime = endTime
-        # put in time stamps for end of last segment and trial
-        self.data.events.append(pglEventSegment(self.state.currentSegment, endTime, eventType=pglEventSegment.boundaryType.END))
-        self.data.events.append(pglEventTrial(self.state.currentTrial, endTime, eventType=pglEventTrial.boundaryType.END))
-
     def endTask(self):
         '''
         subclass overrideable function that gets called for any end of task processing
         '''
         pass
-    
-    def jumpSegment(self):
-        '''
-        Jump to the next segment.
-        '''
-        # set current segment length to 0 to force jump
-        self._thisTrialSeglen[self.state.currentSegment] = 0
-        
+            
     def modifyTrialSegments(self, seglen):
         """Modify randomized segment lengths before the first segment starts.
 
