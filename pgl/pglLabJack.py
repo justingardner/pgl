@@ -747,12 +747,16 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
     ################################################################
     # Start digital acquisition on the existing LabJack connection
     ################################################################
-    def startDigitalRead(self, channels=("FIO0",), edge="rising", scanRate=100000.0, scansPerRead=100):
+    def startDigitalRead(self, channels=("FIO0",), edge="rising", scanRate=1000.0, scansPerRead=100):
         """
-        Start continuous FIO acquisition using the existing device handle.
+        Start continuous digital acquisition using the existing device handle.
 
-        Supports FIO0–FIO7 and equivalent DIO0–DIO7 names.
-        Events use canonical FIO names.
+        Supports one bank per acquisition:
+            FIO0–FIO7 / DIO0–DIO7
+            CIO0–CIO3 / DIO16–DIO19
+
+        Events use canonical FIO or CIO names. Mixed-bank acquisition is
+        explicitly rejected rather than silently reading only some inputs.
 
         Only one analog or digital stream may run on this device.
         Pending events must be polled before restarting acquisition.
@@ -780,16 +784,41 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
         if isinstance(scansPerRead, bool) or not isinstance(scansPerRead, int) or scansPerRead <= 0:
             raise ValueError("scansPerRead must be a positive integer")
 
-        # Normalize physical aliases before checking for input/output conflicts.
+        # Normalize physical aliases before checking input/output conflicts.
         channelBits = {}
+        selectedBanks = set()
+
         for channel in channels:
             if not isinstance(channel, str): raise ValueError("Channels must be physical pin names")
-            match = re.fullmatch(r"(FIO|DIO)([0-7])", channel.strip().upper())
-            if match is None: raise ValueError("Digital capture currently supports only FIO0–FIO7 / DIO0–DIO7")
-            bit = int(match.group(2))
-            name = f"FIO{bit}"
+            match = re.fullmatch(r"(FIO|CIO|DIO)([0-9]+)", channel.strip().upper())
+            if match is None:
+                raise ValueError("Digital capture supports FIO0–FIO7 / DIO0–DIO7 or CIO0–CIO3 / DIO16–DIO19")
+
+            group, index = match.group(1), int(match.group(2))
+
+            if group == "FIO" and 0 <= index <= 7:
+                bank, localBit, dioBit = "FIO", index, index
+            elif group == "CIO" and 0 <= index <= 3:
+                bank, localBit, dioBit = "CIO", index, 16 + index
+            elif group == "DIO" and 0 <= index <= 7:
+                bank, localBit, dioBit = "FIO", index, index
+            elif group == "DIO" and 16 <= index <= 19:
+                bank, localBit, dioBit = "CIO", index - 16, index
+            else:
+                raise ValueError(f"Unsupported digital input: {channel!r}; use FIO0–FIO7 or CIO0–CIO3")
+
+            name = f"{bank}{localBit}"
             if name in channelBits: raise ValueError(f"Duplicate physical input: {name}")
-            channelBits[name] = bit
+            channelBits[name] = dioBit
+            selectedBanks.add(bank)
+
+        if len(selectedBanks) != 1:
+            raise ValueError("One digital bank per acquisition is supported; do not mix FIO and CIO inputs")
+
+        bank = next(iter(selectedBanks))
+        stateRegister = f"{bank}_STATE"
+        bankShift = 0 if bank == "FIO" else 16
+        bankMask = 255 if bank == "FIO" else 15
 
         with self._streamControlLock:
             if self.h is None: raise RuntimeError("LabJack is not connected")
@@ -821,6 +850,9 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
                             "requestedScanRate": scanRate,
                             "scanRate": None,
                             "scansPerRead": scansPerRead,
+                            "stateRegister": stateRegister,
+                            "bankShift": bankShift,
+                            "bankMask": bankMask,
                             "samplesProcessed": 0,
                             "eventsDetected": 0,
                             "unknownSamples": 0,
@@ -842,7 +874,7 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
 
                         self.ljm.eWriteName(self.h, "STREAM_TRIGGER_INDEX", 0)
                         self.ljm.eWriteName(self.h, "STREAM_CLOCK_SOURCE", 0)
-                        address = self.ljm.nameToAddress("FIO_STATE")[0]
+                        address = self.ljm.nameToAddress(stateRegister)[0]
 
                         before = pglTimestamp.getSecs()
                         actualScanRate = self.ljm.eStreamStart(self.h, scansPerRead, 1, [address], scanRate)
@@ -862,7 +894,7 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
                         # Pass immutable acquisition configuration to the worker.
                         self._digitalThread = threading.Thread(
                             target=self._digitalReadThread,
-                            args=(dict(channelBits), edge, float(actualScanRate), (before + after) / 2),
+                            args=(dict(channelBits), edge, float(actualScanRate), (before + after) / 2, bankShift, bankMask),
                             name="pglLabJackDigitalInput",
                             daemon=True,
                         )
@@ -881,14 +913,14 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
                         if not self._digitalStreamActive: self._digitalChannelBits = {}
                         raise
 
-            pglMessages.message(f"LabJack digital input: {', '.join(channelBits)}, {edge}, actual scan rate {actualScanRate:g} Hz")
+            pglMessages.message(f"LabJack digital input: {', '.join(channelBits)}, {edge}, {stateRegister}, actual scan rate {actualScanRate:g} Hz")
             return float(actualScanRate)
 
     ################################################################
     # Read digital samples and queue timestamped edges
     ################################################################
-    def _digitalReadThread(self, channelBits, edge, scanRate, streamStartTimestamp):
-        """Acquire on the existing handle; never mutate experiment data."""
+    def _digitalReadThread(self, channelBits, edge, scanRate, streamStartTimestamp, bankShift=0, bankMask=255):
+        """Acquire bank-local states and convert them to full DIO bitmasks."""
         previousState = None
         firstSampleIndex = 0
 
@@ -924,9 +956,9 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
                     row = int(np.flatnonzero(invalid)[0])
                     raise RuntimeError(f"Invalid digital sample at index {firstSampleIndex + row}: {batch[row]}")
 
-                # Provisional workaround: upper-bit words are uncertain, not
-                # triggers. Keep their positions and reset comparison across gaps.
-                unknownRows = np.flatnonzero(batch > 255)
+                # Preserve the existing gap policy: out-of-bank words are
+                # uncertain, not triggers. Do not mask them into valid samples.
+                unknownRows = np.flatnonzero(batch > bankMask)
                 if unknownRows.size:
                     with self._digitalEventLock:
                         self._digitalStats["unknownSamples"] += int(unknownRows.size)
@@ -941,8 +973,12 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
                     spanEnd = int(spanEnd)
 
                     if spanEnd > spanStart:
+                        # CIO_STATE bit 1 becomes full-device DIO bit 17.
+                        # FIO_STATE retains its original bit positions.
+                        decodedStates = batch[spanStart:spanEnd].astype(np.uint32) << bankShift
+
                         spanEvents, previousState = self._digitalEventsFromSamples(
-                            batch[spanStart:spanEnd], channelBits, previousState,
+                            decodedStates, channelBits, previousState,
                             firstSampleIndex + spanStart, scanRate,
                             streamStartTimestamp, edge=edge,
                         )
