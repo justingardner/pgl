@@ -804,6 +804,20 @@ class pglActionsFixes(pglActionCollection):
                     "it afterward. Existing downstream analyses also require review."
                 )
 
+            # Expected refusal: scan/run correspondence is not configured.
+            if session.scanRunCorrespondence is None:
+                from .pglPipeline import pglActionStatus
+
+                message = (
+                    "Volume triggers were not reconstructed: scan/run correspondence "
+                    "is not configured. Configure the MRI scan-to-behavioral-run "
+                    "matches with session.setScanRunMatches(), then retry the action."
+                )
+                self.error = ValueError(message)
+                self.status = pglActionStatus.FAILED
+                pglMessages.warning(message, level=0)
+                return None
+
             matches = session.getScanRunMatches()
             if not matches:
                 raise ValueError("No scan/run matches are configured.")

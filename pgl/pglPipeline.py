@@ -2603,8 +2603,32 @@ class pglAction(pglActionable):
                     except Exception as error:
                         self.error = error
                         self.status = pglActionStatus.FAILED
-                        traceback.print_exc()
-                        pglMessages.warning(f"Error running action {self.name}: {error}")
+
+                        # Handle a closed SFTP source without a live traceback.
+                        # Keep asyncssh optional for installations which do not use it.
+                        try:
+                            from asyncssh.sftp import SFTPNoConnection
+                        except ImportError:
+                            closedSFTP = False
+                        else:
+                            closedSFTP = isinstance(error, SFTPNoConnection)
+
+                        if closedSFTP:
+                            pglMessages.warning(
+                                f"Action {self.name} could not complete: a required "
+                                "remote file connection is no longer open. "
+                                "Restore access and reconnect the source, or reload the "
+                                "saved session after preserving any unsaved work. "
+                                "Then retry the action. "
+                                "The action remains marked failed; any changes made "
+                                "before the failure were not automatically rolled back.",
+                                level=0,
+                            )
+                        else:
+                            traceback.print_exc()
+                            pglMessages.warning(
+                                f"Error running action {self.name}: {error}"
+                            )
 
                     finally:
                         # Finalize tool provenance and product commitment using

@@ -178,6 +178,9 @@ class pglDatabaseSettingsList(pglTraitSettings):
 ########################################################
 # pglDatabase
 ########################################################
+from dataclasses import dataclass as _publicationDataclass
+from dataclasses import field as _publicationField
+
 class pglDatabase:
     """Coordinate PostgreSQL-backed scientific checkpoints.
 
@@ -1181,6 +1184,9 @@ class pglDatabase:
                 )
                 return None
         
+        if getattr(session, 'mri', None) is not None:
+            return cls._saveReservedRawMRISession(session, settings=settings, settingsName=settingsName, backendID=backendID, storageOptions=storageOptions, sslRootCert=sslRootCert, allowMissingMetadata=allowMissingMetadata, lockTimeoutSeconds=lockTimeoutSeconds, ioTimeoutSeconds=ioTimeoutSeconds, connectTimeoutSeconds=connectTimeoutSeconds)
+
         originalReference = cls._getBoundCheckpointReference(session)
         originalBinding = deepcopy(session._checkpointBinding)
         originalSessionID = session.sessionID
@@ -16005,6 +16011,39 @@ class pglDatabase:
 
         connection.execute(sql.SQL("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA {} TO {}").format(schema, application))
 
+        # Reserved publication: no application DML on protocol/private tables.
+        publication_tables = (
+            "publication_reservations", "publication_attempts",
+            "publication_writer_credentials", "publication_finalization_authority",
+            "publication_reuse_results",
+        )
+        for name in publication_tables:
+            table = sql.Identifier(postgres.databaseSchema, name)
+            connection.execute(
+                sql.SQL("REVOKE ALL ON TABLE {} FROM {}").format(table, application)
+            )
+        for name in (
+            "publication_reservations", "publication_attempts",
+            "publication_reuse_results",
+        ):
+            connection.execute(
+                sql.SQL("GRANT SELECT ON TABLE {} TO {}").format(
+                    sql.Identifier(postgres.databaseSchema, name), application
+                )
+            )
+        for name, signature in (
+            ("pgl_reserve_writer", "jsonb, text"),
+            ("pgl_writer_operation", "uuid, text, text"),
+            ("pgl_finalize_writer", "uuid, text, text"),
+            ("pgl_supersede_writer", "uuid, text, bigint, text"),
+        ):
+            connection.execute(
+                sql.SQL("GRANT EXECUTE ON FUNCTION {}({}) TO {}").format(
+                    sql.Identifier(postgres.databaseSchema, name),
+                    sql.SQL(signature), application,
+                )
+            )
+
     @classmethod
     def _inspectCheckpointReference(cls, connection, postgres, reference, *, includeDeleted=False):
         """Inspect a qualified checkpoint reference in the caller's database.
@@ -25127,6 +25166,552 @@ class pglDatabase:
             )
 
         return validated["checkpoint"]
+
+    ################################################################
+    # Reserved publication — consolidated implementation
+    # No resume, garbage collection, or automatic payload deletion.
+    ################################################################
+
+    @staticmethod
+    def _publicationCanonicalUUID(value):
+        import json
+        from uuid import UUID
+        if not isinstance(value, str):
+            raise ValueError('UUID must be a canonical nonzero string.')
+        try:
+            parsed = UUID(value)
+        except (ValueError, AttributeError):
+            raise ValueError('Invalid UUID.') from None
+        if str(parsed) != value or parsed.int == 0:
+            raise ValueError('UUID must be canonical and nonzero.')
+        return value
+
+    @staticmethod
+    def _makePublicationRequest(*, database_id, reservation_id, attempt_id, backend_id, created_by, plan):
+        """Snapshot a JSON publication plan before opening a connection."""
+        import json
+        from uuid import UUID
+        for value in (database_id, reservation_id, attempt_id):
+            pglDatabase._publicationCanonicalUUID(value)
+        for value in (backend_id, created_by):
+            if type(value) is not int or not 0 <= value <= 9223372036854775807:
+                raise ValueError('IDs must be nonnegative PostgreSQL bigints.')
+        if type(plan) is not dict:
+            raise ValueError('plan must be a dictionary.')
+
+        def check(value):
+            if value is None or type(value) in (str, bool, int):
+                return
+            if type(value) is float:
+                import math
+                if math.isfinite(value):
+                    return
+            elif type(value) is list:
+                for item in value:
+                    check(item)
+                return
+            elif type(value) is dict:
+                if not all((type(key) is str for key in value)):
+                    raise ValueError('JSON object keys must be strings.')
+                for item in value.values():
+                    check(item)
+                return
+            raise ValueError('Plan must contain finite JSON-compatible values.')
+        check(plan)
+        return {'version': 1, 'database_id': database_id, 'reservation_id': reservation_id, 'attempt_id': attempt_id, 'backend_id': backend_id, 'created_by': created_by, 'plan': json.loads(json.dumps(plan, allow_nan=False))}
+
+    @staticmethod
+    def _publicationObjectPrefix(database_id, session_id, attempt_id):
+        import json
+        from uuid import UUID
+        pglDatabase._publicationCanonicalUUID(database_id)
+        pglDatabase._publicationCanonicalUUID(attempt_id)
+        if type(session_id) is not int or not 0 <= session_id <= 9223372036854775807:
+            raise ValueError('Invalid session ID.')
+        return f'database-{database_id}/session{session_id:06d}/attempt-{attempt_id}'
+
+    _publicationCredentialDomain = b'pgl.publication.writer.v1\x00'
+
+    @staticmethod
+    def _validatePublicationAttemptID(attempt_id):
+        import hashlib
+        import hmac
+        import re
+        import secrets
+        from uuid import UUID
+        if type(attempt_id) is not str:
+            raise ValueError('Invalid attempt identity.')
+        try:
+            parsed = UUID(attempt_id)
+        except ValueError:
+            raise ValueError('Invalid attempt identity.') from None
+        if parsed.int == 0 or str(parsed) != attempt_id:
+            raise ValueError('Invalid attempt identity.')
+        return attempt_id
+
+    @staticmethod
+    def _publicationCredentialVerifier(attempt_id, secret):
+        """Return the attempt-bound SHA-256 verifier.
+
+        The secret is 32 cryptographically random bytes represented as
+        lowercase hex. Domain separation and attempt binding prevent
+        accidental reuse across protocols or publication attempts.
+        """
+        import hashlib
+        import hmac
+        import re
+        import secrets
+        from uuid import UUID
+        pglDatabase._validatePublicationAttemptID(attempt_id)
+        if type(secret) is not str or re.fullmatch('[0-9a-f]{64}', secret) is None:
+            raise ValueError('Invalid writer credential.')
+        return hashlib.sha256(pglDatabase._publicationCredentialDomain + attempt_id.encode('ascii') + b'\x00' + bytes.fromhex(secret)).hexdigest()
+
+    @_publicationDataclass(frozen=True)
+    class _PublicationWriterCredential:
+        attempt_id: str
+        secret: str = _publicationField(repr=False, compare=False)
+
+        def __post_init__(self):
+            pglDatabase._publicationCredentialVerifier(self.attempt_id, self.secret)
+
+        @property
+        def verifier(self):
+            return pglDatabase._publicationCredentialVerifier(self.attempt_id, self.secret)
+
+        def __reduce_ex__(self, protocol):
+            raise TypeError('Writer credentials must not be pickled.')
+
+    @staticmethod
+    def _issuePublicationWriterCredential(attempt_id):
+        """Issue once, before creating the reservation.
+
+        Retain this object when retrying an uncertain reservation commit.
+        Do not issue another credential for that retry.
+        """
+        import hashlib
+        import hmac
+        import re
+        import secrets
+        from uuid import UUID
+        pglDatabase._validatePublicationAttemptID(attempt_id)
+        return pglDatabase._PublicationWriterCredential(attempt_id, secrets.token_hex(32))
+
+    @staticmethod
+    def _matchesPublicationVerifier(attempt_id, secret, expected_verifier):
+        """Reference comparison for tests and later server-side parity.
+
+        This is NOT a replacement for authorization inside PostgreSQL.
+        """
+        import hashlib
+        import hmac
+        import re
+        import secrets
+        from uuid import UUID
+        if type(expected_verifier) is not str or re.fullmatch('[0-9a-f]{64}', expected_verifier) is None:
+            return False
+        try:
+            actual = pglDatabase._publicationCredentialVerifier(attempt_id, secret)
+        except ValueError:
+            return False
+        return hmac.compare_digest(actual, expected_verifier)
+
+    @_publicationDataclass(frozen=True)
+    class _PublicationDecision:
+        """Result of catalog preparation inside the publication transaction.
+
+        For published:
+            The callback must register and complete the reserved checkpoint
+            through the existing PGL validators.
+
+        For superseded:
+            The callback must verify the existing checkpoint through PGL's
+            duplicate-verification path and leave the reserved ID unpublished.
+        """
+        outcome: str
+        session_id: int
+        manifest_hash: str
+
+        def __post_init__(self):
+            if self.outcome not in {'published', 'superseded'}:
+                raise ValueError('Unsupported publication outcome.')
+            if type(self.session_id) is not int or not 0 <= self.session_id <= 9223372036854775807:
+                raise ValueError('Invalid result session ID.')
+            if type(self.manifest_hash) is not str or re.fullmatch('[0-9a-f]{64}', self.manifest_hash) is None:
+                raise ValueError('Invalid manifest hash.')
+
+    @_publicationDataclass
+    class _PublicationProgress:
+        """Non-secret operation state, including uncertain commit boundaries.
+
+        Keep this object if the operation raises. A commit attempt without
+        confirmation requires inspection before any fresh save/retry.
+
+        Do not store credentials or credential-bearing request objects here.
+        """
+        phase: str = 'not_started'
+        reservation_id: str | None = None
+        attempt_id: str | None = None
+        reserved_session_id: int | None = None
+        result_session_id: int | None = None
+        object_prefix: str | None = None
+        reservation_commit_attempted: bool = False
+        reservation_commit_confirmed: bool = False
+        start_commit_attempted: bool = False
+        start_commit_confirmed: bool = False
+        publication_commit_attempted: bool = False
+        publication_commit_confirmed: bool = False
+
+    @staticmethod
+    def _requireIdlePublicationConnection(connection):
+        import re
+        from psycopg import sql
+        from psycopg.pq import TransactionStatus
+        from psycopg.types.json import Jsonb
+        if not connection.autocommit or connection.info.transaction_status != TransactionStatus.IDLE:
+            raise ValueError('Coordinator requires an idle autocommit connection; nested transactions cannot provide its commit guarantees.')
+
+    @staticmethod
+    def _publishReservedCheckpoint(*, connection_factory, schema, request, credential, export, prepare_publication, progress, before_commit=None, validate_connection=None, lock_timeout_seconds=30.0):
+        """Coordinate one fresh publication attempt.
+
+        connection_factory():
+            Context manager yielding an explicitly configured connection.
+            It must not discover the caller's default database.
+
+        export(reservation_record):
+            Write and verify payloads at the reserved destination.
+            Called with no coordinator-owned SQL connection open.
+            Return an opaque artifact consumed by prepare_publication.
+
+        prepare_publication(connection, reservation_record, artifact):
+            Acquire publication/lifecycle locks in the project's agreed order.
+            Revalidate inputs and register/complete the checkpoint, or verify
+            an existing duplicate. Return PublicationDecision.
+
+            Runs inside the coordinator's final transaction. It must NOT
+            commit, roll back the outer transaction, or modify the working
+            session's saved identity.
+
+        progress:
+            A fresh PublicationProgress instance, retained by the caller.
+
+        Returns a PublicationDecision only after final commit and connection
+        cleanup. The caller may then install the working-session binding.
+
+        Exceptions propagate. No automatic interruption marker is written:
+        an uncertain database outcome must not be reclassified as failure.
+        Retained transferring attempts require later inspection.
+        """
+        import re
+        from psycopg import sql
+        from psycopg.pq import TransactionStatus
+        from psycopg.types.json import Jsonb
+        if before_commit is not None and (not callable(before_commit)):
+            raise TypeError('before_commit must be callable or None.')
+        if not isinstance(schema, str) or not schema or '\x00' in schema:
+            raise ValueError('Invalid schema.')
+        if not isinstance(progress, pglDatabase._PublicationProgress):
+            raise TypeError('progress must be PublicationProgress.')
+        if progress.phase != 'not_started':
+            raise ValueError('Use a fresh progress object for each invocation.')
+        if credential.attempt_id != request['attempt_id']:
+            raise ValueError('Credential belongs to a different attempt.')
+        import json
+        request = json.loads(json.dumps(request, allow_nan=False))
+        progress.reservation_id = request['reservation_id']
+        progress.attempt_id = request['attempt_id']
+        reserve_sql = sql.SQL('SELECT {}.pgl_reserve_writer(%s, %s)').format(sql.Identifier(schema))
+        progress.phase = 'reserving'
+        with connection_factory() as connection:
+            pglDatabase._requireIdlePublicationConnection(connection)
+            with connection.transaction():
+                if validate_connection is not None:
+                    validate_connection(connection)
+                pglDatabase._acquirePublicationReservationLock(connection, schema, request['reservation_id'], lock_timeout_seconds)
+                record = connection.execute(reserve_sql, (Jsonb(request), credential.verifier)).fetchone()[0]
+                progress.reserved_session_id = record['session_id']
+                progress.object_prefix = record['object_prefix']
+                progress.reservation_commit_attempted = True
+            progress.reservation_commit_confirmed = True
+            progress.phase = 'closing_reservation_connection'
+        if record['reservation_state'] != 'reserved' or record['attempt_state'] != 'reserved':
+            progress.phase = 'existing_attempt_requires_inspection'
+            raise ValueError('This reservation is not a fresh attempt. Inspect its recorded state; automatic resume is unsupported.')
+        progress.phase = 'starting'
+        with connection_factory() as connection:
+            pglDatabase._requireIdlePublicationConnection(connection)
+            with connection.transaction():
+                if validate_connection is not None:
+                    validate_connection(connection)
+                state = connection.execute(sql.SQL("SELECT {}.pgl_writer_operation(%s, %s, 'start')").format(sql.Identifier(schema)), (credential.attempt_id, credential.secret)).fetchone()[0]
+                if state != 'transferring':
+                    raise ValueError('Unexpected attempt-start result.')
+                progress.start_commit_attempted = True
+            progress.start_commit_confirmed = True
+            progress.phase = 'closing_start_connection'
+        progress.phase = 'exporting'
+        artifact = export(dict(record))
+        progress.phase = 'preparing_publication'
+        with connection_factory() as connection:
+            pglDatabase._requireIdlePublicationConnection(connection)
+            with connection.transaction():
+                if validate_connection is not None:
+                    validate_connection(connection)
+                decision = prepare_publication(connection, dict(record), artifact)
+                if not isinstance(decision, pglDatabase._PublicationDecision):
+                    raise TypeError('Publication callback must return PublicationDecision.')
+                progress.phase = 'finalizing'
+                if decision.outcome == 'published':
+                    if decision.session_id != record['session_id']:
+                        raise ValueError('New checkpoint differs from the reserved ID.')
+                    returned_id = connection.execute(sql.SQL('SELECT {}.pgl_finalize_writer(%s, %s, %s)').format(sql.Identifier(schema)), (credential.attempt_id, credential.secret, decision.manifest_hash)).fetchone()[0]
+                else:
+                    if decision.session_id == record['session_id']:
+                        raise ValueError('Duplicate result cannot be the reserved ID.')
+                    returned_id = connection.execute(sql.SQL('SELECT {}.pgl_supersede_writer(%s, %s, %s, %s)').format(sql.Identifier(schema)), (credential.attempt_id, credential.secret, decision.session_id, decision.manifest_hash)).fetchone()[0]
+                if returned_id != decision.session_id:
+                    raise ValueError('Finalizer returned an unexpected ID.')
+                progress.result_session_id = returned_id
+                if before_commit is not None:
+                    progress.phase = 'preparing_binding'
+                    before_commit(connection, decision)
+                progress.phase = 'committing_publication'
+                progress.publication_commit_attempted = True
+            progress.publication_commit_confirmed = True
+            progress.phase = 'closing_publication_connection'
+        progress.phase = 'complete'
+        return decision
+
+    @staticmethod
+    def _acquirePublicationReservationLock(connection, schema, reservation_id, timeout):
+        import re
+        from psycopg import sql
+        from psycopg.pq import TransactionStatus
+        from psycopg.types.json import Jsonb
+        import math
+        import time
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or (not math.isfinite(timeout)) or (timeout <= 0):
+            raise ValueError('Reservation lock timeout must be finite and positive.')
+        name = f'pgl.reserve:{schema}:{reservation_id}'
+        deadline = time.monotonic() + timeout
+        while True:
+            acquired = connection.execute('SELECT pg_try_advisory_xact_lock(hashtextextended(%s, 0))', (name,)).fetchone()[0]
+            if acquired:
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('Timed out waiting for the reservation lock.')
+            time.sleep(min(0.1, remaining))
+
+    @staticmethod
+    def _describePublicationFailure(progress, *, reason):
+        """Describe the known outcome without guessing or exposing exceptions.
+
+        reason must be a caller-selected generic explanation, not raw
+        exception text, credentials, or authenticated storage URLs.
+
+        Call only when the working checkpoint binding was not installed.
+        """
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError('A generic failure reason is required.')
+        if progress.publication_commit_confirmed:
+            outcome = 'Publication committed, but a subsequent step failed. The committed publication was not rolled back. Inspect its recorded result before starting another save.'
+        elif progress.publication_commit_attempted:
+            outcome = "The final publication commit outcome is uncertain. The checkpoint may already be complete. Inspect this reservation's recorded result before starting another save."
+        elif progress.start_commit_confirmed:
+            outcome = 'The reservation and transfer-start state committed. The final publication commit was not attempted. Partial or fully exported payloads may remain; the attempt is not automatically marked abandoned.'
+        elif progress.start_commit_attempted:
+            outcome = 'The reservation committed, but the transfer-start commit outcome is uncertain. This invocation did not begin export. Inspect the attempt state before retrying.'
+        elif progress.reservation_commit_confirmed:
+            outcome = 'The reservation transaction committed. This invocation did not begin export or attempt a publication commit. An existing attempt returned by lookup may already have payloads or a published result; inspect its recorded state.'
+        elif progress.reservation_commit_attempted:
+            outcome = 'The reservation commit outcome is uncertain. This invocation did not begin export. Inspect the reservation by its UUID before issuing a new reservation.'
+        else:
+            outcome = 'No reservation commit was attempted by this invocation, and it did not begin export. Any previously existing publication records and files are unchanged by this fact.'
+        details = [f'Raw MRI save stopped: {reason}', f'Phase: {progress.phase}', outcome]
+        for label, value in (('Reservation UUID', progress.reservation_id), ('Attempt UUID', progress.attempt_id), ('Reserved session ID', progress.reserved_session_id), ('Result session ID (provisional unless committed)', progress.result_session_id), ('Relative storage prefix', progress.object_prefix)):
+            if value is not None:
+                details.append(f'{label}: {value}')
+        details.extend(["The working session's checkpoint identity was not updated.", 'No automatic retry, resume, or payload deletion was performed.'])
+        return '\n'.join(details)
+
+    class _PublicationConnectionCancelled(Exception):
+        pass
+
+    @classmethod
+    def _saveReservedRawMRISession(cls, session, *, settings=None, settingsName=None, backendID=None, storageOptions=None, sslRootCert=None, allowMissingMetadata=False, lockTimeoutSeconds=30.0, ioTimeoutSeconds=60, connectTimeoutSeconds=10):
+        from contextlib import contextmanager
+        from copy import deepcopy
+        from pathlib import PurePosixPath
+        from tempfile import TemporaryDirectory
+        import uuid
+        import psycopg
+        from psycopg import sql
+        from paramiko import SSHException
+        from paramiko.ssh_exception import AuthenticationException, BadHostKeyException
+        from .pglMessages import pglMessages
+        from .pglPostgres import pglPostgres
+        from .pglStorage import pglStorage
+        from .pglDatabase import pglDatabaseAccess
+        state = pglDatabase._PublicationProgress()
+        reference = cls._getBoundCheckpointReference(session)
+        original_id = session.sessionID
+        original_binding = deepcopy(session._checkpointBinding)
+        original_baseline = deepcopy(session._checkpointBaseline)
+        pending = {}
+
+        def require_unchanged():
+            if session.sessionID != original_id or session._checkpointBinding != original_binding or session._checkpointBaseline != original_baseline:
+                raise ValueError('Working checkpoint bookkeeping changed during publication.')
+            pglStorage.requireSafeSave(session)
+
+        def warn(reason):
+            pglMessages.warning(pglDatabase._describePublicationFailure(state, reason=reason), level=0)
+        try:
+            if not cls._checkRawSessionLabels(session, allowMissingMetadata=allowMissingMetadata):
+                return None
+            if storageOptions is not None and (not isinstance(storageOptions, dict)):
+                raise TypeError('storageOptions must be a dictionary or None.')
+            if backendID is not None and (type(backendID) is not int or not 0 <= backendID <= 9223372036854775807):
+                raise ValueError('backendID must be a nonnegative bigint.')
+            state.phase = 'resolving_configuration'
+            resolved = cls.getSettings(settings=settings, settingsName=settingsName)
+            if resolved is None:
+                warn('database settings could not be resolved')
+                return None
+            username = resolved.username
+            if not isinstance(username, str) or not username.strip() or '\x00' in username:
+                warn('a valid username is required in the database settings')
+                return None
+            postgres = pglPostgres.fromSettings(settings=resolved)
+            if postgres is None:
+                warn('PostgreSQL configuration was unavailable')
+                return None
+            postgres = postgres.withTimeouts(lockTimeoutSeconds=lockTimeoutSeconds, ioTimeoutSeconds=ioTimeoutSeconds, connectTimeoutSeconds=connectTimeoutSeconds)
+            endpoint = cls._checkpointDatabaseIdentity(postgres)
+            for binding in (original_binding, original_baseline):
+                if binding and binding['databaseIdentity'] != endpoint:
+                    raise ValueError('Selected database differs from the working checkpoint.')
+            if backendID is None and (not postgres.storageLocations):
+                warn('no storage destination is configured')
+                return None
+
+            @contextmanager
+            def connection_factory():
+                with postgres.connect(sslRootCert=sslRootCert) as connection:
+                    if connection is None:
+                        raise pglDatabase._PublicationConnectionCancelled()
+                    yield connection
+            state.phase = 'preparing_destination'
+            with connection_factory() as connection:
+                with connection.transaction():
+                    database_id = cls._requireStableDatabaseIdentity(connection, postgres)
+                    if reference and reference['databaseID'] != database_id:
+                        raise ValueError('Saved-checkpoint database UUID differs.')
+                    if backendID is None:
+                        backendID = cls._getConfiguredStorageBackend(connection, postgres, storageOptions=storageOptions)
+                    creator = cls.getOrCreateUser(connection, postgres, username)
+                    backend = connection.execute(sql.SQL('SELECT url_prefix, is_active FROM {} WHERE backend_id = %s FOR SHARE').format(sql.Identifier(postgres.databaseSchema, 'storage_backends')), (backendID,)).fetchone()
+                    if backend is None or not backend[1]:
+                        raise cls._PublicationRefused('Storage backend is missing or inactive.')
+                    registered_root = backend[0]
+
+            def validate_connection(connection):
+                observed = cls._requireStableDatabaseIdentity(connection, postgres)
+                if observed != database_id:
+                    raise ValueError('Database UUID changed during publication.')
+            request = pglDatabase._makePublicationRequest(database_id=database_id, reservation_id=str(uuid.uuid4()), attempt_id=str(uuid.uuid4()), backend_id=backendID, created_by=creator, plan={'version': 1, 'operation': 'raw_mri', 'scanUUIDs': [scan.uuid for scan in session.mri.scans], 'behaviorRunCount': len(session.runs or [])})
+            credential = pglDatabase._issuePublicationWriterCredential(request['attempt_id'])
+            with pglDatabaseAccess(postgres, {backendID: storageOptions or {}}) as access:
+                destination_fs, destination_root = access.resolve(backendID, registered_root)
+
+                def export(record):
+                    require_unchanged()
+                    destination = str(PurePosixPath(destination_root) / record['object_prefix'])
+                    result = cls.saveRawMRISessionFiles(session, destination, filesystem=destination_fs)
+                    if result is None:
+                        raise cls._PublicationRefused(f"MRI export was refused; see the exporter warning. Reserved session: {record['session_id']}.")
+                    if result[0] != destination:
+                        raise ValueError('Exporter returned a different destination.')
+                    return result[1]
+
+                def prepare_publication(connection, record, manifest):
+                    require_unchanged()
+                    cls._acquireCheckpointPublicationLock(connection, postgres)
+                    current_backend = connection.execute(sql.SQL('SELECT url_prefix, is_active FROM {} WHERE backend_id = %s FOR SHARE').format(sql.Identifier(postgres.databaseSchema, 'storage_backends')), (backendID,)).fetchone()
+                    if current_backend != (registered_root, True):
+                        raise ValueError('Storage backend changed or became inactive during export.')
+                    digest = cls.hashRawManifest(manifest)
+                    postgres.acquireTransactionLock(connection, digest, description='raw-checkpoint identity', timeoutSeconds=postgres.lockTimeoutSeconds)
+                    sessions = sql.Identifier(postgres.databaseSchema, 'session')
+                    existing = connection.execute(sql.SQL("\n                        SELECT session_id, status, contract_version\n                        FROM {}\n                        WHERE origin = 'raw' AND manifest_hash = %s\n                          AND deleted_at IS NULL\n                        FOR SHARE\n                    ").format(sessions), (digest,)).fetchone()
+                    if existing is not None:
+                        existing_id, status, contract = existing
+                        if (status, contract) != ('complete', 'pgl.raw.session.v2'):
+                            raise ValueError('Matching checkpoint is incomplete or unsupported.')
+                        inspected = None
+                        with TemporaryDirectory(prefix='pgl-mri-duplicate-check-') as temporary:
+                            try:
+                                inspected = cls.loadRawSessionBundle(connection, postgres, existing_id, storageOptionsByBackend={backendID: storageOptions or {}}, cacheDirectory=temporary)
+                            finally:
+                                if inspected is not None:
+                                    try:
+                                        for matrix in inspected.dataMatrices.values():
+                                            matrix.close()
+                                    finally:
+                                        inspected.filesystem.close()
+                        return pglDatabase._PublicationDecision('superseded', existing_id, digest)
+                    session_id = record['session_id']
+                    modalities = (['behavior'] if session.runs else []) + ['mri']
+                    connection.execute(sql.SQL("\n                        INSERT INTO {} (\n                            session_id, origin, kind, ingest_method,\n                            modalities, status, contract_version,\n                            created_by, started_at\n                        )\n                        OVERRIDING SYSTEM VALUE\n                        VALUES (\n                            %s, 'raw', 'acquired', 'manual',\n                            %s::text[], 'in_progress', 'pgl.raw.session.v2',\n                            %s, now()\n                        )\n                    ").format(sessions), (session_id, modalities, creator))
+                    cls._registerSessionBundleFiles(connection, postgres, session_id, backendID, manifest, objectPrefix=record['object_prefix'], origin='raw', accessContext=access)
+                    verified_digest = cls._completeSessionBundleCheckpoint(connection, postgres, session_id, manifest, origin='raw')
+                    if verified_digest != digest:
+                        raise ValueError('Completion manifest identity changed.')
+                    return pglDatabase._PublicationDecision('published', session_id, digest)
+
+                def before_commit(connection, decision):
+                    require_unchanged()
+                    pending['binding'] = cls._prepareCheckpointBinding(decision.session_id, postgres, databaseID=database_id, databaseName=resolved.name)
+                    pending['postgres'] = postgres.withTimeouts()
+                state = pglDatabase._PublicationProgress()
+                decision = pglDatabase._publishReservedCheckpoint(connection_factory=connection_factory, schema=postgres.databaseSchema, request=request, credential=credential, export=export, prepare_publication=prepare_publication, before_commit=before_commit, validate_connection=validate_connection, lock_timeout_seconds=lockTimeoutSeconds, progress=state)
+            require_unchanged()
+            session.sessionID = decision.session_id
+            session._checkpointBinding = pending['binding']
+            session._checkpointPostgres = pending['postgres']
+            if decision.outcome == 'superseded':
+                pglMessages.warning(f'Raw acquisition already exists as checkpoint {decision.session_id}; returning that ID. Reservation {state.reservation_id} records this reuse. The redundant export remains at relative prefix {state.object_prefix}. No files were deleted.', level=0)
+            else:
+                pglMessages.message(f'Raw checkpoint {decision.session_id} is complete. Reservation: {state.reservation_id}.', wrapText=False)
+            return decision.session_id
+        except pglDatabase._PublicationConnectionCancelled:
+            warn('connection setup was cancelled')
+            return None
+        except cls._PublicationRefused:
+            warn('publication was refused; inspect the preceding warning and reservation')
+            return None
+        except (AuthenticationException, BadHostKeyException):
+            warn('SSH authentication or host verification failed')
+            raise
+        except SSHException as error:
+            message = str(error).strip().lower()
+            dropped = message.startswith('server connection dropped:') or message in {'socket is closed', 'socket is closed.', 'server connection dropped', 'ssh session not active', 'no existing session'}
+            if not dropped:
+                warn('an unexpected SSH failure occurred')
+                raise
+            warn('the SSH connection was lost')
+            return None
+        except (psycopg.errors.LockNotAvailable, psycopg.OperationalError, psycopg.InterfaceError, TimeoutError, ConnectionError):
+            warn('a database, network, I/O timeout, or lock failure occurred')
+            return None
+        except KeyboardInterrupt:
+            warn('the operation was interrupted')
+            raise
+        except Exception:
+            warn('an unexpected configuration, integrity, or publication error occurred')
+            raise
 
 class pglDatabaseTestHarness:
     """Own explicitly disposable local PostgreSQL integration-test instances.
