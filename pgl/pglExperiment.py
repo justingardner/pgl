@@ -971,6 +971,9 @@ class pglExperiment(pglExperimentBase):
     def __repr__(self):
         return f"<pglExperiment: {len(self.task)} phases>"
     
+    class _RequiredDeviceUnavailable(RuntimeError):
+        """Expected device unavailability; screen initialization must abort."""
+
     def initScreen(self, backgroundColor=-1, recordFlush=True, recordCommands=False, estimatedDuration=600, startRecording=True):
         '''
         Initialize the screen, start recording, and configure tasks.
@@ -1220,6 +1223,19 @@ class pglExperiment(pglExperimentBase):
             finally:
                 self.state.openScreen = False
 
+            # Existing recovery above records failure and attempts cleanup first.
+            if isinstance(error, self._RequiredDeviceUnavailable):
+                pglMessages.warning(
+                    "Screen initialization was not completed: a required configured "
+                    "device is unavailable. Check device connections, power, drivers, "
+                    "and the selected device/trigger settings before retrying. "
+                    "The screen is not marked ready; do not start the experiment. "
+                    "Cleanup was attempted; review any cleanup warnings.",
+                    level=2,
+                )
+                return None
+
+            # Unexpected failures and user interruptions retain their traceback.
             raise
         
     def setGamma(self, settings, display):
@@ -2115,7 +2131,7 @@ class pglExperiment(pglExperimentBase):
                     self.state.digitalIODevices.append(labJack)
                     pglMessages.message("LabJack initialized")
                 elif needsLabJackInput:
-                    raise RuntimeError("The selected LabJack scanner-trigger device did not initialize")
+                    raise self._RequiredDeviceUnavailable('The selected LabJack scanner-trigger device did not initialize')
                 else:
                     pglMessages.message("LabJack did not initialize")
 
@@ -2461,10 +2477,7 @@ class pglExperiment(pglExperimentBase):
 
         labJack = self.getDigitalIODevice(pglLabJack)
         if labJack is None or not labJack.isActive:
-            raise RuntimeError(
-                "LabJack digital trigger was selected, but no initialized "
-                "LabJack is available"
-            )
+            raise self._RequiredDeviceUnavailable('LabJack digital trigger was selected, but no initialized LabJack is available')
 
         # Both snapshots come from the same preset. Mid-run edits affect neither.
         self._labJackTriggerConfig = deepcopy(config)

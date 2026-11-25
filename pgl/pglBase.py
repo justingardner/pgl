@@ -982,6 +982,53 @@ class pglBase:
             return None
         
         return whichScreen
+
+    ################################################################
+    # Display or hide the mouse cursor
+    ################################################################
+    def displayCursor(self, dispCursor=True):
+        """Show or hide the mouse cursor while mglMetal has focus.
+
+        Args:
+            dispCursor: True/1 to show; False/0 to hide. Defaults to show.
+
+        Returns:
+            Command-result dictionary, or None if no screen is open,
+            the command could not be sent, or results are unavailable.
+
+        Unlike the MATLAB wrapper, arbitrary nonzero values are rejected.
+        This controls the pointer, not keyboard input or mouse movement.
+        No flush is required.
+        """
+        if (
+            not isinstance(dispCursor, (bool, int, np.bool_, np.integer))
+            or dispCursor not in (0, 1)
+        ):
+            raise ValueError("dispCursor must be True/1 or False/0.")
+
+        if self.s is None or not self.s.isOpen():
+            pglMessages.warning(
+                "Cursor visibility was not changed: no screen connection is open.",
+                level=1,
+            )
+            return None
+
+        self.commandResults = None
+        self.pauseInterrupts()
+        try:
+            if self.s.writeCommand("mglDisplayCursor") is False:
+                pglMessages.warning(
+                    "Cursor visibility was not changed: the command could not be sent.",
+                    level=1,
+                )
+                return None
+
+            ack = self.s.readAck()
+            self.s.write(np.uint32(dispCursor))
+            self.commandResults = self.s.readCommandResults(ack)
+            return self.commandResults
+        finally:
+            self.restoreInterrupts()
     #################################################################
     # get the github revision
     #################################################################
