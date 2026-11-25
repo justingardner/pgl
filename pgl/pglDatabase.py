@@ -1121,6 +1121,9 @@ class pglDatabase:
     # +++++++++++++++++++++++++++++ saveRawSession ++++++++++++++++++++++++++++
     # User-facing database API. See the docstring for configuration, side effects, and return
     # conventions.
+    class _PublicationRefused(Exception):
+        """Expected publication refusal requiring transaction rollback."""
+
     @classmethod
     def saveRawSession(cls, session, *, settings=None, settingsName=None, backendID=None, storageOptions=None, sslRootCert=None, allowMissingMetadata=False, lockTimeoutSeconds=30.0, ioTimeoutSeconds=60, connectTimeoutSeconds=10):
         """Save or reuse a parentless acquisition checkpoint with progress.
@@ -1351,6 +1354,16 @@ class pglDatabase:
                 session._checkpointPostgres = pendingPostgres
 
                 progress.finish(f"Raw checkpoint {sessionID} saved")
+
+        except cls._PublicationRefused as error:
+            pglMessages.warning(
+                f"Raw session was not saved: {error}\n"
+                "No checkpoint was completed by this call. "
+                "Existing files were not overwritten or deleted. "
+                "The working session's checkpoint identity was not changed.",
+                level=0,
+            )
+            return None
 
         except psycopg.errors.LockNotAvailable:
             warnSaveFailure("PostgreSQL could not acquire a required lock", inspectLocks=True)
@@ -24052,8 +24065,9 @@ class pglDatabase:
 
         if destinationExists:
             pglMessages.warning(
-                "Raw MRI session was not exported: destination already exists. "
-                "Nothing was overwritten.",
+                f"Raw MRI session was not exported: destination already "
+                f"exists at {destination!r}. Nothing was overwritten. "
+                "Its ownership and publication state have not been established.",
                 level=0,
             )
             return None
@@ -24277,9 +24291,15 @@ class pglDatabase:
 
                     modalities = (["behavior"] if session.runs else []) + ["mri"]
 
-                    # Allocate an unpublished row to obtain its destination ID.
-                    # Existing lineage triggers assign this raw row its own root.
-                    report(0.07, "Allocating raw MRI checkpoint")
+                    # PostgreSQL identity values advance despite savepoint rollback.
+                    # Preserve occupied destinations and discard only provisional rows.
+                    # This is not yet a durable publication reservation.
+                    import os
+                    from fsspec.implementations.local import LocalFileSystem
+
+                    class OccupiedDestination(Exception):
+                        """Reject one allocation without modifying existing storage."""
+
                     statement = sql.SQL("""
                         INSERT INTO {} (
                             origin, kind, ingest_method, modalities, status,
@@ -24292,9 +24312,71 @@ class pglDatabase:
                         RETURNING session_id
                     """).format(sessions)
 
-                    sessionID = connection.execute(statement, (modalities, createdBy)).fetchone()[0]
-                    objectPrefix = f"session{sessionID:06d}"
-                    destination = posixpath.join(destinationRoot, objectPrefix)
+                    maxAllocations = 100
+                    skipped = []
+
+                    for allocationIndex in range(maxAllocations):
+                        report(
+                            0.07,
+                            f"Allocating raw MRI checkpoint "
+                            f"({allocationIndex + 1}/{maxAllocations})",
+                        )
+
+                        try:
+                            with connection.transaction():
+                                candidateID = connection.execute(
+                                    statement, (modalities, createdBy)
+                                ).fetchone()[0]
+
+                                candidatePrefix = f"session{candidateID:06d}"
+                                candidateDestination = posixpath.join(
+                                    destinationRoot, candidatePrefix
+                                )
+
+                                occupied = destinationFS.exists(candidateDestination)
+                                if isinstance(destinationFS, LocalFileSystem):
+                                    occupied = occupied or os.path.lexists(
+                                        candidateDestination
+                                    )
+
+                                if occupied:
+                                    raise OccupiedDestination()
+
+                        except OccupiedDestination:
+                            skipped.append((candidateID, candidateDestination))
+                            continue
+
+                        sessionID = candidateID
+                        objectPrefix = candidatePrefix
+                        destination = candidateDestination
+                        break
+
+                    else:
+                        details = "\n".join(
+                            f"  Session ID {identifier}: {occupiedPath}"
+                            for identifier, occupiedPath in skipped
+                        )
+                        raise cls._PublicationRefused(
+                            f"All {maxAllocations} attempted storage destinations "
+                            f"were occupied.\n{details}\n"
+                            "Inspect storage ownership and database configuration "
+                            "before retrying."
+                        )
+
+                    if skipped:
+                        details = "\n".join(
+                            f"  Session ID {identifier}: {occupiedPath}"
+                            for identifier, occupiedPath in skipped
+                        )
+                        pglMessages.warning(
+                            "Occupied storage destinations were skipped "
+                            "and left unchanged:\n"
+                            f"{details}\n"
+                            "Directory existence does not establish whether these are "
+                            "completed checkpoints, active transfers, or abandoned exports.\n"
+                            f"Continuing with session ID {sessionID}: {destination}",
+                            level=0,
+                        )
 
                     report(0.08, "Streaming original MRI and behavioral acquisition files")
 
@@ -24306,7 +24388,11 @@ class pglDatabase:
                         filesystem=destinationFS,
                     )
                     if result is None:
-                        raise RuntimeError("Raw MRI export was refused; no checkpoint was completed.")
+                        raise cls._PublicationRefused(
+                            f"The MRI exporter refused publication for provisional "
+                            f"session {sessionID} at {destination!r}. "
+                            "See the exporter warning for the specific reason."
+                        )
 
                     exportedPath, manifest = result
                     if exportedPath != destination:
