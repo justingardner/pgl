@@ -2576,6 +2576,7 @@ class pglSettings(pglTraitSettings):
     startOnVolumeTrigger = Bool(False, rowLabel='start experiment', help="Whether to start the experiment on a keyboard or digital scanner-volume trigger")
     manualPreStart = Bool(False, help="Whether to manually start the experiment before the volume trigger")
     verbose = Bool(False, help="Typically set to False so that only essential messages and warnings are printed during experiment run")
+    hideCursor = Bool(False, help="Hide cursor when screen initializes")
     startScreen = List(Unicode(), default_value=["fixation cross", "blank", "waiting message"],help="What to show on the screen before the experiment starts.")
     closeScreenOnEnd = Bool(True, rowLabel='end experiment', help="Whether to close the screen when the experiment ends")
     saveAbortedRunsToTrash = Bool(True, help="When a run is detected as aborted, saves that run into trash of the session directory")

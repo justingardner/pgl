@@ -1092,6 +1092,12 @@ class pglExperiment(pglExperimentBase):
                 self.pgl.open(whichScreen=self.state.display.currentDisplayNum, backgroundColor=backgroundColor)
 
             if not self.pgl.isOpen(): raise RuntimeError("Failed to open screen.")
+            
+            # hide/show cursor
+            if self.settings.hideCursor:
+                self.pgl.displayCursor(False)
+            else:
+                self.pgl.displayCursor(True)
 
             # Set visual angle coordinates.
             self.pgl.visualAngle(self.state.display.displayDistance, self.state.display.displaySize[0], self.state.display.displaySize[1])
