@@ -21,7 +21,21 @@ import time
 from .pglEvent import pglEventDigitalInput
 
 class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
-    def __init__(self):
+    def __init__(self, clockCalibrationDuration=0.05):
+        from uuid import uuid4
+
+        if isinstance(clockCalibrationDuration, (bool, np.bool_)):
+            raise ValueError("clockCalibrationDuration must be positive and finite.")
+        clockCalibrationDuration = float(clockCalibrationDuration)
+        if not np.isfinite(clockCalibrationDuration) or clockCalibrationDuration <= 0:
+            raise ValueError("clockCalibrationDuration must be positive and finite.")
+
+        self.clockCalibrationDuration = clockCalibrationDuration
+        self._clock = None
+        self._clockStreamStarts = []
+        self._digitalCurrentClockSegment = None
+        self._clockStopEvent = threading.Event()
+        self.connectionId = str(uuid4())
         self.h = None
         self._digitalIOLock = threading.Lock()
         self._wordPulseLock = threading.Lock()
@@ -88,6 +102,39 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
     
             # set description
             self.deviceDescription = f"{self.type} LabJack via {self.connectionType}"
+            try:
+                if self.type != "T7":
+                    raise RuntimeError("Clock-calibrated LabJack acquisition currently supports T7 only.")
+
+                self._clock = pglLabJackClock(
+                    self.connectionId,
+                    {
+                        "type": self.type,
+                        "serialNumber": self.serialNumber,
+                        "connectionType": self.connectionType,
+                    },
+                )
+                with self._digitalIOLock:
+                    if self.ljm.eReadName(self.h, "STREAM_ENABLE") != 0:
+                        raise RuntimeError("Device already has an active stream.")
+                    self._clock.collectBeginning(
+                        lambda: self.ljm.eReadName(self.h, "CORE_TIMER"),
+                        pglTimestamp.getSecs,
+                        self.clockCalibrationDuration,
+                        self._clockStopEvent.is_set,
+                    )
+            except BaseException as error:
+                # Retain the object/evidence on the exception if construction fails.
+                error.labJackDevice = self
+                error.labJackClockEvents = self.getClockEvents()
+                try:
+                    self.close()
+                except Exception as cleanupError:
+                    error.labJackCleanupFailure = (
+                        f"{type(cleanupError).__name__}: {cleanupError}"
+                    )
+                raise
+
                
     @property
     def isActive(self):
@@ -413,6 +460,7 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
         
     def close(self):
         """Stop acquisition, wait for word output, and close the shared device."""
+        self._clockStopEvent.set()
         with self._streamControlLock:
             self._digitalStopEvent.set()
             self.stopEvent.set()
@@ -914,7 +962,7 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
                             "maxReadDuration": 0.0,
                             "startCallBefore": None,
                             "startCallAfter": None,
-                            "timestampMethod": "streamStartMidpointEstimate",
+                            "timestampMethod": "calibratedStreamStartSample",
                             "recovering": False,
                             "restartAttempts": 0,
                             "successfulRestarts": 0,
@@ -950,14 +998,11 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
                         self.ljm.eWriteName(self.h, "STREAM_CLOCK_SOURCE", 0)
                         addresses = self.ljm.namesToAddresses(len(scanNames), scanNames)[0]
 
-                        before = pglTimestamp.getSecs()
-                        actualRate = self.ljm.eStreamStart(
-                            self.h, scansPerRead, len(addresses), addresses, scanRate
+                        actualRate, clockSegment = self._startClockedDigitalStream(
+                            scansPerRead, addresses, scanRate
                         )
-                        self._digitalStreamActive = True
-                        after = pglTimestamp.getSecs()
-                        if not np.isfinite(actualRate) or actualRate <= 0:
-                            raise RuntimeError(f"Invalid actual scan rate: {actualRate}")
+                        before = clockSegment["startCallBefore"]
+                        after = clockSegment["startCallAfter"]
 
                         with self._digitalEventLock:
                             self._digitalStats.update({
@@ -970,7 +1015,7 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
                             target=self._digitalReadThread,
                             args=(
                                 dict(channelBits), edge, float(actualRate),
-                                (before + after) / 2, bankShift, bankMask,
+                                clockSegment["startTimestamp"], bankShift, bankMask,
                             ),
                             name="pglLabJackDigitalInput",
                             daemon=True,
@@ -987,6 +1032,7 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
                         except Exception as cleanupError:
                             self._setDigitalReadError(f"Startup cleanup failed: {cleanupError}")
                         if not self._digitalStreamActive: self._digitalChannelBits = {}
+                        self._warnDigitalStreamFailure("startup", error, self._digitalStats)
                         raise
 
         pglMessages.message(
@@ -1044,7 +1090,8 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
                     "startTimestamp": currentStart,
                     "startCallBefore": before,
                     "startCallAfter": after,
-                    "timestampMethod": "streamStartMidpointEstimate",
+                    "timestampMethod": "calibratedStreamStartSample",
+                    "clock": deepcopy(self._digitalCurrentClockSegment),
                 })
 
         def queueEvents(events):
@@ -1064,6 +1111,8 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
             for name, value in payload.items(): setattr(event, name, deepcopy(value))
             event.timestamp = notificationTime
             event.timestampMethod = "hostDiagnosticNotification"
+            event.labJackTimestamp = None
+            event.clockMappingId = None
             event.deviceType = "LabJack"
             event.deviceUUID = str(getattr(self, "uuid", ""))
             event.serialNumber = getattr(self, "serialNumber", None)
@@ -1118,17 +1167,12 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
                                 raise RuntimeError("Counter configuration changed during acquisition.")
 
                         addresses = self.ljm.namesToAddresses(columnCount, scanNames)[0]
-                        before = pglTimestamp.getSecs()
-                        rate = self.ljm.eStreamStart(
-                            self.h, config["scansPerRead"], columnCount,
-                            addresses, config["requestedScanRate"],
+                        rate, clockSegment = self._startClockedDigitalStream(
+                            config["scansPerRead"], addresses,
+                            config["requestedScanRate"],
                         )
-                        with self._digitalEventLock:
-                            self._digitalStreamActive = True
-                        after = pglTimestamp.getSecs()
-
-                        if not np.isfinite(rate) or rate <= 0:
-                            raise RuntimeError(f"Invalid restart scan rate: {rate}")
+                        before = clockSegment["startCallBefore"]
+                        after = clockSegment["startCallAfter"]
 
                         if self._digitalStopEvent.is_set():
                             stopStream()
@@ -1136,7 +1180,7 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
 
                     with self._digitalEventLock:
                         attemptRecord["outcome"] = "restarted"
-                    return float(rate), before, after
+                    return float(rate), before, after, clockSegment["startTimestamp"]
 
                 except Exception as error:
                     lastError = error
@@ -1157,6 +1201,11 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
                                 ) from error
                         with self._digitalEventLock:
                             self._digitalStreamActive = False
+
+                    if self._clock is None or not self._clock.valid:
+                        raise RuntimeError(
+                            "Clock validation failed; recovery cannot reuse this mapping."
+                        ) from error
 
                     # A changed counter configuration is not a retryable overflow.
                     if verifyCounter:
@@ -1246,9 +1295,20 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
                     )
                     for event in edges:
                         event.acquisitionId = acquisitionId
+                        event.eventId = (
+                            f"{acquisitionId}:{segmentId}:{event.sampleIndex}:"
+                            f"{event.channel}:{event.eventType}"
+                        )
                         event.segmentId = segmentId
                         event.sampleIndexScope = "timingSegment"
-                        event.timestampMethod = "streamStartMidpointEstimate"
+                        event.timestampMethod = "calibratedStreamStartSample"
+                        clockSegment = self._digitalCurrentClockSegment
+                        event.labJackTimestamp = (
+                            clockSegment["streamStartTicks"] / pglLabJackClock.nominalTicksPerSecond
+                            + event.sampleTime
+                        )
+                        event.clockMappingId = clockSegment["mappingId"]
+                        event.deviceTimestampMethod = "streamStartStampPlusSampleOffset"
                         event.readCompletedTimestamp = deliveredAt
                         event.isEstimated = False
                         event.deviceUUID = str(getattr(self, "uuid", ""))
@@ -1321,11 +1381,7 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
                     with self._digitalEventLock:
                         record["outcome"] = "failed"
                         record["error"] = f"{type(error).__name__}: {error}"
-                    pglMessages.warning(
-                        f"LabJack stream discontinuity detected. Automatic restart failed: "
-                        f"{error}. Diagnostics have been retained.",
-                        level=2,
-                    )
+                    self._warnDigitalStreamFailure("recovery", error, config)
                     raise
 
                 if restarted is None:
@@ -1333,8 +1389,7 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
                         record["outcome"] = "cancelledByStop"
                     break
 
-                currentRate, before, after = restarted
-                currentStart = (before + after) / 2
+                currentRate, before, after, currentStart = restarted
                 segmentId += 1
                 firstSampleIndex = 0
                 previousState = None
@@ -1454,6 +1509,9 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
         thread = self._digitalThread
         status["running"] = thread is not None and thread.is_alive()
         status["streamActive"] = self._digitalStreamActive
+        status["clockEvents"] = self.getClockEvents()
+        status["clockStreamStarts"] = deepcopy(self._clockStreamStarts)
+        status["clockValid"] = self._clock is not None and self._clock.valid
         return status
 
     ################################################################
@@ -1799,6 +1857,988 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
         if errors: raise RuntimeError("; ".join(errors))
         self._digitalCounterRestore = None
     
+
+    def getClockEvents(self):
+        """Independent retained calibration/mapping snapshots; no hardware access."""
+        from copy import deepcopy
+        return deepcopy(self._clock.events if self._clock is not None else [])
+
+    def _readClockRegister(self, name, record, fieldName):
+        """Caller owns digital-IO lock. Retain brackets even if reading fails."""
+        row = {
+            "register": name,
+            "hostBefore": pglTimestamp.getSecs(),
+            "rawTicks": None,
+            "failure": None,
+        }
+        record[fieldName] = row
+        try:
+            value = self.ljm.eReadName(self.h, name)
+            row["rawValueRepresentation"] = repr(value)
+            row["rawTicks"] = pglLabJackClock._rawTicks(value)
+        except BaseException as error:
+            row["failure"] = f"{type(error).__name__}: {error}"
+            raise
+        finally:
+            row["hostAfter"] = pglTimestamp.getSecs()
+            row["roundTripSeconds"] = row["hostAfter"] - row["hostBefore"]
+        return row
+
+    def _startClockedDigitalStream(self, scansPerRead, addresses, requestedRate):
+        """
+        Start a stream and validate its hardware-derived origin.
+
+        Caller holds _digitalIOLock.
+
+        A native start exception leaves stream ownership potentially active.
+        The caller must confirm stopped ownership before another attempt.
+        Such an exception alone does not invalidate the clock mapping.
+
+        Invalid timing evidence invalidates the mapping. Never fall back to
+        host midpoint origins.
+        """
+        from copy import deepcopy
+
+        record = {
+            "outcome": "starting",
+            "mappingId": (
+                self._clock.mapping.eventId
+                if self._clock is not None and self._clock.mapping is not None
+                else None
+            ),
+            "failure": None,
+            "failureStage": None,
+            "requiresStopConfirmation": False,
+        }
+        self._clockStreamStarts.append(record)
+        stage = "preStartClockValidation"
+
+        try:
+            if self._clock is None or not self._clock.valid:
+                raise RuntimeError("No valid connection clock mapping.")
+
+            pre = self._readClockRegister("CORE_TIMER", record, "coreBeforeStart")
+            preTicks = self._clock.resolveRead(pre)
+
+            stage = "nativeStreamStart"
+            record["startCallBefore"] = pglTimestamp.getSecs()
+            try:
+                rate = self.ljm.eStreamStart(
+                    self.h, scansPerRead, len(addresses), addresses, requestedRate
+                )
+            except BaseException:
+                # A native exception does not establish whether the device
+                # partially started. Make cleanup own that uncertainty.
+                self._digitalStreamActive = True
+                record["requiresStopConfirmation"] = True
+                raise
+            finally:
+                record["startCallAfter"] = pglTimestamp.getSecs()
+
+            # Ownership is active before rate or stamp validation can fail.
+            self._digitalStreamActive = True
+
+            stage = "scanRateValidation"
+            if not np.isfinite(rate) or rate <= 0:
+                raise RuntimeError(f"Invalid actual scan rate: {rate}")
+            record["scanRate"] = float(rate)
+
+            stage = "streamClockValidation"
+            stamp = self._readClockRegister(
+                "STREAM_START_TIME_STAMP", record, "streamStartStamp"
+            )
+            post = self._readClockRegister("CORE_TIMER", record, "coreAfterStart")
+            postTicks = self._clock.resolveRead(post)
+
+            if not 0 <= postTicks - preTicks < pglLabJackClock.timerModulus:
+                raise RuntimeError(
+                    "Stream-start timer interval cannot uniquely locate the stamp."
+                )
+
+            stampTicks = preTicks + (
+                (stamp["rawTicks"] - pre["rawTicks"])
+                % pglLabJackClock.timerModulus
+            )
+            if not preTicks <= stampTicks <= postTicks:
+                raise RuntimeError("Stale or inconsistent stream-start timestamp.")
+
+            stamp["unwrappedTicks"] = int(stampTicks)
+            record.update({
+                "streamStartTicks": int(stampTicks),
+                "startTimestamp": self._clock.toHost(stampTicks),
+                "timestampMethod": "calibratedStreamStartSample",
+                "deviceTimestampMethod": "streamStartStampPlusSampleOffset",
+                "outcome": "validated",
+            })
+            self._digitalCurrentClockSegment = deepcopy(record)
+            return float(rate), deepcopy(record)
+
+        except BaseException as error:
+            record.update({
+                "outcome": "failed",
+                "failure": f"{type(error).__name__}: {error}",
+                "failureStage": stage,
+            })
+            if stage != "nativeStreamStart" and self._clock is not None:
+                self._clock.valid = False
+            raise
+
+    def _warnDigitalStreamFailure(self, stage, error, config):
+        """
+        Warn using the failing acquisition's settings, not today's preset.
+
+        No error-code taxonomy is assumed. Buffer/rate advice is conditional
+        and is not offered as a remedy for an invalid clock mapping.
+        """
+        scanRate = config.get("requestedScanRate")
+        bufferBytes = config.get("streamBufferSizeBytes")
+        if bufferBytes is None:
+            bufferBytes = config.get("requestedStreamBufferSizeBytes")
+        scanNames = config.get("scanNames")
+
+        details = []
+        if scanRate is not None:
+            details.append(f"requested scan rate={scanRate:g} scans/s")
+        if bufferBytes is not None:
+            details.append(f"stream buffer={bufferBytes} bytes")
+        if isinstance(scanNames, (list, tuple)):
+            details.append(f"stream addresses={len(scanNames)}")
+
+        headline = (
+            "LabJack acquisition could not start."
+            if stage == "startup"
+            else "LabJack stream recovery failed; acquisition cannot continue."
+        )
+        message = f"{headline} {type(error).__name__}: {error}."
+        if details:
+            message += " Acquisition settings: " + ", ".join(details) + "."
+
+        clockInvalid = self._clock is None or not self._clock.valid
+        if clockInvalid:
+            message += (
+                " Clock validation is unavailable or failed. Resolve the "
+                "reported clock/device problem before starting a new acquisition; "
+                "changing buffer size or scan rate is not a clock-calibration remedy."
+            )
+        else:
+            if bufferBytes is not None and bufferBytes < 32768:
+                advice = (
+                    "If the reported cause is buffering or throughput, try a "
+                    "larger supported stream buffer (up to 32768 bytes) or a "
+                    "lower scan rate in the LabJack preset, then run again."
+                )
+            elif bufferBytes == 32768:
+                advice = (
+                    "If the reported cause is buffering or throughput, the "
+                    "stream buffer is already at its supported maximum of "
+                    "32768 bytes. Try a lower scan rate in the LabJack preset, "
+                    "then run again."
+                )
+            else:
+                advice = (
+                    "If the reported cause is buffering or throughput, review "
+                    "the stream buffer and scan rate in the LabJack preset "
+                    "before retrying."
+                )
+            message += (
+                " " + advice
+                + " For other causes, address the reported device/configuration "
+                  "error before retrying."
+            )
+
+        message += (
+            " Settings were not changed automatically. Failure and any cleanup "
+            "diagnostics have been retained."
+        )
+        pglMessages.warning(message, level=2)
+
+    def calibrateClockEnding(self, calibrationEventIds=None):
+        """
+        Collect an ending calibration and fit it with explicitly selected records.
+
+        Default: use the calibration IDs supporting the frozen live mapping.
+        Explicit IDs: use exactly those earlier collections plus the new ending
+        collection. Do not automatically include other connection history.
+
+        All collection and fitting evidence is retained by the clock object.
+        Does not close the connection, replace the live mapping, or correct events.
+        """
+        with self._streamControlLock:
+            if self._clock is None or self._clock.mapping is None:
+                raise RuntimeError("No beginning clock mapping exists.")
+
+            if calibrationEventIds is None:
+                selectedIds = list(self._clock.mapping.calibrationEventIds)
+            else:
+                if not isinstance(calibrationEventIds, (list, tuple)):
+                    raise TypeError("calibrationEventIds must be a list or tuple.")
+                selectedIds = list(calibrationEventIds)
+
+            if (
+                not selectedIds
+                or any(not isinstance(value, str) or not value for value in selectedIds)
+                or len(set(selectedIds)) != len(selectedIds)
+            ):
+                raise ValueError("Supply distinct nonempty calibration-event IDs.")
+
+            # Validate references before reading hardware. Do not fit or alter
+            # prior records here; the shared fitter validates their observations.
+            for eventId in selectedIds:
+                matches = [
+                    event for event in self._clock.events
+                    if event.type == "labJackClockCalibration"
+                    and event.eventId == eventId
+                ]
+                if len(matches) != 1:
+                    raise ValueError(f"Calibration ID missing or ambiguous: {eventId}")
+                event = matches[0]
+                if event.connectionId != self._clock.connectionId:
+                    raise ValueError("Cannot combine different device connections.")
+                if event.status != "collected":
+                    raise ValueError(f"Calibration did not complete successfully: {eventId}")
+
+            # RLock permits the shared collection/fit methods to enforce their
+            # own lifecycle rules while this compound operation retains control.
+            ending = self.collectClockCalibration(phase="ending")
+            return self.fitClockCalibrations(
+                selectedIds + [ending.eventId], purpose="postRun"
+            )
+
+    def getClockTiming(self, deviceTicks, mappingId=None):
+        """Hardware-free conversion and conditional uncertainty query."""
+        if self._clock is None:
+            raise RuntimeError("No connection clock calibration exists.")
+        return self._clock.getTiming(deviceTicks, mappingId=mappingId)
+
+    def collectClockCalibration(self, phase="intermediate"):
+        """
+        Collect additional clock evidence at an idle acquisition boundary.
+
+        Does not stop a stream, fit a mapping, or change the live mapping.
+        """
+        if phase not in {"beginning", "intermediate", "ending", "characterization"}:
+            raise ValueError("Invalid additional calibration phase.")
+        with self._streamControlLock:
+            if self.h is None:
+                raise RuntimeError("LabJack is not connected.")
+            for thread in (self._digitalThread, self.acquisitionThread):
+                if thread is not None and thread.is_alive():
+                    raise RuntimeError("Additional clock collection currently requires idle acquisition.")
+            if self._digitalStreamActive or self.isReading:
+                raise RuntimeError("Acquisition still owns the stream.")
+            if getattr(self, "_digitalCounterRestore", None) is not None:
+                raise RuntimeError("Counter restoration is incomplete.")
+            if self._clockStopEvent.is_set():
+                raise RuntimeError("Device closure/cancellation was requested.")
+            if self._clock is None:
+                raise RuntimeError("No connection clock exists.")
+
+            with self._wordPulseLock:
+                with self._digitalIOLock:
+                    if self.ljm.eReadName(self.h, "STREAM_ENABLE") != 0:
+                        raise RuntimeError("Device reports an active stream.")
+                    return self._clock.collectCalibration(
+                        lambda: self.ljm.eReadName(self.h, "CORE_TIMER"),
+                        pglTimestamp.getSecs,
+                        self.clockCalibrationDuration,
+                        self._clockStopEvent.is_set,
+                        phase,
+                    )
+
+    def fitClockCalibrations(self, calibrationEventIds, purpose="postRun"):
+        """
+        Hardware-free fit using explicitly selected calibration-event IDs.
+
+        Does not automatically select unrelated collections or correct events.
+        """
+        with self._streamControlLock:
+            if self._clock is None:
+                raise RuntimeError("No retained clock records exist.")
+            return self._clock.fitCalibrations(
+                calibrationEventIds, pglTimestamp.getSecs, purpose=purpose
+            )
+
+    def getClockCalibrationReport(self, mappingId=None):
+        """
+        Hardware-free inspection, including rejected/incomplete mapping records.
+
+        Unresolved references are reported explicitly. No observations, bounds,
+        or successful mapping status are fabricated.
+        """
+        from copy import deepcopy
+
+        if self._clock is None:
+            raise RuntimeError("No retained clock evidence exists.")
+        if mappingId is None:
+            if self._clock.mapping is None:
+                raise RuntimeError("No live mapping exists; specify a retained mapping ID.")
+            mappingId = self._clock.mapping.eventId
+
+        events = self.getClockEvents()
+        matches = [
+            event for event in events
+            if event.type == "labJackClockMapping" and event.eventId == mappingId
+        ]
+        if len(matches) != 1:
+            raise ValueError("Mapping ID itself is missing or ambiguous.")
+        mapping = matches[0]
+
+        collections, referenceErrors = [], []
+        for calibrationId in mapping.calibrationEventIds:
+            matches = [
+                event for event in events
+                if event.type == "labJackClockCalibration"
+                and event.eventId == calibrationId
+            ]
+            if len(matches) != 1:
+                referenceErrors.append({
+                    "calibrationEventId": calibrationId,
+                    "reason": "missing" if not matches else "ambiguous",
+                    "matchCount": len(matches),
+                })
+                continue
+            event = matches[0]
+            if event.connectionId != mapping.connectionId:
+                referenceErrors.append({
+                    "calibrationEventId": calibrationId,
+                    "reason": "foreignConnection",
+                    "matchCount": 1,
+                })
+                continue
+            collections.append(event)
+
+        summaries, validRows = [], []
+        for collection in collections:
+            rtts = []
+            for row in collection.observations:
+                before, after = row.get("hostBefore"), row.get("hostAfter")
+                if (
+                    isinstance(before, (int, float))
+                    and isinstance(after, (int, float))
+                    and np.isfinite(before) and np.isfinite(after)
+                    and after >= before
+                ):
+                    rtts.append(after - before)
+                ticks = row.get("unwrappedTicks")
+                if isinstance(ticks, (int, np.integer)) and not isinstance(ticks, (bool, np.bool_)):
+                    validRows.append(row)
+
+            summaries.append({
+                "calibrationEventId": collection.eventId,
+                "phase": collection.phase,
+                "status": collection.status,
+                "requestedDurationSeconds": collection.requestedDuration,
+                "actualDurationSeconds": collection.actualDuration,
+                "observationCount": len(collection.observations),
+                "selectedObservationCount": sum(
+                    row.get("selected") is True for row in collection.observations
+                ),
+                "rttSeconds": (
+                    {
+                        "minimum": float(np.min(rtts)),
+                        "median": float(np.median(rtts)),
+                        "p95": float(np.percentile(rtts, 95)),
+                        "maximum": float(np.max(rtts)),
+                    } if rtts else None
+                ),
+            })
+
+        report = {
+            "mappingId": mapping.eventId,
+            "connectionId": mapping.connectionId,
+            "purpose": mapping.purpose,
+            "status": mapping.status,
+            "method": mapping.method,
+            "methodVersion": mapping.methodVersion,
+            "calibrationEventIds": list(mapping.calibrationEventIds),
+            "collections": summaries,
+            "mappingEvent": mapping,
+            "calibrationEvents": collections,
+            "referenceErrors": referenceErrors,
+            "reportStatus": "unavailable",
+            "reportFailureReason": None,
+            "failureReason": mapping.diagnostics.get("failureReason"),
+            "clockScale": None,
+            "scaleDeviationPpm": None,
+            "feasibleScaleDeviationPpm": None,
+            "collectionSeparationSeconds": None,
+            "queries": [],
+            "assumptions": deepcopy(mapping.assumptions),
+            "unknownContributions": [
+                "hostTimestampUncertainty",
+                "withinRunNonlinearClockVariation",
+            ],
+            "totalTimingBoundAvailable": False,
+        }
+
+        if referenceErrors:
+            report["reportStatus"] = "unresolvedReferences"
+            return report
+        if mapping.status != "validConditional":
+            report["reportStatus"] = "mappingRejected"
+            return report
+
+        try:
+            if len(collections) > 1:
+                midpoints = [
+                    event.collectionStartedTimestamp
+                    + (event.collectionCompletedTimestamp - event.collectionStartedTimestamp) / 2
+                    for event in collections
+                ]
+                report["collectionSeparationSeconds"] = max(midpoints) - min(midpoints)
+
+            parameters = mapping.parameters
+            scale = parameters["clockScale"]
+            polygon = parameters["affineRegion"]
+            if not np.isfinite(scale) or scale <= 0 or not polygon:
+                raise ValueError("Invalid mapping parameters.")
+            bounds = [
+                min(point[1] for point in polygon) * 1e6,
+                max(point[1] for point in polygon) * 1e6,
+            ]
+            if not np.all(np.isfinite(bounds)):
+                raise ValueError("Nonfinite scale bounds.")
+
+            queries = []
+            if validRows:
+                firstTicks = min(row["unwrappedTicks"] for row in validRows)
+                lastTicks = max(row["unwrappedTicks"] for row in validRows)
+                for label, ticks in (
+                    ("beginning", firstTicks),
+                    ("midpoint", firstTicks + (lastTicks - firstTicks) / 2),
+                    ("ending", lastTicks),
+                ):
+                    timing = self.getClockTiming(ticks, mapping.eventId)
+                    liveTiming = (
+                        self.getClockTiming(ticks, self._clock.mapping.eventId)
+                        if self._clock.mapping is not None else None
+                    )
+                    queries.append({
+                        "label": label,
+                        "deviceTicks": ticks,
+                        **timing,
+                        "correctionFromLiveSeconds": (
+                            timing["timestamp"] - liveTiming["timestamp"]
+                            if liveTiming is not None else None
+                        ),
+                    })
+
+            report.update({
+                "clockScale": scale,
+                "scaleDeviationPpm": (scale - 1) * 1e6,
+                "feasibleScaleDeviationPpm": bounds,
+                "queries": queries,
+                "reportStatus": "availableConditional",
+            })
+
+        except Exception as error:
+            report["reportStatus"] = "reportFailed"
+            report["reportFailureReason"] = f"{type(error).__name__}: {error}"
+
+        return report
+
+    def getClockCharacterizationHistory(self):
+        """Independent serializable characterization snapshots; no hardware reads."""
+        from copy import deepcopy
+        return deepcopy(getattr(self, "_clockCharacterizationHistory", []))
+
+    def _getClockCheckSummary(self, mappingId):
+        """
+        Prepare a human-readable two-collection clock check.
+
+        Signs:
+            Alignment offset = system time minus nominal device time.
+            Negative drift means the LabJack timer gains on the system clock.
+
+        All intervals are conditional on the retained affine clock model.
+        """
+        import numpy as np
+
+        report = self.getClockCalibrationReport(mappingId)
+        if report["reportStatus"] != "availableConditional":
+            raise ValueError(
+                report.get("failureReason")
+                or report.get("reportFailureReason")
+                or f"Clock report unavailable: {report['reportStatus']}"
+            )
+
+        collections = sorted(
+            report["calibrationEvents"],
+            key=lambda event: event.collectionStartedTimestamp,
+        )
+        if len(collections) != 2:
+            raise ValueError(
+                "This simplified clock-check report requires exactly two "
+                "collections. The general multi-collection mapping remains supported."
+            )
+
+        mapping = report["mappingEvent"]
+        parameters = mapping.parameters
+        rate = parameters["nominalTicksPerSecond"]
+        tickReference = parameters["tickReference"]
+        hostBase = parameters["hostBase"]
+        selectedOffset = parameters["hostReferenceOffset"]
+        selectedScale = parameters["clockScale"]
+        region = np.asarray(parameters["affineRegion"], dtype=float)
+
+        summaries = []
+        for index, collection in enumerate(collections):
+            rows = collection.observations
+            if not rows:
+                raise ValueError("Calibration collection has no observations.")
+
+            x = np.asarray([
+                (row["unwrappedTicks"] - tickReference) / rate
+                for row in rows
+            ])
+            before = np.asarray([
+                row["hostBefore"] - hostBase for row in rows
+            ])
+            after = np.asarray([
+                row["hostAfter"] - hostBase for row in rows
+            ])
+            midpoint = before + (after - before) / 2
+
+            # Representative device coordinate within this collection.
+            referenceX = float(np.median(x))
+
+            # Bring each observation to this collection's reference position
+            # using the selected slope. This removes only the small modeled
+            # drift DURING the collection, not the drift between collections.
+            offsets = (
+                midpoint - x
+                + (selectedScale - 1) * (referenceX - x)
+            )
+
+            # Joint feasible region projected at this collection's reference.
+            possibleOffsets = region[:, 0] + region[:, 1] * referenceX
+            estimatedOffset = selectedOffset + (selectedScale - 1) * referenceX
+            errorLower = float(np.min(possibleOffsets) - estimatedOffset)
+            errorUpper = float(np.max(possibleOffsets) - estimatedOffset)
+
+            summaries.append({
+                "number": index + 1,
+                "calibrationEventId": collection.eventId,
+                "observationCount": len(rows),
+                "selectedObservationCount": sum(
+                    row.get("selected") is True for row in rows
+                ),
+                "durationSeconds": collection.actualDuration,
+                "deviceSeconds": referenceX,
+                "estimatedOffsetSeconds": float(estimatedOffset),
+                "alignmentErrorSeconds": [errorLower, errorUpper],
+                "readAlignmentErrorsSeconds": (
+                    offsets - estimatedOffset
+                ).tolist(),
+                "readHalfBracketSeconds": ((after - before) / 2).tolist(),
+                "hostReferenceTime": (
+                    hostBase + referenceX + estimatedOffset
+                ),
+            })
+
+        first, second = summaries
+        deviceSpan = second["deviceSeconds"] - first["deviceSeconds"]
+        if deviceSpan <= 0:
+            raise ValueError("Calibration references have no positive separation.")
+
+        elapsed = second["hostReferenceTime"] - first["hostReferenceTime"]
+        drift = (selectedScale - 1) * deviceSpan
+        driftBounds = [
+            float(np.min(region[:, 1]) * deviceSpan),
+            float(np.max(region[:, 1]) * deviceSpan),
+        ]
+
+        # Express device gain relative to system time, not its reciprocal.
+        # This is the rate of nominal LabJack seconds per system second minus 1.
+        scaleLower = 1 + float(np.min(region[:, 1]))
+        scaleUpper = 1 + float(np.max(region[:, 1]))
+        if scaleLower <= 0:
+            raise ValueError("Invalid feasible clock scale.")
+
+        deviceRatePpm = (1 / selectedScale - 1) * 1e6
+        deviceRateBoundsPpm = [
+            (1 / scaleUpper - 1) * 1e6,
+            (1 / scaleLower - 1) * 1e6,
+        ]
+
+        # System-minus-device drift after 600 system seconds.
+        driftTenMinutes = 600 * (1 - 1 / selectedScale)
+        driftTenMinutesBounds = [
+            600 * (1 - 1 / scaleLower),
+            600 * (1 - 1 / scaleUpper),
+        ]
+
+        return {
+            "mappingId": mapping.eventId,
+            "collections": summaries,
+            "elapsedSeconds": float(elapsed),
+            "deviceSpanSeconds": float(deviceSpan),
+            "driftSeconds": float(drift),
+            "driftIntervalSeconds": driftBounds,
+            "expectedDriftTenMinutesSeconds": float(driftTenMinutes),
+            "expectedDriftTenMinutesIntervalSeconds": driftTenMinutesBounds,
+            "deviceRateDeviationPpm": float(deviceRatePpm),
+            "deviceRateDeviationIntervalPpm": deviceRateBoundsPpm,
+            "affineRegion": region.tolist(),
+            "selectedOffsetSeconds": selectedOffset,
+            "selectedScale": selectedScale,
+            "totalTimingAccuracyEstablished": False,
+        }
+
+    def printClockCalibrationReport(self, mappingId=None):
+        """
+        Print an understandable two-collection clock-check summary.
+
+        Returns the summary. Other mappings still have the general
+        getClockCalibrationReport() interface.
+        """
+        if mappingId is None:
+            if self._clock is None or self._clock.mapping is None:
+                raise RuntimeError("No clock mapping is available.")
+            mappingId = self._clock.mapping.eventId
+
+        pglMessages.printHeader("Clock calibration")
+
+        try:
+            summary = self._getClockCheckSummary(mappingId)
+        except Exception as error:
+            print(f"Clock-check summary unavailable: {error}")
+            print("Unavailable uncertainty does not mean zero.")
+            return self.getClockCalibrationReport(mappingId)
+
+        for collection in summary["collections"]:
+            lower, upper = collection["alignmentErrorSeconds"]
+            print(
+                f"Calibration {collection['number']}: "
+                f"clock-alignment uncertainty "
+                f"[{lower * 1e6:+.1f}, {upper * 1e6:+.1f}] µs "
+                f"(n={collection['observationCount']}, "
+                f"{collection['durationSeconds'] * 1000:.1f} ms collection)"
+            )
+
+        lower, upper = summary["driftIntervalSeconds"]
+        print(
+            f"\nDrift between system clock and LabJack clock over "
+            f"{summary['elapsedSeconds']:.3f} s = "
+            f"{summary['driftSeconds'] * 1e6:+.1f} µs "
+            f"(supported range [{lower * 1e6:+.1f}, {upper * 1e6:+.1f}] µs)"
+        )
+
+        lower, upper = summary["expectedDriftTenMinutesIntervalSeconds"]
+        print(
+            f"Expected drift over 10 minutes: "
+            f"{summary['expectedDriftTenMinutesSeconds'] * 1000:+.3f} ms "
+            f"(range [{lower * 1000:+.3f}, {upper * 1000:+.3f}] ms)"
+        )
+
+        lower, upper = summary["deviceRateDeviationIntervalPpm"]
+        print(
+            f"Implied T7 clock rate relative to system clock: "
+            f"{summary['deviceRateDeviationPpm']:+.3f} ppm "
+            f"(range [{lower:+.3f}, {upper:+.3f}] ppm)"
+        )
+        print(
+            "\nNegative drift means the LabJack timer gains on the system clock; "
+            "positive T7 ppm means it runs faster."
+        )
+        print(
+            "Collection uncertainty uses all selected brackets in the joint fit. "
+            "These are conditional alignment bounds, not independently measured "
+            "absolute clock accuracy."
+        )
+        print(
+            "The 10-minute prediction assumes constant relative rate. "
+            "Nonlinear drift and host timestamp uncertainty remain unbounded."
+        )
+        return summary
+
+    def plotClockCalibration(self, mappingId=None):
+        """
+        Plot the two calibration distributions and their fitted drift.
+
+        Uses ordinary pyplot figures for notebook rendering.
+        Returns (distributionFigure, driftFigure); no hardware reads.
+        """
+        import numpy as np
+        import matplotlib.pyplot as plt
+
+        if mappingId is None:
+            if self._clock is None or self._clock.mapping is None:
+                raise RuntimeError("No clock mapping is available.")
+            mappingId = self._clock.mapping.eventId
+
+        try:
+            summary = self._getClockCheckSummary(mappingId)
+        except Exception as error:
+            figure, axis = plt.subplots(
+                figsize=(10, 4), constrained_layout=True
+            )
+            axis.set_axis_off()
+            axis.text(
+                0.02, 0.95,
+                f"Clock calibration plot unavailable\n\n{error}\n\n"
+                "Unavailable uncertainty does not mean zero.\n"
+                "Original calibration records remain retained.",
+                va="top", transform=axis.transAxes,
+            )
+            return figure, None
+
+        distributionFigure, axes = plt.subplots(
+            1, 2, figsize=(12, 4.5), constrained_layout=True,
+            sharex=True,
+        )
+        collections = summary["collections"]
+        pooled = np.concatenate([
+            np.asarray(collection["readAlignmentErrorsSeconds"]) * 1e6
+            for collection in collections
+        ])
+        binEdges = np.histogram_bin_edges(pooled, bins=30)
+
+        for axis, collection in zip(axes, collections):
+            values = np.asarray(collection["readAlignmentErrorsSeconds"]) * 1e6
+            lower, upper = np.asarray(collection["alignmentErrorSeconds"]) * 1e6
+
+            axis.hist(
+                values, bins=binEdges, alpha=0.7,
+                label="Individual timer-read estimates",
+            )
+            axis.axvspan(
+                lower, upper, color="tab:green", alpha=0.25,
+                label="Supported clock-alignment range",
+            )
+            axis.axvline(
+                0, color="black", linewidth=1,
+                label="Selected alignment",
+            )
+            axis.axvline(lower, color="tab:green", linestyle="--", linewidth=1)
+            axis.axvline(upper, color="tab:green", linestyle="--", linewidth=1)
+            axis.set(
+                title=(
+                    f"Calibration {collection['number']} "
+                    f"(n={collection['observationCount']})\n"
+                    f"Alignment uncertainty [{lower:+.1f}, {upper:+.1f}] µs"
+                ),
+                xlabel="Timer-read estimate minus selected alignment (µs)",
+                ylabel="Observations (n)",
+            )
+            axis.grid(True, alpha=0.2)
+            axis.legend(fontsize=8)
+
+        distributionFigure.suptitle(
+            "Clock calibration observations\n"
+            "Histogram spread is communication variability; "
+            "shaded bounds come from the joint transaction-bracket fit",
+            fontsize=11,
+        )
+
+        driftFigure, axis = plt.subplots(
+            figsize=(11, 5.5), constrained_layout=True
+        )
+        first, second = collections
+        x0 = first["deviceSeconds"]
+        span = summary["deviceSpanSeconds"]
+        fractions = np.linspace(0, 1, 200)
+        deviceCoordinates = x0 + fractions * span
+        elapsed = fractions * summary["elapsedSeconds"]
+
+        selectedOffset = summary["selectedOffsetSeconds"]
+        selectedScale = summary["selectedScale"]
+        region = np.asarray(summary["affineRegion"])
+        firstSelectedOffset = first["estimatedOffsetSeconds"]
+
+        line = (
+            selectedOffset
+            + (selectedScale - 1) * deviceCoordinates
+            - firstSelectedOffset
+        ) * 1e6
+        possible = (
+            region[:, 0, None]
+            + region[:, 1, None] * deviceCoordinates[None, :]
+            - firstSelectedOffset
+        ) * 1e6
+
+        axis.fill_between(
+            elapsed, possible.min(axis=0), possible.max(axis=0),
+            alpha=0.2, color="tab:blue",
+            label="Conditional clock-alignment interval",
+        )
+        axis.plot(
+            elapsed, line, color="tab:blue", linewidth=2,
+            label="Fitted relative clock drift",
+        )
+
+        for index, collection in enumerate(collections):
+            pointTime = 0 if index == 0 else summary["elapsedSeconds"]
+            pointValue = (
+                collection["estimatedOffsetSeconds"] - firstSelectedOffset
+            ) * 1e6
+            lower, upper = np.asarray(collection["alignmentErrorSeconds"]) * 1e6
+            axis.errorbar(
+                pointTime, pointValue,
+                yerr=np.asarray([[-lower], [upper]]),
+                fmt="o", capsize=6, color=f"C{index + 1}",
+                label=f"Calibration {index + 1} alignment uncertainty",
+            )
+
+        driftText = (
+            "Drift between system clock and LabJack clock "
+            f"= {summary['driftSeconds'] * 1e6:+.1f} µs"
+        )
+        # Offset text above the midpoint. Keep horizontal for readability across
+        # notebook sizes rather than forcing a potentially illegible rotation.
+        axis.annotate(
+            driftText,
+            xy=(summary["elapsedSeconds"] / 2, summary["driftSeconds"] * 0.5e6),
+            xytext=(0, 22), textcoords="offset points",
+            ha="center", va="bottom",
+            bbox={"facecolor": "white", "alpha": 0.85, "edgecolor": "none"},
+        )
+
+        axis.set(
+            title=(
+                f"Expected drift over 10 minutes: "
+                f"{summary['expectedDriftTenMinutesSeconds'] * 1000:+.3f} ms\n"
+                f"T7 rate relative to system clock: "
+                f"{summary['deviceRateDeviationPpm']:+.3f} ppm"
+            ),
+            xlabel="Elapsed system time (s)",
+            ylabel="System-minus-LabJack alignment change (µs)",
+        )
+        axis.axhline(0, color="black", linewidth=0.5)
+        axis.grid(True, alpha=0.2)
+        axis.legend(fontsize=8, loc="best")
+        driftFigure.supxlabel(
+            "Conditional constant-rate model. Error bars share calibration "
+            "uncertainty; nonlinear drift is not bounded.",
+            fontsize=9,
+        )
+
+        return distributionFigure, driftFigure
+
+    def checkClockCalibration(self, endpointSeparation):
+        """
+        Run an idle-only, two-collection clock check and display its outcome.
+
+        endpointSeparation is the start-to-start target in seconds.
+        Collection duration comes from the device's calibration settings.
+
+        Leaves the connection open and the live mapping unchanged.
+        Existing characterization-history storage is retained for compatibility.
+        """
+        from copy import deepcopy
+        from uuid import uuid4
+        import numpy as np
+        import matplotlib.pyplot as plt
+
+        if isinstance(endpointSeparation, (bool, np.bool_)):
+            raise ValueError("endpointSeparation must be positive and finite.")
+        endpointSeparation = float(endpointSeparation)
+        if (
+            not np.isfinite(endpointSeparation)
+            or endpointSeparation <= self.clockCalibrationDuration
+        ):
+            raise ValueError(
+                "endpointSeparation must exceed the configured collection duration."
+            )
+
+        run = {
+            "characterizationId": str(uuid4()),
+            "operation": "checkClockCalibration",
+            "endpointSeparationTargetSeconds": endpointSeparation,
+            "collectionDurationTargetSeconds": self.clockCalibrationDuration,
+            "status": "starting",
+            "failureReason": None,
+            "calibrationEventIds": [],
+            "mappingId": None,
+            "clockEvents": [],
+            "report": None,
+        }
+        if not hasattr(self, "_clockCharacterizationHistory"):
+            self._clockCharacterizationHistory = []
+        self._clockCharacterizationHistory.append(run)
+
+        previousIds = None
+        try:
+            with self._streamControlLock:
+                if self.h is None or self._clock is None:
+                    raise RuntimeError(
+                        "An open calibrated LabJack connection is required."
+                    )
+
+                previousIds = {
+                    event.eventId for event in self.getClockEvents()
+                }
+                print(
+                    f"Running LabJack clock check: "
+                    f"{self.clockCalibrationDuration * 1000:g} ms collections, "
+                    f"{endpointSeparation:g} s separation.",
+                    flush=True,
+                )
+                first = self.collectClockCalibration(phase="characterization")
+                run["calibrationEventIds"].append(first.eventId)
+                target = first.collectionStartedTimestamp + endpointSeparation
+
+                if pglTimestamp.getSecs() >= target:
+                    raise RuntimeError(
+                        "The first collection exceeded the requested separation."
+                    )
+
+                while True:
+                    remaining = target - pglTimestamp.getSecs()
+                    if remaining <= 0:
+                        break
+                    if self._clockStopEvent.wait(min(remaining, 0.1)):
+                        raise RuntimeError("Clock check cancelled.")
+
+                second = self.collectClockCalibration(phase="characterization")
+                run["calibrationEventIds"].append(second.eventId)
+
+                mapping = self.fitClockCalibrations(
+                    run["calibrationEventIds"], purpose="characterization"
+                )
+                run["mappingId"] = mapping.eventId
+                run["clockEvents"] = [
+                    event for event in self.getClockEvents()
+                    if event.eventId not in previousIds
+                ]
+                run["report"] = self.getClockCalibrationReport(mapping.eventId)
+                run["summary"] = self._getClockCheckSummary(mapping.eventId)
+                run["status"] = "fitCompletedConditional"
+
+            try:
+                self.printClockCalibrationReport(run["mappingId"])
+                self.plotClockCalibration(run["mappingId"])
+                plt.show()
+            except Exception as displayError:
+                run["displayFailure"] = (
+                    f"{type(displayError).__name__}: {displayError}"
+                )
+                print(
+                    f"Calibration evidence retained; report/display failed: "
+                    f"{displayError}",
+                    flush=True,
+                )
+
+            return deepcopy(run)
+
+        except BaseException as error:
+            run["status"] = "failedOrInterrupted"
+            run["failureReason"] = f"{type(error).__name__}: {error}"
+            if self._clock is not None:
+                run["clockEvents"] = [
+                    event for event in self.getClockEvents()
+                    if previousIds is None or event.eventId not in previousIds
+                ]
+            error.labJackCharacterizationReport = deepcopy(run)
+
+            pglMessages.printHeader("Clock calibration")
+            print(f"Clock check did not complete: {run['failureReason']}")
+            print(
+                "Partial observations and failure records are retained. "
+                "No accuracy or drift estimate is claimed for this failed check."
+            )
+            raise    
+
 class pglLabJackCounterMatcher:
     """
     Stateful comparison of sampled rising edges with a hardware counter.
@@ -1998,3 +3038,848 @@ class pglLabJackCounterMatcher:
         self.measuredObservations = []
         self.gapRecords = []
         self.counterContinuityVerified = True
+
+class pglLabJackClock:
+    """
+    Connection-owned nominal-rate live mapping.
+
+    Epoch prediction uses all startup transaction brackets under a conditional
+    constant affine clock model. It is not proof against every device reset.
+
+    The live mapping is fixed at scale=1.0. A separate feasible scale envelope
+    is used for epoch placement; it never silently changes emitted timestamps.
+    """
+
+    nominalTicksPerSecond = 40_000_000
+    timerModulus = 1 << 32
+
+    def __init__(self, connectionId, deviceIdentity):
+        from copy import deepcopy
+
+        self.connectionId = connectionId
+        self.deviceIdentity = deepcopy(deviceIdentity)
+        self.events = []
+        self.observations = []
+        self.mapping = None
+        self.valid = False
+        self.lastResolvedTicks = None
+
+    @staticmethod
+    def _rawTicks(value):
+        if isinstance(value, (bool, np.bool_)):
+            raise ValueError("Timer value must not be Boolean.")
+        number = float(value)
+        if (
+            not np.isfinite(number)
+            or number != np.floor(number)
+            or not 0 <= number < (1 << 32)
+        ):
+            raise ValueError(f"Invalid uint32 timer value: {value!r}")
+        return int(number)
+
+    @staticmethod
+    def _clipPolygon(polygon, coefficientA, coefficientB, limit):
+        """Clip a convex (offset, scaleDeviation) polygon by a*x+b*y <= limit."""
+        if not polygon: return []
+        result = []
+        previous = polygon[-1]
+        previousValue = coefficientA * previous[0] + coefficientB * previous[1] - limit
+
+        for current in polygon:
+            currentValue = coefficientA * current[0] + coefficientB * current[1] - limit
+            previousInside = previousValue <= 0
+            currentInside = currentValue <= 0
+
+            if previousInside != currentInside:
+                fraction = previousValue / (previousValue - currentValue)
+                result.append((
+                    previous[0] + fraction * (current[0] - previous[0]),
+                    previous[1] + fraction * (current[1] - previous[1]),
+                ))
+            if currentInside: result.append(current)
+
+            previous, previousValue = current, currentValue
+
+        return result
+
+    @classmethod
+    def _fitBeginning(cls, observations):
+        """
+        Retain nominal offset bounds and the joint feasible affine region.
+
+        Quantization expansion is conditional on near-nominal timer operation.
+        No observation is excluded to manufacture feasibility.
+        """
+        if len(observations) < 3:
+            raise ValueError("Calibration needs at least three valid observations.")
+
+        rate = cls.nominalTicksPerSecond
+        tickReference = observations[0]["unwrappedTicks"]
+        hostBase = observations[0]["hostBefore"]
+        tickAllowance = 1 / rate
+
+        coordinates = []
+        for row in observations:
+            x = (row["unwrappedTicks"] - tickReference) / rate
+            lower = (row["hostBefore"] - hostBase) - x - tickAllowance
+            upper = (row["hostAfter"] - hostBase) - x + tickAllowance
+            coordinates.append((x, lower, upper))
+
+        if coordinates[-1][0] <= coordinates[0][0]:
+            raise ValueError("Calibration has no positive device-time span.")
+
+        nominalLower = max(row[1] for row in coordinates)
+        nominalUpper = min(row[2] for row in coordinates)
+        if nominalLower > nominalUpper:
+            raise ValueError("Empty nominal-rate offset intersection; all observations retained.")
+
+        # Eliminate offset to bound scaleDeviation using every pair.
+        driftLower, driftUpper = -float("inf"), float("inf")
+        for index, (x0, lower0, upper0) in enumerate(coordinates):
+            for x1, lower1, upper1 in coordinates[index + 1:]:
+                delta = x1 - x0
+                if delta < 0:
+                    raise ValueError("Device calibration coordinates moved backward.")
+                if delta == 0:
+                    if max(lower0, lower1) > min(upper0, upper1):
+                        raise ValueError("Conflicting brackets at the same device coordinate.")
+                    continue
+                driftLower = max(driftLower, (lower1 - upper0) / delta)
+                driftUpper = min(driftUpper, (upper1 - lower0) / delta)
+
+        if (
+            not np.isfinite(driftLower)
+            or not np.isfinite(driftUpper)
+            or driftLower > driftUpper
+            or 1 + driftLower <= 0
+        ):
+            raise ValueError("Startup affine envelope is inadequately constrained.")
+
+        # x=0 for the first observation, so its bracket directly bounds offset.
+        firstLower, firstUpper = coordinates[0][1:]
+        polygon = [
+            (firstLower, driftLower), (firstUpper, driftLower),
+            (firstUpper, driftUpper), (firstLower, driftUpper),
+        ]
+        for x, lower, upper in coordinates:
+            polygon = cls._clipPolygon(polygon, 1.0, x, upper)
+            polygon = cls._clipPolygon(polygon, -1.0, -x, -lower)
+            if not polygon:
+                raise ValueError("Empty joint affine clock region.")
+
+        return {
+            "nominalTicksPerSecond": rate,
+            "tickReference": int(tickReference),
+            "hostBase": float(hostBase),
+            "hostReferenceOffset": float((nominalLower + nominalUpper) / 2),
+            "hostReference": float(hostBase + (nominalLower + nominalUpper) / 2),
+            "clockScale": 1.0,
+            "referenceOffsetInterval": [float(nominalLower), float(nominalUpper)],
+            "affineRegion": [[float(a), float(b)] for a, b in polygon],
+            "selectedCount": len(observations),
+            "selectedSpanSeconds": float(coordinates[-1][0]),
+            "quantizationAllowanceSeconds": tickAllowance,
+        }
+
+    def collectBeginning(self, readTimer, getSecs, duration, cancelled):
+        """Collect and retain startup evidence; readTimer performs one fresh read."""
+        from copy import deepcopy
+        from .pglEvent import (
+            pglEventLabJackClockCalibration,
+            pglEventLabJackClockMapping,
+        )
+
+        if self.mapping is not None:
+            raise RuntimeError("The live mapping is already frozen.")
+        if isinstance(duration, (bool, np.bool_)) or not np.isfinite(duration) or duration <= 0:
+            raise ValueError("Calibration duration must be positive and finite.")
+
+        started = getSecs()
+        rows = []
+        diagnostics = {
+            "epochBootstrapMethod": "conditionalNearestNominalPrediction",
+            "epochResolutionCertified": False,
+            "failureReason": None,
+        }
+        status = "collected"
+        errorToRaise = None
+
+        try:
+            while True:
+                if cancelled():
+                    raise RuntimeError("Clock calibration cancelled.")
+
+                row = {
+                    "hostBefore": getSecs(),
+                    "rawTicks": None,
+                    "unwrappedTicks": None,
+                    "selected": False,
+                    "selectionReason": "pendingValidation",
+                }
+                rows.append(row)
+                try:
+                    value = readTimer()
+                    row["rawValueRepresentation"] = repr(value)
+                finally:
+                    row["hostAfter"] = getSecs()
+
+                row["rawTicks"] = self._rawTicks(value)
+                row["roundTripSeconds"] = row["hostAfter"] - row["hostBefore"]
+                if row["roundTripSeconds"] < 0:
+                    raise ValueError("Host clock moved backward.")
+                row["hostMidpoint"] = row["hostBefore"] + row["roundTripSeconds"] / 2
+
+                if len(rows) == 1:
+                    resolved = row["rawTicks"]
+                else:
+                    first = rows[0]
+                    elapsed = row["hostMidpoint"] - first["hostMidpoint"]
+                    if not 0 <= elapsed < self.timerModulus / self.nominalTicksPerSecond / 2:
+                        raise ValueError("Startup collection exceeds conditional bootstrap scope.")
+                    expected = first["unwrappedTicks"] + elapsed * self.nominalTicksPerSecond
+                    epoch = round((expected - row["rawTicks"]) / self.timerModulus)
+                    resolved = row["rawTicks"] + epoch * self.timerModulus
+                    if resolved < rows[-2]["unwrappedTicks"]:
+                        raise ValueError("Startup timer moved backward after conditional resolution.")
+
+                row.update({
+                    "unwrappedTicks": int(resolved),
+                    "selected": True,
+                    "selectionReason": "allValidBracketsIncluded",
+                })
+                if row["hostAfter"] - started >= duration: break
+
+            parameters = self._fitBeginning(rows)
+
+        except BaseException as error:
+            status = "cancelled" if cancelled() else "failed"
+            diagnostics["failureReason"] = f"{type(error).__name__}: {error}"
+            errorToRaise = error
+
+        completed = getSecs()
+        calibration = pglEventLabJackClockCalibration(
+            connectionId=self.connectionId,
+            deviceIdentity=self.deviceIdentity,
+            phase="startup",
+            collectionStartedTimestamp=started,
+            collectionCompletedTimestamp=completed,
+            requestedDuration=float(duration),
+            observations=rows,
+            status=status,
+            diagnostics=diagnostics,
+        )
+        self.events.append(calibration)
+        self.observations = deepcopy(rows)
+
+        if errorToRaise is not None:
+            self.valid = False
+            raise errorToRaise
+
+        mapping = pglEventLabJackClockMapping(
+            connectionId=self.connectionId,
+            calibrationEventIds=[calibration.eventId],
+            createdTimestamp=getSecs(),
+            purpose="live",
+            status="validConditional",
+            method="nominalOffsetWithAffineEpochEnvelope",
+            methodVersion="1",
+            parameters=parameters,
+            uncertainty={
+                "boundStatus": "conditional",
+                "epochEnvelopeModel": "constantAffineClock",
+                "nominalOffsetModel": "constantNominalRate",
+                "hostTimestampUncertainty": None,
+                "withinRunNonlinearDriftBound": None,
+                "totalTimingBoundAvailable": False,
+            },
+            assumptions=[
+                "freshRegisterReadWithinHostBracket",
+                "nearNominalTimerForQuantizationAllowance",
+                "deviceClockContinuous",
+                "constantAffineClockForEpochPrediction",
+            ],
+        )
+        self.events.append(mapping)
+        self.mapping = mapping
+        self.valid = True
+        self.lastResolvedTicks = rows[-1]["unwrappedTicks"]
+
+    def toHost(self, ticks):
+        if not self.valid or self.mapping is None:
+            raise RuntimeError("LabJack clock mapping is invalid or unavailable.")
+        parameters = self.mapping.parameters
+        return (
+            parameters["hostBase"] + parameters["hostReferenceOffset"]
+            + (ticks - parameters["tickReference"]) / self.nominalTicksPerSecond
+        )
+
+    def resolveRead(self, observation):
+        """
+        Resolve a fresh CORE_TIMER bracket against the frozen affine envelope.
+
+        Reject multiple/no supported epochs. Conditional time consistency is
+        not proof that no reset occurred.
+        """
+        if not self.valid or self.mapping is None:
+            raise RuntimeError("LabJack clock mapping is invalid or unavailable.")
+
+        parameters = self.mapping.parameters
+        raw = observation["rawTicks"]
+        before = observation["hostBefore"] - parameters["hostBase"]
+        after = observation["hostAfter"] - parameters["hostBase"]
+        allowance = parameters["quantizationAllowanceSeconds"]
+
+        lowerCoordinates, upperCoordinates = [], []
+        for offset, drift in parameters["affineRegion"]:
+            scale = 1 + drift
+            lowerCoordinates.append((before - allowance - offset) / scale)
+            upperCoordinates.append((after + allowance - offset) / scale)
+
+        lowerTicks = parameters["tickReference"] + min(lowerCoordinates) * self.nominalTicksPerSecond
+        upperTicks = parameters["tickReference"] + max(upperCoordinates) * self.nominalTicksPerSecond
+
+        firstEpoch = int(np.ceil((lowerTicks - raw) / self.timerModulus))
+        lastEpoch = int(np.floor((upperTicks - raw) / self.timerModulus))
+        observation["epochEvidence"] = {
+            "candidateTickInterval": [float(lowerTicks), float(upperTicks)],
+            "candidateEpochInterval": [firstEpoch, lastEpoch],
+            "mappingId": self.mapping.eventId,
+            "conditionalOnConstantAffineClock": True,
+            "resetExcluded": False,
+        }
+
+        if firstEpoch != lastEpoch:
+            self.valid = False
+            raise RuntimeError("CORE_TIMER epoch is ambiguous or inconsistent with the clock envelope.")
+
+        ticks = raw + firstEpoch * self.timerModulus
+        if self.lastResolvedTicks is not None and ticks < self.lastResolvedTicks:
+            self.valid = False
+            raise RuntimeError("Resolved CORE_TIMER moved backward; clock mapping invalidated.")
+
+        observation["unwrappedTicks"] = int(ticks)
+        self.lastResolvedTicks = int(ticks)
+        return int(ticks)
+
+
+
+    def getTiming(self, deviceTicks, mappingId=None):
+        """
+        Return a mapped time and joint-region conditional error interval.
+
+        deviceTicks may be fractional for sample-derived coordinates.
+        An uncertainty interval is not a total physical-edge timing bound.
+        """
+        from copy import deepcopy
+
+        if (
+            isinstance(deviceTicks, (bool, np.bool_))
+            or not isinstance(deviceTicks, (int, float, np.integer, np.floating))
+            or not np.isfinite(deviceTicks)
+        ):
+            raise ValueError("deviceTicks must be a finite numeric coordinate.")
+
+        if mappingId is None:
+            if self.mapping is None:
+                raise RuntimeError("No live mapping exists.")
+            mappingId = self.mapping.eventId
+
+        matches = [
+            event for event in self.events
+            if event.type == "labJackClockMapping" and event.eventId == mappingId
+        ]
+        if len(matches) != 1:
+            raise ValueError("Mapping ID is missing or ambiguous.")
+        mapping = matches[0]
+        if mapping.status != "validConditional":
+            raise ValueError("Rejected mappings cannot convert timestamps.")
+
+        parameters = mapping.parameters
+        rate = parameters["nominalTicksPerSecond"]
+        x = (deviceTicks - parameters["tickReference"]) / rate
+
+        # Center both the estimate and projection before adding hostBase.
+        scale = parameters["clockScale"]
+        estimateRelative = x + parameters["hostReferenceOffset"] + (scale - 1) * x
+        projectedRelative = [
+            x + offset + drift * x
+            for offset, drift in parameters["affineRegion"]
+        ]
+        lower = min(projectedRelative)
+        upper = max(projectedRelative)
+
+        observed = parameters.get("observedTickInterval")
+        if observed is None:
+            observed = [
+                self.observations[0]["unwrappedTicks"],
+                self.observations[-1]["unwrappedTicks"],
+            ]
+
+        return {
+            "timestamp": parameters["hostBase"] + estimateRelative,
+            "clockMappingId": mapping.eventId,
+            "calibrationEventIds": list(mapping.calibrationEventIds),
+            "labJackTimestamp": deviceTicks / rate,
+            "clockErrorLowerSeconds": lower - estimateRelative,
+            "clockErrorUpperSeconds": upper - estimateRelative,
+            "boundStatus": "conditional",
+            "intervalMethod": "jointAffinePolygonProjection",
+            "outsideObservationSpan": not observed[0] <= deviceTicks <= observed[1],
+            "connectionContinuityCurrentlyValid": bool(self.valid),
+            "assumptions": deepcopy(mapping.assumptions),
+            "unknownContributions": [
+                "hostTimestampUncertainty",
+                "withinRunNonlinearClockVariation",
+            ],
+            "totalTimingBoundAvailable": False,
+        }
+
+    def collectCalibration(self, readTimer, getSecs, duration, cancelled, phase):
+        """
+        Collect one additional calibration without fitting or changing live mapping.
+
+        Epoch placement uses the beginning affine envelope and remains conditional.
+        All attempted reads and collection failures are retained.
+        """
+        from copy import deepcopy
+        from .pglEvent import pglEventLabJackClockCalibration
+
+        if phase not in {"beginning", "intermediate", "ending", "characterization"}:
+            raise ValueError("Invalid additional calibration phase.")
+        if isinstance(duration, (bool, np.bool_)):
+            raise ValueError("Calibration duration must be positive and finite.")
+        duration = float(duration)
+        if not np.isfinite(duration) or duration <= 0:
+            raise ValueError("Calibration duration must be positive and finite.")
+        if self.mapping is None:
+            raise RuntimeError("A connection-startup mapping is required.")
+
+        started = getSecs()
+        rows = []
+        failure = None
+        status = "collected"
+        caughtError = None
+
+        try:
+            if not self.valid:
+                raise RuntimeError("Clock continuity is invalid.")
+            while True:
+                if cancelled():
+                    raise RuntimeError("Clock calibration cancelled.")
+
+                row = {
+                    "hostBefore": getSecs(),
+                    "rawTicks": None,
+                    "unwrappedTicks": None,
+                    "selected": False,
+                    "selectionReason": "pendingValidation",
+                    "failure": None,
+                }
+                rows.append(row)
+
+                try:
+                    try:
+                        value = readTimer()
+                        row["rawValueRepresentation"] = repr(value)
+                    finally:
+                        row["hostAfter"] = getSecs()
+
+                    row["roundTripSeconds"] = row["hostAfter"] - row["hostBefore"]
+                    if row["roundTripSeconds"] < 0:
+                        raise ValueError("Host clock moved backward.")
+                    row["hostMidpoint"] = (
+                        row["hostBefore"] + row["roundTripSeconds"] / 2
+                    )
+                    row["rawTicks"] = self._rawTicks(value)
+                    self.resolveRead(row)
+                    row["selected"] = True
+                    row["selectionReason"] = "validResolvedObservation"
+
+                except BaseException as error:
+                    row["failure"] = f"{type(error).__name__}: {error}"
+                    row["selectionReason"] = "observationFailed"
+                    self.valid = False
+                    raise
+
+                if row["hostAfter"] - started >= duration:
+                    break
+
+        except BaseException as error:
+            caughtError = error
+            failure = f"{type(error).__name__}: {error}"
+            status = "cancelled" if cancelled() else "failed"
+
+        event = pglEventLabJackClockCalibration(
+            connectionId=self.connectionId,
+            deviceIdentity=self.deviceIdentity,
+            phase=phase,
+            collectionStartedTimestamp=started,
+            collectionCompletedTimestamp=getSecs(),
+            requestedDuration=duration,
+            observations=rows,
+            status=status,
+            diagnostics={
+                "failureReason": failure,
+                "epochResolutionCertified": False,
+                "epochResolutionMappingId": self.mapping.eventId,
+                "epochResolutionMethod": "beginningAffineEnvelope",
+                "automaticFitApplied": False,
+            },
+        )
+        self.events.append(event)
+
+        if caughtError is not None:
+            caughtError.labJackClockEvents = deepcopy(self.events)
+            caughtError.labJackCalibrationEventId = event.eventId
+            raise caughtError
+
+        return deepcopy(event)
+
+    @classmethod
+    def _fitCalibrationCollections(cls, collections):
+        """
+        Fit all brackets from an arbitrary set of resolved collections.
+
+        No point estimate is substituted for a collection. No conflicting
+        observation is dropped. Uncertainty is conditional on one affine model.
+        """
+        if len(collections) < 2:
+            raise ValueError("At least two calibration collections are required.")
+
+        ordered = sorted(
+            collections, key=lambda event: event.collectionStartedTimestamp
+        )
+        rows = []
+        supports = []
+        spans = []
+        previousEnd = None
+
+        for event in ordered:
+            if event.status != "collected":
+                raise ValueError(f"Collection {event.eventId} did not complete successfully.")
+            if len(event.observations) < 3:
+                raise ValueError(f"Collection {event.eventId} has fewer than three observations.")
+            if previousEnd is not None and event.collectionStartedTimestamp < previousEnd:
+                raise ValueError("Requested calibration collections overlap.")
+            previousEnd = event.collectionCompletedTimestamp
+            spans.append(event.actualDuration)
+
+            for index, row in enumerate(event.observations):
+                # Do not silently omit failed, unresolved, or excluded observations.
+                if row.get("selected") is not True:
+                    raise ValueError(
+                        f"Collection {event.eventId}, observation {index} "
+                        "is not eligible for this all-bracket fit."
+                    )
+                rows.append(row)
+                supports.append({
+                    "calibrationEventId": event.eventId,
+                    "observationIndex": index,
+                })
+
+        firstMidpoint = (
+            ordered[0].collectionStartedTimestamp
+            + ordered[0].collectionCompletedTimestamp
+        ) / 2
+        lastMidpoint = (
+            ordered[-1].collectionStartedTimestamp
+            + ordered[-1].collectionCompletedTimestamp
+        ) / 2
+        separation = lastMidpoint - firstMidpoint
+
+        if separation <= max(spans):
+            raise ValueError("Collection separation does not exceed collection duration.")
+
+        rate = cls.nominalTicksPerSecond
+        tickReference = rows[0]["unwrappedTicks"]
+        if isinstance(tickReference, (bool, np.bool_)) or not isinstance(
+            tickReference, (int, np.integer)
+        ):
+            raise ValueError("Invalid reference ticks.")
+        tickReference = int(tickReference)
+        hostBase = float(rows[0]["hostBefore"])
+        allowance = 1 / rate
+        coordinates = []
+        previousTicks = None
+
+        for row in rows:
+            ticks = row.get("unwrappedTicks")
+            if isinstance(ticks, (bool, np.bool_)) or not isinstance(
+                ticks, (int, np.integer)
+            ):
+                raise ValueError("Missing or invalid resolved ticks.")
+            ticks = int(ticks)
+            before = float(row["hostBefore"])
+            after = float(row["hostAfter"])
+            if not np.isfinite(before) or not np.isfinite(after) or after < before:
+                raise ValueError("Invalid observation bracket.")
+            if previousTicks is not None and ticks < previousTicks:
+                raise ValueError("Resolved timer coordinates move backward.")
+            previousTicks = ticks
+
+            x = (ticks - tickReference) / rate
+            coordinates.append((
+                x,
+                (before - hostBase) - x - allowance,
+                (after - hostBase) - x + allowance,
+            ))
+
+        values = np.asarray(coordinates, dtype=float)
+        xValues, lowerValues, upperValues = values.T
+        driftLower, driftUpper = -float("inf"), float("inf")
+
+        # Offset elimination gives finite scale bounds without inventing
+        # an oscillator tolerance. Complexity is quadratic in observation count.
+        for index in range(len(rows) - 1):
+            delta = xValues[index + 1:] - xValues[index]
+            same = delta == 0
+            if np.any(
+                np.maximum(lowerValues[index], lowerValues[index + 1:][same])
+                > np.minimum(upperValues[index], upperValues[index + 1:][same])
+            ):
+                raise ValueError("Conflicting brackets at the same device coordinate.")
+
+            positive = delta > 0
+            if np.any(positive):
+                driftLower = max(
+                    driftLower,
+                    float(np.max(
+                        (lowerValues[index + 1:][positive] - upperValues[index])
+                        / delta[positive]
+                    )),
+                )
+                driftUpper = min(
+                    driftUpper,
+                    float(np.min(
+                        (upperValues[index + 1:][positive] - lowerValues[index])
+                        / delta[positive]
+                    )),
+                )
+
+        if (
+            not np.isfinite(driftLower)
+            or not np.isfinite(driftUpper)
+            or driftLower > driftUpper
+            or 1 + driftLower <= 0
+        ):
+            raise ValueError("No bounded positive affine clock scale is supported.")
+
+        polygon = [
+            (float(lowerValues[0]), driftLower),
+            (float(upperValues[0]), driftLower),
+            (float(upperValues[0]), driftUpper),
+            (float(lowerValues[0]), driftUpper),
+        ]
+        for x, lower, upper in coordinates:
+            polygon = cls._clipPolygon(polygon, 1.0, x, upper)
+            polygon = cls._clipPolygon(polygon, -1.0, -x, -lower)
+            if not polygon:
+                raise ValueError("All-collection affine constraints are inconsistent.")
+
+        offset = float(np.mean([point[0] for point in polygon]))
+        drift = float(np.mean([point[1] for point in polygon]))
+        residuals = []
+        for row, x in zip(rows, xValues):
+            midpoint = (
+                row["hostBefore"] - hostBase
+                + (row["hostAfter"] - row["hostBefore"]) / 2
+            )
+            residuals.append(float(x + offset + drift * x - midpoint))
+
+        return {
+            "nominalTicksPerSecond": rate,
+            "tickReference": tickReference,
+            "hostBase": hostBase,
+            "hostReferenceOffset": offset,
+            "hostReference": hostBase + offset,
+            "clockScale": 1 + drift,
+            "secondsPerTick": (1 + drift) / rate,
+            "affineRegion": [[float(a), float(b)] for a, b in polygon],
+            "feasibleClockScale": [
+                1 + min(point[1] for point in polygon),
+                1 + max(point[1] for point in polygon),
+            ],
+            "selectionMethod": "meanOfFeasiblePolygonVertices",
+            "collectionCount": len(ordered),
+            "observationCount": len(rows),
+            "observationSupport": supports,
+            "collectionSeparationSeconds": float(separation),
+            "observedTickInterval": [
+                int(rows[0]["unwrappedTicks"]), int(rows[-1]["unwrappedTicks"]),
+            ],
+            "quantizationAllowanceSeconds": allowance,
+            "midpointResidualSeconds": residuals,
+            "precisionAcceptanceThreshold": None,
+            "exclusions": [],
+        }
+
+    def fitCalibrations(self, calibrationEventIds, getSecs, purpose="postRun"):
+        """
+        Fit explicitly selected collections only when continuity remains usable.
+
+        Conservative policy:
+        - An invalidated connection clock cannot authorize another mapping.
+        - Failed collections intersecting the selected span block fitting.
+        - Connection identity alone is not proof of uninterrupted device time.
+
+        Previously emitted mappings and observations remain unchanged.
+        """
+        from copy import deepcopy
+        from .pglEvent import pglEventLabJackClockMapping
+
+        if purpose not in {"postRun", "characterization"}:
+            raise ValueError("This fit cannot replace the live mapping.")
+        if (
+            not isinstance(calibrationEventIds, (list, tuple))
+            or not calibrationEventIds
+            or any(
+                not isinstance(value, str) or not value
+                for value in calibrationEventIds
+            )
+            or len(set(calibrationEventIds)) != len(calibrationEventIds)
+        ):
+            raise ValueError("Supply distinct nonempty calibration-event IDs.")
+
+        parameters = None
+        caughtError = None
+        failure = None
+        continuityEvidence = {
+            "policy": "rejectInvalidClockOrKnownFailedCollectionAcrossFitSpan",
+            "connectionClockValidAtFit": bool(self.valid),
+            "selectedCollectionSpan": None,
+            "blockingCalibrationEventIds": [],
+            "undetectedResetExcluded": False,
+            "epochResolutionCertified": False,
+        }
+
+        try:
+            if not self.valid:
+                raise ValueError(
+                    "Connection clock continuity is invalid; a new mapping "
+                    "cannot be authorized from this clock object."
+                )
+
+            collections = []
+            for eventId in calibrationEventIds:
+                matches = [
+                    event for event in self.events
+                    if event.type == "labJackClockCalibration"
+                    and event.eventId == eventId
+                ]
+                if len(matches) != 1:
+                    raise ValueError(
+                        f"Calibration ID missing or ambiguous: {eventId}"
+                    )
+
+                event = matches[0]
+                if event.connectionId != self.connectionId:
+                    raise ValueError(
+                        "Cannot fit calibrations from different connections."
+                    )
+                if event.status != "collected":
+                    raise ValueError(
+                        f"Calibration did not complete successfully: {eventId}"
+                    )
+
+                before = event.collectionStartedTimestamp
+                after = event.collectionCompletedTimestamp
+                if (
+                    not np.isfinite(before)
+                    or not np.isfinite(after)
+                    or after < before
+                ):
+                    raise ValueError(
+                        f"Invalid calibration collection interval: {eventId}"
+                    )
+                collections.append(event)
+
+            spanStart = min(
+                event.collectionStartedTimestamp for event in collections
+            )
+            spanEnd = max(
+                event.collectionCompletedTimestamp for event in collections
+            )
+            continuityEvidence["selectedCollectionSpan"] = [
+                float(spanStart), float(spanEnd),
+            ]
+
+            # An unselected failed collection cannot disappear merely because
+            # the caller chooses the successful collections on either side.
+            for event in self.events:
+                if (
+                    event.type != "labJackClockCalibration"
+                    or event.connectionId != self.connectionId
+                    or event.status != "failed"
+                ):
+                    continue
+
+                before = event.collectionStartedTimestamp
+                after = event.collectionCompletedTimestamp
+                if (
+                    not np.isfinite(before)
+                    or not np.isfinite(after)
+                    or after < before
+                ):
+                    raise ValueError(
+                        "A failed calibration has invalid temporal provenance; "
+                        "its position relative to the selected span is unknown."
+                    )
+
+                if before <= spanEnd and after >= spanStart:
+                    continuityEvidence["blockingCalibrationEventIds"].append(
+                        event.eventId
+                    )
+
+            if continuityEvidence["blockingCalibrationEventIds"]:
+                raise ValueError(
+                    "A failed clock collection intersects the requested fit span. "
+                    "Cross-failure fitting is not supported."
+                )
+
+            parameters = self._fitCalibrationCollections(collections)
+
+        except Exception as error:
+            caughtError = error
+            failure = f"{type(error).__name__}: {error}"
+
+        mapping = pglEventLabJackClockMapping(
+            connectionId=self.connectionId,
+            calibrationEventIds=list(calibrationEventIds),
+            createdTimestamp=getSecs(),
+            purpose=purpose,
+            status="validConditional" if parameters is not None else "rejected",
+            method="allCollectionBracketAffine",
+            methodVersion="2",
+            parameters=parameters,
+            uncertainty=(
+                {
+                    "boundStatus": "conditional",
+                    "intervalMethod": "jointAffinePolygonProjection",
+                    "hostTimestampUncertainty": None,
+                    "withinRunNonlinearDriftBound": None,
+                    "totalTimingBoundAvailable": False,
+                }
+                if parameters is not None else None
+            ),
+            assumptions=[
+                "freshRegisterReadWithinHostBracket",
+                "nearNominalTimerForQuantizationAllowance",
+                "deviceClockContinuousAcrossSelectedCollections",
+                "constantAffineClockAcrossSelectedCollections",
+                "conditionalEpochPlacement",
+            ],
+            diagnostics={
+                "failureReason": failure,
+                "continuityEvidence": continuityEvidence,
+                "liveMappingChanged": False,
+                "automaticEventCorrectionApplied": False,
+            },
+        )
+        self.events.append(mapping)
+
+        if caughtError is not None:
+            caughtError.labJackClockEvents = deepcopy(self.events)
+            caughtError.labJackRejectedMappingId = mapping.eventId
+            raise caughtError
+
+        return deepcopy(mapping)

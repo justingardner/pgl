@@ -210,19 +210,37 @@ class pglEventKeyboard(pglEvent):
 class pglEventDigitalInput(pglEvent):
     """An acquired digital edge with sample timing and a host-clock timestamp."""
 
-    def __init__(self, channel=None, eventType=None, timestamp=None, sampleIndex=None, scanRate=None, deviceType=None, timestampMethod="streamEstimate"):
+    def __init__(
+        self, channel=None, eventType=None, timestamp=None,
+        sampleIndex=None, scanRate=None, deviceType=None,
+        timestampMethod="streamEstimate", *,
+        labJackTimestamp=None, clockMappingId=None,
+        deviceTimestampMethod=None,
+    ):
         """
         Args:
             channel (str): Physical input name, such as FIO0.
             eventType (str): rising or falling.
             timestamp (float): Estimated edge time in the pglTimestamp clock domain.
-            sampleIndex (int): Zero-based scan index within this acquisition.
+            sampleIndex (int): Zero-based scan index; acquisition metadata defines scope.
             scanRate (float): Actual scan rate returned by the device.
             deviceType (str): Device that acquired the event.
             timestampMethod (str): How the host-clock timestamp was obtained.
+            labJackTimestamp (float or None): Unwrapped device coordinate in
+                nominal core-timer seconds. Not calendar time.
+            clockMappingId (str or None): eventId of the mapping record used
+                to produce timestamp.
+            deviceTimestampMethod (str or None): Provenance of the device
+                coordinate, distinguishing sample-derived timing from capture.
 
         The timestamp identifies the first sample showing the new state.
         Sample resolution and absolute host-clock alignment are separate.
+
+        Calibration evidence and uncertainty are retained in referenced
+        calibration/mapping events, not duplicated on every edge.
+
+        Post-run correction preserves liveTimestamp and liveClockMappingId
+        on first correction. They are not populated by this constructor.
         """
         super().__init__(type="digitalInput")
 
@@ -238,5 +256,178 @@ class pglEventDigitalInput(pglEvent):
         self.timestamp = timestamp
         self.timestampMethod = timestampMethod
 
+        # Compact provenance; None explicitly means unavailable.
+        self.labJackTimestamp = labJackTimestamp
+        self.clockMappingId = clockMappingId
+        self.deviceTimestampMethod = deviceTimestampMethod
+
     def __repr__(self):
         return f"<pglEventDigitalInput channel={self.channel!r} edge={self.eventType!r} timestamp={self.timestamp} sampleIndex={self.sampleIndex}>"
+    
+class pglEventLabJackClockCalibration(pglEvent):
+    """
+    Retained device/host clock observations from one calibration collection.
+
+    timestamp is the host collection-completion time, not a device timestamp.
+    Observations and diagnostics are independent snapshots.
+
+    Calibration IDs use eventId. Failed collections remain valid records,
+    but cannot by themselves authorize a timestamp conversion.
+    """
+
+    def __init__(
+        self, *, connectionId, deviceIdentity, phase,
+        collectionStartedTimestamp, collectionCompletedTimestamp,
+        requestedDuration, observations, status, diagnostics=None,
+        eventId=None,
+    ):
+        from copy import deepcopy
+        from math import isfinite
+        from uuid import uuid4
+
+        if not isinstance(connectionId, str) or not connectionId:
+            raise ValueError("connectionId must be a nonempty string.")
+        if not isinstance(deviceIdentity, dict):
+            raise TypeError("deviceIdentity must be a dictionary.")
+        if phase not in {"startup", "beginning", "intermediate", "ending", "characterization"}:
+            raise ValueError("Unknown clock-calibration phase.")
+        if status not in {"collected", "failed", "cancelled"}:
+            raise ValueError("Calibration status must be collected, failed, or cancelled.")
+        if not isinstance(observations, list):
+            raise TypeError("observations must be a list.")
+        if any(not isinstance(observation, dict) for observation in observations):
+            raise TypeError("Each observation must be a dictionary.")
+        if diagnostics is not None and not isinstance(diagnostics, dict):
+            raise TypeError("diagnostics must be a dictionary or None.")
+
+        for name, value in (
+            ("collectionStartedTimestamp", collectionStartedTimestamp),
+            ("collectionCompletedTimestamp", collectionCompletedTimestamp),
+            ("requestedDuration", requestedDuration),
+        ):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value):
+                raise ValueError(f"{name} must be a finite number.")
+
+        if requestedDuration <= 0:
+            raise ValueError("requestedDuration must be positive.")
+        if collectionCompletedTimestamp < collectionStartedTimestamp:
+            raise ValueError("Collection completion precedes collection start.")
+
+        if eventId is None: eventId = str(uuid4())
+        if not isinstance(eventId, str) or not eventId:
+            raise ValueError("eventId must be a nonempty string.")
+
+        super().__init__(type="labJackClockCalibration")
+
+        self.eventId = eventId
+        self.connectionId = connectionId
+        self.deviceType = "LabJack"
+        self.deviceIdentity = deepcopy(deviceIdentity)
+        self.phase = phase
+
+        self.timestamp = float(collectionCompletedTimestamp)
+        self.timestampMethod = "hostClockCalibrationCollectionCompletion"
+        self.labJackTimestamp = None
+        self.clockMappingId = None
+
+        self.collectionStartedTimestamp = float(collectionStartedTimestamp)
+        self.collectionCompletedTimestamp = float(collectionCompletedTimestamp)
+        self.requestedDuration = float(requestedDuration)
+        self.actualDuration = float(
+            collectionCompletedTimestamp - collectionStartedTimestamp
+        )
+
+        self.observations = deepcopy(observations)
+        self.status = status
+        self.diagnostics = deepcopy(diagnostics) if diagnostics is not None else {}
+        self.schemaVersion = 1
+
+
+class pglEventLabJackClockMapping(pglEvent):
+    """
+    A retained conversion result derived from identified calibration events.
+
+    eventId is the mapping ID referenced by acquisition events.
+    timestamp is host mapping-creation time.
+
+    This is a persistence record, not a clock fitter or validity authority.
+    The driver must establish validity before emitting an applicable mapping.
+    """
+
+    def __init__(
+        self, *, connectionId, calibrationEventIds, createdTimestamp,
+        purpose, status, method, methodVersion, parameters=None,
+        uncertainty=None, assumptions=None, diagnostics=None, eventId=None,
+    ):
+        from copy import deepcopy
+        from math import isfinite
+        from uuid import uuid4
+
+        if not isinstance(connectionId, str) or not connectionId:
+            raise ValueError("connectionId must be a nonempty string.")
+        if (
+            not isinstance(calibrationEventIds, (list, tuple))
+            or not calibrationEventIds
+            or any(not isinstance(value, str) or not value for value in calibrationEventIds)
+            or len(set(calibrationEventIds)) != len(calibrationEventIds)
+        ):
+            raise ValueError("calibrationEventIds must contain distinct nonempty IDs.")
+        if purpose not in {"live", "postRun", "characterization"}:
+            raise ValueError("Unknown clock-mapping purpose.")
+        if status not in {"validConditional", "rejected"}:
+            raise ValueError("Mapping status must be validConditional or rejected.")
+        if not isinstance(method, str) or not method:
+            raise ValueError("method must be a nonempty string.")
+        if not isinstance(methodVersion, str) or not methodVersion:
+            raise ValueError("methodVersion must be a nonempty string.")
+        if (
+            isinstance(createdTimestamp, bool)
+            or not isinstance(createdTimestamp, (int, float))
+            or not isfinite(createdTimestamp)
+        ):
+            raise ValueError("createdTimestamp must be finite.")
+
+        for name, value in (
+            ("parameters", parameters),
+            ("uncertainty", uncertainty),
+            ("diagnostics", diagnostics),
+        ):
+            if value is not None and not isinstance(value, dict):
+                raise TypeError(f"{name} must be a dictionary or None.")
+
+        if assumptions is not None and (
+            not isinstance(assumptions, list)
+            or any(not isinstance(value, str) for value in assumptions)
+        ):
+            raise TypeError("assumptions must be a list of strings or None.")
+
+        if status == "validConditional" and (
+            parameters is None or uncertainty is None
+        ):
+            raise ValueError("An applicable mapping requires parameters and uncertainty metadata.")
+
+        if eventId is None: eventId = str(uuid4())
+        if not isinstance(eventId, str) or not eventId:
+            raise ValueError("eventId must be a nonempty string.")
+
+        super().__init__(type="labJackClockMapping")
+
+        self.eventId = eventId
+        self.connectionId = connectionId
+        self.deviceType = "LabJack"
+        self.calibrationEventIds = list(calibrationEventIds)
+
+        self.timestamp = float(createdTimestamp)
+        self.timestampMethod = "hostClockMappingCreation"
+        self.labJackTimestamp = None
+        self.clockMappingId = None
+
+        self.purpose = purpose
+        self.status = status
+        self.method = method
+        self.methodVersion = methodVersion
+        self.parameters = deepcopy(parameters)
+        self.uncertainty = deepcopy(uncertainty)
+        self.assumptions = deepcopy(assumptions) if assumptions is not None else []
+        self.diagnostics = deepcopy(diagnostics) if diagnostics is not None else {}
+        self.schemaVersion = 1

@@ -1358,6 +1358,25 @@ class pglTraitSettings(HasTraits, pglSerialize):
 class pglLabJackSettings(pglTraitSettings):
     """Named T7 digital-trigger configuration, without live hardware state."""
 
+    clockCalibrationDuration = Float(
+        0.05, min=0.0,
+        traitDisplayName="Clock calibration duration (seconds)",
+        help="Target duration for connection-startup clock observations. "
+             "50 ms is provisional. Quality checks may reject the collection; "
+             "an in-flight native read is not interrupted at the target duration.",
+    )
+
+    def getClockCalibrationConfig(self):
+        """Validated constructor arguments; no mutation or profile writes."""
+        value = self.clockCalibrationDuration
+        if isinstance(value, (bool, np.bool_)):
+            raise ValueError("clockCalibrationDuration must be positive and finite.")
+        value = float(value)
+        if not np.isfinite(value) or value <= 0:
+            raise ValueError("clockCalibrationDuration must be positive and finite.")
+        return {"clockCalibrationDuration": value}
+
+
     name = Unicode("New LabJack", help="Name of this LabJack preset")
     volumeTriggerChannel = Unicode("FIO0", traitDisplayName="Volume trigger channel", help="Physical scanner-trigger input: FIO0–FIO7 or CIO0–CIO3, including corresponding DIO aliases. Counter verification currently supports CIO1 only.", validate="validateVolumeTriggerChannel")
     volumeTriggerEdge = List(Unicode(), default_value=["rising", "falling"], traitDisplayName="Volume trigger edge", help="Selected edge is first. Counter verification currently requires rising; falling remains available with verification disabled.", validate="validateVolumeTriggerEdge")
@@ -1529,6 +1548,7 @@ class pglLabJackSettings(pglTraitSettings):
     def save(self, filename=None, filesystem=None, filesystemPrefix=None):
         """Save a validated preset using the existing JSON serializer."""
         self.getDigitalReadConfig()
+        self.getClockCalibrationConfig()
         if filename is None: filename = self.saveDir()
         return super().save(
             filename=filename,

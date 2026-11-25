@@ -1624,6 +1624,15 @@ class pglExperiment(pglExperimentBase):
         # cleanup, especially after an interrupted renderer exchange.
         #
         # If closeScreenOnEnd=False, this does not blank the final stimulus.
+        # The raw save above remains independent of ending calibration.
+        # Stop/drain and finalize timing while the owned connection is open.
+        self._attemptRunAction(
+            "finalize LabJack clock timing",
+            self._finalizeLabJackClockTiming,
+            errors,
+            reportProgress=False,
+        )
+
         cleanupErrorCount = len(errors)
 
         # Normal completion disables masking without presenting another frame.
@@ -2039,6 +2048,7 @@ class pglExperiment(pglExperimentBase):
         Opening an input-only device does not configure output pins.
         """
         from .pglLabJack import pglLabJack
+        from .pglSettings import pglSettingsManager
 
         self.endDigitalIO()
 
@@ -2055,8 +2065,22 @@ class pglExperiment(pglExperimentBase):
             for name in selectedNames
         )
 
-        # Validate the requested input configuration before opening hardware.
-        if needsLabJackInput: self.settings.getLabJackPreset()
+        # Resolve the preset before opening the experiment-owned connection.
+        self._labJackPresetSnapshot = None
+        needsLabJack = any(
+            name.casefold() in {"labjack", "labjack digital trigger"}
+            for name in selectedNames
+        )
+        if needsLabJack:
+            if self.settings.labJack:
+                self._labJackPresetSnapshot = self.settings.getLabJackPreset()
+            else:
+                from copy import deepcopy
+                preset = pglSettingsManager.getLabJackSettings()
+                if preset is None:
+                    raise RuntimeError("No saved default LabJack preset is available.")
+                self._labJackPresetSnapshot = deepcopy(preset)
+            self._labJackPresetSnapshot.getClockCalibrationConfig()
 
         requestedNames = []
         for name in selectedNames:
@@ -2075,7 +2099,9 @@ class pglExperiment(pglExperimentBase):
                         "Stop, close, and unregister it before initialization."
                     )
 
-                labJack = pglLabJack()
+                labJack = pglLabJack(
+                    **self._labJackPresetSnapshot.getClockCalibrationConfig()
+                )
 
                 # Retain ownership immediately for initialization recovery.
                 if labJack.isActive:
@@ -2419,7 +2445,10 @@ class pglExperiment(pglExperimentBase):
         selectedNames = {name.casefold() for name in self.settings.digitalIO}
         if "labjack digital trigger" not in selectedNames: return
 
-        preset = self.settings.getLabJackPreset()
+        preset = getattr(self, "_labJackPresetSnapshot", None)
+        if preset is None:
+            raise RuntimeError("LabJack preset was not resolved before device construction.")
+        preset = deepcopy(preset)
         config = preset.getDigitalReadConfig()
         repairConfig = preset.getVolumeTriggerRepairConfig()
 
@@ -2438,6 +2467,8 @@ class pglExperiment(pglExperimentBase):
             "presetUUID": preset.uuid,
             "requested": deepcopy(config),
             "volumeTriggerRepair": deepcopy(repairConfig),
+            "clockCalibration": preset.getClockCalibrationConfig(),
+            "clockEvents": labJack.getClockEvents(),
             "actualScanRate": None,
             "streamBufferSizeBytes": None,
             "acquisitionId": None,
@@ -2458,6 +2489,7 @@ class pglExperiment(pglExperimentBase):
             raise RuntimeError("LabJack startup returned no acquisition identity.")
 
         self._labJackAcquisitionId = acquisitionId
+        self._retainLabJackClockEvents(labJack)
         self.data.labJackAcquisition.update({
             "acquisitionId": acquisitionId,
             "actualScanRate": float(actualRate),
@@ -3399,13 +3431,37 @@ class pglExperiment(pglExperimentBase):
     # Retry local saving without rerunning tasks or device cleanup
     ################################################################
     def savePendingData(self):
-        """Retry local saving after acquisition/finalization has stopped.
+        """
+        Retry local saving after acquisition/finalization has stopped.
 
         Call only after the original run cell has returned.
-        Does not run task-ending hooks, display results, close devices,
-        or retrieve eye-tracker data.
+        Does not recalibrate clocks, correct timestamps, run task-ending hooks,
+        display results, close devices, or retrieve eye-tracker data.
+
+        Clock persistence status is reconciled only after a successful save.
+        Earlier failures and every retry attempt remain retained.
         """
+        from uuid import uuid4
+
         errors = []
+        clockRecord = getattr(self.data, "labJackClockFinalization", None)
+        retry = None
+
+        if isinstance(clockRecord, dict):
+            if not hasattr(self.data, "labJackClockSaveRetryAudit"):
+                self.data.labJackClockSaveRetryAudit = []
+
+            retry = {
+                "retryId": str(uuid4()),
+                "startedTimestamp": pglTimestamp.getSecs(),
+                "completedTimestamp": None,
+                "previousCorrectedSaveStatus": clockRecord.get("correctedSaveStatus"),
+                "status": "inProgress",
+                "failureReason": None,
+                "calibrationRepeated": False,
+                "eventCorrectionRepeated": False,
+            }
+            self.data.labJackClockSaveRetryAudit.append(retry)
 
         def stopOwnedRecording():
             metadata = self._getExperimentRecording()
@@ -3414,23 +3470,50 @@ class pglExperiment(pglExperimentBase):
                     outcome=getattr(self, "_recordingOutcome", "error")
                 )
 
-        # A stop failure must not prevent attempting the experiment/task JSON.
-        self._attemptRunAction(
-            "stop owned recording for save retry",
-            stopOwnedRecording,
-            errors,
-        )
-
-        dataPath = self.save(includeEyeTracker=False)
-
-        if errors:
-            self._reportRunProgress(
-                "The save pass returned, but the recording-stop attempt failed. "
-                "Review the error before considering recovery complete."
+        try:
+            # A stop failure must not prevent attempting experiment/task saves.
+            self._attemptRunAction(
+                "stop owned recording for save retry",
+                stopOwnedRecording,
+                errors,
             )
-            raise errors[0]
 
-        return dataPath
+            dataPath = self.save(includeEyeTracker=False)
+
+            if errors:
+                self._reportRunProgress(
+                    "The save pass returned, but the recording-stop attempt failed. "
+                    "Review the error before considering recovery complete."
+                )
+                raise errors[0]
+
+            if retry is not None:
+                retry["completedTimestamp"] = pglTimestamp.getSecs()
+                retry["status"] = "complete"
+                clockRecord["correctedSaveStatus"] = "complete"
+                clockRecord["lastSuccessfulSaveRetryId"] = retry["retryId"]
+
+                # save() already saved all components. Persist the reconciliation
+                # afterward without repeating task or recording saves.
+                self.data.saveStrict(Path(dataPath) / "data.json")
+
+            return dataPath
+
+        except (Exception, KeyboardInterrupt, SystemExit) as error:
+            if retry is not None:
+                retry["completedTimestamp"] = pglTimestamp.getSecs()
+                retry["status"] = "failed"
+                retry["failureReason"] = f"{type(error).__name__}: {error}"
+                clockRecord["correctedSaveStatus"] = "failed"
+
+            self.data.saveStatus = "failed"
+            self._recordRunError("save pending data retry", error)
+            self._reportRunProgress(
+                "Save retry did not complete. Pending data and retry diagnostics "
+                "remain in memory. Some files may have been written; the final "
+                "on-disk status is not confirmed."
+            )
+            raise
     
     ################################################################
     # initStencil
@@ -3866,7 +3949,9 @@ class pglExperiment(pglExperimentBase):
             ):
                 raise ValueError("This missing edge has already been reconstructed.")
 
+        from uuid import uuid4
         volumeEvent = pglEventVolumeTrigger(timestamp=timestamp)
+        volumeEvent.eventId = str(uuid4())
         volumeEvent.sourceType = event.type
 
         # Preserve source identity for measured and reconstructed events.
@@ -3896,6 +3981,13 @@ class pglExperiment(pglExperimentBase):
             volumeEvent.sampleIndexScope = None
 
         elif event.type == "digitalInput":
+            if getattr(event, "deviceType", None) == "LabJack":
+                sourceId = getattr(event, "eventId", None)
+                if not isinstance(sourceId, str) or not sourceId:
+                    raise ValueError("Measured LabJack source has no stable event ID.")
+                volumeEvent.sourceEventId = sourceId
+                for name in ("labJackTimestamp", "clockMappingId", "deviceTimestampMethod"):
+                    setattr(volumeEvent, name, deepcopy(getattr(event, name, None)))
             volumeEvent.edge = event.eventType
             for fieldName in (
                 "sampleIndex", "scanRate", "sampleTime", "timestampMethod",
@@ -4754,6 +4846,489 @@ class pglExperiment(pglExperimentBase):
             task._resolveTaskPresentation(
                 pending, None, "runEndedBeforeFlush", None,
             )
+
+    def _retainLabJackClockEvents(self, device):
+        """Append independent clock records by stable ID, without sorting events."""
+        snapshots = device.getClockEvents()
+        existing = {}
+        for event in self.data.events:
+            if event.type not in ("labJackClockCalibration", "labJackClockMapping"):
+                continue
+            eventId = getattr(event, "eventId", None)
+            if eventId in existing:
+                raise ValueError("Duplicate retained LabJack clock-event ID.")
+            existing[eventId] = event
+
+        for event in snapshots:
+            previous = existing.get(event.eventId)
+            if previous is not None:
+                if previous.toJSON(strict=True) != event.toJSON(strict=True):
+                    raise ValueError("Retained clock-event ID has conflicting contents.")
+                continue
+            self.data.events.append(event)
+            existing[event.eventId] = event
+        return True
+
+    def _correctLabJackEventTimes(self, device, mapping, status):
+        """
+        Preflight and atomically apply supported event-field corrections in memory.
+
+        No event-list sorting, acceptance changes, or volume-count changes.
+        Original reconstruction audits and driver snapshots remain raw evidence.
+        Caller must archive/persist data and retain the mapping events.
+        """
+        from copy import deepcopy
+        from numbers import Integral, Real
+        from uuid import uuid4
+
+        audit = {
+            "auditId": str(uuid4()),
+            "mappingId": mapping.eventId,
+            "method": "deviceSampleCoordinatePostRun-v1",
+            "status": "preflight",
+            "failureReason": None,
+            "proposals": [],
+            "exclusions": [],
+            "estimatedVolumePolicy": "retainOriginalEstimateAndReportExclusion",
+            "diagnosticSnapshotPolicy": "retainOriginalLiveEvidence",
+            "volumeOrderPolicy": "rejectBatchIfExistingVolumeOrderWouldNotIncrease",
+        }
+        if not hasattr(self.data, "labJackClockCorrectionAudit"):
+            self.data.labJackClockCorrectionAudit = []
+        self.data.labJackClockCorrectionAudit.append(audit)
+
+        def finite(value):
+            return (
+                not isinstance(value, (bool, np.bool_))
+                and isinstance(value, Real)
+                and math.isfinite(float(value))
+            )
+
+        def getField(target, name, default=None):
+            return target.get(name, default) if isinstance(target, dict) else getattr(target, name, default)
+
+        def setField(target, name, value):
+            if isinstance(target, dict): target[name] = value
+            else: setattr(target, name, value)
+
+        def delField(target, name):
+            if isinstance(target, dict): target.pop(name, None)
+            elif hasattr(target, name): delattr(target, name)
+
+        proposals = []
+        seenTargets = set()
+        proposedTimes = {}
+        sourceEvents = {}
+        acquisitionId = status.get("acquisitionId")
+        segments = {}
+
+        try:
+            if mapping.status != "validConditional" or mapping.purpose != "postRun":
+                raise ValueError("Mapping is not an applicable post-run mapping.")
+            if mapping.connectionId != device.connectionId:
+                raise ValueError("Mapping belongs to a different connection.")
+            if not status.get("clockValid", False):
+                raise ValueError("Connection clock continuity is invalid.")
+            if not acquisitionId or acquisitionId != getattr(self, "_labJackAcquisitionId", None):
+                raise ValueError("Acquisition identity does not match this experiment.")
+
+            for segment in status.get("timingSegments", []):
+                segmentId = segment["segmentId"]
+                if segmentId in segments:
+                    raise ValueError("Duplicate timing-segment identity.")
+                segments[segmentId] = segment
+
+            # Source identity is explicit. Never associate by timestamp equality.
+            for event in self.data.events:
+                if (
+                    event.type == "digitalInput"
+                    and getattr(event, "deviceType", None) == "LabJack"
+                    and getattr(event, "acquisitionId", None) == acquisitionId
+                ):
+                    eventId = getattr(event, "eventId", None)
+                    if not isinstance(eventId, str) or not eventId:
+                        raise ValueError("Measured digital input has no source-event ID.")
+                    if eventId in sourceEvents:
+                        raise ValueError("Duplicate source-event ID in experiment events.")
+                    sourceEvents[eventId] = event
+
+            def stageSample(target, path, isObservation=False):
+                if id(target) in seenTargets:
+                    return
+                seenTargets.add(id(target))
+
+                segmentId = getField(target, "segmentId")
+                sampleIndex = getField(target, "sampleIndex")
+                if (
+                    isinstance(sampleIndex, (bool, np.bool_))
+                    or not isinstance(sampleIndex, Integral)
+                    or sampleIndex < 0
+                    or isinstance(segmentId, (bool, np.bool_))
+                    or not isinstance(segmentId, Integral)
+                    or segmentId not in segments
+                ):
+                    raise ValueError(f"{path}: missing/invalid measured sample coordinate.")
+
+                segment = segments[segmentId]
+                clockSegment = segment["clock"]
+                actualRate = segment["scanRate"]
+                if not finite(actualRate) or actualRate <= 0:
+                    raise ValueError(f"{path}: invalid segment scan rate.")
+
+                if not isObservation:
+                    eventRate = getField(target, "scanRate")
+                    if eventRate != actualRate:
+                        raise ValueError(f"{path}: event/segment scan-rate mismatch.")
+
+                # Keep the integer origin separate until adding the sample offset.
+                originTicks = clockSegment["streamStartTicks"]
+                if isinstance(originTicks, (bool, np.bool_)) or not isinstance(originTicks, Integral):
+                    raise ValueError(f"{path}: invalid stream-start ticks.")
+
+                oldMappingId = clockSegment["mappingId"]
+                ticks = int(originTicks) + int(sampleIndex) * 40_000_000 / actualRate
+                timing = device.getClockTiming(ticks, mappingId=mapping.eventId)
+                originalTiming = device.getClockTiming(ticks, mappingId=oldMappingId)
+
+                if timing["outsideObservationSpan"]:
+                    raise ValueError(f"{path}: sample is outside the fitted observation span.")
+                newTime = timing["timestamp"]
+                currentTime = getField(target, "timestamp")
+                liveTime = getField(target, "liveTimestamp", currentTime)
+                if not finite(newTime) or not finite(currentTime) or not finite(liveTime):
+                    raise ValueError(f"{path}: nonfinite timestamp.")
+
+                # Numerical consistency tolerance, not an accuracy allowance.
+                tolerance = max(
+                    1e-9,
+                    16 * math.ulp(float(liveTime)),
+                    16 * math.ulp(float(originalTiming["timestamp"])),
+                )
+                if abs(liveTime - originalTiming["timestamp"]) > tolerance:
+                    raise ValueError(f"{path}: original timestamp conflicts with sample provenance.")
+
+                currentMappingId = getField(target, "clockMappingId")
+                if currentMappingId not in (None, oldMappingId, mapping.eventId):
+                    raise ValueError(f"{path}: another correction mapping is already attached.")
+                if not isObservation and currentMappingId is None:
+                    raise ValueError(f"{path}: measured event has no mapping reference.")
+
+                if currentMappingId == mapping.eventId:
+                    if abs(currentTime - newTime) > tolerance:
+                        raise ValueError(f"{path}: existing correction is inconsistent.")
+                    audit["exclusions"].append({
+                        "path": path, "reason": "alreadyCorrectedWithThisMapping",
+                    })
+                    proposedTimes[id(target)] = newTime
+                    return
+
+                fields = {
+                    "timestamp": float(newTime),
+                    "clockMappingId": mapping.eventId,
+                    "timestampMethod": "postRunCalibratedDeviceSample",
+                    "labJackTimestamp": ticks / 40_000_000,
+                    "deviceTimestampMethod": "streamStartStampPlusSampleOffset",
+                    "clockCorrectionSeconds": float(newTime - liveTime),
+                }
+                # Preserve original live fields on FIRST correction only.
+                if getField(target, "liveTimestamp") is None:
+                    fields["liveTimestamp"] = float(liveTime)
+                    fields["liveClockMappingId"] = oldMappingId
+                    fields["liveTimestampMethod"] = getField(target, "timestampMethod")
+
+                proposals.append((target, fields))
+                proposedTimes[id(target)] = float(newTime)
+                audit["proposals"].append({
+                    "path": path,
+                    "originalLiveTimestamp": float(liveTime),
+                    "proposedTimestamp": float(newTime),
+                    "correctionSeconds": float(newTime - liveTime),
+                    "clockErrorLowerSeconds": timing["clockErrorLowerSeconds"],
+                    "clockErrorUpperSeconds": timing["clockErrorUpperSeconds"],
+                    "boundStatus": timing["boundStatus"],
+                })
+
+            def stageObservationTree(value, path):
+                # Only called on explicit counter-observation fields.
+                # Diagnostic host timestamps are never passed here.
+                if isinstance(value, dict):
+                    if all(name in value for name in (
+                        "segmentId", "sampleIndex", "timestamp", "counter", "inputHigh",
+                    )):
+                        stageSample(value, path, isObservation=True)
+                    for name, child in list(value.items()):
+                        if isinstance(child, (dict, list)):
+                            stageObservationTree(child, f"{path}.{name}")
+                elif isinstance(value, list):
+                    for index, child in enumerate(value):
+                        stageObservationTree(child, f"{path}[{index}]")
+
+            def stageEvent(event, path):
+                if getattr(event, "deviceType", None) != "LabJack":
+                    return
+                if getattr(event, "acquisitionId", None) != acquisitionId:
+                    audit["exclusions"].append({"path": path, "reason": "foreignAcquisition"})
+                    return
+
+                if event.type == "volumeTrigger" and getattr(event, "isEstimated", False):
+                    audit["exclusions"].append({
+                        "path": path,
+                        "reason": "estimatedVolumeRetainedWithOriginalReconstruction",
+                    })
+                    return
+
+                if event.type == "volumeTrigger":
+                    sourceId = getattr(event, "sourceEventId", None)
+                    source = sourceEvents.get(sourceId)
+                    if source is None:
+                        raise ValueError(f"{path}: measured volume has no unique raw source.")
+                    for name in ("segmentId", "sampleIndex", "scanRate", "channel"):
+                        if getattr(event, name, None) != getattr(source, name, None):
+                            raise ValueError(f"{path}: source/volume provenance mismatch.")
+                    stageSample(event, path)
+
+                elif event.type == "digitalInput":
+                    stageSample(event, path)
+
+                elif event.type in ("digitalInputCounterWindow", "digitalInputMismatch"):
+                    for name in (
+                        "beforeObservation", "afterObservation",
+                        "measuredObservations", "gapRecords",
+                    ):
+                        stageObservationTree(getattr(event, name, None), f"{path}.{name}")
+
+            owners = [("experiment", self.data)] + [
+                (f"task[{index}]", task.data)
+                for index, task in enumerate(self.tasks)
+            ]
+            for ownerName, data in owners:
+                for index, event in enumerate(data.events):
+                    stageEvent(event, f"{ownerName}.events[{index}]")
+
+            # Shutdown records can contain the same objects or independent copies.
+            for drainIndex, drain in enumerate(
+                getattr(self.data, "digitalInputShutdownDrains", [])
+            ):
+                for index, event in enumerate(drain.get("events", [])):
+                    stageEvent(event, f"shutdownDrains[{drainIndex}].events[{index}]")
+
+            # Check each owner's existing volume order. No global sorting.
+            for ownerName, data in owners:
+                previous = None
+                for event in data.events:
+                    if event.type != "volumeTrigger":
+                        continue
+                    timestamp = proposedTimes.get(id(event), event.timestamp)
+                    if not finite(timestamp) or (previous is not None and timestamp <= previous):
+                        raise ValueError(f"{ownerName}: corrected volume order is invalid or ambiguous.")
+                    previous = timestamp
+
+            # Source/volume copies must receive identical corrected times.
+            for event in self.data.events:
+                if (
+                    event.type == "volumeTrigger"
+                    and getattr(event, "deviceType", None) == "LabJack"
+                    and getattr(event, "acquisitionId", None) == acquisitionId
+                    and not getattr(event, "isEstimated", False)
+                ):
+                    source = sourceEvents[event.sourceEventId]
+                    if proposedTimes[id(event)] != proposedTimes[id(source)]:
+                        raise ValueError("Source and measured volume corrections differ.")
+
+        except Exception as error:
+            audit["status"] = "rejected"
+            audit["failureReason"] = f"{type(error).__name__}: {error}"
+            return audit
+
+        # Commit only after the complete preflight. Roll back fields on failure.
+        backups = []
+        try:
+            for target, fields in proposals:
+                contents = target if isinstance(target, dict) else vars(target)
+                backup = {
+                    name: (name in contents, deepcopy(contents.get(name)))
+                    for name in fields
+                }
+                backups.append((target, backup))
+                for name, value in fields.items():
+                    setField(target, name, value)
+        except BaseException:
+            for target, backup in reversed(backups):
+                for name, (existed, value) in backup.items():
+                    if existed: setField(target, name, value)
+                    else: delField(target, name)
+            audit["status"] = "commitFailedRolledBack"
+            raise
+
+        corrections = [
+            record["correctionSeconds"] for record in audit["proposals"]
+        ]
+        audit.update({
+            "status": "applied" if proposals else "noChanges",
+            "affectedTargetCount": len(proposals),
+            "minimumCorrectionSeconds": min(corrections) if corrections else None,
+            "maximumCorrectionSeconds": max(corrections) if corrections else None,
+            "maximumAbsoluteCorrectionSeconds": (
+                max(abs(value) for value in corrections) if corrections else None
+            ),
+            "historicalAcceptanceDecisionsChanged": False,
+        })
+        return audit
+
+    def _finalizeLabJackClockTiming(self):
+        """
+        Run once after the initial raw-save attempt and before device closure.
+
+        Ordinary calibration/correction failure is retained and warned, not made
+        a prerequisite for saving the rest of the run.
+        """
+        from uuid import uuid4
+
+        previous = getattr(self.data, "labJackClockFinalization", None)
+        if previous is not None:
+            # Save retries do not acquire new observations or repeat correction.
+            return True
+
+        record = {
+            "status": "starting",
+            "failureReason": None,
+            "mappingId": None,
+            "rawArchiveDirectory": None,
+            "correctedSaveStatus": "notAttempted",
+        }
+        self.data.labJackClockFinalization = record
+
+        acquisitionId = getattr(self, "_labJackAcquisitionId", None)
+        if not acquisitionId:
+            record["status"] = "notApplicable"
+            return True
+
+        devices = [
+            device for device in self.state.digitalIODevices
+            if getattr(device, "deviceType", None) == "LabJack"
+            and callable(getattr(device, "calibrateClockEnding", None))
+        ]
+        if len(devices) != 1:
+            record["status"] = "failed"
+            record["failureReason"] = "Expected exactly one owned calibrated LabJack."
+            pglMessages.warning(record["failureReason"], level=2)
+            return True
+
+        device = devices[0]
+        try:
+            if not np.isfinite(self.data.endTime) or self.data.endTime <= 0:
+                raise ValueError("Experiment end time has not been established.")
+
+            # endDevices retains queued source events without accepting volumes.
+            shutdownErrors = []
+            self._attemptRunAction(
+                "stop and drain acquisition before clock calibration",
+                self.endDevices, shutdownErrors, reportProgress=False,
+            )
+            record["shutdownErrors"] = [
+                f"{type(error).__name__}: {error}" for error in shutdownErrors
+            ]
+            status = device.getDigitalReadStatus()
+            if status["running"] or status["streamActive"] or status.get("pendingEvents", 0):
+                raise RuntimeError("Acquisition did not stop and drain completely.")
+
+            # This collection occurs while the SAME owned handle remains open.
+            mapping = device.calibrateClockEnding()
+            record["mappingId"] = mapping.eventId
+            self._retainLabJackClockEvents(device)
+
+            # Retain raw diagnostics explicitly as historical live evidence.
+            self._snapshotDigitalInputStatus()
+            self.data.digitalInputDiagnosticsTiming = "originalLiveClockEvidence"
+            self.data.volumeTriggerRepairAuditTiming = "originalOnlineReconstructionEvidence"
+
+            # Preserve independently readable raw snapshots before corrections.
+            dataPath = getattr(self, "_runSavePath", None)
+            if dataPath is None:
+                raise RuntimeError("No run destination is available for raw timing archive.")
+
+            archive = Path(dataPath) / ("labJack-live-timing-" + str(uuid4()))
+            archive.mkdir(parents=False, exist_ok=False)
+            record["rawArchiveDirectory"] = str(archive)
+
+            owners = [("experiment-data.json", self.data)] + [
+                (f"task-{index}-data.json", task.data)
+                for index, task in enumerate(self.tasks)
+            ]
+            for fileName, owner in owners:
+                encoded = owner.toJSON(strict=True)
+                with (archive / fileName).open("x", encoding="utf-8") as file:
+                    written = file.write(encoded)
+                    if written != len(encoded):
+                        raise OSError("Incomplete raw timing archive write.")
+
+            status = device.getDigitalReadStatus()
+            audit = self._correctLabJackEventTimes(device, mapping, status)
+            record["correctionAuditId"] = audit["auditId"]
+            record["status"] = audit["status"]
+
+            if audit["status"] == "rejected":
+                record["failureReason"] = audit["failureReason"]
+                pglMessages.warning(
+                    "LabJack post-run clock correction was rejected. Original "
+                    f"timestamps were retained. {audit['failureReason']} "
+                    "Calibration evidence and proposed corrections are retained.",
+                    level=2,
+                )
+
+        except (Exception, KeyboardInterrupt, SystemExit) as error:
+            record["status"] = "failed"
+            record["failureReason"] = f"{type(error).__name__}: {error}"
+            self._recordRunError("LabJack clock finalization", error)
+            pglMessages.warning(
+                "LabJack clock finalization did not complete. Review the retained "
+                "clock finalization/correction audit; saving and cleanup will "
+                f"continue. {type(error).__name__}: {error}",
+                level=2,
+            )
+
+        finally:
+            # Preserve ending/rejected records even when fitting or correction fails.
+            try:
+                self._retainLabJackClockEvents(device)
+            except Exception as error:
+                record["clockEventRetentionFailure"] = f"{type(error).__name__}: {error}"
+                self._recordRunError("retain LabJack clock events", error)
+
+            # Save all event owners, not only experiment data.json.
+            # Failed saves remain retryable through existing savePendingData().
+            dataPath = getattr(self, "_runSavePath", None)
+            if dataPath is not None:
+                saveErrors = []
+                for index, task in enumerate(self.tasks):
+                    self._attemptRunAction(
+                        f"save final timing for task {index + 1}",
+                        lambda task=task: task.data.saveStrict(
+                            Path(dataPath) / task._getTaskDirectoryName() / "data.json"
+                        ),
+                        saveErrors, reportProgress=False,
+                    )
+
+                record["correctedSaveStatus"] = "failed" if saveErrors else "complete"
+                self._attemptRunAction(
+                    "save final LabJack timing evidence",
+                    lambda: self.data.saveStrict(Path(dataPath) / "data.json"),
+                    saveErrors, reportProgress=False,
+                )
+                if saveErrors:
+                    record["correctedSaveStatus"] = "failed"
+                    self.data.saveStatus = "failed"
+
+        # Report persistence failure only after all timing saves were attempted.
+        # The outer _attemptRunAction retains this error and continues cleanup.
+        if record["correctedSaveStatus"] == "failed":
+            raise RuntimeError(
+                "Final LabJack timing data were not completely saved. "
+                "Pending evidence remains in memory; use savePendingData() "
+                "after shutdown returns. See retained run errors."
+            )
+
+        return True
     
 ##############################################
 # Settings for pglTask
@@ -6605,6 +7180,336 @@ class pglExperimentData(pglTraitSettings):
             result["max"] = float(np.max(adjustedIntervals))
 
         return result
+
+    def getLabJackClockReport(self):
+        """
+        Describe retained LabJack timing evidence without hardware or mutation.
+
+        Conditional error summaries come from correction audit proposals.
+        Rejected proposals are never described as applied corrections.
+        Audit target counts may include raw inputs, volume events, counter
+        observations, and independent copies; they are not pulse counts.
+        """
+        from copy import deepcopy
+        from numbers import Real
+        import math
+
+        def finite(value):
+            return (
+                not isinstance(value, bool)
+                and isinstance(value, Real)
+                and math.isfinite(float(value))
+            )
+
+        recordsById = {}
+        for event in self.events:
+            if event.type not in (
+                "labJackClockCalibration", "labJackClockMapping",
+            ):
+                continue
+            eventId = getattr(event, "eventId", None)
+            recordsById.setdefault(eventId, []).append(event)
+
+        mappingReports = []
+        calibrationReports = []
+        recordIssues = []
+
+        for eventId, records in recordsById.items():
+            if not isinstance(eventId, str) or not eventId:
+                recordIssues.append({
+                    "eventId": eventId,
+                    "reason": "missingClockRecordIdentity",
+                })
+            elif len(records) != 1:
+                recordIssues.append({
+                    "eventId": eventId,
+                    "reason": "duplicateClockRecordIdentity",
+                    "count": len(records),
+                })
+
+            for event in records:
+                if event.type == "labJackClockCalibration":
+                    calibrationReports.append({
+                        "eventId": eventId,
+                        "connectionId": getattr(event, "connectionId", None),
+                        "phase": getattr(event, "phase", None),
+                        "status": getattr(event, "status", None),
+                        "actualDurationSeconds": getattr(event, "actualDuration", None),
+                        "observationCount": len(getattr(event, "observations", [])),
+                    })
+                    continue
+
+                referenceIssues = []
+                calibrationIds = list(getattr(event, "calibrationEventIds", []))
+                for calibrationId in calibrationIds:
+                    matches = recordsById.get(calibrationId, [])
+                    if len(matches) != 1:
+                        referenceIssues.append({
+                            "calibrationEventId": calibrationId,
+                            "reason": "missing" if not matches else "ambiguous",
+                        })
+                    elif matches[0].type != "labJackClockCalibration":
+                        referenceIssues.append({
+                            "calibrationEventId": calibrationId,
+                            "reason": "wrongRecordType",
+                        })
+                    elif getattr(matches[0], "connectionId", None) != getattr(
+                        event, "connectionId", None
+                    ):
+                        referenceIssues.append({
+                            "calibrationEventId": calibrationId,
+                            "reason": "foreignConnection",
+                        })
+
+                parameters = getattr(event, "parameters", None) or {}
+                scale = parameters.get("clockScale")
+                scaleBounds = parameters.get("feasibleClockScale")
+                if scaleBounds is None:
+                    region = parameters.get("affineRegion")
+                    if (
+                        isinstance(region, list) and region
+                        and all(
+                            isinstance(point, (list, tuple))
+                            and len(point) == 2
+                            and finite(point[1])
+                            for point in region
+                        )
+                    ):
+                        scaleBounds = [
+                            1 + min(point[1] for point in region),
+                            1 + max(point[1] for point in region),
+                        ]
+
+                validBounds = (
+                    isinstance(scaleBounds, (list, tuple))
+                    and len(scaleBounds) == 2
+                    and all(finite(value) for value in scaleBounds)
+                    and 0 < scaleBounds[0] <= scaleBounds[1]
+                )
+                usableReferences = (
+                    not referenceIssues
+                    and isinstance(eventId, str) and bool(eventId)
+                    and len(records) == 1
+                )
+                applicable = (
+                    getattr(event, "status", None) == "validConditional"
+                    and usableReferences
+                )
+
+                mappingReports.append({
+                    "mappingId": eventId,
+                    "purpose": getattr(event, "purpose", None),
+                    "status": getattr(event, "status", None),
+                    "method": getattr(event, "method", None),
+                    "calibrationEventIds": calibrationIds,
+                    "referenceIssues": referenceIssues,
+                    "selectedScaleDeviationPpm": (
+                        (float(scale) - 1) * 1e6
+                        if applicable and finite(scale) and scale > 0 else None
+                    ),
+                    "feasibleScaleDeviationPpm": (
+                        [(float(value) - 1) * 1e6 for value in scaleBounds]
+                        if applicable and validBounds else None
+                    ),
+                    "failureReason": (
+                        getattr(event, "diagnostics", {}) or {}
+                    ).get("failureReason"),
+                })
+
+        audits = []
+        for sourceAudit in getattr(self, "labJackClockCorrectionAudit", []):
+            proposals = sourceAudit.get("proposals", [])
+            corrections = []
+            lowerErrors, upperErrors = [], []
+            invalidProposalCount = 0
+
+            for proposal in proposals:
+                correction = proposal.get("correctionSeconds")
+                lower = proposal.get("clockErrorLowerSeconds")
+                upper = proposal.get("clockErrorUpperSeconds")
+                if finite(correction):
+                    corrections.append(float(correction))
+                else:
+                    invalidProposalCount += 1
+                if finite(lower) and finite(upper) and lower <= upper:
+                    lowerErrors.append(float(lower))
+                    upperErrors.append(float(upper))
+
+            exclusions = {}
+            for exclusion in sourceAudit.get("exclusions", []):
+                reason = exclusion.get("reason", "unspecified")
+                exclusions[reason] = exclusions.get(reason, 0) + 1
+
+            mappingId = sourceAudit.get("mappingId")
+            matching = recordsById.get(mappingId, [])
+            mappingResolved = (
+                len(matching) == 1
+                and matching[0].type == "labJackClockMapping"
+            )
+
+            audits.append({
+                "auditId": sourceAudit.get("auditId"),
+                "mappingId": mappingId,
+                "mappingRecordResolved": mappingResolved,
+                "status": sourceAudit.get("status", "unknown"),
+                "failureReason": sourceAudit.get("failureReason"),
+                "affectedTargetCount": sourceAudit.get("affectedTargetCount"),
+                "proposalCount": len(proposals),
+                "invalidCorrectionValueCount": invalidProposalCount,
+                "correctionRangeSeconds": (
+                    [min(corrections), max(corrections)] if corrections else None
+                ),
+                "maximumAbsoluteCorrectionSeconds": (
+                    max(abs(value) for value in corrections) if corrections else None
+                ),
+                # Envelope over recorded target-specific intervals, not a
+                # newly inferred interval for every point throughout the run.
+                "recordedTargetClockErrorEnvelopeSeconds": (
+                    [min(lowerErrors), max(upperErrors)] if lowerErrors else None
+                ),
+                "targetsWithRecordedClockBounds": len(lowerErrors),
+                "exclusionsByReason": exclusions,
+                "estimatedVolumePolicy": sourceAudit.get("estimatedVolumePolicy"),
+                "historicalAcceptanceDecisionsChanged": sourceAudit.get(
+                    "historicalAcceptanceDecisionsChanged", False
+                ),
+            })
+
+        finalization = deepcopy(getattr(self, "labJackClockFinalization", None))
+        present = bool(recordsById or audits or finalization)
+        return {
+            "availability": "retainedEvidence" if present else "unavailable",
+            "finalization": finalization,
+            "calibrations": calibrationReports,
+            "mappings": mappingReports,
+            "recordIssues": recordIssues,
+            "correctionAudits": audits,
+            "saveRetryAudit": deepcopy(getattr(self, "labJackClockSaveRetryAudit", [])),
+            "uncertaintyBasis": "recordedPerTargetConditionalAffineIntervals",
+            "unknownContributions": [
+                "hostTimestampUncertainty",
+                "withinRunNonlinearClockVariation",
+            ],
+            "totalTimingBoundAvailable": False,
+        }
+
+    def printLabJackClockReport(self):
+        """Print saved clock/correction evidence directly; return its report."""
+        report = self.getLabJackClockReport()
+        print("LabJack experiment clock report")
+
+        if report["availability"] == "unavailable":
+            print(
+                "Clock-calibration/correction evidence is unavailable. "
+                "This recording may predate calibrated device timing."
+            )
+            print("Timing uncertainty is unknown, not zero.")
+            return report
+
+        finalization = report["finalization"]
+        if finalization:
+            print(
+                f"Finalization: {finalization.get('status', 'unknown')} | "
+                f"timing persistence: "
+                f"{finalization.get('correctedSaveStatus', 'unknown')}"
+            )
+            if finalization.get("failureReason"):
+                print(f"Finalization issue: {finalization['failureReason']}")
+
+        for calibration in report["calibrations"]:
+            duration = calibration["actualDurationSeconds"]
+            durationText = (
+                f"{duration * 1000:.2f} ms"
+                if isinstance(duration, (int, float)) else "unavailable"
+            )
+            print(
+                f"  Collection {calibration['phase']}: {calibration['status']}, "
+                f"{calibration['observationCount']} observations, "
+                f"{durationText} actual [{calibration['eventId']}]"
+            )
+
+        for issue in report["recordIssues"]:
+            print(f"RECORD ISSUE: {issue}")
+
+        for mapping in report["mappings"]:
+            print(
+                f"Mapping {mapping['mappingId']}: "
+                f"{mapping['purpose']} / {mapping['status']}"
+            )
+            for issue in mapping["referenceIssues"]:
+                print(f"  UNRESOLVED: {issue}")
+            if mapping["failureReason"]:
+                print(f"  Failure: {mapping['failureReason']}")
+            if mapping["selectedScaleDeviationPpm"] is not None:
+                print(
+                    f"  Selected scale deviation: "
+                    f"{mapping['selectedScaleDeviationPpm']:+.3f} ppm"
+                )
+            bounds = mapping["feasibleScaleDeviationPpm"]
+            if bounds is not None:
+                print(
+                    f"  Conditional supported scale deviation: "
+                    f"[{bounds[0]:+.3f}, {bounds[1]:+.3f}] ppm"
+                )
+
+        for audit in report["correctionAudits"]:
+            status = audit["status"]
+            applied = status == "applied"
+            label = "Applied" if applied else "Proposed / not applied"
+            if status == "noChanges":
+                label = "No changes in this attempt"
+            print(f"Correction audit {audit['auditId']}: {status}")
+            print(
+                f"  Mapping: {audit['mappingId']} "
+                f"(reference {'resolved' if audit['mappingRecordResolved'] else 'UNRESOLVED'})"
+            )
+            print(
+                f"  {label}: {audit['proposalCount']} targets. "
+                "Targets can include copies and counter observations, not just pulses."
+            )
+
+            values = audit["correctionRangeSeconds"]
+            if values is not None:
+                print(
+                    f"  {label} correction range: "
+                    f"[{values[0] * 1000:+.6f}, {values[1] * 1000:+.6f}] ms; "
+                    f"maximum absolute: "
+                    f"{audit['maximumAbsoluteCorrectionSeconds'] * 1000:.6f} ms"
+                )
+            bounds = audit["recordedTargetClockErrorEnvelopeSeconds"]
+            if bounds is not None:
+                print(
+                    f"  Envelope of recorded target-specific conditional clock "
+                    f"errors: [{bounds[0] * 1e6:+.2f}, "
+                    f"{bounds[1] * 1e6:+.2f}] µs "
+                    f"({audit['targetsWithRecordedClockBounds']} targets)"
+                )
+            else:
+                print("  Recorded target-specific clock bounds: unavailable.")
+
+            if audit["failureReason"]:
+                print(f"  Rejection/failure: {audit['failureReason']}")
+            for reason, count in audit["exclusionsByReason"].items():
+                print(f"  Excluded: {reason} ({count})")
+            if audit["invalidCorrectionValueCount"]:
+                print(
+                    f"  Invalid/missing correction values: "
+                    f"{audit['invalidCorrectionValueCount']}"
+                )
+
+        if not report["correctionAudits"]:
+            print("No recorded correction attempt.")
+
+        print(
+            "Conditional clock-model intervals only—not total event-timing accuracy. "
+            "The target envelope is not a bound on unobserved within-run drift."
+        )
+        print("Unknown: " + ", ".join(report["unknownContributions"]))
+        print(
+            "Sampling/edge localization, channel timing, and presentation "
+            "uncertainty remain separate where applicable."
+        )
+        return report
     
 ##############################################
 # State for pglExperiment
