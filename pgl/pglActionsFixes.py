@@ -815,7 +815,7 @@ class pglActionsFixes(pglActionCollection):
                 )
                 self.error = ValueError(message)
                 self.status = pglActionStatus.FAILED
-                pglMessages.warning(message, level=0)
+                pglMessages.warning(message, level=2)
                 return None
 
             matches = session.getScanRunMatches()
