@@ -276,245 +276,517 @@ class pglDisplayCalibration():
         '''
         pass
 
-    def calibrateTemporal(self, settingsName=None, settings=None, displayName=None, displaySettings=None, waitToStart=None):
-        '''
-        User faceing function which runs the temporal calibration process. 
-        
-        You need to make sure that you have initialized with a digitalIODevice or run addDigitalIODevice
-        
-        Args:
-            settingsName (str): The name of the settings to use. If not set (and settings not set), will use default settings
-            settings (pglSettings): An instance of the pglSettings class. If set, will supersede settingsName.
-            displayName (str): The name of the display to use. If set, will be incorporated into settings (and supersede any
-                conflicting settings). If there is no settings/settingsName will use default settings
-            displaySettings (pglDisplaySettings): The settings of the dispaly to use, will supersed the displayName if set and
-                behave in a similar fashion
-            waitToStart (int): Seconds to wait before starting, defaults to None
-        '''
-        if self.digitalIODevice is None:
-            pglMessages.warning("No digitalIO device specified. Please specify on initialization of pglDisplayCalibration or use addDigitalIODevice", level=2)
-            return None
+    def calibrateTemporal(
+        self, settingsName=None, settings=None, displayName=None,
+        displaySettings=None, waitToStart=None, *,
+        dataChannel=0, minimumAmplitude=0.01, useBatch=True,
+        numRepeats=30, stimulusDurationFrames=(2, 3, 8, 0),
+    ):
+        """
+        Record and analyze photodiode onset relative to drawablePresented.
+
+        dataChannel is the photodiode column in the selected analog scan order.
+        minimumAmplitude is an explicit detector acceptance threshold in volts.
+        Digital output is not required to establish the analog clock origin.
+
+        Display/experiment resources are owned by this operation. Supplied
+        analog/digital devices remain caller-owned and are never closed here.
+        """
+        from copy import deepcopy
+        from numbers import Integral, Real
+        from pathlib import Path
+
         if self.analogInputDevice is None:
-            pglMessages.warning("No analog input device specified. Please specify on initialization of pglDisplayCalibration or use addAnalogDevice", level=2)
-            return None
+            raise RuntimeError("An analog input device is required.")
+        required = (
+            "collectClockCalibration", "fitClockCalibrations",
+            "getClockEvents", "getAnalogReadStatus",
+        )
+        if any(not callable(getattr(self.analogInputDevice, name, None)) for name in required):
+            raise RuntimeError(
+                "This presentation-relative path requires a clock-calibrated "
+                "analog driver. Legacy sync-relative analysis remains separate."
+            )
+        if self.pgl.isOpen():
+            raise RuntimeError(
+                "Close the existing display before temporal calibration. "
+                "Caller-owned display resources will not be replaced."
+            )
+        if type(useBatch) is not bool:
+            raise TypeError("useBatch must be Boolean.")
+        if (
+            isinstance(numRepeats, (bool, np.bool_))
+            or not isinstance(numRepeats, Integral) or numRepeats < 1
+        ):
+            raise ValueError("numRepeats must be a positive integer.")
+        if (
+            isinstance(dataChannel, (bool, np.bool_))
+            or not isinstance(dataChannel, Integral) or dataChannel < 0
+        ):
+            raise ValueError("dataChannel must be a nonnegative column index.")
+        if (
+            isinstance(minimumAmplitude, (bool, np.bool_))
+            or not isinstance(minimumAmplitude, Real)
+            or not np.isfinite(minimumAmplitude) or minimumAmplitude <= 0
+        ):
+            raise ValueError("minimumAmplitude must be positive and finite.")
+        durations = list(stimulusDurationFrames)
+        if (
+            len(durations) != 4
+            or any(
+                isinstance(value, (bool, np.bool_))
+                or not isinstance(value, Integral) or value < 0
+                for value in durations
+            )
+            or durations[1] < 1 or durations[2] + durations[3] < 1
+        ):
+            raise ValueError("Frame durations need a white phase and a following black phase.")
+        if waitToStart is not None and (
+            isinstance(waitToStart, (bool, np.bool_))
+            or not isinstance(waitToStart, Real)
+            or not np.isfinite(waitToStart) or waitToStart < 0
+        ):
+            raise ValueError("waitToStart must be nonnegative and finite.")
 
-        self.temporalCalibrationData = None
-        
-        # open the display with specified settings
-        e = pglExperiment(self.pgl, settingsName, settings, displayName, displaySettings)
-        if e.isInitialized is False:
-            pglMessages.warning(f"Could not initialize experiment with settings: {settingsName}")
-            return None
+        # Resolve existing settings without invoking getSettings()'s default
+        # creation/default-repair save behavior.
+        if settings is not None:
+            if not isinstance(settings, pglSettings):
+                raise TypeError("settings must be pglSettings.")
+            localSettings = deepcopy(settings)
+        elif settingsName is not None:
+            selected = pglSettingsManager.getSettings(settingsName=settingsName)
+            if selected is None:
+                raise ValueError("Named experiment settings were not found.")
+            localSettings = deepcopy(selected)
+        else:
+            candidates = [
+                pglSettings.load(filename=path, refresh=False)
+                for path in sorted(
+                    pglSettingsManager.getSettingsDir().glob("*.json")
+                )
+            ]
+            if any(candidate is None for candidate in candidates):
+                raise ValueError("A saved settings file could not be restored.")
+            defaults = [candidate for candidate in candidates if candidate.isDefault]
+            if len(defaults) != 1:
+                raise ValueError(
+                    "Temporal calibration requires one saved default settings profile "
+                    "or explicitly supplied settings. No profile was created or repaired."
+                )
+            localSettings = deepcopy(defaults[0])
+            localSettings.reloadDisplays()
+            localSettings.reloadLabJackSettings()
 
-        e.settings.closeScreenOnEnd = True
-        e.settings.backgroundColor = (0, 0, 0)
-        e.initScreen()
-        if self.pgl.isOpen() is False:
-            pglMessages.warning(f"Display {settingsName} did not open, cannot calibrate.")
-            return None
-        
-        # initialize the data structure for saving data
-        self.temporalCalibrationData = pglDisplayTemporalCalibrationData()
+        if displayName is not None or displaySettings is not None:
+            localSettings = pglSettingsManager.getSettings(
+                settings=localSettings,
+                displayName=displayName,
+                displaySettings=displaySettings,
+            )
+        if localSettings is None:
+            raise ValueError("Display settings could not be resolved.")
 
-        # set information
-        self.temporalCalibrationData.settingsName = settingsName
-        self.temporalCalibrationData.settings = e.settings
-        self.temporalCalibrationData.displaySettings = e.settings.displays[0]
-        self.temporalCalibrationData.digitalIOdeviceDescription = self.digitalIODevice.deviceDescription
-        self.temporalCalibrationData.analogInputDescription = self.analogInputDevice.deviceDescription
-        
-        # get calibration date and time
-        self.temporalCalibrationData.creationDateTime = datetime.now()
+        preset = localSettings.getLabJackPreset()
+        analogConfig = preset.getAnalogReadConfig()
+        if dataChannel >= len(analogConfig["channels"]):
+            raise ValueError("Photodiode dataChannel exceeds the selected analog scan order.")
+
+        # Explicit calibration-only settings copy: do not initialize a second
+        # connection, a digital stream, other experiment inputs, or an eye tracker.
+        for item in localSettings._digitalIO:
+            item.isSelected = False
+        for item in localSettings._devices:
+            item.isSelected = False
+        localSettings.eyetracker = ["None"]
+        localSettings.closeScreenOnEnd = True
+        localSettings.backgroundColor = [0.0, 0.0, 0.0]
+
+        data = pglDisplayTemporalCalibrationData()
+        self.temporalCalibrationData = data
+        data.settingsName = localSettings.name
+        data.settings = localSettings
+        data.creationDateTime = datetime.now()
+        data.analogInputDescription = self.analogInputDevice.deviceDescription
+        data.digitalIOdeviceDescription = "Not required for calibrated-clock analysis"
+        data.numRepeats = int(numRepeats)
+        data.stimulusDurationFrames = [int(value) for value in durations]
+        data.frameTimestampProvenance = {
+            "field": "drawablePresented",
+            "method": "batchCommandResults" if useBatch else "flushCommandResults",
+            "clockDomain": "assumedPGLHostClock",
+            "absoluteUncertaintySeconds": None,
+            "successRequired": 1,
+        }
+        data.acquisitionMetadata = {
+            "analogRequested": deepcopy(analogConfig),
+            "presetName": preset.name,
+            "presetUUID": preset.uuid,
+            "useBatch": useBatch,
+            "digitalSyncUsedForTimeOrigin": False,
+            "measurementPosition": "notRecorded",
+            "detectorDescription": "notRecorded",
+        }
+
+        print(f"Temporal calibration analog preset: {preset.name!r}")
+        print(f"Analog configuration: {analogConfig}")
+        print(
+            f"Photodiode column: {dataChannel} "
+            f"({analogConfig['channels'][dataChannel]}); "
+            f"minimum excursion: {minimumAmplitude:g} V; "
+            f"presentation mode: {'batch' if useBatch else 'non-batch'}."
+        )
+
+        experiment = None
+        failure = None
+        try:
+            experiment = pglExperiment(self.pgl, settings=localSettings)
+            if not experiment.isInitialized:
+                raise RuntimeError("Calibration display experiment did not initialize.")
+            experiment.initScreen(startRecording=False)
+            if not self.pgl.isOpen():
+                raise RuntimeError("Calibration display did not open.")
+            data.displaySettings = experiment.settings.displays[0]
+
+            self.pgl.fullScreen(True)
+            self.pgl.waitSecs(0.75)
+            self.pgl.clearScreen(0)
+            self.pgl.flush()
+            if waitToStart:
+                self.pgl.waitSecs(waitToStart)
+
+            self._calibrateTemporal(
+                analogConfig=analogConfig,
+                useBatch=useBatch,
+                dataChannel=int(dataChannel),
+                minimumAmplitude=float(minimumAmplitude),
+            )
+
+        except (Exception, KeyboardInterrupt, SystemExit) as error:
+            failure = error
+            pglMessages.warning(
+                f"Temporal calibration did not complete: {type(error).__name__}: "
+                f"{error}. Retained data remain in temporalCalibrationData.",
+                level=2,
+            )
+        finally:
+            if experiment is not None:
+                cleanupErrors = []
+                # These experiment-owned device lists were deliberately disabled.
+                for label, action in (
+                    ("stop experiment inputs", experiment.endDevices),
+                    ("close experiment digital IO", experiment.endDigitalIO),
+                    (
+                        "close calibration display",
+                        lambda: experiment.endScreen(
+                            clearScreen=False,
+                            resetStencil=failure is None,
+                        ),
+                    ),
+                ):
+                    try:
+                        action()
+                    except (Exception, KeyboardInterrupt, SystemExit) as error:
+                        cleanupErrors.append(f"{label}: {type(error).__name__}: {error}")
+                data.temporalCleanupErrors = cleanupErrors
+                if cleanupErrors:
+                    pglMessages.warning(
+                        "Temporal calibration cleanup reported errors: "
+                        + "; ".join(cleanupErrors),
+                        level=2,
+                    )
+                # Persist cleanup outcome if raw publication already succeeded.
+                if data.calibrationDataReference:
+                    try:
+                        data.save()
+                    except Exception as error:
+                        data.pendingSaveFailure = f"{type(error).__name__}: {error}"
+                        pglMessages.warning(
+                            "Temporal cleanup metadata could not be saved. "
+                            "The in-memory calibration remains available for retry.",
+                            level=2,
+                        )
+
+        if failure is not None:
+            raise failure
+        return data
+    
+    def _calibrateTemporal(
+        self, *, analogConfig, useBatch, dataChannel, minimumAmplitude,
+    ):
+        """
+        One stop-controlled analog stream through the entire frame sequence.
+
+        Retain all attempted frame rows, including missing/failed presentations.
+        Save raw recording before analysis; never close the supplied device.
+        """
+        from copy import deepcopy
+        import time
+
+        data = self.temporalCalibrationData
+        device = self.analogInputDevice
+        framesPerRepeat = sum(data.stimulusDurationFrames)
+        cumulativeFrames = np.cumsum(data.stimulusDurationFrames)
+        frameRows = []
+        errors = []
+        started = False
+        beginning = None
+        mapping = None
+        trace = None
+
+        # Metadata uses finite values/None; raw nonfinite frame values go in HDF5.
+        data.acquisitionMetadata["errors"] = errors
+        data.acquisitionMetadata["status"] = "starting"
+        data.analysisStatus = "notAnalyzed"
+
+        def appendError(stage, error):
+            errors.append({
+                "stage": stage,
+                "type": type(error).__name__,
+                "message": str(error),
+            })
+
+        def scalar(value):
+            if value is None:
+                return float("nan")
+            array = np.asarray(value)
+            if array.ndim != 0 or array.dtype.kind not in "iuf":
+                raise ValueError("Frame result must be a numeric scalar or None.")
+            return float(array)
+
+        def waitForSamples(target):
+            # Explicit progress/readiness checks. This sleep is only polling
+            # backoff, not an assumption that the hardware has started.
+            deadline = time.monotonic() + 10.0
+            while True:
+                status = device.getAnalogReadStatus()
+                if status.get("error") or status.get("cleanupErrors"):
+                    raise RuntimeError(f"Analog acquisition failed: {status.get('error')}")
+                if status.get("validSampleCount", 0) >= target:
+                    return
+                if not status.get("running") or not status.get("streamActive"):
+                    raise RuntimeError("Analog acquisition stopped before required samples.")
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Analog acquisition did not provide required sample support.")
+                self.pgl.waitSecs(0.005)
 
         try:
-            # get display info if available
-            gpu = next(iter(self.pgl.gpuInfo.values()))
-            displays = gpu.get('Displays', [])
-            self.temporalCalibrationData.displayInfo = displays[self.temporalCalibrationData.displaySettings.currentDisplayNum]
-            
-            # get info from pgl
-            self.temporalCalibrationData.metalInfo = self.pgl.info()
-            
-        except Exception as ex:
-            pglMessages.warning(f"Warning: Could not get display info: {ex}")
+            data.frameRate = float(self.pgl.getFrameRate())
+            if not np.isfinite(data.frameRate) or data.frameRate <= 0:
+                raise ValueError("Invalid display frame rate.")
 
-        if waitToStart:
-            pglMessages.message(f"Waiting for {waitToStart}s")
-            self.pgl.waitSecs(waitToStart)
+            # A fresh acquisition-specific beginning collection follows display
+            # initialization; it does not refit the frozen connection mapping.
+            beginning = device.collectClockCalibration(phase="beginning")
+            data.acquisitionMetadata["beginningCalibrationId"] = beginning.eventId
 
-        # run internal function to calibrate the temporal
-        self._calibrateTemporal()
-        
-        # and save
-        self.temporalCalibrationData.save()
-        
-        # fit onset
-        self.temporalCalibrationData.computeFrameOnsetDelay()
+            started = True
+            actualRate = device.startAnalogRead(duration=None, **analogConfig)
+            data.analogScanRate = float(actualRate)
+            data.acquisitionMetadata["actualScanRate"] = float(actualRate)
+            status = device.getAnalogReadStatus()
+            if not status.get("ready"):
+                raise RuntimeError("Analog startup returned without readiness.")
+            waitForSamples(int(np.ceil(0.05 * actualRate)))
 
-        # plot data
-        self.temporalCalibrationData.display()
+            width = self.pgl.screenWidth.deg
+            height = self.pgl.screenHeight.deg
 
-        # close screen
-        e.endScreen()
-    
-    def _calibrateTemporal(self):
-        
-        # set stimulus duration in frames
-        # first number is pre-stimulus black
-        # second number is the actual stimulus duration
-        # third number is post-stimulus black
-        # fourth number is inter-trial interval 
-        stimulusDurationFrames = [2, 3, 8, 0]
+            for repeatIndex in range(data.numRepeats):
+                status = device.getAnalogReadStatus()
+                if status.get("error") or not status.get("running"):
+                    raise RuntimeError("Analog acquisition is not active for the next repeat.")
 
-        # size of patch to draw in the center of the screen (in degrees)
-        patchWidth = self.pgl.screenWidth.deg
-        patchHeight = self.pgl.screenHeight.deg
+                repeatRows = []
+                for frameIndex in range(framesPerRepeat):
+                    phase = int(np.searchsorted(cumulativeFrames, frameIndex, side="right"))
+                    row = {
+                        "repeatIndex": repeatIndex,
+                        "frameIndex": frameIndex,
+                        "stimulusPhase": phase,
+                        "drawablePresented": float("nan"),
+                        "processedTime": float("nan"),
+                        "success": float("nan"),
+                        "drawablePresentedPresent": False,
+                    }
+                    repeatRows.append(row)
 
-        # number of repeats
-        numRepeats = 30
+                if useBatch:
+                    # Retain intended rows before submission can fail.
+                    frameRows.extend(repeatRows)
+                    self.pgl.batchStart()
+                    for row in repeatRows:
+                        color = 1 if row["stimulusPhase"] == 1 else 0
+                        self.pgl.rect(0, 0, width, height, color)
+                        self.pgl.flush()
+                    self.pgl.batchRun()
+                    self.pgl.batchEnd()  # Return value may be processedTime; do not use it.
+                    results = self.pgl.profileInfo["commandResults"]
 
-        # get total number of frames
-        trialFrames = sum(stimulusDurationFrames)
-        totalFrames = numRepeats * trialFrames
+                    for field in ("drawablePresented", "processedTime", "success"):
+                        values = results.get(field)
+                        if values is None:
+                            continue
+                        values = np.atleast_1d(values)
+                        if len(values) != framesPerRepeat:
+                            raise ValueError(f"Batch {field} count differs from intended frames.")
+                        for row, value in zip(repeatRows, values):
+                            row[field] = scalar(value)
+                            if field == "drawablePresented":
+                                row["drawablePresentedPresent"] = True
 
-        # calculate stimulus time in seconds based on frame rate
-        frameRate = self.pgl.getFrameRate()
-        trialDurationSecs = trialFrames / frameRate
-        totalDurationSecs = totalFrames / frameRate
+                else:
+                    for row in repeatRows:
+                        frameRows.append(row)
+                        color = 1 if row["stimulusPhase"] == 1 else 0
+                        self.pgl.rect(0, 0, width, height, color)
+                        returnedPresentation = self.pgl.flush()
+                        results = self.pgl.commandResults or {}
+                        for field in ("drawablePresented", "processedTime", "success"):
+                            row[field] = scalar(results.get(field))
+                        row["drawablePresentedPresent"] = (
+                            results.get("drawablePresented") is not None
+                        )
+                        # Preserve the public flush return independently.
+                        row["flushReturn"] = scalar(returnedPresentation)
 
-        # open as full screen
-        self.pgl.fullScreen(True)
-        self.pgl.waitSecs(0.75)
-        
-        # set to black
-        self.pgl.rect(0,0,patchWidth,patchHeight,0);
-        self.pgl.flush()
-        self.pgl.waitSecs(0.25)
+            # Retain trailing black samples from the same uninterrupted stream.
+            beforeTail = device.getAnalogReadStatus()["samplesReturned"]
+            waitForSamples(beforeTail + int(np.ceil(0.05 * actualRate)))
+            data.acquisitionMetadata["status"] = "framesCompleted"
 
-        # setup digital output for sync pulse 
-        digitalIOChannel = 0
-        self.digitalIODevice.setupDigitalOutput(channel=digitalIOChannel)
-        
-        sendAuxDigitalIO = True
-        if sendAuxDigitalIO:
-            auxDigitalIOChannel = 1
-            self.digitalIODevice.setupDigitalOutput(channel=auxDigitalIOChannel)
+        except (Exception, KeyboardInterrupt, SystemExit) as error:
+            appendError("acquisition", error)
 
-        # read analog input for a little bit beyond stimulus duration
-        startTime = self.pgl.getSecs()
-        analogReadDurationSecs = totalDurationSecs + 1.0
-        if sendAuxDigitalIO:
-            scanRate = 1500
-            self.analogInputDevice.startAnalogRead(duration=analogReadDurationSecs, channels=['AIN0','AIN1','AIN2'], voltageRange=10.0, scanRate=scanRate, scansPerRead=scanRate)
-        else:
-            scanRate = 3000
-            self.analogInputDevice.startAnalogRead(duration=analogReadDurationSecs, channels=['AIN0','AIN1'], voltageRange=10.0, scanRate=scanRate, scansPerRead=scanRate)
-        self.pgl.waitSecs(0.1)
+        finally:
+            if started:
+                try:
+                    trace = device.stopAnalogRead(
+                        waitToFinish=False, doNotTruncate=True
+                    )
+                except (Exception, KeyboardInterrupt, SystemExit) as error:
+                    appendError("stopAnalogRead", error)
+                    # Do not discard buffered samples because shutdown failed.
+                    try:
+                        trace = device.getAnalogReadSnapshot()
+                        trace.timing["snapshotIncomplete"] = True
+                        trace.timing["snapshotReason"] = "stopAnalogReadFailed"
+                        data.acquisitionMetadata["partialSnapshotRetained"] = True
+                    except (Exception, KeyboardInterrupt, SystemExit) as snapshotError:
+                        appendError("getAnalogReadSnapshot", snapshotError)
 
-        # display
-        pglMessages.message(f"Total read time: {analogReadDurationSecs:.2f} seconds, (n={numRepeats}, trialLen={trialDurationSecs:.2f} s, totalDuration={totalDurationSecs:.2f} s)")
+            if trace is not None:
+                data.analogTraceData = trace
+                if getattr(trace, "scanRate", None) is not None:
+                    data.analogScanRate = float(trace.scanRate)
+                rawStatus = trace.timing.get("status", {}) if trace.timing else {}
+                if rawStatus.get("error") or rawStatus.get("cleanupErrors"):
+                    errors.append({
+                        "stage": "analogStatus",
+                        "type": "AcquisitionIncomplete",
+                        "message": str(rawStatus.get("error") or rawStatus.get("cleanupErrors")),
+                    })
 
-        useBatch = True
-        
-        # initialize arrays of timestamps
-        flushTime = []
-        batchFlushTimes = np.zeros((numRepeats,sum(stimulusDurationFrames)))
-        
-        # two versions here, one that uses batch to try to display more consistent frames, and the other that just
-        # uses regular frame-by-frame updating. Leaving in the latter for debugging / checking
-        if useBatch:
-            # loop over repeats
-            for iRepeat in range(numRepeats):
-                trialStart = True
+            # No endpoint reads while a worker or unresolved stream owns hardware.
+            try:
+                status = device.getAnalogReadStatus()
+                if (
+                    beginning is not None and trace is not None
+                    and not (getattr(trace, "timing", None) or {}).get("snapshotIncomplete", False)
+                ):
+                    if status.get("running") or status.get("streamActive"):
+                        raise RuntimeError("Cannot calibrate ending while analog stream is active.")
+                    ending = device.collectClockCalibration(phase="ending")
+                    mapping = device.fitClockCalibrations(
+                        [beginning.eventId, ending.eventId], purpose="postRun"
+                    )
+                    data.acquisitionMetadata["endingCalibrationId"] = ending.eventId
+                    data.acquisitionMetadata["postRunMappingId"] = mapping.eventId
+            except (Exception, KeyboardInterrupt, SystemExit) as error:
+                appendError("endingClockCalibration", error)
 
-                self.pgl.clearScreen(0)      
-                self.pgl.rect(0,0,patchWidth,patchHeight,0);
-                self.pgl.flush()
-                
-                # set the digital pulse to be timelocked to the start of stimuls presentation
-                #startFrameTime = pgl.getTargetPresentationTimestamp()
-                #pglLabJack.digitalOutputAtTime(startFrameTime+((1/frameRate)*stimulusDurationFrames[0])/1000, 1, pulseLen=pulseLenMilliseconds)
-                
-                # loop over frames in stimulus, creating the batch
-                self.pgl.batchStart()
-                for iFrame in range(sum(stimulusDurationFrames)):
-                    # compute which stimulus phase we are in based on the current frame number and the stimulusDurationFrames
-                    stimulusPhase = np.searchsorted(np.cumsum(stimulusDurationFrames), iFrame, side='right')
+            data.clockCalibrationEvents = device.getClockEvents()
 
-                    if trialStart and stimulusPhase == 1:
-                        trialStart = False
+        fieldNames = (
+            "repeatIndex", "frameIndex", "stimulusPhase",
+            "drawablePresented", "processedTime", "success",
+            "drawablePresentedPresent",
+        )
+        data.frameRecords = {}
+        for field in fieldNames:
+            dtype = (
+                np.int64 if field in ("repeatIndex", "frameIndex", "stimulusPhase")
+                else np.bool_ if field == "drawablePresentedPresent"
+                else np.float64
+            )
+            data.frameRecords[field] = np.asarray(
+                [row[field] for row in frameRows], dtype=dtype
+            )
+        if not useBatch:
+            data.frameRecords["flushReturn"] = np.asarray(
+                [row.get("flushReturn", float("nan")) for row in frameRows],
+                dtype=np.float64,
+            )
+        # New recordings have one canonical frame dataset, not a second alias.
+        data.flushTimes = None
 
-                    # set what color to draw the screen
-                    if stimulusPhase == 1:
-                        self.pgl.rect(0,0,patchWidth,patchHeight,1);
-                    else:
-                        self.pgl.rect(0,0,patchWidth,patchHeight,0);
-                    
-                    # flush the screen
-                    self.pgl.flush()
-            
-                #now that the batch is done, set the digital output and play it
-                self.digitalIODevice.digitalOutputPulse(digitalIOChannel)
-                if sendAuxDigitalIO: self.digitalIODevice.digitalOutputPulse(auxDigitalIOChannel)
-                self.pgl.batchRun()
-                batchFlushTimes[iRepeat,:] = self.pgl.batchEnd()
-            
-        else:
-            flushTime = []
-            for iRepeat in range(numRepeats):
-                trialStart = True
-                currentFrame = 0
-                
-                self.pgl.rect(0,0,patchWidth,patchHeight,0);
-                
-                # set the digital pulse to be timelocked to the start of stimuls presentation
-                #startFrameTime = pgl.getTargetPresentationTimestamp()
-                #pglLabJack.digitalOutputAtTime(startFrameTime+((1/frameRate)*stimulusDurationFrames[0])/1000, 1, pulseLen=pulseLenMilliseconds)
-                
-                for iFrame in range(sum(stimulusDurationFrames)):
-                    # compute which stimulus phase we are in based on the current frame number and the stimulusDurationFrames
-                    stimulusPhase = np.searchsorted(np.cumsum(stimulusDurationFrames), iFrame, side='right')
+        if data.analogTraceData is None and started:
+            # Without a snapshot, an empty trace would falsely represent
+            # a possibly nonempty driver buffer. Keep ownership/data in memory.
+            raise RuntimeError(
+                "Analog shutdown/snapshot failed. No empty recording was "
+                "substituted. Recover buffered data from the supplied device "
+                "before closing or starting another acquisition."
+            )
 
-                    if trialStart and stimulusPhase == 1:
-                        self.digitalIODevice.digitalOutputPulse(digitalIOChannel)
-                        trialStart = False
+        if data.analogTraceData is None:
+            # Save a genuine empty/failed acquisition, not fabricated samples.
+            empty = pglAnalogTraceData(
+                time=np.empty(0),
+                data=np.empty((0, len(analogConfig["channels"]))),
+                channelNames=analogConfig["channels"],
+            )
+            empty.scanRate = None
+            empty.timing = {
+                "validSampleCount": 0,
+                "timelineValid": False,
+                "status": device.getAnalogReadStatus(),
+            }
+            data.analogTraceData = empty
 
-                    # set what color to draw the screen
-                    if stimulusPhase == 1:
-                        self.pgl.rect(0,0,patchWidth,patchHeight,1);
-                    else:
-                        self.pgl.rect(0,0,patchWidth,patchHeight,0);
-                    
-                    # flush the screen, recording the time of each flush for later analysis
-                    flushTime.append(self.pgl.flush())
+        data.acquisitionMetadata["status"] = "partialOrFailed" if errors else "complete"
+        data.acquisitionMetadata["frameRowsRetained"] = len(frameRows)
+        data.analysisStatus = "notAnalyzed" if mapping is not None else "clockMappingUnavailable"
 
-        # get analog data
-        analogTraceData = self.analogInputDevice.stopAnalogRead(waitToFinish=True)
-        if analogTraceData:
-            pglMessages.message(f"Analog read complete (duration={self.pgl.getSecs() - startTime:.2f} s). Read {analogTraceData.nSamples} samples.")
-        else:
-            pglMessages.warning(f"Calibration failed. This may be because the scanRate: {scanRate} was set to high")
-            
-            return
+        # Freeze raw metadata before first publication. Later derived analysis
+        # changes only explicit result fields, not trace/acquisition metadata.
+        data.save()
 
-        # fix, fix, fix, commenting out to deal with batch
-        #frameTime = np.median(np.diff(flushTime))*1000
-        #print(f"Median frame time: {frameTime:.4f} ms (frame rate: {1000/frameTime:.2f} Hz)")
-        # close full screen
-        #pgl.fullScreen(False)
+        if mapping is not None and data.analogTraceData.nSamples:
+            try:
+                data.analyzePhotodiodeOnsets(
+                    dataChannel=dataChannel,
+                    mappingId=mapping.eventId,
+                    minimumAmplitude=minimumAmplitude,
+                )
+            except Exception as error:
+                data.analysisStatus = "failed"
+                data.analysisFailure = f"{type(error).__name__}: {error}"
+                pglMessages.warning(
+                    f"Photodiode analysis failed; raw recording retained: {error}",
+                    level=2,
+                )
+            data.save()
 
-        # process batchFlushTimes to get the frameRate and any dropped frames
-        #for iRepeat in range(numRepeats):
-        #    frameTimes = np.diff(batchFlushTimes[iRepeat])
-        #    print(f"{iRepeat}: {frameTimes}")
-        
-        # save data
-        self.temporalCalibrationData.flushTimes = batchFlushTimes
-        self.temporalCalibrationData.analogScanRate = scanRate
-        self.temporalCalibrationData.frameRate = frameRate
-        self.temporalCalibrationData.numRepeats = numRepeats
-        self.temporalCalibrationData.stimulusDurationFrames = stimulusDurationFrames
-        self.temporalCalibrationData.analogTraceData = analogTraceData
+        if errors:
+            pglMessages.warning(
+                "Temporal recording retained partial/failure evidence: "
+                + "; ".join(f"{entry['stage']}: {entry['message']}" for entry in errors),
+                level=2,
+            )
+            raise RuntimeError("Temporal acquisition did not complete; retained data are available.")
+
+        return data
             
     def calibrateLuminance(self, settingsName, nRepeats=4, nSteps=256, runValidation=True, nStepsValidation=None, nRepeatsValidation=None, runGammaValidation=True):
         '''
@@ -1124,7 +1396,7 @@ class pglDisplayTemporalCalibrationData(pglTraitSettings):
     digitalIOdeviceDescription = Unicode("Unknown", help="Desciption of digitalIO measurement device")
     analogInputDescription = Unicode("Unknown", help="Desciption of analog input measurement device")
     analogTraceData = Instance(pglAnalogTraceData, allow_none=True, default_value=None, help="analong measurement from photodiode")
-    analogScanRate = Int(1000, help="The scanRate that the analog data was collected at")
+    analogScanRate = Float(1000.0, help="Actual device-returned analog scan rate (Hz).")
     syncChannel = Int(1, help="Channel with sync pulse on it")     
     syncChannelThreshold = Float(0.2, help="Threshold for considering sync to be active")
     stimulusDurationFrames = List(Int, help="Frames used for each part of stimulus: first number is pre-stimulus black, second number is the actual stimulus duration, third number is post-stimulus black, fourth number is inter-trial interval ")    
@@ -1133,7 +1405,7 @@ class pglDisplayTemporalCalibrationData(pglTraitSettings):
     flushTimes = Instance(np.ndarray, allow_none=True, default_value=None, help="Matrix of repeats x frames which reports the flush times")
     onsetDelay = Float(allow_none=True, default_value=None, help="delay to frame onset, computed from calibration data")
     
-    def display(self, fig=None):
+    def _displayLegacyTemporal(self, fig=None):
         '''
         display the timing calibration data
         
@@ -1149,46 +1421,174 @@ class pglDisplayTemporalCalibrationData(pglTraitSettings):
         self.displayOnset()
         
     def save(self, filename=None, filepath=None):
-        '''
-        save
-        
-        Args:
-            filename: If none defaults to calibration.json
-            filepath: If none defaults to calibrationDir / display name / data
-        '''
-        # get a filepath
+        """
+        Save raw HDF5 once, then publish calibration.json with derived results.
+
+        Previous JSON revisions and staging files are retained.
+        Publication is per-file, not an atomic two-file transaction.
+        Failures propagate; the in-memory data remain available for retry.
+        """
+        import os
+        from pathlib import Path
+        from uuid import uuid4
+        from .pglSerialize import pglSerialize
+
+        if filename not in (None, "calibration", "calibration.json"):
+            raise ValueError("Temporal recordings use the filename calibration.json.")
+
+        storage = self._getTemporalStorageClass()
+
         if filepath is None:
-            filepath = pglSettingsManager.getDisplayTemporalCalibrationDir(displaySettings=self.displaySettings, newCalibration=True)
-        
-        # get the filename
-        if filename is None:
-            filename = "calibration"
-                           
-        # call parent to save
-        super().save(filepath / filename)
+            retainedDirectory = getattr(self, "_temporalSaveDirectory", None)
+            if retainedDirectory is not None:
+                directory = Path(retainedDirectory)
+            else:
+                # Reserve a unique directory atomically; never reuse an earlier run.
+                parent = pglSettingsManager.getDisplayTemporalCalibrationDir(
+                    displaySettings=self.displaySettings, newCalibration=False
+                )
+                parent.mkdir(parents=True, exist_ok=True)
+                directory = parent / (
+                    datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                    + "_" + uuid4().hex[:8]
+                )
+                directory.mkdir(exist_ok=False)
+        else:
+            directory = Path(filepath).expanduser().resolve()
+            directory.mkdir(parents=True, exist_ok=True)
+
+        self._temporalSaveDirectory = str(directory)
+        frames, metadata = self._prepareTemporalPayload()
+
+        # Preserve legacy arrays in the HDF5 payload without assuming they are
+        # drawablePresented. The layout/provenance is explicitly recorded.
+        legacyFlush = self.flushTimes
+        if legacyFlush is not None:
+            if frames:
+                count = len(next(iter(frames.values())))
+                if legacyFlush.size != count:
+                    raise ValueError(
+                        "flushTimes and frameRecords differ in size. "
+                        "Provide matching frame records; values were not reshaped silently."
+                    )
+            frames["legacyFlushTimes"] = legacyFlush.reshape(-1)
+
+        reference = dict(self.calibrationDataReference)
+        if reference:
+            if "calibrationUUID" in reference and reference["calibrationUUID"] != self.uuid:
+                raise ValueError("Raw reference belongs to another calibration.")
+            restored = storage.loadRaw(directory, reference)
+            self._assertSameTemporalPayload(
+                self.analogTraceData, frames, metadata, restored
+            )
+        else:
+            if (directory / "calibration.json").exists():
+                raise FileExistsError(
+                    "Existing calibration.json has no bound raw reference on this "
+                    "object. Use a new directory for migration or a new recording."
+                )
+            reference = storage.saveRaw(
+                directory, self.analogTraceData, frames, metadata
+            )
+            reference["calibrationUUID"] = self.uuid
+            # Retain publication immediately: a later JSON failure must not cause
+            # retry to overwrite or republish the immutable raw recording.
+            self.calibrationDataReference = reference
+
+        text = self.toJSON(strict=True)
+        destination = directory / "calibration.json"
+        attemptId = str(uuid4())
+        staging = directory / f".calibration.{attemptId}.staging.json"
+
+        with staging.open("x", encoding="utf-8") as file:
+            file.write(text)
+            file.flush()
+            os.fsync(file.fileno())
+
+        if destination.exists():
+            # Preserve the previous bytes before replacing the public JSON name.
+            previous = destination.read_bytes()
+            oldObject = pglSerialize.fromJSON(
+                previous.decode("utf-8"), strict=True
+            )
+            if not isinstance(oldObject, type(self)) or oldObject.uuid != self.uuid:
+                raise ValueError("Existing JSON belongs to another calibration.")
+            with (directory / f"calibration.previous-{attemptId}.json").open("xb") as file:
+                file.write(previous)
+
+            # Atomic replacement of the JSON name, retaining staging evidence.
+            publish = directory / f".calibration.{attemptId}.publish.json"
+            os.link(staging, publish)
+            os.replace(publish, destination)
+        else:
+            # Fail rather than overwrite a destination created concurrently.
+            os.link(staging, destination)
+
+        self._temporalLastSaveFailure = None
+        return destination
 
     @classmethod
-    def load(cls, displayName, filename=None, filepath=None, date=None):
-        '''
-        load
-        
-        Args:
-            displayName: displayName to load
-            filename: If none defaults to calibration.json
-            filepath: If none defaults to calibrationDir / display name / data
-        '''
-        # get a filepath
+    def load(cls, displayName=None, filename=None, filepath=None, date=None):
+        """
+        Restore HDF5-backed temporal data or an existing JSON-only recording.
+
+        Does not recalibrate, analyze, or rewrite historical recordings.
+        Missing legacy timing evidence remains explicitly unavailable.
+        """
+        from pathlib import Path
+        from .pglSerialize import pglSerialize
+
+        if filename not in (None, "calibration", "calibration.json"):
+            raise ValueError("Temporal recordings use the filename calibration.json.")
+
         if filepath is None:
-            filepath = pglDisplayCalibration.chooseCalibrationFilepath(displayName, date=date, calibrationType="temporal")
-            if filepath is None: return
-        # get the filename
-        if filename is None:
-            filename = "calibration"
-        
-        pglMessages.message(f"Loading {filepath / filename}")
-        
-        # call super load to instantiate the object and load it                
-        return super(pglDisplayTemporalCalibrationData, cls).load(filepath / filename)    
+            filepath = pglDisplayCalibration.chooseCalibrationFilepath(
+                displayName, date=date, calibrationType="temporal"
+            )
+            if filepath is None:
+                return None
+
+        directory = Path(filepath).expanduser().resolve()
+        filename = directory / "calibration.json"
+
+        # Ordinary restoration preserves legacy trait defaults. Do not reinterpret
+        # legacy sync-relative onsetDelay as presentation-relative latency.
+        obj = pglSerialize.fromJSON(
+            filename.read_text(encoding="utf-8"), filename=str(filename)
+        )
+        if not isinstance(obj, cls):
+            raise TypeError("Calibration JSON restored an unexpected class.")
+
+        reference = obj.calibrationDataReference
+        if reference:
+            storage = cls._getTemporalStorageClass()
+            restored = storage.loadRaw(directory, reference)
+            if restored["metadata"].get("calibrationUUID") != obj.uuid:
+                raise ValueError("JSON and raw calibration identities disagree.")
+
+            if reference.get("calibrationUUID", obj.uuid) != obj.uuid:
+                raise ValueError("JSON raw reference belongs to another calibration.")
+
+            obj.analogTraceData = restored["trace"]
+            frames = dict(restored["frameArrays"])
+            legacyFlush = frames.pop("legacyFlushTimes", None)
+            shape = restored["metadata"].get("legacyFlushTimesShape")
+
+            if restored["metadata"].get("legacyFlushTimesStored"):
+                if legacyFlush is None or shape is None:
+                    raise ValueError("Missing retained flush-time array/shape.")
+                obj.flushTimes = legacyFlush.reshape(tuple(shape))
+            else:
+                if legacyFlush is not None:
+                    raise ValueError("Unexpected legacy flush-time dataset.")
+                obj.flushTimes = None
+
+            obj.frameRecords = frames
+
+        # A loaded historical directory is not an automatic save destination.
+        # Reanalysis requires an explicit save destination.
+        obj._temporalLoadedDirectory = str(directory)
+        return obj
     
     def getDisplayName(self):
         '''
@@ -1298,6 +1698,768 @@ class pglDisplayTemporalCalibrationData(pglTraitSettings):
             
         # return onset in ms (not the scanRate of the analog device)
         self.onsetDelay = float(onset*1000/self.analogScanRate)
+
+
+    calibrationDataReference = Dict(
+        default_value={}, help="Reference to immutable calibrationData.h5."
+    )
+    frameRecords = Dict(
+        default_value={}, help="Numeric frame-record arrays stored in HDF5."
+    )
+    acquisitionMetadata = Dict(
+        default_value={}, help="Acquisition configuration, validity and provenance."
+    )
+    clockCalibrationEvents = List(
+        default_value=[], help="Retained clock calibration and mapping events."
+    )
+    frameTimestampProvenance = Dict(
+        default_value={}, help="Presentation timestamp field and clock assumptions."
+    )
+    onsetResults = List(
+        default_value=[], help="Per-repeat onset results and exclusions."
+    )
+    detectionConfiguration = Dict(
+        default_value={}, help="Explicit photodiode onset-detection configuration."
+    )
+    timingUncertainty = Dict(
+        default_value={}, help="Clock and measurement uncertainty with assumptions."
+    )
+    analysisMethod = Unicode(
+        "legacySyncRelative",
+        help="Analysis method; legacy values are not presentation-relative latency."
+    )
+    analysisVersion = Unicode("legacy", help="Temporal analysis version.")
+    analysisStatus = Unicode("notAnalyzed", help="Analysis outcome.")
+    timingEvidenceStatus = Unicode(
+        "unavailable", help="Availability of calibrated timing evidence."
+    )
+    temporalPersistenceVersion = Int(2, help="Temporal data storage schema.")
+
+    @staticmethod
+    def _getTemporalStorageClass():
+        from .pglTemporalCalibrationFile import pglTemporalCalibrationFile
+        return pglTemporalCalibrationFile
+
+    def toJSONdict(self, type="all"):
+        """
+        HDF5-backed recordings serialize references, not duplicate raw arrays.
+
+        Objects without an HDF5 reference retain legacy inline serialization.
+        save() always publishes HDF5 before writing a new JSON reference.
+        """
+        result = super().toJSONdict(type)
+        if self.calibrationDataReference:
+            result["analogTraceData"] = None
+            result["flushTimes"] = None
+            result["frameRecords"] = {}
+        return result
+
+    def _prepareTemporalPayload(self):
+        """Prepare raw arrays and small metadata without changing their values."""
+        from copy import deepcopy
+
+        if self.analogTraceData is None:
+            raise ValueError(
+                "No analog trace is available. Retain partial acquisition "
+                "diagnostics in memory; do not publish a fabricated recording."
+            )
+
+        frames = dict(self.frameRecords)
+        reservedName = "legacyFlushTimes"
+        if reservedName in frames:
+            raise ValueError(f"{reservedName} is reserved by temporal persistence.")
+
+        flushShape = None
+        if self.flushTimes is not None:
+            if (
+                not isinstance(self.flushTimes, np.ndarray)
+                or self.flushTimes.dtype.kind not in "iuf"
+            ):
+                raise TypeError("flushTimes must be a numeric array or None.")
+            flushShape = list(self.flushTimes.shape)
+
+        # The storage writer requires equally sized numeric frame columns.
+        # Preserve legacy flushTimes independently if it has another layout.
+        metadata = {
+            "calibrationUUID": self.uuid,
+            "acquisitionMetadata": deepcopy(self.acquisitionMetadata),
+            "frameTimestampProvenance": deepcopy(self.frameTimestampProvenance),
+            "legacyFlushTimesShape": flushShape,
+            "legacyFlushTimesStored": self.flushTimes is not None,
+        }
+        return frames, metadata
+
+    @staticmethod
+    def _assertSameTemporalPayload(trace, frames, metadata, restored):
+        """Do not silently reuse an immutable raw artifact for changed raw data."""
+        from .pglSerialize import pglSerialize
+
+        previous = restored["trace"]
+        if (
+            trace.data.dtype != previous.data.dtype
+            or trace.time.dtype != previous.time.dtype
+            or trace.data.shape != previous.data.shape
+            or trace.time.shape != previous.time.shape
+            or not np.array_equal(trace.data, previous.data, equal_nan=True)
+            or not np.array_equal(trace.time, previous.time, equal_nan=True)
+        ):
+            raise ValueError(
+                "Raw analog arrays differ from the published artifact. "
+                "Save changed raw data in a new calibration directory."
+            )
+
+        def traceMetadata(value):
+            return {
+                key: item for key, item in vars(value).items()
+                if not key.startswith("_") and key not in ("time", "data")
+            }
+
+        if pglSerialize.toJSON(traceMetadata(trace), strict=True) != (
+            pglSerialize.toJSON(traceMetadata(previous), strict=True)
+        ):
+            raise ValueError(
+                "Raw trace metadata changed after publication. Keep derived "
+                "clock/analysis results in the temporal data fields instead."
+            )
+
+        previousFrames = restored["frameArrays"]
+        if set(frames) != set(previousFrames):
+            raise ValueError("Frame record fields changed after publication.")
+        for key, array in frames.items():
+            other = previousFrames[key]
+            if (
+                array.dtype != other.dtype
+                or array.shape != other.shape
+                or not np.array_equal(array, other, equal_nan=True)
+            ):
+                raise ValueError(f"Raw frame field changed after publication: {key}")
+
+        if pglSerialize.toJSON(metadata, strict=True) != (
+            pglSerialize.toJSON(restored["metadata"], strict=True)
+        ):
+            raise ValueError(
+                "Acquisition metadata changed after raw publication. "
+                "Use separate analysis/result fields for derived information."
+            )
+
+    onsetAnalysisHistory = List(default_value=[], help="Retained prior temporal analysis results.")
+
+    def analyzePhotodiodeOnsets(
+        self, *, dataChannel, mappingId, minimumAmplitude,
+        thresholdFraction=0.20, baselineDuration=0.020,
+        searchBefore=0.005, searchAfter=0.050,
+    ):
+        """
+        Compare photodiode threshold crossings with drawablePresented.
+
+        All times are seconds. Channels are explicit array-column indices.
+        Baseline is the median over the pre-search baseline window.
+        Threshold is baseline + thresholdFraction * (search maximum - baseline).
+
+        Interpolate only between an actual below/above sample pair. Preserve
+        that pair as the sample-localization interval; interpolation is not
+        independent evidence of sub-sample accuracy.
+
+        Existing onsetDelay remains legacy sync-relative and is not relabeled.
+        """
+        from copy import copy, deepcopy
+        from numbers import Integral, Real
+        from .pglSerialize import pglSerialize
+
+        def finite(value):
+            return (
+                not isinstance(value, (bool, np.bool_))
+                and isinstance(value, Real)
+                and np.isfinite(value)
+            )
+
+        if (
+            isinstance(dataChannel, (bool, np.bool_))
+            or not isinstance(dataChannel, Integral)
+            or dataChannel < 0
+        ):
+            raise ValueError("dataChannel must be an explicit nonnegative column index.")
+        for name, value in (
+            ("minimumAmplitude", minimumAmplitude),
+            ("baselineDuration", baselineDuration),
+            ("searchAfter", searchAfter),
+        ):
+            if not finite(value) or value <= 0:
+                raise ValueError(f"{name} must be positive and finite.")
+        if not finite(searchBefore) or searchBefore < 0:
+            raise ValueError("searchBefore must be finite and nonnegative.")
+        if not finite(thresholdFraction) or not 0 < thresholdFraction < 1:
+            raise ValueError("thresholdFraction must lie strictly between zero and one.")
+        if not isinstance(mappingId, str) or not mappingId:
+            raise ValueError("Specify the mapping ID used for analysis.")
+
+        trace = self.analogTraceData
+        if trace is None or not callable(getattr(trace, "getSampleTiming", None)):
+            raise ValueError("A trace supporting calibrated sample timing is required.")
+        if not getattr(trace, "timing", None):
+            raise ValueError("Legacy trace has no calibrated timing evidence.")
+
+        samples = np.asarray(trace.data)
+        if samples.ndim == 1:
+            samples = samples.reshape(-1, 1)
+        if (
+            samples.ndim != 2 or samples.shape[0] != len(trace.time)
+            or not 0 <= dataChannel < samples.shape[1]
+        ):
+            raise ValueError("Invalid samples × channels shape or channel index.")
+
+        # Independent timing metadata, shared read-only sample arrays.
+        # Never attach endpoint records by mutating the immutable raw trace.
+        view = copy(trace)
+        view.timing = deepcopy(trace.timing)
+        records = {}
+        for event in (
+            list(view.timing.get("clockEvents", []))
+            + list(self.clockCalibrationEvents)
+        ):
+            eventId = getattr(event, "eventId", None)
+            if not isinstance(eventId, str) or not eventId:
+                raise ValueError("Clock record lacks an identity.")
+            previous = records.get(eventId)
+            if previous is not None:
+                if previous.toJSON(strict=True) != event.toJSON(strict=True):
+                    raise ValueError("Conflicting clock records share an identity.")
+            else:
+                records[eventId] = deepcopy(event)
+        view.timing["clockEvents"] = list(records.values())
+
+        liveMappingId = view.timing["liveMappingId"]
+        if mappingId not in records or liveMappingId not in records:
+            raise ValueError("Requested or live mapping record is unavailable.")
+
+        segment = view.timing["segment"]
+        actualRate = segment["scanRate"]
+        if not finite(actualRate) or actualRate <= 0:
+            raise ValueError("Invalid actual scan rate.")
+        relativeTime = np.asarray(trace.time)
+        if (
+            relativeTime.ndim != 1
+            or not np.all(np.isfinite(relativeTime))
+            or not np.allclose(
+                relativeTime, np.arange(len(samples)) / actualRate,
+                rtol=0, atol=1e-10,
+            )
+        ):
+            raise ValueError("Relative sample times conflict with the recorded scan rate.")
+
+        # This also checks retained mapping/calibration reference identities.
+        origin = view.getSampleTiming(0, mappingId)
+        hostSpacing = origin["sampleSpacingSeconds"]
+        if not finite(hostSpacing) or hostSpacing <= 0:
+            raise ValueError("Invalid mapped sample spacing.")
+        hostTimes = origin["timestamp"] + np.arange(len(samples)) * hostSpacing
+
+        frames = self.frameRecords
+        required = ("repeatIndex", "frameIndex", "drawablePresented", "success")
+        if any(name not in frames for name in required):
+            raise ValueError("Required per-frame presentation records are missing.")
+        arrays = {name: np.asarray(frames[name]) for name in required}
+        if (
+            any(array.ndim != 1 for array in arrays.values())
+            or len({len(array) for array in arrays.values()}) != 1
+        ):
+            raise ValueError("Frame columns must be equal-length vectors.")
+        for name in ("repeatIndex", "frameIndex"):
+            array = arrays[name]
+            if array.dtype.kind not in "iu" or np.any(array < 0):
+                raise ValueError(f"{name} must contain nonnegative integer indices.")
+
+        durations = list(self.stimulusDurationFrames)
+        if (
+            len(durations) != 4
+            or any(
+                isinstance(value, (bool, np.bool_))
+                or not isinstance(value, Integral) or value < 0
+                for value in durations
+            )
+            or durations[1] < 1
+            or durations[2] + durations[3] < 1
+        ):
+            raise ValueError("Stimulus frame durations must include white and following black frames.")
+        firstWhite = int(durations[0])
+        firstBlack = int(durations[0] + durations[1])
+        framesPerRepeat = sum(durations)
+
+        validCount = int(view.timing["validSampleCount"])
+        if not 0 <= validCount <= len(samples):
+            raise ValueError("Invalid valid-sample prefix length.")
+
+        config = {
+            "dataChannel": int(dataChannel),
+            "channelName": trace.channelNames[dataChannel],
+            "minimumAmplitudeVolts": float(minimumAmplitude),
+            "thresholdFraction": float(thresholdFraction),
+            "baselineDurationSeconds": float(baselineDuration),
+            "searchBeforeSeconds": float(searchBefore),
+            "searchAfterSeconds": float(searchAfter),
+            "baselineMethod": "medianBeforeSearchWindow",
+            "amplitudeMethod": "maximumInSearchWindowMinusBaseline",
+            "onsetMethod": "firstRisingThresholdCrossingLinearInterpolation",
+            "interpolationAccuracyEstablished": False,
+            "mappingId": mappingId,
+            "liveMappingId": liveMappingId,
+        }
+        results = []
+
+        for repeatIndex in range(self.numRepeats):
+            result = {
+                "repeatIndex": repeatIndex,
+                "status": "excluded",
+                "reason": None,
+                "mappingId": mappingId,
+                "liveMappingId": liveMappingId,
+            }
+            results.append(result)
+
+            def exclude(reason):
+                result["reason"] = reason
+
+            rows = np.flatnonzero(arrays["repeatIndex"] == repeatIndex)
+            # Preserve received frame order. Do not sort away duplicates/gaps.
+            if (
+                len(rows) != framesPerRepeat
+                or not np.array_equal(
+                    arrays["frameIndex"][rows], np.arange(framesPerRepeat)
+                )
+            ):
+                exclude("missingDuplicateOrOutOfOrderFrameRecords")
+                continue
+
+            presented = arrays["drawablePresented"][rows]
+            success = arrays["success"][rows]
+            if (
+                presented.dtype.kind not in "iuf"
+                or success.dtype.kind not in "iuf"
+                or not np.all(np.isfinite(presented))
+                or np.any(presented <= 0)
+                or not np.all(success == 1)
+                or np.any(np.diff(presented) <= 0)
+            ):
+                exclude("unusablePresentationRecords")
+                continue
+
+            frameOnset = float(presented[firstWhite])
+            frameOffset = float(presented[firstBlack])
+            result["framePresentationHostTime"] = frameOnset
+            result["frameOffsetPresentationHostTime"] = frameOffset
+
+            searchStart = frameOnset - searchBefore
+            searchStop = min(frameOnset + searchAfter, frameOffset)
+            baselineStart = searchStart - baselineDuration
+
+            # Require recorded valid support through the requested windows.
+            if (
+                baselineStart < hostTimes[0]
+                or searchStop > hostTimes[-1]
+                or searchStop <= searchStart
+            ):
+                exclude("analysisWindowOutsideRecording")
+                continue
+
+            baselineIndices = np.flatnonzero(
+                (hostTimes >= baselineStart) & (hostTimes < searchStart)
+            )
+            searchIndices = np.flatnonzero(
+                (hostTimes >= searchStart) & (hostTimes < searchStop)
+            )
+            if len(baselineIndices) < 3 or len(searchIndices) < 3:
+                exclude("insufficientSampleSupport")
+                continue
+
+            lastRequired = max(int(baselineIndices[-1]), int(searchIndices[-1]))
+            if lastRequired >= validCount:
+                exclude("analysisWindowTouchesInvalidTimeline")
+                continue
+
+            baselineValues = samples[baselineIndices, dataChannel]
+            searchValues = samples[searchIndices, dataChannel]
+            if (
+                not np.all(np.isfinite(baselineValues))
+                or not np.all(np.isfinite(searchValues))
+                or np.any(baselineValues == -9999)
+                or np.any(searchValues == -9999)
+            ):
+                exclude("nonfiniteOrMissingAnalogSamples")
+                continue
+
+            baseline = float(np.median(baselineValues))
+            peak = float(np.max(searchValues))
+            amplitude = peak - baseline
+            result.update({
+                "baselineVolts": baseline,
+                "baselineStdVolts": float(np.std(baselineValues)),
+                "peakVolts": peak,
+                "amplitudeVolts": amplitude,
+            })
+            if amplitude < minimumAmplitude:
+                exclude("insufficientSignalAmplitude")
+                continue
+
+            threshold = baseline + thresholdFraction * amplitude
+            result["thresholdVolts"] = threshold
+            if searchValues[0] >= threshold:
+                exclude("signalAlreadyAboveThresholdAtSearchStart")
+                continue
+
+            candidates = np.flatnonzero(
+                (searchValues[:-1] < threshold)
+                & (searchValues[1:] >= threshold)
+            )
+            if not len(candidates):
+                exclude("noSupportedRisingThresholdCrossing")
+                continue
+
+            pair = int(candidates[0])
+            left = int(searchIndices[pair])
+            right = int(searchIndices[pair + 1])
+            if right != left + 1:
+                exclude("nonAdjacentCrossingSamples")
+                continue
+
+            difference = float(samples[right, dataChannel] - samples[left, dataChannel])
+            if difference <= 0:
+                exclude("nonPositiveCrossingSlope")
+                continue
+            fraction = float((threshold - samples[left, dataChannel]) / difference)
+            if not 0 <= fraction <= 1:
+                exclude("unsupportedCrossingInterpolation")
+                continue
+
+            samplePosition = left + fraction
+            selected = view.getSampleTiming(samplePosition, mappingId)
+            live = view.getSampleTiming(samplePosition, liveMappingId)
+            leftTime = view.getSampleTiming(left, mappingId)
+            rightTime = view.getSampleTiming(right, mappingId)
+
+            if any(
+                item["outsideObservationSpan"]
+                for item in (selected, leftTime, rightTime)
+            ):
+                exclude("crossingOutsideSelectedCalibrationSpan")
+                continue
+
+            # Interval propagation, not RSS. This bounds the sampled threshold
+            # location under the clock model—not detector/display physics.
+            partialLower = (
+                leftTime["timestamp"] + leftTime["clockErrorLowerSeconds"] - frameOnset
+            )
+            partialUpper = (
+                rightTime["timestamp"] + rightTime["clockErrorUpperSeconds"] - frameOnset
+            )
+            result.update({
+                "status": "valid",
+                "reason": None,
+                "samplePosition": float(samplePosition),
+                "crossingSampleIndices": [left, right],
+                "photodiodeOnsetHostTime": selected["timestamp"],
+                "livePhotodiodeOnsetHostTime": live["timestamp"],
+                "onsetDelaySeconds": selected["timestamp"] - frameOnset,
+                "liveOnsetDelaySeconds": live["timestamp"] - frameOnset,
+                "clockErrorIntervalSeconds": [
+                    selected["clockErrorLowerSeconds"],
+                    selected["clockErrorUpperSeconds"],
+                ],
+                "sampleSpacingSeconds": selected["sampleSpacingSeconds"],
+                "sampleBracketDelaySeconds": [
+                    leftTime["timestamp"] - frameOnset,
+                    rightTime["timestamp"] - frameOnset,
+                ],
+                "partialClockAndSampleDelayIntervalSeconds": [
+                    partialLower, partialUpper,
+                ],
+                "totalTimingBoundAvailable": False,
+            })
+
+        valid = [result for result in results if result["status"] == "valid"]
+        delays = [result["onsetDelaySeconds"] for result in valid]
+        uncertainty = {
+            "validRepeatCount": len(valid),
+            "excludedRepeatCount": len(results) - len(valid),
+            "meanDelaySeconds": float(np.mean(delays)) if delays else None,
+            "acrossRepeatStdSeconds": (
+                float(np.std(delays, ddof=1)) if len(delays) > 1 else None
+            ),
+            "sharedClockUncertaintyReducedByRepeatCount": False,
+            "clockErrorEnvelopeSeconds": (
+                [
+                    min(result["clockErrorIntervalSeconds"][0] for result in valid),
+                    max(result["clockErrorIntervalSeconds"][1] for result in valid),
+                ] if valid else None
+            ),
+            "unknownContributions": [
+                "withinRunNonlinearClockVariation",
+                "hostTimestampUncertainty",
+                "presentationTimestampUncertainty",
+                "channelApertureUncertainty",
+                "onsetDetectionNoiseAndModelError",
+                "photodiodeAndAmplifierResponse",
+            ],
+            "presentationClockAssumption": "drawablePresentedInPGLHostClock",
+            "totalTimingBoundAvailable": False,
+        }
+
+        # Commit derived results only; raw HDF5-backed fields remain unchanged.
+        if self.onsetResults or self.analysisStatus != "notAnalyzed":
+            self.onsetAnalysisHistory.append({
+                "method": self.analysisMethod,
+                "version": self.analysisVersion,
+                "status": self.analysisStatus,
+                "configuration": deepcopy(self.detectionConfiguration),
+                "results": deepcopy(self.onsetResults),
+                "uncertainty": deepcopy(self.timingUncertainty),
+            })
+        self.onsetResults = results
+        self.detectionConfiguration = config
+        self.timingUncertainty = uncertainty
+        self.analysisMethod = "photodiodeThresholdRelativeToDrawablePresented"
+        self.analysisVersion = "1"
+        self.analysisStatus = "complete" if valid else "noValidRepeats"
+        self.timingEvidenceStatus = "conditionalCalibratedClock"
+        return deepcopy(results)
+
+
+    analysisFailure = Unicode("", help="Retained derived-analysis failure.")
+    pendingSaveFailure = Unicode("", help="Retained final save failure.")
+    temporalCleanupErrors = List(default_value=[], help="Owned-resource cleanup errors.")
+
+
+    def printTemporalTimingReport(self):
+        """Print retained analysis results without refitting or hardware access."""
+        from collections import Counter
+        from copy import deepcopy
+        import numpy as np
+
+        pglMessages.printHeader("Display temporal calibration")
+        if self.analysisMethod != "photodiodeThresholdRelativeToDrawablePresented":
+            print("Legacy sync-relative recording; presentation-relative latency unavailable.")
+            print("Clock-alignment uncertainty is unavailable, not zero.")
+            return {
+                "method": self.analysisMethod,
+                "presentationRelativeLatencyAvailable": False,
+            }
+
+        valid = [row for row in self.onsetResults if row.get("status") == "valid"]
+        exclusions = Counter(
+            row.get("reason", "unspecified")
+            for row in self.onsetResults if row.get("status") != "valid"
+        )
+        summary = deepcopy(self.timingUncertainty)
+
+        print(f"Analysis: {self.analysisStatus} | method version: {self.analysisVersion}")
+        print(
+            f"Repeats: {len(valid)} valid, "
+            f"{len(self.onsetResults) - len(valid)} excluded"
+        )
+
+        if valid:
+            delays = np.asarray([row["onsetDelaySeconds"] for row in valid])
+            print(
+                f"Photodiode onset relative to recorded presentation: "
+                f"{np.mean(delays) * 1000:+.3f} ms (mean)"
+            )
+            if len(delays) > 1:
+                print(
+                    f"Across-repeat standard deviation: "
+                    f"{np.std(delays, ddof=1) * 1000:.3f} ms"
+                )
+            else:
+                print("Across-repeat standard deviation: unavailable (one valid repeat)")
+
+            bounds = [
+                min(row["clockErrorIntervalSeconds"][0] for row in valid),
+                max(row["clockErrorIntervalSeconds"][1] for row in valid),
+            ]
+            print(
+                "Envelope of onset-specific conditional clock errors: "
+                f"[{bounds[0] * 1e6:+.1f}, {bounds[1] * 1e6:+.1f}] µs"
+            )
+            spacing = [row["sampleSpacingSeconds"] * 1e6 for row in valid]
+            print(
+                f"Analog sample spacing: {min(spacing):.2f}–"
+                f"{max(spacing):.2f} µs"
+            )
+        else:
+            print("Photodiode-to-presentation delay: unavailable.")
+
+        criterion = self.detectionConfiguration
+        fraction = criterion.get("thresholdFraction")
+        if fraction is not None:
+            print(
+                f"Onset criterion: {fraction * 100:g}% of the measured "
+                "baseline-to-peak excursion; adjacent-sample interpolation."
+            )
+        print(
+            "Interpolation does not establish sub-sample accuracy. "
+            "Shared clock uncertainty is not reduced by the repeat count."
+        )
+        for reason, count in sorted(exclusions.items()):
+            print(f"Excluded: {reason} (n={count})")
+        unknown = summary.get("unknownContributions", [])
+        if unknown:
+            print("Additional unknown contributions: " + ", ".join(unknown))
+        print(
+            "Presentation timestamps are assumed to share the PGL clock. "
+            "No total worst-case latency accuracy is claimed."
+        )
+        return {
+            "method": self.analysisMethod,
+            "presentationRelativeLatencyAvailable": bool(valid),
+            "summary": summary,
+            "exclusions": dict(exclusions),
+        }
+
+    def plotPresentationLatency(self, fig=None):
+        """
+        Plot retained onset results and original analog samples.
+
+        Trace alignment uses recorded presentation times and the selected
+        clock mapping. No nominal-period alignment or new onset fit is applied.
+        """
+        import numpy as np
+        import matplotlib.pyplot as plt
+
+        if self.analysisMethod != "photodiodeThresholdRelativeToDrawablePresented":
+            raise ValueError("This recording has no presentation-relative analysis.")
+
+        if fig is None:
+            fig, axes = plt.subplots(2, 1, figsize=(12, 9), constrained_layout=True)
+        else:
+            fig.clear()
+            axes = fig.subplots(2, 1)
+
+        valid = [row for row in self.onsetResults if row.get("status") == "valid"]
+        trace = self.analogTraceData
+        if not valid or trace is None:
+            axes[0].text(
+                0.5, 0.5, "No valid presentation-relative onset results",
+                transform=axes[0].transAxes, ha="center", va="center",
+            )
+            axes[1].text(
+                0.5, 0.5, "Review the retained per-repeat exclusion reasons",
+                transform=axes[1].transAxes, ha="center", va="center",
+            )
+            return fig
+
+        samples = np.asarray(trace.data)
+        if samples.ndim == 1:
+            samples = samples.reshape(-1, 1)
+        channel = self.detectionConfiguration["dataChannel"]
+        if not 0 <= channel < samples.shape[1]:
+            raise ValueError("Recorded photodiode channel is outside the trace.")
+
+        validCount = trace.timing["validSampleCount"]
+        indices = np.arange(min(len(samples), validCount))
+        searchBefore = self.detectionConfiguration["searchBeforeSeconds"]
+        searchAfter = self.detectionConfiguration["searchAfterSeconds"]
+
+        for index, row in enumerate(valid):
+            # The retained affine mapping makes spacing constant. Center around
+            # the saved crossing rather than materializing another host-time array.
+            times = (
+                row["photodiodeOnsetHostTime"] - row["framePresentationHostTime"]
+                + (indices - row["samplePosition"]) * row["sampleSpacingSeconds"]
+            )
+            offset = (
+                row["frameOffsetPresentationHostTime"]
+                - row["framePresentationHostTime"]
+            )
+            windowEnd = max(searchAfter, offset + 0.01)
+            mask = (times >= -searchBefore - 0.01) & (times <= windowEnd)
+            values = samples[indices[mask], channel].astype(float, copy=True)
+            values[(values == -9999) | ~np.isfinite(values)] = np.nan
+
+            axes[0].plot(
+                times[mask] * 1000, values,
+                alpha=0.45, linewidth=0.9,
+                label=f"Repeat {row['repeatIndex'] + 1}" if len(valid) <= 8 else None,
+            )
+            axes[0].plot(
+                row["onsetDelaySeconds"] * 1000,
+                row["thresholdVolts"], "o", color="tab:green", markersize=3,
+            )
+            axes[0].axvline(
+                offset * 1000, color="tab:red", alpha=0.15, linewidth=0.8,
+                label="Recorded black-frame presentation" if index == 0 else None,
+            )
+
+        axes[0].axvline(
+            0, color="black", linestyle="--",
+            label="Recorded white-frame presentation",
+        )
+        axes[0].plot(
+            [], [], "o", color="tab:green", markersize=4,
+            label="Detected threshold crossing",
+        )
+        axes[0].set(
+            title="Raw photodiode traces relative to recorded presentation",
+            xlabel="Time relative to white-frame presentation (ms)",
+            ylabel="Photodiode signal (V)",
+        )
+
+        repeatNumbers = np.asarray([row["repeatIndex"] + 1 for row in valid])
+        delays = np.asarray([row["onsetDelaySeconds"] for row in valid])
+        liveDelays = np.asarray([row["liveOnsetDelaySeconds"] for row in valid])
+        clockLower = np.asarray([
+            row["clockErrorIntervalSeconds"][0] for row in valid
+        ])
+        clockUpper = np.asarray([
+            row["clockErrorIntervalSeconds"][1] for row in valid
+        ])
+
+        axes[1].errorbar(
+            repeatNumbers, delays * 1000,
+            yerr=np.vstack([-clockLower, clockUpper]) * 1000,
+            fmt="o", capsize=3, color="tab:blue",
+            label="Selected mapping ± conditional clock interval",
+        )
+        axes[1].plot(
+            repeatNumbers, liveDelays * 1000, "x",
+            color="tab:orange", label="Original live-mapping delay",
+        )
+        for index, row in enumerate(valid):
+            lower, upper = row["sampleBracketDelaySeconds"]
+            axes[1].vlines(
+                repeatNumbers[index], lower * 1000, upper * 1000,
+                color="gray", linewidth=4, alpha=0.35,
+                label="Threshold-crossing sample bracket" if index == 0 else None,
+            )
+
+        stdText = (
+            f"{np.std(delays, ddof=1) * 1000:.3f} ms"
+            if len(delays) > 1 else "unavailable"
+        )
+        axes[1].set(
+            title=(
+                f"Mean onset delay: {np.mean(delays) * 1000:+.3f} ms | "
+                f"Across-repeat SD: {stdText} | n={len(valid)}"
+            ),
+            xlabel="Repeat (number)",
+            ylabel="Photodiode onset minus recorded presentation (ms)",
+        )
+        for axis in axes:
+            axis.grid(True, alpha=0.2)
+            axis.legend(fontsize=8)
+        fig.suptitle(
+            "Presentation-relative photodiode timing\n"
+            "Clock intervals are shared-model uncertainty, not total latency error bars",
+            fontsize=11,
+        )
+        return fig
+
+    def display(self, fig=None):
+        """Select the display appropriate to the recording's analysis provenance."""
+        if self.analysisMethod == "photodiodeThresholdRelativeToDrawablePresented":
+            self.printTemporalTimingReport()
+            return self.plotPresentationLatency(fig=fig)
+        return self._displayLegacyTemporal(fig=fig)
+
+
+
 
         
 # Calibration settings, subclass of pglSettings to inherit load/save functionality

@@ -268,186 +268,436 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
                 pglMessages.warning(f"Error writing digital channel {channel}: {e}")
                 return None
           
-    def startAnalogRead(self, duration=2, channels=[0], scanRate=1000, scansPerRead=1000, voltageRange=10.0):
-        """Start analog acquisition only when no digital stream owns the device."""
+    def startAnalogRead(
+        self, duration=2, channels=(0,), scanRate=1000,
+        scansPerRead=1000, voltageRange=10.0,
+    ):
+        """
+        Start analog acquisition and return its actual scan rate when ready.
+
+        Readiness means stream start and hardware-origin validation succeeded.
+        No fixed sleep is used as a substitute for readiness.
+        One uninterrupted stream; gaps/errors stop acquisition and retain data.
+        """
         with self._streamControlLock:
-            thread = self._digitalThread
-            if self._digitalStreamActive or (thread is not None and thread.is_alive()):
-                raise RuntimeError("Cannot start analog acquisition while digital acquisition is active")
+            if self._digitalStreamActive or (
+                self._digitalThread is not None and self._digitalThread.is_alive()
+            ):
+                raise RuntimeError("Digital acquisition owns the LabJack stream.")
+            if getattr(self, "_analogStreamActive", False) or self.isReading:
+                raise RuntimeError("Analog stream ownership is still active.")
             if self.acquisitionThread is not None and self.acquisitionThread.is_alive():
-                raise RuntimeError("Analog acquisition is already active")
-
-            return self._startAnalogRead(duration, channels, scanRate, scansPerRead, voltageRange)
+                raise RuntimeError("Analog acquisition worker is already active.")
+            return self._startAnalogRead(
+                duration, channels, scanRate, scansPerRead, voltageRange
+            )
           
-    def _startAnalogRead(self, duration=2, channels=[0], scanRate=1000, scansPerRead=1000, voltageRange=10.0):
-        '''
-        Start analog input reading from specified channels.
-        
-        Args:
-            duration (float): Duration of recording in seconds
-            channels (list): List of channel numbers or names
-            scanRate (int): Sampling rate in Hz
-            scansPerRead (int): Number of scans per read operation
-            voltageRange (float): Voltage range for analog inputs. Options: 10.0V, 1.0V, 0.1V, 0.01V
+    def _startAnalogRead(
+        self, duration=2, channels=(0,), scanRate=1000,
+        scansPerRead=1000, voltageRange=10.0,
+    ):
+        """Configure and synchronously establish an analog stream's timing."""
+        from copy import deepcopy
+        from uuid import uuid4
+        from numbers import Integral, Real
 
-        '''
         if self.h is None:
-            print("(pglLabJack:startAnalogRead) LabJack device not connected.")
-            return
-        
-        if self.isReading:
-            pglMessages.warning("Analog acquisition is already active")
-            return
+            raise RuntimeError("LabJack is not connected.")
+        if self.type != "T7":
+            raise RuntimeError("Clock-aligned analog acquisition currently supports T7.")
+        if self._clock is None or not self._clock.valid:
+            raise RuntimeError("No valid connection clock mapping.")
+        if self._clockStopEvent.is_set():
+            raise RuntimeError("Device closure has been requested.")
 
-        # Convert channel numbers to AIN names if needed
-        channelAddresses = []
-        for ch in channels:
-            if isinstance(ch, int):
-                channelAddresses.append(f"AIN{ch}")
-            else:
-                channelAddresses.append(ch)  # Already a string like "AIN0"
-        
-        # validate range 
-        validRanges = [10.0, 1.0, 0.1, 0.01]
-        if voltageRange not in validRanges:
-            print(f"(pglLabJack:startAnalogRead) Invalid range {voltageRange}V. Valid options: {validRanges}")
-            return
-        try:
-            # set each channel to the specified range
-            for channel in channelAddresses:
-                self.ljm.eWriteName(self.h, f"{channel}_RANGE", voltageRange)
-        except Exception as e:
-            print(f"(pglLabJack:startAnalogRead) Error setting range: {e}")
-            return
+        valuesToValidate = [("scanRate", scanRate)]
+        if duration is not None: valuesToValidate.append(("duration", duration))
+        for name, value in valuesToValidate:
+            if (
+                isinstance(value, (bool, np.bool_))
+                or not isinstance(value, Real)
+                or not np.isfinite(value) or value <= 0
+            ):
+                raise ValueError(f"{name} must be positive and finite.")
+        if (
+            isinstance(scansPerRead, (bool, np.bool_))
+            or not isinstance(scansPerRead, Integral) or scansPerRead < 1
+        ):
+            raise ValueError("scansPerRead must be a positive integer.")
+        if (
+            isinstance(voltageRange, (bool, np.bool_))
+            or voltageRange not in (10.0, 1.0, 0.1, 0.01)
+        ):
+            raise ValueError("Unsupported analog voltage range.")
 
-        # save parameters
-        self.channels = channelAddresses
-        self.scanRate = scanRate
-        self.scansPerRead = scansPerRead
-        self.range = voltageRange
-        self.analogStreamDuration = duration
+        channels = [channels] if isinstance(channels, str) else list(channels)
+        if not channels:
+            raise ValueError("At least one analog channel is required.")
+        channelNames = []
+        for channel in channels:
+            if isinstance(channel, (bool, np.bool_)):
+                raise ValueError("Boolean analog channel is invalid.")
+            if isinstance(channel, Integral):
+                if channel < 0:
+                    raise ValueError("Analog channel number must be nonnegative.")
+                channel = f"AIN{int(channel)}"
+            if not isinstance(channel, str) or not channel:
+                raise ValueError("Each analog channel must be an index or register name.")
+            channelNames.append(channel)
+        if len(set(channelNames)) != len(channelNames):
+            raise ValueError("Duplicate analog channels.")
+        if float(scanRate) * len(channelNames) > 100000:
+            raise ValueError(
+                "Analog request exceeds 100000 aggregate samples/s. "
+                "The scan rate was not changed."
+            )
 
-        # derived parameters
-        self.numChannels = len(channels)
-        self.totalScans = int(duration * scanRate)
-        self.totalReads = int(np.ceil(self.totalScans / scansPerRead))
-
-        if self.totalScans % scansPerRead != 0:
-            print(f"(pglLabJack:startAnalogRead) totalScans ({self.totalScans}) is not an integer multiple of scansPerRead ({scansPerRead}). Will collect {self.totalReads * scansPerRead} samples instead of {self.totalScans} and throw out extra samples.")
-            
-        # buffer and synchronization
+        self.channels = channelNames
+        self.numChannels = len(channelNames)
+        self.scansPerRead = int(scansPerRead)
+        self.range = float(voltageRange)
+        self.analogStreamDuration = None if duration is None else float(duration)
+        self.stopEvent.clear()
         self.analogBuffer = []
-        self.bufferLock = threading.Lock()
-        self.stopEvent = threading.Event()
+        self._analogStreamActive = False
+        self._analogClockSegment = None
 
-        # state flag
-        self.isReading = True
+        # Retain earlier acquisition diagnostics before resetting runtime state.
+        if getattr(self, "_analogStats", None):
+            if not hasattr(self, "_analogAcquisitionHistory"):
+                self._analogAcquisitionHistory = []
+            self._analogAcquisitionHistory.append(deepcopy(self._analogStats))
 
-        # start acquisition thread
-        self.acquisitionThread = threading.Thread(
-            target=self._analogReadThread,
-            daemon=True
-        )
-        self.acquisitionThread.start()
+        self._analogStats = {
+            "acquisitionId": str(uuid4()),
+            "connectionId": self.connectionId,
+            "channels": list(channelNames),
+            "scanOrder": list(channelNames),
+            "requestedScanRate": float(scanRate),
+            "scanRate": None,
+            "scansPerRead": int(scansPerRead),
+            "voltageRange": float(voltageRange),
+            "requestedDurationSeconds": None if duration is None else float(duration),
+            "samplesReturned": 0,
+            "validSampleCount": 0,
+            "firstInvalidSampleIndex": None,
+            "timelineValid": True,
+            "ready": False,
+            "error": None,
+            "cleanupErrors": [],
+            "batchDiagnostics": [],
+            "startRecord": {},
+            "clockEvents": self.getClockEvents(),
+            "channelApertureOffsetsSeconds": None,
+            "channelApertureUncertainty": "notEstablished",
+        }
+
+        stage = "configuration"
+        try:
+            with self._wordPulseLock:
+                with self._digitalIOLock:
+                    if self.ljm.eReadName(self.h, "STREAM_ENABLE") != 0:
+                        raise RuntimeError("Device reports an existing active stream.")
+
+                    for channel in channelNames:
+                        self.ljm.eWriteName(
+                            self.h, f"{channel}_RANGE", self.range
+                        )
+                    # Same supported stream-clock contract as calibrated digital IO.
+                    self.ljm.eWriteName(self.h, "STREAM_TRIGGER_INDEX", 0)
+                    self.ljm.eWriteName(self.h, "STREAM_CLOCK_SOURCE", 0)
+                    addresses = self.ljm.namesToAddresses(
+                        self.numChannels, channelNames
+                    )[0]
+
+                    record = self._analogStats["startRecord"]
+                    stage = "clockValidation"
+                    pre = self._readClockRegister(
+                        "CORE_TIMER", record, "coreBeforeStart"
+                    )
+                    preTicks = self._clock.resolveRead(pre)
+
+                    stage = "nativeStreamStart"
+                    record["startCallBefore"] = pglTimestamp.getSecs()
+                    try:
+                        actualRate = self.ljm.eStreamStart(
+                            self.h, self.scansPerRead, self.numChannels,
+                            addresses, float(scanRate),
+                        )
+                    except BaseException:
+                        # A native start exception can leave partial ownership.
+                        self._analogStreamActive = True
+                        raise
+                    finally:
+                        record["startCallAfter"] = pglTimestamp.getSecs()
+
+                    self._analogStreamActive = True
+                    stage = "clockValidation"
+                    if not np.isfinite(actualRate) or actualRate <= 0:
+                        raise ValueError(f"Invalid actual scan rate: {actualRate}")
+                    self.scanRate = float(actualRate)
+                    # Preserve the returned rate even if subsequent timing checks fail.
+                    self._analogStats["scanRate"] = self.scanRate
+                    record["scanRate"] = self.scanRate
+                    self.totalScans = (
+                        None if duration is None else int(np.ceil(duration * self.scanRate))
+                    )
+                    self.totalReads = (
+                        None if self.totalScans is None else
+                        int(np.ceil(self.totalScans / self.scansPerRead))
+                    )
+
+                    stamp = self._readClockRegister(
+                        "STREAM_START_TIME_STAMP", record, "streamStartStamp"
+                    )
+                    post = self._readClockRegister(
+                        "CORE_TIMER", record, "coreAfterStart"
+                    )
+                    postTicks = self._clock.resolveRead(post)
+
+                    startTicks = self._validateAnalogStartStamp(
+                        record, preTicks, postTicks
+                    )
+
+                    self.analogStartTimestamp = self._clock.toHost(startTicks)
+                    self._analogClockSegment = {
+                        "segmentId": 0,
+                        "streamStartTicks": int(startTicks),
+                        "rawStreamStartTicks": stamp["rawTicks"],
+                        "scanRate": self.scanRate,
+                        "mappingId": self._clock.mapping.eventId,
+                        "nominalTicksPerSecond": 40_000_000,
+                        "timestampMethod": "calibratedStreamStartSample",
+                        "deviceTimestampMethod": "streamStartStampPlusSampleOffset",
+                    }
+
+            stage = "workerStart"
+            self._analogStats.update({
+                "scanRate": self.scanRate,
+                "targetSampleCount": self.totalScans,
+                "segment": deepcopy(self._analogClockSegment),
+                "ready": True,
+                "readyTimestamp": pglTimestamp.getSecs(),
+            })
+            self.isReading = True
+            self.acquisitionThread = threading.Thread(
+                target=self._analogReadThread,
+                name="pglLabJackAnalogInput", daemon=True,
+            )
+            self.acquisitionThread.start()
+            return self.scanRate
+
+        except BaseException as error:
+            self._analogStats["error"] = f"{type(error).__name__}: {error}"
+            self._analogStats["ready"] = False
+            if stage == "clockValidation":
+                self._clock.valid = False
+
+            with self._digitalIOLock:
+                if self._analogStreamActive:
+                    try:
+                        try:
+                            self.ljm.eStreamStop(self.h)
+                        except Exception:
+                            if self.ljm.eReadName(self.h, "STREAM_ENABLE") != 0:
+                                raise
+                        self._analogStreamActive = False
+                    except Exception as cleanupError:
+                        self._analogStats["cleanupErrors"].append(
+                            f"{type(cleanupError).__name__}: {cleanupError}"
+                        )
+            # Preserve a failed-ownership flag so another stream cannot start.
+            self.isReading = self._analogStreamActive
+            pglMessages.warning(
+                f"LabJack analog acquisition could not start: "
+                f"{type(error).__name__}: {error}. "
+                "Settings were not changed. Diagnostics have been retained.",
+                level=2,
+            )
+            raise
            
     def _analogReadThread(self):
-        """
-        Thread function to read analog data from LabJack
-        """
-        
-        # record the start time of the stream
-        self.analogStartTimestamp = pglTimestamp.getSecs()
-        
-        # Convert channel names to addresses
-        try:
-            channelAddresses = self.ljm.namesToAddresses(self.numChannels, self.channels)[0]
-        except Exception as e:
-            print(f"(pglLabJack:analogReadThread) Error converting channel names: {e}")
-            self.isReading = False
-            return
-
-        # start stream
-        try:
-            self.scanRate = self.ljm.eStreamStart(
-                self.h,
-                self.scansPerRead,
-                self.numChannels,
-                channelAddresses,
-                self.scanRate
-            )
-        except Exception as e:
-            print(f"(pglLabJack:analogReadThread) Error starting stream: {e}")
-            self.isReading = False
-            return
-
-        # keep getting data until duration is reached or stop event is set
+        """Retain raw scans; stop at the first invalid/gap batch without compression."""
         try:
             while not self.stopEvent.is_set():
-                if (pglTimestamp.getSecs() - self.analogStartTimestamp) >= self.analogStreamDuration:
+                with self.bufferLock:
+                    returned = self._analogStats["samplesReturned"]
+                if self.totalScans is not None and returned >= self.totalScans:
                     break
 
-                # read the data from labJack stream
-                dataArray, deviceBacklog, ljmBacklog = self.ljm.eStreamRead(self.h)
+                with self._digitalIOLock:
+                    if self.stopEvent.is_set():
+                        break
+                    before = pglTimestamp.getSecs()
+                    values, deviceBacklog, ljmBacklog = self.ljm.eStreamRead(self.h)
+                    after = pglTimestamp.getSecs()
 
-                # copy over the data that was received
+                raw = np.asarray(values, dtype=np.float64)
+                batch = {
+                    "hostReadBefore": before,
+                    "hostReadAfter": after,
+                    "firstReturnedSampleIndex": returned,
+                    "valueCount": int(raw.size),
+                    "deviceBacklog": int(deviceBacklog),
+                    "ljmBacklog": int(ljmBacklog),
+                    "classification": "valid",
+                }
+
+                malformed = (
+                    raw.ndim != 1 or raw.size == 0
+                    or raw.size % self.numChannels != 0
+                )
+                invalidOffset = None
+                if not malformed:
+                    rows = raw.reshape(-1, self.numChannels)
+                    invalidRows = np.flatnonzero(
+                        np.any(~np.isfinite(rows) | (rows == -9999), axis=1)
+                    )
+                    if invalidRows.size:
+                        invalidOffset = int(invalidRows[0])
+
                 with self.bufferLock:
-                    self.analogBuffer.extend(dataArray)
+                    # Preserve every returned value, including invalid markers
+                    # and incomplete trailing words.
+                    self.analogBuffer.extend(raw.reshape(-1).tolist())
+                    completeScans = raw.size // self.numChannels
+                    self._analogStats["samplesReturned"] += int(completeScans)
+
+                    if malformed or invalidOffset is not None:
+                        batch["classification"] = (
+                            "malformedBatch" if malformed else "invalidOrMissingScan"
+                        )
+                        batch["rawFailureValues"] = [
+                            float(value) if np.isfinite(value) else repr(float(value))
+                            for value in raw.reshape(-1)
+                        ]
+                        firstInvalid = returned + (
+                            0 if malformed else invalidOffset
+                        )
+                        self._analogStats["timelineValid"] = False
+                        self._analogStats["firstInvalidSampleIndex"] = firstInvalid
+                        self._analogStats["validSampleCount"] = firstInvalid
+                    else:
+                        self._analogStats["validSampleCount"] += int(completeScans)
+
+                    self._analogStats["batchDiagnostics"].append(batch)
+
+                if malformed or invalidOffset is not None:
+                    raise RuntimeError(
+                        "Analog stream contains missing/invalid samples. "
+                        "Raw values retained; timing after the first invalid position "
+                        "is not treated as continuous."
+                    )
+
+        except Exception as error:
+            with self.bufferLock:
+                self._analogStats["error"] = f"{type(error).__name__}: {error}"
+            pglMessages.warning(
+                f"LabJack analog acquisition stopped: {error}. "
+                "Partial data and diagnostics have been retained.",
+                level=2,
+            )
 
         finally:
             try:
-                # stop the stream
-                self.ljm.eStreamStop(self.h)
-            except Exception:
-                pass
-
-            self.isReading = False
+                with self._digitalIOLock:
+                    if self._analogStreamActive:
+                        try:
+                            self.ljm.eStreamStop(self.h)
+                        except Exception:
+                            if self.ljm.eReadName(self.h, "STREAM_ENABLE") != 0:
+                                raise
+                        self._analogStreamActive = False
+            except Exception as error:
+                with self.bufferLock:
+                    self._analogStats["cleanupErrors"].append(
+                        f"{type(error).__name__}: {error}"
+                    )
+                pglMessages.warning(
+                    f"LabJack analog stream cleanup failed: {error}. "
+                    "Ownership and diagnostics are retained.",
+                    level=2,
+                )
+            finally:
+                # Block another acquisition if hardware ownership is unresolved.
+                self.isReading = self._analogStreamActive
 
     def stopAnalogRead(self, waitToFinish=False, doNotTruncate=False):
         """
-        Stop the analog reading and return time and data arrays.
-        
-        Args:
-            waitToFinish (bool): If True, waits for the acquisition thread to finish before returning data.
-                                 If False, signals the thread to stop and returns immediately with whatever data has been collected so far.
-            doNotTruncate (bool): If True, do not truncate the data to the exact number of samples.
-                                 If False (default), truncates the data to the expected number of samples based on duration and scan rate.  
-        Returns:
-            data: pglAnalogTraceData which holds time and data
+        Stop/join owned acquisition and return its retained trace, including partial data.
+
+        time remains device-relative seconds. Hardware-derived origin and
+        calibration records are in trace.timing.
+
+        Worker data errors are exposed in trace.timing/status rather than erasing
+        partial data. An unresolved worker/stream ownership failure raises.
         """
-        if self.h is None:
-            pglMessages.warning("Device not initialized")
-            return None
+        from copy import deepcopy
 
-        # If acquisition is active, request stop when not waiting
-        if not waitToFinish and self.isReading:
-            self.stopEvent.set()
+        with self._streamControlLock:
+            if waitToFinish and getattr(self, 'totalScans', None) is None:
+                raise ValueError('Stop-controlled acquisition requires waitToFinish=False.')
+            if not waitToFinish:
+                self.stopEvent.set()
+            thread = self.acquisitionThread
+            if thread is threading.current_thread():
+                raise RuntimeError("Analog worker cannot join itself.")
+            if thread is not None and thread.is_alive():
+                # Preserve waitToFinish behavior for intentional duration waits.
+                thread.join(timeout=None if waitToFinish else 5.0)
+                if thread.is_alive():
+                    raise TimeoutError("Analog worker did not stop; handle retained.")
 
-        # If acquisition thread exists, wait for it to finish
-        if self.acquisitionThread is not None and self.acquisitionThread.is_alive():
-            pglMessages.message("waiting for analog acquisition to end")
-            self.acquisitionThread.join()
+            status = self.getAnalogReadStatus()
+            if status.get("streamActive"):
+                raise RuntimeError("Analog stream ownership is unresolved.")
 
-        # copy data safely
-        with self.bufferLock:
-            data = np.array(self.analogBuffer)
+            with self.bufferLock:
+                raw = np.asarray(self.analogBuffer, dtype=np.float64).copy()
 
-        if data.size == 0:
-            pglMessages.warning("No data read")
-            return None
+            segment = getattr(self, "_analogClockSegment", None)
+            if segment is None:
+                if raw.size:
+                    raise RuntimeError("Raw analog data have no validated timing segment.")
+                return None
 
-        # Reshape data to separate channels
-        # data shape will be (numSamples, numChannels)
-        numSamples = len(data) // self.numChannels
-        data = data[:numSamples * self.numChannels] 
-        data = data.reshape(numSamples, self.numChannels)
+            completeCount = raw.size // self.numChannels
+            data = raw[:completeCount * self.numChannels].reshape(
+                completeCount, self.numChannels
+            )
+            returnedCount = completeCount
+            if not doNotTruncate and self.totalScans is not None:
+                data = data[:self.totalScans]
+            sampleCount = len(data)
 
-        # truncate to exact number of samples
-        if not doNotTruncate and numSamples > self.totalScans:
-            data = data[:self.totalScans, :]
-            numSamples = self.totalScans
-
-        sampleTimes = np.arange(numSamples) / self.scanRate
-        return pglAnalogTraceData(time=sampleTimes, data=data, channelNames=self.channels)            
+            timing = {
+                "acquisitionId": status["acquisitionId"],
+                "connectionId": self.connectionId,
+                "segment": deepcopy(segment),
+                "liveMappingId": segment["mappingId"],
+                "mappingId": segment["mappingId"],
+                "validSampleCount": min(
+                    sampleCount, status["validSampleCount"]
+                ),
+                "timelineValid": status["timelineValid"],
+                "status": status,
+                "clockEvents": self.getClockEvents(),
+                "returnedCompleteSampleCount": returnedCount,
+                "truncatedSampleCount": returnedCount - sampleCount,
+                "incompleteTrailingValues": [
+                    float(value) if np.isfinite(value) else repr(float(value))
+                    for value in raw[completeCount * self.numChannels:]
+                ],
+                "channelApertureOffsetsSeconds": None,
+                "channelApertureUncertainty": "notEstablished",
+            }
+            return pglAnalogTraceData(
+                time=np.arange(sampleCount) / self.scanRate,
+                data=data,
+                channelNames=self.channels,
+                scanRate=self.scanRate,
+                timing=timing,
+            )
               
     def __del__(self):
         """Attempt cleanup; explicit close() remains required for reliable shutdown."""
@@ -477,6 +727,13 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
             with self._wordPulseLock:
                 with self._digitalIOLock:
                     if self.h is not None:
+                        if getattr(self, "_analogStreamActive", False):
+                            try:
+                                self.ljm.eStreamStop(self.h)
+                            except Exception:
+                                if self.ljm.eReadName(self.h, "STREAM_ENABLE") != 0:
+                                    raise
+                            self._analogStreamActive = False
                         self.ljm.close(self.h)
                         self.h = None
 
@@ -2838,6 +3095,231 @@ class pglLabJack(pglDigitalIODevice, pglAnalogInputDevice):
                 "No accuracy or drift estimate is claimed for this failed check."
             )
             raise    
+
+    def getAnalogReadStatus(self):
+        """Independent diagnostics without hardware reads."""
+        from copy import deepcopy
+
+        with self.bufferLock:
+            status = deepcopy(getattr(self, "_analogStats", {}))
+        thread = self.acquisitionThread
+        status["running"] = thread is not None and thread.is_alive()
+        status["streamActive"] = getattr(self, "_analogStreamActive", False)
+        return status
+
+
+    def getAnalogReadSnapshot(self):
+        """
+        Copy currently buffered analog data without hardware access or stopping.
+
+        A snapshot is not a shutdown operation. If acquisition remains active,
+        later samples are not included and remain in the driver.
+
+        Data with no validated stream origin are retained but cannot be used
+        for calibrated timing. Relative sample times are unavailable (NaN)
+        when no actual scan rate was established.
+        """
+        from copy import deepcopy
+
+        with self.bufferLock:
+            status = deepcopy(getattr(self, "_analogStats", {}))
+            if not status:
+                raise RuntimeError("No analog acquisition record is available.")
+
+            channelNames = list(status["channels"])
+            channelCount = len(channelNames)
+            if channelCount < 1:
+                raise RuntimeError("Analog scan order is unavailable.")
+
+            raw = np.asarray(self.analogBuffer, dtype=np.float64).copy()
+            segment = deepcopy(getattr(self, "_analogClockSegment", None))
+            thread = self.acquisitionThread
+            workerRunning = thread is not None and thread.is_alive()
+            streamActive = bool(getattr(self, "_analogStreamActive", False))
+            snapshotTime = pglTimestamp.getSecs()
+
+        completeCount = raw.size // channelCount
+        data = raw[:completeCount * channelCount].reshape(
+            completeCount, channelCount
+        )
+        rate = status.get("scanRate")
+        validRate = (
+            rate is not None
+            and not isinstance(rate, (bool, np.bool_))
+            and np.isfinite(rate) and rate > 0
+        )
+        originValidated = segment is not None and validRate
+        validCount = (
+            min(completeCount, int(status.get("validSampleCount", 0)))
+            if originValidated else 0
+        )
+
+        if validRate:
+            relativeTime = np.arange(completeCount) / float(rate)
+        else:
+            relativeTime = np.full(completeCount, np.nan)
+
+        status["running"] = workerRunning
+        status["streamActive"] = streamActive
+        incomplete = (
+            workerRunning or streamActive
+            or not originValidated
+            or bool(status.get("error"))
+            or bool(status.get("cleanupErrors"))
+            or not status.get("timelineValid", False)
+        )
+
+        timing = {
+            "acquisitionId": status.get("acquisitionId"),
+            "connectionId": self.connectionId,
+            "segment": segment,
+            "liveMappingId": segment.get("mappingId") if segment else None,
+            "mappingId": segment.get("mappingId") if segment else None,
+            "validSampleCount": validCount,
+            "timelineValid": bool(
+                originValidated and status.get("timelineValid", False)
+            ),
+            "status": status,
+            "clockEvents": deepcopy(status.get("clockEvents", [])),
+            "returnedCompleteSampleCount": completeCount,
+            "truncatedSampleCount": 0,
+            "incompleteTrailingValues": [
+                float(value) if np.isfinite(value) else repr(float(value))
+                for value in raw[completeCount * channelCount:]
+            ],
+            "snapshotTimestamp": snapshotTime,
+            "snapshotIncomplete": bool(incomplete),
+            "snapshotScope": "bufferedValuesAtSnapshotNotAStopConfirmation",
+            "additionalSamplesMayArrive": bool(workerRunning or streamActive),
+            "relativeSampleTimesAvailable": bool(validRate),
+            "channelApertureOffsetsSeconds": None,
+            "channelApertureUncertainty": "notEstablished",
+        }
+        return pglAnalogTraceData(
+            time=relativeTime,
+            data=data,
+            channelNames=channelNames,
+            scanRate=float(rate) if validRate else None,
+            timing=timing,
+        )
+
+
+    def _validateAnalogStartStamp(
+        self, record, preTicks, postTicks, validationTimeout=1.0,
+    ):
+        """
+        Validate a stable start stamp against nearby advancing CORE_TIMER reads.
+
+        Caller holds _digitalIOLock. This performs startup validation only,
+        never periodic reads during acquisition or poll().
+
+        A stamp slightly ahead of the current timer may describe an upcoming
+        first scan. Do not declare readiness until the timer reaches it and a
+        second stamp read agrees. This is conditional consistency evidence,
+        not independent proof of first-scan semantics.
+        """
+        import time
+
+        modulus = 1 << 32
+        preRaw = record["coreBeforeStart"]["rawTicks"]
+        originalRaw = record["streamStartStamp"]["rawTicks"]
+
+        validation = {
+            "method": "stableStampReachedByNearbyCoreTimer",
+            "status": "checking",
+            "timeoutSeconds": float(validationTimeout),
+            "observations": [],
+            "failureReason": None,
+            "initialStampAheadOfTimer": None,
+            "firstScanSemanticsIndependentlyVerified": False,
+        }
+        record["stampValidation"] = validation
+        started = time.monotonic()
+
+        try:
+            if validationTimeout <= 0:
+                raise ValueError("Startup stamp validation timeout must be positive.")
+            if not 0 <= postTicks - preTicks < modulus / 2:
+                raise RuntimeError(
+                    "Analog startup timer interval is inconsistent or too long "
+                    "for this nearby-stamp validation."
+                )
+
+            # Resolve near the pre-start timer, allowing a short future stamp.
+            # A value behind the pre-start observation is not silently called
+            # an almost-complete future wrap.
+            delta = (
+                (originalRaw - preRaw + modulus // 2) % modulus
+                - modulus // 2
+            )
+            startTicks = int(preTicks + delta)
+            if startTicks < preTicks:
+                raise RuntimeError("Analog stream-start stamp precedes pre-start timer.")
+
+            validation["initialStampAheadOfTimer"] = bool(startTicks > postTicks)
+            validation["initialStampMinusPostTicks"] = int(startTicks - postTicks)
+            validation["resolvedStartTicks"] = startTicks
+            stableReadCount = 1
+
+            while True:
+                if self.stopEvent.is_set() or self._clockStopEvent.is_set():
+                    raise RuntimeError("Analog start-stamp validation cancelled.")
+                if time.monotonic() - started >= validationTimeout:
+                    raise TimeoutError(
+                        "Analog timer did not establish a stable reached stream-start "
+                        "stamp within the startup validation limit."
+                    )
+
+                attempt = {}
+                validation["observations"].append(attempt)
+
+                stamp = self._readClockRegister(
+                    "STREAM_START_TIME_STAMP", attempt, "streamStartStamp"
+                )
+                if stamp["rawTicks"] != originalRaw:
+                    raise RuntimeError(
+                        "Analog stream-start stamp changed during validation."
+                    )
+                stableReadCount += 1
+
+                timer = self._readClockRegister(
+                    "CORE_TIMER", attempt, "coreTimer"
+                )
+                currentTicks = self._clock.resolveRead(timer)
+                if (
+                    currentTicks < postTicks
+                    or not 0 <= currentTicks - preTicks < modulus / 2
+                ):
+                    raise RuntimeError(
+                        "Analog timer progression is inconsistent during startup."
+                    )
+                postTicks = currentTicks
+
+                # Do not claim success if the validation operation itself
+                # exceeded the bound. Native reads cannot be interrupted here.
+                if time.monotonic() - started >= validationTimeout:
+                    raise TimeoutError("Analog start-stamp validation exceeded its time limit.")
+
+                if currentTicks >= startTicks:
+                    validation.update({
+                        "status": "validatedConditional",
+                        "stableStampReadCount": stableReadCount,
+                        "confirmingTimerTicks": int(currentTicks),
+                        "elapsedSeconds": time.monotonic() - started,
+                    })
+                    record["streamStartStamp"]["unwrappedTicks"] = startTicks
+                    return startTicks
+
+                # Backoff, not an assumption that a fixed sleep establishes readiness.
+                time.sleep(0.001)
+
+        except BaseException as error:
+            validation["status"] = "failed"
+            validation["failureReason"] = f"{type(error).__name__}: {error}"
+            validation["elapsedSeconds"] = time.monotonic() - started
+            raise
+
+
 
 class pglLabJackCounterMatcher:
     """

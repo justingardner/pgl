@@ -1563,6 +1563,63 @@ class pglLabJackSettings(pglTraitSettings):
             raise ValueError("LabJack presets require a filename-compatible name other than 'None'")
         return pglSettingsManager.getLabJackSettingsDir() / f"{filename}.json"
 
+
+    analogChannels = List(
+        Unicode(), default_value=["AIN0", "AIN1", "AIN2"],
+        help="Analog scan order used for temporal calibration; no channels are substituted."
+    )
+    analogScanRate = Float(
+        1500.0, help="Requested analog scans per second; actual returned rate is retained."
+    )
+    analogScansPerRead = Int(
+        1500, help="Analog scans returned per stream read."
+    )
+    analogVoltageRange = Float(
+        10.0, help="Analog input range: 10, 1, 0.1, or 0.01 volts."
+    )
+
+    def getAnalogReadConfig(self):
+        """Return validated analog options without changing or saving the preset."""
+        channels = list(self.analogChannels)
+        if (
+            not channels
+            or any(
+                not isinstance(channel, str)
+                or re.fullmatch(r"AIN[0-9]+", channel) is None
+                for channel in channels
+            )
+            or len(channels) != len(set(channels))
+        ):
+            raise ValueError("analogChannels must contain distinct explicit AIN names.")
+
+        rate = self.analogScanRate
+        count = self.analogScansPerRead
+        voltageRange = self.analogVoltageRange
+        if isinstance(rate, (bool, np.bool_)) or not np.isfinite(rate) or rate <= 0:
+            raise ValueError("analogScanRate must be positive and finite.")
+        if (
+            isinstance(count, (bool, np.bool_))
+            or not isinstance(count, (int, np.integer)) or count <= 0
+        ):
+            raise ValueError("analogScansPerRead must be a positive integer.")
+        if (
+            isinstance(voltageRange, (bool, np.bool_))
+            or voltageRange not in (10.0, 1.0, 0.1, 0.01)
+        ):
+            raise ValueError("Unsupported analogVoltageRange.")
+        if len(channels) * rate > 100000:
+            raise ValueError(
+                "Analog request exceeds 100000 aggregate samples/s. "
+                "The rate was not changed."
+            )
+        return {
+            "channels": channels,
+            "scanRate": float(rate),
+            "scansPerRead": int(count),
+            "voltageRange": float(voltageRange),
+        }
+
+
 ##################################################
 # LabJack preset editor
 ##################################################

@@ -519,7 +519,7 @@ class pglAnalogInputDevice(pglDevice):
 class pglAnalogTraceData(pglSerialize):
     # Stores short trains of analog data created by pglDigitalIODevice
     # and offers functions for display
-    def __init__(self, time, data, channelNames=None):
+    def __init__(self, time, data, channelNames=None, *, scanRate=None, timing=None):
         '''
         store the time and data
         '''
@@ -555,6 +555,10 @@ class pglAnalogTraceData(pglSerialize):
         
         # store the normalized channel names
         self.channelNames = normalizedChannelNames
+
+        from copy import deepcopy
+        self.scanRate = None if scanRate is None else float(scanRate)
+        self.timing = deepcopy(timing)
         
     def __len__(self):
         if self.time is not None:
@@ -897,6 +901,106 @@ class pglAnalogTraceData(pglSerialize):
         
         # Return figure and axes dictionary
         return retval
+
+    def getSampleTiming(self, samplePosition, mappingId=None):
+        """
+        Convert a possibly fractional sample position using retained clock records.
+
+        Does not infer photon/edge onset accuracy from interpolation.
+        Invalid/missing regions cannot supply timestamps.
+        """
+        import math
+        from numbers import Real
+
+        timing = getattr(self, "timing", None)
+        if not timing:
+            raise RuntimeError("This trace has no calibrated clock metadata.")
+        if (
+            isinstance(samplePosition, (bool, np.bool_))
+            or not isinstance(samplePosition, Real)
+            or not np.isfinite(samplePosition)
+            or samplePosition < 0 or samplePosition > self.nSamples - 1
+        ):
+            raise ValueError("Sample position is outside the recorded trace.")
+
+        validCount = timing["validSampleCount"]
+        if math.ceil(samplePosition) >= validCount:
+            raise ValueError("Sample position touches an invalid/missing region.")
+
+        mappingId = timing["mappingId"] if mappingId is None else mappingId
+        records = timing["clockEvents"]
+        mappings = [
+            record for record in records
+            if record.type == "labJackClockMapping" and record.eventId == mappingId
+        ]
+        if len(mappings) != 1 or mappings[0].status != "validConditional":
+            raise ValueError("No unique applicable mapping is retained.")
+        mapping = mappings[0]
+        if mapping.connectionId != timing["connectionId"]:
+            raise ValueError("Mapping belongs to another device connection.")
+
+        collections = []
+        for eventId in mapping.calibrationEventIds:
+            matches = [
+                record for record in records
+                if record.type == "labJackClockCalibration"
+                and record.eventId == eventId
+            ]
+            if len(matches) != 1 or matches[0].connectionId != mapping.connectionId:
+                raise ValueError("Calibration reference is missing, ambiguous, or foreign.")
+            collections.append(matches[0])
+
+        segment = timing["segment"]
+        parameters = mapping.parameters
+        nominalRate = parameters["nominalTicksPerSecond"]
+
+        # Subtract integer references before converting to floating-point seconds.
+        deviceSeconds = (
+            (segment["streamStartTicks"] - parameters["tickReference"]) / nominalRate
+            + float(samplePosition) / segment["scanRate"]
+        )
+        hostBase = parameters["hostBase"]
+        offset = parameters["hostReferenceOffset"]
+        scale = parameters["clockScale"]
+        estimateRelative = deviceSeconds + offset + (scale - 1) * deviceSeconds
+
+        projected = [
+            deviceSeconds + a + drift * deviceSeconds
+            for a, drift in parameters["affineRegion"]
+        ]
+        observedTicks = [
+            row["unwrappedTicks"]
+            for collection in collections
+            for row in collection.observations
+            if row.get("unwrappedTicks") is not None
+        ]
+        if not observedTicks:
+            raise ValueError("Mapping has no resolved supporting observations.")
+
+        coordinate = (
+            segment["streamStartTicks"]
+            + float(samplePosition) * nominalRate / segment["scanRate"]
+        )
+        return {
+            "timestamp": hostBase + estimateRelative,
+            "clockMappingId": mappingId,
+            "labJackTimestamp": (
+                segment["streamStartTicks"] / nominalRate
+                + float(samplePosition) / segment["scanRate"]
+            ),
+            "samplePosition": float(samplePosition),
+            "sampleSpacingSeconds": scale / segment["scanRate"],
+            "clockErrorLowerSeconds": min(projected) - estimateRelative,
+            "clockErrorUpperSeconds": max(projected) - estimateRelative,
+            "outsideObservationSpan": not min(observedTicks) <= coordinate <= max(observedTicks),
+            "boundStatus": "conditional",
+            "totalTimingBoundAvailable": False,
+            "unknownContributions": [
+                "hostTimestampUncertainty",
+                "withinRunNonlinearClockVariation",
+                "channelApertureUncertainty",
+            ],
+        }
  
         
         

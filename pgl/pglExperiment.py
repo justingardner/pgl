@@ -971,7 +971,7 @@ class pglExperiment(pglExperimentBase):
     def __repr__(self):
         return f"<pglExperiment: {len(self.task)} phases>"
     
-    def initScreen(self, backgroundColor=-1, recordFlush=True, recordCommands=False, estimatedDuration=600):
+    def initScreen(self, backgroundColor=-1, recordFlush=True, recordCommands=False, estimatedDuration=600, startRecording=True):
         '''
         Initialize the screen, start recording, and configure tasks.
 
@@ -984,6 +984,12 @@ class pglExperiment(pglExperimentBase):
         Movie timing is retained independently of the two recording flags.
         Existing recordings must be explicitly saved/exported and cleared.
         '''
+
+        # Temporal batch calibration collects its own frame results.
+        # False skips recording-session creation only, not display/device setup.
+        if type(startRecording) is not bool:
+            raise TypeError("startRecording must be Boolean.")
+
         
         # Never operate on an incompletely initialized experiment.
         if not getattr(self, "isInitialized", False):
@@ -1165,7 +1171,8 @@ class pglExperiment(pglExperimentBase):
             self._validateVolumeTriggerSource()
 
             # Start before configure(), which may create stimulus resources.
-            self._startExperimentRecording(estimatedDuration, recordFlush, recordCommands)
+            if startRecording:
+                self._startExperimentRecording(estimatedDuration, recordFlush, recordCommands)
 
             # Record mask creation so command replay can recreate the stencil.
             # Visual-angle coordinates and display flips are already configured.
