@@ -64,7 +64,7 @@ class pglActionsMRI(pglActionCollection):
             raise ValueError("Select each acquisition UUID only once.")
 
         return [{"scanIndex": index, "scanUUID": scans[index].uuid} for index in indices]
-    
+
     ################################################################
     # Prepare geometry groups and explicit run-alignment references
     ################################################################
@@ -1327,8 +1327,9 @@ class pglActionsMRI(pglActionCollection):
         """Estimate rigid motion and optionally correct original acquisitions.
 
         scanIndices are zero-based session.mri.scans indices.
-        None selects all attached scans; nonfunctional scans are not silently
-        skipped or classified from their names.
+        When omitted, saved scan/run matches are selected automatically.
+        Without saved correspondence, configuration prompts for scans.
+        Single-volume acquisitions cannot be motion-corrected.
 
         This initial action accepts original acquisition sources only.
         No dummy removal or temporal correction is implicit.
@@ -1340,7 +1341,7 @@ class pglActionsMRI(pglActionCollection):
 
         The inherited _run() coordinates _estimate() and _apply().
         """
-        scanIndices = List(Int(), default_value=None, allow_none=True, help="Zero-based MRI scan indices; None opens selection during configuration.")
+        scanIndices = List(Int(), default_value=None, allow_none=True, help="Zero-based MRI scan indices; None uses saved scan/run matches or opens selection.")
         referenceVolume = Union([Int(min=0), Enum(["mid", "middle", "first", "last"])], default_value="mid", help="Reference within each scan: mid (default), middle, first, last, or a zero-based index.")
         twoPass = Bool(True, help="Use AFNI two-pass motion estimation.")
         outputName = Unicode("motion", help="Name of the motion-estimation product.")
@@ -1354,13 +1355,13 @@ class pglActionsMRI(pglActionCollection):
         # Configure and select scans
         ################################
         def configure(self, session=None, **kwargs) -> bool:
-            """Configure motion estimation, prompting when scanIndices is None.
+            """Configure motion estimation using matches or an explicit picker.
 
-            Explicit or previously configured indices bypass the dialog.
-            Pass scanIndices=None with a session to open selection again.
+            Explicit indices bypass selection. Saved scan/run matches are
+            selected automatically; without correspondence, a picker opens.
 
             Reference rules are resolved independently for each acquisition.
-            Single-volume acquisitions are silently omitted from the dialog.
+            Single-volume acquisitions are omitted.
             Returns False on cancellation or unavailable selection.
             """
             from .pglMRI import pglMRINiftiMetadata
@@ -1391,7 +1392,19 @@ class pglActionsMRI(pglActionCollection):
                 pglMessages.warning("Supply session to select MRI scans, or configure explicit scanIndices.", level=1)
                 return False
 
-            selectedScans = pglActionsMRI._selectAcquisitionScans(session.mri)
+            matchedIndices = (
+                None
+                if session.scanRunCorrespondence is None else
+                [scanIndex for scanIndex, _ in session.getScanRunMatches()]
+            )
+            if matchedIndices == []:
+                pglMessages.warning("No MRI scans are matched to behavioral runs.", level=1)
+                return False
+
+            selectedScans = pglActionsMRI._selectAcquisitionScans(
+                session.mri,
+                matchedIndices,
+            )
             scanLabels = []
             eligibleIndices = []
 
@@ -1439,19 +1452,22 @@ class pglActionsMRI(pglActionCollection):
                 pglMessages.warning("No scans support within-run motion with the requested reference volume.", level=1)
                 return False
 
-            # Import the GUI module only for interactive configuration.
-            from .pglDialog import pglDialogs
+            if matchedIndices is None:
+                from .pglDialog import pglDialogs
 
-            selectedPositions = pglDialogs.selectItems(
-                scanLabels,
-                title=f"Select MRI scans — within-run reference: {self.referenceVolume}",
-            )
-            if selectedPositions is None:
-                pglMessages.message("Motion scan selection cancelled; no processing was started.")
-                return False
+                selectedPositions = pglDialogs.selectItems(
+                    scanLabels,
+                    title=f"Select MRI scans — within-run reference: {self.referenceVolume}",
+                )
+                if selectedPositions is None:
+                    pglMessages.message("Motion scan selection cancelled; no processing was started.")
+                    return False
 
-            # Dialog indices refer to scanLabels, not session.mri.scans.
-            indices = [eligibleIndices[position] for position in selectedPositions]
+                # Dialog indices refer to scanLabels, not session.mri.scans.
+                indices = [eligibleIndices[position] for position in selectedPositions]
+            else:
+                indices = eligibleIndices
+
             pglActionsMRI._selectAcquisitionScans(session.mri, indices)
             self.scanIndices = indices
 
@@ -2154,6 +2170,10 @@ class pglActionsMRI(pglActionCollection):
         Explicitly consumes a within-run motion product.
         Uses each scan's recorded reference volume—not an assumed volume zero.
 
+        When scanIndices is omitted, saved scan/run matches are selected.
+        Without correspondence, configuration prompts among scans covered by
+        the supplied within-run motion product.
+
         Matching acquisition grids form independent groups.
         referenceRun selects the common scan independently within each group:
             first, middle, last, explicit session.mri.scans index,
@@ -2180,7 +2200,7 @@ class pglActionsMRI(pglActionCollection):
             Int(),
             default_value=None,
             allow_none=True,
-            help="Zero-based session.mri.scans indices; None selects all.",
+            help="Zero-based session.mri.scans indices; None uses saved scan/run matches or opens selection.",
         )
         referenceRun = Union(
             [
@@ -2198,6 +2218,94 @@ class pglActionsMRI(pglActionCollection):
         cacheDirectory = Unicode(default_value=None, allow_none=True, help="Local working-cache override.")
         timeout = Float(default_value=None, allow_none=True, help="Timeout in seconds for each alignment fit.")
 
+        def configure(self, session=None, **kwargs) -> bool:
+            """Configure scan selection from saved matches or a product-aware picker."""
+            from .pglPipeline import pglActionStatus
+            from .pglSession import pglSession
+
+            self.status = pglActionStatus.INITIALIZED
+            self.configureTraits(**kwargs)
+
+            if session is not None and (not isinstance(session, pglSession) or session.mri is None):
+                raise ValueError("Run-alignment scan selection requires a session with MRI scans.")
+
+            if self.scanIndices is not None:
+                if not self.scanIndices or any(type(index) is not int or index < 0 for index in self.scanIndices):
+                    raise ValueError("scanIndices must contain nonnegative MRI scan indices.")
+                if len(set(self.scanIndices)) != len(self.scanIndices):
+                    raise ValueError("scanIndices must not contain duplicates.")
+                if session is not None:
+                    pglActionsMRI._selectAcquisitionScans(session.mri, self.scanIndices)
+
+                super().configure()
+                return True
+
+            if session is None:
+                super().configure()
+                return True
+
+            matchedIndices = (
+                None
+                if session.scanRunCorrespondence is None else
+                [scanIndex for scanIndex, _ in session.getScanRunMatches()]
+            )
+            if matchedIndices is not None:
+                if not matchedIndices:
+                    pglMessages.warning("No MRI scans are matched to behavioral runs.", level=1)
+                    return False
+                pglActionsMRI._selectAcquisitionScans(session.mri, matchedIndices)
+                self.scanIndices = matchedIndices
+                super().configure()
+                return True
+
+            indices = self._selectScansFromMotionProduct(session)
+            if indices is None: return False
+
+            pglActionsMRI._selectAcquisitionScans(session.mri, indices)
+            self.scanIndices = indices
+            super().configure()
+            return True
+
+        def _selectScansFromMotionProduct(self, session):
+            """Prompt from scans covered by this action's explicit motion product."""
+            if self.withinRunMotion is None:
+                pglMessages.warning(
+                    "Supply withinRunMotion to choose scans, or configure explicit scanIndices.",
+                    level=1,
+                )
+                return None
+
+            motionProduct = self.withinRunMotion.resolve(session)
+            if motionProduct is None: return None
+            if motionProduct.kind != "rigidMotion":
+                pglMessages.warning("withinRunMotion must select a rigidMotion product.")
+                return None
+
+            motionByScan = pglActionsMRI._validateMotionProduct(motionProduct.record)
+            scanLabels = []
+            eligibleIndices = []
+            for scanIndex, scan in enumerate(session.mri.scans):
+                if scan.uuid not in motionByScan: continue
+                scanName = scan.name.replace("\n", " ").replace("\r", " ")
+                scanLabels.append(f"{scanIndex}: {scanName}")
+                eligibleIndices.append(scanIndex)
+
+            if not scanLabels:
+                pglMessages.warning("The within-run motion product covers no scans in this session.", level=1)
+                return None
+
+            from .pglDialog import pglDialogs
+
+            selectedPositions = pglDialogs.selectItems(
+                scanLabels,
+                title="Select MRI scans for across-run alignment",
+            )
+            if selectedPositions is None:
+                pglMessages.message("Run-alignment scan selection cancelled; no processing was started.")
+                return None
+
+            return [eligibleIndices[position] for position in selectedPositions]
+
         def _estimate(self, session):
             """Estimate from explicit recorded references and retain exact inputs."""
             from .pglSession import pglSession
@@ -2212,6 +2320,12 @@ class pglActionsMRI(pglActionCollection):
                     "Supply withinRunMotion explicitly, for example "
                     "pglProductSelector('motion', kind='rigidMotion')."
                 )
+            if self.scanIndices is None:
+                raise ValueError(
+                    "Select scans during configuration with session=..., "
+                    "or supply explicit scanIndices."
+                )
+
             if self.outputName == self.correctedOutputName:
                 raise ValueError("Alignment and corrected-image products need different names.")
 
