@@ -2576,6 +2576,293 @@ class pglExternalTool:
     
     
 ################################################################
+# dcm2niix
+################################################################
+class pglDcm2niix(pglExternalTool):
+    """Configure, install, and validate the dcm2niix converter.
+
+    The installer adds dcm2niix from conda-forge to the active Conda
+    environment. Existing installations can instead be selected by directory.
+    """
+
+    toolName = "dcm2niix"
+    toolLabel = "dcm2niix"
+    multipleInstallations = True
+    resolvedLocationField = "directory"
+    installationURL = "https://github.com/rordenlab/dcm2niix"
+
+    configurationFields = {
+        "directory": {
+            "type": "path",
+            "default": "",
+            "label": "Executable directory",
+            "help": (
+                "Directory containing dcm2niix. Leave blank to search PATH. "
+                "Install adds dcm2niix from conda-forge to the active Conda "
+                "environment and records that environment's executable directory."
+            ),
+        },
+    }
+
+    def __init__(self, *, directory=None, installation=None):
+        super().__init__(
+            executable="dcm2niix",
+            directory=directory,
+            installation=installation,
+        )
+        self.lastResult = None
+        self.lastAvailability = None
+
+    @classmethod
+    def _validateConfiguration(cls, *, configuration=None, timeout=10.0, cacheDirectory=None):
+        """Run dcm2niix help and report its version and resolved location."""
+        import math
+        import os
+        import re
+
+        if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout must be positive and finite.")
+
+        configuration = cls.getConfiguration() if configuration is None else _copyProvenance(configuration)
+        settings = cls._settingsFromValues(configuration)
+        report = {
+            "toolName": cls.toolName,
+            "label": cls.toolLabel,
+            "status": "Unavailable",
+            "available": False,
+            "version": None,
+            "location": None,
+            "diagnostic": None,
+            "details": {},
+        }
+        result = None
+
+        try:
+            resolver = pglExternalTool(
+                executable="dcm2niix",
+                directory=settings.directory.strip() or None,
+            )
+            executable = resolver._resolveExecutable("dcm2niix", dict(os.environ))
+            report["location"] = str(executable)
+
+            runner = pglExternalTool(executable=str(executable))
+            result = runner._runCommand(
+                arguments=["-h"],
+                timeout=timeout,
+                cacheDirectory=cacheDirectory,
+            )
+
+            output = bytearray()
+            for outputPath in (result.stdoutPath, result.stderrPath):
+                if outputPath is None:
+                    continue
+                with outputPath.open("rb") as source:
+                    remaining = 1024 * 1024 + 1 - len(output)
+                    if remaining <= 0:
+                        break
+                    output.extend(source.read(remaining))
+            if len(output) > 1024 * 1024:
+                raise ValueError("dcm2niix validation output exceeds 1 MiB.")
+
+            text = output.decode("utf-8", errors="replace")
+            match = re.search(
+                r"\bdcm2niix\s+version\s+(v?[0-9][A-Za-z0-9._+-]*)",
+                text,
+                flags=re.IGNORECASE,
+            )
+            if match is None:
+                raise ValueError("dcm2niix exited without reporting its version.")
+
+            report.update({
+                "status": "Available",
+                "available": True,
+                "version": match.group(1),
+                "details": {"probe": result.provenance},
+            })
+
+        except Exception as error:
+            if isinstance(error, pglToolExecutionError):
+                result = error.result
+
+            report["status"] = "Check failed"
+            report["diagnostic"] = f"{type(error).__name__}: {error}"
+            if result is not None:
+                report["details"] = {"probe": result.provenance}
+
+        return _copyProvenance(report)
+
+    def checkAvailable(self, *, timeout=10.0, cacheDirectory=None):
+        """Check the selected dcm2niix installation without changing settings."""
+        self.lastAvailability = type(self)._validateConfiguration(
+            configuration={"directory": self.directory or ""},
+            timeout=timeout,
+            cacheDirectory=cacheDirectory,
+        )
+        return self.lastAvailability["available"] is True
+
+    def install(self, *, timeout=None, cacheDirectory=None):
+        """Install dcm2niix from conda-forge into the active Conda environment.
+
+        Requires a Conda-managed environment and an available conda executable.
+        The installation is confirmed before package changes. Conda is asked
+        to freeze existing packages while adding dcm2niix and its dependencies.
+
+        The selected tool profile is updated to use the installed executable
+        directory after a successful install and version check.
+        """
+        import math
+        import os
+        import shlex
+        import sys
+        from copy import deepcopy
+        from pathlib import Path
+
+        from .pglDialog import pglDialogs
+        from .pglMessages import pglMessages
+
+        recorder = getExecutionRecorder()
+        if recorder is not None and recorder.actionID is not None:
+            raise RuntimeError("Install dcm2niix before starting scientific actions.")
+        if timeout is not None and (
+            type(timeout) not in (int, float)
+            or not math.isfinite(timeout)
+            or timeout <= 0
+        ):
+            raise ValueError("timeout must be positive and finite, or None.")
+
+        self.printInstallationNotice()
+
+        prefix = Path(sys.prefix).expanduser().resolve()
+        if not (prefix / "conda-meta").is_dir():
+            pglMessages.warning(
+                "Automatic dcm2niix installation requires a Conda environment. "
+                "Install it with your system package manager, then configure its "
+                "executable directory and run pglDcm2niix.validate().",
+                level=0,
+            )
+            return None
+
+        executableDirectory = (
+            prefix / "Library" / "bin" if os.name == "nt" else prefix / "bin"
+        )
+        if self.directory and Path(self.directory).expanduser().resolve() != executableDirectory:
+            pglMessages.warning(
+                "This tool profile points to a different executable directory. "
+                "Select the active Conda environment's executable directory "
+                "before installing into that environment.",
+                level=0,
+            )
+            return None
+
+        settingsPath = type(self)._toolSettingsPath()
+        originalSettings = type(self)._readToolSettings(settingsPath)
+        entry = type(self)._getInstallationProfiles(originalSettings)
+        profileName = self.installation or entry["defaultInstallation"]
+        if profileName not in entry["installations"]:
+            raise ValueError("The selected dcm2niix installation profile no longer exists.")
+        savedDirectory = entry["installations"][profileName].get("directory", "")
+        if (
+            savedDirectory.strip()
+            and Path(savedDirectory).expanduser().resolve() != executableDirectory
+        ):
+            pglMessages.warning(
+                "The selected tool profile is configured for a different dcm2niix "
+                "installation. Choose another profile or configure the active "
+                "Conda environment's executable directory before installing.",
+                level=0,
+            )
+            return None
+
+        condaCommand = os.environ.get("CONDA_EXE", "conda")
+        condaResolver = pglExternalTool(executable=condaCommand)
+        try:
+            condaExecutable = condaResolver._resolveExecutable(
+                condaCommand,
+                dict(os.environ),
+            )
+        except (FileNotFoundError, ValueError) as error:
+            pglMessages.warning(
+                f"Could not locate conda: {error}",
+                level=0,
+            )
+            return None
+
+        arguments = [
+            "install",
+            "--yes",
+            "--prefix", str(prefix),
+            "--channel", "conda-forge",
+            "--override-channels",
+            "--freeze-installed",
+            "dcm2niix",
+        ]
+        details = (
+            f"Package: conda-forge::dcm2niix\n"
+            f"Environment: {prefix}\n"
+            f"Executable directory to save: {executableDirectory}\n\n"
+            "Conda will add dcm2niix and any required dependencies to this "
+            "environment. --freeze-installed asks Conda not to upgrade existing "
+            "packages. Network access is required.\n\n"
+            f"Command:\n{shlex.join([str(condaExecutable), *arguments])}\n\n"
+            "After installation, restart the notebook kernel and run "
+            "pglDcm2niix.validate() to refresh the saved verification status."
+        )
+        if not pglDialogs.confirm(
+            "Install dcm2niix?",
+            title="Install dcm2niix",
+            details=details,
+            confirmButtonText="Install",
+        ):
+            return None
+
+        runner = pglExternalTool(executable=str(condaExecutable))
+        result = runner.runCommand(
+            arguments=arguments,
+            timeout=timeout,
+            cacheDirectory=cacheDirectory,
+        )
+        if result is None:
+            return None
+
+        report = type(self)._validateConfiguration(
+            configuration={"directory": str(executableDirectory)},
+            timeout=30.0,
+            cacheDirectory=cacheDirectory,
+        )
+        if report["available"] is not True:
+            pglMessages.warning(
+                "Conda completed, but dcm2niix could not be verified: "
+                f"{report['diagnostic']}",
+                level=0,
+            )
+            return None
+
+        if type(self)._readToolSettings(settingsPath) != originalSettings:
+            raise RuntimeError(
+                "Tool settings changed during dcm2niix installation. "
+                "The package was installed and verified, but its location "
+                "was not saved."
+            )
+
+        updatedSettings = deepcopy(originalSettings)
+        updatedEntry = type(self)._getInstallationProfiles(updatedSettings)
+        updatedEntry["installations"][profileName] = {
+            **updatedEntry["installations"][profileName],
+            "directory": str(executableDirectory),
+        }
+        updatedSettings["tools"][type(self).toolName] = updatedEntry
+        type(self)._writeToolSettings(settingsPath, updatedSettings)
+
+        self.directory = str(executableDirectory)
+        self.lastResult = result
+        self.lastAvailability = report
+        pglMessages.message(
+            f"Installed and verified dcm2niix {report['version']} at {report['location']}."
+        )
+        return result
+
+
+################################################################
 # AFNI tools
 ################################################################
 class pglAFNI(pglExternalTool):

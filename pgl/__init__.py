@@ -109,6 +109,7 @@ _EXPORTS = {
  'pglExecutableToolSettings': ('.pglSettings', 'pglExecutableToolSettings'),
  'pglToolSettingsList': ('.pglSettings', 'pglToolSettingsList'),
  'pglExternalTool': ('.pglExternalTools', 'pglExternalTool'),
+ 'pglDcm2niix': ('.pglExternalTools', 'pglDcm2niix'),
  'pglMATLAB': ('.pglExternalTools', 'pglMATLAB'),
  'pglGLMsingle': ('.pglExternalTools', 'pglGLMsingle'),
  'pglLabJackSettings': ('.pglSettings', 'pglLabJackSettings'),

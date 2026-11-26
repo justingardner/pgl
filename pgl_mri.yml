@@ -30,6 +30,7 @@ dependencies:
   - "psutil"
   - "pyserial"
   - "pynput"
+  - "dcm2niix"
   - "nibabel"
   - "scikit-learn"
   - "numba"

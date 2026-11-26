@@ -13,7 +13,7 @@ from copy import deepcopy
 from pathlib import Path
 from uuid import uuid4
 import numpy as np
-from traitlets import Any, Dict, Instance, List, Unicode
+from traitlets import Any, Dict, Instance, List, Unicode, validate
 
 from .pglPipeline import pglActionable
 from .pglSettings import pglTraitSettings
@@ -713,12 +713,13 @@ class pglMRIScan(pglTraitSettings):
         Expandable annotations and current NIfTI metadata.
         Use updateMetadata() for validated edits and trait notifications.
 
+    sidecar:
+        BIDS-style JSON metadata paired with the scan and preserved in MRI bundles.
+
     Accessing data resolves the source and returns a cached NiBabel image.
     Header information is read, but the complete voxel array remains lazy.
 
-    Filesystem backing is implemented. Deferred Flywheel references,
-    current-header synchronization, and bundle/database persistence
-    are not implemented yet.
+    NIfTI geometry and transform codes remain sourced from the NIfTI header.
     """
     name = Unicode("", help="Display name of scan")
     
@@ -743,6 +744,11 @@ class pglMRIScan(pglTraitSettings):
         help="Editable scan annotations and application-specific metadata",
     )
 
+    sidecar = Dict(
+        default_value={},
+        help="BIDS-style JSON metadata associated with this scan",
+    )
+
     # NiBabel readers must never enter JSON metadata.
     _data = Any(default_value=None, allow_none=True, serialize=False)
     
@@ -750,6 +756,9 @@ class pglMRIScan(pglTraitSettings):
     _backing = Any(default_value=None, allow_none=True, serialize=False)
     _cacheDirectory = Unicode("").tag(serialize=False)
 
+    @validate("sidecar")
+    def _validateSidecar(self, proposal):
+        return self._copyMetadata(proposal["value"])
 
     @staticmethod
     def _copyMetadata(value):
@@ -802,6 +811,145 @@ class pglMRIScan(pglTraitSettings):
 
         validate(value)
         return deepcopy(value)
+
+    @staticmethod
+    def _sidecarPath(niftiPath):
+        """Return the BIDS JSON filename paired with a NIfTI filename."""
+        from pathlib import Path
+
+        path = Path(niftiPath)
+        name = path.name
+        if name.lower().endswith(".nii.gz"):
+            stem = name[:-7]
+        elif name.lower().endswith(".nii"):
+            stem = name[:-4]
+        else:
+            raise ValueError("A JSON sidecar requires a .nii or .nii.gz filename.")
+        return path.with_name(f"{stem}.json")
+
+    @classmethod
+    def _readSidecar(cls, niftiPath):
+        """Read a neighboring JSON sidecar, rejecting ambiguous JSON."""
+        import json
+
+        sidecarPath = cls._sidecarPath(niftiPath)
+        if not sidecarPath.is_file():
+            return {}
+
+        def uniqueKeys(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError(f"Duplicate MRI sidecar key: {key!r}.")
+                result[key] = value
+            return result
+
+        def rejectConstant(value):
+            raise ValueError(f"Nonfinite MRI sidecar value is not permitted: {value}.")
+
+        with sidecarPath.open("r", encoding="utf-8") as source:
+            document = json.load(
+                source,
+                object_pairs_hook=uniqueKeys,
+                parse_constant=rejectConstant,
+            )
+        return cls._copyMetadata(document)
+
+    @classmethod
+    def _fillSidecarFromNifti(cls, sidecar, snapshot, *, overwrite=False):
+        """Fill BIDS fields derivable from a header, optionally syncing changes."""
+        import math
+
+        result = cls._copyMetadata(sidecar)
+        fields = snapshot.get("fields", {})
+        dimensions = fields.get("dim")
+        pixelDimensions = fields.get("pixdim")
+        units = fields.get("xyzt_units")
+
+        if (
+            not isinstance(dimensions, list)
+            or not dimensions
+            or type(dimensions[0]) is not int
+            or dimensions[0] < 4
+            or len(dimensions) <= 4
+            or type(dimensions[4]) is not int
+            or dimensions[4] <= 0
+            or not isinstance(pixelDimensions, list)
+            or len(pixelDimensions) <= 4
+            or type(units) is not int
+        ):
+            return result
+
+        secondsPerUnit = {8: 1.0, 16: 0.001, 24: 0.000001}.get(units & 0x38)
+        spacing = pixelDimensions[4]
+        if (
+            secondsPerUnit is not None
+            and type(spacing) in (int, float)
+            and math.isfinite(spacing)
+            and spacing > 0
+        ):
+            if overwrite or "RepetitionTime" not in result:
+                result["RepetitionTime"] = float(spacing) * secondsPerUnit
+
+        return result
+
+    @staticmethod
+    def _sidecarRepetitionTime(sidecar):
+        """Return a validated BIDS RepetitionTime value when available."""
+        import math
+
+        if "RepetitionTime" not in sidecar:
+            return None
+
+        value = sidecar["RepetitionTime"]
+        if (
+            type(value) not in (int, float)
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            raise ValueError(
+                "MRI sidecar RepetitionTime must be a finite positive number in seconds."
+            )
+        return float(value)
+
+    @classmethod
+    def _writeSidecar(cls, niftiPath, sidecar):
+        """Atomically write validated JSON beside a local NIfTI file."""
+        import json
+        import os
+        import tempfile
+        from pathlib import Path
+
+        sidecarPath = cls._sidecarPath(niftiPath)
+        sidecarPath.parent.mkdir(parents=True, exist_ok=True)
+        content = (
+            json.dumps(
+                cls._copyMetadata(sidecar),
+                sort_keys=True,
+                indent=2,
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+
+        temporaryPath = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix=f".{sidecarPath.name}.",
+                dir=sidecarPath.parent,
+                delete=False,
+            ) as target:
+                temporaryPath = Path(target.name)
+                if target.write(content) != len(content):
+                    raise OSError("Incomplete MRI sidecar write.")
+                target.flush()
+                os.fsync(target.fileno())
+
+            os.replace(temporaryPath, sidecarPath)
+            temporaryPath = None
+        finally:
+            if temporaryPath is not None:
+                temporaryPath.unlink(missing_ok=True)
 
     def updateMetadata(self, sectionName, **values):
         """Merge fields into one metadata section without changing provenance.
@@ -873,8 +1021,8 @@ class pglMRIScan(pglTraitSettings):
         Missing configuration/dependencies warn and return None.
         Storage, format, and integrity failures propagate.
 
-        Current-header synchronization after data edits is not implemented
-        yet. Editing metadata does not modify the NIfTI header.
+        Reads a neighboring JSON sidecar when present, then fills missing
+        BIDS fields that can be derived from the NIfTI header.
         """
         from pathlib import Path
 
@@ -932,6 +1080,10 @@ class pglMRIScan(pglTraitSettings):
         elif type(currentMetadata["nifti"]) is not dict:
             raise ValueError("metadata['nifti'] must be a dictionary.")
 
+        sidecar = self._readSidecar(path)
+        sidecar.update(self._copyMetadata(self.sidecar))
+        sidecar = self._fillSidecarFromNifti(sidecar, originalSnapshot)
+
         # Opening creates a lazy data proxy; do not call get_fdata() here.
         data = nib.load(str(path), mmap=True)
 
@@ -940,6 +1092,7 @@ class pglMRIScan(pglTraitSettings):
 
         self.sourceMetadata = sourceMetadata
         self.metadata = currentMetadata
+        self.sidecar = sidecar
 
         # Retain the backing as authoritative. localPath records its resolved
         # cache location rather than replacing the deferred source reference.
@@ -994,7 +1147,9 @@ class pglMRIScan(pglTraitSettings):
     def syncNiftiMetadata(self):
         """Replace current NIfTI metadata from already-loaded scan data.
 
-        Does not resolve a deferred source, read voxel arrays, or write files.
+        Does not resolve a deferred source or read voxel arrays. Updates the
+        BIDS RepetitionTime field when the current header provides it and
+        atomically writes the neighboring JSON sidecar when localPath exists.
         Original sourceMetadata and other metadata sections are preserved.
 
         Returns an independent copy of the new snapshot.
@@ -1018,11 +1173,54 @@ class pglMRIScan(pglTraitSettings):
         updated = self._copyMetadata(self.metadata)
         snapshot = self._copyMetadata(pglMRINiftiMetadata.fromData(self._data))
         result = self._copyMetadata(snapshot)
+        previous = updated.get("nifti")
+        previousSidecar = self._copyMetadata(self.sidecar)
+        if self.localPath:
+            previousSidecar.update(self._readSidecar(self.localPath))
+            previousSidecar.update(self._copyMetadata(self.sidecar))
+        sidecar = self._fillSidecarFromNifti(
+            previousSidecar,
+            snapshot,
+            overwrite=True,
+        )
 
         # Replace the complete section, not a shallow merge. Otherwise raw
         # fields from the original snapshot could survive as stale metadata.
         updated["nifti"] = snapshot
+        if self.localPath:
+            self._writeSidecar(self.localPath, sidecar)
         self.metadata = updated
+        self.sidecar = sidecar
+
+        changes = []
+        if isinstance(previous, dict):
+            oldFields = previous.get("fields", {})
+            newFields = snapshot.get("fields", {})
+            for name in ("dim", "pixdim", "xyzt_units"):
+                oldValue = oldFields.get(name) if isinstance(oldFields, dict) else None
+                newValue = newFields.get(name)
+                if oldValue != newValue:
+                    changes.append(f"{name}: {oldValue!r} -> {newValue!r}")
+
+            oldTransforms = previous.get("transforms", {})
+            newTransforms = snapshot.get("transforms", {})
+            for name in ("qform_code", "qform", "sform_code", "sform"):
+                oldValue = oldTransforms.get(name) if isinstance(oldTransforms, dict) else None
+                newValue = newTransforms.get(name)
+                if oldValue != newValue:
+                    changes.append(f"{name}: {oldValue!r} -> {newValue!r}")
+        else:
+            changes.append("Recorded the current NIfTI geometry and timing.")
+
+        oldTR = previousSidecar.get("RepetitionTime")
+        newTR = sidecar.get("RepetitionTime")
+        if oldTR != newTR:
+            changes.append(f"RepetitionTime: {oldTR!r} -> {newTR!r}")
+
+        if changes:
+            pglMessages.printHeader("MRI header and sidecar changes")
+            for change in changes:
+                pglMessages.message(change)
         return result
     
     def exportSource(self, filename, *, filesystem=None):
@@ -1189,15 +1387,20 @@ class pglMRIScan(pglTraitSettings):
         """Summarize NIfTI geometry and TR without loading voxel arrays.
 
         Uses an already-open working image, stored header metadata, or an
-        optional source-header read. Does not access self.data or modify metadata.
+        optional source-header read. Caches a neighboring JSON sidecar and
+        header-derived BIDS metadata when available. RepetitionTime prefers
+        the sidecar; geometry and qform/sform codes come from the NIfTI header.
 
         scanDims contains the first four dimensions, padded with ones.
         Higher dimensions are reported separately rather than collapsed.
 
         voxelDims and fov are converted to millimeters when spatial units
         are recognized. Affine matrices retain their original header units.
+        encodingAxes contains the zero-based frequency, phase, and slice axes
+        from dim_info. An unspecified axis is None.
 
-        trSeconds is the fourth-axis spacing converted to seconds.
+        trSeconds is the sidecar RepetitionTime when available, otherwise
+        the fourth-axis spacing converted to seconds.
         Requires a fourth dimension and recognized temporal units.
         Missing, invalid, unknown-unit, or frequency-domain spacing returns None.
 
@@ -1224,25 +1427,43 @@ class pglMRIScan(pglTraitSettings):
             elif self.localPath:
                 snapshot = pglMRINiftiMetadata.read(self.localPath)
 
+        sidecar = {}
+        if self.localPath:
+            sidecar = self._readSidecar(self.localPath)
+        sidecar.update(self._copyMetadata(self.sidecar))
+        if snapshot is not None:
+            sidecar = self._fillSidecarFromNifti(sidecar, snapshot)
+        if sidecar != self.sidecar:
+            self.sidecar = sidecar
+
         summary = {
             "scanDims": None,
             "extraDims": [],
             "voxelDims": None,
             "fov": None,
             "spatialUnits": "unknown",
+            "encodingAxes": [None, None, None],
             "trSeconds": None,
             "qform_code": None,
             "qform": None,
             "sform_code": None,
             "sform": None,
         }
-        if snapshot is None: return summary
+        sidecarTR = self._sidecarRepetitionTime(sidecar)
+        if snapshot is None:
+            summary["trSeconds"] = sidecarTR
+            return summary
         if not isinstance(snapshot, dict): raise ValueError("Invalid NIfTI header snapshot.")
 
         fields = snapshot.get("fields", {})
         transforms = snapshot.get("transforms", {})
         if not isinstance(fields, dict) or not isinstance(transforms, dict):
             raise ValueError("Invalid NIfTI header fields or transforms.")
+
+        dimInfo = fields.get("dim_info")
+        if type(dimInfo) is int:
+            codes = [(dimInfo >> shift) & 3 for shift in (0, 2, 4)]
+            summary["encodingAxes"] = [code - 1 if code else None for code in codes]
 
         # Extract active dimensions and pad absent axes with one.
         # Do not reinterpret higher axes as additional time volumes.
@@ -1310,7 +1531,79 @@ class pglMRIScan(pglTraitSettings):
             summary[f"{form}_code"] = code if type(code) is int else None
             summary[form] = deepcopy(transforms.get(form))
 
+        if sidecarTR is not None:
+            summary["trSeconds"] = sidecarTR
         return summary
+
+    # ========================================================================
+    @staticmethod
+    def _getScanOrientation(summary, sidecar):
+        """Describe the image slice plane and encoding axes in scanner space."""
+        voxelAxes = {"i": 0, "j": 1, "k": 2}
+        readoutAxis, phaseAxis, sliceAxis = summary["encodingAxes"]
+        phaseDirection = sidecar.get("PhaseEncodingDirection")
+        if isinstance(phaseDirection, str) and phaseDirection in ("i", "i-", "j", "j-", "k", "k-"):
+            phaseAxis = voxelAxes[phaseDirection[0]]
+        else:
+            phaseDirection = None
+            phaseAxisLabel = sidecar.get("PhaseEncodingAxis")
+            if isinstance(phaseAxisLabel, str): phaseAxis = voxelAxes.get(phaseAxisLabel, phaseAxis)
+
+        sliceDirection = sidecar.get("SliceEncodingDirection")
+        if isinstance(sliceDirection, str): sliceAxis = voxelAxes.get(sliceDirection.removesuffix("-"), sliceAxis)
+        if readoutAxis is None and phaseAxis is not None and sliceAxis is not None and phaseAxis != sliceAxis:
+            readoutAxis = 3 - phaseAxis - sliceAxis
+
+        # Use scanner space when a header also contains an aligned transform.
+        scannerAxes = None
+        for form in ("qform", "sform"):
+            if summary[f"{form}_code"] != 1 or summary[form] is None: continue
+            try:
+                matrix = np.asarray(summary[form], dtype=float)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if matrix.shape == (4, 4) and np.isfinite(matrix).all():
+                scannerAxes = matrix[:3, :3]
+                break
+        if scannerAxes is None: return None, phaseDirection, None
+
+        axisEnds = (("L", "R"), ("P", "A"), ("I", "S"))
+
+        # ====================================================================
+        def formatDirection(axis, signedDirection=None):
+            if axis is None: return None
+            vector = scannerAxes[:, axis]
+            if not np.any(vector): return None
+            dominant = int(np.argmax(np.abs(vector)))
+            start, end = axisEnds[dominant]
+            if signedDirection is None: return ("L–R", "A–P", "I–S")[dominant]
+            if (vector[dominant] < 0) != signedDirection.endswith("-"): start, end = end, start
+            return f"{start}→{end} ({signedDirection})"
+
+        phase = formatDirection(phaseAxis, phaseDirection) or phaseDirection
+        readout = formatDirection(readoutAxis)
+
+        # A missing slice axis leaves the plane spanned by image i and j.
+        slicePlaneAxis = sliceAxis if sliceAxis is not None else 2
+        inPlane = [axis for axis in range(3) if axis != slicePlaneAxis]
+        normal = np.cross(scannerAxes[:, inPlane[0]], scannerAxes[:, inPlane[1]])
+        if not np.isfinite(normal).all() or not np.any(normal): return None, phase, readout
+        dominant = int(np.argmax(np.abs(normal)))
+        if normal[dominant] < 0: normal = -normal
+        plane = ("sagittal", "coronal", "axial")[dominant]
+        tiltAxes = [axis for axis in range(3) if axis != dominant]
+        tilt = round(np.degrees(np.arctan2(np.linalg.norm(normal[tiltAxes]), normal[dominant])))
+        if tilt:
+            negative = ("left", "posterior", "inferior")
+            positive = ("right", "anterior", "superior")
+            directions = [
+                (positive if normal[axis] > 0 else negative)[axis]
+                for axis in tiltAxes if abs(normal[axis]) >= normal[dominant] * np.tan(np.radians(0.5))
+            ]
+            tiltText = f" toward {' and '.join(directions)}" if directions else ""
+            plane = f"oblique {plane} (normal tilted {tilt}°{tiltText})"
+        if sliceAxis is None: plane += " [image k-plane]"
+        return plane, phase, readout
 
 
 ################################################################
@@ -1327,13 +1620,15 @@ class pglMRI(pglActionable):
     dataMatrices = Dict(default_value={},help="MRI-owned scientific matrices, including retained image stages and analysis results; persisted explicitly through session checkpoint integration",serialize=False)
     _sessionReference = Any(default_value=None, allow_none=True, help="Runtime weak reference to the owning session", serialize=False)
 
-    def add(self, filename, *, name=None, sourceMetadata=None):
+    def add(self, filename, *, name=None, sourceMetadata=None, sidecar=None):
         """Attach a local NIfTI without opening its header or voxel array.
 
         Returns the new pglMRIScan.
 
         Source metadata is copied so subsequent caller edits do not modify
         the attached record. Metadata may contain identifying subject details.
+        sidecar optionally provides associated JSON metadata; otherwise a
+        neighboring JSON file is read on first metadata or image access.
 
         File existence and extension are checked here. NIfTI format validation
         occurs on first image access. Recorded source hashes are not verified
@@ -1359,10 +1654,15 @@ class pglMRI(pglActionable):
         if not isinstance(sourceMetadata, dict):
             raise TypeError("sourceMetadata must be a dictionary or None.")
 
+        if sidecar is None:
+            sidecar = {}
+        sidecar = pglMRIScan._copyMetadata(sidecar)
+
         scan = pglMRIScan(
             name=name,
             localPath=str(path),
             sourceMetadata=deepcopy(sourceMetadata),
+            sidecar=sidecar,
         )
 
         # Assign a new list so trait observers see the attachment.
@@ -1378,27 +1678,41 @@ class pglMRI(pglActionable):
         """Restore acquisition metadata and deferred MRI file references."""
         return pglMRIBundle.loadAcquisition(dataPath, filesystem=filesystem, cacheDirectory=cacheDirectory)
     
-    def print(self, *, match=None, verbose=False, readHeaders=True):
+    # ========================================================================
+    def print(self, *, match=None, scanNum=None, verbose=False, displayXform=False, readHeaders=True):
         """Print aligned geometry summaries for all or matching scans.
 
         match optionally selects scans whose acquisition label contains the
         supplied string, ignoring case. Filtering occurs before header reads.
-        Scan numbers retain their original one-based collection positions.
+        By default, an attached session's scan/run correspondence limits
+        output to its matched scans. Use scanNum="all" to include every scan
+        or pass a displayed scan number or list to select specific scans.
+        Numbers are one-based, and match applies to the resulting selection.
+        Scans retain their original numbers and collection order.
 
-        Prints the acquisition label first, followed by HH:MM and scan info.
-        The acquisition date and timezone appear immediately before the filename.
-        Scan numbers and information columns align across selected scans.
+        The compact view aligns scan numbers and information columns across
+        selected scans. It prints the acquisition label first, followed by
+        HH:MM and scan info, then the date, timezone, and filename.
 
         Uses Flywheel's session timezone, falling back to computer-local time.
         Naive timestamps remain unchanged and are labeled explicitly.
 
-        verbose=True adds qform/sform codes and matrices below each summary.
+        verbose=True puts acquisition time, dimensions, slice orientation,
+        and file details on separate lines, followed by transform codes and
+        the acquisition, acceleration, and readout parameters. Converted DICOM
+        scans show the source file and the saved NIfTI with their own sizes.
+        Acquisition parameters come from the sidecar when available, with TR
+        also available from the header.
+        Duration uses AcquisitionDuration or an estimate from volume count
+        and TR. Orientation uses a scanner-space qform or sform.
+        displayXform=True displays the qform and sform matrices.
         readHeaders=False avoids opening source files.
 
         Voxel dimensions and FOV use millimeters.
         Transform matrices retain the original header's spatial units.
         """
         import math
+        from numbers import Integral
         from pathlib import Path
         from .pglProgress import pglProgress
 
@@ -1410,6 +1724,30 @@ class pglMRI(pglActionable):
             print("No MRI scans.")
             return
 
+        scanNumbers = None
+        if scanNum is None:
+            session = self._getSession(required=False)
+            if session is not None and session.scanRunCorrespondence is not None:
+                try:
+                    correspondence = session._validateScanRunCorrespondence(session.scanRunCorrespondence)
+                except (TypeError, ValueError) as error:
+                    pglMessages.warning(f"Could not use the saved scan/run matches: {error} Use scanNum='all' to show every scan.")
+                    return
+                matchedUUIDs = {pair["scanUUID"] for pair in correspondence["pairs"]}
+                scanNumbers = {index for index, scan in enumerate(scans, start=1) if scan.uuid in matchedUUIDs}
+                if not scanNumbers:
+                    print("No MRI scans have a saved run match.")
+                    return
+        elif not (isinstance(scanNum, str) and scanNum.casefold() == "all"):
+            requested = scanNum if isinstance(scanNum, (list, tuple)) else [scanNum]
+            if any(isinstance(number, bool) or not isinstance(number, Integral) or not 1 <= number <= len(scans) for number in requested):
+                pglMessages.warning(f"Set scanNum to 'all', a displayed scan number, or a list of numbers between 1 and {len(scans)}.")
+                return
+            if not requested:
+                print("No MRI scan numbers were selected.")
+                return
+            scanNumbers = set(requested)
+
         def formatNumber(value):
             """Format finite numbers without unnecessary trailing zeros."""
             if type(value) not in (int, float) or not math.isfinite(value): return "unknown"
@@ -1417,6 +1755,96 @@ class pglMRI(pglActionable):
 
         def formatVector(values):
             return "unknown" if values is None else "[" + ", ".join(formatNumber(value) for value in values) + "]"
+
+        # ====================================================================
+        def formatParameter(value, unit="", scale=1):
+            """Format sidecar numbers, multi-echo values, or short labels."""
+            if not unit and isinstance(value, str): return " ".join(value.split()) or None
+            values = value if isinstance(value, list) else [value]
+            if not values or any(type(item) not in (int, float) for item in values): return None
+            try:
+                numbers = [formatNumber(item * scale) for item in values]
+            except OverflowError:
+                return None
+            if "unknown" in numbers: return None
+            text = "[" + ", ".join(numbers) + "]" if isinstance(value, list) else numbers[0]
+            return f"{text}{unit}"
+
+        # ====================================================================
+        def printParameters(label, parameters):
+            values = ", ".join(f"{name}={value}" for name, value in parameters if value is not None)
+            print(f"   {label}: {values or 'unknown'}")
+
+        # ====================================================================
+        def formatDuration(summary, sidecar):
+            duration = sidecar.get("AcquisitionDuration")
+            estimated = False
+            try:
+                if type(duration) not in (int, float) or not math.isfinite(duration) or duration <= 0:
+                    dimensions = summary["scanDims"]
+                    tr = summary["trSeconds"]
+                    if dimensions is None or dimensions[3] <= 1 or tr is None or sidecar.get("VolumeTiming") is not None:
+                        return "unknown"
+                    duration = dimensions[3] * tr
+                    estimated = True
+                if not math.isfinite(duration): return "unknown"
+                minutes, seconds = divmod(round(duration, 1), 60)
+            except OverflowError:
+                return "unknown"
+            text = f"{int(minutes)}m {seconds:g}s" if minutes else f"{duration:.3g}s"
+            return f"~{text}" if estimated else text
+
+        # ====================================================================
+        def printAcquisition(summary, sidecar, phase, readout):
+            printParameters("Acquisition", (
+                ("TR", formatParameter(summary["trSeconds"], "s") or "unknown"),
+                ("TE", formatParameter(sidecar.get("EchoTime"), "ms", 1000) or "unknown"),
+                ("flipAngle", formatParameter(sidecar.get("FlipAngle"), "°") or "unknown"),
+                ("TI", formatParameter(sidecar.get("InversionTime"), "ms", 1000)),
+                ("fieldStrength", formatParameter(sidecar.get("MagneticFieldStrength"), "T")),
+            ))
+            printParameters("Acceleration", (
+                ("inPlane", formatParameter(sidecar.get("ParallelReductionFactorInPlane"), "×")),
+                ("slice (multiband)", formatParameter(sidecar.get("MultibandAccelerationFactor"), "×")),
+                ("outOfPlane (3D)", formatParameter(sidecar.get("ParallelReductionFactorOutOfPlane"), "×")),
+                ("technique", formatParameter(sidecar.get("ParallelAcquisitionTechnique"))),
+                ("partialFourier", formatParameter(sidecar.get("PartialFourier"))),
+                ("phaseEncode", phase),
+            ))
+            printParameters("Readout", (
+                ("vendorEchoSpacing", formatParameter(sidecar.get("VendorReportedEchoSpacing"), "ms", 1000)),
+                ("effectiveEchoSpacing", formatParameter(sidecar.get("EffectiveEchoSpacing"), "ms", 1000)),
+                ("direction", readout),
+                ("effectiveReadoutTime", formatParameter(sidecar.get("TotalReadoutTime"), "ms", 1000)),
+                ("dwellTime", formatParameter(sidecar.get("DwellTime"), "µs", 1_000_000)),
+                ("pixelBandwidth", formatParameter(sidecar.get("PixelBandwidth"), "Hz/pixel")),
+                ("phaseEncodeBandwidth", formatParameter(sidecar.get("BandwidthPerPixelPhaseEncode"), "Hz/pixel")),
+                ("echoTrainLength", formatParameter(sidecar.get("EchoTrainLength"))),
+            ))
+
+        # ====================================================================
+        def formatXformCode(form, code):
+            descriptions = {
+                0: "uncoded, arbitrary coordinates",
+                1: "scanner-based anatomical coordinates",
+                2: "aligned anatomical coordinates",
+                3: "Talairach–Tournoux atlas coordinates",
+                4: "MNI152 normalized coordinates",
+                5: "other standard template coordinates",
+            }
+            if code is None: return f"{form}_code=unknown"
+            return f"{form}_code={code} ({descriptions.get(code, 'unrecognized NIfTI transform code')})"
+
+        # ====================================================================
+        def xformsMatch(summary):
+            if summary["qform_code"] is None or summary["qform_code"] != summary["sform_code"]: return False
+            try:
+                qform = np.asarray(summary["qform"], dtype=float)
+                sform = np.asarray(summary["sform"], dtype=float)
+            except (TypeError, ValueError, OverflowError):
+                return False
+            # Quaternion reconstruction and stored affine rows round differently.
+            return qform.shape == sform.shape == (4, 4) and np.isfinite(qform).all() and np.allclose(qform, sform, rtol=0, atol=1e-5)
 
         def getScanLabel(scan):
             """Resolve the acquisition label and original filename separately."""
@@ -1481,8 +1909,9 @@ class pglMRI(pglActionable):
                 columns = "  ".join(value.rjust(width) for value, width in zip(row, widths))
                 print(f"      [{columns}]")
 
-        def formatFileSize(scan):
-            """Format stored file size in MB or GB with one significant digit."""
+        # ====================================================================
+        def getFileSize(scan, sourceSize, *, preferSource=False):
+            """Return the backing, local, or source file's size in bytes."""
             size = None
 
             # Prefer the backing's recorded byte count when available.
@@ -1490,10 +1919,8 @@ class pglMRI(pglActionable):
                 identity = scan._backing.expectedIdentity
                 if identity is not None: size = identity["size_bytes"]
 
-            # Flywheel preserves the source size in its file metadata.
-            if size is None:
-                fileMetadata = scan.sourceMetadata.get("file", {})
-                if isinstance(fileMetadata, dict): size = fileMetadata.get("size")
+            # The compact summary can display Flywheel's source file size.
+            if size is None and preferSource: size = sourceSize
 
             # Local files require only a filesystem stat, not a payload read.
             if size is None and scan.localPath:
@@ -1502,12 +1929,31 @@ class pglMRI(pglActionable):
                 except OSError:
                     pass
 
+            return sourceSize if size is None else size
+
+        # ====================================================================
+        def formatFileSize(size):
+            """Format stored file size in MB or GB with one significant digit."""
             if type(size) is not int or size < 0: return "unknown"
 
             # Use decimal units and round to one significant digit.
             value, unit = (size / 1_000_000, "MB") if size < 1_000_000_000 else (size / 1_000_000_000, "GB")
             rounded = float(f"{value:.1g}")
             return f"{rounded:,.0f} {unit}" if rounded >= 1 or rounded == 0 else f"{rounded:g} {unit}"
+
+        # ====================================================================
+        def getVerboseFiles(scan, filename, sourceSize):
+            """Identify the original DICOM and the NIfTI used by this scan."""
+            conversion = scan.sourceMetadata.get("conversion", {})
+            originalFile = conversion.get("sourceFile") if isinstance(conversion, dict) else None
+            savedPath = scan._backing.path if scan._backing is not None else scan.localPath
+            savedFile = Path(savedPath).name if savedPath else filename
+            if originalFile and not savedPath: savedFile = conversion.get("outputFile") or "unknown"
+            savedSize = getFileSize(scan, None if originalFile else sourceSize)
+            files = []
+            if originalFile: files.append(("originalFile", originalFile, sourceSize))
+            files.append(("savedFile", savedFile, savedSize))
+            return [f"   {label}: {name}  size={formatFileSize(size).replace(' ', '')}" for label, name, size in files]
 
         def formatAcquisitionTime(scan):
             """Return separate HH:MM and date/timezone strings.
@@ -1568,6 +2014,7 @@ class pglMRI(pglActionable):
         matchText = match.casefold() if match is not None else None
 
         for index, scan in enumerate(scans, start=1):
+            if scanNumbers is not None and index not in scanNumbers: continue
             label, filename = getScanLabel(scan)
             if matchText is not None and matchText not in label.casefold(): continue
             selectedScans.append((index, scan, label, filename))
@@ -1590,18 +2037,22 @@ class pglMRI(pglActionable):
                 progress(position / len(selectedScans), f"Reading scan {position + 1}/{len(selectedScans)}: {label}")
                 summary = scan.getScanSummary(readHeaders=readHeaders)
                 acquisitionTime, acquisitionDate = formatAcquisitionTime(scan)
+                fileMetadata = scan.sourceMetadata.get("file", {})
+                sourceSize = fileMetadata.get("size") if isinstance(fileMetadata, dict) else None
 
                 rows.append({
                     "index": index,
                     "label": label,
                     "filename": filename,
                     "summary": summary,
+                    "sidecar": scan.sidecar,
                     "time": acquisitionTime,
                     "date": acquisitionDate,
                     "dims": f"dims={formatVector(summary['scanDims'])}",
                     "voxelDims": f"voxelDims={formatVector(summary['voxelDims'])}mm",
                     "fov": f"fov={formatVector(summary['fov'])}mm",
-                    "size": f"size={formatFileSize(scan)}",
+                    "size": f"size={formatFileSize(getFileSize(scan, sourceSize, preferSource=True))}" if not verbose else "",
+                    "files": getVerboseFiles(scan, filename, sourceSize) if verbose else [],
                     "extraDims": f"extraDims={formatVector(summary['extraDims'])}" if summary["extraDims"] else "",
                 })
 
@@ -1617,18 +2068,31 @@ class pglMRI(pglActionable):
         # Preserve collection order and number scans starting at one.
         for row in rows:
             summary = row["summary"]
-            information = "  ".join(row[name].ljust(columnWidths[name]) for name in columnNames)
-
-            # Keep the ordinary summary on one line without hiding higher axes.
-            print(f"{row['index']:>{numberWidth}}: {row['label']:<{labelWidth}}  {information} : {row['filename']}")
-
-            # Show both header transforms only when verbose output is requested.
+            heading = f"{row['index']:>{numberWidth}}: {row['label']}"
             if verbose:
+                sidecar = row["sidecar"]
+                plane, phase, readout = pglMRIScan._getScanOrientation(summary, sidecar)
+                acquisitionTime = " ".join(row[name] for name in ("time", "date") if row[name] != "unknown")
+                duration = formatDuration(summary, sidecar)
+                dimensions = ", ".join(row[name] for name in ("dims", "voxelDims", "fov", "extraDims") if row[name])
+                print(heading)
+                print(f"   Acquisition time: {acquisitionTime or 'unknown'}, duration={duration}")
+                print(f"   Dimensions: {dimensions}")
+                print(f"   sliceOrientation: {plane or 'unknown'}")
+                for fileLine in row["files"]: print(fileLine)
+            else:
+                # Keep the ordinary summary on one line without hiding higher axes.
+                information = "  ".join(row[name].ljust(columnWidths[name]) for name in columnNames)
+                print(f"{heading.ljust(numberWidth + 2 + labelWidth)}  {information} : {row['filename']}")
+
+            # Show both header transform matrices only when requested.
+            if verbose or displayXform:
+                codes = ", ".join(formatXformCode(form, summary[f"{form}_code"]) for form in ("qform", "sform"))
+                note = ", qform and sform are identical" if xformsMatch(summary) else ""
+                print(f"   xForms: {codes}{note}")
+            if verbose: printAcquisition(summary, sidecar, phase, readout)
+            if displayXform:
                 for form in ("qform", "sform"):
-                    code = summary[f"{form}_code"]
-                    codeText = "unknown" if code is None else str(code)
-                    note = " (uncoded; not an authoritative transform)" if code == 0 else ""
-                    print(f"   {form}_code={codeText}{note}")
                     print(f"   {form} (header spatial units: {summary['spatialUnits']}):")
                     printMatrix(summary[form])
                     
@@ -2830,7 +3294,8 @@ class pglMRI(pglActionable):
 class pglMRIBundle:
     """Portable acquisition payloads and ordered scan metadata.
 
-    This contract stores scan UUIDs, names, provenance, and annotations.
+    This contract stores scan UUIDs, names, provenance, annotations, and paired
+    JSON sidecars.
     It does not persist collection action history or database/session state.
 
     Payloads are original source bytes, not edited working images.
@@ -2839,11 +3304,81 @@ class pglMRIBundle:
 
     contract = "pgl.mri.acquisition.v1"
 
+    @staticmethod
+    def _encodeSidecar(sidecar):
+        import json
+
+        return (
+            json.dumps(
+                pglMRIScan._copyMetadata(sidecar),
+                sort_keys=True,
+                indent=2,
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+
+    @classmethod
+    def _writeSidecar(cls, filesystem, root, relativePath, sidecar):
+        import hashlib
+        import posixpath
+
+        content = cls._encodeSidecar(sidecar)
+        path = posixpath.join(root, relativePath)
+        with filesystem.open(path, "xb") as target:
+            if target.write(content) != len(content):
+                raise OSError("Incomplete MRI bundle sidecar write.")
+        with filesystem.open(path, "rb") as source:
+            if source.read(len(content) + 1) != content:
+                raise ValueError("MRI bundle sidecar verification failed.")
+        return {
+            "sidecarPath": relativePath,
+            "sidecar_sha256": hashlib.sha256(content).hexdigest(),
+            "sidecar_size_bytes": len(content),
+        }
+
+    @classmethod
+    def _readSidecar(cls, filesystem, root, record):
+        import hashlib
+        import json
+        import posixpath
+
+        if "sidecarPath" not in record:
+            return {}
+
+        expectedSize = record["sidecar_size_bytes"]
+        path = posixpath.join(root, record["sidecarPath"])
+        with filesystem.open(path, "rb") as source:
+            content = source.read(expectedSize + 1)
+        if len(content) != expectedSize:
+            raise ValueError("MRI bundle sidecar size mismatch.")
+        if hashlib.sha256(content).hexdigest() != record["sidecar_sha256"]:
+            raise ValueError("MRI bundle sidecar checksum mismatch.")
+
+        def uniqueKeys(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError(f"Duplicate MRI sidecar key: {key!r}.")
+                result[key] = value
+            return result
+
+        def rejectConstant(value):
+            raise ValueError(f"Nonfinite MRI sidecar value is not permitted: {value}.")
+
+        document = json.loads(
+            content,
+            object_pairs_hook=uniqueKeys,
+            parse_constant=rejectConstant,
+        )
+        return pglMRIScan._copyMetadata(document)
+
     @classmethod
     def saveAcquisition(cls, mri, dataPath, *, filesystem=None):
         """Stream original scan files into a fresh acquisition bundle.
 
-        Writes mri.json last, after payload and metadata verification.
+        Writes each JSON sidecar beside its NIfTI, then writes mri.json last
+        after payload and metadata verification.
         No complete local staging copy or voxel-array loading is required.
 
         Original header snapshots are extracted from verified exported bytes.
@@ -2940,12 +3475,19 @@ class pglMRIBundle:
             # Avoid creating a bundle beneath a source file's path.
             # Ordinary existing destinations were already rejected above.
             suffix = ".nii.gz" if sourcePath.lower().endswith(".nii.gz") else ".nii"
+            sidecar = scan._copyMetadata(scan.sidecar)
+            if scan.localPath:
+                sidecarFromFile = scan._readSidecar(scan.localPath)
+                sidecarFromFile.update(sidecar)
+                sidecar = sidecarFromFile
             prepared.append({
                 "scan": scan,
                 "uuid": scan.uuid,
                 "name": scan.name,
                 "sourceMetadata": scan._copyMetadata(scan.sourceMetadata),
                 "metadata": scan._copyMetadata(scan.metadata),
+                "sidecar": sidecar,
+                "originalSidecar": scan._copyMetadata(scan.sidecar),
                 "path": f"scans/{index:06d}/source{suffix}",
             })
 
@@ -2959,7 +3501,10 @@ class pglMRIBundle:
             ).encode("utf-8")
 
         for item in prepared:
-            encode({key: value for key, value in item.items() if key != "scan"})
+            encode({
+                key: value for key, value in item.items()
+                if key not in {"scan", "originalSidecar"}
+            })
 
         # For local storage, reject a dangling destination symlink too.
         if isinstance(filesystem, LocalFileSystem):
@@ -3005,6 +3550,16 @@ class pglMRIBundle:
             # This archive contains original acquisition bytes. Do not pair
             # them with current-header edits that were not actually exported.
             metadata["nifti"] = scan._copyMetadata(originalHeader)
+            sidecar = pglMRIScan._fillSidecarFromNifti(
+                item["sidecar"],
+                originalHeader,
+            )
+            sidecarIdentity = cls._writeSidecar(
+                filesystem,
+                destination,
+                f"scans/{index:06d}/source.json",
+                sidecar,
+            )
 
             records.append({
                 "index": index,
@@ -3012,6 +3567,7 @@ class pglMRIBundle:
                 "name": item["name"],
                 "path": relativePath,
                 **identity,
+                **sidecarIdentity,
                 "sourceMetadata": sourceMetadata,
                 "metadata": metadata,
             })
@@ -3031,6 +3587,7 @@ class pglMRIBundle:
                 or scan.name != item["name"]
                 or scan.sourceMetadata != item["sourceMetadata"]
                 or scan.metadata != item["metadata"]
+                or scan.sidecar != item["originalSidecar"]
             ):
                 raise ValueError("MRI scan metadata changed during export.")
 
@@ -3087,9 +3644,15 @@ class pglMRIBundle:
             "index", "uuid", "name", "path", "sha256", "size_bytes",
             "sourceMetadata", "metadata",
         }
+        sidecarFields = {
+            "sidecarPath", "sidecar_sha256", "sidecar_size_bytes",
+        }
 
         for index, record in enumerate(records):
-            if not isinstance(record, dict) or set(record) != expectedFields:
+            if not isinstance(record, dict) or set(record) not in (
+                expectedFields,
+                expectedFields | sidecarFields,
+            ):
                 raise ValueError(f"MRI scan {index}: invalid record fields.")
 
             if type(record["index"]) is not int or record["index"] != index:
@@ -3127,6 +3690,18 @@ class pglMRIBundle:
 
             if type(size) is not int or not 0 <= size <= 9223372036854775807:
                 raise ValueError(f"MRI scan {index}: invalid byte count.")
+
+            if sidecarFields.issubset(record):
+                if record["sidecarPath"] != f"scans/{index:06d}/source.json":
+                    raise ValueError(f"MRI scan {index}: invalid sidecar path.")
+                if (
+                    not isinstance(record["sidecar_sha256"], str)
+                    or re.fullmatch(r"[0-9a-f]{64}", record["sidecar_sha256"]) is None
+                ):
+                    raise ValueError(f"MRI scan {index}: invalid sidecar SHA-256.")
+                sidecarSize = record["sidecar_size_bytes"]
+                if type(sidecarSize) is not int or not 0 <= sidecarSize <= 64 * 1024 * 1024:
+                    raise ValueError(f"MRI scan {index}: invalid sidecar byte count.")
 
             sourceMetadata = pglMRIScan._copyMetadata(record["sourceMetadata"])
             metadata = pglMRIScan._copyMetadata(record["metadata"])
@@ -3201,10 +3776,10 @@ class pglMRIBundle:
 
     @classmethod
     def loadAcquisition(cls, dataPath, *, filesystem=None, cacheDirectory, maxDescriptorBytes=64 * 1024 * 1024):
-        """Restore ordered scan metadata and deferred filesystem backings.
+        """Restore ordered scan metadata, JSON sidecars, and deferred backings.
 
-        Reads mri.json only. Header-snapshot validation uses metadata already
-        contained in that descriptor; no NIfTI payload is opened or stat'ed.
+        Reads mri.json and verifies paired JSON sidecars. Header-snapshot
+        validation uses descriptor metadata; no NIfTI payload is opened or stat'ed.
 
         Requires a caller-owned local cache for eventual scan.data access.
         Does not create that cache during restoration.
@@ -3284,11 +3859,13 @@ class pglMRIBundle:
         scans = []
 
         for record in descriptor["scans"]:
+            sidecar = cls._readSidecar(filesystem, root, record)
             scan = pglMRIScan(
                 uuid=record["uuid"],
                 name=record["name"],
                 sourceMetadata=pglMRIScan._copyMetadata(record["sourceMetadata"]),
                 metadata=pglMRIScan._copyMetadata(record["metadata"]),
+                sidecar=sidecar,
             )
 
             # Construction is read-free. The filesystem is retained, not closed;
@@ -3321,7 +3898,8 @@ class pglMRIBundle:
         have been applied to acquisition files. Processed images belong in
         explicit image products and session.derivedFiles.
 
-        Writes mri.json last, after source export and metadata validation.
+        Writes each JSON sidecar beside its NIfTI, then writes mri.json last
+        after source export and metadata validation.
         Does not publish database records or modify the MRI collection.
 
         Returns the destination path.
@@ -3402,8 +3980,14 @@ class pglMRIBundle:
                 "name": scan.name,
                 "sourceMetadata": scan._copyMetadata(scan.sourceMetadata),
                 "metadata": scan._copyMetadata(scan.metadata),
+                "sidecar": scan._copyMetadata(scan.sidecar),
+                "originalSidecar": scan._copyMetadata(scan.sidecar),
                 "path": f"scans/{index:06d}/source{suffix}",
             }
+            if scan.localPath:
+                sidecarFromFile = scan._readSidecar(scan.localPath)
+                sidecarFromFile.update(item["sidecar"])
+                item["sidecar"] = sidecarFromFile
 
             # Validate identifiers before exporting potentially large sources.
             from uuid import UUID
@@ -3426,6 +4010,7 @@ class pglMRIBundle:
                 "name": item["name"],
                 "sourceMetadata": item["sourceMetadata"],
                 "metadata": item["metadata"],
+                "sidecar": item["sidecar"],
             })
             prepared.append(item)
 
@@ -3442,6 +4027,7 @@ class pglMRIBundle:
                     or scan.name != item["name"]
                     or scan.sourceMetadata != item["sourceMetadata"]
                     or scan.metadata != item["metadata"]
+                    or scan.sidecar != item["originalSidecar"]
                     or scan._backing is not item["backing"]
                     or scan.localPath != item["localPath"]
                 ):
@@ -3486,6 +4072,16 @@ class pglMRIBundle:
                 raise ValueError(f"Scan {index}: exported header conflicts with original provenance.")
 
             sourceMetadata["nifti"] = scan._copyMetadata(originalHeader)
+            sidecar = pglMRIScan._fillSidecarFromNifti(
+                item["sidecar"],
+                originalHeader,
+            )
+            sidecarIdentity = cls._writeSidecar(
+                filesystem,
+                destination,
+                f"scans/{index:06d}/source.json",
+                sidecar,
+            )
 
             records.append({
                 "index": index,
@@ -3493,6 +4089,7 @@ class pglMRIBundle:
                 "name": item["name"],
                 "path": item["path"],
                 **identity,
+                **sidecarIdentity,
                 "sourceMetadata": sourceMetadata,
                 # Unlike acquisition export, do not reset current annotations.
                 "metadata": deepcopy(item["metadata"]),
@@ -3583,7 +4180,7 @@ class pglMRIBundle:
                     maxDescriptorBytes=64 * 1024 * 1024):
         """Restore a derived MRI bundle without opening NIfTI payloads.
 
-        Reads mri.json and validates its original header snapshots.
+        Reads mri.json and verifies paired JSON sidecars and original headers.
         Installs verified-identity filesystem backings for acquisition sources.
 
         Preserves current metadata independently of original provenance.
@@ -3656,11 +4253,13 @@ class pglMRIBundle:
         scans = []
 
         for record in descriptor["scans"]:
+            sidecar = cls._readSidecar(filesystem, root, record)
             scan = pglMRIScan(
                 uuid=record["uuid"],
                 name=record["name"],
                 sourceMetadata=pglMRIScan._copyMetadata(record["sourceMetadata"]),
                 metadata=pglMRIScan._copyMetadata(record["metadata"]),
+                sidecar=sidecar,
             )
 
             backing = pglMRIFileBacking(

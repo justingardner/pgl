@@ -59,9 +59,10 @@ MACOS_PIP = [
     "pyobjc; sys_platform == 'darwin'",
 ]
 
-# MRI analysis, array storage, and remote filesystem access.
+# MRI analysis, DICOM conversion, array storage, and remote filesystem access.
 # h5py is supplied by MACOS in the combined MRI environment below.
 MRI = [
+    "dcm2niix",
     "nibabel",
     "scikit-learn",
     "numba",

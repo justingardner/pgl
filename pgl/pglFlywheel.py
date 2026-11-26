@@ -60,6 +60,7 @@ class pglFlywheelScan(pglTraitSettings):
     # Download identifiers survive serialization but are not displayed.
     acquisitionID = Unicode("", help="Flywheel acquisition ID", visible=False)
     fileName = Unicode("", help="Exact Flywheel filename", visible=False)
+    fileType = Unicode("", help="Flywheel file type", visible=False)
 
 ################################################################
 # Session settings
@@ -68,6 +69,7 @@ class pglFlywheelSession(pglTraitSettings):
     name = Unicode(help="Name of session", visible=False)
     subjectID = Unicode(help="subjectID", enabled=False)
     id = Unicode(help="Session ID", visible=False)
+    verbose = Bool(False, help="Show Flywheel scan browsing messages", visible=False)
 
     scans = List(
         Instance(pglFlywheelScan),
@@ -81,10 +83,83 @@ class pglFlywheelSession(pglTraitSettings):
     # These traits survive serialization but are not displayed.
     _connectionEnv = Unicode("")
     _scansLoaded = Bool(False)
+    _sessionLabel = Unicode("")
+    _acquisitionTimeText = Unicode("")
+    _acquisitionTimeBounds = List(Unicode())
+    dicom = Bool(False)
+
+    # ========================================================================
+    @staticmethod
+    def _parseTimestamp(timestamp):
+        """Read an SDK datetime or its serialized ISO timestamp."""
+        from datetime import datetime
+
+        if isinstance(timestamp, str):
+            try:
+                timestamp = datetime.fromisoformat(timestamp.strip().replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        return timestamp if isinstance(timestamp, datetime) else None
+
+    # ========================================================================
+    @classmethod
+    def _localizeTimestamp(cls, timestamp, sessionTimezone, sessionID, *, verbose=True):
+        """Convert a session timestamp to scanner time or computer-local time."""
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+        if timestamp is None: return None
+        timestamp = cls._parseTimestamp(timestamp)
+        if timestamp is None:
+            pglMessages.warning(f"Invalid timestamp for Flywheel session {sessionID}.", level=1, verbose=verbose)
+            return None
+
+        # Do not guess the meaning of a timestamp without an offset.
+        if timestamp.utcoffset() is None: return timestamp
+
+        if isinstance(sessionTimezone, str) and sessionTimezone.strip():
+            try:
+                return timestamp.astimezone(ZoneInfo(sessionTimezone.strip()))
+            except (ZoneInfoNotFoundError, ValueError, OverflowError, OSError):
+                pglMessages.warning(f"Could not use Flywheel session timezone {sessionTimezone!r} for session {sessionID}; falling back to computer-local time.", level=1, verbose=verbose)
+
+        # Absent or empty timezone metadata is an ordinary fallback.
+        try:
+            return timestamp.astimezone()
+        except (ValueError, OverflowError, OSError):
+            pglMessages.warning(f"Could not convert session {sessionID} to computer-local time; retaining the source timezone.", level=1, verbose=verbose)
+            return timestamp
+
+    # ========================================================================
+    @staticmethod
+    def _formatAcquisitionTime(timestamp):
+        """Format a localized timestamp for the Flywheel import summary."""
+        if timestamp is None: return ""
+        timezoneLabel = timestamp.tzname() or timestamp.strftime("%z") or "timezone unspecified"
+        return f"{timestamp:%H:%M:%S %a %b %d, %Y} ({timezoneLabel})"
+
+    # ========================================================================
+    @classmethod
+    def _acquisitionBounds(cls, timestamps):
+        """Find the first and last comparable acquisition start times."""
+        from datetime import timezone
+
+        aware, naive = [], []
+        for value in timestamps:
+            timestamp = cls._parseTimestamp(value)
+            if timestamp is None: continue
+            try:
+                if timestamp.utcoffset() is None:
+                    naive.append(timestamp)
+                else:
+                    aware.append(timestamp.astimezone(timezone.utc))
+            except (ValueError, OverflowError, OSError):
+                continue
+        comparable = aware or naive
+        return (min(comparable), max(comparable)) if comparable else ()
 
     @property
     def loadedScans(self):
-        """Load NIfTI files once, ordered by acquisition time.
+        """Load the selected NIfTI or DICOM files once, ordered by acquisition time.
 
         Reads acquisition/file metadata only, not image payloads.
         Missing or unusable timestamps sort last.
@@ -93,7 +168,7 @@ class pglFlywheelSession(pglTraitSettings):
 
         if self._scansLoaded: return self.scans
 
-        pglMessages.message(f"Loading scans: {self.name}")
+        pglMessages.message(f"Loading scans: {self.name}", verbose=self.verbose)
 
         fw = _getFlywheelClient(self._connectionEnv)
 
@@ -127,19 +202,43 @@ class pglFlywheelSession(pglTraitSettings):
             acquisitionLabel = getattr(flywheelScan, "label", None) or acquisitionID or "Unnamed acquisition"
 
             for flywheelFile in getattr(flywheelScan, "files", None) or []:
-                if getattr(flywheelFile, "type", None) != "nifti": continue
-
                 fileName = getattr(flywheelFile, "name", None)
+                fileType = getattr(flywheelFile, "type", None)
+                if self.dicom:
+                    if not self._isDicomFile(fileType, fileName): continue
+                elif fileType != "nifti":
+                    continue
+
                 if not isinstance(acquisitionID, str) or not acquisitionID:
-                    raise ValueError("Cannot list a Flywheel NIfTI file without an acquisition ID.")
+                    raise ValueError("Cannot list a Flywheel file without an acquisition ID.")
                 if not isinstance(fileName, str) or not fileName:
-                    raise ValueError("Cannot list a Flywheel NIfTI file without a filename.")
+                    raise ValueError("Cannot list a Flywheel file without a filename.")
 
-                scans.append(pglFlywheelScan(name=f"{acquisitionLabel}: {fileName}", acquisitionID=acquisitionID, fileName=fileName))
+                scans.append(
+                    pglFlywheelScan(
+                        name=f"{acquisitionLabel}: {fileName}",
+                        acquisitionID=acquisitionID,
+                        fileName=fileName,
+                        fileType="" if fileType is None else str(fileType),
+                    )
+                )
 
+        self._acquisitionTimeBounds = [timestamp.isoformat() for timestamp in self._acquisitionBounds(
+            getattr(acquisition, "timestamp", None) for acquisition in acquisitions
+        )]
         self.scans = scans
         self._scansLoaded = True
         return self.scans
+
+    @staticmethod
+    def _isDicomFile(fileType, fileName):
+        """Recognize Flywheel DICOM records and downloadable DICOM archives."""
+        normalizedType = fileType.casefold() if isinstance(fileType, str) else ""
+        normalizedName = fileName.casefold() if isinstance(fileName, str) else ""
+        return (
+            normalizedType in {"dicom", "dicom-zip", "dcm"}
+            or normalizedName.endswith((".zip", ".dcm", ".dicom", ".ima"))
+        )
 
 
 ################################################################
@@ -148,7 +247,9 @@ class pglFlywheelSession(pglTraitSettings):
 class pglFlywheelProject(pglTraitSettings):
     name = Unicode(help="Name of project", visible=False)
     id = Unicode(help="Identifier of project", visible=False)
-    showScanCounts = Bool(False, help="Fetch scan metadata for every session to show NIfTI counts. Can be slow.", visible=False)
+    verbose = Bool(False, help="Show Flywheel session browsing messages", visible=False)
+    showScanCounts = Bool(False, help="Fetch scan metadata for every session to show matching file counts. Can be slow.", visible=False)
+    dicom = Bool(False, help="Browse DICOM files instead of NIfTI files", visible=False)
     
     sessions = List(
         Instance(pglFlywheelSession),
@@ -161,9 +262,10 @@ class pglFlywheelProject(pglTraitSettings):
     _connectionEnv = Unicode("")
     _sessionsLoaded = Bool(False)
 
+    # ========================================================================
     @property
     def loadedSessions(self):
-        """Load this project's sessions, optionally counting NIfTI files.
+        """Load this project's sessions, optionally counting matching files.
 
         With showScanCounts=False, scan metadata remains lazy.
         True fetches acquisition/file metadata for each session and caches it.
@@ -175,14 +277,13 @@ class pglFlywheelProject(pglTraitSettings):
 
         Naive timestamps remain unchanged and are labeled explicitly.
         Missing timestamps fall back to the session label or ID.
+        Chooser labels also show the subject and Flywheel session labels
+        when available. These come from the same session listing.
         Original Flywheel metadata remains unchanged.
         """
-        from datetime import datetime
-        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-
         if self._sessionsLoaded: return self.sessions
 
-        pglMessages.message(f"Loading sessions: {self.name}")
+        pglMessages.message(f"Loading sessions: {self.name}", verbose=self.verbose)
 
         fw = _getFlywheelClient(self._connectionEnv)
         flywheelProject = fw.get_project(self.id)
@@ -198,6 +299,7 @@ class pglFlywheelProject(pglTraitSettings):
             sessionTimezone = getattr(flywheelSession, "timezone", None)
             sessionID = getattr(flywheelSession, "id", None)
             sessionLabel = getattr(flywheelSession, "label", None)
+            sessionLabel = sessionLabel.strip() if isinstance(sessionLabel, str) else ""
 
             # Session IDs are required for loading scans; do not invent one.
             if not isinstance(sessionID, str) or not sessionID:
@@ -205,53 +307,55 @@ class pglFlywheelProject(pglTraitSettings):
                 continue
 
             sessionName = sessionLabel or sessionID
-
-            if timestamp is not None:
-                if not isinstance(timestamp, datetime):
-                    pglMessages.warning(f"Invalid timestamp for Flywheel session {sessionID}; displaying its label instead.", level=1)
-                elif timestamp.tzinfo is None or timestamp.utcoffset() is None:
-                    # Do not guess the meaning of a timestamp without an offset.
-                    sessionName = f"{timestamp:%Y-%m-%d %H:%M} (timezone unspecified)"
+            displayTimestamp = pglFlywheelSession._localizeTimestamp(timestamp, sessionTimezone, sessionID, verbose=self.verbose)
+            acquisitionTimeText = pglFlywheelSession._formatAcquisitionTime(displayTimestamp)
+            if displayTimestamp is not None:
+                if displayTimestamp.utcoffset() is None:
+                    sessionName = f"{displayTimestamp:%Y-%m-%d %H:%M} (timezone unspecified)"
                 else:
-                    displayTimestamp = None
-
-                    if isinstance(sessionTimezone, str) and sessionTimezone.strip():
-                        try:
-                            displayTimestamp = timestamp.astimezone(ZoneInfo(sessionTimezone.strip()))
-                        except (ZoneInfoNotFoundError, ValueError, OverflowError, OSError):
-                            pglMessages.warning(f"Could not use Flywheel session timezone {sessionTimezone!r} for session {sessionID}; falling back to computer-local time.", level=1)
-
-                    # Absent or empty timezone metadata is an ordinary fallback.
-                    if displayTimestamp is None:
-                        try:
-                            displayTimestamp = timestamp.astimezone()
-                        except (ValueError, OverflowError, OSError):
-                            displayTimestamp = timestamp
-                            pglMessages.warning(f"Could not convert session {sessionID} to computer-local time; retaining the source timezone.", level=1)
-
                     timezoneLabel = displayTimestamp.tzname() or displayTimestamp.strftime("%z")
                     sessionName = f"{displayTimestamp:%Y-%m-%d %H:%M} {timezoneLabel}".rstrip()
 
             subject = getattr(flywheelSession, "subject", None)
-            subjectID = getattr(subject, "label", "") or ""
+            subjectID = getattr(subject, "label", None)
+            subjectID = subjectID.strip() if isinstance(subjectID, str) else ""
+
+            labelParts = [sessionName]
+            if subjectID and subjectID != sessionName: labelParts.append(f"Subject {subjectID}")
+            if sessionLabel and sessionLabel not in (sessionName, subjectID): labelParts.append(f"Session {sessionLabel}")
+            sessionName = " — ".join(labelParts)
 
             session = existingSessions.get(sessionID)
             if session is None:
-                session = pglFlywheelSession(name=sessionName, subjectID=subjectID, id=sessionID, _connectionEnv=self._connectionEnv)
+                session = pglFlywheelSession(
+                    name=sessionName,
+                    subjectID=subjectID,
+                    id=sessionID,
+                    _connectionEnv=self._connectionEnv,
+                    dicom=self.dicom,
+                )
             else:
                 session.name = sessionName
                 session.subjectID = subjectID
                 session._connectionEnv = self._connectionEnv
+                if session.dicom != self.dicom:
+                    session.dicom = self.dicom
+                    session._scansLoaded = False
 
-            # Count exactly the NIfTI entries offered by the scan chooser.
+            session._sessionLabel = sessionLabel
+            session._acquisitionTimeText = acquisitionTimeText
+            session.verbose = self.verbose
+
+            # Count exactly the entries offered by the scan chooser.
             # Successful loading also caches those entries for later browsing.
             if self.showScanCounts:
                 try:
-                    nScans = len(session.loadedScans)
-                    session.name = f"{sessionName} — {nScans} scans"
+                    nFiles = len(session.loadedScans)
+                    fileLabel = "DICOM files" if self.dicom else "NIfTI files"
+                    session.name = f"{sessionName} — {nFiles} {fileLabel}"
                 except (RuntimeError, ValueError):
-                    session.name = f"{sessionName} — scans unavailable"
-                    pglMessages.warning(f"Could not count scans for Flywheel session {sessionID}. Opening the session will retry.", level=1)
+                    session.name = f"{sessionName} — files unavailable"
+                    pglMessages.warning(f"Could not count matching files for Flywheel session {sessionID}. Opening the session will retry.", level=1)
 
             sessions.append(session)
 
@@ -275,7 +379,7 @@ class pglFlywheelChoose(pglTraitSettings):
 # Deferred, version-pinned MRI source
 ################################################################
 class pglFlywheelMRIBacking(pglMRIFileBacking):
-    """Stream one pinned Flywheel file version without local staging.
+    """Stream one pinned Flywheel NIfTI or DICOM source without staging.
 
     Inherits MRI materialization support. Complete reads verify the recorded
     size and, when available, Flywheel's source SHA-384 checksum.
@@ -290,7 +394,7 @@ class pglFlywheelMRIBacking(pglMRIFileBacking):
     Complete materialization/export must read through EOF.
     """
 
-    def __init__(self, client, acquisitionID, fileName, *, version, sizeBytes, sourceHash):
+    def __init__(self, client, acquisitionID, fileName, *, version, sizeBytes, sourceHash, dicom=False):
         """Record a pinned source with an optional SHA-384 checksum."""
         import re
 
@@ -303,14 +407,18 @@ class pglFlywheelMRIBacking(pglMRIFileBacking):
         if not isinstance(acquisitionID, str) or re.fullmatch(r"[0-9a-fA-F]{24}", acquisitionID) is None:
             raise ValueError("Invalid Flywheel acquisition ID.")
 
+        if type(dicom) is not bool:
+            raise TypeError("dicom must be Boolean.")
+
+        validNifti = isinstance(fileName, str) and fileName.lower().endswith((".nii", ".nii.gz"))
         if (
             not isinstance(fileName, str)
             or not fileName.strip()
             or fileName in (".", "..")
             or any(character in fileName for character in ("/", "\\", "\x00", "\n", "\r"))
-            or not fileName.lower().endswith((".nii", ".nii.gz"))
+            or not (validNifti or dicom)
         ):
-            raise ValueError("Flywheel MRI filename must be a single .nii or .nii.gz filename.")
+            raise ValueError("Flywheel source must be a single NIfTI filename or an explicitly selected DICOM file.")
 
         # Version and size remain mandatory even when the checksum is absent.
         if type(version) is not int or version < 1:
@@ -338,6 +446,7 @@ class pglFlywheelMRIBacking(pglMRIFileBacking):
         self._client = client
         self._acquisitionID = acquisitionID
         self._fileName = fileName
+        self._dicom = dicom
         self._version = version
         self._sourceSize = sizeBytes
         self._sourceHash = normalizedHash
@@ -347,6 +456,14 @@ class pglFlywheelMRIBacking(pglMRIFileBacking):
         self.path = fileName
         self._sha256 = None
         self._sizeBytes = None
+
+    @staticmethod
+    def isDicomFileName(fileName):
+        """Return whether a Flywheel filename has a known DICOM format suffix."""
+        return (
+            isinstance(fileName, str)
+            and fileName.casefold().endswith((".zip", ".dcm", ".dicom", ".ima"))
+        )
 
     def open(self):
         """Return a context-managed stream for the recorded file version.
@@ -536,15 +653,21 @@ class pglFlywheel:
             # Clearing this local reference does not securely erase memory.
             apikey = None
 
-    def choose(self, showScanCounts=False, dialogWidth=1100):
+    # ========================================================================
+    def choose(self, showScanCounts=False, dialogWidth=1100, *, dicom=False, projectName=None, verbose=False):
         """Browse Flywheel and return selected-file records.
 
         showScanCounts=False keeps scan metadata lazy.
         True fetches acquisition/file metadata for every session in a browsed
-        project to show NIfTI counts. No image payloads are downloaded.
+        project to show counts for the selected file type. No payloads are downloaded.
 
         dialogWidth requests a width in Qt logical pixels, limited to the
         available screen. None uses the ordinary dialog width.
+        dicom selects DICOM files or ZIP archives instead of NIfTI files.
+        projectName accepts a project label or ID and selects it initially
+        when it matches uniquely. The chooser falls back to the first project
+        with a warning if the value cannot be matched. verbose enables
+        browsing messages.
 
         Returns
         -------
@@ -560,6 +683,12 @@ class pglFlywheel:
 
         if type(showScanCounts) is not bool:
             raise TypeError("showScanCounts must be Boolean.")
+        if type(dicom) is not bool:
+            raise TypeError("dicom must be Boolean.")
+        if type(verbose) is not bool:
+            raise TypeError("verbose must be Boolean.")
+        if projectName is not None and not isinstance(projectName, str):
+            raise TypeError("projectName must be a project label or ID, or None.")
         if dialogWidth is not None and (type(dialogWidth) is not int or dialogWidth <= 0):
             raise ValueError("dialogWidth must be a positive integer or None.")
 
@@ -572,9 +701,28 @@ class pglFlywheel:
 
         # Apply browsing options to a copy so cancellation preserves selection.
         selection = deepcopy(self.selection)
+        if projectName is not None:
+            label = projectName.strip()
+            matches = []
+            if label:
+                matches = [project for project in selection.projects if project.id == label]
+                if not matches: matches = [project for project in selection.projects if project.name == label]
+                if not matches: matches = [project for project in selection.projects if project.name.casefold() == label.casefold()]
+            if len(matches) == 1:
+                preferred = matches[0]
+                selection.projects = [preferred, *(project for project in selection.projects if project is not preferred)]
+            else:
+                firstProject = selection.projects[0]
+                pglMessages.warning(f"Could not select Flywheel project {label!r} uniquely. Opening the chooser on {firstProject.name or firstProject.id!r}.", level=1)
+
         for project in selection.projects:
+            project.verbose = verbose
+            for session in project.sessions: session.verbose = verbose
             if project.showScanCounts != showScanCounts:
                 project.showScanCounts = showScanCounts
+                project._sessionsLoaded = False
+            if project.dicom != dicom:
+                project.dicom = dicom
                 project._sessionsLoaded = False
 
         # Use the existing subprocess dialog, including its serialization.
@@ -603,7 +751,7 @@ class pglFlywheel:
                     if not scan.isSelected:
                         continue
 
-                    selectedScans.append({
+                    record = {
                         "projectID": project.id,
                         "projectName": project.name,
                         "sessionID": session.id,
@@ -611,8 +759,13 @@ class pglFlywheel:
                         "subjectID": session.subjectID,
                         "acquisitionID": scan.acquisitionID,
                         "fileName": scan.fileName,
+                        "fileType": scan.fileType,
                         "name": scan.name,
-                    })
+                    }
+                    if session._sessionLabel: record["sessionLabel"] = session._sessionLabel
+                    if session._acquisitionTimeText: record["acquisitionTimeText"] = session._acquisitionTimeText
+                    if session._acquisitionTimeBounds: record["acquisitionTimeBounds"] = list(session._acquisitionTimeBounds)
+                    selectedScans.append(record)
 
         return selectedScans
     
@@ -1040,13 +1193,16 @@ class pglFlywheel:
 
         return downloaded
     
-    def toMRI(self, *, cacheDirectory):
-        """Build deferred MRI scans from the currently accepted selection.
+    # ========================================================================
+    def toMRI(self, *, cacheDirectory, dicom=False):
+        """Build deferred scan sources from the currently accepted selection.
 
         Reads project/session/acquisition/file metadata, not NIfTI payloads.
         Pins the file versions observed during this call.
 
         Requires exactly one selected Flywheel session.
+        dicom=False accepts NIfTI files; dicom=True accepts DICOM files and
+        archives for later conversion by loadFlywheel.
         Does not open a dialog, create cache directories, or publish records.
 
         Returns pglMRI, or None with a warning for expected refusals.
@@ -1056,16 +1212,13 @@ class pglFlywheel:
         Backings retain the caller's runtime SDK client.
 
         Metadata requests are separate, not an atomic Flywheel snapshot.
-        Groups, standalone subject records, analyses, jobs, and sidecars
-        are not separately retrieved in this implementation.
+        Groups, standalone subject records, analyses, and jobs are not
+        separately retrieved in this implementation. DICOM mode produces
+        JSON sidecars later through dcm2niix.
         """
-        import json
-        import os
-        from datetime import date, datetime
-        from pathlib import Path
-
-        from .pglMRI import pglMRI, pglMRIScan
-        from .pglProgress import pglProgress
+        if type(dicom) is not bool:
+            pglMessages.warning("MRI scans were not attached: dicom must be Boolean.", level=0)
+            return None
 
         if self.fw is None:
             pglMessages.warning("Create a working Flywheel connection first.", level=0)
@@ -1084,6 +1237,19 @@ class pglFlywheel:
                 level=0,
             )
             return None
+
+        return self._pinSelectedMRI(selected, cacheDirectory=cacheDirectory, dicom=dicom)
+
+    # ========================================================================
+    def _pinSelectedMRI(self, selected, *, cacheDirectory, dicom):
+        """Prepare pinned scan records, including selections from several sessions."""
+        import json
+        import os
+        from datetime import date, datetime
+        from pathlib import Path
+
+        from .pglMRI import pglMRI, pglMRIScan
+        from .pglProgress import pglProgress
 
         try:
             cacheText = os.fspath(cacheDirectory)
@@ -1125,24 +1291,53 @@ class pglFlywheel:
                 )
                 return None
 
-        projectID, sessionID = next(iter(sessionKeys))
+        projects = {}
+        sessions = {}
         acquisitions = {}
         scans = []
 
         with pglProgress("Preparing deferred Flywheel MRI scans") as progress:
-            progress(0, "Reading project metadata")
-            project = fetch(self.fw.get_project, projectID, "project")
-            if project is None: return None
-            projectMetadata = snapshot(project)
-
-            progress(None, "Reading session metadata")
-            session = fetch(self.fw.get_session, sessionID, "session")
-            if session is None: return None
-            sessionMetadata = snapshot(session)
-
             for index, selectedScan in enumerate(selected):
+                projectID = selectedScan["projectID"]
+                sessionID = selectedScan["sessionID"]
                 acquisitionID = selectedScan["acquisitionID"]
                 filename = selectedScan["fileName"]
+                fileType = selectedScan.get("fileType", "")
+
+                if projectID not in projects:
+                    progress(index / len(selected), "Reading project metadata")
+                    project = fetch(self.fw.get_project, projectID, "project")
+                    if project is None: return None
+                    projects[projectID] = snapshot(project)
+
+                sessionKey = (projectID, sessionID)
+                if sessionKey not in sessions:
+                    progress(index / len(selected), "Reading session metadata")
+                    session = fetch(self.fw.get_session, sessionID, "session")
+                    if session is None: return None
+                    sessions[sessionKey] = snapshot(session)
+
+                if dicom:
+                    if not pglFlywheelSession._isDicomFile(fileType, filename):
+                        pglMessages.warning(
+                            f"MRI scans were not attached: {filename!r} is not a DICOM file or archive.",
+                            level=0,
+                        )
+                        return None
+                elif not (
+                    fileType == "nifti"
+                    or (
+                        fileType in ("", None)
+                        and isinstance(filename, str)
+                        and filename.lower().endswith((".nii", ".nii.gz"))
+                    )
+                ):
+                    pglMessages.warning(
+                        f"MRI scans were not attached: {filename!r} is not a NIfTI file.",
+                        level=0,
+                    )
+                    return None
+
                 progress(index / len(selected), f"Reading metadata: {filename}")
 
                 if acquisitionID not in acquisitions:
@@ -1180,6 +1375,7 @@ class pglFlywheel:
                         version=fileMetadata.get("version"),
                         sizeBytes=fileMetadata.get("size"),
                         sourceHash=fileMetadata.get("hash"),
+                        dicom=dicom,
                     )
                 except (TypeError, ValueError) as error:
                     pglMessages.warning(
@@ -1192,8 +1388,8 @@ class pglFlywheel:
                     "provider": "flywheel",
                     "selection": dict(selectedScan),
                     "versionPinnedAt": "toMRI",
-                    "project": projectMetadata,
-                    "session": sessionMetadata,
+                    "project": projects[projectID],
+                    "session": sessions[sessionKey],
                     "acquisition": acquisitionMetadata,
                     "file": fileMetadata,
                 })
@@ -1210,6 +1406,6 @@ class pglFlywheel:
             # Install only after every selected source has been validated.
             mri = pglMRI()
             mri.scans = scans
-            progress.finish(f"Prepared {len(scans)} MRI scans; no NIfTI payloads downloaded")
+            progress.finish(f"Prepared {len(scans)} source(s); no payloads downloaded")
 
         return mri

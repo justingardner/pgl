@@ -6,6 +6,7 @@
 ################################################################
 
 from .pglMessages import pglMessages
+from .pglActionProgress import actionProgress
 from .pglSettings import pglTraitSettings
 from pathlib import Path
 from .pglExperiment import pglEventSegment
@@ -531,15 +532,20 @@ class pglActions(pglActionCollection):
     class loadFlywheel(pglAction):
         """Choose Flywheel MRI files using a saved import-settings profile.
 
-        Configuration connects using the profile's keychain credential,
-        reads source metadata, and pins selected file versions.
-        Execution attaches source references without downloading NIfTI files.
+        By default, dicom=True selects DICOM files or archives, downloads
+        them during execution, and converts each selected source with
+        dcm2niix into NIfTI images and JSON sidecars.
+        Failed conversions fall back to a matching NIfTI from the same
+        Flywheel acquisition. Sources that cannot be loaded are skipped.
+        Set dicom=False to select NIfTI files and attach their pinned sources
+        without downloading image payloads.
 
         Use saveRawSession() later to stream acquisition bytes into storage.
         
-        Execution creates a new session or attaches MRI data to a supplied
-        session without replacing its existing contents. Existing MRI data
-        causes the action to fail rather than overwrite or merge it.
+        One selected Flywheel session returns one PGL session. Multiple
+        selected Flywheel sessions return a list of separate PGL sessions in
+        selection order. Supplying an existing session requires a single
+        Flywheel session and an empty MRI attachment.
         
         History stores the settings name, pinned metadata, and labels.
         It never stores credentials, the SDK client, or caller-local cache
@@ -555,13 +561,15 @@ class pglActions(pglActionCollection):
         selectedScans = List(Dict(), help="Ordered scan names and pinned source metadata")
         experimentName = Unicode("", help="Explicit PGL experiment label")
         subjectID = Unicode("", help="Session subject label")
-        showScanCounts = Bool(False, help="Show NIfTI counts in the session chooser. Fetches scan metadata for every session and can be slow.")
+        dicom = Bool(True, help="Select DICOM files and convert them to NIfTI")
+        showScanCounts = Bool(False, help="Show matching file counts in the session chooser. Fetches scan metadata for every session and can be slow.")
 
         # Runtime resources must not enter action history or pipeline recipes.
         _client = Any(default_value=None, allow_none=True).tag(serialize=False)
         _cacheDirectory = Unicode("").tag(serialize=False)
 
-        def configure(self, settingsName=None, *, experimentName=None, subjectID=None, showScanCounts=False):
+        # ====================================================================
+        def configure(self, settingsName=None, *, experimentName=None, subjectID=None, showScanCounts=False, dicom=True, projectName=None, verbose=False):
             """Connect and choose scans using a saved import-settings profile.
 
             settingsName=None selects the default import-settings profile.
@@ -570,10 +578,15 @@ class pglActions(pglActionCollection):
 
             showScanCounts=False keeps scan discovery lazy while browsing.
             True fetches acquisition/file metadata for every session in a
-            browsed project to display NIfTI counts. This can be slow.
+            browsed project to display matching file counts. This can be slow.
+            By default, dicom=True selects DICOM files/archives for conversion
+            during run. Set dicom=False to select existing NIfTIs directly.
+            projectName selects the initial project by label or ID.
+            verbose=True enables Flywheel project and session browsing messages.
 
             Cancel or invalid input leaves this action unconfigured.
-            No NIfTI payload is downloaded and no cache directory is created.
+            Configuration downloads no image or DICOM payload and creates no
+            cache directory.
 
             experimentName is explicit; a Flywheel project is not automatically
             assumed to be a PGL experiment. Unset labels remain unset and are
@@ -596,6 +609,7 @@ class pglActions(pglActionCollection):
             self.selectedScans = []
             self.experimentName = ""
             self.subjectID = ""
+            self.dicom = True
             self.showScanCounts = False
             self._client = None
             self._cacheDirectory = ""
@@ -605,6 +619,16 @@ class pglActions(pglActionCollection):
                 pglMessages.warning("Flywheel loading was not configured: showScanCounts must be Boolean.", level=1)
                 return
             self.showScanCounts = showScanCounts
+            if type(dicom) is not bool:
+                pglMessages.warning("Flywheel loading was not configured: set dicom to True or False.")
+                return
+            self.dicom = dicom
+            if type(verbose) is not bool:
+                pglMessages.warning("Flywheel loading was not configured: set verbose to True or False.")
+                return
+            if projectName is not None and not isinstance(projectName, str):
+                pglMessages.warning("Flywheel loading was not configured: set projectName to a Flywheel project label or ID, or None.")
+                return
 
             # Validate the requested profile name before loading settings.
             if settingsName is not None:
@@ -635,17 +659,25 @@ class pglActions(pglActionCollection):
             flywheel = pglFlywheel(settings=importSettings)
             if flywheel.fw is None: return
 
-            # Browse and select scans. Cancellation leaves the action
-            # unconfigured; toMRI() handles an empty accepted selection.
-            if flywheel.choose(showScanCounts=self.showScanCounts) is None: return
+            # Browse and select scans. Keep an empty accepted selection
+            # distinct from cancellation for the execution warning.
+            selectedScans = flywheel.choose(showScanCounts=self.showScanCounts, dicom=self.dicom, projectName=projectName, verbose=verbose)
+            if selectedScans is None: return
+            if not selectedScans:
+                self.error = ValueError("no scans were selected")
+                return
+            multipleSessions = len({(scan["projectID"], scan["sessionID"]) for scan in selectedScans}) > 1
 
-            # Validate a single session and pin the selected file versions.
+            # Pin the selected file versions from each chosen session.
             # This reads metadata only, without creating the cache directory.
-            mri = flywheel.toMRI(cacheDirectory=cachePath)
+            if multipleSessions:
+                mri = flywheel._pinSelectedMRI(selectedScans, cacheDirectory=cachePath, dicom=self.dicom)
+            else:
+                mri = flywheel.toMRI(cacheDirectory=cachePath, dicom=self.dicom)
             if mri is None: return
 
             # Use the Flywheel subject label unless explicitly overridden.
-            if subjectID is None:
+            if subjectID is None and not multipleSessions:
                 subjects = {
                     pglSession._normalizeSessionLabel(scan.sourceMetadata["selection"]["subjectID"], "Flywheel subjectID")
                     for scan in mri.scans
@@ -671,6 +703,104 @@ class pglActions(pglActionCollection):
             self._cacheDirectory = cachePath
             super().configure()
 
+        # ====================================================================
+        def run(self, *args, **kwargs):
+            """Import one session or run separate, recorded imports for a batch."""
+            if not self.isConfigured():
+                if self.error is None: return super().run(*args, **kwargs)
+                pglMessages.warning(f"Action {self.name} is not yet configured: {self.error}.")
+                return None
+            if getattr(self, "_executionInProgress", False): return super().run(*args, **kwargs)
+
+            groups = {}
+            try:
+                for record in self.selectedScans:
+                    selection = record["sourceMetadata"]["selection"]
+                    groups.setdefault((selection["projectID"], selection["sessionID"]), []).append(record)
+            except (TypeError, KeyError):
+                return super().run(*args, **kwargs)
+            if len(groups) <= 1: return super().run(*args, **kwargs)
+            return self._runBatch(groups, args, kwargs)
+
+        # ====================================================================
+        @actionProgress
+        def _runBatch(self, groups, args, kwargs):
+            """Preserve independent action history and subject identity per session."""
+            from .pglActionProgress import currentProgress, progressCall
+            from .pglPipeline import pglActionStatus
+
+            selections = [record["sourceMetadata"]["selection"] for group in groups.values() for record in group]
+            subjects = {}
+            try:
+                for key, group in groups.items():
+                    labels = {
+                        pglSession._normalizeSessionLabel(record["sourceMetadata"]["selection"].get("subjectID"), "Flywheel subjectID")
+                        for record in group
+                    }
+                    if len(labels) != 1: raise ValueError(f"Flywheel session {key[1]!r} has inconsistent subject labels. Refresh the selection and retry.")
+                    subjects[key] = next(iter(labels))
+                if self.subjectID and len({label for label in subjects.values() if label}) > 1:
+                    raise ValueError("Omit subjectID= to preserve each subject's Flywheel ID when importing multiple subjects.")
+            except (TypeError, ValueError) as error:
+                self.setError(str(error))
+                return None
+
+            self._printMultiSessionSelection(selections)
+            if (args and args[0] is not None) or kwargs.get("session") is not None:
+                self.setError("Omit session= to import multiple Flywheel sessions into separate PGL sessions.")
+                return None
+
+            progress = currentProgress()
+            totalScans = len(selections)
+            completedScans = 0
+            results = []
+            self.status = pglActionStatus.RUNNING
+            self.error = None
+            self._executionInProgress = True
+            try:
+                for index, (key, group) in enumerate(groups.items(), start=1):
+                    child = type(self)()
+                    child.configureTraits(
+                        settingsName=self.settingsName,
+                        selectedScans=group,
+                        experimentName=self.experimentName,
+                        subjectID=self.subjectID or subjects[key] or "",
+                        dicom=self.dicom,
+                        showScanCounts=self.showScanCounts,
+                    )
+                    child.status = pglActionStatus.CONFIGURED
+                    child.name = self.name
+                    child.version = self.version
+                    child.keepIntermediates = self.keepIntermediates
+                    child._client = self._client
+                    child._cacheDirectory = self._cacheDirectory
+                    child.cacheDirectory = getattr(self, "cacheDirectory", None)
+                    end = completedScans + len(group)
+                    description = f"Flywheel session {index}/{len(groups)}"
+                    try:
+                        result = progressCall(progress, completedScans / totalScans, end / totalScans, description, child.run, *args, **kwargs)
+                    except Exception as error:
+                        pglMessages.warning(f"Could not import Flywheel session {key[1]!r}: {error}. Check the connection and cache settings before retrying.")
+                        result = None
+                    finally:
+                        self.actionHistory.extend(child.actionHistory)
+                    if result is not None: results.append(result)
+                    completedScans = end
+            except (KeyboardInterrupt, SystemExit) as error:
+                self.status = pglActionStatus.FAILED
+                self.error = RuntimeError(f"{type(error).__name__}: Flywheel import was interrupted.")
+                raise
+            finally:
+                self._executionInProgress = False
+
+            if not results:
+                self.setError("No Flywheel sessions were imported. Check the session errors and retry.")
+                return None
+            self.status = pglActionStatus.SUCCESS
+            pglMessages.print(f"Returned {len(results)} of {len(groups)} selected Flywheel sessions.")
+            return results
+
+        # ====================================================================
         def _run(self, session=None, *, flywheel=None, cacheDirectory=None):
             """Attach pinned, unopened MRI sources to a new or existing session.
 
@@ -681,8 +811,11 @@ class pglActions(pglActionCollection):
             Runtime overrides allow execution of a restored/copied action
             without repeating interactive selection or repinning files.
 
-            No SDK requests occur here. Actual source availability and hash
-            verification are checked when payloads are subsequently read.
+            NIfTI mode attaches the pinned source without downloading it.
+            DICOM mode streams the pinned source during this call, verifies
+            its recorded size/checksum, and converts it with dcm2niix.
+            If a source fails, the action tries an existing NIfTI from its
+            acquisition and skips the source if neither route succeeds.
 
             Attaching to an existing session does not establish temporal
             alignment between MRI scans and behavioral runs.
@@ -690,9 +823,13 @@ class pglActions(pglActionCollection):
             import os
             from pathlib import Path
 
-            from .pglFlywheel import pglFlywheel, pglFlywheelMRIBacking
+            from .pglActionProgress import currentProgress
+            from .pglFlywheel import pglFlywheel, pglFlywheelMRIBacking, pglFlywheelSession
             from .pglMRI import pglMRI, pglMRIScan
             from .pglSession import pglSession
+
+            progress = currentProgress()
+            if progress is not None: progress(0, "Preparing Flywheel scan sources")
 
             if session is not None:
                 if not isinstance(session, pglSession):
@@ -734,8 +871,6 @@ class pglActions(pglActionCollection):
                 # Recheck persisted configuration, including recipes edited
                 # through configureTraits() rather than configure().
                 sessionKeys = set()
-                scans = []
-
                 for record in records:
                     if set(record) != {"name", "sourceMetadata"}:
                         raise ValueError("Invalid configured scan record.")
@@ -747,23 +882,92 @@ class pglActions(pglActionCollection):
 
                     if fileMetadata["name"] != selection["fileName"]:
                         raise ValueError("Pinned filename differs from selection metadata.")
+                    if self.dicom:
+                        fileType = selection.get("fileType", "")
+                        isDicomType = (
+                            isinstance(fileType, str)
+                            and fileType.casefold() in {"dicom", "dicom-zip", "dcm"}
+                        )
+                        if (
+                            fileType == "nifti"
+                            or (
+                                not isDicomType
+                                and not pglFlywheelMRIBacking.isDicomFileName(selection["fileName"])
+                            )
+                        ):
+                            raise ValueError("A non-DICOM source was configured for DICOM conversion.")
 
-                    # Reconstruct the recorded source version without requesting
-                    # metadata again or downloading any NIfTI payload.
-                    backing = pglFlywheelMRIBacking(client, selection["acquisitionID"], selection["fileName"], version=fileMetadata["version"], sizeBytes=fileMetadata["size"], sourceHash=fileMetadata["hash"])
-
-                    scan = pglMRIScan(name=record["name"], sourceMetadata=provenance)
-                    if scan.attachBacking(backing, cacheDirectory=cachePath) is None:
-                        raise ValueError("Could not attach the configured MRI source.")
-                    scans.append(scan)
-
-                # Never combine scans from different Flywheel sessions.
+                # Each action execution attaches MRI from one source session.
                 if len(sessionKeys) != 1:
-                    raise ValueError("Configured scans must belong to one Flywheel session.")
+                    raise ValueError("Use run() to import multiple Flywheel sessions into separate PGL sessions.")
 
-                # Prepare the complete MRI collection before changing a supplied session.
-                mri = pglMRI()
-                mri.scans = scans
+                scanRange = progress.section(0.02, 0.95) if progress is not None else None
+                if self.dicom:
+                    provenance = records[0]["sourceMetadata"]
+                    selection = provenance["selection"]
+                    sessionMetadata = provenance.get("session", {})
+                    projectName = selection.get("projectName") or selection["projectID"]
+                    sessionLabel = sessionMetadata.get("label") or selection.get("sessionLabel") or selection.get("sessionName") or "unknown"
+                    subjectID = selection.get("subjectID") or self.subjectID or "unknown"
+                    savedBounds = selection.get("acquisitionTimeBounds")
+                    bounds = pglFlywheelSession._acquisitionBounds(savedBounds) if isinstance(savedBounds, list) else ()
+                    selectedOnly = not bounds
+                    if selectedOnly:
+                        bounds = pglFlywheelSession._acquisitionBounds(
+                            record["sourceMetadata"].get("acquisition", {}).get("timestamp") for record in records
+                        )
+                    pglMessages.printHeader("Flywheel DICOM to NIfTI")
+                    pglMessages.print(f"Project: {projectName}")
+                    pglMessages.print(f"Session label: {sessionLabel}")
+                    pglMessages.print(f"Session ID: {selection['sessionID']}")
+                    pglMessages.print(f"Subject ID: {subjectID}")
+                    acquired = pglFlywheelSession._localizeTimestamp(sessionMetadata.get("timestamp"), sessionMetadata.get("timezone"), selection["sessionID"])
+                    acquisitionTime = pglFlywheelSession._formatAcquisitionTime(acquired) or selection.get("acquisitionTimeText")
+                    if acquisitionTime: pglMessages.print(f"Acquisition time: {acquisitionTime}")
+                    duration = self._formatSessionDuration(bounds, selectedOnly=selectedOnly)
+                    pglMessages.print(f"Session duration: {duration}")
+                    pglMessages.print(f"Selected DICOM files or archives: {len(records)}")
+                    pglMessages.print()
+                    mri = self._convertDicomSources(records, client, cachePath, progress=scanRange)
+                    updatedDuration = self._formatSessionDuration(bounds, selectedOnly=selectedOnly, scans=mri.scans)
+                    if updatedDuration != duration: pglMessages.print(f"Session duration: {updatedDuration}")
+                else:
+                    scans = []
+                    for index, record in enumerate(records):
+                        provenance = record["sourceMetadata"]
+                        selection = provenance["selection"]
+                        fileMetadata = provenance["file"]
+                        if scanRange is not None: scanRange(index / len(records), f"Preparing NIfTI {index + 1}/{len(records)} — {selection['fileName']}")
+
+                        fileType = selection.get("fileType")
+                        if (
+                            fileType != "nifti"
+                            and not (
+                                fileType is None
+                                and isinstance(selection.get("fileName"), str)
+                                and selection["fileName"].lower().endswith((".nii", ".nii.gz"))
+                            )
+                        ):
+                            raise ValueError("A non-NIfTI source was configured for NIfTI loading.")
+
+                        # Reconstruct the recorded source version without
+                        # requesting metadata or downloading NIfTI payloads.
+                        backing = pglFlywheelMRIBacking(
+                            client,
+                            selection["acquisitionID"],
+                            selection["fileName"],
+                            version=fileMetadata["version"],
+                            sizeBytes=fileMetadata["size"],
+                            sourceHash=fileMetadata["hash"],
+                        )
+
+                        scan = pglMRIScan(name=record["name"], sourceMetadata=provenance)
+                        if scan.attachBacking(backing, cacheDirectory=cachePath) is None:
+                            raise ValueError("Could not attach the configured MRI source.")
+                        scans.append(scan)
+
+                    mri = pglMRI()
+                    mri.scans = scans
 
                 # Create a new acquisition session with the configured labels.
                 # Existing session labels remain authoritative, including labels
@@ -779,8 +983,15 @@ class pglActions(pglActionCollection):
                 return None
 
             projectID, flywheelSessionID = next(iter(sessionKeys))
+            if not mri.scans:
+                if progress is not None: progress(0.98, "No Flywheel scans loaded")
+                pglMessages.print("No Flywheel scans were loaded. The session has no attached MRI data.")
+                return session
+
+            if progress is not None: progress(0.98, f"Attaching {len(mri.scans)} MRI scan(s) to the session")
             destination = "a new session" if creatingSession else "the existing session"
-            pglMessages.message(f"Attaching {len(scans)} deferred MRI scan(s) from Flywheel project {projectID!r}, session {flywheelSessionID!r}, to {destination}.")
+            sourceKind = "NIfTI" if self.dicom else "deferred NIfTI"
+            pglMessages.message(f"Attaching {len(mri.scans)} {sourceKind} scan(s) from Flywheel project {projectID!r}, session {flywheelSessionID!r}, to {destination}.")
 
             if not creatingSession:
                 pglMessages.message(f"Preserving {len(session.runs or [])} behavioral run(s), existing labels, and other session contents. Scan-to-run alignment is not performed.")
@@ -789,3 +1000,389 @@ class pglActions(pglActionCollection):
             # session, or the new session created above.
             session.add(mri)
             return session
+
+        # ====================================================================
+        def _printMultiSessionSelection(self, selectedScans):
+            """Summarize a selection that spans multiple Flywheel sessions."""
+            from .pglFlywheel import pglFlywheelSession
+
+            grouped = {}
+            for scan in selectedScans: grouped.setdefault((scan["projectID"], scan["sessionID"]), []).append(scan)
+            sessions = [scans[0] for scans in grouped.values()]
+            projects = dict.fromkeys(scan.get("projectName") or scan["projectID"] for scan in sessions)
+            labels = [scan.get("sessionLabel") or scan.get("sessionName") or "unknown" for scan in sessions]
+            subjects = dict.fromkeys(scan.get("subjectID") or "unknown" for scan in sessions)
+            durations = []
+            for scan in sessions:
+                savedBounds = scan.get("acquisitionTimeBounds", [])
+                bounds = pglFlywheelSession._acquisitionBounds(savedBounds) if isinstance(savedBounds, list) else ()
+                durations.append(self._formatSessionDuration(bounds, selectedOnly=False))
+
+            pglMessages.printHeader("Flywheel selection across sessions")
+            pglMessages.print(f"Projects: {', '.join(projects)}")
+            pglMessages.print(f"Session labels: {', '.join(labels)}")
+            pglMessages.print(f"Session IDs: {', '.join(scan['sessionID'] for scan in sessions)}")
+            pglMessages.print(f"Subject IDs: {', '.join(subjects)}")
+            pglMessages.print(f"Acquisition times: {', '.join(scan.get('acquisitionTimeText') or 'unknown' for scan in sessions)}")
+            pglMessages.print(f"Session durations: {', '.join(durations)}")
+            counts = ", ".join(str(len(scans)) for scans in grouped.values())
+            fileLabel = "DICOM files or archives" if self.dicom else "NIfTI files"
+            pglMessages.print(f"Selected {fileLabel}: {counts} by session ({len(selectedScans)} total)")
+
+        # ====================================================================
+        @staticmethod
+        def _formatSessionDuration(bounds, *, selectedOnly, scans=()):
+            """Describe the recorded acquisition span and any known scan ends."""
+            import math
+            from datetime import timedelta
+
+            from .pglFlywheel import pglFlywheelSession
+
+            if not bounds: return "unknown"
+            firstStart, lastStart = bounds
+            latestEnd = lastStart
+            haveFinalDuration = False
+            for scan in scans:
+                duration = scan.sidecar.get("AcquisitionDuration")
+                acquisition = scan.sourceMetadata.get("acquisition", {})
+                start = pglFlywheelSession._acquisitionBounds([acquisition.get("timestamp")])
+                if not start or (start[0].tzinfo is None) != (firstStart.tzinfo is None): continue
+                if not firstStart <= start[0] <= lastStart: continue
+                try:
+                    if type(duration) not in (int, float) or not math.isfinite(duration) or duration <= 0: continue
+                    end = start[0] + timedelta(seconds=duration)
+                except OverflowError:
+                    continue
+                latestEnd = max(latestEnd, end)
+                if start[0] == lastStart: haveFinalDuration = True
+
+            if latestEnd == firstStart: return "unknown"
+            complete = haveFinalDuration and not selectedOnly
+            elapsed = (latestEnd - firstStart).total_seconds()
+            span = str(timedelta(seconds=round(elapsed) if complete else int(elapsed)))
+            scope = "selected acquisitions only, " if selectedOnly else ""
+            if complete: return f"about {span} (first acquisition start to final scan end)"
+            endpoint = "including available scan durations" if latestEnd > lastStart else "first to last acquisition start"
+            return f"at least {span} ({scope}{endpoint})"
+
+        # ====================================================================
+        def _convertDicomSources(self, records, client, cachePath, *, progress=None):
+            """Convert DICOM sources or download their Flywheel NIfTI fallback."""
+            import re
+            import shutil
+            import stat
+            import tempfile
+            import zipfile
+            from pathlib import Path, PurePosixPath
+            from uuid import uuid4
+
+            from .pglExternalTools import pglDcm2niix
+            from .pglFlywheel import pglFlywheelMRIBacking
+            from .pglMRI import pglMRI, pglMRIScan
+
+            cacheDirectory = Path(cachePath)
+            cacheDirectory.mkdir(parents=True, exist_ok=True)
+            if progress is not None: progress(0, "Checking dcm2niix availability")
+            tool = pglDcm2niix()
+            toolAvailable = tool.checkAvailable(cacheDirectory=cachePath)
+
+            conversionRoot = cacheDirectory / "pgl-dicom-conversions"
+            conversionRoot.mkdir(parents=True, exist_ok=True)
+            publishedDirectory = conversionRoot / uuid4().hex
+
+            def extractArchive(archivePath, destination):
+                """Extract a ZIP without allowing paths or links outside it."""
+                destination.mkdir(parents=True, exist_ok=False)
+                with zipfile.ZipFile(archivePath) as archive:
+                    for member in archive.infolist():
+                        memberName = member.filename.replace("\\", "/")
+                        memberPath = PurePosixPath(memberName)
+                        if (
+                            memberPath.is_absolute()
+                            or any(part in ("..",) for part in memberPath.parts)
+                            or (memberPath.parts and ":" in memberPath.parts[0])
+                        ):
+                            raise ValueError(f"Unsafe path in DICOM archive: {member.filename!r}.")
+                        if not memberPath.parts:
+                            if member.is_dir():
+                                continue
+                            raise ValueError(f"Invalid empty path in DICOM archive: {member.filename!r}.")
+
+                        mode = member.external_attr >> 16
+                        kind = stat.S_IFMT(mode)
+                        if kind not in (0, stat.S_IFREG, stat.S_IFDIR):
+                            raise ValueError(f"Unsupported special file in DICOM archive: {member.filename!r}.")
+                        if stat.S_ISLNK(mode):
+                            raise ValueError(f"Symbolic links are not allowed in DICOM archives: {member.filename!r}.")
+
+                        target = destination.joinpath(*memberPath.parts)
+                        if member.is_dir():
+                            target.mkdir(parents=True, exist_ok=True)
+                            continue
+
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        with archive.open(member, "r") as source, target.open("xb") as output:
+                            shutil.copyfileobj(source, output, length=1024 * 1024)
+
+            # ================================================================
+            def prepareDicomInput(sourcePath, sourceName, inputDirectory, scanProgress):
+                """Expand an outer ZIP and any per-series ZIPs into one tree."""
+                if sourceName.casefold().endswith(".zip") or zipfile.is_zipfile(sourcePath):
+                    if scanProgress is not None: scanProgress(None, f"Extracting DICOM archive — {sourceName}")
+                    extractArchive(sourcePath, inputDirectory)
+                else:
+                    if scanProgress is not None: scanProgress(None, f"Staging DICOM file — {sourceName}")
+                    inputDirectory.mkdir(parents=True, exist_ok=False)
+                    shutil.copyfile(sourcePath, inputDirectory / Path(sourceName).name)
+
+                for _ in range(8):
+                    nestedArchives = sorted(
+                        path for path in inputDirectory.rglob("*")
+                        if path.is_file() and path.suffix.casefold() == ".zip"
+                    )
+                    if not nestedArchives:
+                        return
+
+                    if scanProgress is not None: scanProgress(None, f"Extracting nested DICOM archives — {sourceName}")
+                    for archivePath in nestedArchives:
+                        nestedDirectory = archivePath.with_name(archivePath.name + ".contents")
+                        extractArchive(archivePath, nestedDirectory)
+                        archivePath.unlink()
+
+                if any(
+                    path.is_file() and path.suffix.casefold() == ".zip"
+                    for path in inputDirectory.rglob("*")
+                ):
+                    raise ValueError("DICOM archives are nested too deeply to convert safely.")
+
+            def fileStem(filename):
+                for suffix in (".nii.gz", ".nii", ".zip", ".dcm", ".dicom", ".ima"):
+                    if filename.casefold().endswith(suffix):
+                        return filename[:-len(suffix)]
+                return filename
+
+            def cleanBaseName(filename):
+                cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", fileStem(filename))
+                cleaned = re.sub(r"_+", "_", cleaned).strip("_.")
+                return cleaned or "dicom"
+
+            # ================================================================
+            def download(backing, destination, sizeBytes, scanProgress, description):
+                downloaded = 0
+                sizeMiB = sizeBytes / (1024 ** 2)
+                if scanProgress is not None:
+                    scanProgress(None, f"{description} — 0.0/{sizeMiB:,.1f} MiB — {backing.path}")
+
+                with backing.open() as source, destination.open("xb") as target:
+                    while block := source.read(1024 * 1024):
+                        target.write(block)
+                        downloaded += len(block)
+                        if scanProgress is not None:
+                            scanProgress(None, f"{description} — {downloaded / (1024 ** 2):,.1f}/{sizeMiB:,.1f} MiB — {backing.path}")
+
+            def loadScan(niftiPath, provenance):
+                scan = pglMRIScan(
+                    name=niftiPath.name,
+                    localPath=str(niftiPath),
+                    sourceMetadata=provenance,
+                )
+                if scan.data is None:
+                    raise ValueError(f"Could not open NIfTI header for {scan.name!r}.")
+                return scan
+
+            # ================================================================
+            def convertSource(backing, provenance, sourceDirectory, outputDirectory, scanProgress):
+                sourceName = backing.path
+                sourcePath = sourceDirectory / sourceName
+                download(backing, sourcePath, provenance["file"]["size"], scanProgress, "Downloading DICOM")
+
+                inputDirectory = sourceDirectory / "dicom"
+                prepareDicomInput(sourcePath, sourceName, inputDirectory, scanProgress)
+
+                if scanProgress is not None: scanProgress(None, f"Running dcm2niix — {sourceName}")
+                pglMessages.print(f"Converting Flywheel DICOM {sourceName!r} with dcm2niix.")
+                result = tool.runCommand(
+                    arguments=[
+                        "-z", "y",
+                        "-b", "y",
+                        "-ba", "n",
+                        "-w", "1",
+                        "-f", f"{cleanBaseName(sourceName)}_%s",
+                        "-o", str(outputDirectory),
+                        str(inputDirectory),
+                    ],
+                    cacheDirectory=cachePath,
+                )
+                if result is None:
+                    raise RuntimeError("dcm2niix did not run successfully.")
+
+                if scanProgress is not None: scanProgress(None, f"Validating converted NIfTI — {sourceName}")
+                niftiFiles = sorted(
+                    path for path in outputDirectory.iterdir()
+                    if path.is_file() and path.name.casefold().endswith((".nii", ".nii.gz"))
+                )
+                if not niftiFiles:
+                    raise ValueError("dcm2niix did not produce a NIfTI file.")
+
+                pairedSidecars = set()
+                scans = []
+                for niftiPath in niftiFiles:
+                    sidecarPath = pglMRIScan._sidecarPath(niftiPath)
+                    if not sidecarPath.is_file():
+                        raise ValueError(f"dcm2niix did not create the JSON sidecar for {niftiPath.name!r}.")
+
+                    scanProvenance = {
+                        **provenance,
+                        "conversion": {
+                            "software": "dcm2niix",
+                            "sourceFile": sourceName,
+                            "outputFile": niftiPath.name,
+                        },
+                    }
+                    scan = loadScan(niftiPath, scanProvenance)
+                    pglMRIScan._writeSidecar(niftiPath, scan.sidecar)
+                    scans.append(scan)
+                    pairedSidecars.add(sidecarPath.name)
+
+                jsonFiles = {
+                    path.name for path in outputDirectory.iterdir()
+                    if path.is_file() and path.suffix.casefold() == ".json"
+                }
+                if jsonFiles != pairedSidecars:
+                    raise ValueError("dcm2niix produced unpaired JSON sidecars.")
+                return scans
+
+            # ================================================================
+            def downloadFallback(provenance, outputDirectory, scanProgress):
+                selection = provenance["selection"]
+                acquisitionID = selection["acquisitionID"]
+                if scanProgress is not None: scanProgress(None, f"Looking for a Flywheel NIfTI fallback — {selection['fileName']}")
+                try:
+                    acquisition = client.get_acquisition(acquisitionID)
+                    files = list(acquisition.files or [])
+                except Exception:
+                    raise RuntimeError("Could not read Flywheel acquisition files.") from None
+
+                candidates = [
+                    file for file in files
+                    if isinstance(getattr(file, "name", None), str)
+                    and file.name.casefold().endswith((".nii", ".nii.gz"))
+                ]
+                if not candidates:
+                    raise ValueError("No NIfTI file was found in this Flywheel acquisition.")
+
+                sourceStem = fileStem(selection["fileName"]).casefold()
+                matching = [
+                    file for file in candidates
+                    if fileStem(file.name).casefold() == sourceStem
+                ]
+                candidates = matching or candidates
+                if len(candidates) != 1:
+                    raise ValueError("Could not identify a unique NIfTI file in this Flywheel acquisition.")
+
+                file = candidates[0]
+                fileMetadata = {
+                    "name": file.name,
+                    "type": "nifti",
+                    "version": getattr(file, "version", None),
+                    "size": getattr(file, "size", None),
+                    "hash": getattr(file, "hash", None),
+                }
+                backing = pglFlywheelMRIBacking(
+                    client,
+                    acquisitionID,
+                    file.name,
+                    version=fileMetadata["version"],
+                    sizeBytes=fileMetadata["size"],
+                    sourceHash=fileMetadata["hash"],
+                )
+                acquisitionLabel = provenance.get("acquisition", {}).get("label")
+                fallbackProvenance = {
+                    **provenance,
+                    "selection": {
+                        **selection,
+                        "name": f"{acquisitionLabel}: {file.name}" if acquisitionLabel else file.name,
+                        "fileName": file.name,
+                        "fileType": "nifti",
+                    },
+                    "versionPinnedAt": "loadFlywheel",
+                    "file": fileMetadata,
+                    "fallback": {"selection": selection, "file": provenance["file"]},
+                }
+                pglMessages.print(f"Downloading existing Flywheel NIfTI {file.name!r} for {selection['fileName']!r}.")
+                niftiPath = outputDirectory / file.name
+                download(backing, niftiPath, fileMetadata["size"], scanProgress, "Downloading NIfTI fallback")
+                if scanProgress is not None: scanProgress(None, f"Validating NIfTI fallback — {file.name}")
+                return loadScan(niftiPath, fallbackProvenance)
+
+            mri = pglMRI()
+            scanCount = len(records)
+            with tempfile.TemporaryDirectory(prefix=".pgl-dicom-", dir=str(cacheDirectory)) as temporary:
+                publishedDirectory.mkdir()
+                try:
+                    for index, record in enumerate(records):
+                        provenance = record["sourceMetadata"]
+                        selection = provenance["selection"]
+                        fileMetadata = provenance["file"]
+                        sourceName = selection["fileName"]
+                        if index: pglMessages.printHeader(fillChar="-")
+                        # Advance the overall bar by scans processed. The
+                        # download status shows bytes transferred per scan.
+                        scanProgress = progress.section(index / scanCount, (index + 1) / scanCount, label=f"Scan {index + 1}/{scanCount}") if progress is not None else None
+                        if scanProgress is not None: scanProgress(0, f"Preparing DICOM source — {sourceName}")
+
+                        backing = pglFlywheelMRIBacking(
+                            client,
+                            selection["acquisitionID"],
+                            sourceName,
+                            version=fileMetadata["version"],
+                            sizeBytes=fileMetadata["size"],
+                            sourceHash=fileMetadata["hash"],
+                            dicom=True,
+                        )
+                        sourceDirectory = Path(temporary) / f"source-{index:04d}"
+                        sourceDirectory.mkdir()
+                        outputDirectory = publishedDirectory / f"scan-{index:04d}"
+                        outputDirectory.mkdir()
+                        try:
+                            if not toolAvailable:
+                                raise RuntimeError("dcm2niix is unavailable.")
+                            scans = convertSource(backing, provenance, sourceDirectory, outputDirectory, scanProgress)
+                        except Exception as error:
+                            pglMessages.print(
+                                f"DICOM import failed for {sourceName!r} ({error}). "
+                                "Checking its Flywheel acquisition for an existing NIfTI."
+                            )
+                            shutil.rmtree(outputDirectory)
+                            outputDirectory.mkdir()
+                            try:
+                                scan = downloadFallback(provenance, outputDirectory, scanProgress)
+                            except Exception as fallbackError:
+                                shutil.rmtree(outputDirectory)
+                                pglMessages.message(f"Skipping Flywheel scan {sourceName!r}: {fallbackError}")
+                                if scanProgress is not None: scanProgress(1, f"Skipped — {sourceName}")
+                                continue
+                            pglMessages.print(f"Loaded Flywheel NIfTI {scan.name!r} for {sourceName!r}.")
+                            scans = [scan]
+                        mri.scans = [*mri.scans, *scans]
+                        if scanProgress is not None: scanProgress(1, f"Loaded — {sourceName}")
+                except BaseException:
+                    shutil.rmtree(publishedDirectory)
+                    raise
+
+                if not mri.scans:
+                    publishedDirectory.rmdir()
+
+            if progress is not None: progress(1, "Summarizing imported MRI scans")
+            pglMessages.printHeader("DICOM conversion results", fillChar="-")
+            for scan in mri.scans:
+                summary = scan.getScanSummary(readHeaders=False)
+                tr = summary["trSeconds"]
+                trText = "unknown" if tr is None else f"{tr:.6g}s"
+                pglMessages.message(
+                    f"{scan.name}: dims={summary['scanDims']}, voxelDims={summary['voxelDims']}mm, "
+                    f"TR={trText}, qform_code={summary['qform_code']}, "
+                    f"sform_code={summary['sform_code']}"
+                )
+
+            return mri
