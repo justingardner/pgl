@@ -2589,7 +2589,11 @@ class pglActionsMRI(pglActionCollection):
                 raise ValueError("Could not uniquely identify the task settings for stimulus duration.")
 
             task = taskMatches[0]
-            if task.modifyTrialSegments.__func__ is not pglTask.modifyTrialSegments:
+            modifyTrialSegments = getattr(task, "modifyTrialSegments", None)
+            if (
+                modifyTrialSegments is not None
+                and getattr(modifyTrialSegments, "__func__", modifyTrialSegments) is not pglTask.modifyTrialSegments
+            ):
                 raise ValueError(
                     f"Task {info.taskName!r} changes segment lengths per trial; "
                     "supply stimDur explicitly."
