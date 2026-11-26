@@ -2297,143 +2297,121 @@ class pglActionsMRI(pglActionCollection):
     # GLMsingle
     ############################            
     class GLMsingle(pglAction):
-        """Fit GLMsingle using matched runs and current MRI data.
+        """Fit GLMsingle models and publish beta weights and diagnostics.
 
-        All scientific preparation, fitting, conversion, and publication
-        belongs to this action.
+        The default Type D fit uses the HRF library, GLMdenoise, and fractional
+        ridge. Stimulus duration is read from the selected task segment when it
+        is fixed; otherwise, supply stimDur explicitly.
 
-        Betas and diagnostics are analysis products, not image replacements.
-
-        Currently supports explicit Type B selection. Type C/D execution and
-        output handling remain to be validated before they are supported.
+        By default, retain the selected model's beta weights and useful fit
+        measures, plus diagnostic figures. Set retainIntermediateModels=True
+        to retain the other computed model results and GLMsingle support files.
         """
 
-        scanIndices = List(Int(min=0),default_value=None,allow_none=True,help="Ordered matched MRI scan indices; None preserves saved correspondence order.")
-        taskName = Unicode(default_value=None,allow_none=True,help="Behavioral task selection; None uses existing main-task selection.")
-        segmentNum = Int(default_value=0,min=0,allow_none=True,help="Zero-based onset segment; None selects trial START.")
-        stimDur = Float(2.0,help="Explicit stimulus duration in seconds.")
-        model = Enum(["B"],default_value=None,allow_none=True,help="Explicit model selection. Currently only B is supported; no automatic selection.")
-        glmOptions = Dict(default_value={},help="Additional GLMsingle options; model flags and output routing are action-managed.")
-        retainIntermediateModels = Bool(False,help="Also retain Type A matrices and the full candidate-HRF score arrays.")
-        outputName = Unicode("GLMsingle",help="Name of the GLMsingle analysis product.")
-        cacheDirectory = Unicode(default_value=None,allow_none=True,help="Local working-cache override; None uses ~/.cache/pgl.")
-        showFigures = Bool(True, help="Display GLMsingle figures after successful execution.")
+        scanIndices = List(Int(min=0), default_value=None, allow_none=True, help="Ordered matched MRI scan indices; None uses all saved matches.")
+        taskName = Unicode(default_value=None, allow_none=True, help="Task selection; None uses the run's main task.")
+        segmentNum = Int(default_value=0, min=0, allow_none=True, help="Zero-based onset segment; None selects trial START.")
+        stimDur = Float(default_value=None, allow_none=True, help="Stimulus duration in seconds; None uses the selected task segment's fixed length.")
+        model = Enum(["A", "B", "C", "D"], default_value="D", help="Highest GLMsingle model to run; Type D is the default.")
+        glmOptions = Dict(default_value={}, help="Additional GLMsingle options; model flags and output routing are action-managed.")
+        retainIntermediateModels = Bool(False, help="Retain other computed model results and GLMsingle support files.")
+        outputName = Unicode("GLMsingle", help="Name of the GLMsingle analysis product.")
+        cacheDirectory = Unicode(default_value=None, allow_none=True, help="Local working-cache override; None uses ~/.cache/pgl.")
+        showFigures = Bool(True, help="Display diagnostic figures after a successful fit.")
+
+        def configure(self, session=None, confirm=True, **kwargs):
+            """Configure the analysis and confirm its plan when a session is supplied.
+
+            Pass confirm=False for scripted runs. Confirmation requires session
+            data so the displayed run count and stimulus duration are accurate.
+            """
+            from .pglPipeline import pglActionStatus
+
+            self.status = pglActionStatus.INITIALIZED
+            if type(confirm) is not bool:
+                raise TypeError("confirm must be Boolean.")
+            self.configureTraits(**kwargs)
+
+            if session is None:
+                if confirm:
+                    pglMessages.warning(
+                        "GLMsingle plan confirmation needs a session. "
+                        "Pass session=... or use confirm=False for scripted configuration."
+                    )
+                    return False
+                super().configure()
+                return True
+
+            prepared = self._prepareInputs(
+                session,
+                scanIndices=self.scanIndices,
+                taskName=self.taskName,
+                segmentNum=self.segmentNum,
+                stimDur=self.stimDur,
+            )
+            try:
+                if confirm:
+                    from .pglDialog import pglDialogs
+
+                    if not pglDialogs.confirm(
+                        "Run GLMsingle with these inputs?",
+                        title="Confirm GLMsingle analysis",
+                        details=self._planText(prepared),
+                        confirmButtonText="Run analysis",
+                    ):
+                        pglMessages.message("GLMsingle configuration cancelled; no analysis was started.")
+                        return False
+            finally:
+                for matrix in prepared["matrices"]:
+                    matrix.close()
+
+            super().configure()
+            return True
+
+        def _planText(self, prepared):
+            """Describe the fit in concise, user-facing language."""
+            modelDescriptions = {
+                "A": "Estimate the overall response to stimulus onsets.",
+                "B": "Estimate a response for each presentation and select an HRF.",
+                "C": "Estimate presentation responses while reducing shared noise.",
+                "D": "Estimate presentation responses while reducing shared noise and adjusting beta weights.",
+            }
+            taskName = prepared["runs"][0]["taskName"]
+            durationDescription = (
+                f"{prepared['stimDur']:.3g} seconds from segment "
+                f"{self.segmentNum} of the {taskName} task"
+                if prepared["stimDurSource"] == "task"
+                else f"{prepared['stimDur']:.3g} seconds, supplied explicitly"
+            )
+            return (
+                "Inputs\n"
+                f"  MRI runs: {len(prepared['runs'])}\n"
+                f"  Task: {taskName}\n"
+                f"  Stimulus length: {durationDescription}\n\n"
+                "What GLMsingle will do\n"
+                f"  Model {self.model}: {modelDescriptions[self.model]}\n"
+                "  Fitting may take a long time.\n\n"
+                "Outputs\n"
+                "  Beta weights, fit measures, and diagnostic figures\n"
+                "  Intermediate results are not retained unless requested\n"
+                "  The source MRI images are not changed"
+            )
         
         @operationProgress("GLMsingle analysis")
         def _run(self, session):
-            """Prepare, fit, validate, and publish one GLMsingle analysis.
-
-            Uses the existing action execution/console-capture infrastructure.
-            Does not create another progress display or publish image replacements.
-
-            Current implementation:
-                Explicit Type B selection.
-                Current committed MRI replacements, otherwise acquisition data.
-                Independent writable numerical fit inputs.
-                Validated chronological single-trial output mapping.
-                Lazy Zarr analysis outputs and explicit support artifacts.
-
-            Scientific publication occurs here, not in _afterSuccess().
-            The action runner determines final product commitment.
-            """
-            import inspect
-            from copy import deepcopy
-
-            from .pglExternalTools import getExecutionRecorder
-            from .pglSession import pglSession
-
+            """Prepare inputs, fit the selected model, then publish its results."""
             progress = currentProgress()
             prepared = None
             fitted = None
-
-            if not isinstance(session, pglSession) or session.mri is None:
-                raise ValueError("GLMsingle requires a session with MRI data.")
-            if session.mri._getSession() is not session:
-                raise ValueError("MRI collection is not bound to this session.")
-            if session._failedActionIDs or session.mri._failedActionIDs:
-                raise ValueError("Cannot fit a working object with unresolved action failures.")
-
-            recorder = getExecutionRecorder()
-            if (
-                not getattr(self, "_executionInProgress", False)
-                or recorder is None
-                or not self.actionHistory
-                or recorder.actionID != self.actionHistory[-1].actionID
-            ):
-                raise RuntimeError("Run GLMsingle through the ordinary action runner, not by calling _run() directly.")
-
-            if self.model != "B":
-                raise ValueError(
-                    "Explicitly select model='B' to use the currently validated Type B path. "
-                    "Type C/D support is not implemented yet; no model is selected automatically."
-                )
-            if (
-                not self.outputName.strip()
-                or any(character in self.outputName for character in ("\x00", "\n", "\r"))
-            ):
-                raise ValueError("outputName must be nonblank without NUL or newlines.")
-
-            if any(
-                record.get("name") == self.outputName
-                and record.get("recordStatus") == "committed"
-                for entry in session.actionHistory
-                for record in entry.actionProducts
-            ):
-                raise ValueError(f"Product {self.outputName!r} already exists.")
-            if any(record["name"] == self.outputName for record in recorder.exportProducts()):
-                raise ValueError("This execution already registered the requested outputName.")
-
-            # Scientific model flags and output routing have dedicated controls.
-            # Reject conflicts instead of overriding the user's supplied options.
-            reservedOptions = {
-                "wantlibrary",
-                "wantglmdenoise",
-                "wantfracridge",
-                "wantlss",
-                "wantfileoutputs",
-                "wantmemoryoutputs",
-                "wanthdf5",
-            }
-            conflicts = reservedOptions.intersection(self.glmOptions)
-            if conflicts:
-                raise ValueError(
-                    f"These glmOptions are controlled by the supported model/output path: "
-                    f"{sorted(conflicts)}."
-                )
-            if any(not isinstance(name, str) for name in self.glmOptions):
-                raise TypeError("GLMsingle option names must be strings.")
-
-            params = {
-                **deepcopy(self.glmOptions),
-                "wantlibrary": 1,
-                "wantglmdenoise": 0,
-                "wantfracridge": 0,
-                "wantlss": 0,
-            }
-
-            # Fail on installation/API problems before preparing or loading MRI.
-            # Installation itself remains the external tool adapter's concern.
-            from glmsingle.glmsingle import GLM_single
-
-            inspect.signature(GLM_single).bind(params={})
-            inspect.signature(GLM_single.fit).bind(
-                None,
-                [],
-                [],
-                stimdur=self.stimDur,
-                tr=1.0,
-                outputdir=None,
-                figuredir=None,
-            )
-
-            pglMessages.message(
-                f"GLMsingle analysis: {self.outputName!r}\n"
-                "Explicit model: B — HRF fitting, without GLMdenoise or fractional ridge.\n"
-                "Inputs: current committed MRI images, otherwise acquisitions.\n"
-                "Outputs: analysis matrices; current MRI images will not be replaced."
-            )
-
+            self._validateExecution(session)
+            params = self._modelParams()
             try:
+                pglMessages.printHeader("GLMsingle analysis")
+                pglMessages.print(f"Model        : {self.model}")
+                pglMessages.print(f"Output       : {self.outputName}")
+                pglMessages.print(f"Intermediates: {'retained' if self.retainIntermediateModels else 'not retained'}")
+                pglMessages.printHeader(fillChar="-")
+
                 prepared = progressCall(
                     progress, 0.0, 0.1,
                     "Preparing GLMsingle designs and input provenance",
@@ -2452,18 +2430,10 @@ class pglActionsMRI(pglActionCollection):
                     prepared,
                     params=params,
                     cacheDirectory=self.cacheDirectory,
+                    modelType=self.model,
                 )
 
-                # Default: final single-trial betas and compact fit diagnostics.
-                # Full HRF-candidate scores and Type A matrices are optional.
-                retainRoles = [
-                    "typeb.betasmd",
-                    "typeb.R2",
-                    "typeb.R2run",
-                    "typeb.meanvol",
-                    "typeb.HRFindex",
-                    "typeb.HRFindexrun",
-                ]
+                retainRoles = self._defaultRetainRoles(fitted["matrices"])
                 if self.retainIntermediateModels:
                     retainRoles = list(fitted["matrices"])
 
@@ -2476,8 +2446,12 @@ class pglActionsMRI(pglActionCollection):
                     fitted,
                     outputName=self.outputName,
                     retainRoles=retainRoles,
+                    retainIntermediateModels=self.retainIntermediateModels,
                 )
 
+                pglMessages.printHeader(fillChar="-")
+                pglMessages.print("GLMsingle analysis complete")
+                pglMessages.printHeader("GLMsingle analysis", fillChar="=")
                 return session
 
             finally:
@@ -2489,7 +2463,164 @@ class pglActionsMRI(pglActionCollection):
                 if prepared is not None:
                     for matrix in prepared["matrices"]:
                         matrix.close()
-        def _prepareInputs(self, session, *, scanIndices=None, taskName=None, segmentNum=0, stimDur=2.0):
+
+        def _validateExecution(self, session):
+            """Check session ownership, action execution, options, and output names."""
+            import inspect
+
+            from .pglExternalTools import getExecutionRecorder
+            from .pglSession import pglSession
+
+            if not isinstance(session, pglSession) or session.mri is None:
+                raise ValueError("GLMsingle requires a session with MRI data.")
+            if session.mri._getSession() is not session:
+                raise ValueError("MRI collection is not bound to this session.")
+            if session._failedActionIDs or session.mri._failedActionIDs:
+                raise ValueError("Cannot fit a working object with unresolved action failures.")
+
+            recorder = getExecutionRecorder()
+            if (
+                not getattr(self, "_executionInProgress", False)
+                or recorder is None
+                or not self.actionHistory
+                or recorder.actionID != self.actionHistory[-1].actionID
+            ):
+                raise RuntimeError("Run GLMsingle through the ordinary action runner, not by calling _run() directly.")
+            if not self.outputName.strip() or any(character in self.outputName for character in ("\x00", "\n", "\r")):
+                raise ValueError("outputName must be nonblank without NUL or newlines.")
+            if any(
+                record.get("name") == self.outputName and record.get("recordStatus") == "committed"
+                for entry in session.actionHistory
+                for record in entry.actionProducts
+            ):
+                raise ValueError(f"Product {self.outputName!r} already exists.")
+            if any(record["name"] == self.outputName for record in recorder.exportProducts()):
+                raise ValueError("This execution already registered the requested outputName.")
+
+            reservedOptions = {
+                "wantlibrary", "wantglmdenoise", "wantfracridge", "wantlss",
+                "wantfileoutputs", "wantmemoryoutputs", "wanthdf5",
+            }
+            conflicts = reservedOptions.intersection(self.glmOptions)
+            if conflicts:
+                raise ValueError(f"These GLMsingle options are managed by the action: {sorted(conflicts)}.")
+            if any(not isinstance(name, str) for name in self.glmOptions):
+                raise TypeError("GLMsingle option names must be strings.")
+
+            from glmsingle.glmsingle import GLM_single
+
+            inspect.signature(GLM_single).bind(params={})
+            inspect.signature(GLM_single.fit).bind(
+                None, [], [], stimdur=1.0, tr=1.0, outputdir=None, figuredir=None,
+            )
+
+        def _modelParams(self):
+            """Build explicit model and output settings for GLMsingle."""
+            from copy import deepcopy
+
+            modelFlags = {
+                "A": {"wantlibrary": 0, "wantglmdenoise": 0, "wantfracridge": 0},
+                "B": {"wantlibrary": 1, "wantglmdenoise": 0, "wantfracridge": 0},
+                "C": {"wantlibrary": 1, "wantglmdenoise": 1, "wantfracridge": 0},
+                "D": {"wantlibrary": 1, "wantglmdenoise": 1, "wantfracridge": 1},
+            }
+            modelIndex = ["A", "B", "C", "D"].index(self.model)
+            memoryOutputs = [0, 0, 0, 0]
+            if self.retainIntermediateModels:
+                memoryOutputs[:modelIndex + 1] = [1] * (modelIndex + 1)
+            else:
+                memoryOutputs[modelIndex] = 1
+
+            params = deepcopy(self.glmOptions)
+            params.update(modelFlags[self.model])
+            params.update({
+                "wantlss": 0,
+                "wantfileoutputs": [0, 0, 0, 0],
+                "wantmemoryoutputs": memoryOutputs,
+                "wanthdf5": 0,
+            })
+            params.setdefault("seed", 1)
+            return params
+
+        def _defaultRetainRoles(self, matrices):
+            """Return beta weights and compact fit measures for the selected model."""
+            roleSets = {
+                "A": ["typea.betasmd", "typea.onoffR2", "typea.meanvol"],
+                "B": ["typeb.betasmd", "typeb.R2", "typeb.R2run", "typeb.meanvol", "typeb.HRFindex", "typeb.HRFindexrun"],
+                "C": ["typec.betasmd", "typec.R2", "typec.R2run", "typec.meanvol", "typec.HRFindex", "typec.HRFindexrun"],
+                "D": ["typed.betasmd", "typed.R2", "typed.R2run", "typed.meanvol", "typed.HRFindex", "typed.HRFindexrun", "typed.FRACvalue"],
+            }
+            roles = roleSets[self.model]
+            missing = set(roles) - set(matrices)
+            if missing:
+                raise ValueError(f"GLMsingle did not return required {self.model} outputs: {sorted(missing)}.")
+            return roles
+
+        def _resolveStimDuration(self, run, info, segmentNum, stimDur):
+            """Use an explicit duration or the selected task's fixed segment length."""
+            import math
+            from numbers import Real
+
+            import numpy as np
+
+            def validDuration(value):
+                return (
+                    not isinstance(value, (bool, np.bool_))
+                    and isinstance(value, Real)
+                    and math.isfinite(float(value))
+                    and value > 0
+                )
+
+            if stimDur is not None:
+                if not validDuration(stimDur):
+                    raise ValueError("stimDur must be positive and finite.")
+                return float(stimDur), "explicit"
+            if segmentNum is None:
+                raise ValueError("Set stimDur when segmentNum=None selects trial START.")
+
+            from .pglExperiment import pglTask
+
+            taskMatches = [
+                task for task in run.tasks
+                if task.settings.taskName == info.taskName
+                and task.settings.taskSaveName == info.taskSaveName
+            ]
+            if len(taskMatches) != 1:
+                raise ValueError("Could not uniquely identify the task settings for stimulus duration.")
+
+            task = taskMatches[0]
+            if task.modifyTrialSegments.__func__ is not pglTask.modifyTrialSegments:
+                raise ValueError(
+                    f"Task {info.taskName!r} changes segment lengths per trial; "
+                    "supply stimDur explicitly."
+                )
+
+            settings = task.settings
+            if (
+                segmentNum >= settings.nSegments
+                or segmentNum >= len(settings.seglen)
+                or segmentNum >= len(settings.segmin)
+                or segmentNum >= len(settings.segmax)
+            ):
+                raise ValueError(f"Task {info.taskName!r} has no configured segment {segmentNum}.")
+
+            duration = settings.seglen[segmentNum]
+            minimum = settings.segmin[segmentNum]
+            maximum = settings.segmax[segmentNum]
+            if not validDuration(duration) or not validDuration(minimum) or not validDuration(maximum):
+                raise ValueError(
+                    f"Task segment {segmentNum} does not have a finite positive duration; "
+                    "supply stimDur explicitly."
+                )
+            if not np.isclose(minimum, maximum, rtol=0, atol=1e-9):
+                raise ValueError(
+                    f"Task segment {segmentNum} has a variable duration; supply stimDur explicitly."
+                )
+            if not np.isclose(duration, minimum, rtol=0, atol=1e-9):
+                raise ValueError(f"Task segment {segmentNum} has inconsistent configured durations.")
+            return float(duration), "task"
+
+        def _prepareInputs(self, session, *, scanIndices=None, taskName=None, segmentNum=0, stimDur=None):
             """Prepare shared-condition designs and lazy MRI input matrices.
 
             Uses existing scan/run matches and established volume correspondence.
@@ -2503,7 +2634,8 @@ class pglActionsMRI(pglActionCollection):
                 Zero-based onset segment. None selects trial START.
 
             stimDur:
-                Explicit positive duration in seconds; need not be a multiple of TR.
+                Positive duration in seconds, or None to use the selected task
+                segment's fixed duration. It need not be a multiple of TR.
 
             Conditions:
                 Exact recorded source-image identity defines shared columns:
@@ -2540,9 +2672,6 @@ class pglActionsMRI(pglActionCollection):
 
             def finiteNumber(value):
                 return not isinstance(value, (bool, np.bool_)) and isinstance(value, Real) and np.isfinite(value)
-
-            if not finiteNumber(stimDur) or stimDur <= 0:
-                raise ValueError("stimDur must be positive and finite.")
 
             matches = list(session.getScanRunMatches())
             if not matches:
@@ -2583,6 +2712,7 @@ class pglActionsMRI(pglActionCollection):
             conditionColumns, stimulusSources = {}, {}
             trialsByRun = []
             commonTR, commonShape, nVoxels = None, None, None
+            resolvedStimDur, stimDurSource = None, None
             identityFields = ("filesystemPrefix", "filename", "datasetPath", "imageAxis", "imageIndex")
 
             try:
@@ -2600,6 +2730,14 @@ class pglActionsMRI(pglActionCollection):
                         raise ValueError(f"Run {runIndex}: trial information could not be selected.")
                     if info.groupBy != "stimulus":
                         raise ValueError("GLMsingle preparation currently requires stimulus grouping.")
+                    runStimDur, runStimDurSource = self._resolveStimDuration(
+                        run, info, segmentNum, stimDur,
+                    )
+                    if resolvedStimDur is None:
+                        resolvedStimDur = runStimDur
+                        stimDurSource = runStimDurSource
+                    elif not np.isclose(runStimDur, resolvedStimDur, rtol=0, atol=1e-9):
+                        raise ValueError("Selected runs have different stimulus durations.")
 
                     # Blank exclusion is intentional. Other omissions must not
                     # silently turn missing presentations into baseline periods.
@@ -2860,7 +2998,7 @@ class pglActionsMRI(pglActionCollection):
                     f"identity: recorded source image"
                 )
                 pglMessages.message(
-                    f"TR: {commonTR:.6g} s; stimulus duration: {float(stimDur):.6g} s; "
+                    f"TR: {commonTR:.6g} s; stimulus duration: {resolvedStimDur:.6g} s; "
                     f"onsets: {onsetLabel}"
                 )
                 pglMessages.message(
@@ -2875,7 +3013,8 @@ class pglActionsMRI(pglActionCollection):
                     "conditions": conditions,
                     "trials": allTrials,
                     "runs": runRecords,
-                    "stimDur": float(stimDur),
+                    "stimDur": resolvedStimDur,
+                    "stimDurSource": stimDurSource,
                     "tr": commonTR,
                     "nVoxels": nVoxels,
                     "nTrials": len(allTrials),
@@ -2901,19 +3040,33 @@ class pglActionsMRI(pglActionCollection):
                 "typeb.FitHRFR2run": "typeB_hrfCandidateR2ByRun",
                 "typeb.HRFindex": "typeB_hrfIndex",
                 "typeb.HRFindexrun": "typeB_hrfIndexByRun",
+                "typec.betasmd": "typeC_betas",
+                "typec.R2": "typeC_R2",
+                "typec.R2run": "typeC_R2ByRun",
+                "typec.meanvol": "typeC_meanVolume",
+                "typec.HRFindex": "typeC_hrfIndex",
+                "typec.HRFindexrun": "typeC_hrfIndexByRun",
+                "typed.betasmd": "typeD_betas",
+                "typed.R2": "typeD_R2",
+                "typed.R2run": "typeD_R2ByRun",
+                "typed.meanvol": "typeD_meanVolume",
+                "typed.HRFindex": "typeD_hrfIndex",
+                "typed.HRFindexrun": "typeD_hrfIndexByRun",
+                "typed.FRACvalue": "typeD_fraction",
             }
             return labels.get(role, role.replace(".", "_"))
 
-        def _convertTypeBResults(self, prepared, results, designInfo, *, artifactDirectory=None):
+        def _convertResults(self, prepared, results, designInfo, *, model, retainIntermediateModels=False, artifactDirectory=None):
             """Validate result associations and construct unattached analysis matrices.
 
-            Supports the currently implemented ordinary Type B, multi-HRF-library path.
-            Preserves native numerical outputs, including NaN and infinity.
+            Converts standard numeric outputs for any requested model and
+            preserves native numerical outputs, including NaN and infinity.
 
             Validates explicit dimensions and chronological trial/design associations.
             Does not impose numerical fit-quality thresholds or recompute HRF selection.
 
-            Additional returned fields/models are preserved in a native file artifact.
+            Additional fields are preserved in a native file artifact only when
+            intermediate model retention is requested.
             They are not silently discarded or passed to Zarr as object arrays.
 
             Native HRF indices are preserved. The inspected multi-HRF branch of the
@@ -2936,17 +3089,23 @@ class pglActionsMRI(pglActionCollection):
             nConditions = len(prepared["conditions"])
             params = designInfo["params"]
 
+            expectedFlags = {
+                "A": (0, 0, 0),
+                "B": (1, 0, 0),
+                "C": (1, 1, 0),
+                "D": (1, 1, 1),
+            }[model]
             if (
-                params["wantlibrary"] != 1
-                or params["wantglmdenoise"] != 0
-                or params["wantfracridge"] != 0
+                params["wantlibrary"] != expectedFlags[0]
+                or params["wantglmdenoise"] != expectedFlags[1]
+                or params["wantfracridge"] != expectedFlags[2]
                 or params.get("wantlss", 0) != 0
             ):
-                raise ValueError("This converter currently implements ordinary Type B without denoising/ridge.")
+                raise ValueError(f"Saved GLMsingle model flags do not match requested Type {model}.")
 
             hrfLibrary = np.asarray(params["hrflibrary"])
-            if hrfLibrary.ndim != 2 or hrfLibrary.shape[1] <= 1:
-                raise ValueError("Single-HRF/assumed-HRF conversion is not implemented yet.")
+            if hrfLibrary.ndim != 2 or hrfLibrary.shape[1] < 1:
+                raise ValueError("GLMsingle saved an invalid HRF library.")
             nHRFs = hrfLibrary.shape[1]
 
             if not np.isclose(designInfo["tr"], prepared["tr"], rtol=0, atol=1e-8):
@@ -3029,11 +3188,19 @@ class pglActionsMRI(pglActionCollection):
                 if not np.array_equal(np.asarray(designInfo[field]), np.asarray(expected)):
                     raise ValueError(f"Saved GLMsingle {field} differs from preparation.")
 
-            if not isinstance(results, dict) or "typeb" not in results:
-                raise ValueError("GLMsingle did not return the requested Type B results.")
+            modelKey = f"type{model.lower()}"
+            if not isinstance(results, dict) or modelKey not in results:
+                raise ValueError(f"GLMsingle did not return the requested Type {model} results.")
+            if not isinstance(results[modelKey], dict):
+                raise TypeError(f"GLMsingle Type {model} results must be a dictionary.")
 
             # Each entry specifies native shape and explicit analysis dimensions.
             specifications = {
+                "typea": {
+                    "betasmd": ((nVoxels, 1, 1, 1), ("voxel", "onoff")),
+                    "onoffR2": ((nVoxels, 1, 1), ("voxel",)),
+                    "meanvol": ((nVoxels, 1, 1), ("voxel",)),
+                },
                 "typeb": {
                     "betasmd": ((nVoxels, 1, 1, nTrials), ("voxel", "trial")),
                     "R2": ((nVoxels, 1, 1), ("voxel",)),
@@ -3044,21 +3211,30 @@ class pglActionsMRI(pglActionCollection):
                     "HRFindex": ((nVoxels, 1, 1), ("voxel",)),
                     "HRFindexrun": ((nVoxels, 1, 1, nRuns), ("voxel", "fitRun")),
                 },
-                "typea": {
-                    "betasmd": ((nVoxels, 1, 1, 1), ("voxel", "onoff")),
-                    "onoffR2": ((nVoxels, 1, 1), ("voxel",)),
+                "typec": {
+                    "betasmd": ((nVoxels, 1, 1, nTrials), ("voxel", "trial")),
+                    "R2": ((nVoxels, 1, 1), ("voxel",)),
+                    "R2run": ((nVoxels, 1, 1, nRuns), ("voxel", "fitRun")),
                     "meanvol": ((nVoxels, 1, 1), ("voxel",)),
+                    "HRFindex": ((nVoxels, 1, 1), ("voxel",)),
+                    "HRFindexrun": ((nVoxels, 1, 1, nRuns), ("voxel", "fitRun")),
+                },
+                "typed": {
+                    "betasmd": ((nVoxels, 1, 1, nTrials), ("voxel", "trial")),
+                    "R2": ((nVoxels, 1, 1), ("voxel",)),
+                    "R2run": ((nVoxels, 1, 1, nRuns), ("voxel", "fitRun")),
+                    "meanvol": ((nVoxels, 1, 1), ("voxel",)),
+                    "HRFindex": ((nVoxels, 1, 1), ("voxel",)),
+                    "HRFindexrun": ((nVoxels, 1, 1, nRuns), ("voxel", "fitRun")),
+                    "FRACvalue": ((nVoxels, 1, 1), ("voxel",)),
                 },
             }
 
             additionalOutputs = {}
             for modelName, modelResults in results.items():
-                if modelName not in specifications:
+                if modelName not in specifications or not isinstance(modelResults, dict):
                     additionalOutputs[modelName] = modelResults
                     continue
-
-                if not isinstance(modelResults, dict):
-                    raise TypeError(f"{modelName}: expected a result dictionary.")
 
                 missingFields = set(specifications[modelName]) - set(modelResults)
                 if missingFields:
@@ -3070,9 +3246,10 @@ class pglActionsMRI(pglActionCollection):
                         raise ValueError(f"{modelName}.{field}: unexpected shape or numerical dtype.")
 
                 extras = {field: value for field, value in modelResults.items() if field not in specifications[modelName]}
-                if extras: additionalOutputs[modelName] = extras
+                if extras:
+                    additionalOutputs[modelName] = extras
 
-            if additionalOutputs:
+            if additionalOutputs and retainIntermediateModels:
                 if artifactDirectory is None:
                     raise ValueError("Additional GLMsingle outputs require artifactDirectory for preservation.")
 
@@ -3091,8 +3268,9 @@ class pglActionsMRI(pglActionCollection):
                 "runs": deepcopy(prepared["runs"]),
                 "trialOrder": "inputRunThenOnsetVolume",
                 "hrfIndexBase": 0,
-                "hrfIndexConvention": "inspectedMultiHRFLibraryBranch",
+                "hrfIndexConvention": "zeroBasedIndexIntoSavedHRFLibrary",
                 "stimDur": float(prepared["stimDur"]),
+                "stimDurSource": prepared["stimDurSource"],
                 "tr": float(prepared["tr"]),
                 "nonfiniteOutputPolicy": "preserveNativeValues",
             }
@@ -3140,7 +3318,7 @@ class pglActionsMRI(pglActionCollection):
                             pglMessages.message(f"GLMsingle {role}: retaining {nonfiniteCount} nonfinite output values without replacement.")
 
                 pglMessages.message(
-                    f"Validated GLMsingle Type B dimensions and mappings: {nVoxels} voxels; "
+                    f"Validated GLMsingle Type {model} dimensions and mappings: {nVoxels} voxels; "
                     f"{nTrials} chronological trial betas; {nRuns} runs; {nHRFs} HRF candidates."
                 )
                 return matrices
@@ -3148,6 +3326,19 @@ class pglActionsMRI(pglActionCollection):
             except BaseException:
                 for matrix in matrices.values(): matrix.close()
                 raise
+
+        def _modelSummary(self, results):
+            """Keep small model-selection diagnostics in the analysis manifest."""
+            summary = {}
+            for modelName, modelResults in results.items():
+                fields = {
+                    name: modelResults[name]
+                    for name in ("pcnum", "xvaltrend")
+                    if isinstance(modelResults, dict) and modelResults.get(name) is not None
+                }
+                if fields:
+                    summary[modelName] = fields
+            return summary
         
         def _materializeFitData(self, prepared):
             """Load independent writable float32 arrays for GLMsingle.
@@ -3236,26 +3427,11 @@ class pglActionsMRI(pglActionCollection):
             return fitData
         
         @operationProgress("Fitting GLMsingle")
-        def _fitPreparedInputs(self, prepared, *, params, cacheDirectory=None):
-            """Fit and validate the currently supported Type B execution path.
+        def _fitPreparedInputs(self, prepared, *, params, modelType, retainIntermediateModels=False, cacheDirectory=None):
+            """Fit the selected GLMsingle model and validate returned results.
 
-            All scientific options are supplied explicitly by the caller.
-            This implementation requires:
-                wantlibrary=1
-                wantglmdenoise=0
-                wantfracridge=0
-                wantlss=0 or omitted
-
-            Output routing is action-owned:
-                Type A/B are returned in memory.
-                Large native model files are disabled.
-                Support files and figures remain in a fresh dedicated workspace.
-
-            Does not attach matrices, register products, or change current MRI images.
-            The caller closes prepared input views and returned analysis wrappers.
-
-            Failed workspaces are retained for diagnosis. Never passes an existing
-            session cache root or unrelated directory to GLMsingle.
+            Native model files are disabled; matrices return in memory and figures
+            and requested support files remain in a dedicated workspace.
             """
             import inspect
             import os
@@ -3291,27 +3467,28 @@ class pglActionsMRI(pglActionCollection):
                 raise TypeError("params must be an explicit GLMsingle options dictionary.")
 
             requiredOptions = {
-                "wantlibrary": 1,
-                "wantglmdenoise": 0,
-                "wantfracridge": 0,
-            }
+                "A": {"wantlibrary": 0, "wantglmdenoise": 0, "wantfracridge": 0},
+                "B": {"wantlibrary": 1, "wantglmdenoise": 0, "wantfracridge": 0},
+                "C": {"wantlibrary": 1, "wantglmdenoise": 1, "wantfracridge": 0},
+                "D": {"wantlibrary": 1, "wantglmdenoise": 1, "wantfracridge": 1},
+            }[modelType]
             for name, expected in requiredOptions.items():
                 value = params.get(name)
                 if not isinstance(value, (int, np.integer)) or value != expected:
-                    raise ValueError(
-                        f"This verified Type B execution path requires explicit {name}={expected}. "
-                        "Other model paths are not implemented here yet."
-                    )
+                    raise ValueError(f"Type {modelType} requires explicit {name}={expected}.")
 
             wantLSS = params.get("wantlss", 0)
             if not isinstance(wantLSS, (int, np.integer)) or wantLSS != 0:
-                raise ValueError("LSS is not supported by this verified Type B execution path.")
+                raise ValueError("GLMsingle's LSS option is not supported by this action.")
 
             # These are storage choices, not scientific modeling choices.
             # Reject conflicting requests instead of silently overriding them.
             outputOptions = {
                 "wantfileoutputs": [0, 0, 0, 0],
-                "wantmemoryoutputs": [1, 1, 0, 0],
+                "wantmemoryoutputs": [
+                    int(retainIntermediateModels or index == ["A", "B", "C", "D"].index(modelType))
+                    for index in range(4)
+                ],
                 "wanthdf5": 0,
             }
             for name, expected in outputOptions.items():
@@ -3325,9 +3502,23 @@ class pglActionsMRI(pglActionCollection):
             fitParams = deepcopy(params)
             fitParams.update(deepcopy(outputOptions))
 
-            # Constructing the model is cheap compared with loading the MRI inputs.
-            # Constructor validation therefore belongs before materialization.
-            model = GLM_single(params=deepcopy(fitParams))
+            glmSingle = GLM_single(params=deepcopy(fitParams))
+            resolvedParams = glmSingle.params
+            conditionsInRuns = np.sum(
+                np.stack([np.asarray(design).sum(axis=0) > 0 for design in prepared["design"]]),
+                axis=0,
+            )
+            hasCrossRunRepeats = bool(np.any(conditionsInRuns > 1))
+            if resolvedParams["wantglmdenoise"] and not hasCrossRunRepeats and resolvedParams["pcstop"] > 0:
+                raise ValueError(
+                    "GLMdenoise cross-validation needs conditions repeated across runs. "
+                    "Supply a fixed pcstop value (for example -1) to use a chosen PC count without cross-validation."
+                )
+            if resolvedParams["wantfracridge"] and not hasCrossRunRepeats and np.asarray(resolvedParams["fracs"]).size > 1:
+                raise ValueError(
+                    "Fractional-ridge cross-validation needs conditions repeated across runs. "
+                    "Supply one fixed fracs value to use ridge without cross-validation."
+                )
 
             if cacheDirectory is None:
                 cacheRoot = Path.home() / ".cache" / "pgl"
@@ -3352,8 +3543,8 @@ class pglActionsMRI(pglActionCollection):
             pglMessages.message(
                 f"GLMsingle {toolInfo['version']}: {toolInfo['implementation']}\n"
                 f"Workspace: {workspace}\n"
-                "Model: Type B, HRF library enabled; denoising disabled; ridge disabled.\n"
-                "Type A ON/OFF results are retained separately from single-trial betas."
+                f"Model: Type {modelType}; GLMdenoise and fractional ridge use the selected model settings.\n"
+                "Type A ON/OFF results are separate from single-trial betas."
             )
             pglMessages.message(f"GLMsingle submitted options: {fitParams}")
 
@@ -3378,8 +3569,8 @@ class pglActionsMRI(pglActionCollection):
                 # under the action infrastructure's stdout/stderr capture.
                 results = progressCall(
                     progress, 0.25, 0.85,
-                    "Fitting GLMsingle — library output below",
-                    model.fit,
+                    "Fitting GLMsingle — may take a long time; progress is approximate",
+                    glmSingle.fit,
                     fitDesigns,
                     fitData,
                     stimdur=prepared["stimDur"],
@@ -3405,7 +3596,15 @@ class pglActionsMRI(pglActionCollection):
                 if not isinstance(designInfo, dict) or not isinstance(designInfo.get("params"), dict):
                     raise ValueError("GLMsingle design information lacks its parameter snapshot.")
 
-                converted = progressCall(progress, 0.85, 0.98, "Validating GLMsingle results and trial mapping", self._convertTypeBResults, prepared, results, designInfo, artifactDirectory=outputDirectory)
+                converted = progressCall(
+                    progress, 0.85, 0.98,
+                    "Validating GLMsingle results and trial mapping",
+                    self._convertResults,
+                    prepared, results, designInfo,
+                    model=modelType,
+                    retainIntermediateModels=retainIntermediateModels,
+                    artifactDirectory=outputDirectory,
+                )
                 
                 # Report resolved values, not presumed defaults. DESIGNINFO records the
                 # library's parameter snapshot when it writes that support artifact.
@@ -3418,7 +3617,10 @@ class pglActionsMRI(pglActionCollection):
                     f"  Seed: {savedParams.get('seed')}\n"
                     f"  Session labels (external one-based convention): "
                     f"{np.asarray(savedParams.get('sessionindicator')).tolist()}\n"
-                    "  Denoising/ridge hyperparameter CV: disabled for this explicit Type B fit."
+                    f"  Type {self.model} flags: "
+                    f"library={savedParams.get('wantlibrary')}, "
+                    f"denoising={savedParams.get('wantglmdenoise')}, "
+                    f"fractional ridge={savedParams.get('wantfracridge')}"
                 )
 
                 artifacts = [
@@ -3429,7 +3631,15 @@ class pglActionsMRI(pglActionCollection):
                     }
                     for path in sorted(workspace.rglob("*"))
                     if path.is_file()
+                    and (
+                        retainIntermediateModels
+                        or (
+                            path.is_relative_to(figureDirectory)
+                            and path.suffix.lower() in {".png", ".pdf"}
+                        )
+                    )
                 ]
+                modelSummary = self._modelSummary(results)
                 pglMessages.message(
                     f"GLMsingle fit validated: {len(converted)} analysis matrices; "
                     f"{len(artifacts)} support/figure files. Nothing has been published yet."
@@ -3440,10 +3650,11 @@ class pglActionsMRI(pglActionCollection):
                     "designInfo": designInfo,
                     "requestedParams": requestedParams,
                     "submittedParams": fitParams,
+                    "modelSummary": modelSummary,
                     "tool": toolInfo,
                     "workspace": str(workspace),
                     "artifacts": artifacts,
-                    "computedModels": ["typea", "typeb"],
+                    "computedModels": sorted(results),
                 }
 
             except BaseException:
@@ -3458,18 +3669,20 @@ class pglActionsMRI(pglActionCollection):
                 fitDesigns = None
 
         @operationProgress("Storing GLMsingle analysis")
-        def _publishResults(self, session, prepared, fitted, *, outputName, retainRoles):
+        def _publishResults(
+            self, session, prepared, fitted, *, outputName, retainRoles,
+            retainIntermediateModels=False,
+        ):
             """Persist validated GLMsingle analysis matrices and register their product.
 
             retainRoles:
                 Explicit nonempty list of converted matrix roles to retain.
-                The final Type B single-trial betas must be included.
 
             Always retains:
-                Prepared design matrices.
                 Trial, condition, run, geometry, and input provenance mappings.
                 Requested/submitted options and the saved library parameter snapshot.
-                Generated support files and figures.
+                Diagnostic figures. Intermediate support files and designs are
+                retained only when retainIntermediateModels is true.
 
             Large model matrices omitted by retainRoles are explicitly recorded.
             Native support files may contain nested structures and remain file artifacts.
@@ -3533,8 +3746,9 @@ class pglActionsMRI(pglActionCollection):
                 raise ValueError("retainRoles must be a nonempty sequence of unique matrix-role strings.")
             if set(retainRoles) - set(available):
                 raise ValueError(f"Unknown retained matrix roles: {sorted(set(retainRoles) - set(available))}")
-            if "typeb.betasmd" not in retainRoles:
-                raise ValueError("The final Type B single-trial betas must be retained.")
+            betaRole = f"type{self.model.lower()}.betasmd"
+            if betaRole not in retainRoles:
+                raise ValueError(f"The final Type {self.model} beta weights must be retained.")
 
             omittedRoles = sorted(set(available) - set(retainRoles))
             workspace = Path(fitted["workspace"]).resolve()
@@ -3580,6 +3794,7 @@ class pglActionsMRI(pglActionCollection):
                 "conditions": prepared["conditions"],
                 "trials": prepared["trials"],
                 "stimDur": prepared["stimDur"],
+                "stimDurSource": prepared["stimDurSource"],
                 "tr": prepared["tr"],
                 "nVoxels": prepared["nVoxels"],
                 "nTrials": prepared["nTrials"],
@@ -3591,10 +3806,13 @@ class pglActionsMRI(pglActionCollection):
                 "savedLibraryParams": fitted["designInfo"]["params"],
                 "parameterSnapshotSource": "GLMsingle DESIGNINFO.npy",
                 "computedModels": fitted["computedModels"],
+                "modelSummary": fitted["modelSummary"],
                 "retainedModelMatrixRoles": list(retainRoles),
                 "omittedModelMatrixRoles": omittedRoles,
+                "retainIntermediateModels": retainIntermediateModels,
+                "designMatricesRetained": retainIntermediateModels,
                 "hrfIndexBase": 0,
-                "hrfIndexConvention": "inspectedMultiHRFLibraryBranch",
+                "hrfIndexConvention": "zeroBasedIndexIntoSavedHRFLibrary",
             })
 
             dependencies = list(dict.fromkeys(
@@ -3667,36 +3885,36 @@ class pglActionsMRI(pglActionCollection):
             try:
                 outputs = [(role, available[role]) for role in retainRoles]
 
-                # Designs have ordinary numeric dimensions, not object-valued cells.
-                for record, design in zip(prepared["runs"], prepared["design"]):
-                    role = f"design_scan{record['scanIndex']:02d}_run{record['runIndex']:02d}"
-                    data = xr.DataArray(
-                        design,
-                        dims=("volume", "condition"),
-                        coords={
-                            "volume": np.arange(design.shape[0], dtype=np.int64),
-                            "condition": np.arange(design.shape[1], dtype=np.int64),
-                            "originalVolumeIndex": (
-                                "volume", np.asarray(record["volumeIndices"], dtype=np.int64),
-                            ),
-                        },
-                        attrs={
-                            "analysis": "GLMsingle",
-                            "fitRunIndex": record["fitRunIndex"],
-                            "scanIndex": record["scanIndex"],
-                            "runIndex": record["runIndex"],
-                            "trSeconds": prepared["tr"],
-                            "stimDurSeconds": prepared["stimDur"],
-                        },
-                    )
-                    matrix = pglDataMatrix(data, name=role)
-                    temporaryMatrices.append(matrix)
-                    matrix.provenance = {
-                        "operation": "GLMsingleDesign",
-                        "input": deepcopy(record["input"]),
-                        "conditionIdentityMethod": prepared["conditionIdentityMethod"],
-                    }
-                    outputs.append((role, matrix))
+                if retainIntermediateModels:
+                    for record, design in zip(prepared["runs"], prepared["design"]):
+                        role = f"design_scan{record['scanIndex']:02d}_run{record['runIndex']:02d}"
+                        data = xr.DataArray(
+                            design,
+                            dims=("volume", "condition"),
+                            coords={
+                                "volume": np.arange(design.shape[0], dtype=np.int64),
+                                "condition": np.arange(design.shape[1], dtype=np.int64),
+                                "originalVolumeIndex": (
+                                    "volume", np.asarray(record["volumeIndices"], dtype=np.int64),
+                                ),
+                            },
+                            attrs={
+                                "analysis": "GLMsingle",
+                                "fitRunIndex": record["fitRunIndex"],
+                                "scanIndex": record["scanIndex"],
+                                "runIndex": record["runIndex"],
+                                "trSeconds": prepared["tr"],
+                                "stimDurSeconds": prepared["stimDur"],
+                            },
+                        )
+                        matrix = pglDataMatrix(data, name=role)
+                        temporaryMatrices.append(matrix)
+                        matrix.provenance = {
+                            "operation": "GLMsingleDesign",
+                            "input": deepcopy(record["input"]),
+                            "conditionIdentityMethod": prepared["conditionIdentityMethod"],
+                        }
+                        outputs.append((role, matrix))
 
                 requireUnchanged()
 
@@ -3841,6 +4059,8 @@ class pglActionsMRI(pglActionCollection):
                         "computedModels": fitted["computedModels"],
                         "retainedModelMatrixRoles": list(retainRoles),
                         "omittedModelMatrixRoles": omittedRoles,
+                        "retainIntermediateModels": retainIntermediateModels,
+                        "designMatricesRetained": retainIntermediateModels,
                         "nRuns": len(prepared["runs"]),
                         "nConditions": len(prepared["conditions"]),
                         "nTrials": prepared["nTrials"],
