@@ -2104,10 +2104,79 @@ class pglImportSettings(pglTraitSettings):
             # Clearing a local reference does not guarantee secure memory erasure.
             apiKey = None
 
+    # ========================================================================
+    @staticmethod
+    def _unlockRemoteFlywheelKeychain(store):
+        """Give a remote macOS notebook one chance to unlock a locked keychain."""
+        import os
+        import sys
+
+        from .pglDialog import pglRemoteDialog
+
+        if sys.platform != "darwin" or not pglRemoteDialog._isRemote(): return False
+
+        import ctypes
+        from IPython import get_ipython
+
+        prompt = getattr(getattr(get_ipython(), "kernel", None), "getpass", None)
+        if not callable(prompt): return False
+
+        keychainPath = getattr(store, "keychain", None) or Path.home() / "Library/Keychains/login.keychain-db"
+        try:
+            security = ctypes.CDLL("/System/Library/Frameworks/Security.framework/Security")
+            coreFoundation = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+            security.SecKeychainOpen.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p)]
+            security.SecKeychainOpen.restype = ctypes.c_int32
+            security.SecKeychainGetStatus.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+            security.SecKeychainGetStatus.restype = ctypes.c_int32
+            security.SecKeychainUnlock.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_ubyte]
+            security.SecKeychainUnlock.restype = ctypes.c_int32
+            coreFoundation.CFRelease.argtypes = [ctypes.c_void_p]
+            coreFoundation.CFRelease.restype = None
+        except (OSError, AttributeError):
+            return False
+
+        keychain = ctypes.c_void_p()
+        if security.SecKeychainOpen(os.fsencode(os.path.expanduser(keychainPath)), ctypes.byref(keychain)) != 0 or not keychain:
+            return False
+
+        try:
+            status = ctypes.c_uint32()
+            unlocked = 1  # kSecUnlockStateStatus
+            if security.SecKeychainGetStatus(keychain, ctypes.byref(status)) != 0 or status.value & unlocked:
+                return False
+
+            # ipykernel sends password input through the notebook's stdin channel.
+            # Keep the unlock in this process, where keyring will retry the read.
+            try:
+                password = prompt("Enter the macOS Keychain password for the SSH host to load the saved Flywheel key")
+            except EOFError:
+                password = None
+            except Exception:
+                raise RuntimeError("The notebook could not show a masked Keychain password prompt. Unlock the keychain in the Remote SSH terminal and retry.") from None
+            if not password: raise RuntimeError("Flywheel Keychain unlock cancelled. Rerun the cell when you are ready to unlock it.")
+
+            passwordBytes = bytearray(password, "utf-8")
+            password = None
+            buffer = (ctypes.c_ubyte * len(passwordBytes)).from_buffer(passwordBytes)
+            try:
+                result = security.SecKeychainUnlock(keychain, len(passwordBytes), buffer, 1)
+            finally:
+                ctypes.memset(buffer, 0, len(passwordBytes))
+
+            if result == -25293:  # errSecAuthFailed
+                raise RuntimeError("macOS rejected the Keychain password. Rerun the cell and enter the password for the SSH host's keychain.")
+            if result != 0:
+                raise RuntimeError("macOS could not unlock the keychain from the notebook. Unlock it in the Remote SSH terminal and retry.")
+            return True
+        finally:
+            coreFoundation.CFRelease(keychain)
+
+    # ========================================================================
     def _readSavedFlywheelApiKey(self):
         """Retrieve this profile's key without prompting for an API key.
 
-        The OS may request permission to access its credential store.
+        A Remote SSH notebook may prompt to unlock a locked macOS keychain.
         There is no environment-variable or file fallback.
         """
         # Resolve the same identity used when storing the key.
@@ -2117,10 +2186,15 @@ class pglImportSettings(pglTraitSettings):
             raise RuntimeError("Secure Flywheel credential storage is unavailable.")
 
         # Read only from the approved OS credential store.
+        readError = "Could not read the saved Flywheel API key from the OS credential store."
         try:
             apiKey = store.get_password(service, account)
         except Exception:
-            raise RuntimeError("Could not read the saved Flywheel API key from the OS credential store.") from None
+            if not self._unlockRemoteFlywheelKeychain(store): raise RuntimeError(readError) from None
+            try:
+                apiKey = store.get_password(service, account)
+            except Exception:
+                raise RuntimeError(f"{readError} Check the Flywheel entry's Access Control settings on the SSH host.") from None
 
         # Missing credentials must be configured through importSettings().
         if not isinstance(apiKey, str) or not apiKey:
