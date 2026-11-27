@@ -3592,6 +3592,7 @@ class pglRemoteDialog:
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
   <Default Extension=".js" ContentType="application/javascript"/>
   <Default Extension=".json" ContentType="application/json"/>
+  <Default Extension=".py" ContentType="text/x-python"/>
   <Default Extension=".vsixmanifest" ContentType="text/xml"/>
 </Types>"""
         with ZipFile(output, "w", compression=ZIP_DEFLATED) as package:
@@ -3599,6 +3600,8 @@ class pglRemoteDialog:
             package.writestr("[Content_Types].xml", contentTypes)
             package.write(source / "package.json", "extension/package.json")
             package.write(source / "extension.js", "extension/extension.js")
+            package.writestr("extension/confirm.py", pglDialogs._confirmationScript())
+            package.writestr("extension/selectItems.py", pglDialogs._selectionScript())
         return output
 
     # ========================================================================
@@ -3664,7 +3667,7 @@ class pglRemoteDialog:
         if sys.platform == "win32":
             raise RuntimeError("This pilot requires a Linux or macOS SSH host.")
         requestHash = hashlib.sha256(requestText.encode("utf-8")).hexdigest()
-        frame = json.dumps({"version": 1, "mode": mode, "request": requestText}, ensure_ascii=False).encode("utf-8")
+        frame = json.dumps({"version": 2, "mode": mode, "request": requestText}, ensure_ascii=False).encode("utf-8")
         if len(frame) > 64 * 1024: raise ValueError("The remote dialog is too large. Shorten the text or reduce the number of items.")
 
         requestID = uuid.uuid4().hex
@@ -3975,7 +3978,57 @@ class pglDialogs:
 
         # Qt lives entirely in the child process. User-supplied text enters
         # through JSON, never through Python source or shell interpolation.
-        dialogScript = r'''
+        dialogScript = pglDialogs._confirmationScript()
+
+        try:
+            with tempfile.TemporaryDirectory(prefix="pgl-confirm-") as directory:
+                root = Path(directory)
+                inputFile = root / "request.json"
+                outputFile = root / "response.json"
+                inputFile.write_bytes(requestText.encode("utf-8"))
+
+                # There is no interaction timeout: users may need time to
+                # review or copy details. subprocess.run cleans up its
+                # child if execution is interrupted.
+                result = subprocess.run(
+                    [sys.executable, "-c", dialogScript, str(inputFile), str(outputFile)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
+                )
+
+                if result.returncode != 0:
+                    errorDetails = result.stderr.strip()[-4000:] or "No diagnostic output."
+                    raise RuntimeError(f"Dialog process exited with code {result.returncode}:\n{errorDetails}")
+
+                if not outputFile.is_file():
+                    raise RuntimeError("Dialog closed without a confirmation response.")
+
+                response = json.loads(outputFile.read_text(encoding="utf-8"))
+
+                if (
+                    not isinstance(response, dict)
+                    or set(response) != {"confirmed", "requestHash"}
+                    or type(response["confirmed"]) is not bool
+                    or response["requestHash"] != requestHash
+                ):
+                    raise ValueError("Invalid or mismatched confirmation response.")
+
+                return response["confirmed"]
+
+        except Exception as error:
+            # Fail closed. Never interpret a launch or decoding failure as
+            # consent, and do not silently switch confirmation interfaces.
+            pglMessages.warning(f"Confirmation was not obtained: {type(error).__name__}: {error}", level=1)
+            return False
+
+    # ========================================================================
+    @staticmethod
+    def _confirmationScript():
+        return r'''
 import hashlib
 import json
 import sys
@@ -4095,51 +4148,6 @@ response = {"confirmed": confirmed, "requestHash": requestHash}
 Path(sys.argv[2]).write_text(json.dumps(response), encoding="utf-8")
 '''
 
-        try:
-            with tempfile.TemporaryDirectory(prefix="pgl-confirm-") as directory:
-                root = Path(directory)
-                inputFile = root / "request.json"
-                outputFile = root / "response.json"
-                inputFile.write_bytes(requestText.encode("utf-8"))
-
-                # There is no interaction timeout: users may need time to
-                # review or copy details. subprocess.run cleans up its
-                # child if execution is interrupted.
-                result = subprocess.run(
-                    [sys.executable, "-c", dialogScript, str(inputFile), str(outputFile)],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    check=False,
-                )
-
-                if result.returncode != 0:
-                    errorDetails = result.stderr.strip()[-4000:] or "No diagnostic output."
-                    raise RuntimeError(f"Dialog process exited with code {result.returncode}:\n{errorDetails}")
-
-                if not outputFile.is_file():
-                    raise RuntimeError("Dialog closed without a confirmation response.")
-
-                response = json.loads(outputFile.read_text(encoding="utf-8"))
-
-                if (
-                    not isinstance(response, dict)
-                    or set(response) != {"confirmed", "requestHash"}
-                    or type(response["confirmed"]) is not bool
-                    or response["requestHash"] != requestHash
-                ):
-                    raise ValueError("Invalid or mismatched confirmation response.")
-
-                return response["confirmed"]
-
-        except Exception as error:
-            # Fail closed. Never interpret a launch or decoding failure as
-            # consent, and do not silently switch confirmation interfaces.
-            pglMessages.warning(f"Confirmation was not obtained: {type(error).__name__}: {error}", level=1)
-            return False
-    
     ################################################################
     # Select from a list of strings
     ################################################################
@@ -4176,7 +4184,41 @@ Path(sys.argv[2]).write_text(json.dumps(response), encoding="utf-8")
                 return None
 
         # Pass display strings through JSON, not Python source interpolation.
-        dialogScript = r'''
+        dialogScript = pglDialogs._selectionScript()
+
+        try:
+            with tempfile.TemporaryDirectory(prefix="pgl-select-") as directory:
+                root = Path(directory)
+                inputFile = root / "request.json"
+                outputFile = root / "response.json"
+                inputFile.write_text(json.dumps(request, ensure_ascii=False), encoding="utf-8")
+
+                # No interaction timeout: the user may need time to choose.
+                result = subprocess.run(
+                    [sys.executable, "-c", dialogScript, str(inputFile), str(outputFile)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
+                )
+                if result.returncode != 0:
+                    details = result.stderr.strip()[-4000:] or "No diagnostic output."
+                    raise RuntimeError(f"Selection dialog exited with code {result.returncode}:\n{details}")
+                if not outputFile.is_file(): raise RuntimeError("Selection dialog returned no response.")
+
+                selected = json.loads(outputFile.read_text(encoding="utf-8"))
+                return pglDialogs._validateSelection(selected, len(items))
+
+        except Exception as error:
+            pglMessages.warning(f"Selection was not obtained: {type(error).__name__}: {error}", level=1)
+            return None
+
+    # ========================================================================
+    @staticmethod
+    def _selectionScript():
+        return r'''
 import json
 import sys
 from pathlib import Path
@@ -4267,35 +4309,6 @@ if screen is not None:
 selection = selectedIndices() if dialog.exec() == QDialog.DialogCode.Accepted else None
 Path(sys.argv[2]).write_text(json.dumps(selection), encoding="utf-8")
 '''
-
-        try:
-            with tempfile.TemporaryDirectory(prefix="pgl-select-") as directory:
-                root = Path(directory)
-                inputFile = root / "request.json"
-                outputFile = root / "response.json"
-                inputFile.write_text(json.dumps(request, ensure_ascii=False), encoding="utf-8")
-
-                # No interaction timeout: the user may need time to choose.
-                result = subprocess.run(
-                    [sys.executable, "-c", dialogScript, str(inputFile), str(outputFile)],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    check=False,
-                )
-                if result.returncode != 0:
-                    details = result.stderr.strip()[-4000:] or "No diagnostic output."
-                    raise RuntimeError(f"Selection dialog exited with code {result.returncode}:\n{details}")
-                if not outputFile.is_file(): raise RuntimeError("Selection dialog returned no response.")
-
-                selected = json.loads(outputFile.read_text(encoding="utf-8"))
-                return pglDialogs._validateSelection(selected, len(items))
-
-        except Exception as error:
-            pglMessages.warning(f"Selection was not obtained: {type(error).__name__}: {error}", level=1)
-            return None
 
     # ========================================================================
     @staticmethod

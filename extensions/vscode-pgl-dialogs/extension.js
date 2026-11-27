@@ -1,11 +1,18 @@
 const vscode = require('vscode');
+const { execFile } = require('node:child_process');
 const { createHash, randomUUID } = require('node:crypto');
+const localFs = require('node:fs/promises');
+const os = require('node:os');
+const path = require('node:path');
+const { promisify } = require('node:util');
 
 const requestMime = 'application/vnd.pgl.dialog+json';
 const requestLimit = 64 * 1024;
+const desktopPythonKey = 'desktopPython';
+const run = promisify(execFile);
 const dialogs = new Map([
-    ['confirm', { validate: validConfirmation, show: showConfirmation, resultKey: 'confirmed' }],
-    ['selectItems', { validate: validSelection, show: showSelection, resultKey: 'result' }],
+    ['confirm', { validate: validConfirmation, script: 'confirm.py', resultKey: 'confirmed' }],
+    ['selectItems', { validate: validSelection, script: 'selectItems.py', resultKey: 'result' }],
 ]);
 
 // =============================================================================
@@ -13,7 +20,7 @@ const dialogs = new Map([
 // =============================================================================
 
 // =============================================================================
-async function serveRequest(root, id) {
+async function serveRequest(root, id, desktopPython) {
     const fs = vscode.workspace.fs;
     const requestFile = vscode.Uri.joinPath(root, 'request.json');
     const stateFile = vscode.Uri.joinPath(root, 'response.json');
@@ -26,7 +33,7 @@ async function serveRequest(root, id) {
     if (data.length > requestLimit) return;
     const { version, mode, request: requestText } = JSON.parse(Buffer.from(data).toString('utf8'));
     const dialog = dialogs.get(mode);
-    if (version !== 1 || !dialog || typeof requestText !== 'string') return;
+    if (![1, 2].includes(version) || !dialog || typeof requestText !== 'string') return;
     const request = JSON.parse(requestText);
     if (!dialog.validate(request)) return;
     const requestHash = createHash('sha256').update(requestText, 'utf8').digest('hex');
@@ -37,7 +44,8 @@ async function serveRequest(root, id) {
 
     let response;
     try {
-        response = { id, requestHash, status: 'done', [dialog.resultKey]: await dialog.show(request) };
+        const result = await showDialog(dialog, requestText, requestHash, requestFile, desktopPython);
+        response = { id, requestHash, status: 'done', [dialog.resultKey]: result };
     } catch (error) {
         response = { id, requestHash, status: 'error', error: String(error.message || error) };
     }
@@ -47,6 +55,14 @@ async function serveRequest(root, id) {
 
 // =============================================================================
 function activate(context) {
+    let discoveredPython;
+    const desktopPython = () => {
+        const configured = context.globalState.get(desktopPythonKey);
+        if (configured) return Promise.resolve(configured);
+        discoveredPython ??= findDesktopPython().finally(() => { discoveredPython = undefined; });
+        return discoveredPython;
+    };
+    context.subscriptions.push(vscode.commands.registerCommand('pglDialogs.selectDesktopPython', () => selectDesktopPython(context)));
     if (vscode.env.remoteName !== 'ssh-remote') return;
 
     const activeRequests = new Set();
@@ -70,7 +86,7 @@ function activate(context) {
                 const key = root.toString();
                 if (activeRequests.has(key)) continue;
                 activeRequests.add(key);
-                serveRequest(root, id).catch(error => {
+                serveRequest(root, id, desktopPython).catch(error => {
                     // Old outputs and interrupted cells can refer to removed requests.
                     if (!['FileNotFound', 'FileExists'].includes(error.code)) console.error('PGL Dialogs:', error);
                 }).finally(() => activeRequests.delete(key));
@@ -80,7 +96,103 @@ function activate(context) {
 }
 
 // =============================================================================
-// Confirmation dialogs
+// Run the bundled PGL dialog on the desktop
+// =============================================================================
+
+// =============================================================================
+async function showDialog(dialog, requestText, requestHash, remoteRequest, desktopPython) {
+    const python = await desktopPython();
+    if (!python) {
+        throw new Error('Desktop Python with PySide6 is required. Use PGL Dialogs: Select Desktop Python in the VS Code Command Palette.');
+    }
+
+    const directory = await localFs.mkdtemp(path.join(os.tmpdir(), 'pgl-dialog-'));
+    const input = path.join(directory, 'request.json');
+    const output = path.join(directory, 'response.json');
+    const controller = new AbortController();
+    let watcher;
+    try {
+        await localFs.writeFile(input, requestText, { encoding: 'utf8', mode: 0o600 });
+        // An interrupted kernel removes the request. Stop its desktop process too.
+        const checkRequest = async () => {
+            try {
+                await vscode.workspace.fs.stat(remoteRequest);
+            } catch (error) {
+                if (error.code === 'FileNotFound') controller.abort();
+            }
+            if (!controller.signal.aborted) watcher = setTimeout(checkRequest, 1000);
+        };
+        await checkRequest();
+        await run(python, ['-I', path.join(__dirname, dialog.script), input, output], {
+            signal: controller.signal, timeout: 900000, windowsHide: true,
+        });
+        const result = JSON.parse(await localFs.readFile(output, 'utf8'));
+        if (dialog.resultKey !== 'confirmed') return result;
+        if (result?.requestHash !== requestHash || typeof result.confirmed !== 'boolean') {
+            throw new Error('Invalid desktop confirmation response.');
+        }
+        return result.confirmed;
+    } catch (error) {
+        if (controller.signal.aborted) throw vscode.FileSystemError.FileNotFound(remoteRequest);
+        const details = String(error.stderr || error.message).trim().slice(-2000);
+        throw new Error(`Could not run the PySide6 dialog on your desktop. ${details}\nUse PGL Dialogs: Select Desktop Python to choose an environment with PySide6.`);
+    } finally {
+        controller.abort();
+        clearTimeout(watcher);
+        await localFs.rm(directory, { recursive: true, force: true });
+    }
+}
+
+// =============================================================================
+// Find and select a local PySide6 environment
+// =============================================================================
+
+// =============================================================================
+async function canUsePython(executable) {
+    if (!path.isAbsolute(executable)) return false;
+    try {
+        await run(executable, ['-I', '-c', 'from PySide6 import QtWidgets'], { timeout: 4000, windowsHide: true });
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+// =============================================================================
+async function findDesktopPython() {
+    const windows = process.platform === 'win32';
+    const envFile = path.join(os.homedir(), '.conda', 'environments.txt');
+    const registered = await localFs.readFile(envFile, 'utf8').catch(() => '');
+    const environments = registered.split(/\r?\n/).map(prefix => prefix.trim()).filter(prefix => path.isAbsolute(prefix));
+    const candidates = [
+        ...environments.filter(prefix => /^pgl(?:$|_)/i.test(path.basename(prefix)))
+            .map(prefix => path.join(prefix, ...(windows ? ['python.exe'] : ['bin', 'python']))),
+        ...(process.env.PATH || '').split(path.delimiter).filter(prefix => path.isAbsolute(prefix))
+            .flatMap(prefix => (windows ? ['python.exe'] : ['python3', 'python']).map(name => path.join(prefix, name))),
+    ];
+    for (const executable of new Set(candidates)) {
+        if (await canUsePython(executable)) return executable;
+    }
+}
+
+// =============================================================================
+async function selectDesktopPython(context) {
+    const executable = await vscode.window.showInputBox({
+        title: 'PGL Dialogs',
+        prompt: 'Enter the full path to a Python executable with PySide6 on this computer',
+        value: context.globalState.get(desktopPythonKey) || '',
+        validateInput: value => path.isAbsolute(value.trim()) ? undefined : 'Enter an absolute path on this computer.',
+    });
+    if (!executable) return;
+    if (!await canUsePython(executable.trim())) {
+        await vscode.window.showErrorMessage('Could not import PySide6 with that desktop Python. Choose a local Python environment with PySide6 installed.');
+        return;
+    }
+    await context.globalState.update(desktopPythonKey, executable.trim());
+}
+
+// =============================================================================
+// Validate the request before using the bundled dialog
 // =============================================================================
 
 // =============================================================================
@@ -92,58 +204,10 @@ function validConfirmation(request) {
 }
 
 // =============================================================================
-async function showConfirmation(request) {
-    const { title, summary, details, confirmButtonText, copyText } = request;
-    const confirm = { title: confirmButtonText };
-    const copy = { title: copyText };
-    const buttons = copyText ? [confirm, copy] : [confirm];
-    const options = { modal: true, detail: details ? `${summary}\n\n${details}` : summary };
-
-    while (true) {
-        const answer = await vscode.window.showInformationMessage(title, options, ...buttons);
-        if (answer !== copy) return answer === confirm;
-        await vscode.env.clipboard.writeText(details || summary);
-    }
-}
-
-// =============================================================================
-// Item selection dialogs
-// =============================================================================
-
-// =============================================================================
 function validSelection(request) {
     return request && typeof request.title === 'string' && request.title.trim() &&
         Array.isArray(request.items) && request.items.length > 0 &&
         request.items.every(label => typeof label === 'string');
-}
-
-// =============================================================================
-async function showSelection({ title, items }) {
-    const picker = vscode.window.createQuickPick();
-    try {
-        const selectAll = { iconPath: new vscode.ThemeIcon('check-all'), tooltip: 'Select all' };
-        const selectNone = { iconPath: new vscode.ThemeIcon('clear-all'), tooltip: 'Select none' };
-        picker.title = title;
-        picker.placeholder = 'Select one or more items';
-        picker.canSelectMany = true;
-        picker.ignoreFocusOut = true;
-        picker.buttons = [selectAll, selectNone];
-        picker.items = items.map((label, index) => ({ label, index }));
-        picker.selectedItems = [];
-
-        return await new Promise(resolve => {
-            picker.onDidTriggerButton(button => {
-                picker.selectedItems = button === selectAll ? picker.items : [];
-            });
-            picker.onDidAccept(() => {
-                if (picker.selectedItems.length) resolve(picker.selectedItems.map(item => item.index));
-            });
-            picker.onDidHide(() => resolve(null));
-            picker.show();
-        });
-    } finally {
-        picker.dispose();
-    }
 }
 
 module.exports = { activate };
