@@ -59,13 +59,16 @@ class pglSettingsManager:
         # and save
         cls._saveModifiedSettings(modified, original)
 
+    # ========================================================================
     @classmethod
     def displaySettings(cls):
         """
         Edit display settings without requiring an instance.
         """
         # get the display infos
-        original = pglDisplaySettingsList(cls.getDisplaySettings())
+        displays = cls.getDisplaySettings()
+        if displays is None: return
+        original = pglDisplaySettingsList(displays)
 
         # display the settings
         modified = pglDialogs.traitsDialog(original)
@@ -137,6 +140,7 @@ class pglSettingsManager:
             else:
                 return pglEyelinkSettings()
         
+    # ========================================================================
     @classmethod
     def isShiftPressed(cls):
         """Check Shift on macOS or Windows; otherwise use normal save behavior."""
@@ -144,7 +148,17 @@ class pglSettingsManager:
 
         # macOS: read the current keyboard modifier flags.
         if sys.platform == "darwin":
-            import Quartz
+            try:
+                import Quartz
+            except (ImportError, OSError) as error:
+                pglMessages.warning(
+                    f"Could not load Quartz to check Shift ({error}). Saving only changed settings. "
+                    "Install pyobjc-framework-Quartz in the PGL Python environment to enable Shift detection.",
+                    level=1,
+                )
+                return False
+            # Headless sessions have no keyboard state to query through WindowServer.
+            if not Quartz.CGMainDisplayID(): return False
             flags = Quartz.CGEventSourceFlagsState(Quartz.kCGEventSourceStateHIDSystemState)
             return bool(flags & Quartz.kCGEventFlagMaskShift)
 
@@ -322,25 +336,31 @@ class pglSettingsManager:
                 pglMessages.message(f"Deleting settings {originalSettings.name}")
                 cls.moveToTrash(originalSettings.saveDir())
     
+    # ========================================================================
     @classmethod
     def getDisplaySettings(cls, displayName=None):
         '''
-        Get all of the displaySettings
-        
-        Args:
-            displayName (str): If not (default=None) will return the matching setting or None if not found
+        Get all display settings, or the matching setting when displayName is given.
+
+        Return None if a named display is missing or the macOS display bindings cannot load.
         '''
-        import Quartz
-        import CoreFoundation
-        displays = []
-        
-        # Get CGDisplayCreateUUIDFromDisplayID
         try:
-            from ColorSync import CGDisplayCreateUUIDFromDisplayID
-        except ImportError as e:
-            pglMessages.message(f"CGDisplayCreateUUIDFromDisplayID not found in ColorSync, trying Quartz: {e}")
-            # fallback: some builds expose it under Quartz
-            from Quartz import CGDisplayCreateUUIDFromDisplayID
+            import Quartz
+            import CoreFoundation
+
+            try:
+                from ColorSync import CGDisplayCreateUUIDFromDisplayID
+            except ImportError:
+                # Some builds expose it under Quartz.
+                from Quartz import CGDisplayCreateUUIDFromDisplayID
+        except (ImportError, OSError) as error:
+            pglMessages.warning(
+                f"Could not load the macOS display bindings ({error}). On the Mac running PGL, install them in the Python environment used by PGL.\n"
+                "python -m pip install pyobjc-framework-Quartz pyobjc-framework-Cocoa pyobjc-framework-ColorSync"
+            )
+            return None
+
+        displays = []
             
         # first check saved displays
         displayDir = cls.getDisplayDir()
@@ -357,11 +377,16 @@ class pglSettingsManager:
             # and add to display list
             displays.append(displaySettings)
                 
-        maxDisplays = 16        
-        (err, active, count) = Quartz.CGGetActiveDisplayList(maxDisplays, None, None)
-        currentRefreshRate = 0.0
+        maxDisplays = 16
+        error, active, _ = Quartz.CGGetActiveDisplayList(maxDisplays, None, None)
+        if error:
+            pglMessages.warning(f"macOS could not enumerate active displays (CoreGraphics error {error}). Check the Mac's display connection and graphical login session, then retry.")
+            return None
+
+        # A headless session can still load saved and Windowed settings.
+        currentDisplayMode = (0, 0, 0.0)
         
-        for iDisplay, displayID in enumerate(active):
+        for iDisplay, displayID in enumerate(active or ()):
             # initialize the displaySettings
             displaySettings = pglDisplaySettings()
             
@@ -370,7 +395,8 @@ class pglSettingsManager:
             currentWidth = Quartz.CGDisplayModeGetWidth(currentMode)
             currentHeight = Quartz.CGDisplayModeGetHeight(currentMode)
             currentRefreshRate = Quartz.CGDisplayModeGetRefreshRate(currentMode)
-            displaySettings.currentDisplayMode = (currentWidth, currentHeight, currentRefreshRate)
+            currentDisplayMode = (currentWidth, currentHeight, currentRefreshRate)
+            displaySettings.currentDisplayMode = currentDisplayMode
 
             # get all supported modes
             modes = Quartz.CGDisplayCopyAllDisplayModes(displayID, None)
@@ -468,7 +494,7 @@ class pglSettingsManager:
             displaySettingsWindowed.displayModes = [pglDisplayModeSettings(modeName="800 x 600", pixelDims=(800, 600), refreshRate=[60.0])]
             displays.append(displaySettingsWindowed)
         displaySettingsWindowed.currentDisplayNum = 0
-        displaySettingsWindowed.currentDisplayMode = (currentWidth, currentHeight, currentRefreshRate)
+        displaySettingsWindowed.currentDisplayMode = currentDisplayMode
         displaySettingsWindowed.luminanceCalibration = ['None']
         displaySettingsWindowed.temporalCalibration = ['None']
                
@@ -2878,6 +2904,7 @@ class pglSettings(pglTraitSettings):
         return pglSettingsManager.getSettingsDir() / f"{pglStorage.makeValidFilename(self.name)}.json"
 
     
+    # ========================================================================
     def reloadDisplays(self, selected=None, overwrite=False):
         '''
         reload the displays so we have the most up-to-date display settings to choose from
@@ -2890,6 +2917,7 @@ class pglSettings(pglTraitSettings):
 
         # load all the display settings
         displays = pglSettingsManager.getDisplaySettings()
+        if displays is None: return
         
         if selected is None:
             if self.displays is None or len(self.displays) == 0:

@@ -47,7 +47,9 @@ dependencies:
   - "pyyaml"
   - pip:
       - "windows-curses; sys_platform == 'win32'"
-      - "pyobjc; sys_platform == 'darwin'"
+      - "pyobjc-framework-Quartz; sys_platform == 'darwin'"
+      - "pyobjc-framework-Cocoa; sys_platform == 'darwin'"
+      - "pyobjc-framework-ColorSync; sys_platform == 'darwin'"
       - "flywheel-sdk"
       - "fracridge"
       - "labjack-ljm"

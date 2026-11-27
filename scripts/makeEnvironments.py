@@ -53,10 +53,11 @@ MACOS = [
     "pynput",
 ]
 
-# Install via pip after Conda packages. PyObjC provides the Apple
-# framework bindings used by graphics settings.
+# Install the PyObjC bindings used by display discovery and settings saves.
 MACOS_PIP = [
-    "pyobjc; sys_platform == 'darwin'",
+    "pyobjc-framework-Quartz; sys_platform == 'darwin'",
+    "pyobjc-framework-Cocoa; sys_platform == 'darwin'",
+    "pyobjc-framework-ColorSync; sys_platform == 'darwin'",
 ]
 
 # MRI analysis, DICOM conversion, array storage, and remote filesystem access.
