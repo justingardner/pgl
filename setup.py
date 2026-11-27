@@ -63,6 +63,8 @@ if build_native:
     ]
 
 setup(
-    packages=find_packages(),
+    packages=find_packages() + ["pgl.vscodePglDialogs"],
+    package_dir={"pgl.vscodePglDialogs": "extensions/vscode-pgl-dialogs"},
+    package_data={"pgl.vscodePglDialogs": ["extension.js", "package.json"]},
     ext_modules=extensions,
 )

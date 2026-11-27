@@ -3536,6 +3536,168 @@ class _WindowFigureCanvas(FigureCanvasQTAgg):
             self.plotWindow.activateWindow()
             
 #####################################################################
+# VS Code Remote SSH desktop dialogs
+#####################################################################
+class pglRemoteDialog:
+    _requestMime = "application/vnd.pgl.dialog+json"
+    _installHint = "Run `from pgl import pglRemoteDialog` and then `pglRemoteDialog.install()` in this notebook."
+    _installDirectory = None
+
+    # ========================================================================
+    @staticmethod
+    def _isRemote():
+        import os
+
+        authority = os.environ.get("VSCODE_CLI_AUTHORITY", "")
+        if authority: return authority.startswith("ssh-remote+")
+        if any(os.environ.get(name) for name in ("WSL_DISTRO_NAME", "REMOTE_CONTAINERS", "REMOTE_CONTAINERS_IPC", "CODESPACES")):
+            return False
+
+        # VS Code Server adds remote-cli to the extension host's PATH.
+        return bool(os.environ.get("VSCODE_RECONNECTION_GRACE_TIME")) or any(
+            Path(entry).name == "remote-cli" for entry in os.get_exec_path()
+        )
+
+    # ========================================================================
+    @staticmethod
+    def _extensionSource():
+        installed = Path(__file__).resolve().parent / "vscodePglDialogs"
+        if installed.is_dir(): return installed
+        return installed.parent.parent / "extensions" / "vscode-pgl-dialogs"
+
+    # ========================================================================
+    @classmethod
+    def _packageExtension(cls, directory, manifest):
+        from xml.sax.saxutils import escape, quoteattr
+        from zipfile import ZIP_DEFLATED, ZipFile
+
+        source = cls._extensionSource()
+        output = Path(directory) / f"{manifest['name']}-{manifest['version']}.vsix"
+        vsixManifest = f"""<?xml version="1.0" encoding="utf-8"?>
+<PackageManifest Version="2.0.0" xmlns="http://schemas.microsoft.com/developer/vsx-schema/2011">
+  <Metadata>
+    <Identity Id={quoteattr(manifest['name'])} Version={quoteattr(manifest['version'])} Publisher={quoteattr(manifest['publisher'])} Language="en-US"/>
+    <DisplayName>{escape(manifest['displayName'])}</DisplayName>
+    <Description>{escape(manifest['description'])}</Description>
+    <Properties>
+      <Property Id="Microsoft.VisualStudio.Code.Engine" Value={quoteattr(manifest['engines']['vscode'])}/>
+      <Property Id="Microsoft.VisualStudio.Code.ExtensionKind" Value="ui"/>
+      <Property Id="Microsoft.VisualStudio.Code.ExecutesCode" Value="true"/>
+    </Properties>
+  </Metadata>
+  <Installation><InstallationTarget Id="Microsoft.VisualStudio.Code"/></Installation>
+  <Dependencies/>
+  <Assets><Asset Type="Microsoft.VisualStudio.Code.Manifest" Path="extension/package.json" Addressable="true"/></Assets>
+</PackageManifest>"""
+        contentTypes = """<?xml version="1.0" encoding="utf-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension=".js" ContentType="application/javascript"/>
+  <Default Extension=".json" ContentType="application/json"/>
+  <Default Extension=".vsixmanifest" ContentType="text/xml"/>
+</Types>"""
+        with ZipFile(output, "w", compression=ZIP_DEFLATED) as package:
+            package.writestr("extension.vsixmanifest", vsixManifest)
+            package.writestr("[Content_Types].xml", contentTypes)
+            package.write(source / "package.json", "extension/package.json")
+            package.write(source / "extension.js", "extension/extension.js")
+        return output
+
+    # ========================================================================
+    @classmethod
+    def install(cls):
+        """Install PGL Dialogs locally, or prepare the package from Remote SSH."""
+        import json
+        import shutil
+
+        try:
+            manifest = json.loads((cls._extensionSource() / "package.json").read_text(encoding="utf-8"))
+            if cls._isRemote():
+                if cls._installDirectory is None: cls._installDirectory = tempfile.TemporaryDirectory(prefix="pgl-vscode-")
+                package = cls._packageExtension(cls._installDirectory.name, manifest)
+                pglMessages.message(
+                    "In this VS Code window, open the Command Palette and choose Extensions: Install from VSIX...\n"
+                    f"Paste this path in the file picker and choose Install. VS Code installs PGL Dialogs on your desktop.\n{package}\n"
+                    "Reload the window if VS Code prompts you, then rerun the dialog.",
+                    format=False, wrapText=False,
+                )
+                return
+
+            code = shutil.which("code")
+            if code is None and sys.platform == "darwin":
+                appCode = Path("/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code")
+                if appCode.is_file(): code = str(appCode)
+            if code is None:
+                raise RuntimeError("VS Code's `code` command is unavailable. Install Visual Studio Code or add `code` to your PATH.")
+
+            extensionID = f"{manifest['publisher']}.{manifest['name']}".lower()
+            installed = subprocess.run([code, "--list-extensions"], capture_output=True, text=True, check=True, timeout=30).stdout
+            if extensionID in installed.lower().splitlines():
+                pglMessages.message("PGL Dialogs is already installed in VS Code.")
+                return
+
+            if not pglDialogs.confirm("Install PGL Dialogs in VS Code on this computer?", title="Install PGL Dialogs", confirmButtonText="Install"):
+                return
+            with tempfile.TemporaryDirectory(prefix="pgl-vscode-") as directory:
+                package = cls._packageExtension(directory, manifest)
+                subprocess.run([code, "--install-extension", str(package)], capture_output=True, text=True, check=True, timeout=120)
+            pglMessages.message("PGL Dialogs is installed. Reload the VS Code window if prompted, then rerun the dialog.")
+        except Exception as error:
+            details = (getattr(error, "stderr", "") or getattr(error, "stdout", "") or str(error)).strip()
+            if isinstance(details, bytes): details = details.decode("utf-8", errors="replace")
+            pglMessages.warning(f"Could not prepare or install PGL Dialogs. {details} Check that you have a complete PGL installation and can install extensions in VS Code.")
+
+    # ========================================================================
+    @classmethod
+    def _requestConfirmation(cls, requestText, requestHash):
+        import json
+        import shutil
+        import time
+        from IPython import get_ipython
+
+        if not getattr(get_ipython(), "kernel", None):
+            raise RuntimeError("Open a notebook in VS Code Remote SSH to show the confirmation on your desktop.")
+        if sys.platform == "win32":
+            raise RuntimeError("This pilot requires a Linux or macOS SSH host.")
+        frame = json.dumps({"version": 1, "mode": "confirm", "request": requestText}, ensure_ascii=False).encode("utf-8")
+        if len(frame) > 64 * 1024: raise ValueError("The remote confirmation is too large. Shorten the dialog text.")
+
+        requestID = uuid.uuid4().hex
+        root = Path("/tmp") / f"pgl-dialog-{requestID}"
+        root.mkdir(mode=0o700)
+        try:
+            (root / "request.json").write_bytes(frame)
+            responseFile = root / "response.json"
+            display({"text/plain": "PGL desktop confirmation", cls._requestMime: {"id": requestID}}, raw=True)
+            deadline = time.monotonic() + 8
+            opened = False
+            while time.monotonic() < deadline:
+                try:
+                    response = json.loads(responseFile.read_text(encoding="utf-8"))
+                except FileNotFoundError:
+                    time.sleep(0.1)
+                    continue
+                if not isinstance(response, dict) or response.get("id") != requestID or response.get("requestHash") != requestHash:
+                    raise ValueError("Invalid or mismatched desktop confirmation response.")
+                if response.get("status") == "done" and type(response.get("confirmed")) is bool:
+                    return response["confirmed"]
+                if response.get("status") == "error":
+                    raise RuntimeError(f"The desktop dialog could not be shown. {response.get('error', '')}")
+                if response.get("status") != "open": raise ValueError("Unexpected desktop confirmation response.")
+                if not opened:
+                    opened = True
+                    deadline = time.monotonic() + 900
+                time.sleep(0.1)
+
+            if opened: raise TimeoutError("The desktop confirmation expired. Rerun the cell when you are ready to respond.")
+            raise TimeoutError(
+                f"PGL Dialogs did not respond. {cls._installHint} If it is installed, check that it is enabled, "
+                "reload VS Code, and retry from a saved notebook on the SSH host."
+            )
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+
+#####################################################################
 # pglTraitsDialog: what gets called by the user. This rund
 # pglTraitsDialogStandalone which runs outside the jupyter notebook
 # to avoid crashy-conflicty behavior.
@@ -3724,9 +3886,10 @@ class pglDialogs:
     ################################################################
     # Display information and request explicit confirmation
     ################################################################
+    # ========================================================================
     @staticmethod
     def confirm(summary, title="Confirm", *, details=None, confirmButtonText="Ok", copyText=None):
-        """Request confirmation in a separate PySide6 process.
+        """Request confirmation in PySide6 or on the VS Code Remote SSH desktop.
 
         summary is required nonblank string.
         title is optional and defaults to "Confirm".
@@ -3792,6 +3955,13 @@ class pglDialogs:
         # Successful process exit alone is never interpreted as confirmation.
         requestText = json.dumps(request, ensure_ascii=False, sort_keys=True)
         requestHash = hashlib.sha256(requestText.encode("utf-8")).hexdigest()
+
+        if pglRemoteDialog._isRemote():
+            try:
+                return pglRemoteDialog._requestConfirmation(requestText, requestHash)
+            except Exception as error:
+                pglMessages.warning(f"Confirmation was not obtained. {error}")
+                return False
 
         # Qt lives entirely in the child process. User-supplied text enters
         # through JSON, never through Python source or shell interpolation.

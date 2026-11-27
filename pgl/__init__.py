@@ -71,6 +71,7 @@ _EXPORTS = {
  'pglEyePositionSample': ('.pglEyeTracker', 'pglEyePositionSample'),
  'pglEyelinkSettings': ('.pglEyelink', 'pglEyelinkSettings'),
  'pglDialogs': ('.pglDialog', 'pglDialogs'),
+ 'pglRemoteDialog': ('.pglDialog', 'pglRemoteDialog'),
  'pglMessages': ('.pglMessages', 'pglMessages'),
  'pglActions': ('.pglActions', 'pglActions'),
  'pglFlywheel': ('.pglFlywheel', 'pglFlywheel'),
