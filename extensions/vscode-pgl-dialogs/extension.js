@@ -13,6 +13,7 @@ const run = promisify(execFile);
 const dialogs = new Map([
     ['confirm', { validate: validConfirmation, script: 'confirm.py', resultKey: 'confirmed' }],
     ['selectItems', { validate: validSelection, script: 'selectItems.py', resultKey: 'result' }],
+    ['qtWindow', { validate: validWindow, script: 'qtWindow.py', resultKey: 'result', mirror: true }],
 ]);
 
 // =============================================================================
@@ -44,7 +45,7 @@ async function serveRequest(root, id, desktopPython) {
 
     let response;
     try {
-        const result = await showDialog(dialog, requestText, requestHash, requestFile, desktopPython);
+        const result = await showDialog(dialog, requestText, requestHash, root, requestFile, desktopPython);
         response = { id, requestHash, status: 'done', [dialog.resultKey]: result };
     } catch (error) {
         response = { id, requestHash, status: 'error', error: String(error.message || error) };
@@ -100,7 +101,7 @@ function activate(context) {
 // =============================================================================
 
 // =============================================================================
-async function showDialog(dialog, requestText, requestHash, remoteRequest, desktopPython) {
+async function showDialog(dialog, requestText, requestHash, remoteRoot, remoteRequest, desktopPython) {
     const python = await desktopPython();
     if (!python) {
         throw new Error('Desktop Python with PySide6 is required. Use PGL Dialogs: Select Desktop Python in the VS Code Command Palette.');
@@ -111,6 +112,8 @@ async function showDialog(dialog, requestText, requestHash, remoteRequest, deskt
     const output = path.join(directory, 'response.json');
     const controller = new AbortController();
     let watcher;
+    let watcherError;
+    const relayState = {};
     try {
         await localFs.writeFile(input, requestText, { encoding: 'utf8', mode: 0o600 });
         // An interrupted kernel removes the request. Stop its desktop process too.
@@ -120,7 +123,15 @@ async function showDialog(dialog, requestText, requestHash, remoteRequest, deskt
             } catch (error) {
                 if (error.code === 'FileNotFound') controller.abort();
             }
-            if (!controller.signal.aborted) watcher = setTimeout(checkRequest, 1000);
+            if (dialog.mirror && !controller.signal.aborted) {
+                try {
+                    await relayWindow(remoteRoot, directory, relayState, controller.signal);
+                } catch (error) {
+                    watcherError = error;
+                    controller.abort();
+                }
+            }
+            if (!controller.signal.aborted) watcher = setTimeout(checkRequest, dialog.mirror ? 50 : 1000);
         };
         await checkRequest();
         await run(python, ['-I', path.join(__dirname, dialog.script), input, output], {
@@ -133,6 +144,7 @@ async function showDialog(dialog, requestText, requestHash, remoteRequest, deskt
         }
         return result.confirmed;
     } catch (error) {
+        if (watcherError) throw watcherError;
         if (controller.signal.aborted) throw vscode.FileSystemError.FileNotFound(remoteRequest);
         const details = String(error.stderr || error.message).trim().slice(-2000);
         throw new Error(`Could not run the PySide6 dialog on your desktop. ${details}\nUse PGL Dialogs: Select Desktop Python to choose an environment with PySide6.`);
@@ -140,6 +152,45 @@ async function showDialog(dialog, requestText, requestHash, remoteRequest, deskt
         controller.abort();
         clearTimeout(watcher);
         await localFs.rm(directory, { recursive: true, force: true });
+    }
+}
+
+// =============================================================================
+async function relayWindow(root, directory, state, signal) {
+    const fs = vscode.workspace.fs;
+    const localInput = path.join(directory, 'input.json');
+    const remoteInput = vscode.Uri.joinPath(root, 'input.json');
+    const remoteFrame = vscode.Uri.joinPath(root, 'frame.json');
+    const localFrame = path.join(directory, 'frame.json');
+
+    try {
+        const input = await localFs.stat(localInput);
+        if (input.mtimeMs !== state.input && !signal.aborted) {
+            if (input.size > 1024 * 1024) throw new Error('Desktop input exceeds the settings dialog limit.');
+            const pending = vscode.Uri.joinPath(root, 'input.tmp');
+            await fs.writeFile(pending, await localFs.readFile(localInput));
+            await fs.rename(pending, remoteInput, { overwrite: true });
+            state.input = input.mtimeMs;
+        }
+    } catch (error) {
+        if (!['ENOENT', 'FileNotFound'].includes(error.code)) throw error;
+    }
+
+    try {
+        const frame = await fs.stat(remoteFrame);
+        if (frame.mtime === state.frame || signal.aborted) return;
+        if (frame.type !== vscode.FileType.File || frame.size > 8 * 1024 * 1024) {
+            throw new Error('The settings dialog frame is invalid or too large.');
+        }
+        const bytes = await fs.readFile(remoteFrame);
+        if (bytes.length > 8 * 1024 * 1024) throw new Error('The settings dialog frame is too large.');
+        if (signal.aborted) return;
+        const pending = path.join(directory, 'frame.tmp');
+        await localFs.writeFile(pending, bytes);
+        await localFs.rename(pending, localFrame);
+        state.frame = frame.mtime;
+    } catch (error) {
+        if (!['ENOENT', 'FileNotFound'].includes(error.code)) throw error;
     }
 }
 
@@ -208,6 +259,11 @@ function validSelection(request) {
     return request && typeof request.title === 'string' && request.title.trim() &&
         Array.isArray(request.items) && request.items.length > 0 &&
         request.items.every(label => typeof label === 'string');
+}
+
+// =============================================================================
+function validWindow(request) {
+    return request && typeof request.title === 'string' && request.title.trim() && !request.title.includes('\0');
 }
 
 module.exports = { activate };

@@ -3602,6 +3602,7 @@ class pglRemoteDialog:
             package.write(source / "extension.js", "extension/extension.js")
             package.writestr("extension/confirm.py", pglDialogs._confirmationScript())
             package.writestr("extension/selectItems.py", pglDialogs._selectionScript())
+            package.writestr("extension/qtWindow.py", cls._desktopWindowScript())
         return output
 
     # ========================================================================
@@ -3655,7 +3656,7 @@ class pglRemoteDialog:
 
     # ========================================================================
     @classmethod
-    def _requestDialog(cls, mode, requestText, *, resultKey="result"):
+    def _requestDialog(cls, mode, requestText, *, resultKey="result", startProcess=None, onPoll=None):
         import hashlib
         import json
         import shutil
@@ -3673,6 +3674,7 @@ class pglRemoteDialog:
         requestID = uuid.uuid4().hex
         root = Path("/tmp") / f"pgl-dialog-{requestID}"
         root.mkdir(mode=0o700)
+        process = None
         try:
             (root / "request.json").write_bytes(frame)
             responseFile = root / "response.json"
@@ -3680,6 +3682,8 @@ class pglRemoteDialog:
             deadline = time.monotonic() + 8
             opened = False
             while time.monotonic() < deadline:
+                if onPoll is not None: onPoll()
+                if process is not None and process.poll() is not None: return process.returncode
                 try:
                     response = json.loads(responseFile.read_text(encoding="utf-8"))
                 except FileNotFoundError:
@@ -3687,13 +3691,14 @@ class pglRemoteDialog:
                     continue
                 if not isinstance(response, dict) or response.get("id") != requestID or response.get("requestHash") != requestHash:
                     raise ValueError("Invalid or mismatched desktop dialog response.")
-                if response.get("status") == "done" and resultKey in response: return response[resultKey]
+                if response.get("status") == "done" and resultKey in response: return 1 if startProcess is not None else response[resultKey]
                 if response.get("status") == "error":
                     raise RuntimeError(f"The desktop dialog could not be shown. {response.get('error', '')}")
                 if response.get("status") != "open": raise ValueError("Unexpected desktop dialog response.")
                 if not opened:
                     opened = True
                     deadline = time.monotonic() + 900
+                    if startProcess is not None: process = startProcess(root)
                 time.sleep(0.1)
 
             if opened: raise TimeoutError("The desktop dialog expired. Rerun the cell when you are ready to respond.")
@@ -3706,7 +3711,188 @@ class pglRemoteDialog:
                 "If the extension is up to date, check that it is enabled and reload your Remote SSH window."
             )
         finally:
+            if process is not None:
+                if process.poll() is None: process.kill()
+                process.wait()
             shutil.rmtree(root, ignore_errors=True)
+
+    # ========================================================================
+    @classmethod
+    def _runQtWindow(cls, command, title, *, environment=None, stdout=None, stderr=None, onPoll=None):
+        import json
+        import os
+
+        def startProcess(root):
+            screen = root / "screen.json"
+            screen.write_text(json.dumps({"screens": [{"name": "PGL", "width": 1440, "height": 1000}]}), encoding="utf-8")
+            childEnv = dict(os.environ if environment is None else environment)
+            packageRoot = str(Path(__file__).resolve().parent.parent)
+            pythonPath = childEnv.get("PYTHONPATH")
+            childEnv["PYTHONPATH"] = os.pathsep.join((packageRoot, pythonPath)) if pythonPath else packageRoot
+            childEnv.update(QT_QPA_PLATFORM=f"offscreen:configfile={screen}", PGL_DIALOG_FRAME_DIRECTORY=str(root))
+            return subprocess.Popen(command, env=childEnv, stdout=stdout, stderr=stderr)
+
+        return cls._requestDialog("qtWindow", json.dumps({"title": title}), startProcess=startProcess, onPoll=onPoll)
+
+    # ========================================================================
+    @staticmethod
+    def _desktopWindowScript():
+        return r'''
+import base64
+import json
+from pathlib import Path
+import sys
+
+from PySide6.QtCore import QEvent, QPoint, QRect, QSize, QTimer, Qt
+from PySide6.QtGui import QKeySequence, QPainter, QPixmap
+from PySide6.QtWidgets import QApplication, QLabel
+
+
+class DialogWindow(QLabel):
+    # ========================================================================
+    def __init__(self, directory, title):
+        super().__init__("Opening settings…")
+        self.directory = directory
+        self.frame = None
+        self.frameTime = None
+        self.origin = (0, 0)
+        self.clipboardText = None
+        self.input = []
+        self.nextInput = 0
+        self.unsent = False
+        self.pendingMove = None
+        self.setWindowTitle(title)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setMouseTracking(True)
+        self.resize(420, 120)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._poll)
+        self.timer.start(40)
+
+    # ========================================================================
+    def _poll(self):
+        try:
+            self._readFrame()
+            self._flushMove()
+            if self.unsent:
+                pending = self.directory / "input.tmp"
+                pending.write_text(json.dumps(self.input), encoding="utf-8")
+                pending.replace(self.directory / "input.json")
+                self.unsent = False
+        except Exception:
+            import traceback
+
+            traceback.print_exc()
+            QApplication.exit(2)
+
+    # ========================================================================
+    def _readFrame(self):
+        path = self.directory / "frame.json"
+        try:
+            frameTime = path.stat().st_mtime_ns
+        except FileNotFoundError:
+            return
+        if self.frameTime == frameTime: return
+
+        packet = json.loads(path.read_text(encoding="utf-8"))
+        image = QPixmap()
+        if not image.loadFromData(base64.b64decode(packet["image"]), "PNG"):
+            raise ValueError("Could not read the Qt dialog frame.")
+        self.frame = image
+        self.frameTime = frameTime
+        self.origin = tuple(packet["origin"])
+        self.input = [item for item in self.input if item[0] > packet["ack"]]
+        if packet["clipboard"] != self.clipboardText:
+            self.clipboardText = packet["clipboard"]
+            if self.clipboardText is not None: QApplication.clipboard().setText(self.clipboardText)
+
+        available = self.screen().availableGeometry().size() - QSize(40, 70)
+        desired = image.size()
+        if desired.width() > available.width() or desired.height() > available.height():
+            desired.scale(available, Qt.AspectRatioMode.KeepAspectRatio)
+        if desired != self.size(): self.setFixedSize(desired)
+        self.update()
+
+    # ========================================================================
+    def paintEvent(self, event):
+        if self.frame is None:
+            super().paintEvent(event)
+            return
+        painter = QPainter(self)
+        painter.drawPixmap(self.rect(), self.frame)
+
+    # ========================================================================
+    def _queue(self, event):
+        if len(self.input) >= 1024: return
+        self.nextInput += 1
+        self.input.append([self.nextInput, event])
+        self.unsent = True
+
+    # ========================================================================
+    def _flushMove(self):
+        if self.pendingMove is None: return
+        self._queue(self.pendingMove)
+        self.pendingMove = None
+
+    # ========================================================================
+    def event(self, event):
+        if event.type() in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease) and self.frame is not None:
+            self._flushMove()
+            press = event.type() == QEvent.Type.KeyPress
+            paste = press and event.matches(QKeySequence.StandardKey.Paste)
+            self._queue([
+                "keyPress" if press else "keyRelease", event.key(), event.modifiers().value,
+                event.text(), event.isAutoRepeat(), QApplication.clipboard().text()[:65536] if paste else None,
+            ])
+            return True
+        return super().event(event)
+
+    # ========================================================================
+    def _pointer(self, kind, event, button, horizontal=0, vertical=0):
+        if self.frame is None: return
+        point = event.position()
+        x = self.origin[0] + int(point.x() * self.frame.width() / self.width())
+        y = self.origin[1] + int(point.y() * self.frame.height() / self.height())
+        data = [kind, x, y, button, event.buttons().value, event.modifiers().value, horizontal, vertical]
+        if kind == "move":
+            self.pendingMove = data
+        else:
+            self._flushMove()
+            self._queue(data)
+
+    # ========================================================================
+    def mousePressEvent(self, event):
+        self._pointer("press", event, event.button().value)
+
+    # ========================================================================
+    def mouseReleaseEvent(self, event):
+        self._pointer("release", event, event.button().value)
+
+    # ========================================================================
+    def mouseDoubleClickEvent(self, event):
+        self._pointer("doubleClick", event, event.button().value)
+
+    # ========================================================================
+    def mouseMoveEvent(self, event):
+        self._pointer("move", event, 0)
+
+    # ========================================================================
+    def wheelEvent(self, event):
+        delta = event.angleDelta()
+        self._pointer("wheel", event, 0, delta.x(), delta.y())
+
+
+inputFile, outputFile = map(Path, sys.argv[1:])
+app = QApplication([])
+window = DialogWindow(inputFile.parent, json.loads(inputFile.read_text(encoding="utf-8"))["title"])
+window.show()
+window.raise_()
+window.activateWindow()
+exitCode = app.exec()
+if exitCode == 0: outputFile.write_text("null", encoding="utf-8")
+sys.exit(exitCode)
+'''
 
 
 #####################################################################
@@ -3715,6 +3901,32 @@ class pglRemoteDialog:
 # to avoid crashy-conflicty behavior.
 #####################################################################
 class pglDialogs:
+    # ========================================================================
+    @staticmethod
+    def _insideMirroredWindow():
+        import os
+
+        return bool(os.environ.get("PGL_DIALOG_FRAME_DIRECTORY")) and QApplication.instance() is not None
+
+    # ========================================================================
+    @staticmethod
+    def _runDialogScript(script, inputFile, outputFile, label):
+        if pglDialogs._insideMirroredWindow():
+            # Use the same dialog within the existing Qt loop so callbacks can
+            # open nested confirmations and pickers on the mirrored display.
+            exec(compile(script, "<PGL Qt dialog>", "exec"), {
+                "__name__": "_pglNestedDialog", "requestPath": inputFile, "responsePath": outputFile,
+            })
+            return
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(inputFile), str(outputFile)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", check=False,
+        )
+        if result.returncode != 0:
+            details = result.stderr.strip()[-4000:] or "No diagnostic output."
+            raise RuntimeError(f"{label} exited with code {result.returncode}.\n{details}")
+
+    # ========================================================================
     @staticmethod
     def traitsDialog(settings, width=None):
         """
@@ -3740,9 +3952,18 @@ class pglDialogs:
                 scriptPath = Path(__file__).parent / "pglTraitsDialogStandalone.py"
                 command = [sys.executable, str(scriptPath), str(inFile), str(outFile)]
                 if width is not None: command.append(str(width))
-                result = subprocess.run(command, stderr=subprocess.DEVNULL)
+                if pglRemoteDialog._isRemote():
+                    errorPath = tmpDir / "stderr.log"
+                    with errorPath.open("wb") as stderr:
+                        exitCode = pglRemoteDialog._runQtWindow(command, "Settings", stderr=stderr)
+                    if exitCode not in (0, 1):
+                        with errorPath.open("rb") as stderr: detail = stderr.read(4000).decode("utf-8", errors="replace")
+                        raise RuntimeError(f"The settings dialog exited with status {exitCode}. {detail.strip()}")
+                    if exitCode == 0 and not outFile.exists(): raise RuntimeError("The settings dialog closed without returning settings.")
+                else:
+                    exitCode = subprocess.run(command, stderr=subprocess.DEVNULL).returncode
 
-                if result.returncode == 0 and outFile.exists():
+                if exitCode == 0 and outFile.exists():
                     # OK
                     return pglSerialize.load(outFile)
                 else:
@@ -3752,6 +3973,7 @@ class pglDialogs:
             pglMessages.warning(f"Error running traitsDialog: {e}")
             return None
         
+    # ========================================================================
     @staticmethod
     def toolDialog(document, width=None, *, returnValidation=False):
         """Edit a tool schema using the existing standalone traits dialog.
@@ -3838,32 +4060,47 @@ class pglDialogs:
                 if len(pending) > 1024 * 1024:
                     pending = b""
 
+        desktop = pglRemoteDialog._isRemote()
         with stdoutPath.open("xb") as stdout, stderrPath.open("xb") as stderr:
             with progressPath.open("rb", buffering=0) as progressReader:
-                process = subprocess.Popen(
-                    command, stdout=stdout, stderr=stderr, env=environment,
-                )
-                try:
-                    while process.poll() is None:
-                        forwardProgress(progressReader)
-                        time.sleep(0.1)
+                if desktop:
+                    try:
+                        exitCode = pglRemoteDialog._runQtWindow(
+                            command, f"{document['label']} — installation settings", environment=environment,
+                            stdout=stdout, stderr=stderr, onPoll=lambda: forwardProgress(progressReader),
+                        )
+                    except Exception as error:
+                        pglMessages.warning(f"Could not open the tool settings on your desktop. {error}")
+                        return None
                     forwardProgress(progressReader, final=True)
-                finally:
-                    # As before, interruption stops/reaps the dialog child.
-                    # A separately running validation descendant is not
-                    # guaranteed to stop; its diagnostic files are retained.
-                    if process.poll() is None: process.kill()
-                    process.wait()
+                else:
+                    process = subprocess.Popen(command, stdout=stdout, stderr=stderr, env=environment)
+                    try:
+                        while process.poll() is None:
+                            forwardProgress(progressReader)
+                            time.sleep(0.1)
+                        forwardProgress(progressReader, final=True)
+                    finally:
+                        # As before, interruption stops/reaps the dialog child.
+                        # A separately running validation descendant is not
+                        # guaranteed to stop; its diagnostic files are retained.
+                        if process.poll() is None: process.kill()
+                        process.wait()
+                    exitCode = process.returncode
 
-        if process.returncode == 1: return None
-        if process.returncode != 0:
+        if exitCode == 1: return None
+        if exitCode != 0:
             with stderrPath.open("rb") as source:
                 source.seek(max(0, stderrPath.stat().st_size - 12000))
                 details = source.read(12000).decode("utf-8", errors="replace")
-            raise RuntimeError(
+            note = (
                 f"Tool dialog failed. Retained files: {root}\n"
                 + (details.strip() or "No child diagnostic.")
             )
+            if desktop:
+                pglMessages.warning(note)
+                return None
+            raise RuntimeError(note)
 
         def readResponse(path):
             with path.open("rb") as source:
@@ -3966,7 +4203,7 @@ class pglDialogs:
         # Bind the response to the complete request, including button labels.
         # Successful process exit alone is never interpreted as confirmation.
         requestText = json.dumps(request, ensure_ascii=False, sort_keys=True)
-        if pglRemoteDialog._isRemote():
+        if not pglDialogs._insideMirroredWindow() and pglRemoteDialog._isRemote():
             try:
                 confirmed = pglRemoteDialog._requestDialog("confirm", requestText, resultKey="confirmed")
                 if type(confirmed) is not bool: raise ValueError("Invalid desktop confirmation response.")
@@ -3990,19 +4227,7 @@ class pglDialogs:
                 # There is no interaction timeout: users may need time to
                 # review or copy details. subprocess.run cleans up its
                 # child if execution is interrupted.
-                result = subprocess.run(
-                    [sys.executable, "-c", dialogScript, str(inputFile), str(outputFile)],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    check=False,
-                )
-
-                if result.returncode != 0:
-                    errorDetails = result.stderr.strip()[-4000:] or "No diagnostic output."
-                    raise RuntimeError(f"Dialog process exited with code {result.returncode}:\n{errorDetails}")
+                pglDialogs._runDialogScript(dialogScript, inputFile, outputFile, "Confirmation dialog")
 
                 if not outputFile.is_file():
                     raise RuntimeError("Dialog closed without a confirmation response.")
@@ -4041,12 +4266,14 @@ from PySide6.QtWidgets import (
     QPushButton, QVBoxLayout,
 )
 
-requestBytes = Path(sys.argv[1]).read_bytes()
+if __name__ == "__main__":
+    requestPath, responsePath = map(Path, sys.argv[1:])
+requestBytes = requestPath.read_bytes()
 requestHash = hashlib.sha256(requestBytes).hexdigest()
 request = json.loads(requestBytes)
 
 # Create the application before constructing any widgets.
-app = QApplication([])
+app = QApplication.instance() or QApplication([])
 dialog = QDialog()
 dialog.setWindowTitle(request["title"])
 dialog.setSizeGripEnabled(True)
@@ -4145,7 +4372,7 @@ confirmed = dialog.exec() == QDialog.DialogCode.Accepted
 
 # Return explicit confirmation bound to the request that was displayed.
 response = {"confirmed": confirmed, "requestHash": requestHash}
-Path(sys.argv[2]).write_text(json.dumps(response), encoding="utf-8")
+responsePath.write_text(json.dumps(response), encoding="utf-8")
 '''
 
     ################################################################
@@ -4175,7 +4402,7 @@ Path(sys.argv[2]).write_text(json.dumps(response), encoding="utf-8")
             raise ValueError("title must be a nonblank string.")
 
         request = {"title": title, "items": items}
-        if pglRemoteDialog._isRemote():
+        if not pglDialogs._insideMirroredWindow() and pglRemoteDialog._isRemote():
             try:
                 selected = pglRemoteDialog._requestDialog("selectItems", json.dumps(request, ensure_ascii=False))
                 return pglDialogs._validateSelection(selected, len(items))
@@ -4194,18 +4421,7 @@ Path(sys.argv[2]).write_text(json.dumps(response), encoding="utf-8")
                 inputFile.write_text(json.dumps(request, ensure_ascii=False), encoding="utf-8")
 
                 # No interaction timeout: the user may need time to choose.
-                result = subprocess.run(
-                    [sys.executable, "-c", dialogScript, str(inputFile), str(outputFile)],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    check=False,
-                )
-                if result.returncode != 0:
-                    details = result.stderr.strip()[-4000:] or "No diagnostic output."
-                    raise RuntimeError(f"Selection dialog exited with code {result.returncode}:\n{details}")
+                pglDialogs._runDialogScript(dialogScript, inputFile, outputFile, "Selection dialog")
                 if not outputFile.is_file(): raise RuntimeError("Selection dialog returned no response.")
 
                 selected = json.loads(outputFile.read_text(encoding="utf-8"))
@@ -4229,9 +4445,11 @@ from PySide6.QtWidgets import (
     QListWidget, QListWidgetItem, QPushButton, QVBoxLayout,
 )
 
-request = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+if __name__ == "__main__":
+    requestPath, responsePath = map(Path, sys.argv[1:])
+request = json.loads(requestPath.read_text(encoding="utf-8"))
 
-app = QApplication([])
+app = QApplication.instance() or QApplication([])
 dialog = QDialog()
 dialog.setWindowTitle(request["title"])
 dialog.setSizeGripEnabled(True)
@@ -4307,7 +4525,7 @@ if screen is not None:
     dialog.move(available.center() - dialog.rect().center())
 
 selection = selectedIndices() if dialog.exec() == QDialog.DialogCode.Accepted else None
-Path(sys.argv[2]).write_text(json.dumps(selection), encoding="utf-8")
+responsePath.write_text(json.dumps(selection), encoding="utf-8")
 '''
 
     # ========================================================================
