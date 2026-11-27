@@ -3540,7 +3540,6 @@ class _WindowFigureCanvas(FigureCanvasQTAgg):
 #####################################################################
 class pglRemoteDialog:
     _requestMime = "application/vnd.pgl.dialog+json"
-    _installHint = "Run `from pgl import pglRemoteDialog` and then `pglRemoteDialog.install()` in this notebook."
     _installDirectory = None
 
     # ========================================================================
@@ -3616,7 +3615,8 @@ class pglRemoteDialog:
                 package = cls._packageExtension(cls._installDirectory.name, manifest)
                 pglMessages.message(
                     "In this VS Code window, open the Command Palette and choose Extensions: Install from VSIX...\n"
-                    f"Paste this path in the file picker and choose Install. VS Code installs PGL Dialogs on your desktop.\n{package}\n"
+                    "Paste this path in the file picker and choose Install. VS Code installs PGL Dialogs on your desktop.\n\n"
+                    f"{package}\n\n"
                     "Reload the window if VS Code prompts you, then rerun the dialog.",
                     format=False, wrapText=False,
                 )
@@ -3630,12 +3630,16 @@ class pglRemoteDialog:
                 raise RuntimeError("VS Code's `code` command is unavailable. Install Visual Studio Code or add `code` to your PATH.")
 
             extensionID = f"{manifest['publisher']}.{manifest['name']}".lower()
-            installed = subprocess.run([code, "--list-extensions"], capture_output=True, text=True, check=True, timeout=30).stdout
-            if extensionID in installed.lower().splitlines():
-                pglMessages.message("PGL Dialogs is already installed in VS Code.")
+            installed = subprocess.run([code, "--list-extensions", "--show-versions"], capture_output=True, text=True, check=True, timeout=30).stdout
+            installedVersion = next((line.partition("@")[2] for line in installed.splitlines() if line.partition("@")[0].lower() == extensionID), "")
+            installedRelease = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:\+.*)?", installedVersion)
+            bundledRelease = tuple(map(int, manifest["version"].split(".")))
+            if installedRelease and tuple(map(int, installedRelease.groups())) >= bundledRelease:
+                pglMessages.message(f"PGL Dialogs {installedVersion} is already installed in VS Code.")
                 return
 
-            if not pglDialogs.confirm("Install PGL Dialogs in VS Code on this computer?", title="Install PGL Dialogs", confirmButtonText="Install"):
+            action = "Update" if installedVersion else "Install"
+            if not pglDialogs.confirm(f"{action} PGL Dialogs in VS Code on this computer?", title=f"{action} PGL Dialogs", confirmButtonText=action):
                 return
             with tempfile.TemporaryDirectory(prefix="pgl-vscode-") as directory:
                 package = cls._packageExtension(directory, manifest)
@@ -3648,18 +3652,20 @@ class pglRemoteDialog:
 
     # ========================================================================
     @classmethod
-    def _requestConfirmation(cls, requestText, requestHash):
+    def _requestDialog(cls, mode, requestText, *, resultKey="result"):
+        import hashlib
         import json
         import shutil
         import time
         from IPython import get_ipython
 
         if not getattr(get_ipython(), "kernel", None):
-            raise RuntimeError("Open a notebook in VS Code Remote SSH to show the confirmation on your desktop.")
+            raise RuntimeError("Open a notebook in VS Code Remote SSH to show the dialog on your desktop.")
         if sys.platform == "win32":
             raise RuntimeError("This pilot requires a Linux or macOS SSH host.")
-        frame = json.dumps({"version": 1, "mode": "confirm", "request": requestText}, ensure_ascii=False).encode("utf-8")
-        if len(frame) > 64 * 1024: raise ValueError("The remote confirmation is too large. Shorten the dialog text.")
+        requestHash = hashlib.sha256(requestText.encode("utf-8")).hexdigest()
+        frame = json.dumps({"version": 1, "mode": mode, "request": requestText}, ensure_ascii=False).encode("utf-8")
+        if len(frame) > 64 * 1024: raise ValueError("The remote dialog is too large. Shorten the text or reduce the number of items.")
 
         requestID = uuid.uuid4().hex
         root = Path("/tmp") / f"pgl-dialog-{requestID}"
@@ -3667,7 +3673,7 @@ class pglRemoteDialog:
         try:
             (root / "request.json").write_bytes(frame)
             responseFile = root / "response.json"
-            display({"text/plain": "PGL desktop confirmation", cls._requestMime: {"id": requestID}}, raw=True)
+            display({"text/plain": "PGL desktop dialog", cls._requestMime: {"id": requestID}}, raw=True)
             deadline = time.monotonic() + 8
             opened = False
             while time.monotonic() < deadline:
@@ -3677,21 +3683,24 @@ class pglRemoteDialog:
                     time.sleep(0.1)
                     continue
                 if not isinstance(response, dict) or response.get("id") != requestID or response.get("requestHash") != requestHash:
-                    raise ValueError("Invalid or mismatched desktop confirmation response.")
-                if response.get("status") == "done" and type(response.get("confirmed")) is bool:
-                    return response["confirmed"]
+                    raise ValueError("Invalid or mismatched desktop dialog response.")
+                if response.get("status") == "done" and resultKey in response: return response[resultKey]
                 if response.get("status") == "error":
                     raise RuntimeError(f"The desktop dialog could not be shown. {response.get('error', '')}")
-                if response.get("status") != "open": raise ValueError("Unexpected desktop confirmation response.")
+                if response.get("status") != "open": raise ValueError("Unexpected desktop dialog response.")
                 if not opened:
                     opened = True
                     deadline = time.monotonic() + 900
                 time.sleep(0.1)
 
-            if opened: raise TimeoutError("The desktop confirmation expired. Rerun the cell when you are ready to respond.")
+            if opened: raise TimeoutError("The desktop dialog expired. Rerun the cell when you are ready to respond.")
             raise TimeoutError(
-                f"PGL Dialogs did not respond. {cls._installHint} If it is installed, check that it is enabled, "
-                "reload VS Code, and retry from a saved notebook on the SSH host."
+                "The PGL Dialogs extension in desktop VS Code did not respond.\n\n"
+                "To install or update the extension, run these two lines in a notebook cell.\n\n"
+                "from pgl import pglRemoteDialog\n"
+                "pglRemoteDialog.install()\n\n"
+                "Follow the install instructions it prints, then rerun the dialog.\n"
+                "If the extension is up to date, check that it is enabled and reload your Remote SSH window."
             )
         finally:
             shutil.rmtree(root, ignore_errors=True)
@@ -3954,14 +3963,15 @@ class pglDialogs:
         # Bind the response to the complete request, including button labels.
         # Successful process exit alone is never interpreted as confirmation.
         requestText = json.dumps(request, ensure_ascii=False, sort_keys=True)
-        requestHash = hashlib.sha256(requestText.encode("utf-8")).hexdigest()
-
         if pglRemoteDialog._isRemote():
             try:
-                return pglRemoteDialog._requestConfirmation(requestText, requestHash)
+                confirmed = pglRemoteDialog._requestDialog("confirm", requestText, resultKey="confirmed")
+                if type(confirmed) is not bool: raise ValueError("Invalid desktop confirmation response.")
+                return confirmed
             except Exception as error:
                 pglMessages.warning(f"Confirmation was not obtained. {error}")
                 return False
+        requestHash = hashlib.sha256(requestText.encode("utf-8")).hexdigest()
 
         # Qt lives entirely in the child process. User-supplied text enters
         # through JSON, never through Python source or shell interpolation.
@@ -4133,6 +4143,7 @@ Path(sys.argv[2]).write_text(json.dumps(response), encoding="utf-8")
     ################################################################
     # Select from a list of strings
     ################################################################
+    # ========================================================================
     @staticmethod
     def selectItems(items, title="Select items"):
         """Display checkboxes and return zero-based selected positions.
@@ -4141,7 +4152,8 @@ Path(sys.argv[2]).write_text(json.dumps(response), encoding="utf-8")
         Nothing is selected initially; at least one selection is required.
 
         Returns selected indices in list order, or None on Cancel/failure.
-        Qt runs in a separate process to avoid notebook conflicts.
+        VS Code Remote SSH displays the picker on the desktop.
+        On the same host, Qt runs in a separate process to avoid notebook conflicts.
         """
         import json
         import subprocess
@@ -4153,6 +4165,15 @@ Path(sys.argv[2]).write_text(json.dumps(response), encoding="utf-8")
             raise ValueError("items must be a nonempty list of strings.")
         if not isinstance(title, str) or not title.strip():
             raise ValueError("title must be a nonblank string.")
+
+        request = {"title": title, "items": items}
+        if pglRemoteDialog._isRemote():
+            try:
+                selected = pglRemoteDialog._requestDialog("selectItems", json.dumps(request, ensure_ascii=False))
+                return pglDialogs._validateSelection(selected, len(items))
+            except Exception as error:
+                pglMessages.warning(f"Selection was not obtained. {error}")
+                return None
 
         # Pass display strings through JSON, not Python source interpolation.
         dialogScript = r'''
@@ -4252,7 +4273,7 @@ Path(sys.argv[2]).write_text(json.dumps(selection), encoding="utf-8")
                 root = Path(directory)
                 inputFile = root / "request.json"
                 outputFile = root / "response.json"
-                inputFile.write_text(json.dumps({"title": title, "items": items}, ensure_ascii=False), encoding="utf-8")
+                inputFile.write_text(json.dumps(request, ensure_ascii=False), encoding="utf-8")
 
                 # No interaction timeout: the user may need time to choose.
                 result = subprocess.run(
@@ -4270,19 +4291,23 @@ Path(sys.argv[2]).write_text(json.dumps(selection), encoding="utf-8")
                 if not outputFile.is_file(): raise RuntimeError("Selection dialog returned no response.")
 
                 selected = json.loads(outputFile.read_text(encoding="utf-8"))
-                if selected is None: return None
-                if (
-                    not isinstance(selected, list) or not selected
-                    or any(type(index) is not int or not 0 <= index < len(items) for index in selected)
-                    or len(set(selected)) != len(selected)
-                ):
-                    raise ValueError("Invalid selection response.")
-
-                return sorted(selected)
+                return pglDialogs._validateSelection(selected, len(items))
 
         except Exception as error:
             pglMessages.warning(f"Selection was not obtained: {type(error).__name__}: {error}", level=1)
             return None
+
+    # ========================================================================
+    @staticmethod
+    def _validateSelection(selected, itemCount):
+        if selected is None: return None
+        if (
+            not isinstance(selected, list) or not selected
+            or any(type(index) is not int or not 0 <= index < itemCount for index in selected)
+            or len(set(selected)) != len(selected)
+        ):
+            raise ValueError("Invalid selection response.")
+        return sorted(selected)
         
 ################################################################
 #   pglToolDialog.py

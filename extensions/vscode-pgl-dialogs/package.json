@@ -1,8 +1,8 @@
 {
   "name": "pgl-dialogs",
   "displayName": "PGL Dialogs",
-  "description": "Display PGL confirmation dialogs on the desktop for VS Code Remote SSH notebooks.",
-  "version": "0.1.0",
+  "description": "Display PGL dialogs on the desktop for VS Code Remote SSH notebooks.",
+  "version": "0.2.0",
   "publisher": "gardnerlab",
   "license": "MIT",
   "engines": {

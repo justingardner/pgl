@@ -3,6 +3,10 @@ const { createHash, randomUUID } = require('node:crypto');
 
 const requestMime = 'application/vnd.pgl.dialog+json';
 const requestLimit = 64 * 1024;
+const dialogs = new Map([
+    ['confirm', { validate: validConfirmation, show: showConfirmation, resultKey: 'confirmed' }],
+    ['selectItems', { validate: validSelection, show: showSelection, resultKey: 'result' }],
+]);
 
 // =============================================================================
 // Receive notebook requests and send replies over VS Code's remote filesystem
@@ -21,9 +25,10 @@ async function serveRequest(root, id) {
     const data = await fs.readFile(requestFile);
     if (data.length > requestLimit) return;
     const { version, mode, request: requestText } = JSON.parse(Buffer.from(data).toString('utf8'));
-    if (version !== 1 || mode !== 'confirm' || typeof requestText !== 'string') return;
+    const dialog = dialogs.get(mode);
+    if (version !== 1 || !dialog || typeof requestText !== 'string') return;
     const request = JSON.parse(requestText);
-    if (!validConfirmation(request)) return;
+    if (!dialog.validate(request)) return;
     const requestHash = createHash('sha256').update(requestText, 'utf8').digest('hex');
 
     // Claim each request once, even if the same output is seen again.
@@ -32,7 +37,7 @@ async function serveRequest(root, id) {
 
     let response;
     try {
-        response = { id, requestHash, status: 'done', confirmed: await showConfirmation(request) };
+        response = { id, requestHash, status: 'done', [dialog.resultKey]: await dialog.show(request) };
     } catch (error) {
         response = { id, requestHash, status: 'error', error: String(error.message || error) };
     }
@@ -98,6 +103,46 @@ async function showConfirmation(request) {
         const answer = await vscode.window.showInformationMessage(title, options, ...buttons);
         if (answer !== copy) return answer === confirm;
         await vscode.env.clipboard.writeText(details || summary);
+    }
+}
+
+// =============================================================================
+// Item selection dialogs
+// =============================================================================
+
+// =============================================================================
+function validSelection(request) {
+    return request && typeof request.title === 'string' && request.title.trim() &&
+        Array.isArray(request.items) && request.items.length > 0 &&
+        request.items.every(label => typeof label === 'string');
+}
+
+// =============================================================================
+async function showSelection({ title, items }) {
+    const picker = vscode.window.createQuickPick();
+    try {
+        const selectAll = { iconPath: new vscode.ThemeIcon('check-all'), tooltip: 'Select all' };
+        const selectNone = { iconPath: new vscode.ThemeIcon('clear-all'), tooltip: 'Select none' };
+        picker.title = title;
+        picker.placeholder = 'Select one or more items';
+        picker.canSelectMany = true;
+        picker.ignoreFocusOut = true;
+        picker.buttons = [selectAll, selectNone];
+        picker.items = items.map((label, index) => ({ label, index }));
+        picker.selectedItems = [];
+
+        return await new Promise(resolve => {
+            picker.onDidTriggerButton(button => {
+                picker.selectedItems = button === selectAll ? picker.items : [];
+            });
+            picker.onDidAccept(() => {
+                if (picker.selectedItems.length) resolve(picker.selectedItems.map(item => item.index));
+            });
+            picker.onDidHide(() => resolve(null));
+            picker.show();
+        });
+    } finally {
+        picker.dispose();
     }
 }
 
