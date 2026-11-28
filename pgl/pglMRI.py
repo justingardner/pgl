@@ -1383,6 +1383,59 @@ class pglMRIScan(pglTraitSettings):
 
         return identity
     
+    ################################################################
+    # Resolve the human-readable label and original filename
+    ################################################################
+    def _getScanLabel(self):
+        """Resolve the acquisition label and original filename separately."""
+        filename = None
+        label = None
+
+        # Prefer explicit Flywheel provenance over parsing the display name.
+        selection = self.sourceMetadata.get("selection", {})
+        if isinstance(selection, dict):
+            value = selection.get("fileName")
+            if isinstance(value, str) and value.strip(): filename = value
+
+        acquisition = self.sourceMetadata.get("acquisition", {})
+        if isinstance(acquisition, dict):
+            value = acquisition.get("label")
+            if isinstance(value, str) and value.strip(): label = value
+
+        # File metadata can also preserve the original filename.
+        fileMetadata = self.sourceMetadata.get("file", {})
+        if filename is None and isinstance(fileMetadata, dict):
+            value = fileMetadata.get("name")
+            if isinstance(value, str) and value.strip(): filename = value
+
+        # Older display names use "acquisition label: filename".
+        # Strip only an exact known filename suffix when one is available.
+        if filename is not None and label is None:
+            suffix = f": {filename}"
+            if self.name.endswith(suffix): label = self.name[:-len(suffix)]
+
+        if filename is None:
+            prefix, separator, suffix = self.name.rpartition(": ")
+            if separator and suffix.lower().endswith((".nii", ".nii.gz")):
+                filename = suffix
+                if label is None: label = prefix
+
+        # Local scans use their filename; other scans retain their name.
+        if filename is None:
+            if self._backing is None and self.localPath:
+                filename = Path(self.localPath).name
+            else:
+                filename = self.name or "unnamed"
+
+        # Do not repeat a filename as the leading acquisition label.
+        if not label:
+            label = self.name if self.name and self.name != filename else "(unlabeled)"
+
+        return label, filename
+
+    ################################################################
+    # Summarize MRI scan geometry and timing
+    ################################################################
     def getScanSummary(self, *, readHeaders=True):
         """Summarize NIfTI geometry and TR without loading voxel arrays.
 
@@ -1846,53 +1899,6 @@ class pglMRI(pglActionable):
             # Quaternion reconstruction and stored affine rows round differently.
             return qform.shape == sform.shape == (4, 4) and np.isfinite(qform).all() and np.allclose(qform, sform, rtol=0, atol=1e-5)
 
-        def getScanLabel(scan):
-            """Resolve the acquisition label and original filename separately."""
-            filename = None
-            label = None
-
-            # Prefer explicit Flywheel provenance over parsing the display name.
-            selection = scan.sourceMetadata.get("selection", {})
-            if isinstance(selection, dict):
-                value = selection.get("fileName")
-                if isinstance(value, str) and value.strip(): filename = value
-
-            acquisition = scan.sourceMetadata.get("acquisition", {})
-            if isinstance(acquisition, dict):
-                value = acquisition.get("label")
-                if isinstance(value, str) and value.strip(): label = value
-
-            # File metadata can also preserve the original filename.
-            fileMetadata = scan.sourceMetadata.get("file", {})
-            if filename is None and isinstance(fileMetadata, dict):
-                value = fileMetadata.get("name")
-                if isinstance(value, str) and value.strip(): filename = value
-
-            # Older display names use "acquisition label: filename".
-            # Strip only an exact known filename suffix when one is available.
-            if filename is not None and label is None:
-                suffix = f": {filename}"
-                if scan.name.endswith(suffix): label = scan.name[:-len(suffix)]
-
-            if filename is None:
-                prefix, separator, suffix = scan.name.rpartition(": ")
-                if separator and suffix.lower().endswith((".nii", ".nii.gz")):
-                    filename = suffix
-                    if label is None: label = prefix
-
-            # Local scans use their filename; other scans retain their name.
-            if filename is None:
-                if scan._backing is None and scan.localPath:
-                    filename = Path(scan.localPath).name
-                else:
-                    filename = scan.name or "unnamed"
-
-            # Do not repeat a filename as the leading acquisition label.
-            if not label:
-                label = scan.name if scan.name and scan.name != filename else "(unlabeled)"
-
-            return label, filename
-
         def printMatrix(matrix):
             """Print a 4x4 matrix with aligned columns."""
             if not isinstance(matrix, list) or len(matrix) != 4:
@@ -2015,7 +2021,7 @@ class pglMRI(pglActionable):
 
         for index, scan in enumerate(scans, start=1):
             if scanNumbers is not None and index not in scanNumbers: continue
-            label, filename = getScanLabel(scan)
+            label, filename = scan._getScanLabel()
             if matchText is not None and matchText not in label.casefold(): continue
             selectedScans.append((index, scan, label, filename))
 
@@ -2183,6 +2189,67 @@ class pglMRI(pglActionable):
             pglMessages.warning(f"MRI viewer could not be opened: {type(error).__name__}: {error}")
             return None
         
+    ################################################################
+    # Open an exported mrTools session in mrLoadRet
+    ################################################################
+    def openMLR(self, sessionDirectory=None, *, matlabExecutable=None, installation=None, timeout=None):
+        """Open mrLoadRet without MATLAB Desktop and return its viewer record.
+
+        By default use the owning session's most recent successful mrTools
+        export. Pass a local session directory to open a moved or older export.
+        The returned tool retains its MATLAB Engine session for the viewer.
+        """
+        from pathlib import Path
+
+        from .pglExternalTools import pglMATLAB
+        from .pglMessages import pglMessages
+        from .pglPipeline import pglActionStatus
+
+        try:
+            if sessionDirectory is None:
+                session = self._getSession(required=False)
+                history = session.actionHistory if session is not None else ()
+                export = next((
+                    entry for entry in reversed(history)
+                    if entry.actionName in ("exportToMLR", "exportToMrTools") and entry.actionStatus == pglActionStatus.SUCCESS
+                ), None)
+                destination = export.actionSettings.get("destination") if export is not None else None
+                if not destination:
+                    raise ValueError("No successful mrTools export was found. Run exportToMLR or supply sessionDirectory.")
+                sessionDirectory = Path(destination).expanduser()
+                if not sessionDirectory.is_absolute():
+                    # The batch staging directory was created beside the export.
+                    for invocation in reversed(export.actionInvocations):
+                        specification = invocation.get("specification", {})
+                        workingDirectory = specification.get("workingDirectory")
+                        if invocation.get("status") == "success" and workingDirectory and Path(workingDirectory).name.startswith(".pgl-mrtools-"):
+                            sessionDirectory = Path(workingDirectory).parent / sessionDirectory.name
+                            break
+                    if not sessionDirectory.is_absolute():
+                        raise ValueError("The export history contains only a relative path. Supply sessionDirectory explicitly.")
+
+            directory = Path(sessionDirectory).expanduser().resolve()
+            if not (directory / "mrSession.mat").is_file():
+                raise FileNotFoundError(f"No mrSession.mat in {directory}. If the export moved, supply its current directory.")
+
+            matlab = pglMATLAB.getViewerSession(
+                matlabExecutable=matlabExecutable, installation=installation, sessionDirectory=directory,
+            )
+            matlab.startSession(desktop=False)
+            implementation = matlab.feval("which", "mrLoadRet", nargout=1, timeout=timeout)
+            if not implementation:
+                raise RuntimeError("mrLoadRet is not on MATLAB's path. Check the mrTools directory in PGL's MATLAB settings.")
+            matlab.feval("cd", str(directory), nargout=0, timeout=timeout)
+            if not matlab.eval("~isempty(mrLoadRet())", nargout=1, timeout=timeout):
+                raise RuntimeError(f"mrLoadRet did not open the session at {directory}. Check MATLAB's output.")
+            matlab.feval("drawnow", nargout=0, timeout=timeout)
+            pglMessages.message(f"Opened mrLoadRet session at {directory}")
+            return {"tool": matlab, "sessionDirectory": directory, "mrLoadRet": implementation}
+
+        except Exception as error:
+            pglMessages.warning(f"mrLoadRet could not be opened. {error}")
+            return None
+
     def getAcquisitionDataMatrix(self, scanNum=0, *, cacheDirectory=None):
         """Return an original acquisition as a lazy MRI image matrix.
 

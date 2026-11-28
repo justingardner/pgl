@@ -30,6 +30,361 @@ class pglActionsMRI(pglActionCollection):
     """
 
     ################################################################
+    # Export a new mrTools session
+    ################################################################
+    class exportToMLR(pglAction):
+        """Initialize a standalone mrTools session with scans and anatomies."""
+
+        destination = Unicode("", isPath=True, pathType="saveFile", help="New local mrTools session directory. Its parent must exist.")
+        scanIndices = List(Int(min=0), default_value=None, allow_none=True, help="Ordered zero-based MRI scan indices. None uses the saved scan/run matches.")
+        anatomyScanIndex = Int(default_value=None, min=0, allow_none=True, help="Zero-based index of the anatomical acquisition. None exports all labeled anatomies.")
+        anatomyFile = Unicode("", isPath=True, pathType="file", help="Optional local anatomical NIfTI in place of a scan from the session.")
+
+        ################################################################
+        # Resolve matched scans and committed stages
+        ################################################################
+        def _plan(self, session):
+            from .pglMRI import pglMRIData
+
+            mri = session.mri
+            if mri is None: raise ValueError("Attach MRI scans to the PGL session before exporting.")
+            matches = dict(session.getScanRunMatches()) if session.scanRunCorrespondence is not None else {}
+            if self.scanIndices is None and not matches:
+                raise ValueError("No matched MRI scans. Match scans and runs in the session, or supply scanIndices explicitly.")
+            scans = pglActionsMRI._selectAcquisitionScans(mri, list(matches) if self.scanIndices is None else self.scanIndices)
+            stages, _ = mri._getCommittedImageStages()
+            for number, record in enumerate(scans, 1):
+                index = record["scanIndex"]
+                acquisition = mri.scans[index]
+                stage = pglMRIData._resolveImageStage(acquisition.uuid, stages)
+                record.update({
+                    "scanNumber": number,
+                    "runIndex": matches.get(index),
+                    "description": acquisition.name,
+                    "stageID": stage["stageID"] if stage else f"acquisition:{acquisition.uuid}",
+                })
+            rawIndices = [scan["scanIndex"] for scan in scans if scan["stageID"].startswith("acquisition:")]
+            if rawIndices and len(rawIndices) != len(scans):
+                raise ValueError(f"Selected scans have mixed motion-correction status. Scans without a replacement: {rawIndices}. Correct those scans or choose a consistent subset.")
+
+            excluded = {record["scanIndex"] for record in scans} | set(matches)
+            return "Raw" if rawIndices else "motionComp", scans, self._planAnatomies(mri, excluded)
+
+        ################################################################
+        # Select explicit or labeled anatomies and retain human-readable names
+        ################################################################
+        def _planAnatomies(self, mri, excluded):
+            import re
+            from pathlib import Path
+
+            if self.anatomyFile:
+                if self.anatomyScanIndex is not None:
+                    raise ValueError("Supply either anatomyFile or anatomyScanIndex.")
+                path = Path(self.anatomyFile).expanduser().resolve(strict=True)
+                return [(None, path, path.name)]
+
+            index = self.anatomyScanIndex
+            if index is not None and (not 0 <= index < len(mri.scans) or index in excluded):
+                raise ValueError("Choose a valid anatomyScanIndex outside the functional scans and saved matches.")
+
+            anatomyPattern = re.compile(r"(?<![a-z0-9])(?:t[12]w?|mp[-_ ]?rage|spgr|flair|bold[-_ ]*flash|anat(?:omy|omical)?)(?![a-z0-9])", re.IGNORECASE)
+            indices = [index] if index is not None else [i for i in range(len(mri.scans)) if i not in excluded]
+            anatomies = []
+            for scanIndex in indices:
+                scan = mri.scans[scanIndex]
+                label, filename = scan._getScanLabel()
+                descriptions = [scan.sidecar.get(key) for key in ("SeriesDescription", "ProtocolName")]
+                labels = [value for value in (label, *descriptions, filename) if isinstance(value, str) and value.strip() and value != "(unlabeled)"]
+                if index is not None or any(anatomyPattern.search(value) for value in labels):
+                    anatomies.append((scanIndex, scan, labels[0] if labels else "anatomy"))
+            if not anatomies:
+                raise ValueError("No labeled anatomical scans were found. Supply anatomyScanIndex or anatomyFile.")
+            return anatomies
+
+        ################################################################
+        # Copy one acquisition or anatomy while retaining its file encoding
+        ################################################################
+        @staticmethod
+        def _copyNifti(source, directory, stem):
+            import shutil
+            from pathlib import Path
+
+            if isinstance(source, Path):
+                sourceName = source.name
+            else:
+                sourceName = source._backing.path if source._backing is not None else source.localPath
+            if not sourceName.lower().endswith((".nii", ".nii.gz")):
+                raise ValueError(f"{stem} needs an attached .nii or .nii.gz source.")
+            suffix = ".nii.gz" if sourceName.lower().endswith(".nii.gz") else ".nii"
+            path = directory / f"{stem}{suffix}"
+            if isinstance(source, Path):
+                shutil.copyfile(source, path)
+            elif source.exportSource(path) is None:
+                raise ValueError(f"Could not export MRI acquisition {source.name}. Check that its source is available.")
+            return path
+
+        ################################################################
+        # Read the geometry and timing mrInit needs from a staged NIfTI
+        ################################################################
+        @staticmethod
+        def _readNifti(path, dimensions, *, skipOtherDimensions=False):
+            import nibabel as nib
+            import numpy as np
+
+            image = nib.load(str(path))
+            singletonVolume = dimensions == 3 and len(image.shape) == 4 and image.shape[3] == 1
+            validDimensions = len(image.shape) == dimensions or singletonVolume
+            if not validDimensions and skipOtherDimensions: return None
+            if not isinstance(image, nib.Nifti1Image) or not validDimensions or min(image.shape) < 1:
+                raise ValueError(f"{path.name} must be a nonempty {dimensions}D NIfTI-1 image for mrTools.")
+            if not np.isfinite(image.affine).all() or not np.linalg.det(image.affine[:3, :3]):
+                raise ValueError(f"{path.name} has invalid spatial geometry.")
+            if dimensions == 3: return image
+
+            # mrInit reads timing from the actual file and prompts for an unusual TR.
+            _, units = image.header.get_xyzt_units()
+            scale = {"sec": 1.0, "msec": 0.001, "usec": 0.000001}.get(units)
+            trSeconds = image.header.get_zooms()[3] * scale if scale is not None else None
+            mrInitTR = trSeconds / 10 if units == "usec" else trSeconds
+            if mrInitTR is None or not 0.01 <= mrInitTR <= 100:
+                raise ValueError(f"{path.name} needs a NIfTI header TR that mrInit accepts without prompting. Check its time units and TR.")
+            return image, float(trSeconds)
+
+        ################################################################
+        # Reconstruct the stored corrected tensor in original voxel order
+        ################################################################
+        @classmethod
+        def _writeCorrected(cls, mri, record, path, workingDirectory):
+            import base64
+            from tempfile import TemporaryFile
+
+            import nibabel as nib
+            import numpy as np
+
+            index = record["scanIndex"]
+            matrix = mri.getDataMatrix(index, stageID=record["stageID"])
+            if matrix is None: raise ValueError(f"Scan {index} has no retained corrected matrix.")
+            try:
+                replacement = matrix.provenance["sourceProvenance"]
+                if replacement.get("sourceProvenance", {}).get("operation") != "motionCorrection":
+                    raise ValueError(f"Scan {index}'s current image stage is not a motion-correction result. Choose an original or motion-corrected run set.")
+                data = matrix.requireData()
+                metadata = data.attrs["pglMRI"]
+                spatialShape = tuple(metadata["spatialShape"])
+                affine = np.asarray(metadata["affine"])
+                tr = metadata["trSeconds"]
+                if tr is None: raise ValueError(f"Scan {index}'s corrected matrix has no TR. Check the acquisition metadata.")
+
+                snapshot = metadata["nifti"]
+                headerType = nib.Nifti1Header if snapshot["niftiVersion"] == 1 else nib.Nifti2Header
+                headerBytes = snapshot.get("workingHeader") or snapshot.get("raw")
+                if not headerBytes: raise ValueError(f"Scan {index}'s corrected matrix is missing its NIfTI header snapshot.")
+                header = headerType(base64.b64decode(headerBytes["header"]))
+                if not np.allclose(header.get_best_affine(), affine, rtol=0, atol=1e-6):
+                    raise ValueError(f"Scan {index}'s corrected affine disagrees with its recorded NIfTI geometry.")
+                outputHeader = nib.Nifti1Header.from_header(header)
+                outputHeader.set_data_dtype(np.float32)
+                spatialUnits, _ = header.get_xyzt_units()
+                outputHeader.set_xyzt_units(spatialUnits, "sec")
+
+                # Disk-backed storage keeps peak memory bounded by one volume.
+                volumeCount = data.sizes["volume"]
+                with TemporaryFile(dir=workingDirectory) as scratch:
+                    shape = (*spatialShape, volumeCount)
+                    buffer = np.memmap(scratch, dtype=np.float32, mode="w+", shape=shape, order="F")
+                    for volume in range(volumeCount):
+                        buffer[..., volume] = np.asarray(data.data[:, volume]).reshape(spatialShape, order="C")
+                    image = nib.Nifti1Image(buffer, affine, header=outputHeader)
+                    for form in ("qform", "sform"):
+                        transform, code = getattr(header, f"get_{form}")(coded=True)
+                        getattr(image, f"set_{form}")(transform, int(code))
+                    image.header.set_zooms((*header.get_zooms()[:3], tr))
+                    image.header.set_slope_inter(1, 0)
+                    nib.save(image, str(path))
+                    del image, buffer
+
+                exported, exportedTR = cls._readNifti(path, 4)
+                if exported.shape != shape or not np.allclose(exported.affine, affine, rtol=0, atol=1e-5) or not np.isclose(exportedTR, tr):
+                    raise ValueError(f"Scan {index}'s exported geometry or TR disagrees with the corrected matrix.")
+                return exported, exportedTR, list(metadata["volumeIndices"])
+            finally:
+                matrix.close()
+
+        ################################################################
+        # Initialize and reopen the staged session in isolated MATLAB
+        ################################################################
+        @staticmethod
+        def _initialize(staging, matlab):
+            import json
+            from pathlib import Path
+
+            directories = []
+            for directory in (matlab.mglDirectory, matlab.mrToolsDirectory):
+                if not directory: continue
+                path = Path(directory).expanduser().resolve()
+                if not path.is_dir(): raise ValueError(f"MATLAB toolbox directory is missing: {path}. Update the MATLAB tool settings.")
+                directories.append(str(path))
+            (staging / "toolboxes.json").write_text(json.dumps(directories), encoding="utf-8")
+            # Values travel as JSON. The batch expression and script are fixed.
+            (staging / "initializeMrTools.m").write_text("""
+toolboxes = jsondecode(fileread('toolboxes.json'));
+for toolbox = 1:numel(toolboxes)
+    addpath(genpath(toolboxes{toolbox}));
+end
+assert(~isempty(which('mrInit')), 'mrInit is unavailable. Configure the mrTools directory in PGL.');
+cd('session');
+manifest = jsondecode(fileread(fullfile('Etc', 'pglExport.json')));
+runs = manifest.scans;
+groupParams.name = {runs.filename};
+groupParams.description = {runs.description};
+groupParams.totalFrames = [runs.volumeCount];
+groupParams.nFrames = [runs.volumeCount];
+groupParams.junkFrames = zeros(1, numel(runs));
+sessionParams = struct('description', manifest.description, 'subject', manifest.subject, ...
+    'operator', '', 'magnet', '', 'coil', '', 'pulseSequence', '', 'pulseSequenceText', '');
+mrInit(sessionParams, groupParams, 'makeReadme=0');
+assert(isfile('mrSession.mat'), 'mrInit did not create mrSession.mat.');
+
+view = newView('Volume');
+assert(~isempty(view), 'mrTools could not open the staged session.');
+if strcmp(manifest.group, 'motionComp')
+    view = viewSet(view, 'renameGroup', 'motionComp', 1);
+end
+for scan = 1:numel(runs)
+    params = viewGet(view, 'scanParams', scan, 1);
+    params.originalGroupName = {manifest.group};
+    params.framePeriod = runs(scan).trSeconds;
+    params.niftiHdr.hdr_name = fullfile(manifest.group, 'TSeries', runs(scan).filename);
+    params.niftiHdr.img_name = params.niftiHdr.hdr_name;
+    view = viewSet(view, 'scanParams', params, scan, 1);
+end
+saveSession(0);
+
+[~, groups] = loadSession(pwd);
+assert(numel(groups) == 1 && strcmp(groups.name, manifest.group), 'mrTools group verification failed.');
+assert(numel(groups.scanParams) == numel(runs), 'mrTools scan count verification failed.');
+for scan = 1:numel(runs)
+    params = groups.scanParams(scan);
+    assert(strcmp(params.fileName, runs(scan).filename), 'mrTools scan order verification failed.');
+    assert(params.totalFrames == runs(scan).volumeCount && params.nFrames == runs(scan).volumeCount, ...
+        'mrTools frame count verification failed.');
+    assert(abs(params.framePeriod - runs(scan).trSeconds) < 1e-7, 'mrTools TR verification failed.');
+    assert(isfile(fullfile(manifest.group, 'TSeries', params.fileName)), 'mrTools time series is missing.');
+end
+for anatomyIndex = 1:numel(manifest.anatomies)
+    filename = manifest.anatomies(anatomyIndex).filename;
+    [anatomy, header] = mlrImageLoad(fullfile('Anatomy', filename));
+    assert(~isempty(anatomy) && ~isempty(header), 'mrTools could not load the exported anatomy %s.', filename);
+end
+fprintf('PGL_MRTOOLS_EXPORT_VERIFIED\\n');
+""", encoding="utf-8")
+            result = matlab._runCommand(
+                arguments=["-batch", "run('initializeMrTools.m')"],
+                cwd=staging,
+                timeout=300,
+                streamOutput=True,
+            )
+            with result.stdoutPath.open("rb") as log:
+                if not any(line.strip() == b"PGL_MRTOOLS_EXPORT_VERIFIED" for line in log):
+                    raise RuntimeError("MATLAB exited before verifying the mrTools session. Review the MATLAB output.")
+
+        ################################################################
+        # Publish the verified session without replacing an existing target
+        ################################################################
+        @staticmethod
+        def _publish(stagedSession, destination):
+            # Reserve the name exclusively and publish mrSession.mat last.
+            destination.mkdir()
+            moved = []
+            try:
+                paths = sorted(stagedSession.iterdir(), key=lambda path: path.name == "mrSession.mat")
+                for path in paths:
+                    path.rename(destination / path.name)
+                    moved.append(path)
+            except BaseException:
+                for path in reversed(moved):
+                    (destination / path.name).rename(path)
+                destination.rmdir()
+                raise
+
+        ################################################################
+        # Run the export through the ordinary PGL action runner
+        ################################################################
+        def _run(self, session):
+            import json
+            import os
+            import re
+            from pathlib import Path
+            from tempfile import TemporaryDirectory
+
+            from .pglExternalTools import pglMATLAB
+
+            try:
+                if not self.destination.strip() or "://" in self.destination or "\x00" in self.destination:
+                    raise ValueError("Supply a new local mrTools session directory as destination.")
+                requested = Path(self.destination).expanduser()
+                destination = requested.parent.resolve(strict=True) / requested.name
+                if os.path.lexists(destination):
+                    raise FileExistsError(f"Destination already exists: {destination}. Choose a new mrTools session directory.")
+                group, scans, anatomies = self._plan(session)
+                matlab = pglMATLAB()
+                with TemporaryDirectory(prefix=".pgl-mrtools-", dir=destination.parent) as temporary:
+                    staging = Path(temporary)
+                    stagedSession = staging / "session"
+                    timeSeries = stagedSession / "Raw" / "TSeries"
+                    anatomyDirectory = stagedSession / "Anatomy"
+                    etc = stagedSession / "Etc"
+                    for directory in (timeSeries, anatomyDirectory, etc):
+                        directory.mkdir(parents=True)
+
+                    automaticAnatomies = self.anatomyScanIndex is None and not self.anatomyFile
+                    anatomyRecords = []
+                    for scanIndex, anatomy, label in anatomies:
+                        name = re.sub(r"\.nii(?:\.gz)?$", "", label, flags=re.IGNORECASE)
+                        stem = re.sub(r"[^A-Za-z0-9-]+", "_", name).strip("_-")[:180] or "anatomy"
+                        if scanIndex is not None: stem += f"_scan{scanIndex}"
+                        path = self._copyNifti(anatomy, anatomyDirectory, stem)
+                        if self._readNifti(path, 3, skipOtherDimensions=automaticAnatomies) is None:
+                            pglMessages.warning(f"Skipping anatomy candidate {label} at scan {scanIndex}. It contains multiple volumes or lacks three spatial dimensions.", level=1)
+                            path.unlink()
+                            continue
+                        anatomyRecords.append({"filename": path.name, "scanIndex": scanIndex, "scanUUID": getattr(anatomy, "uuid", None)})
+                    if not anatomyRecords:
+                        raise ValueError("No anatomical volumes could be exported. Supply a 3D anatomyScanIndex or anatomyFile.")
+                    for record in scans:
+                        stem = f"scan-{record['scanNumber']:04d}"
+                        pglMessages.message(f"Exporting MRI scan {record['scanIndex']} to {group}/TSeries")
+                        if group == "Raw":
+                            path = self._copyNifti(session.mri.scans[record["scanIndex"]], timeSeries, stem)
+                            image, tr = self._readNifti(path, 4)
+                            indices = list(range(image.shape[3]))
+                        else:
+                            path = timeSeries / f"{stem}.nii"
+                            image, tr, indices = self._writeCorrected(session.mri, record, path, staging)
+                        record.update({
+                            "filename": path.name,
+                            "volumeCount": image.shape[3],
+                            "volumeIndices": indices,
+                            "trSeconds": tr,
+                        })
+                    (etc / "pglExport.json").write_text(json.dumps({
+                        "schemaVersion": 2,
+                        "group": group,
+                        "subject": session.subjectID or "",
+                        "description": session.description or session.experimentName or "",
+                        "scans": scans,
+                        "anatomies": anatomyRecords,
+                    }, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+                    self._initialize(staging, matlab)
+                    self._publish(stagedSession, destination)
+            except (ValueError, OSError, RuntimeError) as error:
+                self.setError(errorString=f"Could not export an mrTools session. {error}")
+                return
+
+            pglMessages.message(f"Exported mrTools session to {destination}")
+            return session
+
+    ################################################################
     # Select acquisitions without imposing geometry relationships
     ################################################################
     @staticmethod

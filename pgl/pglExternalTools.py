@@ -7768,18 +7768,26 @@ print(marker + json.dumps(record, allow_nan=False), flush=True)
                 )
         return _copyProvenance(report)
 
+    ################################################################
+    # Retain interactive MATLAB sessions by configuration and dataset
+    ################################################################
     @classmethod
-    def getViewerSession(cls, *, matlabExecutable=None, installation=None):
+    def getViewerSession(cls, *, matlabExecutable=None, installation=None, sessionDirectory=None):
         """Return a retained convenience session for MRI/class-level use.
 
         Explicit instance users need not use this registry. Entries are keyed
         by the resolved invocation path and selected profile. Editing a profile
         to another executable does not silently reuse the previous MATLAB.
+        A sessionDirectory isolates viewers with dataset-wide MATLAB state.
         """
+        from pathlib import Path
+
         tool = cls(matlabExecutable=matlabExecutable, installation=installation)
+        if sessionDirectory is not None:
+            sessionDirectory = Path(sessionDirectory).expanduser().resolve()
         key = (
             str(tool.executable), tool.installation,
-            tool.mglDirectory, tool.mrToolsDirectory,
+            tool.mglDirectory, tool.mrToolsDirectory, sessionDirectory,
         )
         sessions = cls.__dict__.get("_viewerSessions")
         if sessions is None:
