@@ -1,3 +1,6 @@
 *.egg-info/
 /scripts/__pycache__/
 
+# Track database migrations even when a global ignore rule matches *.sql.
+!/database/migrations/*.sql
+
