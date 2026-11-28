@@ -2432,7 +2432,8 @@ class pglDisplaySettings(pglTraitSettings):
     flipUpDown = Bool(False, help="Whether to flip the display up-down")
     windowPosition = Tuple(Int(), Int(), labels=("x","y"), default_value=(100, 100), help="Position of window in pixels", visible=False)
     windowSize = Tuple(Int(), Int(), labels=("width","height"), default_value=(800, 600), help="Size of window in pixels", visible=False)
-    displayModes = List(Instance(pglDisplayModeSettings), settingsListKey="modeName", hideKey=True, highlightSelector=False, traitDisplayName="pixelDims", help="All supported display modes")
+    setDisplayMode = Bool(True, help="Apply the selected resolution and refresh rate at experiment startup. Leave unchecked to keep the current display mode.")
+    displayModes = List(Instance(pglDisplayModeSettings), settingsListKey="modeName", hideKey=True, highlightSelector=False, traitDisplayName="pixelDims", contingentOn="setDisplayMode", help="All supported display modes")
     luminanceCalibration = List(Unicode(), hasPlotButton=True, buttonFunction="plotLuminanceCalibration", default_value=['None'], help="Which luminance calibration to use")
     temporalCalibration = List(Unicode(), hasPlotButton=True, buttonFunction="plotTemporalCalibration", default_value=['None'], help="Which temporal calibration to use")
     
@@ -2650,7 +2651,8 @@ class pglDisplaySettingsList(pglTraitSettings):
 class pglDisplaySettingsWindowed(pglDisplaySettings):
     windowPosition = Tuple(Int(), Int(), labels=("x","y"), default_value=(0, 0), help="Position of window in pixels", visible=True)
     windowSize = Tuple(Int(), Int(), labels=("width","height"), default_value=(800, 600), help="Size of window in pixels", visible=True)
-    displayModes = List(Instance(pglDisplayModeSettings), settingsListKey="modeName", hideKey=True, highlightSelector=False, traitDisplayName="pixelDims", help="All supported display modes", visible=False)
+    setDisplayMode = Bool(False, visible=False)
+    displayModes = List(Instance(pglDisplayModeSettings), settingsListKey="modeName", hideKey=True, highlightSelector=False, traitDisplayName="pixelDims", contingentOn="setDisplayMode", help="All supported display modes", visible=False)
 
 ##################################################
 # Settings 

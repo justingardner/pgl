@@ -551,6 +551,7 @@ class _pglTraitsDialog(QDialog):
         # Read the backing property when metadata specifies one.
         readName = trait.metadata.get("property", traitName)
         current = getattr(settingsObject, readName)
+        dependentRows = ()
 
         # Explicit ordered choices take precedence over ordinary editors.
         if "stepValues" in trait.metadata:
@@ -586,7 +587,7 @@ class _pglTraitsDialog(QDialog):
                 # if empty list just move on
                 return
             else:
-                self._addSettingsList(traitName, trait, current, helpText, settingsObject, layout, settingsKey)
+                dependentRows = self._addSettingsList(traitName, trait, current, helpText, settingsObject, layout, settingsKey)
 
         # Float with finite min and max -> slider + spinbox.
         # Check both bounds for None before calling math.isfinite().
@@ -649,6 +650,7 @@ class _pglTraitsDialog(QDialog):
                     "owner": settingsObject,
                     "traitName": traitName,
                     "widget": entry["row"],
+                    "dependentRows": dependentRows,
                 })
                 self._refreshContingencies()
                 
@@ -1587,6 +1589,7 @@ class _pglTraitsDialog(QDialog):
 
         # and show the first item in the list
         showSelection(0)
+        return self.traitWidgets[settingsKey].values()
         
     #-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-#-
     # ----- add multi select dropdown -----
@@ -2779,7 +2782,9 @@ class _pglTraitsDialog(QDialog):
         The controlling trait must be a Boolean on the same settings object.
         Missing or invalid dependencies warn once per object/field and are
         ignored. Explicit enabled=False metadata always takes precedence.
+        A dependent settings list also gates the editors for its selected item.
         """
+        enabledByWidget = {}
         for field in self._contingentFields:
             owner = field["owner"]
 
@@ -2821,7 +2826,15 @@ class _pglTraitsDialog(QDialog):
                         "Ignoring contingentOn."
                     )
 
-            field["widget"].setEnabled(enabled)
+            widget = field["widget"]
+            enabledByWidget[widget] = enabledByWidget.get(widget, True) and enabled
+            for entry in field["dependentRows"]:
+                widget = entry["row"]
+                childEnabled = bool(entry["trait"].metadata.get("enabled", True))
+                enabledByWidget[widget] = enabledByWidget.get(widget, True) and enabled and childEnabled
+
+        for widget, enabled in enabledByWidget.items():
+            widget.setEnabled(enabled)
             
     ################################################################
     # Compact rows explicitly started by existing layout metadata

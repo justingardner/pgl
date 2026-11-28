@@ -1035,6 +1035,8 @@ class pglExperiment(pglExperimentBase):
         self.data.cleanupStatus = "notAttempted"
         self.data.eyeTrackerSaveStatus = "notAttempted"
         self.state.openScreen = False
+        self.state.originalScreenResolution = None
+        self.state.screenResolution = None
 
         # Get background color. Only the scalar sentinel means "use settings".
         if isinstance(backgroundColor, (int, float)) and backgroundColor == -1:
@@ -1052,9 +1054,6 @@ class pglExperiment(pglExperimentBase):
             # Preserve the existing screen-initialization cleanup behavior.
             self.pgl.cleanUp()
 
-            # Save original screen resolution before changing it.
-            self.state.originalScreenResolution = self.pgl.getResolution(self.state.display.currentDisplayNum)
-
             if self.state.display.uuid == "windowed":
                 # Open the screen.
                 self.pgl.open(0, screenWidth=self.state.display.windowSize[0], screenHeight=self.state.display.windowSize[1], backgroundColor=backgroundColor)
@@ -1067,17 +1066,26 @@ class pglExperiment(pglExperimentBase):
                     screenHeight=self.state.display.windowSize[1],
                 )
             else:
-                if self.state.display.currentDisplayNum == -1:
+                whichScreen = self.state.display.currentDisplayNum
+                if whichScreen == -1:
                     raise RuntimeError(f"Display {self.state.display.name} is not connected.")
 
                 # Compare the current display mode with the desired mode.
-                if self.state.display.displayModes:
+                if self.state.display.setDisplayMode and self.state.display.displayModes:
                     displayMode = self.state.display.displayModes[0]
-                    if displayMode == self.state.originalScreenResolution:
+                    if not displayMode.refreshRate:
+                        pglMessages.warning(f"No refresh rate is selected for {self.state.display.name}. Choose one in display settings and retry.")
+                        return
+
+                    # Save the original mode for restoration before attempting a change.
+                    self.state.originalScreenResolution = self.pgl.getResolution(whichScreen)
+                    if self.state.originalScreenResolution == (-1, -1, -1, -1): return
+                    requestedMode = (*displayMode.pixelDims, int(displayMode.refreshRate[0]))
+                    if requestedMode == self.state.originalScreenResolution[:3]:
                         pglMessages.message(f"Display mode settings match current mode: {self.state.originalScreenResolution}")
                     else:
-                        self.pgl.setResolutionUsingDisplayModeSettings(self.state.display.currentDisplayNum, displayMode)
-                        self.state.screenResolution = self.pgl.getResolution()
+                        self.pgl.setResolutionUsingDisplayModeSettings(whichScreen, displayMode)
+                        self.state.screenResolution = self.pgl.getResolution(whichScreen)
                         pglMessages.message(
                             f"Changing screen resolution to: {self.state.screenResolution[0]} x "
                             f"{self.state.screenResolution[1]} {self.state.screenResolution[2]}Hz "
@@ -1089,7 +1097,7 @@ class pglExperiment(pglExperimentBase):
                         )
 
                 # Open the screen.
-                self.pgl.open(whichScreen=self.state.display.currentDisplayNum, backgroundColor=backgroundColor)
+                self.pgl.open(whichScreen=whichScreen, backgroundColor=backgroundColor)
 
             if not self.pgl.isOpen(): raise RuntimeError("Failed to open screen.")
             
