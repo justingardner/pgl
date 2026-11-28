@@ -61,7 +61,6 @@ MACOS_PIP = [
 ]
 
 # MRI analysis, DICOM conversion, array storage, and remote filesystem access.
-# h5py is supplied by MACOS in the combined MRI environment below.
 MRI = [
     "dcm2niix",
     "nibabel",
@@ -73,8 +72,7 @@ MRI = [
     "sshfs",
 ]
 
-# Preserve the additional interfaces and integrations in the current
-# MRI environment until a code audit establishes which are optional.
+# Additional interfaces and integrations for the MRI environment.
 MRI_INTEGRATIONS = [
     "gspread",
     "google-auth-oauthlib",
@@ -97,26 +95,28 @@ MRI_PIP = [
 
 ENVIRONMENTS = {
     "pgl": {
-        "conda": BASE + TOOLS,
-        "pip": BASE_PIP,
+        "conda": [],
+        "pip": [],
     },
     "pgl_mne": {
-        "conda": BASE + TOOLS + MNE,
-        "pip": BASE_PIP,
+        "conda": MNE,
+        "pip": [],
     },
     "pgl_mri": {
-        # Preserve MRI analysis plus the current graphics/hardware dependencies.
-        "conda": BASE + TOOLS + MACOS + MRI + MRI_INTEGRATIONS,
-        "pip": BASE_PIP + MACOS_PIP + MRI_PIP,
-    },
-    "pgl_macos": {
-        "conda": BASE + TOOLS + MACOS,
-        "pip": BASE_PIP + MACOS_PIP,
+        "conda": MRI + MRI_INTEGRATIONS,
+        "pip": MRI_PIP,
     },
 }
 
-def render_environment(name, conda_packages, pip_packages):
-    if len(conda_packages) != len(set(conda_packages)):
+
+# ========================================================================
+# Render one environment with the requested platform dependencies
+# ========================================================================
+def renderEnvironment(name, *, macOS=False):
+    dependencies = ENVIRONMENTS[name]
+    condaPackages = BASE + TOOLS + (MACOS if macOS else []) + dependencies["conda"]
+    pipPackages = BASE_PIP + (MACOS_PIP if macOS else []) + dependencies["pip"]
+    if len(condaPackages) != len(set(condaPackages)):
         raise ValueError(f"Duplicate dependency specification in {name}")
 
     lines = [
@@ -128,23 +128,22 @@ def render_environment(name, conda_packages, pip_packages):
         "dependencies:",
     ]
 
-    lines.extend(f"  - {json.dumps(spec)}" for spec in conda_packages)
+    lines.extend(f"  - {json.dumps(spec)}" for spec in condaPackages)
 
-    if pip_packages:
+    if pipPackages:
         lines.append("  - pip:")
-        lines.extend(f"      - {json.dumps(spec)}" for spec in pip_packages)
+        lines.extend(f"      - {json.dumps(spec)}" for spec in pipPackages)
 
     return "\n".join(lines) + "\n"
 
 
+# ========================================================================
+# Write portable specs for direct Conda use
+# ========================================================================
 def main():
-    for name, dependencies in ENVIRONMENTS.items():
+    for name in ENVIRONMENTS:
         path = ROOT / f"{name}.yml"
-        contents = render_environment(
-            name,
-            dependencies["conda"],
-            dependencies["pip"],
-        )
+        contents = renderEnvironment(name)
 
         if path.exists() and path.read_text(encoding="utf-8") == contents:
             print(f"Unchanged: {path.name}")

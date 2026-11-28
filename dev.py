@@ -12,13 +12,13 @@ Use the Python interpreter from your PGL development environment.
 If your Python command is named python3, substitute python3 above.
 
 Environment activation is optional. For example:
-    conda run --no-capture-output -n pgl_macos python dev.py build
+    conda run --no-capture-output -n pgl python dev.py build
 
 These tasks do not create environments or install PGL.
 For installation, use:
     python install.py analysis
     python install.py mne
-    python install.py native   # macOS only.
+    python install.py mri
 """
 
 import argparse
