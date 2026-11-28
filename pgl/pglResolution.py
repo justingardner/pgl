@@ -69,7 +69,10 @@ class pglResolution:
         if self.verbose > 1: print(f"(pgl:getResolution) Getting resolution for screen {whichScreen}")
 
         # Call the C function to get the display info
-        return _resolution.getResolution(whichScreen)
+        resolution = _resolution.getResolution(whichScreen)
+        if resolution == (-1, -1, -1, -1):
+            pglMessages.warning(f"Could not read the current mode for screen {whichScreen}. Check the display connection and retry.")
+        return resolution
     
     ################################################################
     # Set the display resolution
@@ -135,6 +138,8 @@ class pglResolution:
         if _resolution.setResolution(whichScreen, screenWidth, screenHeight, screenRefreshRate, screenColorDepth):
             # print what resolution the display was set to
             self.getResolution(whichScreen)
+        else:
+            pglMessages.warning(f"Could not set the mode for screen {whichScreen}. Check the display connection and requested mode, then retry.")
     
     ################################################################
     # Get the number of displays and the default display

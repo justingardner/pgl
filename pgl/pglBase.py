@@ -147,6 +147,9 @@ class pglBase:
         pglMessages.printHeader("pglBase:open")
         # get how many displays we have
         (numDisplays, defaultDisplay) = self.getNumDisplaysAndDefault()
+        if numDisplays == 0:
+            pglMessages.warning("No displays are available to this session. Connect a display and run PGL from the Mac's graphical login session.")
+            return False
         if whichScreen is None: whichScreen = defaultDisplay
 
         # Check if the screen number is valid
@@ -224,7 +227,11 @@ class pglBase:
         self.getWindowFrameInDisplay()
 
         # get frame rate
-        self.frameRate = self.getFrameRate(whichScreen)
+        frameRate = self.getFrameRate(whichScreen)
+        if frameRate is None or frameRate < 0:
+            self.close()
+            return False
+        self.frameRate = frameRate
 
         # clear screen
         if backgroundColor is None:
@@ -769,12 +776,20 @@ class pglBase:
                     gpuNumCores = gpuInfo.get("Total Number of Cores", "Unknown")
                     pglMessages.message(f"GPU: {gpuChipset} ({gpuBus}) {gpuNumCores} cores, {gpuMetalSupport} support" )
                     displays = gpuInfo.get("Displays", [])
+                    if not displays: continue
+                    numDisplays, _ = self.getNumDisplaysAndDefault()
                     for iDisplay, display in enumerate(displays):
                         displayName = display.get("DisplayName", "Unnamed")
                         displayResolution = display.get("Resolution", "Unknown resolution")
                         displayType = display.get("Display Type", "Unknown type")
-                        #display gamma table size
-                        displayGammaTableSize = self.getGammaTableSize(iDisplay)
+                        # The profiler may report displays that this session cannot query.
+                        displayGammaTableSize = "unavailable"
+                        if iDisplay < numDisplays:
+                            try:
+                                gammaTableSize = self.getGammaTableSize(iDisplay)
+                            except (ValueError, RuntimeError):
+                                gammaTableSize = -1
+                            if gammaTableSize > 0: displayGammaTableSize = gammaTableSize
                         if display.get("Main Display", "No") == "Yes":
                             pglMessages.message(f"   {displayName} [Main Display]: {displayResolution} ({displayType}) GammaTable size: {displayGammaTableSize}")
                         else:

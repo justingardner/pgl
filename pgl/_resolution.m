@@ -5,11 +5,6 @@
 #import <Cocoa/Cocoa.h>
 #import <CoreGraphics/CoreGraphics.h>
 
-////////////////////////
-//   define section   //
-////////////////////////
-#define kMaxDisplays 8
-
 ///////////////////////////////
 //   function declarations   //
 ///////////////////////////////
@@ -21,6 +16,7 @@ static PyObject* getNumDisplaysAndDefault(PyObject* self, PyObject* args);
 //////////////////////////
 //   helper functions   //
 //////////////////////////
+static CGDirectDisplayID getScreenDisplayID(NSScreen *screen);
 int getBitDepth(CGDisplayModeRef displayMode);
 boolean_t setBestMode(CGDirectDisplayID whichDisplay,int screenWidth,int screenHeight,int frameRate,int bitDepth);
 void printDisplayModes(CGDirectDisplayID whichDisplay);
@@ -92,46 +88,18 @@ static PyObject* setResolution(PyObject* self, PyObject* args)
   // start auto release pool
   NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
 
-  // FIX FIX FIX this is just the carbon code copied from below
-  CGDisplayErr displayErrorNum;
-  CGDirectDisplayID displays[kMaxDisplays];
-  CGDirectDisplayID whichDisplay;
-  CGDisplayCount numDisplays;
-  CFDictionaryRef modeInfo;
-
-  // check number of displays
-  displayErrorNum = CGGetActiveDisplayList(kMaxDisplays,displays,&numDisplays);
-  if (displayErrorNum) {
-    printf("(pgl:_resolution:_setResolution) Cannot get displays (%d)\n", displayErrorNum);
-    [pool release];
-    Py_INCREF(Py_False); return Py_False;
-  }
- 
-  // checkfor valid displayNumber
+  // Resolve the AppKit screen index used by the renderer to a Core Graphics ID.
   NSArray *screens = [NSScreen screens];
-  if (displayNumber < 0 || displayNumber >= [screens count]) {
-    if (verbose) printf("(pgl:_resolution:_setResolution) Invalid display number %d\n", displayNumber);
+  if (displayNumber < 0 || (NSUInteger)displayNumber >= [screens count]) {
     [pool release];
-     Py_INCREF(Py_False); return Py_False;
+    Py_RETURN_FALSE;
   }
-
-  // get the display
-  whichDisplay = displays[displayNumber];
 
   // Switch the display mode
-  boolean_t success=false;
-  success = setBestMode(whichDisplay,screenWidth,screenHeight,frameRate,bitDepth);
-
-  // check to see if it found the right setting
-  if (!success) {
-    printf("(pgl:_resolution:_setResolution) Warning: failed to set requested display parameters.\n");
-    [pool release];
-    Py_INCREF(Py_False); return Py_False;
-  }
-
+  CGDirectDisplayID whichDisplay = getScreenDisplayID([screens objectAtIndex:displayNumber]);
+  boolean_t success = whichDisplay != kCGNullDirectDisplay && setBestMode(whichDisplay, screenWidth, screenHeight, frameRate, bitDepth);
   [pool release];
-  // return success
-  Py_INCREF(Py_True); return Py_True;
+  return PyBool_FromLong(success);
 }
 
 ///////////////////////////////
@@ -149,59 +117,33 @@ static PyObject* getResolution(PyObject* self, PyObject* args)
   // get all screen array
   NSArray *screens = [NSScreen screens];
 
-  // checkfor valid displayNumber
-  if (displayNumber < 0 || displayNumber >= [screens count]) {
-    if (verbose) printf("(pgl:_resolution:getResolution) Invalid display number %d\n", displayNumber);
+  // Check the index against the current screen snapshot.
+  NSUInteger numDisplays = [screens count];
+  if (displayNumber < 0 || (NSUInteger)displayNumber >= numDisplays) {
     [pool release];
     return Py_BuildValue("(iiii)", -1,-1,-1,-1);
   }
 
   // grab the screen in question
-  NSScreen *thisDisplay = [screens objectAtIndex:(displayNumber)];
-  
-  // get the display description
-  NSDictionary *thisDisplayDescription = [thisDisplay deviceDescription];
-  
-  //NSLog(@"test %@",[thisDisplayDescription objectForKey:@"NSDeviceResolution"]);
-  // get the display size
-  NSSize thisDisplaySize = [[thisDisplayDescription objectForKey:@"NSDeviceSize"] sizeValue];
-  int screenWidth = thisDisplaySize.width;
-  int screenHeight = thisDisplaySize.height;
-  
-  // get the bit depth - this gets how many bits per sample, but needs
-  // to be multiplied by how many channels there are (which is not starightforward
-  // because the call to get whether alpha exists or not apparently doesn't consistently work)
-  // commenting out until there is a fix for this.
-  //int bitDepth = [[thisDisplayDescription objectForKey:@"NSDeviceBitsPerSample"] integerValue];
-  int bitDepth;
-
-  // FIX FIX FIX ok, giving up carbon code to follow here, when I can figure out how to 
-  // write cocoa code above to get bitDepth and frameRate then the code
-  // below can be removed
-  CGDisplayErr displayErrorNum;
-  CGDirectDisplayID displays[kMaxDisplays];
-  CGDirectDisplayID whichDisplay;
-  CGDisplayCount numDisplays;
-
-  // check number of displays
-  displayErrorNum = CGGetActiveDisplayList(kMaxDisplays,displays,&numDisplays);
-  if (displayErrorNum) {
-    printf("(pgl:_resolution:getResolution) Cannot get displays (%d)\n", displayErrorNum);
+  NSScreen *thisDisplay = [screens objectAtIndex:displayNumber];
+  CGDirectDisplayID whichDisplay = getScreenDisplayID(thisDisplay);
+  if (whichDisplay == kCGNullDirectDisplay) {
     [pool release];
     return Py_BuildValue("(iiii)", -1,-1,-1,-1);
   }
 
-  // get the display
-  whichDisplay = displays[displayNumber];
+  // The display can disappear after AppKit returns it.
+  CGDisplayModeRef displayMode = CGDisplayCopyDisplayMode(whichDisplay);
+  if (displayMode == NULL) {
+    [pool release];
+    return Py_BuildValue("(iiii)", -1,-1,-1,-1);
+  }
 
-  // get the display settings
-  CGDisplayModeRef displayMode;
-  displayMode = CGDisplayCopyDisplayMode(whichDisplay);
-  
-  // get bit depth
-  bitDepth = getBitDepth(displayMode);
-  
-  // get frame rate
+  // Keep AppKit dimensions and read the refresh rate and bit depth for the same display.
+  NSSize thisDisplaySize = [[[thisDisplay deviceDescription] objectForKey:@"NSDeviceSize"] sizeValue];
+  int screenWidth = thisDisplaySize.width;
+  int screenHeight = thisDisplaySize.height;
+  int bitDepth = getBitDepth(displayMode);
   int frameRate = (int)CGDisplayModeGetRefreshRate(displayMode);
 
   // release the display settings
@@ -211,8 +153,8 @@ static PyObject* getResolution(PyObject* self, PyObject* args)
   [pool release];
 
   // display information depending on verbose level
-  if (verbose>0) printf("(pgl:_resolution:getResolution) Display %i/%i: %ix%i %iHz %ibits\n",displayNumber,numDisplays,screenWidth,screenHeight,frameRate,bitDepth);
-  if (verbose>1) printDisplayModes(displayNumber);
+  if (verbose>0) printf("(pgl:_resolution:getResolution) Display %i/%lu: %ix%i %iHz %ibits\n",displayNumber,(unsigned long)numDisplays,screenWidth,screenHeight,frameRate,bitDepth);
+  if (verbose>1) printDisplayModes(whichDisplay);
 
   // return the screen resolution, frame rate, and bit depth
   return Py_BuildValue("(iiii)", screenWidth, screenHeight, frameRate, bitDepth);
@@ -235,6 +177,15 @@ static PyObject* getNumDisplaysAndDefault(PyObject* self, PyObject* args)
   return Py_BuildValue("(ii)", numDisplays, defaultDisplayNum);
 }
 
+////////////////////////////
+//   getScreenDisplayID   //
+////////////////////////////
+static CGDirectDisplayID getScreenDisplayID(NSScreen *screen)
+{
+  NSNumber *screenNumber = [[screen deviceDescription] objectForKey:@"NSScreenNumber"];
+  return [screenNumber unsignedIntValue];
+}
+
 /////////////////////
 //   getBitDepth   //
 /////////////////////
@@ -245,6 +196,7 @@ int getBitDepth(CGDisplayModeRef displayMode)
   // get bit depth
   CFStringRef pixelEncoding;
   pixelEncoding = CGDisplayModeCopyPixelEncoding(displayMode);
+  if (pixelEncoding == NULL) return bitDepth;
   // return an appropriate bit depth for each one of these strings
   // defined in IOGraphicsTypes.h
   if (CFStringCompare(pixelEncoding,CFSTR(IO32BitDirectPixels),0)==kCFCompareEqualTo)
@@ -275,7 +227,12 @@ boolean_t setBestMode(CGDirectDisplayID whichDisplay,int screenWidth,int screenH
 
   // get all available display modes
   modeList = CGDisplayCopyAllDisplayModes(whichDisplay, NULL);
+  if (modeList == NULL) return false;
   count = CFArrayGetCount(modeList);
+  if (count == 0) {
+    CFRelease(modeList);
+    return false;
+  }
 
   // check for closest match in width, height
   double minDifference = DBL_MAX,thisDifference;
@@ -337,18 +294,18 @@ boolean_t setBestMode(CGDirectDisplayID whichDisplay,int screenWidth,int screenH
         printf("(pgl:_resolution:setBestMode) Setting display %i to %ix%i %iHz %i bits\n",
                whichDisplay, bestWidth, bestHeight, bestFrameRate, bestBitDepth);
       // capture the appropriate display
-      CGDisplayCapture(whichDisplay);
+      CGError captureError = CGDisplayCapture(whichDisplay);
       // set the video mode
-      CGDisplaySetDisplayMode(whichDisplay,mode,NULL);
+      CGError modeError = CGDisplaySetDisplayMode(whichDisplay,mode,NULL);
       // release the appropriate display
-      CGDisplayRelease(whichDisplay);
-      retval = true;
+      if (captureError == kCGErrorSuccess) CGDisplayRelease(whichDisplay);
+      if (modeError == kCGErrorSuccess) retval = true;
     }
   }
   // release the mode list
   CFRelease(modeList);
 
-  if ((bestWidth != screenWidth) || (bestHeight != screenHeight) || (bestBitDepth != bitDepth) || (bestFrameRate != frameRate)) {
+  if (retval && ((bestWidth != screenWidth) || (bestHeight != screenHeight) || (bestBitDepth != bitDepth) || (bestFrameRate != frameRate))) {
     printDisplayModes(whichDisplay);
     printf("(mglResolution:setBestMode) No exact mode match found (see avaliable modes printed above). Using closest match: %ix%i %i bits %iHz\n",bestWidth,bestHeight,bestBitDepth,bestFrameRate);
   }
@@ -368,6 +325,7 @@ void printDisplayModes(CGDirectDisplayID whichDisplay)
 
   // get all available display modes
   modeList = CGDisplayCopyAllDisplayModes(whichDisplay, NULL);
+  if (modeList == NULL) return;
   count = CFArrayGetCount(modeList);
 
   // cycle through each available mode
@@ -378,9 +336,10 @@ void printDisplayModes(CGDirectDisplayID whichDisplay)
     CFStringRef pixelEncoding;
     pixelEncoding = CGDisplayModeCopyPixelEncoding(mode);
     char encodingStr[1024];
-    if (!CFStringGetCString(pixelEncoding, encodingStr, sizeof(encodingStr), kCFStringEncodingUTF8)) {
+    if (pixelEncoding == NULL || !CFStringGetCString(pixelEncoding, encodingStr, sizeof(encodingStr), kCFStringEncodingUTF8)) {
       strcpy(encodingStr, "Unknown");
     }
+    if (pixelEncoding != NULL) CFRelease(pixelEncoding);
 
     printf("%2d: %4dx%4d %3dHz %2d bits\t%s\n",
        (int)index,
